@@ -1,0 +1,15 @@
+// Negative Control: Bounded `journal_budget` contradicts `offline_recovery = NeverReset`!
+// Protocol Constraint Solver MUST reject this at compile time with diagnostic P2014.
+
+@sync_view("session.broken_msg_list")
+pub reactive view BrokenSyncView(session_id Text) {
+    durability = Reconstructible
+    bounds = {
+        max_items = 50 turns
+        max_payload = 16 MiB
+        max_frame = 4 MiB
+        journal_budget = 16 MiB
+        offline_recovery = NeverReset
+    }
+    output committed_turns(session_id)
+}

@@ -1,0 +1,20 @@
+// Evolution V1: Buggy leap-year rule (`y % 4 == 0`) that erroneously admits 1900-02-29.
+
+pub pure fn is_leap_year(y Int) Bool {
+    y % 4 == 0
+}
+
+pub pure fn days_in_month(y Int, m Int) Int {
+    match m {
+        2 => if is_leap_year(y) { 29 } else { 28 }
+        4 | 6 | 9 | 11 => 30
+        _ => 31
+    }
+}
+
+@evolve("calendar.Date")
+pub record Date {
+    @field(1) year  Int where 1 <= self && self <= 9999
+    @field(2) month Int where 1 <= self && self <= 12
+    @field(3) day   Int where 1 <= self && self <= days_in_month(year, month)
+}

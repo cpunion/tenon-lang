@@ -1,0 +1,7 @@
+// Evolution V1: Order permits `amount >= 0`.
+
+@evolve("billing.Order")
+@supports_cap("checkout", "basic_payment")
+pub record Order {
+    @field(1) amount Int64 where self >= 0
+}

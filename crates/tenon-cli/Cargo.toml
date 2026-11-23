@@ -1,0 +1,17 @@
+[package]
+name = "tenon-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tenon"
+path = "src/main.rs"
+
+[dependencies]
+tenon-syntax = { workspace = true }
+tenon-verify = { workspace = true }
+tenon-codegen = { workspace = true }
+tenon-dist = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

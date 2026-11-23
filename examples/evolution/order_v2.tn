@@ -1,0 +1,38 @@
+// Evolution V2: Order narrows `amount > 0` and adds optional `note`,
+// WITH a Z3-verified bidirectional `evolution Order: v1 <-> v2` lens!
+
+@evolve("billing.Order")
+@requires_cap("checkout", "basic_payment")
+pub record Order {
+    @field(1) amount Int64 where self > 0
+    @field(2) note   Option[Text] = None
+}
+
+evolution Order: v1 <-> v2
+    policy {
+        dual_write = true
+        read_repair = LazyOnRead
+        retain_unknown_fields = true
+    }
+{
+    archive LegacyZero {
+        original_amount Int64 where self == 0
+    }
+
+    up(old Order@v1) (Order@v2, Option[LegacyZero]) {
+        if old.amount == 0 {
+            (Order@v2 { amount = 1, note = None }, Some(LegacyZero { original_amount = old.amount }))
+        } else {
+            (Order@v2 { amount = old.amount, note = None }, None)
+        }
+    }
+
+    down(new Order@v2, arch Option[LegacyZero]) Order@v1
+        retain(new.note)
+    {
+        match arch {
+            Some(a) if new.amount == 1 => Order@v1 { amount = a.original_amount }
+            _ => Order@v1 { amount = new.amount }
+        }
+    }
+}

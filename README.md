@@ -1,8 +1,56 @@
 # Tenon 语言设计与技术方案（已拍板定稿）
 
 > **Working Codename**: `Tenon`（榫卯）—— 寓意**强约束精化类型、分层形式化验证、无别名污染的内存模型、系统级版本演化与可验证分布式协议**严丝合缝。  
-> **状态**: 核心架构已通过 13 项决策收敛定稿（见 [ADR-0001](docs/adr/0001-architecture-decisions.md)，2026-11-23），进入 M0 实现准备阶段。  
+> **状态**: 核心架构 13 项决策已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md)），**M0 纵向切片与可运行分布式应用原型已贯通**（Rust 1.100.0 + Z3 + Cranelift JIT + SQLite/SSE 通用微内核）。  
 > **上游沉淀**: 综合 [`loom-lang`](../loom-lang)（984 PR 自举实践）、[`lang-research`](../lang-research)（2026-11 多语言可复现实验）与 [`dast-os-kernel`](../../dast.ai/dast-os-kernel/README.md)（227 轮分布式调和内核审计），并结合 2025–2026 全球最新编程语言与形式化验证进展形成的全新通用编程语言设计。
+
+---
+
+## 0. 快速体验可运行原型（Quick Start）
+
+前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）与 `z3`（供 L1 SMT 与版本演化求解）。
+
+```bash
+# 1. 运行全工作区单元测试（语法解析、L0/L1 验证、Cranelift JIT、分布式多 Worker Qualification）
+cargo test --workspace
+
+# 2. 强约束精化类型与跨字段不变量验证（Odd+Odd->Even、Date 2024-02-29、ensures、SQLite CHECK 派生）
+cargo run --bin tenon -- check examples/refinements/date_and_odd.tn
+cargo run --bin tenon -- run   examples/refinements/date_and_odd.tn   # Cranelift 原生 JIT 执行
+cargo run --bin tenon -- test  examples/refinements/date_and_odd.tn
+
+# 3. 负例验证：2023-02-29 编译期直接拦截（E0412: 29 <= 28 is false）
+cargo run --bin tenon -- check examples/refinements/bad_date.tn
+
+# 4. 系统级版本演化：Z3 自动找出世纪闰年反例（如 500-02-29 / 1900-02-29）并阻断发布
+cargo run --bin tenon -- evolve check examples/evolution/date_v1_buggy.tn examples/evolution/date_v2_fixed.tn
+
+# 5. 已证明双向演化透镜：Order v1 <-> v2 由 Z3 证明 Law 1 (Totality) + Law 2 (Round-Trip) + Law 3 (Retain)
+cargo run --bin tenon -- evolve check examples/evolution/order_v1.tn examples/evolution/order_v2.tn
+
+# 6. 声明式分布式协议约束求解（负例 P2014 矛盾拦截 + 正例派生 Universal SyncKernel 清单）
+cargo run --bin tenon -- check examples/dast_mini/bad_sync.tn
+cargo run --bin tenon -- check examples/dast_mini/app.tn
+
+# 7. 内置 L2-b 协议模型检测（3 个核心协议 × 9 组正/负控变异 + 导出 TLA+ 供 TLC 交叉验证）
+cargo run --bin tenon -- modelcheck --export-tla target/tla
+
+# 8. 一键运行端到端分布式应用原型（SQLite 分片权威 + 双端硬 Fencing + Turn DAG Interrupt/Steer/Followup + Anti-Join + 33ms SSE Web UI + 渠道节流/Email 死流消除）
+cargo run --bin tenon -- serve examples/dast_mini/app.tn --demo
+
+# 9. 启动交互式 Web UI 服务（打开 http://127.0.0.1:8787 实时体验 Send / Interrupt / Steer / Followup）
+cargo run --bin tenon -- serve examples/dast_mini/app.tn --addr 127.0.0.1:8787
+```
+
+### Workspace 结构
+
+| Crate | 职责 |
+| --- | --- |
+| [`crates/tenon-syntax`](crates/tenon-syntax) | `loom/Go` 风格词法/语法分析器与 AST（精化、`mutate`、`evolution`、`lock_lattice`、`protocol`、`stream`、`reactive view`、`subscriber`） |
+| [`crates/tenon-verify`](crates/tenon-verify) | L0 极速抽象求解器 + L1 Z3 SMT（严格 Fail-Closed + SHA-256 缓存）+ 版本演化与双向透镜证明器 + 分布式协议约束求解器 + L2-b 双引擎协议模型检测器（Rust BFS + TLA+ 导出） |
+| [`crates/tenon-codegen`](crates/tenon-codegen) | Cranelift 原生 JIT 后端 |
+| [`crates/tenon-dist`](crates/tenon-dist) | SQLite WAL 分片权威存储 + 硬 `exec_epoch` Fencing + Turn DAG + Universal Minimal SyncKernel + 多路复用 HTTP/SSE 网关与 33ms 帧合并 Web UI |
+| [`crates/tenon-cli`](crates/tenon-cli) | `tenon` 统一 CLI（`check` / `run` / `test` / `evolve` / `modelcheck` / `serve`） |
 
 ---
 

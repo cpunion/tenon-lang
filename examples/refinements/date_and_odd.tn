@@ -1,0 +1,62 @@
+// Tenon M0 Refinement Types & Cross-Field Invariant Demo
+// Demonstrates: Amount > 0, Odd + Odd -> Even, Date leap-year validation,
+// `mutate` atomic update, and Cranelift native JIT execution.
+
+pub type Amount = Int64 where self > 0
+pub type Odd    = Int64 where self % 2 != 0
+pub type Even   = Int64 where self % 2 == 0
+
+pub pure fn add_odds(a Odd, b Odd) Even {
+    a + b
+}
+
+pub pure fn is_leap_year(y Int) Bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+pub pure fn days_in_month(y Int, m Int where 1 <= self && self <= 12) Int
+    ensures 28 <= result && result <= 31
+{
+    match m {
+        2 => if is_leap_year(y) { 29 } else { 28 }
+        4 | 6 | 9 | 11 => 30
+        _ => 31
+    }
+}
+
+pub record Date {
+    year  Int where 1 <= self && self <= 9999
+    month Int where 1 <= self && self <= 12
+    day   Int where 1 <= self && self <= days_in_month(year, month)
+}
+
+pub fn make_valid_leap_date() Date {
+    Date { year = 2024, month = 2, day = 29 }
+}
+
+pub fn transfer_safe(balance Amount, delta Amount) Amount
+    requires balance > delta
+    ensures result > 0
+{
+    balance - delta
+}
+
+pub test fn test_calendar_and_parity() Int {
+    assert days_in_month(2024, 2) == 29
+    assert days_in_month(2023, 2) == 28
+    assert days_in_month(1900, 2) == 28
+    assert days_in_month(2000, 2) == 29
+    assert add_odds(3, 5) == 8
+    assert transfer_safe(100, 40) == 60
+    1
+}
+
+pub fn main() Int {
+    assert days_in_month(2024, 2) == 29
+    assert days_in_month(1900, 2) == 28
+    let sum = add_odds(11, 13)
+    let rem = transfer_safe(100, 25)
+    assert sum == 24
+    assert rem == 75
+    sum + rem
+}

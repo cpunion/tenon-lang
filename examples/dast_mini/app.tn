@@ -1,0 +1,62 @@
+// Tenon Distributed Prototype: Declarative dast-os-kernel Mini-App
+// Compiles down to ONE Universal Minimal SyncKernel with:
+//   - Partitioned Single-Writer + Hard `exec_epoch` Fencing (Storage + EffectProxy)
+//   - Branch-Aware Turn DAG for Interrupt / Steer (P0) / Followup (P1)
+//   - Zero-DB-Write Volatile `ActiveTurnStream`
+//   - Anti-Join `SessionMsgList` overlay (zero duplicate bubbles on commit handoff)
+//   - Compiled Web `coalesce_window(33 ms)` + Telegram `1200ms` throttle + Email Dead-Stream Elimination
+
+@evolve("dast.AgentSession")
+@partition(key = session_id, writer = SingleFenced)
+@reconciled(fencing = exec_epoch)
+pub record AgentSession {
+    @field(1) session_id Text
+
+    @axis(Intent) {
+        @field(2) active_branch Int64 where self >= 1
+        @field(3) conv_gen      Int64 where self >= 1
+    }
+
+    @axis(Execution) {
+        @field(4) exec_epoch    Int64 where self >= 0
+    }
+}
+
+@stream(durability = Volatile, db_writes = 0, slow_consumer = DropAndResync)
+pub stream ActiveTurnStream(session_id Text) Text {
+    fenced_by = exec_epoch
+    lineage = active_branch
+}
+
+@sync_view("session.msg_list")
+pub reactive view SessionMsgList(session_id Text) {
+    durability = Reconstructible
+    bounds = {
+        max_items = 50 turns
+        max_payload = 16 MiB
+        max_frame = 4 MiB
+        journal_budget = 16 MiB
+        offline_recovery = BoundedReset
+    }
+    let history = committed_turns(session_id)
+    let live = active_overlay(session_id)
+    output anti_join(history, live)
+}
+
+@client_binding(target = Web)
+pub subscriber SessionChatStore(session_id Text) {
+    bind view = SessionMsgList(session_id)
+    pacing {
+        live.delta = coalesce_window(33 ms)
+        cards = debounce(100 ms)
+    }
+    local_storage {
+        persist_overlay = false
+    }
+}
+
+@channel_binding("telegram", supports_edit = true, max_bytes = 4096, rate_limit_ms = 1200)
+@channel_binding("email", supports_edit = false)
+pub subscriber OutboundChannelSink(session_id Text) {
+    bind view = SessionMsgList(session_id)
+}

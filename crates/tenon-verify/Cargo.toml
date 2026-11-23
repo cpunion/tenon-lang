@@ -1,0 +1,11 @@
+[package]
+name = "tenon-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tenon-syntax.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
