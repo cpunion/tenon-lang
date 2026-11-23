@@ -366,6 +366,7 @@ pub enum ExprKind {
         arms: Vec<MatchArm>,
     },
     Block(Block),
+    Await(Box<Expr>),
     Old(Box<Expr>),
     Forall {
         binders: Vec<(String, TypeExpr)>,

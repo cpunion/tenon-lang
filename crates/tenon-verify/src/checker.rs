@@ -68,6 +68,7 @@ struct CheckerCtx {
     records: BTreeMap<String, RecordDecl>,
     pure_fns: BTreeMap<String, FnDecl>,
     all_fns: BTreeMap<String, FnDecl>,
+    async_fns: BTreeSet<String>,
     proofs: Vec<ProofRecord>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -78,6 +79,8 @@ impl CheckerCtx {
         let mut records = BTreeMap::new();
         let mut pure_fns = BTreeMap::new();
         let mut all_fns = BTreeMap::new();
+        let mut async_fns = BTreeSet::new();
+        async_fns.insert("yield_val".into());
 
         for item in &program.items {
             match item {
@@ -94,6 +97,9 @@ impl CheckerCtx {
                     if f.is_pure {
                         pure_fns.insert(f.name.clone(), f.clone());
                     }
+                    if f.is_async {
+                        async_fns.insert(f.name.clone());
+                    }
                     all_fns.insert(f.name.clone(), f.clone());
                 }
                 _ => {}
@@ -105,6 +111,7 @@ impl CheckerCtx {
             records,
             pure_fns,
             all_fns,
+            async_fns,
             proofs: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -152,7 +159,11 @@ impl CheckerCtx {
             smt_premises.push((req.clone(), BTreeMap::new()));
         }
 
-        // 3. Walk statements & tail expression checking record literals, calls, div-by-zero, mutate blocks
+        // 3. Static Effect & Memory Contract Checks (`async`/`await` discipline + `@no_heap_alloc`)
+        let no_heap = f.attrs.iter().any(|a| a.name == "no_heap_alloc");
+        self.check_block_effects(&f.body, f.is_async, f.is_pure, no_heap, &f.name, false);
+
+        // 4. Walk statements & tail expression checking record literals, calls, div-by-zero, mutate blocks
         let mut active_mutate: Option<String> = None;
         let tail_expr = self.check_block(
             &f.body,
@@ -180,6 +191,211 @@ impl CheckerCtx {
         // 5. Verify every declared `ensures` clause (strict Fail-Closed: L0 -> L1 Z3!)
         for ens in &f.ensures {
             self.check_ensures(f, ens, tail_expr.as_ref(), &env, &smt_int_vars, &smt_premises);
+        }
+    }
+
+    fn check_block_effects(
+        &mut self,
+        blk: &Block,
+        in_async: bool,
+        in_pure: bool,
+        no_heap: bool,
+        fn_name: &str,
+        inside_block_on: bool,
+    ) {
+        for s in &blk.stmts {
+            match s {
+                Stmt::Let { value, .. } => {
+                    self.check_expr_effects(value, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+                Stmt::Assign { value, .. } => {
+                    self.check_expr_effects(value, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+                Stmt::Return { value: Some(e), .. } | Stmt::Expr { expr: e, .. } => {
+                    self.check_expr_effects(e, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+                Stmt::Assert { cond, .. } => {
+                    self.check_expr_effects(cond, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+                Stmt::Mutate { body, .. } => {
+                    self.check_block_effects(body, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+                Stmt::While { cond, body, .. } => {
+                    self.check_expr_effects(cond, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                    self.check_block_effects(body, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+                _ => {}
+            }
+        }
+        if let Some(t) = &blk.tail {
+            self.check_expr_effects(t, in_async, in_pure, no_heap, fn_name, inside_block_on);
+        }
+    }
+
+    fn check_expr_effects(
+        &mut self,
+        expr: &Expr,
+        in_async: bool,
+        in_pure: bool,
+        no_heap: bool,
+        fn_name: &str,
+        inside_block_on: bool,
+    ) {
+        match &expr.kind {
+            ExprKind::Await(inner) => {
+                if in_pure {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0602".into(),
+                        message: format!("pure function `{}` cannot use `await`", fn_name),
+                        span: expr.span,
+                        notes: vec!["remove `pure` or move suspension to an `async fn`".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                } else if !in_async {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0601".into(),
+                        message: format!(
+                            "async effect violation: `await` used inside synchronous function `{}`",
+                            fn_name
+                        ),
+                        span: expr.span,
+                        notes: vec![
+                            "mark the enclosing function `async fn` or drive futures via `block_on(...)`".into(),
+                        ],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+                self.check_expr_effects(inner, in_async, in_pure, no_heap, fn_name, true);
+            }
+            ExprKind::RecordLit { name, fields, .. } => {
+                if no_heap {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0701".into(),
+                        message: format!(
+                            "`@no_heap_alloc` contract violated in `{}`: record allocation `{}`",
+                            fn_name, name
+                        ),
+                        span: expr.span,
+                        notes: vec!["functions annotated `@no_heap_alloc` must stay strictly stack/register-only".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+                for (_, v) in fields {
+                    self.check_expr_effects(v, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+            }
+            ExprKind::List(elems) => {
+                if no_heap {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0701".into(),
+                        message: format!(
+                            "`@no_heap_alloc` contract violated in `{}`: heap list allocation",
+                            fn_name
+                        ),
+                        span: expr.span,
+                        notes: vec!["avoid dynamic `List` literals inside `@no_heap_alloc` functions".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+                for e in elems {
+                    self.check_expr_effects(e, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+            }
+            ExprKind::Str(_) => {
+                if no_heap {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0701".into(),
+                        message: format!(
+                            "`@no_heap_alloc` contract violated in `{}`: heap Text allocation",
+                            fn_name
+                        ),
+                        span: expr.span,
+                        notes: vec!["avoid dynamic `Text` allocations inside `@no_heap_alloc` functions".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                let is_block_on = matches!(&callee.kind, ExprKind::Ident(s) if s == "block_on");
+                if let ExprKind::Ident(fname) = &callee.kind {
+                    if self.async_fns.contains(fname) && !in_async && !inside_block_on {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0601".into(),
+                            message: format!(
+                                "async effect violation: `{}` is `async` and cannot be called directly from sync fn `{}`",
+                                fname, fn_name
+                            ),
+                            span: expr.span,
+                            notes: vec![format!("use `await {}(...)` inside an `async fn` or `block_on({}(...))`", fname, fname)],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                    if no_heap && fname == "push" {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0701".into(),
+                            message: format!(
+                                "`@no_heap_alloc` contract violated in `{}`: `push(...)` may allocate",
+                                fn_name
+                            ),
+                            span: expr.span,
+                            notes: vec![],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                }
+                if let ExprKind::Field { field, .. } = &callee.kind {
+                    if no_heap && field == "parse" {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0701".into(),
+                            message: format!(
+                                "`@no_heap_alloc` contract violated in `{}`: `.parse(...)` allocates a Result/Record",
+                                fn_name
+                            ),
+                            span: expr.span,
+                            notes: vec![],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                }
+                for a in args {
+                    self.check_expr_effects(
+                        &a.value,
+                        in_async,
+                        in_pure,
+                        no_heap,
+                        fn_name,
+                        inside_block_on || is_block_on,
+                    );
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.check_expr_effects(left, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                self.check_expr_effects(right, in_async, in_pure, no_heap, fn_name, inside_block_on);
+            }
+            ExprKind::Unary { expr: inner, .. } => {
+                self.check_expr_effects(inner, in_async, in_pure, no_heap, fn_name, inside_block_on);
+            }
+            ExprKind::If {
+                cond,
+                then_block,
+                else_branch,
+            } => {
+                self.check_expr_effects(cond, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                self.check_block_effects(then_block, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                if let Some(eb) = else_branch {
+                    self.check_expr_effects(eb, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.check_expr_effects(scrutinee, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                for a in arms {
+                    self.check_expr_effects(&a.body, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+            }
+            ExprKind::Block(b) => {
+                self.check_block_effects(b, in_async, in_pure, no_heap, fn_name, inside_block_on);
+            }
+            _ => {}
         }
     }
 

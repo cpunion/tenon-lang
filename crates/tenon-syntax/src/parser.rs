@@ -1662,6 +1662,15 @@ impl Parser {
                 self.bump();
                 self.parse_unary()
             }
+            TokenKind::Await => {
+                let start = self.bump().span;
+                let inner = self.parse_unary()?;
+                let span = start.merge(inner.span);
+                Ok(Expr {
+                    kind: ExprKind::Await(Box::new(inner)),
+                    span,
+                })
+            }
             _ => self.parse_postfix(),
         }
     }
@@ -1672,6 +1681,15 @@ impl Parser {
             match self.peek().kind {
                 TokenKind::Dot => {
                     self.bump();
+                    if self.peek().kind == TokenKind::Await {
+                        let aspan = self.bump().span;
+                        let span = expr.span.merge(aspan);
+                        expr = Expr {
+                            kind: ExprKind::Await(Box::new(expr)),
+                            span,
+                        };
+                        continue;
+                    }
                     let (field, fspan) = self.expect_ident()?;
                     let span = expr.span.merge(fspan);
                     expr = Expr {

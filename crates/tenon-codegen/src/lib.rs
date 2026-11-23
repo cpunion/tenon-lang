@@ -54,6 +54,10 @@ struct RtFuncs {
     text_new: FuncId,
     text_eq: FuncId,
     list_push: FuncId,
+    async_frame_alloc: FuncId,
+    async_yield_create: FuncId,
+    async_poll_frame: FuncId,
+    async_block_on: FuncId,
 }
 
 pub struct JitProgram {
@@ -92,6 +96,10 @@ impl JitProgram {
         jit_builder.symbol("tenon_text_new", tenon_text_new as *const u8);
         jit_builder.symbol("tenon_text_eq", tenon_text_eq as *const u8);
         jit_builder.symbol("tenon_list_push", tenon_list_push as *const u8);
+        jit_builder.symbol("tenon_async_frame_alloc", tenon_async_frame_alloc as *const u8);
+        jit_builder.symbol("tenon_async_yield_create", tenon_async_yield_create as *const u8);
+        jit_builder.symbol("tenon_async_poll_frame", tenon_async_poll_frame as *const u8);
+        jit_builder.symbol("tenon_async_block_on", tenon_async_block_on as *const u8);
 
         let mut module = JITModule::new(jit_builder);
 
@@ -155,7 +163,7 @@ impl JitProgram {
             }
         }
 
-        // Collect compilable functions
+        // Collect compilable sync AND async functions
         let fns: Vec<&FnDecl> = program
             .items
             .iter()
@@ -164,10 +172,47 @@ impl JitProgram {
                 _ => None,
             })
             .collect();
+        let async_fns: Vec<&FnDecl> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Fn(f) if f.is_async && f.type_params.is_empty() => Some(f),
+                _ => None,
+            })
+            .collect();
 
         let mut func_ids = BTreeMap::new();
         let mut fn_metas: BTreeMap<String, FnMeta> = BTreeMap::new();
         func_ids.insert("print_int".into(), print_int_id);
+
+        // Declare stackless async functions (constructor `<name>(params) -> frame_ptr` + `<name>__poll(frame_ptr) -> i64`)
+        for f in &async_fns {
+            let mut create_sig = module.make_signature();
+            for _ in &f.params {
+                create_sig.params.push(AbiParam::new(types::I64));
+            }
+            create_sig.returns.push(AbiParam::new(types::I64));
+            let create_id = module
+                .declare_function(&f.name, Linkage::Export, &create_sig)
+                .map_err(|e| e.to_string())?;
+            func_ids.insert(f.name.clone(), create_id);
+            fn_metas.insert(
+                f.name.clone(),
+                FnMeta {
+                    params_inout: vec![false; f.params.len()],
+                    returns_rc: true,
+                },
+            );
+
+            let poll_name = format!("{}__poll", f.name);
+            let mut poll_sig = module.make_signature();
+            poll_sig.params.push(AbiParam::new(types::I64));
+            poll_sig.returns.push(AbiParam::new(types::I64));
+            let poll_id = module
+                .declare_function(&poll_name, Linkage::Export, &poll_sig)
+                .map_err(|e| e.to_string())?;
+            func_ids.insert(poll_name, poll_id);
+        }
 
         // Declare all user functions
         for f in &fns {
@@ -410,6 +455,226 @@ impl JitProgram {
             compiled_fns.push(pname);
         }
 
+        // Compile all stackless `async fn` state machines (`<name>` constructor + `<name>__poll` state machine!)
+        for f in &async_fns {
+            let poll_name = format!("{}__poll", f.name);
+            let create_id = func_ids[&f.name];
+            let poll_id = func_ids[&poll_name];
+
+            // Collect all frame slots: params + let locals + optional synthetic tail await result
+            let mut frame_slots: BTreeMap<String, i64> = BTreeMap::new();
+            let mut next_slot = 4i64;
+            for p in &f.params {
+                frame_slots.insert(p.name.clone(), next_slot);
+                next_slot += 1;
+            }
+            for s in &f.body.stmts {
+                if let Stmt::Let { name, .. } = s {
+                    if !frame_slots.contains_key(name) {
+                        frame_slots.insert(name.clone(), next_slot);
+                        next_slot += 1;
+                    }
+                }
+            }
+            let segments = split_async_segments(&f.body, &mut frame_slots, &mut next_slot);
+            let total_slots = next_slot;
+
+            // 1) Constructor `<name>(params...) -> frame_ptr`
+            ctx.func.signature = module
+                .declarations()
+                .get_function_decl(create_id)
+                .signature
+                .clone();
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+                let entry = builder.create_block();
+                builder.append_block_params_for_function_params(entry);
+                builder.switch_to_block(entry);
+                builder.seal_block(entry);
+
+                let poll_local = module.declare_func_in_func(poll_id, builder.func);
+                let poll_ptr = builder.ins().func_addr(types::I64, poll_local);
+                let slots_v = builder.ins().iconst(types::I64, total_slots);
+                let alloc_callee = module.declare_func_in_func(rt.async_frame_alloc, builder.func);
+                let call = builder.ins().call(alloc_callee, &[slots_v, poll_ptr]);
+                let frame = builder.inst_results(call)[0];
+
+                let set_callee = module.declare_func_in_func(rt.rc_set_field, builder.func);
+                for (idx, p) in f.params.iter().enumerate() {
+                    let pv = builder.block_params(entry)[idx];
+                    let slot = builder.ins().iconst(types::I64, frame_slots[&p.name]);
+                    builder.ins().call(set_callee, &[frame, slot, pv]);
+                }
+                builder.ins().return_(&[frame]);
+                builder.finalize();
+            }
+            module
+                .define_function(create_id, &mut ctx)
+                .map_err(|e| format!("Cranelift async ctor failed for `{}`: {}", f.name, e))?;
+            module.clear_context(&mut ctx);
+
+            // 2) Stackless State-Machine `<name>__poll(frame_ptr) -> i64 (0=Pending, 1=Ready)`
+            ctx.func.signature = module
+                .declarations()
+                .get_function_decl(poll_id)
+                .signature
+                .clone();
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+                let entry = builder.create_block();
+                builder.append_block_params_for_function_params(entry);
+                builder.switch_to_block(entry);
+                let frame = builder.block_params(entry)[0];
+
+                let mut vars = BTreeMap::new();
+                let mut lower = FnLower {
+                    module: &mut module,
+                    builder: &mut builder,
+                    rt,
+                    func_ids: &func_ids,
+                    fn_metas: &fn_metas,
+                    records: &records,
+                    field_to_idx: &field_to_idx,
+                    enum_tags: &enum_tags,
+                    interned_strings: &mut interned_strings,
+                    vars: BTreeMap::new(),
+                    var_records: BTreeMap::new(),
+                    inout_vars: BTreeSet::new(),
+                    owned_rc_vars: BTreeSet::new(),
+                    text_vars: BTreeSet::new(),
+                    self_var: None,
+                    terminated: false,
+                };
+
+                // Load current state & restore all captured frame slots into Cranelift Variables
+                let z0 = lower.builder.ins().iconst(types::I64, 0);
+                let cur_state = lower.call_rt_2_vals(rt.rc_get_field, frame, z0);
+                for (vname, &slot) in &frame_slots {
+                    let sv = lower.builder.ins().iconst(types::I64, slot);
+                    let val = lower.call_rt_2_vals(rt.rc_get_field, frame, sv);
+                    let var = lower.declare_var(vname, types::I64);
+                    lower.builder.def_var(var, val);
+                    vars.insert(vname.clone(), var);
+                }
+
+                let n_awaits = segments.await_steps.len();
+                let mut start_blocks = Vec::new();
+                let mut poll_blocks = Vec::new();
+                for _ in 0..n_awaits {
+                    start_blocks.push(lower.builder.create_block());
+                    poll_blocks.push(lower.builder.create_block());
+                }
+                let final_block = lower.builder.create_block();
+
+                // State dispatch switch on `cur_state`
+                for s in 0..n_awaits {
+                    let st_start = lower.builder.ins().iconst(types::I64, (2 * s) as i64);
+                    let cmp_s = lower.builder.ins().icmp(IntCC::Equal, cur_state, st_start);
+                    let next_chk1 = lower.builder.create_block();
+                    lower
+                        .builder
+                        .ins()
+                        .brif(cmp_s, start_blocks[s], &[], next_chk1, &[]);
+                    lower.builder.switch_to_block(next_chk1);
+
+                    let st_poll = lower.builder.ins().iconst(types::I64, (2 * s + 1) as i64);
+                    let cmp_p = lower.builder.ins().icmp(IntCC::Equal, cur_state, st_poll);
+                    let next_chk2 = lower.builder.create_block();
+                    lower
+                        .builder
+                        .ins()
+                        .brif(cmp_p, poll_blocks[s], &[], next_chk2, &[]);
+                    lower.builder.switch_to_block(next_chk2);
+                }
+                lower.builder.ins().jump(final_block, &[]);
+
+                // Lower each await segment (start -> poll -> suspend or resume!)
+                for (s, step) in segments.await_steps.iter().enumerate() {
+                    lower.builder.switch_to_block(start_blocks[s]);
+                    lower.terminated = false;
+                    let pre_blk = Block {
+                        stmts: step.pre_stmts.clone(),
+                        tail: None,
+                        span: f.span,
+                    };
+                    let _ = lower.lower_block(&pre_blk)?;
+                    // Persist all frame slots before suspending
+                    for (vname, &slot) in &frame_slots {
+                        let cur_v = lower.builder.use_var(vars[vname]);
+                        lower.call_rt_3_void(rt.rc_set_field, frame, slot, cur_v);
+                    }
+                    let child_frame = lower.lower_expr(&step.child_expr)?;
+                    lower.call_rt_3_void(rt.rc_set_field, frame, 3, child_frame);
+                    let poll_state = lower.builder.ins().iconst(types::I64, (2 * s + 1) as i64);
+                    lower.call_rt_3_void(rt.rc_set_field, frame, 0, poll_state);
+                    lower.builder.ins().jump(poll_blocks[s], &[]);
+
+                    // Poll block: call `tenon_async_poll_frame(child)`; suspend (`return 0`) if Pending!
+                    lower.builder.switch_to_block(poll_blocks[s]);
+                    lower.terminated = false;
+                    let slot3 = lower.builder.ins().iconst(types::I64, 3);
+                    let cframe = lower.call_rt_2_vals(rt.rc_get_field, frame, slot3);
+                    let ready = lower.call_rt_1(rt.async_poll_frame, cframe);
+                    let zero = lower.builder.ins().iconst(types::I64, 0);
+                    let is_ready = lower.builder.ins().icmp(IntCC::NotEqual, ready, zero);
+                    let resume_b = lower.builder.create_block();
+                    let pending_b = lower.builder.create_block();
+                    lower
+                        .builder
+                        .ins()
+                        .brif(is_ready, resume_b, &[], pending_b, &[]);
+
+                    lower.builder.switch_to_block(pending_b);
+                    let pend_ret = lower.builder.ins().iconst(types::I64, 0);
+                    lower.builder.ins().return_(&[pend_ret]);
+
+                    lower.builder.switch_to_block(resume_b);
+                    let slot2 = lower.builder.ins().iconst(types::I64, 2);
+                    let child_res = lower.call_rt_2_vals(rt.rc_get_field, cframe, slot2);
+                    lower.call_rt_1_void(rt.rc_dec, cframe);
+                    let zclear = lower.builder.ins().iconst(types::I64, 0);
+                    lower.call_rt_3_void(rt.rc_set_field, frame, 3, zclear);
+                    if let Some(bname) = &step.bind_var {
+                        let slot = frame_slots[bname];
+                        lower.call_rt_3_void(rt.rc_set_field, frame, slot, child_res);
+                        lower.builder.def_var(vars[bname], child_res);
+                    }
+                    let next_state = lower.builder.ins().iconst(types::I64, (2 * (s + 1)) as i64);
+                    lower.call_rt_3_void(rt.rc_set_field, frame, 0, next_state);
+                    let target_b = if s + 1 < n_awaits {
+                        start_blocks[s + 1]
+                    } else {
+                        final_block
+                    };
+                    lower.builder.ins().jump(target_b, &[]);
+                }
+
+                // Final block: run trailing statements + tail expression, store result, return Ready (1)!
+                lower.builder.switch_to_block(final_block);
+                lower.terminated = false;
+                let final_blk = Block {
+                    stmts: segments.final_stmts.clone(),
+                    tail: segments.final_tail.clone().map(Box::new),
+                    span: f.span,
+                };
+                let final_val = lower.lower_block(&final_blk)?;
+                lower.call_rt_3_void(rt.rc_set_field, frame, 2, final_val);
+                let done_st = lower.builder.ins().iconst(types::I64, -1);
+                lower.call_rt_3_void(rt.rc_set_field, frame, 0, done_st);
+                let ready_ret = lower.builder.ins().iconst(types::I64, 1);
+                lower.builder.ins().return_(&[ready_ret]);
+
+                lower.builder.seal_all_blocks();
+                builder.finalize();
+            }
+            module
+                .define_function(poll_id, &mut ctx)
+                .map_err(|e| format!("Cranelift async poll failed for `{}`: {}", f.name, e))?;
+            module.clear_context(&mut ctx);
+            compiled_fns.push(f.name.clone());
+            compiled_fns.push(poll_name);
+        }
+
         module.finalize_definitions().map_err(|e| e.to_string())?;
         Ok(Self {
             module,
@@ -489,7 +754,101 @@ fn declare_runtime_funcs(module: &mut JITModule) -> Result<RtFuncs, String> {
         text_new: declare_sig(module, "tenon_text_new", 2, true)?,
         text_eq: declare_sig(module, "tenon_text_eq", 2, true)?,
         list_push: declare_sig(module, "tenon_list_push", 2, true)?,
+        async_frame_alloc: declare_sig(module, "tenon_async_frame_alloc", 2, true)?,
+        async_yield_create: declare_sig(module, "tenon_async_yield_create", 1, true)?,
+        async_poll_frame: declare_sig(module, "tenon_async_poll_frame", 1, true)?,
+        async_block_on: declare_sig(module, "tenon_async_block_on", 1, true)?,
     })
+}
+
+pub(crate) struct AsyncAwaitStep {
+    pub pre_stmts: Vec<Stmt>,
+    pub bind_var: Option<String>,
+    pub child_expr: Expr,
+}
+
+pub(crate) struct AsyncSegments {
+    pub await_steps: Vec<AsyncAwaitStep>,
+    pub final_stmts: Vec<Stmt>,
+    pub final_tail: Option<Expr>,
+}
+
+pub(crate) fn split_async_segments(
+    body: &Block,
+    frame_slots: &mut BTreeMap<String, i64>,
+    next_slot: &mut i64,
+) -> AsyncSegments {
+    let mut await_steps = Vec::new();
+    let mut cur_stmts = Vec::new();
+
+    for stmt in &body.stmts {
+        match stmt {
+            Stmt::Let {
+                name,
+                value:
+                    Expr {
+                        kind: ExprKind::Await(inner),
+                        ..
+                    },
+                ..
+            } => {
+                if !frame_slots.contains_key(name) {
+                    frame_slots.insert(name.clone(), *next_slot);
+                    *next_slot += 1;
+                }
+                await_steps.push(AsyncAwaitStep {
+                    pre_stmts: std::mem::take(&mut cur_stmts),
+                    bind_var: Some(name.clone()),
+                    child_expr: (**inner).clone(),
+                });
+            }
+            Stmt::Expr {
+                expr:
+                    Expr {
+                        kind: ExprKind::Await(inner),
+                        ..
+                    },
+                ..
+            } => {
+                await_steps.push(AsyncAwaitStep {
+                    pre_stmts: std::mem::take(&mut cur_stmts),
+                    bind_var: None,
+                    child_expr: (**inner).clone(),
+                });
+            }
+            other => cur_stmts.push(other.clone()),
+        }
+    }
+
+    let final_tail = match body.tail.as_deref() {
+        Some(Expr {
+            kind: ExprKind::Await(inner),
+            span,
+        }) => {
+            let synth = "__await_tail".to_string();
+            if !frame_slots.contains_key(&synth) {
+                frame_slots.insert(synth.clone(), *next_slot);
+                *next_slot += 1;
+            }
+            await_steps.push(AsyncAwaitStep {
+                pre_stmts: std::mem::take(&mut cur_stmts),
+                bind_var: Some(synth.clone()),
+                child_expr: (**inner).clone(),
+            });
+            Some(Expr {
+                kind: ExprKind::Ident(synth),
+                span: *span,
+            })
+        }
+        Some(e) => Some(e.clone()),
+        None => None,
+    };
+
+    AsyncSegments {
+        await_steps,
+        final_stmts: cur_stmts,
+        final_tail,
+    }
 }
 
 fn is_rc_type(ty: &TypeExpr, records: &BTreeMap<String, RecordLayout>) -> bool {
@@ -1183,6 +1542,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         let val = self.lower_expr(&args[1].value)?;
                         return Ok(self.call_rt_2_vals(self.rt.list_push, xs, val));
                     }
+                    if fname == "yield_val" && args.len() == 1 {
+                        let v = self.lower_expr(&args[0].value)?;
+                        return Ok(self.call_rt_1(self.rt.async_yield_create, v));
+                    }
+                    if fname == "block_on" && args.len() == 1 {
+                        let fut = self.lower_expr(&args[0].value)?;
+                        return Ok(self.call_rt_1(self.rt.async_block_on, fut));
+                    }
                     if let Some(&tag) = self.enum_tags.get(fname) {
                         if !self.func_ids.contains_key(fname) {
                             let obj = self.call_rt_2(self.rt.rc_alloc, tag, args.len() as i64);
@@ -1389,5 +1756,38 @@ pub fn main() Int {
             "Perceus RC must leave 0 leaked heap objects, got {:?}",
             stats
         );
+    }
+
+    #[test]
+    fn stackless_async_state_machine_suspends_resumes_and_frees_zero_leaks() {
+        let src = r#"
+@no_heap_alloc
+pub pure fn combine(a Int, b Int) Int { a * 2 + b }
+
+pub async fn step(seed Int) Int {
+    let first = await yield_val(seed + 10)
+    let second = await yield_val(first + 5)
+    second
+}
+
+pub async fn pipeline(base Int) Int {
+    let x = await step(base)
+    let y = await yield_val(base * 3)
+    combine(x, y)
+}
+
+pub fn main() Int {
+    block_on(pipeline(7))
+}
+"#;
+        perceus::reset_stats();
+        let prog = parse(src).unwrap();
+        let jit = JitProgram::compile(&prog).unwrap();
+        assert!(jit.compiled_fns.contains(&"pipeline__poll".to_string()));
+        assert_eq!(jit.call_0("main").unwrap(), 65);
+        let st = perceus::snapshot_stats();
+        assert!(st.async_suspends >= 3, "expected >=3 stackless suspensions, got {:?}", st);
+        assert!(st.async_polls >= 6, "expected >=6 cooperative polls, got {:?}", st);
+        assert_eq!(st.live_objects, 0, "stackless async frames must leave 0 leaks, got {:?}", st);
     }
 }

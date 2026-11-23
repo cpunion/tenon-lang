@@ -274,4 +274,19 @@ pub fn bad_fn(x Int) Int { x }
         assert!(!bad_tr.ok);
         assert!(bad_tr.violations[0].contains("NoStaleProxyCall"));
     }
+
+    #[test]
+    fn enforces_async_effect_discipline_and_no_heap_alloc_contract() {
+        let bad = parse(r#"
+pub record Point { x Int, y Int }
+pub async fn a(v Int) Int { await yield_val(v) }
+pub fn bad_sync(v Int) Int { await a(v) }
+@no_heap_alloc
+pub fn bad_alloc(v Int) Point { Point { x = v, y = v } }
+"#).unwrap();
+        let rep = check_program(&bad);
+        assert!(!rep.ok);
+        assert!(rep.diagnostics.iter().any(|d| d.code == "E0601"));
+        assert!(rep.diagnostics.iter().any(|d| d.code == "E0701"));
+    }
 }

@@ -7,12 +7,15 @@ pub const TAG_NONE: i64 = 2;
 pub const TAG_SOME: i64 = 3;
 pub const TAG_LIST: i64 = 4;
 pub const TAG_TEXT: i64 = 5;
+pub const TAG_ASYNC_FRAME: i64 = 6;
 pub const TAG_RECORD_BASE: i64 = 100;
 
 static LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static REUSE_HITS: AtomicUsize = AtomicUsize::new(0);
 static COW_CLONES: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_POLLS: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_SUSPENDS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PerceusStats {
@@ -20,6 +23,8 @@ pub struct PerceusStats {
     pub total_allocs: usize,
     pub reuse_hits: usize,
     pub cow_clones: usize,
+    pub async_polls: usize,
+    pub async_suspends: usize,
 }
 
 pub fn reset_stats() {
@@ -27,6 +32,8 @@ pub fn reset_stats() {
     TOTAL_ALLOCS.store(0, Ordering::SeqCst);
     REUSE_HITS.store(0, Ordering::SeqCst);
     COW_CLONES.store(0, Ordering::SeqCst);
+    ASYNC_POLLS.store(0, Ordering::SeqCst);
+    ASYNC_SUSPENDS.store(0, Ordering::SeqCst);
 }
 
 pub fn snapshot_stats() -> PerceusStats {
@@ -35,6 +42,8 @@ pub fn snapshot_stats() -> PerceusStats {
         total_allocs: TOTAL_ALLOCS.load(Ordering::SeqCst),
         reuse_hits: REUSE_HITS.load(Ordering::SeqCst),
         cow_clones: COW_CLONES.load(Ordering::SeqCst),
+        async_polls: ASYNC_POLLS.load(Ordering::SeqCst),
+        async_suspends: ASYNC_SUSPENDS.load(Ordering::SeqCst),
     }
 }
 
@@ -175,7 +184,6 @@ pub extern "C" fn tenon_rc_get_len(ptr: i64) -> i64 {
     unsafe { (*(ptr as *const ObjHeader)).len as i64 }
 }
 
-/// Allocate a Perceus-managed UTF-8 Text object storing bytes packed in i64 words + exact byte length.
 pub extern "C" fn tenon_text_new(data_ptr: i64, byte_len: i64) -> i64 {
     let blen = byte_len.max(0) as usize;
     let words = blen.div_ceil(8).max(1);
@@ -210,7 +218,6 @@ pub extern "C" fn tenon_text_eq(a: i64, b: i64) -> i64 {
     }
 }
 
-/// MVS List push with Perceus unique in-place reuse if capacity permits, or fresh allocation!
 pub extern "C" fn tenon_list_push(ptr: i64, val: i64) -> i64 {
     if ptr == 0 {
         let fresh = tenon_rc_alloc(TAG_LIST, 1);
@@ -242,5 +249,68 @@ pub extern "C" fn tenon_list_push(ptr: i64, val: i64) -> i64 {
         }
         tenon_rc_dec(ptr);
         fresh as i64
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stackless Async Coroutine State-Machine Runtime (ADR-0001 D04)
+// Frame layout:
+//   slot 0: state (0 = init, ..., -1 = done)
+//   slot 1: poll_fn_ptr (`extern "C" fn(frame_ptr: i64) -> i64`, 0=Pending, 1=Ready)
+//   slot 2: result value (valid when Ready)
+//   slot 3: active child future frame_ptr (if suspended awaiting child)
+//   slot 4+: captured params & locals surviving across `await` points
+// ---------------------------------------------------------------------------
+
+pub extern "C" fn tenon_async_frame_alloc(total_slots: i64, poll_fn_ptr: i64) -> i64 {
+    let slots = total_slots.max(4);
+    let frame = tenon_rc_alloc(TAG_ASYNC_FRAME, slots);
+    tenon_rc_set_field(frame, 0, 0);
+    tenon_rc_set_field(frame, 1, poll_fn_ptr);
+    tenon_rc_set_field(frame, 2, 0);
+    tenon_rc_set_field(frame, 3, 0);
+    frame
+}
+
+extern "C" fn tenon_async_yield_poll(frame: i64) -> i64 {
+    let st = tenon_rc_get_field(frame, 0);
+    if st == 0 {
+        tenon_rc_set_field(frame, 0, 1);
+        ASYNC_SUSPENDS.fetch_add(1, Ordering::SeqCst);
+        0 // Pending: genuine stackless suspension!
+    } else {
+        let val = tenon_rc_get_field(frame, 4);
+        tenon_rc_set_field(frame, 2, val);
+        tenon_rc_set_field(frame, 0, -1);
+        1 // Ready!
+    }
+}
+
+pub extern "C" fn tenon_async_yield_create(val: i64) -> i64 {
+    let frame = tenon_async_frame_alloc(5, tenon_async_yield_poll as *const u8 as usize as i64);
+    tenon_rc_set_field(frame, 4, val);
+    frame
+}
+
+pub extern "C" fn tenon_async_poll_frame(frame: i64) -> i64 {
+    if frame == 0 {
+        return 1;
+    }
+    ASYNC_POLLS.fetch_add(1, Ordering::SeqCst);
+    let poll_ptr = tenon_rc_get_field(frame, 1);
+    if poll_ptr == 0 {
+        return 1;
+    }
+    let poll_fn: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(poll_ptr as usize) };
+    poll_fn(frame)
+}
+
+pub extern "C" fn tenon_async_block_on(frame: i64) -> i64 {
+    loop {
+        if tenon_async_poll_frame(frame) != 0 {
+            let res = tenon_rc_get_field(frame, 2);
+            tenon_rc_dec(frame);
+            return res;
+        }
     }
 }

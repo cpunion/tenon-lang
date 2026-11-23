@@ -1,0 +1,27 @@
+// Tenon M5 Demo: Stackless Async State Machines (ADR-0001 D04) + `@no_heap_alloc` Hot Path (D09)
+// Compiles `async fn` into zero-thread stackless Poll state machines with genuine suspend/resume
+// and Perceus zero-leak frame cleanup!
+
+@no_heap_alloc
+pub pure fn combine_fenced_scores(a Int, b Int) Int {
+    a * 2 + b
+}
+
+pub async fn fetch_branch_step(seed Int) Int {
+    let first = await yield_val(seed + 10)
+    let second = await yield_val(first + 5)
+    second
+}
+
+pub async fn run_async_pipeline(base Int) Int {
+    let x = await fetch_branch_step(base)
+    let y = await yield_val(base * 3)
+    combine_fenced_scores(x, y)
+}
+
+pub fn main() Int {
+    let ans = block_on(run_async_pipeline(7))
+    // base=7 -> first=17 -> second=22 (x=22), y=21 -> 22*2 + 21 = 65
+    assert ans == 65
+    ans
+}

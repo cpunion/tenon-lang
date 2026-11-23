@@ -246,10 +246,15 @@ fn cmd_run(args: &[String]) -> ExitCode {
         Ok(val) => {
             let st = tenon_codegen::perceus::snapshot_stats();
             println!("main() => {}", val);
-            if st.total_allocs > 0 {
+            if st.total_allocs > 0 || st.async_polls > 0 {
                 println!(
-                    "Perceus RC stats: allocs={}, unique_reuse_hits={}, cow_clones={}, live_objects={}",
-                    st.total_allocs, st.reuse_hits, st.cow_clones, st.live_objects
+                    "Perceus/Async stats: allocs={}, unique_reuse_hits={}, cow_clones={}, live_objects={}, async_polls={}, async_suspends={}",
+                    st.total_allocs,
+                    st.reuse_hits,
+                    st.cow_clones,
+                    st.live_objects,
+                    st.async_polls,
+                    st.async_suspends
                 );
             }
             ExitCode::SUCCESS

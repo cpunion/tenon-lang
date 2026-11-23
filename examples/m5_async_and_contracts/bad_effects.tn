@@ -1,0 +1,21 @@
+// Negative Control:
+// 1) Using `await` inside a synchronous function MUST fail with E0601!
+// 2) Allocating a Record/List inside `@no_heap_alloc` MUST fail with E0701!
+
+pub record Point {
+    x Int
+    y Int
+}
+
+pub async fn step_async(v Int) Int {
+    await yield_val(v + 1)
+}
+
+pub fn illegal_sync_await(v Int) Int {
+    await step_async(v)
+}
+
+@no_heap_alloc
+pub fn illegal_alloc_hotpath(v Int) Point {
+    Point { x = v, y = v }
+}
