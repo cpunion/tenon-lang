@@ -1,6 +1,9 @@
+pub mod agent;
+pub mod agent_tools;
 pub mod authority;
 pub mod channels;
 pub mod llm;
+pub mod openai_responses;
 pub mod sandbox;
 pub mod server;
 pub mod sync_kernel;
@@ -440,5 +443,60 @@ mod tests {
             .count();
         assert_eq!(tg_drafts, 1);
         assert_eq!(tg_final_chunks, 3);
+    }
+
+    #[tokio::test]
+    async fn agent_toolkit_shell_file_ops_and_workspace_guard_work() {
+        let tmp = std::env::temp_dir().join(format!("tenon_agent_tools_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let tk = agent_tools::AgentToolkit::new(tmp.clone(), false);
+
+        // 1. write_file
+        let w = tk
+            .execute(
+                "write_file",
+                r#"{"path":"hello.txt","content":"line1\nhello tenon\nline3\n"}"#,
+            )
+            .await;
+        assert!(w.ok, "write_file failed: {:?}", w);
+
+        // 2. edit_file
+        let e = tk
+            .execute(
+                "edit_file",
+                r#"{"path":"hello.txt","target":"hello tenon","replacement":"verified tenon"}"#,
+            )
+            .await;
+        assert!(e.ok, "edit_file failed: {:?}", e);
+
+        // 3. read_file
+        let r = tk.execute("read_file", r#"{"path":"hello.txt"}"#).await;
+        assert!(r.ok && r.output_json.contains("verified tenon"));
+
+        // 4. grep_search & list_dir
+        let g = tk.execute("grep_search", r#"{"query":"verified tenon"}"#).await;
+        assert!(g.ok && g.output_json.contains("hello.txt:2:"));
+        let l = tk.execute("list_dir", r#"{}"#).await;
+        assert!(l.ok && l.output_json.contains("hello.txt"));
+
+        // 5. shell
+        let s = tk.execute("shell", r#"{"command":"wc -l < hello.txt"}"#).await;
+        assert!(s.ok && s.output_json.contains("3"));
+
+        // 6. Workspace escape guard MUST reject `../` traversal!
+        let esc = tk.execute("read_file", r#"{"path":"../../etc/passwd"}"#).await;
+        assert!(!esc.ok && esc.output_json.contains("escapes workspace root"));
+
+        // 7. Dotenv parser handles unquoted `Name <email>` safely
+        let mut map = std::collections::BTreeMap::new();
+        openai_responses::parse_dotenv_into(
+            "OPENAI_API_KEY=sk-test-123\nDAST_AUTH_EMAIL_FROM=DastAI <login@auth.dast.ai>\n",
+            &mut map,
+        );
+        assert_eq!(map.get("OPENAI_API_KEY").map(|s| s.as_str()), Some("sk-test-123"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -38,7 +38,12 @@ cargo run --bin tenon -- build        examples/dast_os_kernel/kernel_v2.tn -o ta
 cargo run --bin tenon -- build-wasm   examples/dast_os_kernel/kernel_v2.tn -o target/dast_kernel_client.wasm
 cargo run --bin tenon -- cluster-demo examples/dast_os_kernel/kernel_v2.tn
 
-# 6. 启动交互式 Web UI（自动加载 /tenon_client_store.wasm；可选环境变量对接真实 OpenAI 兼容 LLM 与 Webhook 渠道）
+# 6. 启动真实交互式 CLI Agent（直连 dast-os OpenAI Responses API：`gpt-6-luna` / `gpt-6.1-sol` / `gpt-6.1-terra` / `gpt-6-astra` + 真实 shell/文件工具 + SQLite Fencing Turn DAG）
+cargo run --bin tenon -- agent --model gpt-6-luna
+# 或切换到编码模型 gpt-6.1-sol / 单轮命令模式：
+cargo run --bin tenon -- agent --model sol -p "列出当前仓库顶层目录并用 shell 查看 git 最近 3 条提交"
+
+# 7. 启动交互式 Web UI（自动加载 /tenon_client_store.wasm；可选环境变量对接真实 OpenAI 兼容 LLM 与 Webhook 渠道）
 # TENON_LLM_BASE_URL=http://127.0.0.1:11434 TENON_LLM_MODEL=qwen2.5 TENON_CHANNEL_WEBHOOK_URL=http://127.0.0.1:9000 \
 cargo run --bin tenon -- serve examples/dast_os_kernel/kernel_v2.tn --addr 127.0.0.1:8787
 ```

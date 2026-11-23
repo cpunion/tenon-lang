@@ -1,10 +1,14 @@
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use tenon_codegen::JitProgram;
+use tenon_dist::agent::TenonAgentRuntime;
+use tenon_dist::agent_tools::AgentToolkit;
 use tenon_dist::authority::{AuthorityStore, ExecSlice};
+use tenon_dist::openai_responses::OpenAIResponsesConfig;
 use tenon_dist::run_distributed_qualification;
 use tenon_dist::server::{serve_http, serve_http_with_options};
 use tenon_dist::sync_kernel::UniversalSyncKernel;
@@ -12,7 +16,7 @@ use tenon_dist::worker::{http_rpc, run_external_worker};
 use tenon_syntax::{Item, parse};
 use tenon_verify::{
     ProofTier, check_evolution, check_program, check_program_protocols, export_program_tla_specs,
-    export_tla_specs, run_all_protocol_checks,
+    export_tla_specs, run_all_protocol_checks, verify_runtime_trace,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -35,6 +39,7 @@ async fn main() -> ExitCode {
         "authority" => cmd_authority(&args[2..]).await,
         "worker" => cmd_worker(&args[2..]).await,
         "cluster-demo" => cmd_cluster_demo(&args[2..]).await,
+        "agent" => cmd_agent(&args[2..]).await,
         "build" => cmd_build_aot(&args[2..]),
         "build-wasm" => cmd_build_wasm(&args[2..]),
         "-h" | "--help" | "help" => {
@@ -67,6 +72,8 @@ USAGE:
   tenon worker --authority http://127.0.0.1:8787 --id worker-1 [--session main] [--delay-ms 40] [--takeover] [--once]
                                                   Run standalone Worker OS process with Fabric Sandbox
   tenon cluster-demo <app.tn>                     Spawn real multi-process cluster (Authority + 2 Workers + SIGKILL failover + 410 reset)
+  tenon agent [--model luna|sol|terra|astra|<id>] [--workspace <dir>] [--spec <app.tn>] [--db <sqlite>] [--env-file <path>] [-p "<prompt>"]
+                                                  Interactive CLI Agent powered by real OpenAI Responses API (dast-os models) + shell & file tools
   tenon build <file.tn> -o <bin> [--emit-llvm <file.ll>] [--opt O0|O2|O3]
                                                   Verify (Fail-Closed) & AOT-compile to standalone native binary via LLVM
   tenon build-wasm <app.tn> [-o <out.wasm>]       Compile declarative .tn view/pacing directly to binary WebAssembly client store"#
@@ -1198,5 +1205,265 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             eprintln!("LLVM AOT build failed: {}", e);
             ExitCode::from(1)
         }
+    }
+}
+
+async fn cmd_agent(args: &[String]) -> ExitCode {
+    let model_arg = args
+        .windows(2)
+        .find(|w| w[0] == "--model" || w[0] == "-m")
+        .map(|w| w[1].as_str())
+        .unwrap_or("gpt-6-luna");
+    let effort_arg = args
+        .windows(2)
+        .find(|w| w[0] == "--effort")
+        .map(|w| w[1].as_str());
+    let spec_file = args
+        .windows(2)
+        .find(|w| w[0] == "--spec")
+        .map(|w| w[1].as_str())
+        .unwrap_or("examples/dast_os_kernel/kernel_v2.tn");
+    let db_path = args
+        .windows(2)
+        .find(|w| w[0] == "--db")
+        .map(|w| w[1].as_str())
+        .unwrap_or(":memory:");
+    let session_id = args
+        .windows(2)
+        .find(|w| w[0] == "--session")
+        .map(|w| w[1].as_str())
+        .unwrap_or("main");
+    let env_file = args
+        .windows(2)
+        .find(|w| w[0] == "--env-file")
+        .map(|w| Path::new(w[1].as_str()));
+    let workspace = args
+        .windows(2)
+        .find(|w| w[0] == "--workspace" || w[0] == "-C")
+        .map(|w| PathBuf::from(&w[1]))
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let allow_outside = args.iter().any(|a| a == "--allow-outside-workspace");
+    let single_prompt = args
+        .windows(2)
+        .find(|w| w[0] == "--prompt" || w[0] == "-p")
+        .map(|w| w[1].clone());
+
+    // 1. Load & verify `.tn` distributed kernel manifest (or fall back to default verified manifest if run outside repo)
+    let manifest = if Path::new(spec_file).exists() {
+        let prog = match load_and_parse(spec_file) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error loading spec `{}`: {}", spec_file, e);
+                return ExitCode::from(1);
+            }
+        };
+        let rep = check_program(&prog);
+        if !rep.ok {
+            eprintln!("FAIL-CLOSED: spec `{}` failed verification.", spec_file);
+            return ExitCode::from(1);
+        }
+        rep.manifest.unwrap_or_else(default_agent_manifest)
+    } else {
+        default_agent_manifest()
+    };
+
+    // 2. Load OpenAI Responses API config (dast-os models: gpt-6-luna / gpt-6.1-sol / gpt-6.1-terra / gpt-6-astra)
+    let llm_cfg = match OpenAIResponsesConfig::load(model_arg, env_file, effort_arg) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("OpenAI configuration error: {}", e);
+            eprintln!("Hint: export OPENAI_API_KEY=... or pass --env-file /path/to/.env");
+            return ExitCode::from(1);
+        }
+    };
+
+    let store = match AuthorityStore::open(Path::new(db_path)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to open SQLite authority `{}`: {}", db_path, e);
+            return ExitCode::from(1);
+        }
+    };
+    let kernel = Arc::new(UniversalSyncKernel::new(store, manifest));
+    let toolkit = AgentToolkit::new(workspace, allow_outside);
+    let mut agent = TenonAgentRuntime::new(kernel, llm_cfg, toolkit, session_id);
+
+    // Single-shot mode (`-p "..."`)
+    if let Some(prompt) = single_prompt {
+        println!(
+            "Tenon Agent [model={} effort={} workspace={}]",
+            agent.llm_cfg.model,
+            agent.llm_cfg.reasoning_effort,
+            agent.toolkit.workspace_root.display()
+        );
+        match agent.run_turn(&prompt, true).await {
+            Ok(rep) => {
+                let trace_ok = verify_runtime_trace(&agent.kernel.snapshot_trace()).ok;
+                println!(
+                    "[done] branch=#{} epoch={} rounds={} tools={} tokens(in={} cached={} out={}) cost=${:.6} trace_refinement={}",
+                    rep.branch_id,
+                    rep.exec_epoch,
+                    rep.rounds,
+                    rep.tool_calls_executed.len(),
+                    rep.usage.input_tokens,
+                    rep.usage.cached_tokens,
+                    rep.usage.output_tokens,
+                    rep.usage.estimated_cost_usd,
+                    trace_ok
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("agent error: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // Interactive CLI REPL Mode!
+    println!("==================================================================");
+    println!("  Tenon Interactive CLI Agent (dast-os OpenAI Responses API)");
+    println!("  Model:     {} (reasoning={})", agent.llm_cfg.model, agent.llm_cfg.reasoning_effort);
+    println!("  Workspace: {}", agent.toolkit.workspace_root.display());
+    println!("  Tools:     shell, read_file, write_file, edit_file, list_dir, grep_search");
+    println!("  Authority: SQLite WAL ({}) | Hard exec_epoch Fencing | Turn DAG", db_path);
+    println!("  Commands:  /model <luna|sol|terra|astra>  /state  /trace  /clear  /help  /exit");
+    println!("==================================================================");
+
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    loop {
+        print!("\ntenon[{}]> ", agent.llm_cfg.model);
+        let _ = io::stdout().flush();
+
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                println!("\nBye.");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("stdin error: {}", e);
+                break;
+            }
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if matches!(trimmed, "/exit" | "/quit" | "exit" | "quit") {
+            println!("Bye.");
+            break;
+        }
+        if trimmed == "/help" {
+            println!("Commands:");
+            println!("  /model <luna|terra|sol|astra|<id>>  Switch OpenAI model (gpt-6-luna / gpt-6.1-terra / gpt-6.1-sol / gpt-6-astra)");
+            println!("  /state                              Inspect SQLite Turn DAG branch, epoch, history & receipts");
+            println!("  /trace                              Verify live Runtime Trace Refinement invariants");
+            println!("  /steer <msg>                        Enqueue P0 steering instruction for next turn");
+            println!("  /clear                              Reset conversation context");
+            println!("  /exit                               Quit interactive agent");
+            continue;
+        }
+        if let Some(m) = trimmed.strip_prefix("/model ") {
+            agent.switch_model(m.trim());
+            println!(
+                "Switched model -> {} (reasoning={})",
+                agent.llm_cfg.model, agent.llm_cfg.reasoning_effort
+            );
+            continue;
+        }
+        if trimmed == "/state" || trimmed == "/branch" {
+            match agent.kernel.authority.read_session_view(&agent.session_id) {
+                Ok(v) => println!(
+                    "session={} branch=#{} epoch={} phase={} history_turns={} audit_receipts={} journal_head={}",
+                    v.session_id,
+                    v.active_branch,
+                    v.exec_epoch,
+                    v.phase,
+                    v.history.len(),
+                    v.late_audit_receipts,
+                    v.journal_head_seq
+                ),
+                Err(e) => eprintln!("state error: {}", e),
+            }
+            continue;
+        }
+        if trimmed == "/trace" {
+            let tr = verify_runtime_trace(&agent.kernel.snapshot_trace());
+            println!("{}", serde_json::to_string_pretty(&tr).unwrap());
+            continue;
+        }
+        if let Some(st) = trimmed.strip_prefix("/steer ") {
+            let cid = format!("steer_{}", agent.conversation_items.len());
+            match agent
+                .kernel
+                .authority
+                .enqueue_steer(&agent.session_id, &cid, st.trim())
+            {
+                Ok(()) => println!("Enqueued P0 steering instruction."),
+                Err(e) => eprintln!("steer error: {}", e),
+            }
+            continue;
+        }
+        if trimmed == "/clear" {
+            agent.reset_conversation();
+            println!("Cleared conversation context.");
+            continue;
+        }
+
+        // Run live fenced agent turn with Ctrl-C cancellation support!
+        let run_fut = agent.run_turn(trimmed, true);
+        tokio::select! {
+            res = run_fut => {
+                match res {
+                    Ok(rep) => {
+                        println!(
+                            "\n[branch=#{} epoch={} rounds={} tools={} in={} cached={} out={} cost=${:.6}]",
+                            rep.branch_id,
+                            rep.exec_epoch,
+                            rep.rounds,
+                            rep.tool_calls_executed.len(),
+                            rep.usage.input_tokens,
+                            rep.usage.cached_tokens,
+                            rep.usage.output_tokens,
+                            rep.usage.estimated_cost_usd
+                        );
+                    }
+                    Err(e) => eprintln!("\n[agent error] {}", e),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n[interrupted] Ctrl-C received; fencing active epoch and opening clean branch...");
+                let cid = format!("ctrlc_{}", std::process::id());
+                let _ = agent.kernel.authority.interrupt(&agent.session_id, &cid, "(interrupted by Ctrl-C)");
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn default_agent_manifest() -> tenon_verify::DistributedAppManifest {
+    tenon_verify::DistributedAppManifest {
+        partitioned_entities: vec!["AgentSession".into()],
+        streams: vec![tenon_verify::ResolvedStreamSpec {
+            name: "ActiveTurnStream".into(),
+            durability: "Volatile".into(),
+            db_writes_per_delta: 0,
+            slow_consumer_policy: "DropAndResync".into(),
+        }],
+        views: vec![tenon_verify::ResolvedViewSpec {
+            name: "SessionMsgList".into(),
+            sync_id: "session.msg_list".into(),
+            archetype: tenon_verify::SyncArchetypeKind::FencedIncremental,
+            max_items: 50,
+            max_payload_bytes: 16 * 1024 * 1024,
+            max_frame_bytes: 4 * 1024 * 1024,
+            journal_budget_bytes: Some(16 * 1024 * 1024),
+            bounded_reset: true,
+            uses_anti_join_overlay: true,
+        }],
+        subscribers: vec![],
     }
 }
