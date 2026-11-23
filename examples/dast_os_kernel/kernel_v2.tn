@@ -1,0 +1,290 @@
+// ============================================================================
+// dast-os-kernel Core Specification & Executable Implementation in Tenon (v2)
+// Single Source of Truth verified by:
+//   1. tenon check       (L0 + L1 Z3 + SQLite CHECK + DistributedAppManifest)
+//   2. tenon evolve      (Z3 Bidirectional Lens Proof v1 <-> v2 + Capabilities)
+//   3. tenon modelcheck  (AST BFS + Negative Faults + Lock Lattice + TLA+ Export)
+//   4. tenon run         (Cranelift JIT + Stackless Async + Perceus Zero Leaks)
+//   5. tenon build       (LLVM 22 -O3 Standalone Native arm64 Executable)
+//   6. tenon build-wasm  (Binary WebAssembly Client Store: Anti-Join + 33ms)
+//   7. tenon cluster-demo(Multi-Process Authority + 2xWorker + SIGKILL + 409/410)
+// ============================================================================
+
+// --- 1. Reusable Refined Domain Types ---
+pub type Epoch    = Int64 where self >= 0
+pub type BranchId = Int64 where self >= 1
+pub type Year     = Int   where 1 <= self && self <= 9999
+pub type Month    = Int   where 1 <= self && self <= 12
+
+// --- 2. Deadlock-Free Lock Ordering Lattice ---
+pub lock_lattice DastKernelLocks {
+    PartitionLock < StorageTxnLock < EffectProxyLock < ReceiptAuditLock
+}
+
+// --- 3. Hot-Path `@no_heap_alloc` Fencing & Pure Kernel Predicates ---
+@no_heap_alloc
+pub pure fn is_epoch_fenced(worker_epoch Epoch, auth_epoch Epoch) Bool {
+    worker_epoch == auth_epoch
+}
+
+@no_heap_alloc
+pub pure fn next_epoch(cur Epoch) Epoch
+    ensures result > cur
+{
+    cur + 1
+}
+
+@no_heap_alloc
+pub pure fn next_branch(cur BranchId) BranchId
+    ensures result > cur
+{
+    cur + 1
+}
+
+@acquires("PartitionLock", "StorageTxnLock", "EffectProxyLock", "ReceiptAuditLock")
+pub fn fenced_dispatch_score(worker_epoch Epoch, auth_epoch Epoch, tokens Int) Int {
+    if is_epoch_fenced(worker_epoch, auth_epoch) {
+        tokens
+    } else {
+        0
+    }
+}
+
+// --- 4. System-Level Schema Evolution (`v1 <-> v2`) with Z3-Proved Bidirectional Lens ---
+@evolve("dast.AttemptBudget")
+@requires_cap("reconcile", "fenced_epoch_v1")
+@requires_cap("reconcile", "branch_turn_dag")
+pub record AttemptBudget {
+    @field(1) amount     Int64 where self > 0
+    @field(2) audit_note Option[Text] = None
+}
+
+evolution AttemptBudget: v1 <-> v2
+    policy {
+        dual_write = true
+        read_repair = LazyOnRead
+        retain_unknown_fields = true
+    }
+{
+    archive LegacyZeroBudget {
+        original_amount Int64 where self == 0
+    }
+
+    up(old AttemptBudget@v1) (AttemptBudget@v2, Option[LegacyZeroBudget]) {
+        if old.amount == 0 {
+            (
+                AttemptBudget@v2 { amount = 1, audit_note = None },
+                Some(LegacyZeroBudget { original_amount = old.amount })
+            )
+        } else {
+            (
+                AttemptBudget@v2 { amount = old.amount, audit_note = None },
+                None
+            )
+        }
+    }
+
+    down(new AttemptBudget@v2, arch Option[LegacyZeroBudget]) AttemptBudget@v1
+        retain(new.audit_note)
+    {
+        match arch {
+            Some(a) if new.amount == 1 => AttemptBudget@v1 { amount = a.original_amount }
+            _ => AttemptBudget@v1 { amount = new.amount }
+        }
+    }
+}
+
+// --- 5. Verified Session Control-Plane Record (`mutate` Z3 invariant preservation) ---
+pub record LeaseState {
+    branch_id  BranchId
+    exec_epoch Epoch
+}
+
+pub fn interrupt_lease(inout lease LeaseState) {
+    mutate lease {
+        lease.branch_id += 1
+        lease.exec_epoch += 1
+    }
+}
+
+// --- 6. Formal Protocol State Machines (Compiled from AST -> BFS + Fault Controls + TLA+) ---
+pub protocol state_machine DastFencedTurnDAG {
+    state {
+        auth_epoch       Int  = 1
+        active_branch    Int  = 1
+        w1_epoch         Int  = 1
+        w1_branch        Int  = 1
+        stale_proxy_hit  Bool = false
+        branch_polluted  Bool = false
+    }
+
+    action Worker2Takeover when auth_epoch < 3 {
+        auth_epoch = auth_epoch + 1
+    }
+
+    action UserInterrupt when active_branch < 2 && auth_epoch < 3 {
+        active_branch = active_branch + 1
+        auth_epoch = auth_epoch + 1
+    }
+
+    action ValidWorker1Proxy when w1_epoch == auth_epoch && w1_branch == active_branch {
+        stale_proxy_hit = false
+    }
+
+    fault DropProxyFence when w1_epoch < auth_epoch {
+        stale_proxy_hit = true
+    }
+
+    fault CrossBranchWrite when w1_branch != active_branch {
+        branch_polluted = true
+    }
+
+    laws {
+        invariant NoStaleProxyCall: !stale_proxy_hit
+        invariant NoCrossBranchPollution: !branch_polluted
+    }
+}
+
+pub protocol state_machine DastAttemptDualFence {
+    state {
+        cancelled       Bool = false
+        hold_active     Bool = false
+        outcome         Int  = 0
+        external_calls  Int  = 0
+        revived_cancel  Bool = false
+    }
+
+    action AdmitAttempt when !cancelled && !hold_active && outcome == 0 {
+        hold_active = true
+        outcome = 1
+        external_calls = external_calls + 1
+    }
+
+    action UserCancel when !cancelled {
+        cancelled = true
+    }
+
+    action CrashToUnknown when outcome == 1 {
+        outcome = 2
+    }
+
+    action SettleLateReceipt when (outcome == 1 || outcome == 2) && cancelled {
+        outcome = 3
+    }
+
+    action SettleNormal when (outcome == 1 || outcome == 2) && !cancelled {
+        outcome = 3
+        hold_active = false
+    }
+
+    fault BlindRetryUnknown when outcome == 2 && external_calls < 2 {
+        external_calls = external_calls + 1
+    }
+
+    fault ReviveOnLateReceipt when outcome == 3 && cancelled {
+        cancelled = false
+        revived_cancel = true
+    }
+
+    laws {
+        invariant NoDuplicateExternalEffect: external_calls <= 1
+        invariant NoReviveCancelled: !revived_cancel
+        invariant HoldKeptWhileUnknown: outcome != 2 || hold_active
+    }
+}
+
+// --- 7. Declarative 7-Axis Distributed Runtime Specification ---
+@evolve("dast.AgentSession")
+@partition(key = session_id, writer = SingleFenced)
+@reconciled(fencing = exec_epoch)
+pub record AgentSession {
+    @field(1) session_id Text
+
+    @axis(Intent) {
+        @field(2) active_branch BranchId
+        @field(3) conv_gen      BranchId
+    }
+
+    @axis(Execution) {
+        @field(4) exec_epoch    Epoch
+    }
+}
+
+@stream(durability = Volatile, db_writes = 0, slow_consumer = DropAndResync)
+pub stream ActiveTurnStream(session_id Text) Text {
+    fenced_by = exec_epoch
+    lineage = active_branch
+}
+
+@sync_view("session.msg_list")
+pub reactive view SessionMsgList(session_id Text) {
+    durability = Reconstructible
+    bounds = {
+        max_items = 50 turns
+        max_payload = 16 MiB
+        max_frame = 4 MiB
+        journal_budget = 16 MiB
+        offline_recovery = BoundedReset
+    }
+    let history = committed_turns(session_id)
+    let live = active_overlay(session_id)
+    output anti_join(history, live)
+}
+
+@client_binding(target = Web)
+pub subscriber SessionChatStore(session_id Text) {
+    bind view = SessionMsgList(session_id)
+    pacing {
+        live.delta = coalesce_window(33 ms)
+        cards = debounce(100 ms)
+    }
+    local_storage {
+        persist_overlay = false
+    }
+}
+
+@channel_binding("telegram", supports_edit = true, max_bytes = 4096, rate_limit_ms = 1200)
+@channel_binding("slack", supports_edit = true, max_bytes = 3000, rate_limit_ms = 800)
+@channel_binding("email", supports_edit = false)
+pub subscriber OutboundChannelSink(session_id Text) {
+    bind view = SessionMsgList(session_id)
+}
+
+// --- 8. Executable Stackless Async Kernel Pipeline (Cranelift JIT + LLVM 22 AOT) ---
+pub async fn run_fenced_turn(worker_epoch Epoch, auth_epoch Epoch, tokens Int) Int {
+    let admitted = await yield_val(fenced_dispatch_score(worker_epoch, auth_epoch, tokens))
+    let settled = await yield_val(admitted * 2)
+    settled
+}
+
+pub fn main() Int {
+    // 1. Atomic `mutate` on LeaseState (Interrupt: branch 1->2, epoch 1->2) with Perceus unique reuse
+    var lease LeaseState = LeaseState { branch_id = 1, exec_epoch = 1 }
+    let snapshot_before LeaseState = lease
+    interrupt_lease(lease)
+    // MVS COW preserved `snapshot_before` while advancing `lease`!
+    assert snapshot_before.branch_id == 1
+    assert snapshot_before.exec_epoch == 1
+    assert lease.branch_id == 2
+    assert lease.exec_epoch == 2
+
+    // 2. Auto-derived boundary parser `LeaseState.parse(...)` rejects branch=0 or epoch=-1!
+    let ok_ep = match LeaseState.parse(2, 4) {
+        Ok(ls) => ls.exec_epoch
+        Err(code) => -code
+    }
+    let bad_br = match LeaseState.parse(0, 1) {
+        Ok(ls) => ls.exec_epoch
+        Err(code) => -code
+    }
+    assert ok_ep == 4
+    assert bad_br == -1
+
+    // 3. Stackless async fenced pipeline: stale epoch returns 0, current epoch executes!
+    let stale_out = block_on(run_fenced_turn(1, lease.exec_epoch, 50))
+    let valid_out = block_on(run_fenced_turn(lease.exec_epoch, lease.exec_epoch, 50))
+    assert stale_out == 0
+    assert valid_out == 100
+
+    valid_out + ok_ep + lease.branch_id
+}

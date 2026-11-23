@@ -1,17 +1,17 @@
 # Tenon 语言设计与技术方案（已拍板定稿）
 
 > **Working Codename**: `Tenon`（榫卯）—— 寓意**强约束精化类型、分层形式化验证、无别名污染的内存模型、系统级版本演化与可验证分布式协议**严丝合缝。  
-> **状态**: 核心架构 13 项决策已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md)），**M0–M4 纵向原型全链路已贯通**（Rust 1.100.0 + Z3 + Cranelift JIT + Perceus RC/COW + 通用 `.tn` AST 协议检测 + 真多进程 Authority/Worker/Fabric Sandbox + `.tn` 直编二进制 `.wasm` 客户端 + OpenAI 兼容流式 LLM & Webhook 渠道适配器）。  
+> **状态**: 核心架构 13 项决策已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md)），**M0–M7 全栈原型已彻底贯通**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 原生后端** + Perceus RC/COW + 无栈 `async` 状态机 + `@no_heap_alloc` + 通用 `.tn` AST 协议检测 + 真多进程 Authority/Worker/Fabric Sandbox + `.tn` 直编二进制 `.wasm` 客户端 + OpenAI SSE LLM & Webhook 渠道 + **`dast-os-kernel` 全栈 Tenon 重写原型**）。  
 > **上游沉淀**: 综合 [`loom-lang`](../loom-lang)（984 PR 自举实践）、[`lang-research`](../lang-research)（2026-11 多语言可复现实验）与 [`dast-os-kernel`](../../dast.ai/dast-os-kernel/README.md)（227 轮分布式调和内核审计），并结合 2025–2026 全球最新编程语言与形式化验证进展形成的全新通用编程语言设计。
 
 ---
 
 ## 0. 快速体验可运行原型（Quick Start）
 
-前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）与 `z3`（可选 `node` 验证编译出的 `.wasm`）。
+前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）、`z3`、LLVM `clang`（已验证 LLVM 22.1.8；可选 `node` 验证编译出的 `.wasm`）。
 
 ```bash
-# 1. 全工作区单元测试（含 Perceus 零泄漏、Z3 mutate 证明、V8 Wasm 执行、OpenAI SSE + Webhook 实测、Fabric Sandbox + 410 Reset）
+# 1. 全工作区 18 项自动化测试（含 Perceus 零泄漏、无栈 async、LLVM 22 AOT、V8 Wasm、OpenAI SSE + Webhook、Fabric Sandbox + 410 Reset）
 cargo test --workspace
 
 # 2. 精化类型别名复用（Year/Month/Odd/Even/Amount）+ 跨字段 Date + Cranelift 原生执行
@@ -23,40 +23,35 @@ cargo run --bin tenon -- check examples/refinements/bad_date.tn          # 负�
 cargo run --bin tenon -- run   examples/m1_records_perceus/date_parse_and_mutate.tn
 cargo run --bin tenon -- check examples/m1_records_perceus/bad_mutate.tn # 负例：漏调闰年 29->28 被 Z3 抓反例
 
-# 4. 系统级版本演化：世纪闰年反例拦截 + Order v1<->v2 双向透镜 Z3 三大定律证明
-cargo run --bin tenon -- evolve check examples/evolution/date_v1_buggy.tn examples/evolution/date_v2_fixed.tn
-cargo run --bin tenon -- evolve check examples/evolution/order_v1.tn      examples/evolution/order_v2.tn
+# 4. M5 & M6：无栈 async 协程状态机 + @no_heap_alloc 契约 + LLVM 22 -O3 独立原生二进制编译
+cargo run --bin tenon -- run   examples/m5_async_and_contracts/stackless_async.tn
+cargo run --bin tenon -- check examples/m5_async_and_contracts/bad_effects.tn
+cargo run --bin tenon -- build examples/m5_async_and_contracts/stackless_async.tn -o target/aot_async_bin --emit-llvm target/aot_async.ll --opt O3
+./target/aot_async_bin
 
-# 5. M2：通用 .tn AST 协议模型检测 + lock_lattice 静态死锁序检测 + TLA+ 直出
-cargo run --bin tenon -- modelcheck --export-tla target/tla
-cargo run --bin tenon -- modelcheck examples/protocols/fenced_lease.tn --export-tla target/tla_custom
-cargo run --bin tenon -- modelcheck examples/protocols/bad_lock_order.tn # 负例：锁序倒置编译期拦截
+# 5. M7：单源 `dast-os-kernel` 全栈 Tenon 重写 — 7 把工具全链路验证同一份源码！
+cargo run --bin tenon -- check        examples/dast_os_kernel/kernel_v2.tn
+cargo run --bin tenon -- evolve check examples/dast_os_kernel/kernel_v1.tn examples/dast_os_kernel/kernel_v2.tn
+cargo run --bin tenon -- modelcheck   examples/dast_os_kernel/kernel_v2.tn --export-tla target/tla_dast_kernel
+cargo run --bin tenon -- run          examples/dast_os_kernel/kernel_v2.tn
+cargo run --bin tenon -- build        examples/dast_os_kernel/kernel_v2.tn -o target/dast_kernel_bin --opt O3 && ./target/dast_kernel_bin
+cargo run --bin tenon -- build-wasm   examples/dast_os_kernel/kernel_v2.tn -o target/dast_kernel_client.wasm
+cargo run --bin tenon -- cluster-demo examples/dast_os_kernel/kernel_v2.tn
 
-# 6. 分布式协议约束求解 + 单进程 SSE/Wasm Web UI 原型
-cargo run --bin tenon -- check examples/dast_mini/bad_sync.tn            # 负例：P2014 矛盾拦截
-cargo run --bin tenon -- check examples/dast_mini/app.tn
-cargo run --bin tenon -- serve examples/dast_mini/app.tn --demo
-
-# 7. M3：真多进程分布式混沌验收（独立 Authority + 2 个独立 Worker OS 进程 + 真实 SIGKILL 故障切换 + Fabric Sandbox + HTTP 409 Fencing + HTTP 410 reset_required + Trace Refinement）
-cargo run --bin tenon -- cluster-demo examples/dast_mini/app.tn
-
-# 8. M4：声明式 .tn 直编二进制 WebAssembly 客户端 Store（Anti-Join + 33ms 帧合并）
-cargo run --bin tenon -- build-wasm examples/dast_mini/app.tn -o target/tenon_client_store.wasm
-
-# 9. 启动交互式 Web UI（自动加载 /tenon_client_store.wasm；可选环境变量对接真实 OpenAI 兼容 LLM 与 Webhook 渠道）
+# 6. 启动交互式 Web UI（自动加载 /tenon_client_store.wasm；可选环境变量对接真实 OpenAI 兼容 LLM 与 Webhook 渠道）
 # TENON_LLM_BASE_URL=http://127.0.0.1:11434 TENON_LLM_MODEL=qwen2.5 TENON_CHANNEL_WEBHOOK_URL=http://127.0.0.1:9000 \
-cargo run --bin tenon -- serve examples/dast_mini/app.tn --addr 127.0.0.1:8787
+cargo run --bin tenon -- serve examples/dast_os_kernel/kernel_v2.tn --addr 127.0.0.1:8787
 ```
 
 ### Workspace 结构
 
 | Crate | 职责 |
 | --- | --- |
-| [`crates/tenon-syntax`](crates/tenon-syntax) | `loom/Go` 风格词法/语法分析器与 AST（精化、`mutate`、`evolution`、`lock_lattice`、`protocol state_machine`、`stream`、`reactive view`、`subscriber`） |
-| [`crates/tenon-verify`](crates/tenon-verify) | `IncrementalDb` 内容寻址增量查询缓存 + L0 极速求解 + L1 Z3 SMT（含 `mutate` 符号后态证明、别名约束继承）+ 版本演化/透镜证明 + 分布式约束求解 + L2-b 通用 AST 模型检测/锁序格/Trace Refinement |
-| [`crates/tenon-codegen`](crates/tenon-codegen) | Cranelift 原生 JIT（含 `Record`/`Enum`/`Text`/`List`/`inout`/`mutate`、自动派生 `Record.parse`、Perceus RC/COW 零泄漏运行时）+ 直出二进制 WebAssembly (`.wasm`) 客户端 Store 编译器 |
+| [`crates/tenon-syntax`](crates/tenon-syntax) | `loom/Go` 风格词法/语法分析器与 AST（精化、`mutate`、`async`/`await`、`evolution`、`lock_lattice`、`protocol state_machine`、`stream`、`reactive view`、`subscriber`） |
+| [`crates/tenon-verify`](crates/tenon-verify) | `IncrementalDb` 增量查询缓存 + L0 极速求解 + L1 Z3 SMT（含 `mutate` 符号后态、`async` 效应纪律、`@no_heap_alloc`、别名继承）+ 版本演化/透镜证明 + 分布式约束求解 + L2-b 通用 AST 模型检测/锁序格/Trace Refinement |
+| [`crates/tenon-codegen`](crates/tenon-codegen) | Cranelift Dev JIT + **LLVM 22 AOT Release 后端（`tenon build -O3`）** + Perceus RC/COW 零泄漏运行时 + 无栈 `async` 协程状态机 + 直出二进制 WebAssembly (`.wasm`) 客户端编译器 |
 | [`crates/tenon-dist`](crates/tenon-dist) | SQLite WAL 分片权威存储 + 硬 `exec_epoch` Fencing + Turn DAG + 独立 Worker RPC + Fabric Sandbox 子进程隔离 + Journal GC `410 reset_required` + OpenAI SSE 流式 LLM 客户端 + 节流/拆包/死流消除 Webhook 渠道适配器 + 多路复用 HTTP/SSE/Wasm 网关 |
-| [`crates/tenon-cli`](crates/tenon-cli) | `tenon` 统一 CLI（`check` / `run` / `test` / `evolve` / `modelcheck` / `serve` / `authority` / `worker` / `cluster-demo` / `build-wasm`） |
+| [`crates/tenon-cli`](crates/tenon-cli) | `tenon` 统一 CLI（`check` / `run` / `test` / `build` / `build-wasm` / `evolve` / `modelcheck` / `serve` / `authority` / `worker` / `cluster-demo`） |
 
 ---
 

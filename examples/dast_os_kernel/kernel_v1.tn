@@ -1,0 +1,28 @@
+// dast-os-kernel v1 Deployed Schema Basis (for Tenon System-Level Evolution Proof)
+// v1 allowed zero-cost/unlimited AttemptBudget (`amount >= 0`).
+
+pub type Epoch    = Int64 where self >= 0
+pub type BranchId = Int64 where self >= 1
+
+@evolve("dast.AttemptBudget")
+@supports_cap("reconcile", "fenced_epoch_v1")
+@supports_cap("reconcile", "branch_turn_dag")
+pub record AttemptBudget {
+    @field(1) amount Int64 where self >= 0
+}
+
+@evolve("dast.AgentSession")
+@partition(key = session_id, writer = SingleFenced)
+@reconciled(fencing = exec_epoch)
+pub record AgentSession {
+    @field(1) session_id Text
+
+    @axis(Intent) {
+        @field(2) active_branch BranchId
+        @field(3) conv_gen      BranchId
+    }
+
+    @axis(Execution) {
+        @field(4) exec_epoch    Epoch
+    }
+}
