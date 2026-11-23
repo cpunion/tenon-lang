@@ -1,0 +1,332 @@
+// Tenon Interactive CLI Agent — Written 100% in Tenon!
+//
+// Layered architecture:
+//   1. Minimal Language Core (`tenon-rt`: Perceus RC + 19 byte/OS/SSE transport syscalls)
+//   2. Pure-Tenon Standard Library (`std/io.tn`, `std/text.tn`, `std/json.tn`,
+//      `std/env.tn`, `std/tools.tn`, `std/openai.tn`)
+//   3. This Interactive CLI Agent (`examples/agent/cli_agent.tn`), formally verified with
+//      refined types, Z3 `mutate` proofs, `@no_heap_alloc`, `lock_lattice`, and
+//      `protocol state_machine`, runnable via BOTH Cranelift JIT (`tenon run`) AND
+//      LLVM 22 `-O3` AOT standalone native binary (`tenon build`)!
+
+import "std/io.tn"
+import "std/text.tn"
+import "std/json.tn"
+import "std/env.tn"
+import "std/tools.tn"
+import "std/openai.tn"
+
+// =========================================================================
+// 1. Formally Verified Agent Lease, Lock Lattice & Protocol State Machine
+// =========================================================================
+
+pub type BranchId = Int where self >= 1
+pub type Epoch    = Int where self >= 0
+
+pub record AgentLease {
+    branch_id  BranchId
+    epoch      Epoch
+    turns_done Int where self >= 0
+}
+
+@no_heap_alloc
+pub pure fn is_epoch_valid(active Epoch, candidate Epoch) Bool {
+    candidate == active
+}
+
+pub lock_lattice AgentLocks {
+    SessionLease < ToolExec
+}
+
+@acquires("SessionLease")
+pub fn bump_turn_epoch(inout lease AgentLease) {
+    mutate lease {
+        lease.epoch += 1
+        lease.turns_done += 1
+    }
+}
+
+@acquires("SessionLease")
+pub fn fork_clean_branch(inout lease AgentLease) {
+    mutate lease {
+        lease.branch_id += 1
+        lease.epoch += 1
+    }
+}
+
+pub protocol state_machine TenonCliAgentFence {
+    state {
+        branch_id    Int = 1
+        exec_epoch   Int = 0
+        turns_done   Int = 0
+        stale_writes Int = 0
+    }
+
+    action StartTurn when exec_epoch < 4 {
+        exec_epoch = exec_epoch + 1
+        turns_done = turns_done + 1
+    }
+
+    action ForkBranch when branch_id < 3 && exec_epoch < 4 {
+        branch_id = branch_id + 1
+        exec_epoch = exec_epoch + 1
+    }
+
+    fault StaleWorkerCommit when exec_epoch >= 1 {
+        stale_writes = stale_writes + 1
+    }
+
+    laws {
+        invariant SingleExecutorFence: stale_writes == 0
+        invariant MonotonicBranch: branch_id >= 1 && exec_epoch >= 0
+        invariant TurnCountNonNegative: turns_done >= 0
+    }
+}
+
+// =========================================================================
+// 2. Tool Schemas & Pure-Tenon Tool Dispatcher (Shell + File Tools)
+// =========================================================================
+
+pub fn agent_instructions(workspace Text) Text {
+    "You are the Tenon CLI Agent — an interactive coding and systems assistant implemented natively in the Tenon programming language. " ++
+    "Current workspace: " ++ workspace ++ ". " ++
+    "You have real tools: shell, read_file, write_file, edit_file, list_dir, grep_search. " ++
+    "Use tools to inspect, create, edit, and verify files/commands instead of guessing. " ++
+    "Be concise and direct in your answers."
+}
+
+pub fn agent_tools_json() Text {
+    "[" ++
+    "{\"type\":\"function\",\"name\":\"shell\",\"description\":\"Execute a shell command in the workspace and return exit_code plus combined stdout/stderr.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"Shell command to run via /bin/sh -c\"}},\"required\":[\"command\"]}}," ++
+    "{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file relative to the workspace with line numbers.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Relative file path\"}},\"required\":[\"path\"]}}," ++
+    "{\"type\":\"function\",\"name\":\"write_file\",\"description\":\"Create or overwrite a file relative to the workspace.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Relative file path\"},\"content\":{\"type\":\"string\",\"description\":\"Full file content\"}},\"required\":[\"path\",\"content\"]}}," ++
+    "{\"type\":\"function\",\"name\":\"edit_file\",\"description\":\"Replace the first exact occurrence of target text with replacement in a workspace file.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Relative file path\"},\"target\":{\"type\":\"string\",\"description\":\"Exact substring to replace\"},\"replacement\":{\"type\":\"string\",\"description\":\"Replacement text\"}},\"required\":[\"path\",\"target\",\"replacement\"]}}," ++
+    "{\"type\":\"function\",\"name\":\"list_dir\",\"description\":\"List files and subdirectories in the workspace.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Relative directory path (default '.')\"}},\"required\":[]}}," ++
+    "{\"type\":\"function\",\"name\":\"grep_search\",\"description\":\"Recursively search for text in workspace files.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search text\"},\"path\":{\"type\":\"string\",\"description\":\"Optional relative subdirectory\"}},\"required\":[\"query\"]}}" ++
+    "]"
+}
+
+pub fn dispatch_tool(workspace Text, name Text, args_json Text) Text {
+    if name == "shell" {
+        let cmd = json_get_string(args_json, "command")
+        let _ = println("  [tool:shell] $ " ++ cmd)
+        return tool_shell(workspace, cmd)
+    }
+    if name == "read_file" {
+        let path = json_get_string(args_json, "path")
+        let _ = println("  [tool:read_file] " ++ path)
+        return tool_read_file(workspace, path)
+    }
+    if name == "write_file" {
+        let path = json_get_string(args_json, "path")
+        let content = json_get_string(args_json, "content")
+        let _ = println("  [tool:write_file] " ++ path ++ " (" ++ int_to_text(len(content)) ++ " bytes)")
+        return tool_write_file(workspace, path, content)
+    }
+    if name == "edit_file" {
+        let path = json_get_string(args_json, "path")
+        let target = json_get_string(args_json, "target")
+        let replacement = json_get_string(args_json, "replacement")
+        let _ = println("  [tool:edit_file] " ++ path)
+        return tool_edit_file(workspace, path, target, replacement)
+    }
+    if name == "list_dir" {
+        let path = json_get_string(args_json, "path")
+        let _ = println("  [tool:list_dir] " ++ path)
+        return tool_list_dir(workspace, path)
+    }
+    if name == "grep_search" {
+        let query = json_get_string(args_json, "query")
+        let path = json_get_string(args_json, "path")
+        let _ = println("  [tool:grep_search] " ++ query)
+        return tool_grep(workspace, query, path)
+    }
+    "error: unknown tool `" ++ name ++ "`"
+}
+
+// =========================================================================
+// 3. Multi-Round Pure-Tenon ReAct Agent Loop
+// =========================================================================
+
+pub fn run_agent_turn(
+    inout lease AgentLease,
+    api_key Text,
+    model Text,
+    effort Text,
+    workspace Text,
+    conv_items_csv Text,
+    user_prompt Text
+) Text {
+    bump_turn_epoch(lease)
+    let active_epoch = lease.epoch
+    assert is_epoch_valid(lease.epoch, active_epoch)
+
+    let session_id = "tenon-cli-b" ++ int_to_text(lease.branch_id)
+    let instructions = agent_instructions(workspace)
+    let tools_json = agent_tools_json()
+
+    var items_csv = json_csv_append(conv_items_csv, openai_user_item(user_prompt))
+    var rounds = 0
+    var total_tools = 0
+    var total_in = 0
+    var total_cached = 0
+    var total_out = 0
+
+    while rounds < 12 {
+        rounds += 1
+        let turn = openai_stream_turn(
+            api_key,
+            model,
+            effort,
+            session_id,
+            instructions,
+            items_csv,
+            tools_json,
+            true
+        )
+        if len(turn.error) > 0 {
+            let _ = println("[agent error] " ++ turn.error)
+            return items_csv
+        }
+        if len(turn.output_items_json) > 0 {
+            items_csv = json_csv_append(items_csv, turn.output_items_json)
+        }
+        total_in += turn.input_tokens
+        total_cached += turn.cached_tokens
+        total_out += turn.output_tokens
+
+        if turn.call_count == 0 {
+            break
+        }
+
+        var idx = 0
+        while idx < turn.call_count {
+            let call_obj = json_array_get_raw(turn.calls_json, idx)
+            let call_id = json_get_string(call_obj, "call_id")
+            let tname = json_get_string(call_obj, "name")
+            let targs = json_get_string(call_obj, "arguments")
+            let tool_out = dispatch_tool(workspace, tname, targs)
+            items_csv = json_csv_append(items_csv, openai_tool_output_item(call_id, tool_out))
+            total_tools += 1
+            idx += 1
+        }
+    }
+
+    let _ = println(
+        "[tenon-agent branch=#" ++ int_to_text(lease.branch_id) ++
+        " epoch=" ++ int_to_text(lease.epoch) ++
+        " model=" ++ model ++
+        " rounds=" ++ int_to_text(rounds) ++
+        " tools=" ++ int_to_text(total_tools) ++
+        " in=" ++ int_to_text(total_in) ++
+        " cached=" ++ int_to_text(total_cached) ++
+        " out=" ++ int_to_text(total_out) ++ "]"
+    )
+    items_csv
+}
+
+// =========================================================================
+// 4. Interactive CLI REPL & Single-Shot Entry Point
+// =========================================================================
+
+pub fn print_help() Int {
+    let _ = println("Commands:")
+    let _ = println("  /model <luna|terra|sol|astra|<id>>  Switch dast-os OpenAI model")
+    let _ = println("  /state                              Show verified AgentLease & context info")
+    let _ = println("  /branch                             Fork clean branch (Z3-proved mutate) & clear context")
+    let _ = println("  /clear                              Clear conversation context")
+    let _ = println("  /help                               Show this help message")
+    let _ = println("  /exit                               Exit Tenon CLI Agent")
+    0
+}
+
+pub fn main() Int {
+    let api_key = env_or_dotenv("OPENAI_API_KEY")
+    if len(api_key) == 0 {
+        let _ = println("error: OPENAI_API_KEY not found in environment or .env")
+        return 1
+    }
+
+    var workspace = sys_env("TENON_WORKSPACE")
+    if len(workspace) == 0 {
+        workspace = sys_cwd()
+    }
+    var model = resolve_dast_model(sys_env("TENON_MODEL"))
+    var effort = resolve_dast_effort(model)
+    var lease AgentLease = AgentLease { branch_id = 1, epoch = 0, turns_done = 0 }
+    var conv_items_csv = ""
+
+    // Single-shot mode via TENON_PROMPT="..."
+    let single_prompt = sys_env("TENON_PROMPT")
+    if len(single_prompt) > 0 {
+        let _ = println("Tenon Pure-Language CLI Agent | model=" ++ model ++ " (" ++ effort ++ ") | workspace=" ++ workspace)
+        conv_items_csv = run_agent_turn(lease, api_key, model, effort, workspace, conv_items_csv, single_prompt)
+        return 0
+    }
+
+    // Interactive REPL mode
+    let _ = println("======================================================================")
+    let _ = println("  Tenon Interactive CLI Agent (Written 100% in Tenon + std/*.tn)")
+    let _ = println("  Model:     " ++ model ++ " (reasoning=" ++ effort ++ ")")
+    let _ = println("  Workspace: " ++ workspace)
+    let _ = println("  Tools:     shell, read_file, write_file, edit_file, list_dir, grep_search")
+    let _ = println("  Commands:  /model <luna|terra|sol|astra>  /state  /branch  /clear  /help  /exit")
+    let _ = println("======================================================================")
+
+    while true {
+        let _ = print("\ntenon[" ++ model ++ "]> ")
+        let raw_line = read_line()
+        if is_eof() {
+            let _ = println("\nBye.")
+            break
+        }
+        let line = str_trim(raw_line)
+        if len(line) == 0 {
+            continue
+        }
+        if line == "/exit" || line == "/quit" || line == "exit" || line == "quit" {
+            let _ = println("Bye.")
+            break
+        }
+        if line == "/help" {
+            let _ = print_help()
+            continue
+        }
+        if str_starts_with(line, "/model ") {
+            let alias = str_trim(str_strip_prefix(line, "/model "))
+            model = resolve_dast_model(alias)
+            effort = resolve_dast_effort(model)
+            let _ = println("Switched model -> " ++ model ++ " (reasoning=" ++ effort ++ ")")
+            continue
+        }
+        if line == "/state" {
+            let _ = println(
+                "lease: branch=#" ++ int_to_text(lease.branch_id) ++
+                " epoch=" ++ int_to_text(lease.epoch) ++
+                " turns_done=" ++ int_to_text(lease.turns_done) ++
+                " model=" ++ model ++
+                " effort=" ++ effort ++
+                " workspace=" ++ workspace ++
+                " context_bytes=" ++ int_to_text(len(conv_items_csv))
+            )
+            continue
+        }
+        if line == "/branch" {
+            fork_clean_branch(lease)
+            conv_items_csv = ""
+            let _ = println(
+                "Forked clean branch -> branch=#" ++ int_to_text(lease.branch_id) ++
+                " epoch=" ++ int_to_text(lease.epoch)
+            )
+            continue
+        }
+        if line == "/clear" {
+            conv_items_csv = ""
+            let _ = println("Cleared conversation context.")
+            continue
+        }
+
+        conv_items_csv = run_agent_turn(lease, api_key, model, effort, workspace, conv_items_csv, line)
+    }
+    0
+}

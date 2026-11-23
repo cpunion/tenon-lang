@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tenon_syntax::*;
+
+static AOT_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct BuildArtifact {
@@ -350,12 +353,9 @@ pub fn compile_to_native_binary(
 ) -> Result<BuildArtifact, String> {
     let ir = emit_llvm_ir(program)?;
     let pid = std::process::id();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_ll = std::env::temp_dir().join(format!("tenon_aot_{}_{}.ll", pid, nonce));
-    let tmp_rt = std::env::temp_dir().join(format!("tenon_rt_{}_{}.c", pid, nonce));
+    let seq = AOT_TMP_SEQ.fetch_add(1, Ordering::SeqCst);
+    let tmp_ll = std::env::temp_dir().join(format!("tenon_aot_{}_{}.ll", pid, seq));
+    let tmp_rt = std::env::temp_dir().join(format!("tenon_rt_{}_{}.c", pid, seq));
 
     fs::write(&tmp_ll, &ir).map_err(|e| e.to_string())?;
     let needs_full_rt = ir_uses_tenon_rt_syscalls(&ir);

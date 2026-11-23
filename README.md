@@ -1,7 +1,7 @@
 # Tenon 语言设计与技术方案（已拍板定稿）
 
 > **Working Codename**: `Tenon`（榫卯）—— 寓意**强约束精化类型、分层形式化验证、无别名污染的内存模型、系统级版本演化与可验证分布式协议**严丝合缝。  
-> **状态**: 核心架构 13 项决策已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md)），**M0–M7 全栈原型已彻底贯通**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 原生后端** + Perceus RC/COW + 无栈 `async` 状态机 + `@no_heap_alloc` + 通用 `.tn` AST 协议检测 + 真多进程 Authority/Worker/Fabric Sandbox + `.tn` 直编二进制 `.wasm` 客户端 + OpenAI SSE LLM & Webhook 渠道 + **`dast-os-kernel` 全栈 Tenon 重写原型**）。  
+> **状态**: 核心架构 13 项决策已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md)），**极简语言核心 → 纯 Tenon 标准库（`std/*.tn`）→ 纯 Tenon 编写的真实交互式 CLI Agent（`examples/agent/cli_agent.tn`）三层闭环已彻底贯通**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 独立原生二进制** + Perceus RC/COW/`rc_mask` 零泄漏 + 无栈 `async` 状态机 + `@no_heap_alloc` + 通用 `.tn` AST 协议检测 + 真多进程 Authority/Worker/Fabric Sandbox + `.tn` 直编二进制 `.wasm` 客户端 + `dast-os` OpenAI Responses API 实跑验证）。  
 > **上游沉淀**: 综合 [`loom-lang`](../loom-lang)（984 PR 自举实践）、[`lang-research`](../lang-research)（2026-11 多语言可复现实验）与 [`dast-os-kernel`](../../dast.ai/dast-os-kernel/README.md)（227 轮分布式调和内核审计），并结合 2025–2026 全球最新编程语言与形式化验证进展形成的全新通用编程语言设计。
 
 ---
@@ -11,7 +11,7 @@
 前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）、`z3`、LLVM `clang`（已验证 LLVM 22.1.8；可选 `node` 验证编译出的 `.wasm`）。
 
 ```bash
-# 1. 全工作区 18 项自动化测试（含 Perceus 零泄漏、无栈 async、LLVM 22 AOT、V8 Wasm、OpenAI SSE + Webhook、Fabric Sandbox + 410 Reset）
+# 1. 全工作区 22 项自动化测试（含 import 模块系统、Perceus/rc_mask 零泄漏、无栈 async、LLVM 22 AOT + tenon-rt 链接、V8 Wasm、OpenAI SSE + Webhook、Fabric Sandbox + 410 Reset）
 cargo test --workspace
 
 # 2. 精化类型别名复用（Year/Month/Odd/Even/Amount）+ 跨字段 Date + Cranelift 原生执行
@@ -38,25 +38,36 @@ cargo run --bin tenon -- build        examples/dast_os_kernel/kernel_v2.tn -o ta
 cargo run --bin tenon -- build-wasm   examples/dast_os_kernel/kernel_v2.tn -o target/dast_kernel_client.wasm
 cargo run --bin tenon -- cluster-demo examples/dast_os_kernel/kernel_v2.tn
 
-# 6. 启动真实交互式 CLI Agent（直连 dast-os OpenAI Responses API：`gpt-6-luna` / `gpt-6.1-sol` / `gpt-6.1-terra` / `gpt-6-astra` + 真实 shell/文件工具 + SQLite Fencing Turn DAG）
-cargo run --bin tenon -- agent --model gpt-6-luna
-# 或切换到编码模型 gpt-6.1-sol / 单轮命令模式：
-cargo run --bin tenon -- agent --model sol -p "列出当前仓库顶层目录并用 shell 查看 git 最近 3 条提交"
+# 6. 纯 Tenon 标准库自测（std/io, std/text, std/json, std/env, std/tools, std/openai 全部由 .tn 编写，底层仅 19 个字节/OS/SSE 系统调用）
+cargo run --bin tenon -- check examples/stdlib_test.tn
+cargo run --bin tenon -- run   examples/stdlib_test.tn
+cargo run --bin tenon -- build examples/stdlib_test.tn -o target/stdlib_test_bin --opt O3 && ./target/stdlib_test_bin
 
-# 7. 启动交互式 Web UI（自动加载 /tenon_client_store.wasm；可选环境变量对接真实 OpenAI 兼容 LLM 与 Webhook 渠道）
+# 7. 纯 Tenon 编写的真实交互式 CLI Agent（examples/agent/cli_agent.tn，直连 dast-os OpenAI Responses API：gpt-6-luna / gpt-6.1-sol / gpt-6.1-terra / gpt-6-astra + shell/文件工具 + Z3 AgentLease + Protocol 模型检测）
+cargo run --bin tenon -- check      examples/agent/cli_agent.tn
+cargo run --bin tenon -- modelcheck examples/agent/cli_agent.tn
+# 方式 A：Cranelift JIT 直接运行（支持交互 REPL 或 TENON_PROMPT 单轮执行；自动统计 Perceus live_objects=0）
+TENON_MODEL=luna cargo run --bin tenon -- run examples/agent/cli_agent.tn
+# 方式 B：LLVM 22 -O3 AOT 编译为独立原生可执行文件并运行！
+cargo run --bin tenon -- build examples/agent/cli_agent.tn -o target/tenon_agent --opt O3
+TENON_MODEL=luna ./target/tenon_agent
+
+# 8. 启动交互式 Web UI（自动加载 /tenon_client_store.wasm；可选环境变量对接真实 OpenAI 兼容 LLM 与 Webhook 渠道）
 # TENON_LLM_BASE_URL=http://127.0.0.1:11434 TENON_LLM_MODEL=qwen2.5 TENON_CHANNEL_WEBHOOK_URL=http://127.0.0.1:9000 \
 cargo run --bin tenon -- serve examples/dast_os_kernel/kernel_v2.tn --addr 127.0.0.1:8787
 ```
 
-### Workspace 结构
+### 三层分层架构（极简核心 → 纯 Tenon 标准库 → 纯 Tenon 应用）
 
-| Crate | 职责 |
+| 层级 / 模块 | 职责 |
 | --- | --- |
-| [`crates/tenon-syntax`](crates/tenon-syntax) | `loom/Go` 风格词法/语法分析器与 AST（精化、`mutate`、`async`/`await`、`evolution`、`lock_lattice`、`protocol state_machine`、`stream`、`reactive view`、`subscriber`） |
-| [`crates/tenon-verify`](crates/tenon-verify) | `IncrementalDb` 增量查询缓存 + L0 极速求解 + L1 Z3 SMT（含 `mutate` 符号后态、`async` 效应纪律、`@no_heap_alloc`、别名继承）+ 版本演化/透镜证明 + 分布式约束求解 + L2-b 通用 AST 模型检测/锁序格/Trace Refinement |
-| [`crates/tenon-codegen`](crates/tenon-codegen) | Cranelift Dev JIT + **LLVM 22 AOT Release 后端（`tenon build -O3`）** + Perceus RC/COW 零泄漏运行时 + 无栈 `async` 协程状态机 + 直出二进制 WebAssembly (`.wasm`) 客户端编译器 |
-| [`crates/tenon-dist`](crates/tenon-dist) | SQLite WAL 分片权威存储 + 硬 `exec_epoch` Fencing + Turn DAG + 独立 Worker RPC + Fabric Sandbox 子进程隔离 + Journal GC `410 reset_required` + OpenAI SSE 流式 LLM 客户端 + 节流/拆包/死流消除 Webhook 渠道适配器 + 多路复用 HTTP/SSE/Wasm 网关 |
-| [`crates/tenon-cli`](crates/tenon-cli) | `tenon` 统一 CLI（`check` / `run` / `test` / `build` / `build-wasm` / `evolve` / `modelcheck` / `serve` / `authority` / `worker` / `cluster-demo`） |
+| [`crates/tenon-syntax`](crates/tenon-syntax) | `loom/Go` 风格词法/语法分析器、`import "..."` 拓扑模块解析、UTF-8 字面量、`break`/`continue`、精化/`mutate`/`async`/`evolution`/`lock_lattice`/`protocol state_machine`/`stream`/`view`/`subscriber` |
+| [`crates/tenon-rt`](crates/tenon-rt) | 极简语言核心运行时（`rlib` + `staticlib`）：Perceus RC/COW/`rc_mask` + 无栈协程调度 + **仅 19 个最小字节/OS/原始 HTTPS-SSE 行流系统调用**（零 JSON、零 `.env`、零 OpenAI 协议逻辑） |
+| [`crates/tenon-verify`](crates/tenon-verify) | `IncrementalDb` 增量缓存 + L0 极速求解 + L1 Z3 SMT（`mutate` 符号后态、`async` 效应纪律、`@no_heap_alloc`、别名继承）+ 版本演化/透镜证明 + 分布式约束求解 + L2-b 通用 AST 模型检测/锁序格/Trace Refinement |
+| [`crates/tenon-codegen`](crates/tenon-codegen) | Cranelift Dev JIT + **LLVM 22 AOT Release 后端（`tenon build -O3`，自动链接 `libtenon_rt.a` 生成独立原生二进制）** + 块级 RAII 与临时对象精确回收 + 直出二进制 WebAssembly (`.wasm`) 客户端编译器 |
+| [`std/*.tn`](std) | **100% 纯 Tenon 编写的标准库**：`std/io.tn`、`std/text.tn`（trim/index_of/replace/int_to_text）、`std/json.tn`（深度感知结构化 JSON 解析器与转义器）、`std/env.tn`（安全 `.env` 解析）、`std/tools.tn`（工作区隔离的文件读写编辑/目录/grep/shell）、`std/openai.tn`（OpenAI Responses API SSE 流式客户端与 `dast-os` 模型路由） |
+| [`examples/agent/cli_agent.tn`](examples/agent/cli_agent.tn) | **100% 纯 Tenon 编写的交互式 CLI Agent**：基于 `std/*.tn` + Z3 证明的 `AgentLease` + `@no_heap_alloc` + `lock_lattice` + `protocol state_machine`，支持多轮 ReAct 工具调用、流式输出与 `/model`/`/state`/`/branch`/`/clear`/`/help`/`/exit` 交互命令 |
+| [`crates/tenon-dist`](crates/tenon-dist) & [`crates/tenon-cli`](crates/tenon-cli) | SQLite WAL 分布式权威内核、真多进程 Authority/Worker/Fabric Sandbox、`tenon` 统一 CLI |
 
 ---
 
