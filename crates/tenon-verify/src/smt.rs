@@ -361,7 +361,11 @@ pub fn encode_expr(expr: &Expr, subst: &BTreeMap<String, String>) -> Result<Stri
         ExprKind::Bool(b) => Ok(if *b { "true".into() } else { "false".into() }),
         ExprKind::Ident(s) => {
             if let Some(rep) = subst.get(s) {
-                Ok(rep.clone())
+                if rep.starts_with('(') {
+                    Ok(rep.clone())
+                } else {
+                    Ok(smt_ident(rep))
+                }
             } else {
                 Ok(smt_ident(s))
             }

@@ -215,6 +215,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    tenon_codegen::perceus::reset_stats();
     let jit = match JitProgram::compile(&prog) {
         Ok(j) => j,
         Err(e) => {
@@ -223,13 +224,21 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
     println!(
-        "Verified ({} proofs) & JIT-compiled {} function(s) via Cranelift -> executing main()...",
+        "Verified ({} proofs) & JIT-compiled {} function(s) (derived parsers: {:?}) -> executing main()...",
         report.proofs.len(),
-        jit.compiled_fns.len()
+        jit.compiled_fns.len(),
+        jit.derived_parsers
     );
     match jit.call_0("main") {
         Ok(val) => {
+            let st = tenon_codegen::perceus::snapshot_stats();
             println!("main() => {}", val);
+            if st.total_allocs > 0 {
+                println!(
+                    "Perceus RC stats: allocs={}, unique_reuse_hits={}, cow_clones={}, live_objects={}",
+                    st.total_allocs, st.reuse_hits, st.cow_clones, st.live_objects
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

@@ -372,12 +372,13 @@ impl CheckerCtx {
                     );
                     *active_mutate = prev;
 
-                    // Verify record invariants hold upon exiting `mutate target { ... }`!
+                    // Verify record invariants hold upon exiting `mutate target { ... }` using symbolic post-state!
                     if let Some(rec_name) = var_types.get(target).cloned() {
                         if let Some(rec) = self.records.get(&rec_name).cloned() {
                             self.verify_record_invariants_after_mutate(
                                 target,
                                 &rec,
+                                body,
                                 env,
                                 smt_int_vars,
                                 smt_premises,
@@ -402,26 +403,49 @@ impl CheckerCtx {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn verify_record_invariants_after_mutate(
         &mut self,
         var: &str,
         rec: &RecordDecl,
+        body: &Block,
         env: &L0Env,
         smt_int_vars: &BTreeSet<String>,
         smt_premises: &[(Expr, BTreeMap<String, String>)],
         span: Span,
     ) {
+        // Build symbolic SSA post-state map for every field of `var` across assignments & `if` branches in `body`
+        let mut sym_fields: BTreeMap<String, String> = BTreeMap::new();
+        for f in &rec.fields {
+            sym_fields.insert(
+                f.name.clone(),
+                crate::smt::smt_ident(&format!("{}.{}", var, f.name)),
+            );
+        }
+        let mut mutated_any = false;
+        apply_mutate_block_symbolic(var, body, &mut sym_fields, &mut mutated_any);
+
         let mut subst = BTreeMap::new();
         subst.insert("self".into(), var.to_string());
         for f in &rec.fields {
-            subst.insert(f.name.clone(), format!("{}.{}", var, f.name));
+            let post_expr = sym_fields
+                .get(&f.name)
+                .cloned()
+                .unwrap_or_else(|| crate::smt::smt_ident(&format!("{}.{}", var, f.name)));
+            subst.insert(f.name.clone(), post_expr.clone());
+            subst.insert(format!("{}.{}", var, f.name), post_expr);
         }
 
         for f in &rec.fields {
             if let Some(pred) = &f.predicate {
                 let fkey = format!("{}.{}", var, f.name);
                 let rewritten = substitute_field_idents(pred, &rec.fields, var);
-                match env.check_predicate(&rewritten, Some(&fkey)) {
+                let l0_res = if mutated_any {
+                    L0Result::Unknown // Escalate symbolic post-state directly to L1 Z3 for exact relational proof
+                } else {
+                    env.check_predicate(&rewritten, Some(&fkey))
+                };
+                match l0_res {
                     L0Result::Proved => {
                         self.proofs.push(ProofRecord {
                             obligation: format!("mutate({}) invariant `{}.{}`", var, rec.name, f.name),
@@ -450,7 +474,13 @@ impl CheckerCtx {
                             let _ = q.add_premise_expr(p, s);
                         }
                         let mut fs = subst.clone();
-                        fs.insert("self".into(), fkey);
+                        fs.insert(
+                            "self".into(),
+                            sym_fields
+                                .get(&f.name)
+                                .cloned()
+                                .unwrap_or_else(|| crate::smt::smt_ident(&fkey)),
+                        );
                         if q.set_goal_expr(pred, &fs).is_ok() {
                             match q.solve() {
                                 SmtOutcome::Proved => {
@@ -489,6 +519,52 @@ impl CheckerCtx {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Also verify record-level `where` cross-field invariants on exit from `mutate`!
+        for wc in &rec.where_clauses {
+            let mut q = SmtQuery::new(self.pure_fns.clone());
+            for v in smt_int_vars {
+                q.declare_int(v.clone());
+            }
+            for (p, s) in smt_premises {
+                let _ = q.add_premise_expr(p, s);
+            }
+            if q.set_goal_expr(wc, &subst).is_ok() {
+                match q.solve() {
+                    SmtOutcome::Proved => {
+                        self.proofs.push(ProofRecord {
+                            obligation: format!("mutate({}) record invariant `{}`", var, rec.name),
+                            tier: ProofTier::L1Smt,
+                            span,
+                        });
+                    }
+                    SmtOutcome::Counterexample(ce) => {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0421".into(),
+                            message: format!(
+                                "mutate `{}` may violate record invariant on `{}`",
+                                var, rec.name
+                            ),
+                            span,
+                            notes: vec!["counterexample found by L1 SMT (Z3)".into()],
+                            counterexample: ce,
+                        });
+                    }
+                    SmtOutcome::Unknown(msg) => {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0422".into(),
+                            message: format!(
+                                "unproved mutate `{}` record invariant on `{}` (Fail-Closed)",
+                                var, rec.name
+                            ),
+                            span,
+                            notes: vec![msg],
+                            counterexample: BTreeMap::new(),
+                        });
                     }
                 }
             }
@@ -1185,5 +1261,95 @@ fn expr_to_sql(expr: &Expr, self_col: Option<&str>) -> Option<String> {
             Some(format!("({} {} {})", l, sym, r))
         }
         _ => None,
+    }
+}
+
+fn apply_mutate_block_symbolic(
+    var: &str,
+    blk: &Block,
+    sym_fields: &mut BTreeMap<String, String>,
+    mutated_any: &mut bool,
+) {
+    for stmt in &blk.stmts {
+        match stmt {
+            Stmt::Assign {
+                target, op, value, ..
+            } => {
+                if let ExprKind::Field { target: obj, field } = &target.kind {
+                    if matches!(&obj.kind, ExprKind::Ident(s) if s == var) {
+                        let mut subst = BTreeMap::new();
+                        for (k, v) in sym_fields.iter() {
+                            subst.insert(format!("{}.{}", var, k), v.clone());
+                            subst.insert(k.clone(), v.clone());
+                        }
+                        if let Ok(rhs) = crate::smt::encode_expr(value, &subst) {
+                            let cur = sym_fields
+                                .get(field)
+                                .cloned()
+                                .unwrap_or_else(|| crate::smt::smt_ident(&format!("{}.{}", var, field)));
+                            let updated = match op {
+                                AssignOp::Set => rhs,
+                                AssignOp::AddSet => format!("(+ {} {})", cur, rhs),
+                                AssignOp::SubSet => format!("(- {} {})", cur, rhs),
+                            };
+                            sym_fields.insert(field.clone(), updated);
+                            *mutated_any = true;
+                        }
+                    }
+                }
+            }
+            Stmt::Expr { expr, .. } => {
+                apply_mutate_expr_symbolic(var, expr, sym_fields, mutated_any);
+            }
+            _ => {}
+        }
+    }
+    if let Some(tail) = &blk.tail {
+        apply_mutate_expr_symbolic(var, tail, sym_fields, mutated_any);
+    }
+}
+
+fn apply_mutate_expr_symbolic(
+    var: &str,
+    expr: &Expr,
+    sym_fields: &mut BTreeMap<String, String>,
+    mutated_any: &mut bool,
+) {
+    match &expr.kind {
+        ExprKind::If {
+            cond,
+            then_block,
+            else_branch,
+        } => {
+            let mut subst = BTreeMap::new();
+            for (k, v) in sym_fields.iter() {
+                subst.insert(format!("{}.{}", var, k), v.clone());
+                subst.insert(k.clone(), v.clone());
+            }
+            let Ok(cond_smt) = crate::smt::encode_expr(cond, &subst) else {
+                return;
+            };
+            let mut then_fields = sym_fields.clone();
+            let mut else_fields = sym_fields.clone();
+            let mut m1 = false;
+            let mut m2 = false;
+            apply_mutate_block_symbolic(var, then_block, &mut then_fields, &mut m1);
+            if let Some(eb) = else_branch {
+                apply_mutate_expr_symbolic(var, eb, &mut else_fields, &mut m2);
+            }
+            if m1 || m2 {
+                *mutated_any = true;
+                let keys: Vec<String> = sym_fields.keys().cloned().collect();
+                for k in keys {
+                    let t = &then_fields[&k];
+                    let e = &else_fields[&k];
+                    if t != e {
+                        sym_fields.insert(k, format!("(ite {} {} {})", cond_smt, t, e));
+                    }
+                }
+            }
+        }
+        ExprKind::Block(b) => apply_mutate_block_symbolic(var, b, sym_fields, mutated_any),
+        _ => {}
     }
 }

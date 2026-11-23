@@ -1,0 +1,28 @@
+// Negative Control: Forgetting the Feb-29 adjustment in `mutate d` MUST be rejected by Z3!
+
+pub pure fn is_leap_year(y Int) Bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+pub pure fn days_in_month(y Int, m Int where 1 <= self && self <= 12) Int {
+    match m {
+        2 => if is_leap_year(y) { 29 } else { 28 }
+        4 | 6 | 9 | 11 => 30
+        _ => 31
+    }
+}
+
+pub record Date {
+    year  Int where 1 <= self && self <= 9999
+    month Int where 1 <= self && self <= 12
+    day   Int where 1 <= self && self <= days_in_month(year, month)
+}
+
+pub fn shift_to_prev_year_buggy(inout d Date)
+    requires d.year > 1
+{
+    mutate d {
+        d.year -= 1
+        // BUG: forgot to clamp 29 -> 28 when moving from a leap year to a non-leap year!
+    }
+}

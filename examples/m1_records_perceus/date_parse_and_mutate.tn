@@ -1,0 +1,74 @@
+// Tenon M1 Demo: Records, Auto-Derived `Date.parse(...)`, `inout`, `mutate`,
+// Perceus Unique In-Place Reuse (FBIP) & MVS Copy-on-Write, Text & Lists!
+
+pub pure fn is_leap_year(y Int) Bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+pub pure fn days_in_month(y Int, m Int where 1 <= self && self <= 12) Int
+    ensures 28 <= result && result <= 31
+{
+    match m {
+        2 => if is_leap_year(y) { 29 } else { 28 }
+        4 | 6 | 9 | 11 => 30
+        _ => 31
+    }
+}
+
+pub record Date {
+    year  Int where 1 <= self && self <= 9999
+    month Int where 1 <= self && self <= 12
+    day   Int where 1 <= self && self <= days_in_month(year, month)
+}
+
+pub fn shift_to_prev_year_safe(inout d Date)
+    requires d.year > 1
+{
+    mutate d {
+        d.year -= 1
+        if d.month == 2 && d.day == 29 && !is_leap_year(d.year) {
+            d.day = 28
+        }
+    }
+}
+
+pub fn main() Int {
+    // 1. Statically verified leap Date -> unique `inout` + `mutate` triggers Perceus in-place reuse!
+    var d Date = Date { year = 2024, month = 2, day = 29 }
+    shift_to_prev_year_safe(d)
+    assert d.year == 2023
+    assert d.month == 2
+    assert d.day == 28
+
+    // 2. MVS Copy-on-Write: sharing `a` into `b` isolates mutations to `b` while `a` stays 2024-02-29!
+    let a Date = Date { year = 2024, month = 2, day = 29 }
+    var b Date = a
+    shift_to_prev_year_safe(b)
+    assert a.year == 2024
+    assert a.day == 29
+    assert b.year == 2023
+    assert b.day == 28
+
+    // 3. Auto-derived boundary parser `Date.parse(...)` (Single Source of Truth!)
+    let ok_day = match Date.parse(2024, 2, 29) {
+        Ok(dt) => dt.day
+        Err(code) => -code
+    }
+    assert ok_day == 29
+
+    let bad_err = match Date.parse(2023, 2, 29) {
+        Ok(dt) => dt.day
+        Err(code) => -code
+    }
+    assert bad_err == -3
+
+    // 4. Managed Lists & Text values
+    let label = "tenon-m1"
+    assert len(label) == 8
+    var xs = [10, 20, 30]
+    xs = push(xs, 40)
+    assert len(xs) == 4
+    assert xs[3] == 40
+
+    ok_day + b.day + xs[3]
+}
