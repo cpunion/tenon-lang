@@ -170,6 +170,7 @@ evolution Order: v1 <-> v2 {
 | [03 — 三层分层形式化验证引擎设计](docs/03-formal-verification-engine.md) | L0 进程内极速抽象域求解器（区间/同余/八边形/有界 CTFE）+ L1 增量 SMT（Z3/CVC5 + 缓存 + 可解释反例）+ L2 Ghost/Lemma/极小证书；MVS 如何让验证器复杂度下降 10×；面向 AI Vericoding 的结构化验证协议。 |
 | [04 — 系统级版本演化与兼容性推导引擎](docs/04-system-evolution-and-compatibility.md) | `@evolve` 双轨身份与 `evolution.lock`；API/Wire/Storage/In-Flight 四维 SMT 兼容性推导矩阵；一等双向演化透镜（Bidirectional Lens）与四大形式化证明定律；在线 Expand-Contract 滚动发布计划推导与 Append-Only 部署账本。 |
 | [05 — 内存模型、并发与编译器实现路线](docs/05-memory-concurrency-and-compiler-architecture.md) | MVS + 原生栈 / Goose 多数据栈 / Perceus 原地复用三层内存引擎；`Store[T] + Handle + phase` 可控长期图；显式效应与结构化并发；Query 增量编译器架构、IR 分层、Cranelift(Dev) + LLVM(Release) 双后端、M0–M4 里程碑与可证伪验收门禁。 |
+| [06 — 调和状态机形式化、分布式同步协议推导与通用微内核演化](docs/06-reconciliation-and-distributed-sync-calculus.md) | 对接 [`dast-os-kernel`](../../dast.ai/dast-os-kernel/README.md) 需求：一等三轴状态/锁序格/防 ABA 令牌/双围栏线性 Attempt；从声明式状态与性能/数据量硬预算推导并验证同步画像；极简参数化通用 `SyncArchetype` 微内核（1 套实现 + N 模块零胶水适配 + 可扩充自演化）；单源双编译消灭代码与 TLA+ 两张皮。 |
 
 ---
 
@@ -183,3 +184,4 @@ evolution Order: v1 <-> v2 {
 4. **内存引擎的首版组合**：在 M1 原型阶段，是先做 **MVS + Perceus RC 复用** 再叠 **Goose 多数据栈**，还是像 `lang-research` 的 `goose-hybrid-gc` 一样保留非移动精准 GC 回退路径？
 5. **演化身份的载体**：在普通文本文件中，持久化/协议类型是否接受显式 `@evolve("...")` + 字段编号 `@field(N)`（类似 Protobuf/Avro 但带精化谓词），而内部函数/重构演化靠自动生成的 `evolution.lock` 跟踪？
 6. **初始编译器实现语言与后端**：采用 **Rust + Salsa（Query 增量）+ Cranelift（Dev）+ LLVM（Release）**，还是 **Zig + 自研/C 后端**？何时启动自举？
+7. **调和与同步原语的内建边界**：三轴实体、锁序格与 `SyncArchetype` 协议推导，是作为语言核心原语一等内建，还是拆分为“极小核心类型/效应/线性令牌原语 + 标准库 `std.reconcile` / `std.sync` + 编译器插件级约束检查”？（*直接决定语言核心简约度与 `dast-os-kernel` 类系统的表达力平衡*）

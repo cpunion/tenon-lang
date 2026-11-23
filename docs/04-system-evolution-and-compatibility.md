@@ -199,3 +199,5 @@ stateDiagram-v2
 1. **不能自动绕过非托管的外部裸 SQL 篡改**：如果 DBA 或第三方非 Tenon 服务直接执行裸 SQL 破坏了表结构、触发器或 UTF-8 编码，边界解码器会在读取时安全拒绝，预检会报告 `LayoutMismatch` / `DataOrLineageMismatch`，而不会伪造兼容证明。
 2. **业务语义等价不等同于类型谓词等价**：把“价格单位从元改成美分”（类型都是 `Int64 where self > 0`）若不通过 `distinct type CnyYuan` / `UsdCents` 或显式语义版本区隔，SMT 无法读心发现单位语义改变。因此 Tenon 鼓励**用强名义精化类型建模所有业务量纲**，让这类变更显式暴露在类型签名中。
 3. **跨分布式节点的物理时钟/网络分区仍属运维契约**：编译器可以静态验证协议与状态机兼容，以及强制在 `Contract` 阶段检查旧 Writer 租约已过期，但底层集群的租约隔离（Fencing Token）依赖运行环境正确执行。
+
+> **延伸阅读**：关于如何把本章的静态精化兼容推导与 `dast-os-kernel` 的**少版本化按职责能力子集模型（`required(record, op) ⊆ supported(consumer, op)`）**以及通用分布式同步协议的自演化结合，详见 [06 — 调和状态机形式化、分布式同步协议推导与通用微内核演化](06-reconciliation-and-distributed-sync-calculus.md#5-通用协议与模块的双层自演化融合-dast-os-kerneldocs10-的少版本化能力模型)。
