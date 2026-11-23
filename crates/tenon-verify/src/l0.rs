@@ -232,6 +232,8 @@ pub struct L0Env {
     pub diffs: BTreeMap<(String, String), i128>,
     /// Pure function declarations available for bounded CTFE and ensures summaries.
     pub pure_fns: BTreeMap<String, FnDecl>,
+    /// Refined type alias predicates available for callee return-type summaries.
+    pub type_aliases: BTreeMap<String, TypeAliasDecl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,12 +272,44 @@ impl L0Env {
             ExprKind::Unary {
                 op: UnOp::Not,
                 expr: inner,
-            } => {
-                if let ExprKind::Ident(name) = &inner.kind {
+            } => match &inner.kind {
+                ExprKind::Ident(name) => {
                     let key = resolve_self(name, self_var);
                     self.bools.insert(key, false);
                 }
-            }
+                ExprKind::Unary {
+                    op: UnOp::Not,
+                    expr: double,
+                } => self.assume_expr(double, self_var),
+                ExprKind::Binary { op, left, right } => match op {
+                    BinOp::Or => {
+                        let nl = Expr {
+                            kind: ExprKind::Unary {
+                                op: UnOp::Not,
+                                expr: left.clone(),
+                            },
+                            span: left.span,
+                        };
+                        let nr = Expr {
+                            kind: ExprKind::Unary {
+                                op: UnOp::Not,
+                                expr: right.clone(),
+                            },
+                            span: right.span,
+                        };
+                        self.assume_expr(&nl, self_var);
+                        self.assume_expr(&nr, self_var);
+                    }
+                    BinOp::Lt => self.assume_cmp(BinOp::Ge, left, right, self_var),
+                    BinOp::Le => self.assume_cmp(BinOp::Gt, left, right, self_var),
+                    BinOp::Gt => self.assume_cmp(BinOp::Le, left, right, self_var),
+                    BinOp::Ge => self.assume_cmp(BinOp::Lt, left, right, self_var),
+                    BinOp::Eq => self.assume_cmp(BinOp::Ne, left, right, self_var),
+                    BinOp::Ne => self.assume_cmp(BinOp::Eq, left, right, self_var),
+                    _ => {}
+                },
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -439,6 +473,24 @@ impl L0Env {
                             non_zero: nz,
                         }
                     }
+                    BinOp::Div => {
+                        if r.interval.min == r.interval.max && r.interval.min > 0 {
+                            let d = r.interval.min;
+                            return AbsInt {
+                                interval: Interval {
+                                    min: l.interval.min / d,
+                                    max: l.interval.max / d,
+                                },
+                                cong: if l.interval.min == l.interval.max {
+                                    Congruence::exact(l.interval.min / d)
+                                } else {
+                                    Congruence::TOP
+                                },
+                                non_zero: (l.interval.min / d) > 0 || (l.interval.max / d) < 0,
+                            };
+                        }
+                        AbsInt::top()
+                    }
                     BinOp::Mod => {
                         if r.interval.min == r.interval.max && r.interval.min > 0 {
                             let m = r.interval.min;
@@ -475,6 +527,16 @@ impl L0Env {
             }
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Ident(fname) = &callee.kind {
+                    // Built-in core domain facts: `len(x) >= 0`, `byte_at(s, i) in [-1, 255]`
+                    if fname == "len" && args.len() == 1 {
+                        return AbsInt::top().refine_interval(Interval {
+                            min: 0,
+                            max: i64::MAX as i128,
+                        });
+                    }
+                    if fname == "byte_at" && args.len() == 2 {
+                        return AbsInt::top().refine_interval(Interval { min: -1, max: 255 });
+                    }
                     // 1. Try exact bounded CTFE if all args evaluate to exact constants!
                     let mut const_args = Vec::new();
                     let mut all_const = true;
@@ -493,12 +555,20 @@ impl L0Env {
                             return AbsInt::exact(v);
                         }
                     }
-                    // 2. Otherwise use callee `ensures` summary bounds on `result`!
+                    // 2. Otherwise use callee return-type refinement & `ensures` summary bounds on `result`!
                     if let Some(fdecl) = self.pure_fns.get(fname) {
                         let mut summary_env = L0Env {
                             pure_fns: self.pure_fns.clone(),
+                            type_aliases: self.type_aliases.clone(),
                             ..Default::default()
                         };
+                        if let Some(TypeExpr::Named { name: rty, .. }) = &fdecl.ret_ty {
+                            if let Some(alias) = self.type_aliases.get(rty) {
+                                if let Some(pred) = &alias.predicate {
+                                    summary_env.assume_expr(pred, Some("result"));
+                                }
+                            }
+                        }
                         for ens in &fdecl.ensures {
                             summary_env.assume_expr(ens, Some("result"));
                         }

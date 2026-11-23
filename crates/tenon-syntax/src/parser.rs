@@ -482,6 +482,33 @@ impl Parser {
                     fields.push(self.parse_field(Vec::new())?);
                     self.eat_sep();
                 }
+            } else if self.peek().kind == TokenKind::LParen {
+                // Tuple-payload variant syntax: e.g. `JStr(Text)`, `JArr(List[JsonValue])`
+                self.bump();
+                let mut idx = 0usize;
+                loop {
+                    self.skip_newlines();
+                    if self.peek().kind == TokenKind::RParen {
+                        self.bump();
+                        break;
+                    }
+                    let fstart = self.peek().span;
+                    let ty = self.parse_type_expr()?;
+                    fields.push(FieldDecl {
+                        attrs: Vec::new(),
+                        axis: None,
+                        name: format!("_{}", idx),
+                        ty,
+                        predicate: None,
+                        default: None,
+                        span: fstart,
+                    });
+                    idx += 1;
+                    if !self.eat(&TokenKind::Comma) {
+                        self.expect(TokenKind::RParen)?;
+                        break;
+                    }
+                }
             }
             let predicate = if self.peek_non_nl().kind == TokenKind::Where {
                 self.eat(&TokenKind::Where);

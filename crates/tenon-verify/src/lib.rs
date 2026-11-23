@@ -289,4 +289,94 @@ pub fn bad_alloc(v Int) Point { Point { x = v, y = v } }
         assert!(rep.diagnostics.iter().any(|d| d.code == "E0601"));
         assert!(rep.diagnostics.iter().any(|d| d.code == "E0701"));
     }
+
+    #[test]
+    fn enforces_exhaustiveness_requires_purity_immutability_and_type_checks() {
+        // 1. Positive: exhaustive enum/Option/Result match + diverging-if narrowing + call-site requires + pure fn!
+        let good = parse(r#"
+pub type NonNegative = Int where self >= 0
+
+pub enum JsonVal {
+    JNull
+    JInt(Int)
+    JStr(Text)
+}
+
+@no_heap_alloc
+pub pure fn clamp_non_neg(n Int) NonNegative
+    ensures result >= 0
+{
+    if n < 0 {
+        return 0
+    }
+    n
+}
+
+pub pure fn slice_len(start NonNegative, end NonNegative) NonNegative
+    requires start <= end
+    ensures result >= 0
+{
+    end - start
+}
+
+pub pure fn describe(v JsonVal) Text {
+    match v {
+        JNull => "null"
+        JInt(_) => "int"
+        JStr(s) => s
+    }
+}
+
+pub fn ok_caller(x Int) NonNegative {
+    let a = clamp_non_neg(x)
+    slice_len(a, a + 5)
+}
+"#).unwrap();
+        let good_rep = check_program(&good);
+        assert!(
+            good_rep.ok,
+            "valid contracts + exhaustive match should pass: {:?}",
+            good_rep.diagnostics
+        );
+        assert!(good_rep.proofs.iter().any(|p| p.obligation.contains("exhaustive match on `JsonVal`")));
+        assert!(good_rep.proofs.iter().any(|p| p.obligation.contains("precondition `requires` of `slice_len`")));
+
+        // 2. Negative: missing variant in match (E0301), violated call-site requires (E0440),
+        //    impure syscall in pure fn (E0610), immutable assign (E0203), type mismatch (E0205), undefined fn (E0201)!
+        let bad = parse(r#"
+pub type NonNegative = Int where self >= 0
+pub enum JsonVal { JNull, JInt(Int), JStr(Text) }
+
+pub pure fn slice_len(start NonNegative, end NonNegative) NonNegative
+    requires start <= end
+{
+    end - start
+}
+
+pub pure fn bad_pure() Text {
+    sys_cwd()
+}
+
+pub fn bad_checks(v JsonVal) Int {
+    let x = 10
+    x = 20
+    let _ = slice_len(10, 3)
+    let _ = unknown_fn(1)
+    let _ Int = "not_an_int"
+    match v {
+        JNull => 0
+        JInt(n) => n
+    }
+}
+"#).unwrap();
+        let bad_rep = check_program(&bad);
+        assert!(!bad_rep.ok);
+        let codes: Vec<&str> = bad_rep.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0610"), "expected E0610 purity error, got {:?}", codes);
+        assert!(codes.contains(&"E0203"), "expected E0203 immutability error, got {:?}", codes);
+        assert!(codes.contains(&"E0440"), "expected E0440 requires violation, got {:?}", codes);
+        assert!(codes.contains(&"E0201"), "expected E0201 undefined fn, got {:?}", codes);
+        assert!(codes.contains(&"E0205"), "expected E0205 type mismatch, got {:?}", codes);
+        assert!(codes.contains(&"E0301"), "expected E0301 non-exhaustive match, got {:?}", codes);
+    }
 }

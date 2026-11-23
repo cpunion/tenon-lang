@@ -51,13 +51,60 @@ pub(crate) const CORE_SYSCALLS: &[CoreSyscallSpec] = &[
     CoreSyscallSpec { tenon_name: "sys_http_sse_close", c_symbol: "tenon_sys_http_sse_close", arity: 1, returns_rc: false, returns_text: false },
 ];
 
+pub(crate) fn named_ty(name: &str) -> TypeExpr {
+    TypeExpr::Named {
+        name: name.to_string(),
+        version: None,
+        args: Vec::new(),
+        span: Span::default(),
+    }
+}
+
+pub(crate) fn generic_ty(name: &str, args: Vec<TypeExpr>) -> TypeExpr {
+    TypeExpr::Named {
+        name: name.to_string(),
+        version: None,
+        args,
+        span: Span::default(),
+    }
+}
+
+pub(crate) fn resolve_alias_ty(ty: &TypeExpr, aliases: &BTreeMap<String, TypeExpr>) -> TypeExpr {
+    if let TypeExpr::Named { name, .. } = ty {
+        if let Some(base) = aliases.get(name) {
+            return resolve_alias_ty(base, aliases);
+        }
+    }
+    ty.clone()
+}
+
+pub(crate) fn is_rc_type_expr(
+    ty: &TypeExpr,
+    aliases: &BTreeMap<String, TypeExpr>,
+    record_names: &BTreeSet<String>,
+    enum_names: &BTreeSet<String>,
+) -> bool {
+    let resolved = resolve_alias_ty(ty, aliases);
+    match resolved {
+        TypeExpr::Named { name, .. } => {
+            record_names.contains(&name)
+                || enum_names.contains(&name)
+                || matches!(name.as_str(), "Text" | "List" | "Option" | "Result")
+        }
+        TypeExpr::Tuple(_, _) => false,
+    }
+}
+
+pub(crate) fn is_text_type_expr(ty: &TypeExpr, aliases: &BTreeMap<String, TypeExpr>) -> bool {
+    matches!(resolve_alias_ty(ty, aliases), TypeExpr::Named { name, .. } if name == "Text")
+}
+
 #[derive(Debug, Clone)]
 struct FieldLayout {
     name: String,
+    ty: TypeExpr,
     preds: Vec<Expr>,
     is_rc: bool,
-    is_text: bool,
-    record_ty: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,11 +116,17 @@ struct RecordLayout {
 }
 
 #[derive(Debug, Clone)]
+struct EnumVariantLayout {
+    enum_name: String,
+    payload_tys: Vec<TypeExpr>,
+}
+
+#[derive(Debug, Clone)]
 struct FnMeta {
     params_inout: Vec<bool>,
+    param_tys: Vec<TypeExpr>,
+    ret_ty: Option<TypeExpr>,
     returns_rc: bool,
-    returns_text: bool,
-    ret_record: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -121,7 +174,6 @@ impl JitProgram {
             .map_err(|e| e.to_string())?;
 
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        // Core Perceus / Async runtime symbols
         jit_builder.symbol("tenon_rt_assert_fail", tenon_rt_assert_fail as *const u8);
         jit_builder.symbol("tenon_rt_print_int", tenon_rt_print_int as *const u8);
         jit_builder.symbol("tenon_rc_alloc", tenon_rc_alloc as *const u8);
@@ -141,7 +193,6 @@ impl JitProgram {
         jit_builder.symbol("tenon_async_poll_frame", tenon_async_poll_frame as *const u8);
         jit_builder.symbol("tenon_async_block_on", tenon_async_block_on as *const u8);
 
-        // Minimal 19 Core Byte & OS/Network Syscall Primitives
         jit_builder.symbol("tenon_byte_at", syscalls::tenon_byte_at as *const u8);
         jit_builder.symbol("tenon_str_slice", syscalls::tenon_str_slice as *const u8);
         jit_builder.symbol("tenon_byte_to_text", syscalls::tenon_byte_to_text as *const u8);
@@ -167,17 +218,18 @@ impl JitProgram {
         let rt = declare_runtime_funcs(&mut module)?;
         let print_int_id = declare_sig(&mut module, "tenon_rt_print_int", 1, true)?;
 
-        // Collect refined type alias predicates
+        // Collect type aliases (bases & predicates)
         let mut alias_preds: BTreeMap<String, Expr> = BTreeMap::new();
+        let mut alias_bases: BTreeMap<String, TypeExpr> = BTreeMap::new();
         for item in &program.items {
             if let Item::TypeAlias(ta) = item {
+                alias_bases.insert(ta.name.clone(), ta.base.clone());
                 if let Some(p) = &ta.predicate {
                     alias_preds.insert(ta.name.clone(), p.clone());
                 }
             }
         }
 
-        // First collect all non-generic record names so nested record fields are recognized as RC!
         let record_names: BTreeSet<String> = program
             .items
             .iter()
@@ -186,11 +238,20 @@ impl JitProgram {
                 _ => None,
             })
             .collect();
+        let enum_names: BTreeSet<String> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Enum(e) => Some(e.name.clone()),
+                _ => None,
+            })
+            .collect();
 
-        // Collect Records & Enums
+        // Collect Records & Enums (with full variant payload types!)
         let mut records: BTreeMap<String, RecordLayout> = BTreeMap::new();
         let mut field_to_idx: BTreeMap<String, usize> = BTreeMap::new();
         let mut enum_tags: BTreeMap<String, i64> = BTreeMap::new();
+        let mut enum_variants: BTreeMap<String, EnumVariantLayout> = BTreeMap::new();
         enum_tags.insert("Err".into(), TAG_ERR);
         enum_tags.insert("Ok".into(), TAG_OK);
         enum_tags.insert("None".into(), TAG_NONE);
@@ -212,22 +273,16 @@ impl JitProgram {
                         if let Some(fp) = &f.predicate {
                             preds.push(fp.clone());
                         }
-                        let is_text = tname == "Text";
-                        let is_rc = is_rc_type_name(&tname, &record_names);
+                        let is_rc =
+                            is_rc_type_expr(&f.ty, &alias_bases, &record_names, &enum_names);
                         if is_rc && idx < 64 {
                             rc_mask |= 1u64 << idx;
                         }
-                        let record_ty = if record_names.contains(&tname) {
-                            Some(tname)
-                        } else {
-                            None
-                        };
                         fields.push(FieldLayout {
                             name: f.name.clone(),
+                            ty: f.ty.clone(),
                             preds,
                             is_rc,
-                            is_text,
-                            record_ty,
                         });
                         field_to_idx.entry(f.name.clone()).or_insert(idx);
                     }
@@ -244,8 +299,16 @@ impl JitProgram {
                 }
                 Item::Enum(e) => {
                     for v in &e.variants {
+                        let payload_tys: Vec<TypeExpr> =
+                            v.fields.iter().map(|f| f.ty.clone()).collect();
+                        let vl = EnumVariantLayout {
+                            enum_name: e.name.clone(),
+                            payload_tys,
+                        };
                         enum_tags.insert(v.name.clone(), next_enum_tag);
                         enum_tags.insert(format!("{}.{}", e.name, v.name), next_enum_tag);
+                        enum_variants.insert(v.name.clone(), vl.clone());
+                        enum_variants.insert(format!("{}.{}", e.name, v.name), vl);
                         next_enum_tag += 1;
                     }
                 }
@@ -253,7 +316,6 @@ impl JitProgram {
             }
         }
 
-        // Collect compilable sync AND async functions
         let fns: Vec<&FnDecl> = program
             .items
             .iter()
@@ -276,7 +338,6 @@ impl JitProgram {
         func_ids.insert("print_int".into(), print_int_id);
         declare_core_syscalls(&mut module, rt.str_concat, &mut func_ids, &mut fn_metas)?;
 
-        // Declare stackless async functions
         for f in &async_fns {
             let mut create_sig = module.make_signature();
             for _ in &f.params {
@@ -291,9 +352,9 @@ impl JitProgram {
                 f.name.clone(),
                 FnMeta {
                     params_inout: vec![false; f.params.len()],
+                    param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                    ret_ty: f.ret_ty.clone(),
                     returns_rc: true,
-                    returns_text: false,
-                    ret_record: None,
                 },
             );
 
@@ -307,7 +368,6 @@ impl JitProgram {
             func_ids.insert(poll_name, poll_id);
         }
 
-        // Declare all user functions
         for f in &fns {
             let mut sig = module.make_signature();
             let mut params_inout = Vec::new();
@@ -320,21 +380,19 @@ impl JitProgram {
                 .declare_function(&f.name, Linkage::Export, &sig)
                 .map_err(|e| e.to_string())?;
             func_ids.insert(f.name.clone(), id);
-            let ret_name = f.ret_ty.as_ref().map(|t| t.display_name());
             fn_metas.insert(
                 f.name.clone(),
                 FnMeta {
                     params_inout,
-                    returns_rc: ret_name
-                        .as_deref()
-                        .is_some_and(|n| is_rc_type_name(n, &record_names)),
-                    returns_text: ret_name.as_deref() == Some("Text"),
-                    ret_record: ret_name.filter(|n| record_names.contains(n)),
+                    param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                    ret_ty: f.ret_ty.clone(),
+                    returns_rc: f.ret_ty.as_ref().is_some_and(|t| {
+                        is_rc_type_expr(t, &alias_bases, &record_names, &enum_names)
+                    }),
                 },
             );
         }
 
-        // Declare auto-derived `<Record>__parse` boundary parsers
         let mut derived_parsers = Vec::new();
         for (rname, layout) in &records {
             if layout.fields.is_empty() {
@@ -354,9 +412,9 @@ impl JitProgram {
                 pname.clone(),
                 FnMeta {
                     params_inout: vec![false; layout.fields.len()],
+                    param_tys: layout.fields.iter().map(|f| f.ty.clone()).collect(),
+                    ret_ty: Some(generic_ty("Result", vec![named_ty(rname), named_ty("Int")])),
                     returns_rc: true,
-                    returns_text: false,
-                    ret_record: None,
                 },
             );
             derived_parsers.push(pname);
@@ -367,7 +425,6 @@ impl JitProgram {
         let mut fb_ctx = FunctionBuilderContext::new();
         let mut compiled_fns = Vec::new();
 
-        // Compile all user sync functions
         for f in &fns {
             let id = func_ids[&f.name];
             ctx.func.signature = module
@@ -384,9 +441,8 @@ impl JitProgram {
                 builder.seal_block(entry_block);
 
                 let mut vars = BTreeMap::new();
-                let mut var_records = BTreeMap::new();
+                let mut var_types = BTreeMap::new();
                 let mut inout_vars = BTreeSet::new();
-                let mut text_vars = BTreeSet::new();
                 let mut borrowed_rc_vars = BTreeSet::new();
 
                 for (idx, p) in f.params.iter().enumerate() {
@@ -394,14 +450,8 @@ impl JitProgram {
                     let val = builder.block_params(entry_block)[idx];
                     builder.def_var(var, val);
                     vars.insert(p.name.clone(), var);
-                    let tname = p.ty.display_name();
-                    if records.contains_key(&tname) {
-                        var_records.insert(p.name.clone(), tname.clone());
-                    }
-                    if tname == "Text" {
-                        text_vars.insert(p.name.clone());
-                    }
-                    if is_rc_type_name(&tname, &record_names) {
+                    var_types.insert(p.name.clone(), p.ty.clone());
+                    if is_rc_type_expr(&p.ty, &alias_bases, &record_names, &enum_names) {
                         borrowed_rc_vars.insert(p.name.clone());
                     }
                     if p.is_inout {
@@ -409,9 +459,7 @@ impl JitProgram {
                     }
                 }
 
-                let fn_returns_rc = fn_metas
-                    .get(&f.name)
-                    .is_some_and(|m| m.returns_rc);
+                let fn_returns_rc = fn_metas.get(&f.name).is_some_and(|m| m.returns_rc);
 
                 let mut lower = FnLower {
                     module: &mut module,
@@ -419,25 +467,28 @@ impl JitProgram {
                     rt,
                     func_ids: &func_ids,
                     fn_metas: &fn_metas,
+                    alias_bases: &alias_bases,
                     records: &records,
                     record_names: &record_names,
+                    enum_names: &enum_names,
                     field_to_idx: &field_to_idx,
                     enum_tags: &enum_tags,
+                    enum_variants: &enum_variants,
                     interned_strings: &mut interned_strings,
                     vars,
-                    var_records,
+                    var_types,
                     inout_vars,
                     owned_rc_vars: BTreeSet::new(),
                     borrowed_rc_vars,
-                    text_vars,
                     rc_scopes: Vec::new(),
                     temp_rc_scopes: Vec::new(),
                     loop_stack: Vec::new(),
                     fn_returns_rc,
+                    fn_ret_ty: f.ret_ty.clone(),
                     self_var: None,
                     terminated: false,
                 };
-                let ret_val = lower.lower_block(&f.body, fn_returns_rc)?;
+                let ret_val = lower.lower_block(&f.body, fn_returns_rc, f.ret_ty.as_ref())?;
                 if !lower.terminated {
                     lower.builder.ins().return_(&[ret_val]);
                 }
@@ -451,7 +502,7 @@ impl JitProgram {
             compiled_fns.push(f.name.clone());
         }
 
-        // Compile all auto-derived `<Record>__parse` functions
+        // Auto-derived `<Record>__parse`
         for (rname, layout) in &records {
             if layout.fields.is_empty() {
                 continue;
@@ -472,16 +523,14 @@ impl JitProgram {
                 builder.seal_block(entry_block);
 
                 let mut vars = BTreeMap::new();
-                let mut text_vars = BTreeSet::new();
+                let mut var_types = BTreeMap::new();
                 let mut borrowed_rc_vars = BTreeSet::new();
                 for (idx, fl) in layout.fields.iter().enumerate() {
                     let var = builder.declare_var(types::I64);
                     let val = builder.block_params(entry_block)[idx];
                     builder.def_var(var, val);
                     vars.insert(fl.name.clone(), var);
-                    if fl.is_text {
-                        text_vars.insert(fl.name.clone());
-                    }
+                    var_types.insert(fl.name.clone(), fl.ty.clone());
                     if fl.is_rc {
                         borrowed_rc_vars.insert(fl.name.clone());
                     }
@@ -493,21 +542,24 @@ impl JitProgram {
                     rt,
                     func_ids: &func_ids,
                     fn_metas: &fn_metas,
+                    alias_bases: &alias_bases,
                     records: &records,
                     record_names: &record_names,
+                    enum_names: &enum_names,
                     field_to_idx: &field_to_idx,
                     enum_tags: &enum_tags,
+                    enum_variants: &enum_variants,
                     interned_strings: &mut interned_strings,
                     vars,
-                    var_records: BTreeMap::new(),
+                    var_types,
                     inout_vars: BTreeSet::new(),
                     owned_rc_vars: BTreeSet::new(),
                     borrowed_rc_vars,
-                    text_vars,
                     rc_scopes: Vec::new(),
                     temp_rc_scopes: Vec::new(),
                     loop_stack: Vec::new(),
                     fn_returns_rc: true,
+                    fn_ret_ty: None,
                     self_var: None,
                     terminated: false,
                 };
@@ -585,7 +637,7 @@ impl JitProgram {
             compiled_fns.push(pname);
         }
 
-        // Compile all stackless `async fn` state machines
+        // Stackless `async fn` state machines
         for f in &async_fns {
             let poll_name = format!("{}__poll", f.name);
             let create_id = func_ids[&f.name];
@@ -608,7 +660,6 @@ impl JitProgram {
             let segments = split_async_segments(&f.body, &mut frame_slots, &mut next_slot);
             let total_slots = next_slot;
 
-            // 1) Constructor `<name>(params...) -> frame_ptr`
             ctx.func.signature = module
                 .declarations()
                 .get_function_decl(create_id)
@@ -642,7 +693,6 @@ impl JitProgram {
                 .map_err(|e| format!("Cranelift async ctor failed for `{}`: {}", f.name, e))?;
             module.clear_context(&mut ctx);
 
-            // 2) Stackless State-Machine `<name>__poll(frame_ptr) -> i64`
             ctx.func.signature = module
                 .declarations()
                 .get_function_decl(poll_id)
@@ -662,21 +712,24 @@ impl JitProgram {
                     rt,
                     func_ids: &func_ids,
                     fn_metas: &fn_metas,
+                    alias_bases: &alias_bases,
                     records: &records,
                     record_names: &record_names,
+                    enum_names: &enum_names,
                     field_to_idx: &field_to_idx,
                     enum_tags: &enum_tags,
+                    enum_variants: &enum_variants,
                     interned_strings: &mut interned_strings,
                     vars: BTreeMap::new(),
-                    var_records: BTreeMap::new(),
+                    var_types: BTreeMap::new(),
                     inout_vars: BTreeSet::new(),
                     owned_rc_vars: BTreeSet::new(),
                     borrowed_rc_vars: BTreeSet::new(),
-                    text_vars: BTreeSet::new(),
                     rc_scopes: Vec::new(),
                     temp_rc_scopes: Vec::new(),
                     loop_stack: Vec::new(),
                     fn_returns_rc: false,
+                    fn_ret_ty: None,
                     self_var: None,
                     terminated: false,
                 };
@@ -730,12 +783,12 @@ impl JitProgram {
                         tail: None,
                         span: f.span,
                     };
-                    let _ = lower.lower_block(&pre_blk, false)?;
+                    let _ = lower.lower_block(&pre_blk, false, None)?;
                     for (vname, &slot) in &frame_slots {
                         let cur_v = lower.builder.use_var(vars[vname]);
                         lower.call_rt_3_void(rt.rc_set_field, frame, slot, cur_v);
                     }
-                    let child_frame = lower.lower_expr_owned(&step.child_expr)?;
+                    let child_frame = lower.lower_expr_owned(&step.child_expr, None)?;
                     lower.call_rt_3_void(rt.rc_set_field, frame, 3, child_frame);
                     let poll_state = lower.builder.ins().iconst(types::I64, (2 * s + 1) as i64);
                     lower.call_rt_3_void(rt.rc_set_field, frame, 0, poll_state);
@@ -787,7 +840,7 @@ impl JitProgram {
                     tail: segments.final_tail.clone().map(Box::new),
                     span: f.span,
                 };
-                let final_val = lower.lower_block(&final_blk, true)?;
+                let final_val = lower.lower_block(&final_blk, true, None)?;
                 lower.call_rt_3_void(rt.rc_set_field, frame, 2, final_val);
                 let done_st = lower.builder.ins().iconst(types::I64, -1);
                 lower.call_rt_3_void(rt.rc_set_field, frame, 0, done_st);
@@ -910,9 +963,13 @@ fn declare_core_syscalls(
             spec.tenon_name.to_string(),
             FnMeta {
                 params_inout: vec![false; spec.arity],
+                param_tys: vec![named_ty("Any"); spec.arity],
+                ret_ty: Some(if spec.returns_text {
+                    named_ty("Text")
+                } else {
+                    named_ty("Int")
+                }),
                 returns_rc: spec.returns_rc,
-                returns_text: spec.returns_text,
-                ret_record: None,
             },
         );
     }
@@ -1009,14 +1066,6 @@ pub(crate) fn split_async_segments(
     }
 }
 
-pub(crate) fn is_rc_type_name(name: &str, record_names: &BTreeSet<String>) -> bool {
-    record_names.contains(name)
-        || name == "Text"
-        || name.starts_with("List[")
-        || name.starts_with("Option[")
-        || name.starts_with("Result[")
-}
-
 struct LoopCtx {
     hdr_blk: ClifBlock,
     exit_blk: ClifBlock,
@@ -1026,10 +1075,9 @@ struct LoopCtx {
 
 struct SavedLexical {
     vars: BTreeMap<String, Variable>,
-    var_records: BTreeMap<String, String>,
+    var_types: BTreeMap<String, TypeExpr>,
     owned_rc_vars: BTreeSet<String>,
     borrowed_rc_vars: BTreeSet<String>,
-    text_vars: BTreeSet<String>,
 }
 
 struct FnLower<'a, 'b> {
@@ -1038,21 +1086,24 @@ struct FnLower<'a, 'b> {
     rt: RtFuncs,
     func_ids: &'a BTreeMap<String, FuncId>,
     fn_metas: &'a BTreeMap<String, FnMeta>,
+    alias_bases: &'a BTreeMap<String, TypeExpr>,
     records: &'a BTreeMap<String, RecordLayout>,
     record_names: &'a BTreeSet<String>,
+    enum_names: &'a BTreeSet<String>,
     field_to_idx: &'a BTreeMap<String, usize>,
     enum_tags: &'a BTreeMap<String, i64>,
+    enum_variants: &'a BTreeMap<String, EnumVariantLayout>,
     interned_strings: &'a mut Vec<Box<[u8]>>,
     vars: BTreeMap<String, Variable>,
-    var_records: BTreeMap<String, String>,
+    var_types: BTreeMap<String, TypeExpr>,
     inout_vars: BTreeSet<String>,
     owned_rc_vars: BTreeSet<String>,
     borrowed_rc_vars: BTreeSet<String>,
-    text_vars: BTreeSet<String>,
     rc_scopes: Vec<Vec<(String, Variable)>>,
     temp_rc_scopes: Vec<Vec<Value>>,
     loop_stack: Vec<LoopCtx>,
     fn_returns_rc: bool,
+    fn_ret_ty: Option<TypeExpr>,
     self_var: Option<String>,
     terminated: bool,
 }
@@ -1061,19 +1112,17 @@ impl<'a, 'b> FnLower<'a, 'b> {
     fn save_lexical(&self) -> SavedLexical {
         SavedLexical {
             vars: self.vars.clone(),
-            var_records: self.var_records.clone(),
+            var_types: self.var_types.clone(),
             owned_rc_vars: self.owned_rc_vars.clone(),
             borrowed_rc_vars: self.borrowed_rc_vars.clone(),
-            text_vars: self.text_vars.clone(),
         }
     }
 
     fn restore_lexical(&mut self, saved: SavedLexical) {
         self.vars = saved.vars;
-        self.var_records = saved.var_records;
+        self.var_types = saved.var_types;
         self.owned_rc_vars = saved.owned_rc_vars;
         self.borrowed_rc_vars = saved.borrowed_rc_vars;
-        self.text_vars = saved.text_vars;
     }
 
     fn declare_fresh_var(&mut self, name: &str, ty: Type) -> Variable {
@@ -1150,8 +1199,145 @@ impl<'a, 'b> FnLower<'a, 'b> {
             .any(|sc| sc.iter().any(|(_, v)| *v == var))
     }
 
+    fn type_is_rc(&self, ty: &TypeExpr) -> bool {
+        is_rc_type_expr(ty, self.alias_bases, self.record_names, self.enum_names)
+    }
+
+    fn list_elem_ty(&self, ty: &TypeExpr) -> Option<TypeExpr> {
+        let resolved = resolve_alias_ty(ty, self.alias_bases);
+        if let TypeExpr::Named { name, args, .. } = resolved {
+            if name == "List" && !args.is_empty() {
+                return Some(args[0].clone());
+            }
+        }
+        None
+    }
+
+    fn infer_expr_type(&self, expr: &Expr) -> TypeExpr {
+        match &expr.kind {
+            ExprKind::Int(_) => named_ty("Int"),
+            ExprKind::Bool(_) => named_ty("Bool"),
+            ExprKind::Str(_) => named_ty("Text"),
+            ExprKind::Ident(s) => {
+                if s == "None" {
+                    return generic_ty("Option", vec![named_ty("Any")]);
+                }
+                if let Some(ty) = self.var_types.get(s) {
+                    return ty.clone();
+                }
+                if let Some(vl) = self.enum_variants.get(s) {
+                    return named_ty(&vl.enum_name);
+                }
+                named_ty("Any")
+            }
+            ExprKind::RecordLit { name, .. } => named_ty(name),
+            ExprKind::List(elems) => {
+                if let Some(first) = elems.first() {
+                    generic_ty("List", vec![self.infer_expr_type(first)])
+                } else {
+                    generic_ty("List", vec![named_ty("Any")])
+                }
+            }
+            ExprKind::Binary { op: BinOp::Concat, .. } => named_ty("Text"),
+            ExprKind::Binary {
+                op: BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or,
+                ..
+            } => named_ty("Bool"),
+            ExprKind::Binary { .. } => named_ty("Int"),
+            ExprKind::Unary { op: UnOp::Not, .. } => named_ty("Bool"),
+            ExprKind::Unary { op: UnOp::Neg, .. } => named_ty("Int"),
+            ExprKind::Field { target, field } => {
+                if let ExprKind::Ident(ename) = &target.kind {
+                    if let Some(vl) = self.enum_variants.get(&format!("{}.{}", ename, field)) {
+                        return named_ty(&vl.enum_name);
+                    }
+                }
+                if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
+                    return fl.ty;
+                }
+                named_ty("Any")
+            }
+            ExprKind::Index { target, .. } => {
+                let tt = self.infer_expr_type(target);
+                self.list_elem_ty(&tt).unwrap_or_else(|| named_ty("Any"))
+            }
+            ExprKind::Call { callee, args } => match &callee.kind {
+                ExprKind::Field { target, field } if field == "parse" => {
+                    if let ExprKind::Ident(rname) = &target.kind {
+                        return generic_ty("Result", vec![named_ty(rname), named_ty("Int")]);
+                    }
+                    named_ty("Any")
+                }
+                ExprKind::Field { target, field } => {
+                    if let ExprKind::Ident(ename) = &target.kind {
+                        if let Some(vl) = self.enum_variants.get(&format!("{}.{}", ename, field)) {
+                            return named_ty(&vl.enum_name);
+                        }
+                    }
+                    named_ty("Any")
+                }
+                ExprKind::Ident(f) => {
+                    if f == "Ok" && args.len() == 1 {
+                        return generic_ty("Result", vec![self.infer_expr_type(&args[0].value), named_ty("Any")]);
+                    }
+                    if f == "Err" && args.len() == 1 {
+                        return generic_ty("Result", vec![named_ty("Any"), self.infer_expr_type(&args[0].value)]);
+                    }
+                    if f == "Some" && args.len() == 1 {
+                        return generic_ty("Option", vec![self.infer_expr_type(&args[0].value)]);
+                    }
+                    if f == "push" && args.len() == 2 {
+                        let lt = self.infer_expr_type(&args[0].value);
+                        if self.list_elem_ty(&lt).is_some_and(|e| e.display_name() != "Any") {
+                            return lt;
+                        }
+                        return generic_ty("List", vec![self.infer_expr_type(&args[1].value)]);
+                    }
+                    if let Some(meta) = self.fn_metas.get(f) {
+                        if let Some(rt) = &meta.ret_ty {
+                            return rt.clone();
+                        }
+                    }
+                    if let Some(vl) = self.enum_variants.get(f) {
+                        return named_ty(&vl.enum_name);
+                    }
+                    named_ty("Any")
+                }
+                _ => named_ty("Any"),
+            },
+            ExprKind::If { then_block, else_branch, .. } => {
+                if let Some(t) = &then_block.tail {
+                    let ty = self.infer_expr_type(t);
+                    if ty.display_name() != "Any" {
+                        return ty;
+                    }
+                }
+                if let Some(eb) = else_branch {
+                    return self.infer_expr_type(eb);
+                }
+                named_ty("Any")
+            }
+            ExprKind::Match { arms, .. } => {
+                for arm in arms {
+                    let t = self.infer_expr_type(&arm.body);
+                    if t.display_name() != "Any" {
+                        return t;
+                    }
+                }
+                named_ty("Any")
+            }
+            ExprKind::Block(blk) => blk
+                .tail
+                .as_deref()
+                .map(|t| self.infer_expr_type(t))
+                .unwrap_or_else(|| named_ty("Any")),
+            _ => named_ty("Any"),
+        }
+    }
+
     fn resolve_field_layout(&self, obj_expr: &Expr, field: &str) -> Result<(usize, Option<FieldLayout>), String> {
-        if let Some(rname) = self.expr_record_name(obj_expr) {
+        let obj_ty = resolve_alias_ty(&self.infer_expr_type(obj_expr), self.alias_bases);
+        if let TypeExpr::Named { name: rname, .. } = obj_ty {
             if let Some(layout) = self.records.get(&rname) {
                 if let Some((pos, fl)) = layout
                     .fields
@@ -1171,46 +1357,21 @@ impl<'a, 'b> FnLower<'a, 'b> {
         Ok((idx, None))
     }
 
-    fn expr_record_name(&self, expr: &Expr) -> Option<String> {
-        match &expr.kind {
-            ExprKind::Ident(vname) => self.var_records.get(vname).cloned(),
-            ExprKind::RecordLit { name, .. } => Some(name.clone()),
-            ExprKind::Call { callee, .. } => match &callee.kind {
-                ExprKind::Ident(f) => self.fn_metas.get(f).and_then(|m| m.ret_record.clone()),
-                _ => None,
-            },
-            ExprKind::Field { target, field } => {
-                if let Some(rname) = self.expr_record_name(target) {
-                    if let Some(layout) = self.records.get(&rname) {
-                        if let Some(fl) = layout.fields.iter().find(|f| f.name == *field) {
-                            return fl.record_ty.clone();
-                        }
-                    }
-                }
-                None
-            }
-            ExprKind::Block(blk) => blk.tail.as_deref().and_then(|t| self.expr_record_name(t)),
-            ExprKind::If { then_block, else_branch, .. } => then_block
-                .tail
-                .as_deref()
-                .and_then(|t| self.expr_record_name(t))
-                .or_else(|| else_branch.as_deref().and_then(|e| self.expr_record_name(e))),
-            _ => None,
-        }
-    }
-
     fn is_rc_ident(&self, s: &str) -> bool {
         self.owned_rc_vars.contains(s)
             || self.borrowed_rc_vars.contains(s)
-            || self.var_records.contains_key(s)
-            || self.text_vars.contains(s)
+            || self.var_types.get(s).is_some_and(|t| self.type_is_rc(t))
     }
 
     fn expr_produces_rc(&self, expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::RecordLit { .. } | ExprKind::List(_) | ExprKind::Str(_) => true,
             ExprKind::Binary { op: BinOp::Concat, .. } => true,
-            ExprKind::Ident(s) => s == "None" || self.is_rc_ident(s) || (self.enum_tags.contains_key(s) && !self.vars.contains_key(s)),
+            ExprKind::Ident(s) => {
+                s == "None"
+                    || self.is_rc_ident(s)
+                    || (self.enum_tags.contains_key(s) && !self.vars.contains_key(s))
+            }
             ExprKind::Field { target, field } => {
                 if let ExprKind::Ident(ename) = &target.kind {
                     if self.enum_tags.contains_key(&format!("{}.{}", ename, field)) {
@@ -1222,13 +1383,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
                 false
             }
+            ExprKind::Index { target, .. } => {
+                let tt = self.infer_expr_type(target);
+                self.list_elem_ty(&tt).is_some_and(|et| self.type_is_rc(&et))
+            }
             ExprKind::Call { callee, .. } => match &callee.kind {
                 ExprKind::Ident(f) => {
                     matches!(f.as_str(), "Ok" | "Err" | "Some" | "push" | "yield_val")
                         || (self.enum_tags.contains_key(f) && !self.func_ids.contains_key(f))
                         || self.fn_metas.get(f).is_some_and(|m| m.returns_rc)
                 }
-                ExprKind::Field { field, .. } => field == "parse",
+                ExprKind::Field { target, field } => {
+                    field == "parse"
+                        || matches!(&target.kind, ExprKind::Ident(e) if self.enum_tags.contains_key(&format!("{}.{}", e, field)))
+                }
                 _ => false,
             },
             ExprKind::If { then_block, else_branch, .. } => {
@@ -1243,20 +1411,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
     }
 
     fn is_text_expr(&self, expr: &Expr) -> bool {
+        let ty = self.infer_expr_type(expr);
+        if is_text_type_expr(&ty, self.alias_bases) {
+            return true;
+        }
         match &expr.kind {
-            ExprKind::Str(_) => true,
-            ExprKind::Binary { op: BinOp::Concat, .. } => true,
-            ExprKind::Ident(s) => self.text_vars.contains(s),
-            ExprKind::Field { target, field } => {
-                if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
-                    return fl.is_text;
-                }
-                false
-            }
-            ExprKind::Call { callee, .. } => match &callee.kind {
-                ExprKind::Ident(f) => self.fn_metas.get(f).is_some_and(|m| m.returns_text),
-                _ => false,
-            },
+            ExprKind::Str(_) | ExprKind::Binary { op: BinOp::Concat, .. } => true,
             ExprKind::If { then_block, else_branch, .. } => {
                 then_block.tail.as_deref().is_some_and(|t| self.is_text_expr(t))
                     || else_branch.as_deref().is_some_and(|e| self.is_text_expr(e))
@@ -1267,7 +1427,43 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
     }
 
-    fn lower_block(&mut self, blk: &Block, want_owned_tail: bool) -> Result<Value, String> {
+    fn infer_match_binding_type(&self, scrutinee_ty: &TypeExpr, variant_name: &str) -> TypeExpr {
+        let base = resolve_alias_ty(scrutinee_ty, self.alias_bases);
+        if variant_name == "Some" {
+            if let TypeExpr::Named { name, args, .. } = &base {
+                if name == "Option" && !args.is_empty() {
+                    return args[0].clone();
+                }
+            }
+        }
+        if variant_name == "Ok" {
+            if let TypeExpr::Named { name, args, .. } = &base {
+                if name == "Result" && !args.is_empty() {
+                    return args[0].clone();
+                }
+            }
+        }
+        if variant_name == "Err" {
+            if let TypeExpr::Named { name, args, .. } = &base {
+                if name == "Result" && args.len() >= 2 {
+                    return args[1].clone();
+                }
+            }
+        }
+        if let Some(vl) = self.enum_variants.get(variant_name) {
+            if let Some(pty) = vl.payload_tys.first() {
+                return pty.clone();
+            }
+        }
+        named_ty("Any")
+    }
+
+    fn lower_block(
+        &mut self,
+        blk: &Block,
+        want_owned_tail: bool,
+        expected_tail_ty: Option<&TypeExpr>,
+    ) -> Result<Value, String> {
         let saved = self.save_lexical();
         let scope_idx = self.rc_scopes.len();
         self.rc_scopes.push(Vec::new());
@@ -1281,13 +1477,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 Stmt::Let {
                     name, ty, value, ..
                 } => {
-                    let produces_rc = if let Some(t) = ty {
-                        is_rc_type_name(&t.display_name(), self.record_names)
-                    } else {
-                        self.expr_produces_rc(value)
-                    };
+                    let effective_ty = ty.clone().unwrap_or_else(|| self.infer_expr_type(value));
+                    let produces_rc = self.type_is_rc(&effective_ty) || self.expr_produces_rc(value);
                     let v = if produces_rc {
-                        self.lower_expr_owned(value)?
+                        self.lower_expr_owned(value, ty.as_ref())?
                     } else {
                         let mut temps = Vec::new();
                         let val = self.lower_expr_borrowed(value, &mut temps)?;
@@ -1297,37 +1490,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     let var = self.declare_fresh_var(name, types::I64);
                     self.builder.def_var(var, v);
 
-                    // Update lexical type metadata for this new binding
-                    self.var_records.remove(name);
-                    self.text_vars.remove(name);
+                    self.var_types.insert(name.clone(), effective_ty);
                     self.owned_rc_vars.remove(name);
                     self.borrowed_rc_vars.remove(name);
-
-                    if let Some(t) = ty {
-                        let tname = t.display_name();
-                        if self.records.contains_key(&tname) {
-                            self.var_records.insert(name.clone(), tname);
-                            self.owned_rc_vars.insert(name.clone());
-                            self.rc_scopes[scope_idx].push((name.clone(), var));
-                        } else if tname == "Text" {
-                            self.text_vars.insert(name.clone());
-                            self.owned_rc_vars.insert(name.clone());
-                            self.rc_scopes[scope_idx].push((name.clone(), var));
-                        } else if is_rc_type_name(&tname, self.record_names) {
-                            self.owned_rc_vars.insert(name.clone());
-                            self.rc_scopes[scope_idx].push((name.clone(), var));
-                        }
-                    } else {
-                        if let Some(rname) = self.expr_record_name(value) {
-                            self.var_records.insert(name.clone(), rname);
-                        }
-                        if self.is_text_expr(value) {
-                            self.text_vars.insert(name.clone());
-                        }
-                        if produces_rc {
-                            self.owned_rc_vars.insert(name.clone());
-                            self.rc_scopes[scope_idx].push((name.clone(), var));
-                        }
+                    if produces_rc {
+                        self.owned_rc_vars.insert(name.clone());
+                        self.rc_scopes[scope_idx].push((name.clone(), var));
                     }
                 }
                 Stmt::Assign {
@@ -1338,20 +1506,34 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             &value.kind,
                             ExprKind::Call { callee, args }
                             if matches!(&callee.kind, ExprKind::Ident(f) if f == "push")
+                                && args.len() == 2
                                 && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
                         );
+                        let target_ty = self.var_types.get(name).cloned();
                         let target_is_rc = self.owned_rc_vars.contains(name);
                         let rhs = if consuming_push {
-                            let mut temps = Vec::new();
-                            let v = self.lower_expr_borrowed(value, &mut temps)?;
-                            // `push` consumes its first arg and returns a new owned list; do NOT dec `v`!
-                            if temps.last().copied() == Some(v) {
-                                temps.pop();
-                            }
-                            self.flush_temps(&temps);
-                            v
+                            let ExprKind::Call { args, .. } = &value.kind else {
+                                unreachable!()
+                            };
+                            let elem_is_rc = target_ty
+                                .as_ref()
+                                .and_then(|t| self.list_elem_ty(t))
+                                .is_some_and(|et| self.type_is_rc(&et))
+                                || self.expr_produces_rc(&args[1].value);
+                            let xs_val = self.load_ident_val(name)?;
+                            let val_v = if elem_is_rc {
+                                let mv = self.builder.ins().iconst(types::I64, RC_MASK_ALL as i64);
+                                self.call_rt_2_void(self.rt.rc_set_rc_mask, xs_val, mv);
+                                self.lower_expr_owned(&args[1].value, None)?
+                            } else {
+                                let mut temps = Vec::new();
+                                let v = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                                self.flush_temps(&temps);
+                                v
+                            };
+                            self.call_rt_2_vals(self.rt.list_push, xs_val, val_v)
                         } else if target_is_rc && *op == AssignOp::Set {
-                            self.lower_expr_owned(value)?
+                            self.lower_expr_owned(value, target_ty.as_ref())?
                         } else {
                             let mut temps = Vec::new();
                             let v = self.lower_expr_borrowed(value, &mut temps)?;
@@ -1401,8 +1583,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         if let ExprKind::Ident(vname) = &obj.kind {
                             let (fidx, fl) = self.resolve_field_layout(obj, field)?;
                             let field_is_rc = fl.as_ref().is_some_and(|f| f.is_rc);
+                            let field_ty = fl.as_ref().map(|f| &f.ty);
                             let rhs = if field_is_rc && *op == AssignOp::Set {
-                                self.lower_expr_owned(value)?
+                                self.lower_expr_owned(value, field_ty)?
                             } else {
                                 let mut temps = Vec::new();
                                 let v = self.lower_expr_borrowed(value, &mut temps)?;
@@ -1457,10 +1640,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     _ => {}
                 },
                 Stmt::Mutate { body, .. } => {
-                    let _ = self.lower_block(body, false)?;
+                    let _ = self.lower_block(body, false, None)?;
                 }
                 Stmt::Return { value, .. } => {
                     let mut move_skip_var: Option<Variable> = None;
+                    let ret_ty_opt = self.fn_ret_ty.clone();
                     let v = match value {
                         Some(e) => {
                             if self.fn_returns_rc {
@@ -1471,16 +1655,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                                 move_skip_var = Some(rv);
                                                 self.builder.use_var(rv)
                                             } else {
-                                                self.lower_expr_owned(e)?
+                                                self.lower_expr_owned(e, ret_ty_opt.as_ref())?
                                             }
                                         } else {
-                                            self.lower_expr_owned(e)?
+                                            self.lower_expr_owned(e, ret_ty_opt.as_ref())?
                                         }
                                     } else {
-                                        self.lower_expr_owned(e)?
+                                        self.lower_expr_owned(e, ret_ty_opt.as_ref())?
                                     }
                                 } else {
-                                    self.lower_expr_owned(e)?
+                                    self.lower_expr_owned(e, ret_ty_opt.as_ref())?
                                 }
                             } else {
                                 let mut temps = Vec::new();
@@ -1564,7 +1748,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         rc_scope_depth: self.rc_scopes.len(),
                         temp_scope_depth: self.temp_rc_scopes.len(),
                     });
-                    let _ = self.lower_block(body, false)?;
+                    let _ = self.lower_block(body, false, None)?;
                     self.loop_stack.pop();
 
                     if !self.terminated {
@@ -1596,16 +1780,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                     move_skip_var = Some(tv);
                                     last = self.builder.use_var(tv);
                                 } else {
-                                    last = self.lower_expr_owned(tail)?;
+                                    last = self.lower_expr_owned(tail, expected_tail_ty)?;
                                 }
                             } else {
-                                last = self.lower_expr_owned(tail)?;
+                                last = self.lower_expr_owned(tail, expected_tail_ty)?;
                             }
                         } else {
-                            last = self.lower_expr_owned(tail)?;
+                            last = self.lower_expr_owned(tail, expected_tail_ty)?;
                         }
                     } else {
-                        last = self.lower_expr_owned(tail)?;
+                        last = self.lower_expr_owned(tail, expected_tail_ty)?;
                     }
                 } else {
                     let mut temps = Vec::new();
@@ -1625,7 +1809,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
         Ok(last)
     }
 
-    fn lower_expr_owned(&mut self, expr: &Expr) -> Result<Value, String> {
+    fn lower_expr_owned(
+        &mut self,
+        expr: &Expr,
+        expected_ty: Option<&TypeExpr>,
+    ) -> Result<Value, String> {
         match &expr.kind {
             ExprKind::Ident(s) => {
                 if s == "self" {
@@ -1667,14 +1855,30 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.flush_temps(&temps);
                 Ok(val)
             }
+            ExprKind::Index { target, index } => {
+                let elem_is_rc = self
+                    .list_elem_ty(&self.infer_expr_type(target))
+                    .is_some_and(|et| self.type_is_rc(&et));
+                let mut temps = Vec::new();
+                let t = self.lower_expr_borrowed(target, &mut temps)?;
+                let i = self.lower_expr_borrowed(index, &mut temps)?;
+                let mut res = self.call_rt_2_vals(self.rt.rc_get_field, t, i);
+                if elem_is_rc {
+                    res = self.call_rt_1(self.rt.rc_inc, res);
+                }
+                self.flush_temps(&temps);
+                Ok(res)
+            }
             ExprKind::If {
                 cond,
                 then_block,
                 else_branch,
-            } => self.lower_if(cond, then_block, else_branch.as_deref(), true),
-            ExprKind::Match { scrutinee, arms } => self.lower_match(scrutinee, arms, true),
-            ExprKind::Block(blk) => self.lower_block(blk, true),
-            _ => self.lower_expr_fresh(expr),
+            } => self.lower_if(cond, then_block, else_branch.as_deref(), true, expected_ty),
+            ExprKind::Match { scrutinee, arms } => {
+                self.lower_match(scrutinee, arms, true, expected_ty)
+            }
+            ExprKind::Block(blk) => self.lower_block(blk, true, expected_ty),
+            _ => self.lower_expr_fresh(expr, expected_ty),
         }
     }
 
@@ -1720,13 +1924,18 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let idx_v = self.builder.ins().iconst(types::I64, idx as i64);
                 Ok(self.call_rt_2_vals(self.rt.rc_get_field, obj, idx_v))
             }
+            ExprKind::Index { target, index } => {
+                let t = self.lower_expr_borrowed(target, temps)?;
+                let i = self.lower_expr_borrowed(index, temps)?;
+                Ok(self.call_rt_2_vals(self.rt.rc_get_field, t, i))
+            }
             ExprKind::If {
                 cond,
                 then_block,
                 else_branch,
             } => {
                 let want_owned = self.expr_produces_rc(expr);
-                let v = self.lower_if(cond, then_block, else_branch.as_deref(), want_owned)?;
+                let v = self.lower_if(cond, then_block, else_branch.as_deref(), want_owned, None)?;
                 if want_owned && !self.terminated {
                     temps.push(v);
                 }
@@ -1734,7 +1943,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 let want_owned = self.expr_produces_rc(expr);
-                let v = self.lower_match(scrutinee, arms, want_owned)?;
+                let v = self.lower_match(scrutinee, arms, want_owned, None)?;
                 if want_owned && !self.terminated {
                     temps.push(v);
                 }
@@ -1742,14 +1951,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             ExprKind::Block(blk) => {
                 let want_owned = self.expr_produces_rc(expr);
-                let v = self.lower_block(blk, want_owned)?;
+                let v = self.lower_block(blk, want_owned, None)?;
                 if want_owned && !self.terminated {
                     temps.push(v);
                 }
                 Ok(v)
             }
             _ => {
-                let v = self.lower_expr_fresh(expr)?;
+                let v = self.lower_expr_fresh(expr, None)?;
                 if self.expr_produces_rc(expr) {
                     temps.push(v);
                 }
@@ -1780,6 +1989,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         then_block: &Block,
         else_branch: Option<&Expr>,
         want_owned: bool,
+        expected_ty: Option<&TypeExpr>,
     ) -> Result<Value, String> {
         let mut ctemps = Vec::new();
         let c = self.lower_expr_borrowed(cond, &mut ctemps)?;
@@ -1797,7 +2007,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
         self.builder.switch_to_block(then_b);
         self.builder.seal_block(then_b);
-        let tv = self.lower_block(then_block, want_owned)?;
+        let tv = self.lower_block(then_block, want_owned, expected_ty)?;
         let then_term = self.terminated;
         if !then_term {
             self.builder.ins().jump(merge_b, &[tv.into()]);
@@ -1809,7 +2019,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let ev = match else_branch {
             Some(eb) => {
                 if want_owned {
-                    self.lower_expr_owned(eb)?
+                    self.lower_expr_owned(eb, expected_ty)?
                 } else {
                     let mut etemps = Vec::new();
                     let v = self.lower_expr_borrowed(eb, &mut etemps)?;
@@ -1842,17 +2052,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
         scrutinee: &Expr,
         arms: &[MatchArm],
         want_owned: bool,
+        expected_ty: Option<&TypeExpr>,
     ) -> Result<Value, String> {
-        let parse_record_name = match &scrutinee.kind {
-            ExprKind::Call { callee, .. } => match &callee.kind {
-                ExprKind::Field { target, field } if field == "parse" => match &target.kind {
-                    ExprKind::Ident(rname) => Some(rname.clone()),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        };
+        let scrutinee_ty = self.infer_expr_type(scrutinee);
         let is_variant_match = arms
             .iter()
             .any(|a| a.patterns.iter().any(|p| matches!(p, Pattern::Variant { .. })));
@@ -1875,13 +2077,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let mut any_reachable_merge = false;
 
         for arm in arms {
-            let is_wild = arm
-                .patterns
-                .iter()
-                .any(|p| matches!(p, Pattern::Wildcard(_)));
+            let is_wild = arm.guard.is_none()
+                && arm
+                    .patterns
+                    .iter()
+                    .any(|p| matches!(p, Pattern::Wildcard(_)));
             if is_wild {
                 let v = if want_owned {
-                    self.lower_expr_owned(&arm.body)?
+                    self.lower_expr_owned(&arm.body, expected_ty)?
                 } else {
                     let mut atemps = Vec::new();
                     let av = self.lower_expr_borrowed(&arm.body, &mut atemps)?;
@@ -1908,9 +2111,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
 
             let mut cond: Option<Value> = None;
-            let mut variant_binding: Option<(String, bool)> = None;
+            let mut variant_binding: Option<(String, String)> = None;
             for p in &arm.patterns {
                 let eq = match p {
+                    Pattern::Wildcard(_) => {
+                        let one = self.builder.ins().iconst(types::I64, 1);
+                        let zero = self.builder.ins().iconst(types::I64, 0);
+                        self.builder.ins().icmp(IntCC::NotEqual, one, zero)
+                    }
                     Pattern::Int(n, _) => {
                         let pv = self.builder.ins().iconst(types::I64, *n);
                         self.builder.ins().icmp(IntCC::Equal, cmp_target, pv)
@@ -1936,7 +2144,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             .get(name)
                             .ok_or_else(|| format!("unknown enum variant `{}` in match", name))?;
                         if let Some(bname) = binding {
-                            variant_binding = Some((bname.clone(), name == "Ok"));
+                            if bname != "_" {
+                                variant_binding = Some((bname.clone(), name.clone()));
+                            }
                         }
                         let pv = self.builder.ins().iconst(types::I64, tag);
                         self.builder.ins().icmp(IntCC::Equal, cmp_target, pv)
@@ -1959,20 +2169,30 @@ impl<'a, 'b> FnLower<'a, 'b> {
             self.builder.switch_to_block(matched_b);
             self.builder.seal_block(matched_b);
             let saved_arm = self.save_lexical();
-            if let Some((bname, is_ok)) = variant_binding {
+            if let Some((bname, vname)) = variant_binding {
                 let zero = self.builder.ins().iconst(types::I64, 0);
                 let payload = self.call_rt_2_vals(self.rt.rc_get_field, sv, zero);
                 let bvar = self.declare_fresh_var(&bname, types::I64);
                 self.builder.def_var(bvar, payload);
-                if is_ok {
-                    if let Some(rname) = &parse_record_name {
-                        self.var_records.insert(bname.clone(), rname.clone());
-                        self.borrowed_rc_vars.insert(bname);
-                    }
+                let bty = self.infer_match_binding_type(&scrutinee_ty, &vname);
+                if self.type_is_rc(&bty) {
+                    self.borrowed_rc_vars.insert(bname.clone());
                 }
+                self.var_types.insert(bname, bty);
+            }
+            if let Some(guard_expr) = &arm.guard {
+                let mut gtemps = Vec::new();
+                let gv = self.lower_expr_borrowed(guard_expr, &mut gtemps)?;
+                self.flush_temps(&gtemps);
+                let gz = self.builder.ins().iconst(types::I64, 0);
+                let gc = self.builder.ins().icmp(IntCC::NotEqual, gv, gz);
+                let body_b = self.builder.create_block();
+                self.builder.ins().brif(gc, body_b, &[], next_b, &[]);
+                self.builder.switch_to_block(body_b);
+                self.builder.seal_block(body_b);
             }
             let v = if want_owned {
-                self.lower_expr_owned(&arm.body)?
+                self.lower_expr_owned(&arm.body, expected_ty)?
             } else {
                 let mut atemps = Vec::new();
                 let av = self.lower_expr_borrowed(&arm.body, &mut atemps)?;
@@ -2001,7 +2221,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
         Ok(self.builder.block_params(merge_b)[0])
     }
 
-    fn lower_expr_fresh(&mut self, expr: &Expr) -> Result<Value, String> {
+    fn lower_expr_fresh(
+        &mut self,
+        expr: &Expr,
+        expected_ty: Option<&TypeExpr>,
+    ) -> Result<Value, String> {
         match &expr.kind {
             ExprKind::Int(n) => Ok(self.builder.ins().iconst(types::I64, *n)),
             ExprKind::Bool(b) => Ok(self
@@ -2034,7 +2258,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         .find(|(_, f)| f.name == *fname)
                     {
                         let val = if fl.is_rc {
-                            self.lower_expr_owned(fexpr)?
+                            self.lower_expr_owned(fexpr, Some(&fl.ty))?
                         } else {
                             let mut temps = Vec::new();
                             let v = self.lower_expr_borrowed(fexpr, &mut temps)?;
@@ -2047,22 +2271,28 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 Ok(obj)
             }
             ExprKind::List(elems) => {
+                let exp_elem_ty = expected_ty.and_then(|t| self.list_elem_ty(t));
+                let elem_is_rc = exp_elem_ty
+                    .as_ref()
+                    .is_some_and(|et| self.type_is_rc(et))
+                    || elems.iter().any(|e| self.expr_produces_rc(e));
                 let obj = self.call_rt_2(self.rt.rc_alloc, TAG_LIST, elems.len() as i64);
+                if elem_is_rc {
+                    let mv = self.builder.ins().iconst(types::I64, RC_MASK_ALL as i64);
+                    self.call_rt_2_void(self.rt.rc_set_rc_mask, obj, mv);
+                }
                 for (idx, e) in elems.iter().enumerate() {
-                    let mut temps = Vec::new();
-                    let val = self.lower_expr_borrowed(e, &mut temps)?;
-                    self.flush_temps(&temps);
+                    let val = if elem_is_rc {
+                        self.lower_expr_owned(e, exp_elem_ty.as_ref())?
+                    } else {
+                        let mut temps = Vec::new();
+                        let v = self.lower_expr_borrowed(e, &mut temps)?;
+                        self.flush_temps(&temps);
+                        v
+                    };
                     self.call_rt_3_void(self.rt.rc_set_field, obj, idx as i64, val);
                 }
                 Ok(obj)
-            }
-            ExprKind::Index { target, index } => {
-                let mut temps = Vec::new();
-                let t = self.lower_expr_borrowed(target, &mut temps)?;
-                let i = self.lower_expr_borrowed(index, &mut temps)?;
-                let res = self.call_rt_2_vals(self.rt.rc_get_field, t, i);
-                self.flush_temps(&temps);
-                Ok(res)
             }
             ExprKind::Unary { op, expr } => {
                 let mut temps = Vec::new();
@@ -2231,28 +2461,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     if let ExprKind::Ident(ename) = &target.kind {
                         let key = format!("{}.{}", ename, field);
                         if let Some(&tag) = self.enum_tags.get(&key) {
-                            let obj = self.call_rt_2(self.rt.rc_alloc, tag, args.len() as i64);
-                            let mut rc_mask = 0u64;
-                            for (idx, a) in args.iter().enumerate() {
-                                let is_rc = self.expr_produces_rc(&a.value);
-                                let av = if is_rc {
-                                    if idx < 64 {
-                                        rc_mask |= 1u64 << idx;
-                                    }
-                                    self.lower_expr_owned(&a.value)?
-                                } else {
-                                    let mut temps = Vec::new();
-                                    let v = self.lower_expr_borrowed(&a.value, &mut temps)?;
-                                    self.flush_temps(&temps);
-                                    v
-                                };
-                                self.call_rt_3_void(self.rt.rc_set_field, obj, idx as i64, av);
-                            }
-                            if rc_mask != 0 {
-                                let mv = self.builder.ins().iconst(types::I64, rc_mask as i64);
-                                self.call_rt_2_void(self.rt.rc_set_rc_mask, obj, mv);
-                            }
-                            return Ok(obj);
+                            let ptys = self
+                                .enum_variants
+                                .get(&key)
+                                .map(|vl| vl.payload_tys.clone())
+                                .unwrap_or_default();
+                            return self.lower_enum_ctor(tag, &ptys, args);
                         }
                     }
                     Err("unsupported method call in codegen".into())
@@ -2266,12 +2480,24 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         return Ok(res);
                     }
                     if fname == "push" && args.len() == 2 {
-                        let mut temps = Vec::new();
-                        let xs = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                        let val = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                        let res = self.call_rt_2_vals(self.rt.list_push, xs, val);
-                        self.flush_temps(&temps);
-                        return Ok(res);
+                        let xs_ty = self.infer_expr_type(&args[0].value);
+                        let elem_is_rc = self
+                            .list_elem_ty(&xs_ty)
+                            .is_some_and(|et| self.type_is_rc(&et))
+                            || self.expr_produces_rc(&args[1].value);
+                        // Non-consuming `push`: own `xs` (inc if ident so `tenon_list_push` COW-clones!)
+                        let xs = self.lower_expr_owned(&args[0].value, expected_ty)?;
+                        let val = if elem_is_rc {
+                            let mv = self.builder.ins().iconst(types::I64, RC_MASK_ALL as i64);
+                            self.call_rt_2_void(self.rt.rc_set_rc_mask, xs, mv);
+                            self.lower_expr_owned(&args[1].value, None)?
+                        } else {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                            self.flush_temps(&temps);
+                            v
+                        };
+                        return Ok(self.call_rt_2_vals(self.rt.list_push, xs, val));
                     }
                     if fname == "yield_val" && args.len() == 1 {
                         let mut temps = Vec::new();
@@ -2280,34 +2506,31 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         return Ok(self.call_rt_1(self.rt.async_yield_create, v));
                     }
                     if fname == "block_on" && args.len() == 1 {
-                        // `block_on` consumes and frees the async frame itself!
-                        let fut = self.lower_expr_owned(&args[0].value)?;
+                        let fut = self.lower_expr_owned(&args[0].value, None)?;
                         return Ok(self.call_rt_1(self.rt.async_block_on, fut));
                     }
                     if let Some(&tag) = self.enum_tags.get(fname) {
                         if !self.func_ids.contains_key(fname) {
-                            let obj = self.call_rt_2(self.rt.rc_alloc, tag, args.len() as i64);
-                            let mut rc_mask = 0u64;
-                            for (idx, a) in args.iter().enumerate() {
-                                let is_rc = self.expr_produces_rc(&a.value);
-                                let av = if is_rc {
-                                    if idx < 64 {
-                                        rc_mask |= 1u64 << idx;
+                            let mut ptys = self
+                                .enum_variants
+                                .get(fname)
+                                .map(|vl| vl.payload_tys.clone())
+                                .unwrap_or_default();
+                            if ptys.is_empty() {
+                                if let Some(exp) = expected_ty {
+                                    let resolved = resolve_alias_ty(exp, self.alias_bases);
+                                    if let TypeExpr::Named { name: tn, args: targs, .. } = resolved {
+                                        if fname == "Some" && tn == "Option" && !targs.is_empty() {
+                                            ptys.push(targs[0].clone());
+                                        } else if fname == "Ok" && tn == "Result" && !targs.is_empty() {
+                                            ptys.push(targs[0].clone());
+                                        } else if fname == "Err" && tn == "Result" && targs.len() >= 2 {
+                                            ptys.push(targs[1].clone());
+                                        }
                                     }
-                                    self.lower_expr_owned(&a.value)?
-                                } else {
-                                    let mut temps = Vec::new();
-                                    let v = self.lower_expr_borrowed(&a.value, &mut temps)?;
-                                    self.flush_temps(&temps);
-                                    v
-                                };
-                                self.call_rt_3_void(self.rt.rc_set_field, obj, idx as i64, av);
+                                }
                             }
-                            if rc_mask != 0 {
-                                let mv = self.builder.ins().iconst(types::I64, rc_mask as i64);
-                                self.call_rt_2_void(self.rt.rc_set_rc_mask, obj, mv);
-                            }
-                            return Ok(obj);
+                            return self.lower_enum_ctor(tag, &ptys, args);
                         }
                     }
 
@@ -2326,6 +2549,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             .as_ref()
                             .and_then(|m| m.params_inout.get(idx).copied())
                             .unwrap_or(false);
+                        let pty = meta.as_ref().and_then(|m| m.param_tys.get(idx));
                         if is_inout {
                             if let ExprKind::Ident(vname) = &a.value.kind {
                                 let cur_val = self.load_ident_val(vname)?;
@@ -2344,6 +2568,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                     idx, fname
                                 ));
                             }
+                        } else if matches!(&a.value.kind, ExprKind::List(es) if es.is_empty())
+                            && pty.is_some()
+                        {
+                            let lv = self.lower_expr_owned(&a.value, pty)?;
+                            temps.push(lv);
+                            arg_vals.push(lv);
                         } else {
                             arg_vals.push(self.lower_expr_borrowed(&a.value, &mut temps)?);
                         }
@@ -2371,6 +2601,37 @@ impl<'a, 'b> FnLower<'a, 'b> {
             },
             _ => Ok(self.builder.ins().iconst(types::I64, 0)),
         }
+    }
+
+    fn lower_enum_ctor(
+        &mut self,
+        tag: i64,
+        payload_tys: &[TypeExpr],
+        args: &[CallArg],
+    ) -> Result<Value, String> {
+        let obj = self.call_rt_2(self.rt.rc_alloc, tag, args.len() as i64);
+        let mut rc_mask = 0u64;
+        for (idx, a) in args.iter().enumerate() {
+            let pty = payload_tys.get(idx);
+            let is_rc = pty.is_some_and(|t| self.type_is_rc(t)) || self.expr_produces_rc(&a.value);
+            let av = if is_rc {
+                if idx < 64 {
+                    rc_mask |= 1u64 << idx;
+                }
+                self.lower_expr_owned(&a.value, pty)?
+            } else {
+                let mut temps = Vec::new();
+                let v = self.lower_expr_borrowed(&a.value, &mut temps)?;
+                self.flush_temps(&temps);
+                v
+            };
+            self.call_rt_3_void(self.rt.rc_set_field, obj, idx as i64, av);
+        }
+        if rc_mask != 0 {
+            let mv = self.builder.ins().iconst(types::I64, rc_mask as i64);
+            self.call_rt_2_void(self.rt.rc_set_rc_mask, obj, mv);
+        }
+        Ok(obj)
     }
 }
 
@@ -2609,6 +2870,87 @@ pub fn main() Int {
         assert_eq!(
             st.live_objects, 0,
             "core text/record/loop ops must leave 0 leaks, got {:?}",
+            st
+        );
+    }
+
+    #[test]
+    fn recursive_payload_enum_option_result_and_rc_lists_zero_leaks() {
+        let src = r#"
+pub record Entry {
+    key Text
+    val Val
+}
+
+pub enum Val {
+    VNull
+    VInt(Int)
+    VStr(Text)
+    VArr(List[Val])
+    VObj(List[Entry])
+}
+
+pub fn get_field(v Val, k Text) Option[Val] {
+    match v {
+        VObj(entries) => {
+            var i = 0
+            while i < len(entries) {
+                let e = entries[i]
+                if e.key == k {
+                    return Some(e.val)
+                }
+                i += 1
+            }
+            None
+        }
+        _ => None
+    }
+}
+
+pub fn summarize(v Val) Result[Text, Text] {
+    match v {
+        VNull => Ok("null")
+        VInt(n) => Ok("int")
+        VStr(s) => Ok("str:" ++ s)
+        VArr(xs) => Ok("arr")
+        VObj(es) => Ok("obj")
+    }
+}
+
+pub fn main() Int {
+    var xs List[Val] = []
+    xs = push(xs, VInt(10))
+    xs = push(xs, VStr("hello"))
+    var entries List[Entry] = []
+    entries = push(entries, Entry { key = "items", val = VArr(xs) })
+    entries = push(entries, Entry { key = "name", val = VStr("tenon") })
+    let obj = VObj(entries)
+
+    let name_ok = match get_field(obj, "name") {
+        Some(v) => match summarize(v) {
+            Ok(txt) => txt == "str:tenon"
+            Err(_) => false
+        }
+        None => false
+    }
+    assert name_ok
+
+    let missing_ok = match get_field(obj, "nope") {
+        Some(_) => false
+        None => true
+    }
+    assert missing_ok
+    99
+}
+"#;
+        perceus::reset_stats();
+        let prog = parse(src).unwrap();
+        let jit = JitProgram::compile(&prog).unwrap();
+        assert_eq!(jit.call_0("main").unwrap(), 99);
+        let st = perceus::snapshot_stats();
+        assert_eq!(
+            st.live_objects, 0,
+            "recursive payload enums + Option/Result + RC Lists must leave 0 leaks, got {:?}",
             st
         );
     }

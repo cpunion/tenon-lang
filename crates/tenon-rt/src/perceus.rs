@@ -9,6 +9,8 @@ pub const TAG_LIST: i64 = 4;
 pub const TAG_TEXT: i64 = 5;
 pub const TAG_ASYNC_FRAME: i64 = 6;
 pub const TAG_RECORD_BASE: i64 = 100;
+/// Sentinel `rc_mask` meaning EVERY element in `0..len` is an RC pointer (used for `List[T]` of RC `T`).
+pub const RC_MASK_ALL: u64 = u64::MAX;
 
 static LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -174,7 +176,16 @@ pub extern "C" fn tenon_rc_dec(ptr: i64) {
         let prev = (*hdr).rc.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
             let rc_mask = (*hdr).rc_mask;
-            if rc_mask != 0 {
+            if rc_mask == RC_MASK_ALL {
+                let len = (*hdr).len;
+                let fp = fields_ptr(hdr);
+                for i in 0..len {
+                    let child = *fp.add(i);
+                    if child != 0 {
+                        tenon_rc_dec(child);
+                    }
+                }
+            } else if rc_mask != 0 {
                 let len = (*hdr).len.min(64);
                 let fp = fields_ptr(hdr);
                 for i in 0..len {
@@ -215,7 +226,8 @@ pub extern "C" fn tenon_rc_ensure_unique(ptr: i64) -> i64 {
         for i in 0..len {
             let v = *src_f.add(i);
             *dst_f.add(i) = v;
-            if i < 64 && (rc_mask & (1u64 << i)) != 0 && v != 0 {
+            let is_rc = rc_mask == RC_MASK_ALL || (i < 64 && (rc_mask & (1u64 << i)) != 0);
+            if is_rc && v != 0 {
                 tenon_rc_inc(v);
             }
         }
@@ -251,7 +263,9 @@ pub extern "C" fn tenon_rc_set_field(ptr: i64, idx: i64, val: i64) {
             let fp = fields_ptr(hdr);
             let old = *fp.add(i);
             *fp.add(i) = val;
-            if i < 64 && ((*hdr).rc_mask & (1u64 << i)) != 0 && old != 0 {
+            let mask = (*hdr).rc_mask;
+            let is_rc = mask == RC_MASK_ALL || (i < 64 && (mask & (1u64 << i)) != 0);
+            if is_rc && old != 0 {
                 tenon_rc_dec(old);
             }
         }
@@ -320,7 +334,9 @@ pub extern "C" fn tenon_list_push(ptr: i64, val: i64) -> i64 {
     unsafe {
         let hdr = ptr as *mut ObjHeader;
         let old_len = (*hdr).len;
-        if (*hdr).rc.load(Ordering::SeqCst) == 1 && old_len < (*hdr).cap {
+        let rc_mask = (*hdr).rc_mask;
+        let shared = (*hdr).rc.load(Ordering::SeqCst) > 1;
+        if !shared && old_len < (*hdr).cap {
             REUSE_HITS.fetch_add(1, Ordering::SeqCst);
             *fields_ptr(hdr).add(old_len) = val;
             (*hdr).len = old_len + 1;
@@ -329,16 +345,23 @@ pub extern "C" fn tenon_list_push(ptr: i64, val: i64) -> i64 {
         let new_cap = (old_len + 1).max((*hdr).cap * 2);
         let fresh = tenon_rc_alloc(TAG_LIST, new_cap as i64) as *mut ObjHeader;
         (*fresh).len = old_len + 1;
+        (*fresh).rc_mask = rc_mask;
         let src_f = fields_ptr(hdr);
         let dst_f = fields_ptr(fresh);
         for i in 0..old_len {
-            *dst_f.add(i) = *src_f.add(i);
+            let elem = *src_f.add(i);
+            *dst_f.add(i) = elem;
+            if shared && rc_mask == RC_MASK_ALL && elem != 0 {
+                tenon_rc_inc(elem);
+            }
         }
         *dst_f.add(old_len) = val;
-        if (*hdr).rc.load(Ordering::SeqCst) > 1 {
+        if shared {
             COW_CLONES.fetch_add(1, Ordering::SeqCst);
         } else {
             REUSE_HITS.fetch_add(1, Ordering::SeqCst);
+            // Elements were moved into `fresh`; prevent `tenon_rc_dec(ptr)` from freeing them!
+            (*hdr).rc_mask = 0;
         }
         tenon_rc_dec(ptr);
         fresh as i64

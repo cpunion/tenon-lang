@@ -1,5 +1,10 @@
-use crate::perceus::{TAG_ERR, TAG_LIST, TAG_NONE, TAG_OK, TAG_RECORD_BASE, TAG_SOME};
-use crate::{CORE_SYSCALLS, is_rc_type_name, split_async_segments};
+use crate::perceus::{
+    RC_MASK_ALL, TAG_ERR, TAG_LIST, TAG_NONE, TAG_OK, TAG_RECORD_BASE, TAG_SOME,
+};
+use crate::{
+    CORE_SYSCALLS, generic_ty, is_rc_type_expr, is_text_type_expr, named_ty, resolve_alias_ty,
+    split_async_segments,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,10 +25,9 @@ pub struct BuildArtifact {
 #[derive(Debug, Clone)]
 struct LlvmFieldLayout {
     name: String,
+    ty: TypeExpr,
     preds: Vec<Expr>,
     is_rc: bool,
-    is_text: bool,
-    record_ty: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,11 +39,17 @@ struct LlvmRecordLayout {
 }
 
 #[derive(Debug, Clone)]
+struct LlvmEnumVariantLayout {
+    enum_name: String,
+    payload_tys: Vec<TypeExpr>,
+}
+
+#[derive(Debug, Clone)]
 struct LlvmFnMeta {
     params_inout: Vec<bool>,
+    param_tys: Vec<TypeExpr>,
+    ret_ty: Option<TypeExpr>,
     returns_rc: bool,
-    returns_text: bool,
-    ret_record: Option<String>,
 }
 
 const TENON_AOT_RUNTIME_C: &str = r#"
@@ -106,7 +116,11 @@ void tenon_rc_dec(int64_t ptr) {
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
     obj->rc--;
     if (obj->rc <= 0) {
-        if (obj->rc_mask != 0) {
+        if (obj->rc_mask == UINT64_MAX) {
+            for (int64_t i = 0; i < obj->len; i++) {
+                if (obj->fields[i] != 0) tenon_rc_dec(obj->fields[i]);
+            }
+        } else if (obj->rc_mask != 0) {
             int64_t n = obj->len < 64 ? obj->len : 64;
             for (int64_t i = 0; i < n; i++) {
                 if ((obj->rc_mask & (1ULL << i)) && obj->fields[i] != 0) {
@@ -132,7 +146,8 @@ int64_t tenon_rc_ensure_unique(int64_t ptr) {
     fresh->rc_mask = obj->rc_mask;
     for (int64_t i = 0; i < obj->len; i++) {
         fresh->fields[i] = obj->fields[i];
-        if (i < 64 && (obj->rc_mask & (1ULL << i)) && obj->fields[i] != 0) {
+        int is_rc = (obj->rc_mask == UINT64_MAX) || (i < 64 && (obj->rc_mask & (1ULL << i)));
+        if (is_rc && obj->fields[i] != 0) {
             tenon_rc_inc(obj->fields[i]);
         }
     }
@@ -153,7 +168,8 @@ void tenon_rc_set_field(int64_t ptr, int64_t idx, int64_t val) {
     if (idx < obj->len) {
         int64_t old = obj->fields[idx];
         obj->fields[idx] = val;
-        if (idx < 64 && (obj->rc_mask & (1ULL << idx)) && old != 0) {
+        int is_rc = (obj->rc_mask == UINT64_MAX) || (idx < 64 && (obj->rc_mask & (1ULL << idx)));
+        if (is_rc && old != 0) {
             tenon_rc_dec(old);
         }
     }
@@ -199,7 +215,9 @@ int64_t tenon_list_push(int64_t ptr, int64_t val) {
     }
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
     int64_t old_len = obj->len;
-    if (obj->rc == 1 && old_len < obj->cap) {
+    uint64_t mask = obj->rc_mask;
+    int shared = obj->rc > 1;
+    if (!shared && old_len < obj->cap) {
         g_reuse++;
         obj->fields[old_len] = val;
         obj->len = old_len + 1;
@@ -210,9 +228,20 @@ int64_t tenon_list_push(int64_t ptr, int64_t val) {
     int64_t fp = tenon_rc_alloc(4, new_cap);
     TenonObj* fresh = (TenonObj*)(uintptr_t)fp;
     fresh->len = old_len + 1;
-    for (int64_t i = 0; i < old_len; i++) fresh->fields[i] = obj->fields[i];
+    fresh->rc_mask = mask;
+    for (int64_t i = 0; i < old_len; i++) {
+        fresh->fields[i] = obj->fields[i];
+        if (shared && mask == UINT64_MAX && obj->fields[i] != 0) {
+            tenon_rc_inc(obj->fields[i]);
+        }
+    }
     fresh->fields[old_len] = val;
-    if (obj->rc > 1) g_cow++; else g_reuse++;
+    if (shared) {
+        g_cow++;
+    } else {
+        g_reuse++;
+        obj->rc_mask = 0;
+    }
     tenon_rc_dec(ptr);
     return fp;
 }
@@ -318,7 +347,6 @@ fn find_or_build_tenon_rt_staticlib() -> Result<PathBuf, String> {
             return Ok(c.clone());
         }
     }
-    // Automatically build `tenon-rt` staticlib so `tenon build` always works seamlessly!
     let ws_root = manifest_dir
         .parent()
         .and_then(|p| p.parent())
@@ -339,12 +367,13 @@ fn find_or_build_tenon_rt_staticlib() -> Result<PathBuf, String> {
     if built.exists() {
         Ok(built)
     } else {
-        Err(format!("expected staticlib at `{}` after cargo build", built.display()))
+        Err(format!(
+            "expected staticlib at `{}` after cargo build",
+            built.display()
+        ))
     }
 }
 
-/// Compile a verified Tenon `Program` directly into LLVM 22 IR (`.ll`) and link with `clang`
-/// into a standalone native Mach-O/ELF executable!
 pub fn compile_to_native_binary(
     program: &Program,
     output_path: &Path,
@@ -436,11 +465,12 @@ pub fn compile_to_native_binary(
     })
 }
 
-/// Emit clean, self-contained LLVM 22 IR (opaque `ptr`) for a Tenon `Program`.
 pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     let mut alias_preds: BTreeMap<String, Expr> = BTreeMap::new();
+    let mut alias_bases: BTreeMap<String, TypeExpr> = BTreeMap::new();
     for item in &program.items {
         if let Item::TypeAlias(ta) = item {
+            alias_bases.insert(ta.name.clone(), ta.base.clone());
             if let Some(p) = &ta.predicate {
                 alias_preds.insert(ta.name.clone(), p.clone());
             }
@@ -455,10 +485,19 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             _ => None,
         })
         .collect();
+    let enum_names: BTreeSet<String> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Enum(e) => Some(e.name.clone()),
+            _ => None,
+        })
+        .collect();
 
     let mut records: BTreeMap<String, LlvmRecordLayout> = BTreeMap::new();
     let mut field_to_idx: BTreeMap<String, usize> = BTreeMap::new();
     let mut enum_tags: BTreeMap<String, i64> = BTreeMap::new();
+    let mut enum_variants: BTreeMap<String, LlvmEnumVariantLayout> = BTreeMap::new();
     enum_tags.insert("Err".into(), TAG_ERR);
     enum_tags.insert("Ok".into(), TAG_OK);
     enum_tags.insert("None".into(), TAG_NONE);
@@ -480,22 +519,16 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
                     if let Some(fp) = &f.predicate {
                         preds.push(fp.clone());
                     }
-                    let is_text = tname == "Text";
-                    let is_rc = is_rc_type_name(&tname, &record_names);
+                    let is_rc =
+                        is_rc_type_expr(&f.ty, &alias_bases, &record_names, &enum_names);
                     if is_rc && idx < 64 {
                         rc_mask |= 1u64 << idx;
                     }
-                    let record_ty = if record_names.contains(&tname) {
-                        Some(tname)
-                    } else {
-                        None
-                    };
                     fields.push(LlvmFieldLayout {
                         name: f.name.clone(),
+                        ty: f.ty.clone(),
                         preds,
                         is_rc,
-                        is_text,
-                        record_ty,
                     });
                     field_to_idx.entry(f.name.clone()).or_insert(idx);
                 }
@@ -512,8 +545,16 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             }
             Item::Enum(e) => {
                 for v in &e.variants {
+                    let payload_tys: Vec<TypeExpr> =
+                        v.fields.iter().map(|f| f.ty.clone()).collect();
+                    let vl = LlvmEnumVariantLayout {
+                        enum_name: e.name.clone(),
+                        payload_tys,
+                    };
                     enum_tags.insert(v.name.clone(), next_enum_tag);
                     enum_tags.insert(format!("{}.{}", e.name, v.name), next_enum_tag);
+                    enum_variants.insert(v.name.clone(), vl.clone());
+                    enum_variants.insert(format!("{}.{}", e.name, v.name), vl);
                     next_enum_tag += 1;
                 }
             }
@@ -546,23 +587,26 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             spec.tenon_name.to_string(),
             LlvmFnMeta {
                 params_inout: vec![false; spec.arity],
+                param_tys: vec![named_ty("Any"); spec.arity],
+                ret_ty: Some(if spec.returns_text {
+                    named_ty("Text")
+                } else {
+                    named_ty("Int")
+                }),
                 returns_rc: spec.returns_rc,
-                returns_text: spec.returns_text,
-                ret_record: None,
             },
         );
     }
     for f in &sync_fns {
-        let ret_name = f.ret_ty.as_ref().map(|t| t.display_name());
         fn_metas.insert(
             f.name.clone(),
             LlvmFnMeta {
                 params_inout: f.params.iter().map(|p| p.is_inout).collect(),
-                returns_rc: ret_name
-                    .as_deref()
-                    .is_some_and(|n| is_rc_type_name(n, &record_names)),
-                returns_text: ret_name.as_deref() == Some("Text"),
-                ret_record: ret_name.filter(|n| record_names.contains(n)),
+                param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                ret_ty: f.ret_ty.clone(),
+                returns_rc: f.ret_ty.as_ref().is_some_and(|t| {
+                    is_rc_type_expr(t, &alias_bases, &record_names, &enum_names)
+                }),
             },
         );
     }
@@ -571,9 +615,9 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             f.name.clone(),
             LlvmFnMeta {
                 params_inout: vec![false; f.params.len()],
+                param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                ret_ty: f.ret_ty.clone(),
                 returns_rc: true,
-                returns_text: false,
-                ret_record: None,
             },
         );
     }
@@ -583,9 +627,9 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
                 format!("{}__parse", rname),
                 LlvmFnMeta {
                     params_inout: vec![false; layout.fields.len()],
+                    param_tys: layout.fields.iter().map(|f| f.ty.clone()).collect(),
+                    ret_ty: Some(generic_ty("Result", vec![named_ty(rname), named_ty("Int")])),
                     returns_rc: true,
-                    returns_text: false,
-                    ret_record: None,
                 },
             );
         }
@@ -596,10 +640,13 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
 
     for f in &sync_fns {
         let mut cg = LlvmFnGen::new(
+            &alias_bases,
             &records,
             &record_names,
+            &enum_names,
             &field_to_idx,
             &enum_tags,
+            &enum_variants,
             &fn_metas,
             &syscall_map,
             &mut string_globals,
@@ -613,10 +660,13 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             continue;
         }
         let mut cg = LlvmFnGen::new(
+            &alias_bases,
             &records,
             &record_names,
+            &enum_names,
             &field_to_idx,
             &enum_tags,
+            &enum_variants,
             &fn_metas,
             &syscall_map,
             &mut string_globals,
@@ -627,10 +677,13 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
 
     for f in &async_fns {
         let mut cg = LlvmFnGen::new(
+            &alias_bases,
             &records,
             &record_names,
+            &enum_names,
             &field_to_idx,
             &enum_tags,
+            &enum_variants,
             &fn_metas,
             &syscall_map,
             &mut string_globals,
@@ -703,17 +756,19 @@ struct LlvmLoopCtx {
 
 struct LlvmSavedLexical {
     var_ptrs: BTreeMap<String, String>,
-    var_records: BTreeMap<String, String>,
+    var_types: BTreeMap<String, TypeExpr>,
     owned_rc_vars: BTreeSet<String>,
     borrowed_rc_vars: BTreeSet<String>,
-    text_vars: BTreeSet<String>,
 }
 
 struct LlvmFnGen<'a> {
+    alias_bases: &'a BTreeMap<String, TypeExpr>,
     records: &'a BTreeMap<String, LlvmRecordLayout>,
     record_names: &'a BTreeSet<String>,
+    enum_names: &'a BTreeSet<String>,
     field_to_idx: &'a BTreeMap<String, usize>,
     enum_tags: &'a BTreeMap<String, i64>,
+    enum_variants: &'a BTreeMap<String, LlvmEnumVariantLayout>,
     fn_metas: &'a BTreeMap<String, LlvmFnMeta>,
     syscall_map: &'a BTreeMap<String, &'static str>,
     string_globals: &'a mut Vec<(String, String)>,
@@ -723,15 +778,15 @@ struct LlvmFnGen<'a> {
     entry_allocas: String,
     code: String,
     var_ptrs: BTreeMap<String, String>,
-    var_records: BTreeMap<String, String>,
+    var_types: BTreeMap<String, TypeExpr>,
     inout_vars: BTreeSet<String>,
     owned_rc_vars: BTreeSet<String>,
     borrowed_rc_vars: BTreeSet<String>,
-    text_vars: BTreeSet<String>,
     rc_scopes: Vec<Vec<(String, String)>>,
     temp_rc_scopes: Vec<Vec<String>>,
     loop_stack: Vec<LlvmLoopCtx>,
     fn_returns_rc: bool,
+    fn_ret_ty: Option<TypeExpr>,
     self_var: Option<String>,
     terminated: bool,
 }
@@ -739,19 +794,25 @@ struct LlvmFnGen<'a> {
 impl<'a> LlvmFnGen<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
+        alias_bases: &'a BTreeMap<String, TypeExpr>,
         records: &'a BTreeMap<String, LlvmRecordLayout>,
         record_names: &'a BTreeSet<String>,
+        enum_names: &'a BTreeSet<String>,
         field_to_idx: &'a BTreeMap<String, usize>,
         enum_tags: &'a BTreeMap<String, i64>,
+        enum_variants: &'a BTreeMap<String, LlvmEnumVariantLayout>,
         fn_metas: &'a BTreeMap<String, LlvmFnMeta>,
         syscall_map: &'a BTreeMap<String, &'static str>,
         string_globals: &'a mut Vec<(String, String)>,
     ) -> Self {
         Self {
+            alias_bases,
             records,
             record_names,
+            enum_names,
             field_to_idx,
             enum_tags,
+            enum_variants,
             fn_metas,
             syscall_map,
             string_globals,
@@ -761,15 +822,15 @@ impl<'a> LlvmFnGen<'a> {
             entry_allocas: String::new(),
             code: String::new(),
             var_ptrs: BTreeMap::new(),
-            var_records: BTreeMap::new(),
+            var_types: BTreeMap::new(),
             inout_vars: BTreeSet::new(),
             owned_rc_vars: BTreeSet::new(),
             borrowed_rc_vars: BTreeSet::new(),
-            text_vars: BTreeSet::new(),
             rc_scopes: Vec::new(),
             temp_rc_scopes: Vec::new(),
             loop_stack: Vec::new(),
             fn_returns_rc: false,
+            fn_ret_ty: None,
             self_var: None,
             terminated: false,
         }
@@ -778,19 +839,17 @@ impl<'a> LlvmFnGen<'a> {
     fn save_lexical(&self) -> LlvmSavedLexical {
         LlvmSavedLexical {
             var_ptrs: self.var_ptrs.clone(),
-            var_records: self.var_records.clone(),
+            var_types: self.var_types.clone(),
             owned_rc_vars: self.owned_rc_vars.clone(),
             borrowed_rc_vars: self.borrowed_rc_vars.clone(),
-            text_vars: self.text_vars.clone(),
         }
     }
 
     fn restore_lexical(&mut self, saved: LlvmSavedLexical) {
         self.var_ptrs = saved.var_ptrs;
-        self.var_records = saved.var_records;
+        self.var_types = saved.var_types;
         self.owned_rc_vars = saved.owned_rc_vars;
         self.borrowed_rc_vars = saved.borrowed_rc_vars;
-        self.text_vars = saved.text_vars;
     }
 
     fn fresh_tmp(&mut self) -> String {
@@ -858,6 +917,269 @@ impl<'a> LlvmFnGen<'a> {
             .any(|sc| sc.iter().any(|(_, s)| s == slot))
     }
 
+    fn type_is_rc(&self, ty: &TypeExpr) -> bool {
+        is_rc_type_expr(ty, self.alias_bases, self.record_names, self.enum_names)
+    }
+
+    fn list_elem_ty(&self, ty: &TypeExpr) -> Option<TypeExpr> {
+        let resolved = resolve_alias_ty(ty, self.alias_bases);
+        if let TypeExpr::Named { name, args, .. } = resolved {
+            if name == "List" && !args.is_empty() {
+                return Some(args[0].clone());
+            }
+        }
+        None
+    }
+
+    fn infer_expr_type(&self, expr: &Expr) -> TypeExpr {
+        match &expr.kind {
+            ExprKind::Int(_) => named_ty("Int"),
+            ExprKind::Bool(_) => named_ty("Bool"),
+            ExprKind::Str(_) => named_ty("Text"),
+            ExprKind::Ident(s) => {
+                if s == "None" {
+                    return generic_ty("Option", vec![named_ty("Any")]);
+                }
+                if let Some(ty) = self.var_types.get(s) {
+                    return ty.clone();
+                }
+                if let Some(vl) = self.enum_variants.get(s) {
+                    return named_ty(&vl.enum_name);
+                }
+                named_ty("Any")
+            }
+            ExprKind::RecordLit { name, .. } => named_ty(name),
+            ExprKind::List(elems) => {
+                if let Some(first) = elems.first() {
+                    generic_ty("List", vec![self.infer_expr_type(first)])
+                } else {
+                    generic_ty("List", vec![named_ty("Any")])
+                }
+            }
+            ExprKind::Binary { op: BinOp::Concat, .. } => named_ty("Text"),
+            ExprKind::Binary {
+                op: BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or,
+                ..
+            } => named_ty("Bool"),
+            ExprKind::Binary { .. } => named_ty("Int"),
+            ExprKind::Unary { op: UnOp::Not, .. } => named_ty("Bool"),
+            ExprKind::Unary { op: UnOp::Neg, .. } => named_ty("Int"),
+            ExprKind::Field { target, field } => {
+                if let ExprKind::Ident(ename) = &target.kind {
+                    if let Some(vl) = self.enum_variants.get(&format!("{}.{}", ename, field)) {
+                        return named_ty(&vl.enum_name);
+                    }
+                }
+                if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
+                    return fl.ty;
+                }
+                named_ty("Any")
+            }
+            ExprKind::Index { target, .. } => {
+                let tt = self.infer_expr_type(target);
+                self.list_elem_ty(&tt).unwrap_or_else(|| named_ty("Any"))
+            }
+            ExprKind::Call { callee, args } => match &callee.kind {
+                ExprKind::Field { target, field } if field == "parse" => {
+                    if let ExprKind::Ident(rname) = &target.kind {
+                        return generic_ty("Result", vec![named_ty(rname), named_ty("Int")]);
+                    }
+                    named_ty("Any")
+                }
+                ExprKind::Field { target, field } => {
+                    if let ExprKind::Ident(ename) = &target.kind {
+                        if let Some(vl) = self.enum_variants.get(&format!("{}.{}", ename, field)) {
+                            return named_ty(&vl.enum_name);
+                        }
+                    }
+                    named_ty("Any")
+                }
+                ExprKind::Ident(f) => {
+                    if f == "Ok" && args.len() == 1 {
+                        return generic_ty("Result", vec![self.infer_expr_type(&args[0].value), named_ty("Any")]);
+                    }
+                    if f == "Err" && args.len() == 1 {
+                        return generic_ty("Result", vec![named_ty("Any"), self.infer_expr_type(&args[0].value)]);
+                    }
+                    if f == "Some" && args.len() == 1 {
+                        return generic_ty("Option", vec![self.infer_expr_type(&args[0].value)]);
+                    }
+                    if f == "push" && args.len() == 2 {
+                        let lt = self.infer_expr_type(&args[0].value);
+                        if self.list_elem_ty(&lt).is_some_and(|e| e.display_name() != "Any") {
+                            return lt;
+                        }
+                        return generic_ty("List", vec![self.infer_expr_type(&args[1].value)]);
+                    }
+                    if let Some(meta) = self.fn_metas.get(f) {
+                        if let Some(rt) = &meta.ret_ty {
+                            return rt.clone();
+                        }
+                    }
+                    if let Some(vl) = self.enum_variants.get(f) {
+                        return named_ty(&vl.enum_name);
+                    }
+                    named_ty("Any")
+                }
+                _ => named_ty("Any"),
+            },
+            ExprKind::If { then_block, else_branch, .. } => {
+                if let Some(t) = &then_block.tail {
+                    let ty = self.infer_expr_type(t);
+                    if ty.display_name() != "Any" {
+                        return ty;
+                    }
+                }
+                if let Some(eb) = else_branch {
+                    return self.infer_expr_type(eb);
+                }
+                named_ty("Any")
+            }
+            ExprKind::Match { arms, .. } => {
+                for arm in arms {
+                    let t = self.infer_expr_type(&arm.body);
+                    if t.display_name() != "Any" {
+                        return t;
+                    }
+                }
+                named_ty("Any")
+            }
+            ExprKind::Block(blk) => blk
+                .tail
+                .as_deref()
+                .map(|t| self.infer_expr_type(t))
+                .unwrap_or_else(|| named_ty("Any")),
+            _ => named_ty("Any"),
+        }
+    }
+
+    fn resolve_field_layout(
+        &self,
+        obj_expr: &Expr,
+        field: &str,
+    ) -> Result<(usize, Option<LlvmFieldLayout>), String> {
+        let obj_ty = resolve_alias_ty(&self.infer_expr_type(obj_expr), self.alias_bases);
+        if let TypeExpr::Named { name: rname, .. } = obj_ty {
+            if let Some(layout) = self.records.get(&rname) {
+                if let Some((pos, fl)) = layout
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| f.name == field)
+                {
+                    return Ok((pos, Some(fl.clone())));
+                }
+            }
+        }
+        let idx = self
+            .field_to_idx
+            .get(field)
+            .copied()
+            .ok_or_else(|| format!("unknown field `{}` in LLVM codegen", field))?;
+        Ok((idx, None))
+    }
+
+    fn is_rc_ident(&self, s: &str) -> bool {
+        self.owned_rc_vars.contains(s)
+            || self.borrowed_rc_vars.contains(s)
+            || self.var_types.get(s).is_some_and(|t| self.type_is_rc(t))
+    }
+
+    fn expr_produces_rc(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::RecordLit { .. } | ExprKind::List(_) | ExprKind::Str(_) => true,
+            ExprKind::Binary { op: BinOp::Concat, .. } => true,
+            ExprKind::Ident(s) => {
+                s == "None"
+                    || self.is_rc_ident(s)
+                    || (self.enum_tags.contains_key(s) && !self.var_ptrs.contains_key(s))
+            }
+            ExprKind::Field { target, field } => {
+                if let ExprKind::Ident(ename) = &target.kind {
+                    if self.enum_tags.contains_key(&format!("{}.{}", ename, field)) {
+                        return true;
+                    }
+                }
+                if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
+                    return fl.is_rc;
+                }
+                false
+            }
+            ExprKind::Index { target, .. } => {
+                let tt = self.infer_expr_type(target);
+                self.list_elem_ty(&tt).is_some_and(|et| self.type_is_rc(&et))
+            }
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Ident(f) => {
+                    matches!(f.as_str(), "Ok" | "Err" | "Some" | "push" | "yield_val")
+                        || (self.enum_tags.contains_key(f) && !self.fn_metas.contains_key(f))
+                        || self.fn_metas.get(f).is_some_and(|m| m.returns_rc)
+                }
+                ExprKind::Field { target, field } => {
+                    field == "parse"
+                        || matches!(&target.kind, ExprKind::Ident(e) if self.enum_tags.contains_key(&format!("{}.{}", e, field)))
+                }
+                _ => false,
+            },
+            ExprKind::If { then_block, else_branch, .. } => {
+                else_branch.is_some()
+                    && (then_block.tail.as_deref().is_some_and(|t| self.expr_produces_rc(t))
+                        || else_branch.as_deref().is_some_and(|e| self.expr_produces_rc(e)))
+            }
+            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.expr_produces_rc(&a.body)),
+            ExprKind::Block(blk) => blk.tail.as_deref().is_some_and(|t| self.expr_produces_rc(t)),
+            _ => false,
+        }
+    }
+
+    fn is_text_expr(&self, expr: &Expr) -> bool {
+        let ty = self.infer_expr_type(expr);
+        if is_text_type_expr(&ty, self.alias_bases) {
+            return true;
+        }
+        match &expr.kind {
+            ExprKind::Str(_) | ExprKind::Binary { op: BinOp::Concat, .. } => true,
+            ExprKind::If { then_block, else_branch, .. } => {
+                then_block.tail.as_deref().is_some_and(|t| self.is_text_expr(t))
+                    || else_branch.as_deref().is_some_and(|e| self.is_text_expr(e))
+            }
+            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.is_text_expr(&a.body)),
+            ExprKind::Block(blk) => blk.tail.as_deref().is_some_and(|t| self.is_text_expr(t)),
+            _ => false,
+        }
+    }
+
+    fn infer_match_binding_type(&self, scrutinee_ty: &TypeExpr, variant_name: &str) -> TypeExpr {
+        let base = resolve_alias_ty(scrutinee_ty, self.alias_bases);
+        if variant_name == "Some" {
+            if let TypeExpr::Named { name, args, .. } = &base {
+                if name == "Option" && !args.is_empty() {
+                    return args[0].clone();
+                }
+            }
+        }
+        if variant_name == "Ok" {
+            if let TypeExpr::Named { name, args, .. } = &base {
+                if name == "Result" && !args.is_empty() {
+                    return args[0].clone();
+                }
+            }
+        }
+        if variant_name == "Err" {
+            if let TypeExpr::Named { name, args, .. } = &base {
+                if name == "Result" && args.len() >= 2 {
+                    return args[1].clone();
+                }
+            }
+        }
+        if let Some(vl) = self.enum_variants.get(variant_name) {
+            if let Some(pty) = vl.payload_tys.first() {
+                return pty.clone();
+            }
+        }
+        named_ty("Any")
+    }
+
     fn emit_sync_fn(&mut self, f: &FnDecl) -> Result<String, String> {
         let mut param_list = Vec::new();
         for (i, p) in f.params.iter().enumerate() {
@@ -866,14 +1188,8 @@ impl<'a> LlvmFnGen<'a> {
             let slot = self.fresh_var_slot(&p.name);
             self.code
                 .push_str(&format!("  store i64 {}, ptr {}\n", pname, slot));
-            let tname = p.ty.display_name();
-            if self.records.contains_key(&tname) {
-                self.var_records.insert(p.name.clone(), tname.clone());
-            }
-            if tname == "Text" {
-                self.text_vars.insert(p.name.clone());
-            }
-            if is_rc_type_name(&tname, self.record_names) {
+            self.var_types.insert(p.name.clone(), p.ty.clone());
+            if self.type_is_rc(&p.ty) {
                 self.borrowed_rc_vars.insert(p.name.clone());
             }
             if p.is_inout {
@@ -881,12 +1197,10 @@ impl<'a> LlvmFnGen<'a> {
             }
         }
 
-        self.fn_returns_rc = self
-            .fn_metas
-            .get(&f.name)
-            .is_some_and(|m| m.returns_rc);
+        self.fn_returns_rc = self.fn_metas.get(&f.name).is_some_and(|m| m.returns_rc);
+        self.fn_ret_ty = f.ret_ty.clone();
 
-        let ret_val = self.lower_block(&f.body, self.fn_returns_rc)?;
+        let ret_val = self.lower_block(&f.body, self.fn_returns_rc, f.ret_ty.as_ref())?;
         if !self.terminated {
             self.code.push_str(&format!("  ret i64 {}\n", ret_val));
         }
@@ -912,9 +1226,7 @@ impl<'a> LlvmFnGen<'a> {
             let slot = self.fresh_var_slot(&fl.name);
             self.code
                 .push_str(&format!("  store i64 {}, ptr {}\n", pname, slot));
-            if fl.is_text {
-                self.text_vars.insert(fl.name.clone());
-            }
+            self.var_types.insert(fl.name.clone(), fl.ty.clone());
             if fl.is_rc {
                 self.borrowed_rc_vars.insert(fl.name.clone());
             }
@@ -1084,7 +1396,7 @@ impl<'a> LlvmFnGen<'a> {
                 tail: None,
                 span: f.span,
             };
-            let _ = self.lower_block(&pre_blk, false)?;
+            let _ = self.lower_block(&pre_blk, false, None)?;
             for (vname, &slot) in &frame_slots {
                 let vp = self.var_ptrs[vname].clone();
                 let lv = self.fresh_tmp();
@@ -1093,7 +1405,7 @@ impl<'a> LlvmFnGen<'a> {
                     lv, vp, slot, lv
                 ));
             }
-            let cframe = self.lower_expr_owned(&step.child_expr)?;
+            let cframe = self.lower_expr_owned(&step.child_expr, None)?;
             self.code.push_str(&format!(
                 "  call void @tenon_rc_set_field(i64 %frame, i64 3, i64 {})\n  call void @tenon_rc_set_field(i64 %frame, i64 0, i64 {})\n  br label %{}\n",
                 cframe,
@@ -1146,7 +1458,7 @@ impl<'a> LlvmFnGen<'a> {
             tail: segments.final_tail.clone().map(Box::new),
             span: f.span,
         };
-        let fval = self.lower_block(&final_blk, true)?;
+        let fval = self.lower_block(&final_blk, true, None)?;
         self.code.push_str(&format!(
             "  call void @tenon_rc_set_field(i64 %frame, i64 2, i64 {})\n  call void @tenon_rc_set_field(i64 %frame, i64 0, i64 -1)\n  ret i64 1\n",
             fval
@@ -1157,131 +1469,6 @@ impl<'a> LlvmFnGen<'a> {
             sname, self.entry_allocas, self.code
         );
         Ok(format!("{}{}", ctor_ir, poll_ir))
-    }
-
-    fn resolve_field_layout(
-        &self,
-        obj_expr: &Expr,
-        field: &str,
-    ) -> Result<(usize, Option<LlvmFieldLayout>), String> {
-        if let Some(rname) = self.expr_record_name(obj_expr) {
-            if let Some(layout) = self.records.get(&rname) {
-                if let Some((pos, fl)) = layout
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .find(|(_, f)| f.name == field)
-                {
-                    return Ok((pos, Some(fl.clone())));
-                }
-            }
-        }
-        let idx = self
-            .field_to_idx
-            .get(field)
-            .copied()
-            .ok_or_else(|| format!("unknown field `{}` in LLVM codegen", field))?;
-        Ok((idx, None))
-    }
-
-    fn expr_record_name(&self, expr: &Expr) -> Option<String> {
-        match &expr.kind {
-            ExprKind::Ident(vname) => self.var_records.get(vname).cloned(),
-            ExprKind::RecordLit { name, .. } => Some(name.clone()),
-            ExprKind::Call { callee, .. } => match &callee.kind {
-                ExprKind::Ident(f) => self.fn_metas.get(f).and_then(|m| m.ret_record.clone()),
-                _ => None,
-            },
-            ExprKind::Field { target, field } => {
-                if let Some(rname) = self.expr_record_name(target) {
-                    if let Some(layout) = self.records.get(&rname) {
-                        if let Some(fl) = layout.fields.iter().find(|f| f.name == *field) {
-                            return fl.record_ty.clone();
-                        }
-                    }
-                }
-                None
-            }
-            ExprKind::Block(blk) => blk.tail.as_deref().and_then(|t| self.expr_record_name(t)),
-            ExprKind::If { then_block, else_branch, .. } => then_block
-                .tail
-                .as_deref()
-                .and_then(|t| self.expr_record_name(t))
-                .or_else(|| else_branch.as_deref().and_then(|e| self.expr_record_name(e))),
-            _ => None,
-        }
-    }
-
-    fn is_rc_ident(&self, s: &str) -> bool {
-        self.owned_rc_vars.contains(s)
-            || self.borrowed_rc_vars.contains(s)
-            || self.var_records.contains_key(s)
-            || self.text_vars.contains(s)
-    }
-
-    fn expr_produces_rc(&self, expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::RecordLit { .. } | ExprKind::List(_) | ExprKind::Str(_) => true,
-            ExprKind::Binary { op: BinOp::Concat, .. } => true,
-            ExprKind::Ident(s) => {
-                s == "None"
-                    || self.is_rc_ident(s)
-                    || (self.enum_tags.contains_key(s) && !self.var_ptrs.contains_key(s))
-            }
-            ExprKind::Field { target, field } => {
-                if let ExprKind::Ident(ename) = &target.kind {
-                    if self.enum_tags.contains_key(&format!("{}.{}", ename, field)) {
-                        return true;
-                    }
-                }
-                if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
-                    return fl.is_rc;
-                }
-                false
-            }
-            ExprKind::Call { callee, .. } => match &callee.kind {
-                ExprKind::Ident(f) => {
-                    matches!(f.as_str(), "Ok" | "Err" | "Some" | "push" | "yield_val")
-                        || (self.enum_tags.contains_key(f) && !self.fn_metas.contains_key(f))
-                        || self.fn_metas.get(f).is_some_and(|m| m.returns_rc)
-                }
-                ExprKind::Field { field, .. } => field == "parse",
-                _ => false,
-            },
-            ExprKind::If { then_block, else_branch, .. } => {
-                else_branch.is_some()
-                    && (then_block.tail.as_deref().is_some_and(|t| self.expr_produces_rc(t))
-                        || else_branch.as_deref().is_some_and(|e| self.expr_produces_rc(e)))
-            }
-            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.expr_produces_rc(&a.body)),
-            ExprKind::Block(blk) => blk.tail.as_deref().is_some_and(|t| self.expr_produces_rc(t)),
-            _ => false,
-        }
-    }
-
-    fn is_text_expr(&self, expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Str(_) => true,
-            ExprKind::Binary { op: BinOp::Concat, .. } => true,
-            ExprKind::Ident(s) => self.text_vars.contains(s),
-            ExprKind::Field { target, field } => {
-                if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
-                    return fl.is_text;
-                }
-                false
-            }
-            ExprKind::Call { callee, .. } => match &callee.kind {
-                ExprKind::Ident(f) => self.fn_metas.get(f).is_some_and(|m| m.returns_text),
-                _ => false,
-            },
-            ExprKind::If { then_block, else_branch, .. } => {
-                then_block.tail.as_deref().is_some_and(|t| self.is_text_expr(t))
-                    || else_branch.as_deref().is_some_and(|e| self.is_text_expr(e))
-            }
-            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.is_text_expr(&a.body)),
-            ExprKind::Block(blk) => blk.tail.as_deref().is_some_and(|t| self.is_text_expr(t)),
-            _ => false,
-        }
     }
 
     fn load_ident_val(&mut self, s: &str) -> Result<String, String> {
@@ -1307,7 +1494,12 @@ impl<'a> LlvmFnGen<'a> {
         }
     }
 
-    fn lower_block(&mut self, blk: &Block, want_owned_tail: bool) -> Result<String, String> {
+    fn lower_block(
+        &mut self,
+        blk: &Block,
+        want_owned_tail: bool,
+        expected_tail_ty: Option<&TypeExpr>,
+    ) -> Result<String, String> {
         let saved = self.save_lexical();
         let scope_idx = self.rc_scopes.len();
         self.rc_scopes.push(Vec::new());
@@ -1321,13 +1513,10 @@ impl<'a> LlvmFnGen<'a> {
                 Stmt::Let {
                     name, ty, value, ..
                 } => {
-                    let produces_rc = if let Some(t) = ty {
-                        is_rc_type_name(&t.display_name(), self.record_names)
-                    } else {
-                        self.expr_produces_rc(value)
-                    };
+                    let effective_ty = ty.clone().unwrap_or_else(|| self.infer_expr_type(value));
+                    let produces_rc = self.type_is_rc(&effective_ty) || self.expr_produces_rc(value);
                     let v = if produces_rc {
-                        self.lower_expr_owned(value)?
+                        self.lower_expr_owned(value, ty.as_ref())?
                     } else {
                         let mut temps = Vec::new();
                         let val = self.lower_expr_borrowed(value, &mut temps)?;
@@ -1338,36 +1527,12 @@ impl<'a> LlvmFnGen<'a> {
                     self.code
                         .push_str(&format!("  store i64 {}, ptr {}\n", v, slot));
 
-                    self.var_records.remove(name);
-                    self.text_vars.remove(name);
+                    self.var_types.insert(name.clone(), effective_ty);
                     self.owned_rc_vars.remove(name);
                     self.borrowed_rc_vars.remove(name);
-
-                    if let Some(t) = ty {
-                        let tname = t.display_name();
-                        if self.records.contains_key(&tname) {
-                            self.var_records.insert(name.clone(), tname);
-                            self.owned_rc_vars.insert(name.clone());
-                            self.rc_scopes[scope_idx].push((name.clone(), slot));
-                        } else if tname == "Text" {
-                            self.text_vars.insert(name.clone());
-                            self.owned_rc_vars.insert(name.clone());
-                            self.rc_scopes[scope_idx].push((name.clone(), slot));
-                        } else if is_rc_type_name(&tname, self.record_names) {
-                            self.owned_rc_vars.insert(name.clone());
-                            self.rc_scopes[scope_idx].push((name.clone(), slot));
-                        }
-                    } else {
-                        if let Some(rname) = self.expr_record_name(value) {
-                            self.var_records.insert(name.clone(), rname);
-                        }
-                        if self.is_text_expr(value) {
-                            self.text_vars.insert(name.clone());
-                        }
-                        if produces_rc {
-                            self.owned_rc_vars.insert(name.clone());
-                            self.rc_scopes[scope_idx].push((name.clone(), slot));
-                        }
+                    if produces_rc {
+                        self.owned_rc_vars.insert(name.clone());
+                        self.rc_scopes[scope_idx].push((name.clone(), slot));
                     }
                 }
                 Stmt::Assign {
@@ -1378,19 +1543,41 @@ impl<'a> LlvmFnGen<'a> {
                             &value.kind,
                             ExprKind::Call { callee, args }
                             if matches!(&callee.kind, ExprKind::Ident(f) if f == "push")
+                                && args.len() == 2
                                 && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
                         );
+                        let target_ty = self.var_types.get(name).cloned();
                         let target_is_rc = self.owned_rc_vars.contains(name);
                         let rhs = if consuming_push {
-                            let mut temps = Vec::new();
-                            let v = self.lower_expr_borrowed(value, &mut temps)?;
-                            if temps.last() == Some(&v) {
-                                temps.pop();
-                            }
-                            self.flush_temps(&temps);
-                            v
+                            let ExprKind::Call { args, .. } = &value.kind else {
+                                unreachable!()
+                            };
+                            let elem_is_rc = target_ty
+                                .as_ref()
+                                .and_then(|t| self.list_elem_ty(t))
+                                .is_some_and(|et| self.type_is_rc(&et))
+                                || self.expr_produces_rc(&args[1].value);
+                            let xs_val = self.load_ident_val(name)?;
+                            let val_v = if elem_is_rc {
+                                self.code.push_str(&format!(
+                                    "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                    xs_val, RC_MASK_ALL as i64
+                                ));
+                                self.lower_expr_owned(&args[1].value, None)?
+                            } else {
+                                let mut temps = Vec::new();
+                                let v = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                                self.flush_temps(&temps);
+                                v
+                            };
+                            let res = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = call i64 @tenon_list_push(i64 {}, i64 {})\n",
+                                res, xs_val, val_v
+                            ));
+                            res
                         } else if target_is_rc && *op == AssignOp::Set {
-                            self.lower_expr_owned(value)?
+                            self.lower_expr_owned(value, target_ty.as_ref())?
                         } else {
                             let mut temps = Vec::new();
                             let v = self.lower_expr_borrowed(value, &mut temps)?;
@@ -1469,8 +1656,9 @@ impl<'a> LlvmFnGen<'a> {
                         if let ExprKind::Ident(vname) = &obj.kind {
                             let (fidx, fl) = self.resolve_field_layout(obj, field)?;
                             let field_is_rc = fl.as_ref().is_some_and(|f| f.is_rc);
+                            let field_ty = fl.as_ref().map(|f| &f.ty);
                             let rhs = if field_is_rc && *op == AssignOp::Set {
-                                self.lower_expr_owned(value)?
+                                self.lower_expr_owned(value, field_ty)?
                             } else {
                                 let mut temps = Vec::new();
                                 let v = self.lower_expr_borrowed(value, &mut temps)?;
@@ -1540,10 +1728,11 @@ impl<'a> LlvmFnGen<'a> {
                     _ => {}
                 },
                 Stmt::Mutate { body, .. } => {
-                    let _ = self.lower_block(body, false)?;
+                    let _ = self.lower_block(body, false, None)?;
                 }
                 Stmt::Return { value, .. } => {
                     let mut move_skip_slot: Option<String> = None;
+                    let ret_ty_opt = self.fn_ret_ty.clone();
                     let v = match value {
                         Some(e) => {
                             if self.fn_returns_rc {
@@ -1559,16 +1748,16 @@ impl<'a> LlvmFnGen<'a> {
                                                 ));
                                                 lv
                                             } else {
-                                                self.lower_expr_owned(e)?
+                                                self.lower_expr_owned(e, ret_ty_opt.as_ref())?
                                             }
                                         } else {
-                                            self.lower_expr_owned(e)?
+                                            self.lower_expr_owned(e, ret_ty_opt.as_ref())?
                                         }
                                     } else {
-                                        self.lower_expr_owned(e)?
+                                        self.lower_expr_owned(e, ret_ty_opt.as_ref())?
                                     }
                                 } else {
-                                    self.lower_expr_owned(e)?
+                                    self.lower_expr_owned(e, ret_ty_opt.as_ref())?
                                 }
                             } else {
                                 let mut temps = Vec::new();
@@ -1641,7 +1830,7 @@ impl<'a> LlvmFnGen<'a> {
                         rc_scope_depth: self.rc_scopes.len(),
                         temp_scope_depth: self.temp_rc_scopes.len(),
                     });
-                    let _ = self.lower_block(body, false)?;
+                    let _ = self.lower_block(body, false, None)?;
                     self.loop_stack.pop();
                     if !self.terminated {
                         self.code.push_str(&format!("  br label %{}\n", hdr));
@@ -1675,16 +1864,16 @@ impl<'a> LlvmFnGen<'a> {
                                     ));
                                     last = lv;
                                 } else {
-                                    last = self.lower_expr_owned(tail)?;
+                                    last = self.lower_expr_owned(tail, expected_tail_ty)?;
                                 }
                             } else {
-                                last = self.lower_expr_owned(tail)?;
+                                last = self.lower_expr_owned(tail, expected_tail_ty)?;
                             }
                         } else {
-                            last = self.lower_expr_owned(tail)?;
+                            last = self.lower_expr_owned(tail, expected_tail_ty)?;
                         }
                     } else {
-                        last = self.lower_expr_owned(tail)?;
+                        last = self.lower_expr_owned(tail, expected_tail_ty)?;
                     }
                 } else {
                     let mut temps = Vec::new();
@@ -1704,7 +1893,11 @@ impl<'a> LlvmFnGen<'a> {
         Ok(last)
     }
 
-    fn lower_expr_owned(&mut self, expr: &Expr) -> Result<String, String> {
+    fn lower_expr_owned(
+        &mut self,
+        expr: &Expr,
+        expected_ty: Option<&TypeExpr>,
+    ) -> Result<String, String> {
         match &expr.kind {
             ExprKind::Ident(s) => {
                 if s == "self" {
@@ -1775,14 +1968,39 @@ impl<'a> LlvmFnGen<'a> {
                 self.flush_temps(&temps);
                 Ok(res)
             }
+            ExprKind::Index { target, index } => {
+                let elem_is_rc = self
+                    .list_elem_ty(&self.infer_expr_type(target))
+                    .is_some_and(|et| self.type_is_rc(&et));
+                let mut temps = Vec::new();
+                let t = self.lower_expr_borrowed(target, &mut temps)?;
+                let i = self.lower_expr_borrowed(index, &mut temps)?;
+                let mut res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
+                    res, t, i
+                ));
+                if elem_is_rc {
+                    let inc = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_rc_inc(i64 {})\n",
+                        inc, res
+                    ));
+                    res = inc;
+                }
+                self.flush_temps(&temps);
+                Ok(res)
+            }
             ExprKind::If {
                 cond,
                 then_block,
                 else_branch,
-            } => self.lower_if(cond, then_block, else_branch.as_deref(), true),
-            ExprKind::Match { scrutinee, arms } => self.lower_match(scrutinee, arms, true),
-            ExprKind::Block(blk) => self.lower_block(blk, true),
-            _ => self.lower_expr_fresh(expr),
+            } => self.lower_if(cond, then_block, else_branch.as_deref(), true, expected_ty),
+            ExprKind::Match { scrutinee, arms } => {
+                self.lower_match(scrutinee, arms, true, expected_ty)
+            }
+            ExprKind::Block(blk) => self.lower_block(blk, true, expected_ty),
+            _ => self.lower_expr_fresh(expr, expected_ty),
         }
     }
 
@@ -1848,13 +2066,23 @@ impl<'a> LlvmFnGen<'a> {
                 ));
                 Ok(res)
             }
+            ExprKind::Index { target, index } => {
+                let t = self.lower_expr_borrowed(target, temps)?;
+                let i = self.lower_expr_borrowed(index, temps)?;
+                let res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
+                    res, t, i
+                ));
+                Ok(res)
+            }
             ExprKind::If {
                 cond,
                 then_block,
                 else_branch,
             } => {
                 let want_owned = self.expr_produces_rc(expr);
-                let v = self.lower_if(cond, then_block, else_branch.as_deref(), want_owned)?;
+                let v = self.lower_if(cond, then_block, else_branch.as_deref(), want_owned, None)?;
                 if want_owned && !self.terminated {
                     temps.push(v.clone());
                 }
@@ -1862,7 +2090,7 @@ impl<'a> LlvmFnGen<'a> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 let want_owned = self.expr_produces_rc(expr);
-                let v = self.lower_match(scrutinee, arms, want_owned)?;
+                let v = self.lower_match(scrutinee, arms, want_owned, None)?;
                 if want_owned && !self.terminated {
                     temps.push(v.clone());
                 }
@@ -1870,14 +2098,14 @@ impl<'a> LlvmFnGen<'a> {
             }
             ExprKind::Block(blk) => {
                 let want_owned = self.expr_produces_rc(expr);
-                let v = self.lower_block(blk, want_owned)?;
+                let v = self.lower_block(blk, want_owned, None)?;
                 if want_owned && !self.terminated {
                     temps.push(v.clone());
                 }
                 Ok(v)
             }
             _ => {
-                let v = self.lower_expr_fresh(expr)?;
+                let v = self.lower_expr_fresh(expr, None)?;
                 if self.expr_produces_rc(expr) {
                     temps.push(v.clone());
                 }
@@ -1892,6 +2120,7 @@ impl<'a> LlvmFnGen<'a> {
         then_block: &Block,
         else_branch: Option<&Expr>,
         want_owned: bool,
+        expected_ty: Option<&TypeExpr>,
     ) -> Result<String, String> {
         let mut ctemps = Vec::new();
         let c = self.lower_expr_borrowed(cond, &mut ctemps)?;
@@ -1911,7 +2140,7 @@ impl<'a> LlvmFnGen<'a> {
             "  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n",
             cmp, c, cmp, tl, el, tl
         ));
-        let tv = self.lower_block(then_block, want_owned)?;
+        let tv = self.lower_block(then_block, want_owned, expected_ty)?;
         let then_term = self.terminated;
         if !then_term {
             self.code.push_str(&format!(
@@ -1924,7 +2153,7 @@ impl<'a> LlvmFnGen<'a> {
         let ev = match else_branch {
             Some(eb) => {
                 if want_owned {
-                    self.lower_expr_owned(eb)?
+                    self.lower_expr_owned(eb, expected_ty)?
                 } else {
                     let mut etemps = Vec::new();
                     let v = self.lower_expr_borrowed(eb, &mut etemps)?;
@@ -1961,17 +2190,9 @@ impl<'a> LlvmFnGen<'a> {
         scrutinee: &Expr,
         arms: &[MatchArm],
         want_owned: bool,
+        expected_ty: Option<&TypeExpr>,
     ) -> Result<String, String> {
-        let parse_rname = match &scrutinee.kind {
-            ExprKind::Call { callee, .. } => match &callee.kind {
-                ExprKind::Field { target, field } if field == "parse" => match &target.kind {
-                    ExprKind::Ident(rn) => Some(rn.clone()),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        };
+        let scrutinee_ty = self.infer_expr_type(scrutinee);
         let is_variant = arms
             .iter()
             .any(|a| a.patterns.iter().any(|p| matches!(p, Pattern::Variant { .. })));
@@ -2003,13 +2224,14 @@ impl<'a> LlvmFnGen<'a> {
         let mut any_reachable = false;
 
         for arm in arms {
-            let is_wild = arm
-                .patterns
-                .iter()
-                .any(|p| matches!(p, Pattern::Wildcard(_)));
+            let is_wild = arm.guard.is_none()
+                && arm
+                    .patterns
+                    .iter()
+                    .any(|p| matches!(p, Pattern::Wildcard(_)));
             if is_wild {
                 let v = if want_owned {
-                    self.lower_expr_owned(&arm.body)?
+                    self.lower_expr_owned(&arm.body, expected_ty)?
                 } else {
                     let mut atemps = Vec::new();
                     let av = self.lower_expr_borrowed(&arm.body, &mut atemps)?;
@@ -2041,9 +2263,14 @@ impl<'a> LlvmFnGen<'a> {
             }
 
             let mut cond_var: Option<String> = None;
-            let mut vbind: Option<(String, bool)> = None;
+            let mut vbind: Option<(String, String)> = None;
             for p in &arm.patterns {
                 let eq = match p {
+                    Pattern::Wildcard(_) => {
+                        let e = self.fresh_tmp();
+                        self.code.push_str(&format!("  {} = icmp eq i64 1, 1\n", e));
+                        e
+                    }
                     Pattern::Int(n, _) => {
                         let e = self.fresh_tmp();
                         self.code
@@ -2079,7 +2306,9 @@ impl<'a> LlvmFnGen<'a> {
                             .get(name)
                             .ok_or_else(|| format!("unknown variant `{}` in LLVM match", name))?;
                         if let Some(bn) = binding {
-                            vbind = Some((bn.clone(), name == "Ok"));
+                            if bn != "_" {
+                                vbind = Some((bn.clone(), name.clone()));
+                            }
                         }
                         let e = self.fresh_tmp();
                         self.code
@@ -2107,22 +2336,32 @@ impl<'a> LlvmFnGen<'a> {
                 c, mat_l, nxt_l, mat_l
             ));
             let saved_arm = self.save_lexical();
-            if let Some((bn, is_ok)) = vbind {
+            if let Some((bn, vname)) = vbind {
                 let pay = self.fresh_tmp();
                 let bslot = self.fresh_var_slot(&bn);
                 self.code.push_str(&format!(
                     "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 0)\n  store i64 {}, ptr {}\n",
                     pay, sv, pay, bslot
                 ));
-                if is_ok {
-                    if let Some(rn) = &parse_rname {
-                        self.var_records.insert(bn.clone(), rn.clone());
-                        self.borrowed_rc_vars.insert(bn);
-                    }
+                let bty = self.infer_match_binding_type(&scrutinee_ty, &vname);
+                if self.type_is_rc(&bty) {
+                    self.borrowed_rc_vars.insert(bn.clone());
                 }
+                self.var_types.insert(bn, bty);
+            }
+            if let Some(guard_expr) = &arm.guard {
+                let mut gtemps = Vec::new();
+                let gv = self.lower_expr_borrowed(guard_expr, &mut gtemps)?;
+                self.flush_temps(&gtemps);
+                let gc = self.fresh_tmp();
+                let body_l = self.fresh_lbl("mgbody");
+                self.code.push_str(&format!(
+                    "  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n",
+                    gc, gv, gc, body_l, nxt_l, body_l
+                ));
             }
             let av = if want_owned {
-                self.lower_expr_owned(&arm.body)?
+                self.lower_expr_owned(&arm.body, expected_ty)?
             } else {
                 let mut atemps = Vec::new();
                 let v = self.lower_expr_borrowed(&arm.body, &mut atemps)?;
@@ -2153,7 +2392,11 @@ impl<'a> LlvmFnGen<'a> {
         Ok(out)
     }
 
-    fn lower_expr_fresh(&mut self, expr: &Expr) -> Result<String, String> {
+    fn lower_expr_fresh(
+        &mut self,
+        expr: &Expr,
+        expected_ty: Option<&TypeExpr>,
+    ) -> Result<String, String> {
         match &expr.kind {
             ExprKind::Int(n) => Ok(n.to_string()),
             ExprKind::Bool(b) => Ok(if *b { "1" } else { "0" }.into()),
@@ -2195,7 +2438,7 @@ impl<'a> LlvmFnGen<'a> {
                         .find(|(_, f)| f.name == *fname)
                     {
                         let fv = if fl.is_rc {
-                            self.lower_expr_owned(fexpr)?
+                            self.lower_expr_owned(fexpr, Some(&fl.ty))?
                         } else {
                             let mut temps = Vec::new();
                             let v = self.lower_expr_borrowed(fexpr, &mut temps)?;
@@ -2211,6 +2454,11 @@ impl<'a> LlvmFnGen<'a> {
                 Ok(obj)
             }
             ExprKind::List(elems) => {
+                let exp_elem_ty = expected_ty.and_then(|t| self.list_elem_ty(t));
+                let elem_is_rc = exp_elem_ty
+                    .as_ref()
+                    .is_some_and(|et| self.type_is_rc(et))
+                    || elems.iter().any(|e| self.expr_produces_rc(e));
                 let obj = self.fresh_tmp();
                 self.code.push_str(&format!(
                     "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 {})\n",
@@ -2218,28 +2466,27 @@ impl<'a> LlvmFnGen<'a> {
                     TAG_LIST,
                     elems.len()
                 ));
+                if elem_is_rc {
+                    self.code.push_str(&format!(
+                        "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                        obj, RC_MASK_ALL as i64
+                    ));
+                }
                 for (idx, e) in elems.iter().enumerate() {
-                    let mut temps = Vec::new();
-                    let ev = self.lower_expr_borrowed(e, &mut temps)?;
-                    self.flush_temps(&temps);
+                    let ev = if elem_is_rc {
+                        self.lower_expr_owned(e, exp_elem_ty.as_ref())?
+                    } else {
+                        let mut temps = Vec::new();
+                        let v = self.lower_expr_borrowed(e, &mut temps)?;
+                        self.flush_temps(&temps);
+                        v
+                    };
                     self.code.push_str(&format!(
                         "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
                         obj, idx, ev
                     ));
                 }
                 Ok(obj)
-            }
-            ExprKind::Index { target, index } => {
-                let mut temps = Vec::new();
-                let t = self.lower_expr_borrowed(target, &mut temps)?;
-                let i = self.lower_expr_borrowed(index, &mut temps)?;
-                let res = self.fresh_tmp();
-                self.code.push_str(&format!(
-                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
-                    res, t, i
-                ));
-                self.flush_temps(&temps);
-                Ok(res)
             }
             ExprKind::Unary { op, expr } => {
                 let mut temps = Vec::new();
@@ -2417,39 +2664,12 @@ impl<'a> LlvmFnGen<'a> {
                     if let ExprKind::Ident(ename) = &target.kind {
                         let key = format!("{}.{}", ename, field);
                         if let Some(&tag) = self.enum_tags.get(&key) {
-                            let o = self.fresh_tmp();
-                            self.code.push_str(&format!(
-                                "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 {})\n",
-                                o,
-                                tag,
-                                args.len()
-                            ));
-                            let mut rc_mask = 0u64;
-                            for (i, a) in args.iter().enumerate() {
-                                let is_rc = self.expr_produces_rc(&a.value);
-                                let av = if is_rc {
-                                    if i < 64 {
-                                        rc_mask |= 1u64 << i;
-                                    }
-                                    self.lower_expr_owned(&a.value)?
-                                } else {
-                                    let mut temps = Vec::new();
-                                    let v = self.lower_expr_borrowed(&a.value, &mut temps)?;
-                                    self.flush_temps(&temps);
-                                    v
-                                };
-                                self.code.push_str(&format!(
-                                    "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
-                                    o, i, av
-                                ));
-                            }
-                            if rc_mask != 0 {
-                                self.code.push_str(&format!(
-                                    "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
-                                    o, rc_mask as i64
-                                ));
-                            }
-                            return Ok(o);
+                            let ptys = self
+                                .enum_variants
+                                .get(&key)
+                                .map(|vl| vl.payload_tys.clone())
+                                .unwrap_or_default();
+                            return self.lower_enum_ctor(tag, &ptys, args);
                         }
                     }
                     Err("unsupported method call in LLVM codegen".into())
@@ -2478,15 +2698,29 @@ impl<'a> LlvmFnGen<'a> {
                         return Ok(res);
                     }
                     if fname == "push" && args.len() == 2 {
-                        let mut temps = Vec::new();
-                        let xs = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                        let val = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        let xs_ty = self.infer_expr_type(&args[0].value);
+                        let elem_is_rc = self
+                            .list_elem_ty(&xs_ty)
+                            .is_some_and(|et| self.type_is_rc(&et))
+                            || self.expr_produces_rc(&args[1].value);
+                        let xs = self.lower_expr_owned(&args[0].value, expected_ty)?;
+                        let val = if elem_is_rc {
+                            self.code.push_str(&format!(
+                                "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                xs, RC_MASK_ALL as i64
+                            ));
+                            self.lower_expr_owned(&args[1].value, None)?
+                        } else {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                            self.flush_temps(&temps);
+                            v
+                        };
                         let res = self.fresh_tmp();
                         self.code.push_str(&format!(
                             "  {} = call i64 @tenon_list_push(i64 {}, i64 {})\n",
                             res, xs, val
                         ));
-                        self.flush_temps(&temps);
                         return Ok(res);
                     }
                     if fname == "yield_val" && args.len() == 1 {
@@ -2501,7 +2735,7 @@ impl<'a> LlvmFnGen<'a> {
                         return Ok(res);
                     }
                     if fname == "block_on" && args.len() == 1 {
-                        let f = self.lower_expr_owned(&args[0].value)?;
+                        let f = self.lower_expr_owned(&args[0].value, None)?;
                         let res = self.fresh_tmp();
                         self.code.push_str(&format!(
                             "  {} = call i64 @tenon_async_block_on(i64 {})\n",
@@ -2530,39 +2764,26 @@ impl<'a> LlvmFnGen<'a> {
                     }
                     if let Some(&tag) = self.enum_tags.get(fname) {
                         if !self.fn_metas.contains_key(fname) {
-                            let o = self.fresh_tmp();
-                            self.code.push_str(&format!(
-                                "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 {})\n",
-                                o,
-                                tag,
-                                args.len()
-                            ));
-                            let mut rc_mask = 0u64;
-                            for (i, a) in args.iter().enumerate() {
-                                let is_rc = self.expr_produces_rc(&a.value);
-                                let av = if is_rc {
-                                    if i < 64 {
-                                        rc_mask |= 1u64 << i;
+                            let mut ptys = self
+                                .enum_variants
+                                .get(fname)
+                                .map(|vl| vl.payload_tys.clone())
+                                .unwrap_or_default();
+                            if ptys.is_empty() {
+                                if let Some(exp) = expected_ty {
+                                    let resolved = resolve_alias_ty(exp, self.alias_bases);
+                                    if let TypeExpr::Named { name: tn, args: targs, .. } = resolved {
+                                        if fname == "Some" && tn == "Option" && !targs.is_empty() {
+                                            ptys.push(targs[0].clone());
+                                        } else if fname == "Ok" && tn == "Result" && !targs.is_empty() {
+                                            ptys.push(targs[0].clone());
+                                        } else if fname == "Err" && tn == "Result" && targs.len() >= 2 {
+                                            ptys.push(targs[1].clone());
+                                        }
                                     }
-                                    self.lower_expr_owned(&a.value)?
-                                } else {
-                                    let mut temps = Vec::new();
-                                    let v = self.lower_expr_borrowed(&a.value, &mut temps)?;
-                                    self.flush_temps(&temps);
-                                    v
-                                };
-                                self.code.push_str(&format!(
-                                    "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
-                                    o, i, av
-                                ));
+                                }
                             }
-                            if rc_mask != 0 {
-                                self.code.push_str(&format!(
-                                    "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
-                                    o, rc_mask as i64
-                                ));
-                            }
-                            return Ok(o);
+                            return self.lower_enum_ctor(tag, &ptys, args);
                         }
                     }
 
@@ -2575,6 +2796,7 @@ impl<'a> LlvmFnGen<'a> {
                             .as_ref()
                             .and_then(|m| m.params_inout.get(idx).copied())
                             .unwrap_or(false);
+                        let pty = meta.as_ref().and_then(|m| m.param_tys.get(idx));
                         if is_inout {
                             if let ExprKind::Ident(vn) = &a.value.kind {
                                 let cur = self.load_ident_val(vn)?;
@@ -2592,6 +2814,12 @@ impl<'a> LlvmFnGen<'a> {
                             } else {
                                 return Err("inout arg must be variable".into());
                             }
+                        } else if matches!(&a.value.kind, ExprKind::List(es) if es.is_empty())
+                            && pty.is_some()
+                        {
+                            let lv = self.lower_expr_owned(&a.value, pty)?;
+                            temps.push(lv.clone());
+                            avals.push(format!("i64 {}", lv));
                         } else {
                             let av = self.lower_expr_borrowed(&a.value, &mut temps)?;
                             avals.push(format!("i64 {}", av));
@@ -2628,6 +2856,48 @@ impl<'a> LlvmFnGen<'a> {
             },
             _ => Ok("0".into()),
         }
+    }
+
+    fn lower_enum_ctor(
+        &mut self,
+        tag: i64,
+        payload_tys: &[TypeExpr],
+        args: &[CallArg],
+    ) -> Result<String, String> {
+        let o = self.fresh_tmp();
+        self.code.push_str(&format!(
+            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 {})\n",
+            o,
+            tag,
+            args.len()
+        ));
+        let mut rc_mask = 0u64;
+        for (i, a) in args.iter().enumerate() {
+            let pty = payload_tys.get(i);
+            let is_rc = pty.is_some_and(|t| self.type_is_rc(t)) || self.expr_produces_rc(&a.value);
+            let av = if is_rc {
+                if i < 64 {
+                    rc_mask |= 1u64 << i;
+                }
+                self.lower_expr_owned(&a.value, pty)?
+            } else {
+                let mut temps = Vec::new();
+                let v = self.lower_expr_borrowed(&a.value, &mut temps)?;
+                self.flush_temps(&temps);
+                v
+            };
+            self.code.push_str(&format!(
+                "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
+                o, i, av
+            ));
+        }
+        if rc_mask != 0 {
+            self.code.push_str(&format!(
+                "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                o, rc_mask as i64
+            ));
+        }
+        Ok(o)
     }
 }
 
@@ -2736,15 +3006,30 @@ pub record Msg {
     body Text
 }
 
+pub enum BoxVal {
+    BEmpty
+    BMsg(Msg)
+    BList(List[Msg])
+}
+
 pub fn build_msg(t Text, b Text) Msg {
     Msg { tag = "[" ++ t ++ "]", body = b }
 }
 
 pub fn main() Int {
-    let m = build_msg("OK", "hello tenon")
-    let sub = str_slice(m.body, 0, 5)
-    assert sub == "hello"
-    let _ = sys_write_stdout(m.tag ++ " " ++ sub ++ "\n")
+    var xs List[Msg] = []
+    xs = push(xs, build_msg("OK", "hello tenon"))
+    let bv = BList(xs)
+    let out = match bv {
+        BList(items) => {
+            let m = items[0]
+            m.tag ++ " " ++ str_slice(m.body, 0, 5)
+        }
+        BMsg(m) => m.tag
+        BEmpty => ""
+    }
+    assert out == "[OK] hello"
+    let _ = sys_write_stdout(out ++ "\n")
     0
 }
 "#;

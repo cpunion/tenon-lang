@@ -287,14 +287,17 @@ fn collect_calls_in_expr(e: &Expr, out: &mut Vec<String>) {
 
 fn type_to_smt_sort(ty: &TypeExpr) -> Result<&'static str, String> {
     match ty {
-        TypeExpr::Named { name, .. } => match name.as_str() {
+        TypeExpr::Named { name, args, .. } if args.is_empty() => match name.as_str() {
             "Bool" => Ok("Bool"),
-            "Int" | "Int64" | "Int32" | "UInt16" | "USize" | "Amount" | "Odd" | "Even"
-            | "PositiveInt" | "NonNegInt" | "AmountCents" | "Percentage" => Ok("Int"),
+            "Text" | "String" | "Any" => Err(format!("non-scalar SMT sort `{}`", name)),
             _ => Ok("Int"),
         },
         _ => Err(format!("unsupported SMT sort {:?}", ty)),
     }
+}
+
+pub fn can_encode_pure_fn(f: &FnDecl) -> bool {
+    encode_pure_fn(f).is_ok()
 }
 
 fn encode_pure_fn(f: &FnDecl) -> Result<String, String> {
@@ -322,31 +325,47 @@ fn encode_pure_fn(f: &FnDecl) -> Result<String, String> {
 }
 
 pub fn encode_block(blk: &Block, subst: &BTreeMap<String, String>) -> Result<String, String> {
-    let mut bindings = Vec::new();
-    for stmt in &blk.stmts {
-        match stmt {
-            Stmt::Let { name, value, .. } => {
-                bindings.push((smt_ident(name), encode_expr(value, subst)?));
-            }
-            Stmt::Return { value: Some(e), .. } => {
-                let inner = encode_expr(e, subst)?;
-                return Ok(wrap_lets(&bindings, inner));
-            }
-            _ => return Err("unsupported statement in pure SMT function".into()),
-        }
-    }
-    let tail = match &blk.tail {
-        Some(e) => encode_expr(e, subst)?,
-        None => return Err("empty block in pure SMT function".into()),
-    };
-    Ok(wrap_lets(&bindings, tail))
+    encode_stmts(&blk.stmts, blk.tail.as_deref(), subst)
 }
 
-fn wrap_lets(bindings: &[(String, String)], mut body: String) -> String {
-    for (k, v) in bindings.iter().rev() {
-        body = format!("(let (({} {})) {})", k, v, body);
+fn encode_stmts(
+    stmts: &[Stmt],
+    tail: Option<&Expr>,
+    subst: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let Some((first, rest)) = stmts.split_first() else {
+        return match tail {
+            Some(e) => encode_expr(e, subst),
+            None => Err("empty block in pure SMT function".into()),
+        };
+    };
+    match first {
+        Stmt::Let { name, value, .. } => {
+            let v = encode_expr(value, subst)?;
+            let body = encode_stmts(rest, tail, subst)?;
+            Ok(format!("(let (({} {})) {})", smt_ident(name), v, body))
+        }
+        Stmt::Return { value: Some(e), .. } => encode_expr(e, subst),
+        Stmt::Expr {
+            expr:
+                Expr {
+                    kind:
+                        ExprKind::If {
+                            cond,
+                            then_block,
+                            else_branch: None,
+                        },
+                    ..
+                },
+            ..
+        } => {
+            let c = encode_expr(cond, subst)?;
+            let t = encode_block(then_block, subst)?;
+            let e = encode_stmts(rest, tail, subst)?;
+            Ok(format!("(ite {} {} {})", c, t, e))
+        }
+        _ => Err("unsupported statement in pure SMT function".into()),
     }
-    body
 }
 
 pub fn encode_expr(expr: &Expr, subst: &BTreeMap<String, String>) -> Result<String, String> {
