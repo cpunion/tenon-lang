@@ -13,7 +13,7 @@ use tenon_dist::run_distributed_qualification;
 use tenon_dist::server::{serve_http, serve_http_with_options};
 use tenon_dist::sync_kernel::UniversalSyncKernel;
 use tenon_dist::worker::{http_rpc, run_external_worker};
-use tenon_syntax::{Item, parse};
+use tenon_syntax::{Item, load_program_with_imports};
 use tenon_verify::{
     ProofTier, check_evolution, check_program, check_program_protocols, export_program_tla_specs,
     export_tla_specs, run_all_protocol_checks, verify_runtime_trace,
@@ -81,8 +81,7 @@ USAGE:
 }
 
 fn load_and_parse(path: &str) -> Result<tenon_syntax::Program, String> {
-    let src = fs::read_to_string(path).map_err(|e| format!("failed to read `{}`: {}", path, e))?;
-    parse(&src).map_err(|e| format!("{}: {}", path, e))
+    load_program_with_imports(Path::new(path))
 }
 
 fn cmd_check(args: &[String]) -> ExitCode {

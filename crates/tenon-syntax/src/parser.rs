@@ -208,6 +208,22 @@ impl Parser {
     fn parse_item(&mut self) -> Result<Item, ParseError> {
         let attrs = self.parse_attrs()?;
         self.skip_newlines();
+        if self.peek().kind == TokenKind::Import {
+            let start = self.bump().span;
+            self.skip_newlines();
+            let tok = self.peek().clone();
+            if let TokenKind::Str(path) = tok.kind {
+                self.bump();
+                return Ok(Item::Import {
+                    path,
+                    span: start.merge(tok.span),
+                });
+            }
+            return Err(ParseError {
+                message: format!("expected string path after `import`, found {:?}", tok.kind),
+                span: tok.span,
+            });
+        }
         let is_pub = self.eat(&TokenKind::Pub);
         self.skip_newlines();
         match self.peek().kind {
@@ -1330,6 +1346,8 @@ impl Parser {
                     | TokenKind::Assert
                     | TokenKind::Mutate
                     | TokenKind::While
+                    | TokenKind::Break
+                    | TokenKind::Continue
             ) {
                 stmts.push(self.parse_stmt()?);
                 self.eat_sep();
@@ -1449,6 +1467,14 @@ impl Parser {
                     body,
                     span,
                 })
+            }
+            TokenKind::Break => {
+                let span = self.bump().span;
+                Ok(Stmt::Break { span })
+            }
+            TokenKind::Continue => {
+                let span = self.bump().span;
+                Ok(Stmt::Continue { span })
             }
             _ => {
                 let expr = self.parse_expr()?;

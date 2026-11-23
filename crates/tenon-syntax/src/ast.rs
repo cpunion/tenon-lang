@@ -21,6 +21,7 @@ pub struct AttrArg {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Item {
+    Import { path: String, span: Span },
     TypeAlias(TypeAliasDecl),
     Record(RecordDecl),
     Enum(EnumDecl),
@@ -301,6 +302,12 @@ pub enum Stmt {
         invariants: Vec<Expr>,
         decreases: Option<Expr>,
         body: Block,
+        span: Span,
+    },
+    Break {
+        span: Span,
+    },
+    Continue {
         span: Span,
     },
     Expr {

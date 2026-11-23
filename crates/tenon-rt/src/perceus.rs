@@ -1,5 +1,5 @@
 use std::alloc::{Layout, alloc, dealloc};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 pub const TAG_ERR: i64 = 0;
 pub const TAG_OK: i64 = 1;
@@ -16,6 +16,8 @@ static REUSE_HITS: AtomicUsize = AtomicUsize::new(0);
 static COW_CLONES: AtomicUsize = AtomicUsize::new(0);
 static ASYNC_POLLS: AtomicUsize = AtomicUsize::new(0);
 static ASYNC_SUSPENDS: AtomicUsize = AtomicUsize::new(0);
+static LAST_ASSERT_FAILED: AtomicI64 = AtomicI64::new(0);
+static LAST_PRINTED: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PerceusStats {
@@ -47,12 +49,37 @@ pub fn snapshot_stats() -> PerceusStats {
     }
 }
 
+pub fn clear_assert_failed() {
+    LAST_ASSERT_FAILED.store(0, Ordering::SeqCst);
+}
+
+pub fn last_assert_failed() -> i64 {
+    LAST_ASSERT_FAILED.load(Ordering::SeqCst)
+}
+
+pub fn last_printed() -> i64 {
+    LAST_PRINTED.load(Ordering::SeqCst)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_rt_assert_fail(line: i64) {
+    LAST_ASSERT_FAILED.store(line, Ordering::SeqCst);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_rt_print_int(val: i64) -> i64 {
+    LAST_PRINTED.store(val, Ordering::SeqCst);
+    println!("{}", val);
+    val
+}
+
 #[repr(C)]
 struct ObjHeader {
     rc: AtomicUsize,
     tag: i64,
     len: usize,
     cap: usize,
+    rc_mask: u64,
 }
 
 fn obj_layout(cap: usize) -> Layout {
@@ -65,6 +92,30 @@ unsafe fn fields_ptr(hdr: *mut ObjHeader) -> *mut i64 {
     unsafe { (hdr as *mut u8).add(std::mem::size_of::<ObjHeader>()) as *mut i64 }
 }
 
+pub fn read_text_bytes<'a>(ptr: i64) -> &'a [u8] {
+    if ptr == 0 {
+        return &[];
+    }
+    unsafe {
+        let hdr = ptr as *mut ObjHeader;
+        let blen = (*hdr).len;
+        std::slice::from_raw_parts(fields_ptr(hdr) as *const u8, blen)
+    }
+}
+
+pub fn read_text(ptr: i64) -> String {
+    String::from_utf8_lossy(read_text_bytes(ptr)).to_string()
+}
+
+pub fn make_text_bytes(bytes: &[u8]) -> i64 {
+    tenon_text_new(bytes.as_ptr() as usize as i64, bytes.len() as i64)
+}
+
+pub fn make_text(s: &str) -> i64 {
+    make_text_bytes(s.as_bytes())
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_rc_alloc(tag: i64, len: i64) -> i64 {
     let len_u = len.max(0) as usize;
     let cap = len_u.max(1);
@@ -79,6 +130,7 @@ pub extern "C" fn tenon_rc_alloc(tag: i64, len: i64) -> i64 {
             tag,
             len: len_u,
             cap,
+            rc_mask: 0,
         });
         let fp = fields_ptr(raw);
         for i in 0..cap {
@@ -90,6 +142,17 @@ pub extern "C" fn tenon_rc_alloc(tag: i64, len: i64) -> i64 {
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_rc_set_rc_mask(ptr: i64, mask: i64) {
+    if ptr == 0 {
+        return;
+    }
+    unsafe {
+        (*(ptr as *mut ObjHeader)).rc_mask = mask as u64;
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_rc_inc(ptr: i64) -> i64 {
     if ptr == 0 {
         return 0;
@@ -101,6 +164,7 @@ pub extern "C" fn tenon_rc_inc(ptr: i64) -> i64 {
     ptr
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_rc_dec(ptr: i64) {
     if ptr == 0 {
         return;
@@ -109,6 +173,19 @@ pub extern "C" fn tenon_rc_dec(ptr: i64) {
         let hdr = ptr as *mut ObjHeader;
         let prev = (*hdr).rc.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
+            let rc_mask = (*hdr).rc_mask;
+            if rc_mask != 0 {
+                let len = (*hdr).len.min(64);
+                let fp = fields_ptr(hdr);
+                for i in 0..len {
+                    if (rc_mask & (1u64 << i)) != 0 {
+                        let child = *fp.add(i);
+                        if child != 0 {
+                            tenon_rc_dec(child);
+                        }
+                    }
+                }
+            }
             let cap = (*hdr).cap;
             LIVE_OBJECTS.fetch_sub(1, Ordering::SeqCst);
             dealloc(hdr as *mut u8, obj_layout(cap));
@@ -116,9 +193,7 @@ pub extern "C" fn tenon_rc_dec(ptr: i64) {
     }
 }
 
-/// Perceus FBIP / MVS Copy-on-Write primitive:
-/// - If `rc == 1`: mutates in-place with ZERO allocation (increments `REUSE_HITS`)!
-/// - If `rc > 1`: decrements old rc and allocates an independent clone with `rc == 1` (increments `COW_CLONES`)!
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_rc_ensure_unique(ptr: i64) -> i64 {
     if ptr == 0 {
         return 0;
@@ -132,17 +207,24 @@ pub extern "C" fn tenon_rc_ensure_unique(ptr: i64) -> i64 {
         COW_CLONES.fetch_add(1, Ordering::SeqCst);
         let tag = (*hdr).tag;
         let len = (*hdr).len;
+        let rc_mask = (*hdr).rc_mask;
         let fresh = tenon_rc_alloc(tag, len as i64) as *mut ObjHeader;
+        (*fresh).rc_mask = rc_mask;
         let src_f = fields_ptr(hdr);
         let dst_f = fields_ptr(fresh);
         for i in 0..len {
-            *dst_f.add(i) = *src_f.add(i);
+            let v = *src_f.add(i);
+            *dst_f.add(i) = v;
+            if i < 64 && (rc_mask & (1u64 << i)) != 0 && v != 0 {
+                tenon_rc_inc(v);
+            }
         }
         tenon_rc_dec(ptr);
         fresh as i64
     }
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_rc_get_field(ptr: i64, idx: i64) -> i64 {
     if ptr == 0 || idx < 0 {
         return 0;
@@ -157,6 +239,7 @@ pub extern "C" fn tenon_rc_get_field(ptr: i64, idx: i64) -> i64 {
     }
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_rc_set_field(ptr: i64, idx: i64, val: i64) {
     if ptr == 0 || idx < 0 {
         return;
@@ -165,11 +248,17 @@ pub extern "C" fn tenon_rc_set_field(ptr: i64, idx: i64, val: i64) {
         let hdr = ptr as *mut ObjHeader;
         let i = idx as usize;
         if i < (*hdr).len {
-            *fields_ptr(hdr).add(i) = val;
+            let fp = fields_ptr(hdr);
+            let old = *fp.add(i);
+            *fp.add(i) = val;
+            if i < 64 && ((*hdr).rc_mask & (1u64 << i)) != 0 && old != 0 {
+                tenon_rc_dec(old);
+            }
         }
     }
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_rc_get_tag(ptr: i64) -> i64 {
     if ptr == 0 {
         return -1;
@@ -177,6 +266,7 @@ pub extern "C" fn tenon_rc_get_tag(ptr: i64) -> i64 {
     unsafe { (*(ptr as *const ObjHeader)).tag }
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_rc_get_len(ptr: i64) -> i64 {
     if ptr == 0 {
         return 0;
@@ -184,6 +274,7 @@ pub extern "C" fn tenon_rc_get_len(ptr: i64) -> i64 {
     unsafe { (*(ptr as *const ObjHeader)).len as i64 }
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_text_new(data_ptr: i64, byte_len: i64) -> i64 {
     let blen = byte_len.max(0) as usize;
     let words = blen.div_ceil(8).max(1);
@@ -199,6 +290,7 @@ pub extern "C" fn tenon_text_new(data_ptr: i64, byte_len: i64) -> i64 {
     obj as i64
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_text_eq(a: i64, b: i64) -> i64 {
     if a == b {
         return 1;
@@ -218,6 +310,7 @@ pub extern "C" fn tenon_text_eq(a: i64, b: i64) -> i64 {
     }
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_list_push(ptr: i64, val: i64) -> i64 {
     if ptr == 0 {
         let fresh = tenon_rc_alloc(TAG_LIST, 1);
@@ -252,16 +345,7 @@ pub extern "C" fn tenon_list_push(ptr: i64, val: i64) -> i64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Stackless Async Coroutine State-Machine Runtime (ADR-0001 D04)
-// Frame layout:
-//   slot 0: state (0 = init, ..., -1 = done)
-//   slot 1: poll_fn_ptr (`extern "C" fn(frame_ptr: i64) -> i64`, 0=Pending, 1=Ready)
-//   slot 2: result value (valid when Ready)
-//   slot 3: active child future frame_ptr (if suspended awaiting child)
-//   slot 4+: captured params & locals surviving across `await` points
-// ---------------------------------------------------------------------------
-
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_async_frame_alloc(total_slots: i64, poll_fn_ptr: i64) -> i64 {
     let slots = total_slots.max(4);
     let frame = tenon_rc_alloc(TAG_ASYNC_FRAME, slots);
@@ -277,21 +361,23 @@ extern "C" fn tenon_async_yield_poll(frame: i64) -> i64 {
     if st == 0 {
         tenon_rc_set_field(frame, 0, 1);
         ASYNC_SUSPENDS.fetch_add(1, Ordering::SeqCst);
-        0 // Pending: genuine stackless suspension!
+        0
     } else {
         let val = tenon_rc_get_field(frame, 4);
         tenon_rc_set_field(frame, 2, val);
         tenon_rc_set_field(frame, 0, -1);
-        1 // Ready!
+        1
     }
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_async_yield_create(val: i64) -> i64 {
     let frame = tenon_async_frame_alloc(5, tenon_async_yield_poll as *const u8 as usize as i64);
     tenon_rc_set_field(frame, 4, val);
     frame
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_async_poll_frame(frame: i64) -> i64 {
     if frame == 0 {
         return 1;
@@ -305,6 +391,7 @@ pub extern "C" fn tenon_async_poll_frame(frame: i64) -> i64 {
     poll_fn(frame)
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_async_block_on(frame: i64) -> i64 {
     loop {
         if tenon_async_poll_frame(frame) != 0 {

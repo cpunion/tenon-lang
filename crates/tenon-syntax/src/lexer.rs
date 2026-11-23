@@ -8,6 +8,7 @@ pub enum TokenKind {
     Str(String),
 
     // Keywords
+    Import,
     Pub,
     Type,
     Distinct,
@@ -30,6 +31,8 @@ pub enum TokenKind {
     If,
     Else,
     While,
+    Break,
+    Continue,
     Match,
     Return,
     Assert,
@@ -169,37 +172,37 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 let scol = col;
                 i += 1;
                 col += 1;
-                let mut s = String::new();
+                let mut raw: Vec<u8> = Vec::new();
                 let mut closed = false;
                 while i < bytes.len() {
-                    let c = bytes[i] as char;
-                    if c == '"' {
+                    let b = bytes[i];
+                    if b == b'"' {
                         i += 1;
                         col += 1;
                         closed = true;
                         break;
                     }
-                    if c == '\\' && i + 1 < bytes.len() {
+                    if b == b'\\' && i + 1 < bytes.len() {
                         i += 1;
                         col += 1;
-                        match bytes[i] as char {
-                            'n' => s.push('\n'),
-                            't' => s.push('\t'),
-                            'r' => s.push('\r'),
-                            '\\' => s.push('\\'),
-                            '"' => s.push('"'),
-                            other => s.push(other),
+                        match bytes[i] {
+                            b'n' => raw.push(b'\n'),
+                            b't' => raw.push(b'\t'),
+                            b'r' => raw.push(b'\r'),
+                            b'\\' => raw.push(b'\\'),
+                            b'"' => raw.push(b'"'),
+                            other => raw.push(other),
                         }
                         i += 1;
                         col += 1;
                     } else {
-                        if c == '\n' {
+                        if b == b'\n' {
                             line += 1;
                             col = 1;
                         } else {
                             col += 1;
                         }
-                        s.push(c);
+                        raw.push(b);
                         i += 1;
                     }
                 }
@@ -209,6 +212,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                         span: Span::new(start, i, sline, scol),
                     });
                 }
+                let s = String::from_utf8_lossy(&raw).into_owned();
                 tokens.push(Token {
                     kind: TokenKind::Str(s),
                     span: Span::new(start, i, sline, scol),
@@ -254,6 +258,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 }
                 let word = &src[start..i];
                 let kind = match word {
+                    "import" => TokenKind::Import,
                     "pub" => TokenKind::Pub,
                     "type" => TokenKind::Type,
                     "distinct" => TokenKind::Distinct,
@@ -276,6 +281,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                     "if" => TokenKind::If,
                     "else" => TokenKind::Else,
                     "while" => TokenKind::While,
+                    "break" => TokenKind::Break,
+                    "continue" => TokenKind::Continue,
                     "match" => TokenKind::Match,
                     "return" => TokenKind::Return,
                     "assert" => TokenKind::Assert,

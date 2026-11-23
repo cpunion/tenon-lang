@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/tenon-syntax",
     "crates/tenon-verify",
+    "crates/tenon-rt",
     "crates/tenon-codegen",
     "crates/tenon-dist",
     "crates/tenon-cli",
@@ -28,5 +29,6 @@ cranelift-module = "0.125"
 cranelift-native = "0.125"
 tenon-syntax = { path = "crates/tenon-syntax" }
 tenon-verify = { path = "crates/tenon-verify" }
+tenon-rt = { path = "crates/tenon-rt" }
 tenon-codegen = { path = "crates/tenon-codegen" }
 tenon-dist = { path = "crates/tenon-dist" }

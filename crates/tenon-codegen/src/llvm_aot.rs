@@ -1,8 +1,8 @@
 use crate::perceus::{TAG_ERR, TAG_LIST, TAG_NONE, TAG_OK, TAG_RECORD_BASE, TAG_SOME};
-use crate::split_async_segments;
+use crate::{CORE_SYSCALLS, is_rc_type_name, split_async_segments};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tenon_syntax::*;
 
@@ -15,9 +15,19 @@ pub struct BuildArtifact {
 }
 
 #[derive(Debug, Clone)]
+struct LlvmFieldLayout {
+    name: String,
+    preds: Vec<Expr>,
+    is_rc: bool,
+    is_text: bool,
+    record_ty: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct LlvmRecordLayout {
     tag: i64,
-    fields: Vec<(String, Vec<Expr>)>,
+    fields: Vec<LlvmFieldLayout>,
+    rc_mask: i64,
     where_clauses: Vec<Expr>,
 }
 
@@ -25,6 +35,8 @@ struct LlvmRecordLayout {
 struct LlvmFnMeta {
     params_inout: Vec<bool>,
     returns_rc: bool,
+    returns_text: bool,
+    ret_record: Option<String>,
 }
 
 const TENON_AOT_RUNTIME_C: &str = r#"
@@ -38,6 +50,7 @@ typedef struct {
     int64_t tag;
     int64_t len;
     int64_t cap;
+    uint64_t rc_mask;
     int64_t fields[];
 } TenonObj;
 
@@ -67,9 +80,15 @@ int64_t tenon_rc_alloc(int64_t tag, int64_t len) {
     obj->tag = tag;
     obj->len = lu;
     obj->cap = cap;
+    obj->rc_mask = 0;
     g_live++;
     g_allocs++;
     return (int64_t)(uintptr_t)obj;
+}
+
+void tenon_rc_set_rc_mask(int64_t ptr, int64_t mask) {
+    if (ptr == 0) return;
+    ((TenonObj*)(uintptr_t)ptr)->rc_mask = (uint64_t)mask;
 }
 
 int64_t tenon_rc_inc(int64_t ptr) {
@@ -84,6 +103,14 @@ void tenon_rc_dec(int64_t ptr) {
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
     obj->rc--;
     if (obj->rc <= 0) {
+        if (obj->rc_mask != 0) {
+            int64_t n = obj->len < 64 ? obj->len : 64;
+            for (int64_t i = 0; i < n; i++) {
+                if ((obj->rc_mask & (1ULL << i)) && obj->fields[i] != 0) {
+                    tenon_rc_dec(obj->fields[i]);
+                }
+            }
+        }
         g_live--;
         free(obj);
     }
@@ -99,7 +126,13 @@ int64_t tenon_rc_ensure_unique(int64_t ptr) {
     g_cow++;
     int64_t fresh_p = tenon_rc_alloc(obj->tag, obj->len);
     TenonObj* fresh = (TenonObj*)(uintptr_t)fresh_p;
-    for (int64_t i = 0; i < obj->len; i++) fresh->fields[i] = obj->fields[i];
+    fresh->rc_mask = obj->rc_mask;
+    for (int64_t i = 0; i < obj->len; i++) {
+        fresh->fields[i] = obj->fields[i];
+        if (i < 64 && (obj->rc_mask & (1ULL << i)) && obj->fields[i] != 0) {
+            tenon_rc_inc(obj->fields[i]);
+        }
+    }
     tenon_rc_dec(ptr);
     return fresh_p;
 }
@@ -114,7 +147,13 @@ int64_t tenon_rc_get_field(int64_t ptr, int64_t idx) {
 void tenon_rc_set_field(int64_t ptr, int64_t idx, int64_t val) {
     if (ptr == 0 || idx < 0) return;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    if (idx < obj->len) obj->fields[idx] = val;
+    if (idx < obj->len) {
+        int64_t old = obj->fields[idx];
+        obj->fields[idx] = val;
+        if (idx < 64 && (obj->rc_mask & (1ULL << idx)) && old != 0) {
+            tenon_rc_dec(old);
+        }
+    }
 }
 
 int64_t tenon_rc_get_tag(int64_t ptr) {
@@ -238,6 +277,69 @@ int main(void) {
 }
 "#;
 
+const TENON_RT_MAIN_SHIM_C: &str = r#"
+#include <stdint.h>
+extern int64_t tenon_fn_main(void);
+int main(void) {
+    return (int)tenon_fn_main();
+}
+"#;
+
+fn ir_uses_tenon_rt_syscalls(ir: &str) -> bool {
+    ir.contains("call i64 @tenon_byte_")
+        || ir.contains("call i64 @tenon_str_")
+        || ir.contains("call i64 @tenon_sys_")
+}
+
+fn find_or_build_tenon_rt_staticlib() -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("target/release/libtenon_rt.a"));
+        candidates.push(cwd.join("target/debug/libtenon_rt.a"));
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(ws_root) = manifest_dir.parent().and_then(|p| p.parent()) {
+        candidates.push(ws_root.join("target/release/libtenon_rt.a"));
+        candidates.push(ws_root.join("target/debug/libtenon_rt.a"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("libtenon_rt.a"));
+            if let Some(parent) = dir.parent() {
+                candidates.push(parent.join("libtenon_rt.a"));
+            }
+        }
+    }
+    for c in &candidates {
+        if c.exists() {
+            return Ok(c.clone());
+        }
+    }
+    // Automatically build `tenon-rt` staticlib so `tenon build` always works seamlessly!
+    let ws_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let build = Command::new("cargo")
+        .args(["build", "-p", "tenon-rt"])
+        .current_dir(&ws_root)
+        .output()
+        .map_err(|e| format!("failed to build tenon-rt staticlib: {}", e))?;
+    if !build.status.success() {
+        return Err(format!(
+            "cargo build -p tenon-rt failed:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        ));
+    }
+    let built = ws_root.join("target/debug/libtenon_rt.a");
+    if built.exists() {
+        Ok(built)
+    } else {
+        Err(format!("expected staticlib at `{}` after cargo build", built.display()))
+    }
+}
+
 /// Compile a verified Tenon `Program` directly into LLVM 22 IR (`.ll`) and link with `clang`
 /// into a standalone native Mach-O/ELF executable!
 pub fn compile_to_native_binary(
@@ -256,7 +358,12 @@ pub fn compile_to_native_binary(
     let tmp_rt = std::env::temp_dir().join(format!("tenon_rt_{}_{}.c", pid, nonce));
 
     fs::write(&tmp_ll, &ir).map_err(|e| e.to_string())?;
-    fs::write(&tmp_rt, TENON_AOT_RUNTIME_C).map_err(|e| e.to_string())?;
+    let needs_full_rt = ir_uses_tenon_rt_syscalls(&ir);
+    if needs_full_rt {
+        fs::write(&tmp_rt, TENON_RT_MAIN_SHIM_C).map_err(|e| e.to_string())?;
+    } else {
+        fs::write(&tmp_rt, TENON_AOT_RUNTIME_C).map_err(|e| e.to_string())?;
+    }
     if let Some(p) = emit_ll_path {
         if let Some(parent) = p.parent() {
             let _ = fs::create_dir_all(parent);
@@ -273,15 +380,39 @@ pub fn compile_to_native_binary(
         _ => "-O3",
     };
 
-    let out = Command::new("clang")
-        .args([
-            opt_flag,
-            "-Wno-override-module",
-            tmp_ll.to_str().unwrap(),
-            tmp_rt.to_str().unwrap(),
-            "-o",
-            output_path.to_str().unwrap(),
-        ])
+    let mut cmd = Command::new("clang");
+    cmd.args([
+        opt_flag,
+        "-Wno-override-module",
+        tmp_ll.to_str().unwrap(),
+        tmp_rt.to_str().unwrap(),
+    ]);
+    if needs_full_rt {
+        let staticlib = find_or_build_tenon_rt_staticlib()?;
+        cmd.arg(staticlib.to_str().unwrap());
+        #[cfg(target_os = "macos")]
+        {
+            cmd.args([
+                "-framework",
+                "Security",
+                "-framework",
+                "CoreFoundation",
+                "-framework",
+                "SystemConfiguration",
+                "-liconv",
+                "-lpthread",
+                "-ldl",
+                "-lm",
+            ]);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            cmd.args(["-lpthread", "-ldl", "-lm"]);
+        }
+    }
+    cmd.args(["-o", output_path.to_str().unwrap()]);
+
+    let out = cmd
         .output()
         .map_err(|e| format!("failed to invoke LLVM clang: {}", e))?;
 
@@ -316,6 +447,15 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
         }
     }
 
+    let record_names: BTreeSet<String> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Record(r) if r.type_params.is_empty() => Some(r.name.clone()),
+            _ => None,
+        })
+        .collect();
+
     let mut records: BTreeMap<String, LlvmRecordLayout> = BTreeMap::new();
     let mut field_to_idx: BTreeMap<String, usize> = BTreeMap::new();
     let mut enum_tags: BTreeMap<String, i64> = BTreeMap::new();
@@ -330,15 +470,33 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
         match item {
             Item::Record(r) if r.type_params.is_empty() => {
                 let mut fields = Vec::new();
+                let mut rc_mask = 0u64;
                 for (idx, f) in r.fields.iter().enumerate() {
+                    let tname = f.ty.display_name();
                     let mut preds = Vec::new();
-                    if let Some(ap) = alias_preds.get(&f.ty.display_name()) {
+                    if let Some(ap) = alias_preds.get(&tname) {
                         preds.push(ap.clone());
                     }
                     if let Some(fp) = &f.predicate {
                         preds.push(fp.clone());
                     }
-                    fields.push((f.name.clone(), preds));
+                    let is_text = tname == "Text";
+                    let is_rc = is_rc_type_name(&tname, &record_names);
+                    if is_rc && idx < 64 {
+                        rc_mask |= 1u64 << idx;
+                    }
+                    let record_ty = if record_names.contains(&tname) {
+                        Some(tname)
+                    } else {
+                        None
+                    };
+                    fields.push(LlvmFieldLayout {
+                        name: f.name.clone(),
+                        preds,
+                        is_rc,
+                        is_text,
+                        record_ty,
+                    });
                     field_to_idx.entry(f.name.clone()).or_insert(idx);
                 }
                 records.insert(
@@ -346,6 +504,7 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
                     LlvmRecordLayout {
                         tag: next_rec_tag,
                         fields,
+                        rc_mask: rc_mask as i64,
                         where_clauses: r.where_clauses.clone(),
                     },
                 );
@@ -380,12 +539,30 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
         .collect();
 
     let mut fn_metas: BTreeMap<String, LlvmFnMeta> = BTreeMap::new();
+    let mut syscall_map: BTreeMap<String, &'static str> = BTreeMap::new();
+    for spec in CORE_SYSCALLS {
+        syscall_map.insert(spec.tenon_name.to_string(), spec.c_symbol);
+        fn_metas.insert(
+            spec.tenon_name.to_string(),
+            LlvmFnMeta {
+                params_inout: vec![false; spec.arity],
+                returns_rc: spec.returns_rc,
+                returns_text: spec.returns_text,
+                ret_record: None,
+            },
+        );
+    }
     for f in &sync_fns {
+        let ret_name = f.ret_ty.as_ref().map(|t| t.display_name());
         fn_metas.insert(
             f.name.clone(),
             LlvmFnMeta {
                 params_inout: f.params.iter().map(|p| p.is_inout).collect(),
-                returns_rc: f.ret_ty.as_ref().is_some_and(|t| is_rc_type(t, &records)),
+                returns_rc: ret_name
+                    .as_deref()
+                    .is_some_and(|n| is_rc_type_name(n, &record_names)),
+                returns_text: ret_name.as_deref() == Some("Text"),
+                ret_record: ret_name.filter(|n| record_names.contains(n)),
             },
         );
     }
@@ -395,6 +572,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             LlvmFnMeta {
                 params_inout: vec![false; f.params.len()],
                 returns_rc: true,
+                returns_text: false,
+                ret_record: None,
             },
         );
     }
@@ -405,6 +584,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
                 LlvmFnMeta {
                     params_inout: vec![false; layout.fields.len()],
                     returns_rc: true,
+                    returns_text: false,
+                    ret_record: None,
                 },
             );
         }
@@ -413,26 +594,47 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     let mut string_globals: Vec<(String, String)> = Vec::new();
     let mut fn_defs = String::new();
 
-    // 1. Emit all sync functions
     for f in &sync_fns {
-        let mut cg = LlvmFnGen::new(&records, &field_to_idx, &enum_tags, &fn_metas, &mut string_globals);
+        let mut cg = LlvmFnGen::new(
+            &records,
+            &record_names,
+            &field_to_idx,
+            &enum_tags,
+            &fn_metas,
+            &syscall_map,
+            &mut string_globals,
+        );
         fn_defs.push_str(&cg.emit_sync_fn(f)?);
         fn_defs.push('\n');
     }
 
-    // 2. Emit auto-derived `<Record>__parse(...)` parsers
     for (rname, layout) in &records {
         if layout.fields.is_empty() {
             continue;
         }
-        let mut cg = LlvmFnGen::new(&records, &field_to_idx, &enum_tags, &fn_metas, &mut string_globals);
+        let mut cg = LlvmFnGen::new(
+            &records,
+            &record_names,
+            &field_to_idx,
+            &enum_tags,
+            &fn_metas,
+            &syscall_map,
+            &mut string_globals,
+        );
         fn_defs.push_str(&cg.emit_record_parser(rname, layout)?);
         fn_defs.push('\n');
     }
 
-    // 3. Emit stackless `async fn` constructors + state-machine poll functions!
     for f in &async_fns {
-        let mut cg = LlvmFnGen::new(&records, &field_to_idx, &enum_tags, &fn_metas, &mut string_globals);
+        let mut cg = LlvmFnGen::new(
+            &records,
+            &record_names,
+            &field_to_idx,
+            &enum_tags,
+            &fn_metas,
+            &syscall_map,
+            &mut string_globals,
+        );
         fn_defs.push_str(&cg.emit_async_fn(f)?);
         fn_defs.push('\n');
     }
@@ -442,6 +644,7 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     ir.push_str("declare void @tenon_rt_assert_fail(i64)\n");
     ir.push_str("declare i64 @tenon_rt_print_int(i64)\n");
     ir.push_str("declare i64 @tenon_rc_alloc(i64, i64)\n");
+    ir.push_str("declare void @tenon_rc_set_rc_mask(i64, i64)\n");
     ir.push_str("declare i64 @tenon_rc_inc(i64)\n");
     ir.push_str("declare void @tenon_rc_dec(i64)\n");
     ir.push_str("declare i64 @tenon_rc_ensure_unique(i64)\n");
@@ -455,7 +658,12 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     ir.push_str("declare i64 @tenon_async_frame_alloc(i64, i64)\n");
     ir.push_str("declare i64 @tenon_async_yield_create(i64)\n");
     ir.push_str("declare i64 @tenon_async_poll_frame(i64)\n");
-    ir.push_str("declare i64 @tenon_async_block_on(i64)\n\n");
+    ir.push_str("declare i64 @tenon_async_block_on(i64)\n");
+    for spec in CORE_SYSCALLS {
+        let params = vec!["i64"; spec.arity].join(", ");
+        ir.push_str(&format!("declare i64 @{}({})\n", spec.c_symbol, params));
+    }
+    ir.push('\n');
 
     for (gname, text) in &string_globals {
         let escaped = escape_llvm_bytes(text.as_bytes());
@@ -486,60 +694,103 @@ fn escape_llvm_bytes(bytes: &[u8]) -> String {
     out
 }
 
-fn is_rc_type(ty: &TypeExpr, records: &BTreeMap<String, LlvmRecordLayout>) -> bool {
-    let name = ty.display_name();
-    records.contains_key(&name)
-        || name == "Text"
-        || name.starts_with("List[")
-        || name.starts_with("Option[")
-        || name.starts_with("Result[")
+struct LlvmLoopCtx {
+    hdr_lbl: String,
+    exit_lbl: String,
+    rc_scope_depth: usize,
+    temp_scope_depth: usize,
+}
+
+struct LlvmSavedLexical {
+    var_ptrs: BTreeMap<String, String>,
+    var_records: BTreeMap<String, String>,
+    owned_rc_vars: BTreeSet<String>,
+    borrowed_rc_vars: BTreeSet<String>,
+    text_vars: BTreeSet<String>,
 }
 
 struct LlvmFnGen<'a> {
     records: &'a BTreeMap<String, LlvmRecordLayout>,
+    record_names: &'a BTreeSet<String>,
     field_to_idx: &'a BTreeMap<String, usize>,
     enum_tags: &'a BTreeMap<String, i64>,
     fn_metas: &'a BTreeMap<String, LlvmFnMeta>,
+    syscall_map: &'a BTreeMap<String, &'static str>,
     string_globals: &'a mut Vec<(String, String)>,
     tmp: usize,
     lbl: usize,
+    slot_id: usize,
     entry_allocas: String,
     code: String,
     var_ptrs: BTreeMap<String, String>,
     var_records: BTreeMap<String, String>,
     inout_vars: BTreeSet<String>,
     owned_rc_vars: BTreeSet<String>,
+    borrowed_rc_vars: BTreeSet<String>,
     text_vars: BTreeSet<String>,
+    rc_scopes: Vec<Vec<(String, String)>>,
+    temp_rc_scopes: Vec<Vec<String>>,
+    loop_stack: Vec<LlvmLoopCtx>,
+    fn_returns_rc: bool,
     self_var: Option<String>,
     terminated: bool,
 }
 
 impl<'a> LlvmFnGen<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         records: &'a BTreeMap<String, LlvmRecordLayout>,
+        record_names: &'a BTreeSet<String>,
         field_to_idx: &'a BTreeMap<String, usize>,
         enum_tags: &'a BTreeMap<String, i64>,
         fn_metas: &'a BTreeMap<String, LlvmFnMeta>,
+        syscall_map: &'a BTreeMap<String, &'static str>,
         string_globals: &'a mut Vec<(String, String)>,
     ) -> Self {
         Self {
             records,
+            record_names,
             field_to_idx,
             enum_tags,
             fn_metas,
+            syscall_map,
             string_globals,
             tmp: 0,
             lbl: 0,
+            slot_id: 0,
             entry_allocas: String::new(),
             code: String::new(),
             var_ptrs: BTreeMap::new(),
             var_records: BTreeMap::new(),
             inout_vars: BTreeSet::new(),
             owned_rc_vars: BTreeSet::new(),
+            borrowed_rc_vars: BTreeSet::new(),
             text_vars: BTreeSet::new(),
+            rc_scopes: Vec::new(),
+            temp_rc_scopes: Vec::new(),
+            loop_stack: Vec::new(),
+            fn_returns_rc: false,
             self_var: None,
             terminated: false,
         }
+    }
+
+    fn save_lexical(&self) -> LlvmSavedLexical {
+        LlvmSavedLexical {
+            var_ptrs: self.var_ptrs.clone(),
+            var_records: self.var_records.clone(),
+            owned_rc_vars: self.owned_rc_vars.clone(),
+            borrowed_rc_vars: self.borrowed_rc_vars.clone(),
+            text_vars: self.text_vars.clone(),
+        }
+    }
+
+    fn restore_lexical(&mut self, saved: LlvmSavedLexical) {
+        self.var_ptrs = saved.var_ptrs;
+        self.var_records = saved.var_records;
+        self.owned_rc_vars = saved.owned_rc_vars;
+        self.borrowed_rc_vars = saved.borrowed_rc_vars;
+        self.text_vars = saved.text_vars;
     }
 
     fn fresh_tmp(&mut self) -> String {
@@ -552,15 +803,59 @@ impl<'a> LlvmFnGen<'a> {
         format!("{}_{}", prefix, self.lbl)
     }
 
-    fn ensure_var_slot(&mut self, name: &str) -> String {
-        if let Some(p) = self.var_ptrs.get(name) {
-            return p.clone();
-        }
-        let slot = format!("%v_{}_{}", sanitize(name), self.var_ptrs.len());
+    fn fresh_var_slot(&mut self, name: &str) -> String {
+        self.slot_id += 1;
+        let slot = format!("%v_{}_{}", sanitize(name), self.slot_id);
         self.entry_allocas
             .push_str(&format!("  {} = alloca i64\n  store i64 0, ptr {}\n", slot, slot));
         self.var_ptrs.insert(name.to_string(), slot.clone());
         slot
+    }
+
+    fn ensure_var_slot(&mut self, name: &str) -> String {
+        if let Some(p) = self.var_ptrs.get(name) {
+            return p.clone();
+        }
+        self.fresh_var_slot(name)
+    }
+
+    fn flush_temps(&mut self, temps: &[String]) {
+        for v in temps.iter().rev() {
+            self.code
+                .push_str(&format!("  call void @tenon_rc_dec(i64 {})\n", v));
+        }
+    }
+
+    fn emit_cleanup_scopes_from(&mut self, from_depth: usize, skip_slot: Option<&str>) {
+        let scopes: Vec<Vec<(String, String)>> = self.rc_scopes[from_depth..].to_vec();
+        for scope in scopes.iter().rev() {
+            for (_, slot) in scope.iter().rev() {
+                if skip_slot == Some(slot.as_str()) {
+                    continue;
+                }
+                let h = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = load i64, ptr {}\n  call void @tenon_rc_dec(i64 {})\n",
+                    h, slot, h
+                ));
+            }
+        }
+    }
+
+    fn emit_cleanup_temp_scopes_from(&mut self, from_depth: usize) {
+        let scopes: Vec<Vec<String>> = self.temp_rc_scopes[from_depth..].to_vec();
+        for scope in scopes.iter().rev() {
+            for val in scope.iter().rev() {
+                self.code
+                    .push_str(&format!("  call void @tenon_rc_dec(i64 {})\n", val));
+            }
+        }
+    }
+
+    fn find_owned_slot_in_scopes(&self, slot: &str, from_depth: usize) -> bool {
+        self.rc_scopes[from_depth..]
+            .iter()
+            .any(|sc| sc.iter().any(|(_, s)| s == slot))
     }
 
     fn emit_sync_fn(&mut self, f: &FnDecl) -> Result<String, String> {
@@ -568,7 +863,7 @@ impl<'a> LlvmFnGen<'a> {
         for (i, p) in f.params.iter().enumerate() {
             let pname = format!("%arg_{}", i);
             param_list.push(format!("i64 {}", pname));
-            let slot = self.ensure_var_slot(&p.name);
+            let slot = self.fresh_var_slot(&p.name);
             self.code
                 .push_str(&format!("  store i64 {}, ptr {}\n", pname, slot));
             let tname = p.ty.display_name();
@@ -578,18 +873,21 @@ impl<'a> LlvmFnGen<'a> {
             if tname == "Text" {
                 self.text_vars.insert(p.name.clone());
             }
+            if is_rc_type_name(&tname, self.record_names) {
+                self.borrowed_rc_vars.insert(p.name.clone());
+            }
             if p.is_inout {
                 self.inout_vars.insert(p.name.clone());
             }
         }
 
-        let ret_ident = f.body.tail.as_deref().and_then(|t| match &t.kind {
-            ExprKind::Ident(s) => Some(s.clone()),
-            _ => None,
-        });
-        let ret_val = self.lower_block(&f.body)?;
+        self.fn_returns_rc = self
+            .fn_metas
+            .get(&f.name)
+            .is_some_and(|m| m.returns_rc);
+
+        let ret_val = self.lower_block(&f.body, self.fn_returns_rc)?;
         if !self.terminated {
-            self.emit_cleanup(ret_ident.as_deref());
             self.code.push_str(&format!("  ret i64 {}\n", ret_val));
         }
 
@@ -608,18 +906,26 @@ impl<'a> LlvmFnGen<'a> {
         layout: &LlvmRecordLayout,
     ) -> Result<String, String> {
         let mut param_list = Vec::new();
-        for (i, (fname, _)) in layout.fields.iter().enumerate() {
+        for (i, fl) in layout.fields.iter().enumerate() {
             let pname = format!("%arg_{}", i);
             param_list.push(format!("i64 {}", pname));
-            let slot = self.ensure_var_slot(fname);
+            let slot = self.fresh_var_slot(&fl.name);
             self.code
                 .push_str(&format!("  store i64 {}, ptr {}\n", pname, slot));
+            if fl.is_text {
+                self.text_vars.insert(fl.name.clone());
+            }
+            if fl.is_rc {
+                self.borrowed_rc_vars.insert(fl.name.clone());
+            }
         }
 
-        for (idx, (fname, preds)) in layout.fields.iter().enumerate() {
-            for pred in preds {
-                self.self_var = Some(fname.clone());
-                let cv = self.lower_expr(pred)?;
+        for (idx, fl) in layout.fields.iter().enumerate() {
+            for pred in &fl.preds {
+                self.self_var = Some(fl.name.clone());
+                let mut temps = Vec::new();
+                let cv = self.lower_expr_borrowed(pred, &mut temps)?;
+                self.flush_temps(&temps);
                 self.self_var = None;
                 let cond = self.fresh_tmp();
                 let fail_l = self.fresh_lbl("pfail");
@@ -639,7 +945,9 @@ impl<'a> LlvmFnGen<'a> {
         }
 
         for wc in &layout.where_clauses {
-            let cv = self.lower_expr(wc)?;
+            let mut temps = Vec::new();
+            let cv = self.lower_expr_borrowed(wc, &mut temps)?;
+            self.flush_temps(&temps);
             let cond = self.fresh_tmp();
             let fail_l = self.fresh_lbl("wfail");
             let ok_l = self.fresh_lbl("wok");
@@ -663,18 +971,32 @@ impl<'a> LlvmFnGen<'a> {
             layout.tag,
             layout.fields.len()
         ));
-        for (idx, (fname, _)) in layout.fields.iter().enumerate() {
-            let slot = self.var_ptrs[fname].clone();
-            let fv = self.fresh_tmp();
+        if layout.rc_mask != 0 {
             self.code.push_str(&format!(
-                "  {} = load i64, ptr {}\n  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
-                fv, slot, rec, idx, fv
+                "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                rec, layout.rc_mask
+            ));
+        }
+        for (idx, fl) in layout.fields.iter().enumerate() {
+            let slot = self.var_ptrs[&fl.name].clone();
+            let mut fv = self.fresh_tmp();
+            self.code
+                .push_str(&format!("  {} = load i64, ptr {}\n", fv, slot));
+            if fl.is_rc {
+                let inc = self.fresh_tmp();
+                self.code
+                    .push_str(&format!("  {} = call i64 @tenon_rc_inc(i64 {})\n", inc, fv));
+                fv = inc;
+            }
+            self.code.push_str(&format!(
+                "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
+                rec, idx, fv
             ));
         }
         let ok_obj = self.fresh_tmp();
         self.code.push_str(&format!(
-            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 1)\n  call void @tenon_rc_set_field(i64 {}, i64 0, i64 {})\n  ret i64 {}\n",
-            ok_obj, TAG_OK, ok_obj, rec, ok_obj
+            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 1)\n  call void @tenon_rc_set_rc_mask(i64 {}, i64 1)\n  call void @tenon_rc_set_field(i64 {}, i64 0, i64 {})\n  ret i64 {}\n",
+            ok_obj, TAG_OK, ok_obj, ok_obj, rec, ok_obj
         ));
 
         Ok(format!(
@@ -705,7 +1027,6 @@ impl<'a> LlvmFnGen<'a> {
         let total_slots = next_slot;
         let sname = sanitize(&f.name);
 
-        // 1) Constructor `@tenon_fn_<name>(params...) -> frame_ptr`
         let mut ctor_params = Vec::new();
         let mut ctor_body = String::new();
         ctor_body.push_str(&format!(
@@ -727,7 +1048,6 @@ impl<'a> LlvmFnGen<'a> {
             ctor_body
         );
 
-        // 2) Poll state machine `@tenon_fn_<name>__poll(i64 %frame) -> i64`
         for (vname, &slot) in &frame_slots {
             let vp = self.ensure_var_slot(vname);
             let lv = self.fresh_tmp();
@@ -764,7 +1084,7 @@ impl<'a> LlvmFnGen<'a> {
                 tail: None,
                 span: f.span,
             };
-            let _ = self.lower_block(&pre_blk)?;
+            let _ = self.lower_block(&pre_blk, false)?;
             for (vname, &slot) in &frame_slots {
                 let vp = self.var_ptrs[vname].clone();
                 let lv = self.fresh_tmp();
@@ -773,7 +1093,7 @@ impl<'a> LlvmFnGen<'a> {
                     lv, vp, slot, lv
                 ));
             }
-            let cframe = self.lower_expr(&step.child_expr)?;
+            let cframe = self.lower_expr_owned(&step.child_expr)?;
             self.code.push_str(&format!(
                 "  call void @tenon_rc_set_field(i64 %frame, i64 3, i64 {})\n  call void @tenon_rc_set_field(i64 %frame, i64 0, i64 {})\n  br label %{}\n",
                 cframe,
@@ -826,7 +1146,7 @@ impl<'a> LlvmFnGen<'a> {
             tail: segments.final_tail.clone().map(Box::new),
             span: f.span,
         };
-        let fval = self.lower_block(&final_blk)?;
+        let fval = self.lower_block(&final_blk, true)?;
         self.code.push_str(&format!(
             "  call void @tenon_rc_set_field(i64 %frame, i64 2, i64 {})\n  call void @tenon_rc_set_field(i64 %frame, i64 0, i64 -1)\n  ret i64 1\n",
             fval
@@ -839,55 +1159,102 @@ impl<'a> LlvmFnGen<'a> {
         Ok(format!("{}{}", ctor_ir, poll_ir))
     }
 
-    fn emit_cleanup(&mut self, keep_var: Option<&str>) {
-        let to_dec: Vec<String> = self
-            .owned_rc_vars
-            .iter()
-            .filter(|v| keep_var != Some(v.as_str()) && !self.inout_vars.contains(*v))
-            .cloned()
-            .collect();
-        for vname in to_dec {
-            if let Some(slot) = self.var_ptrs.get(&vname).cloned() {
-                let h = self.fresh_tmp();
-                self.code.push_str(&format!(
-                    "  {} = load i64, ptr {}\n  call void @tenon_rc_dec(i64 {})\n",
-                    h, slot, h
-                ));
-            }
-        }
-    }
-
-    fn resolve_field_idx(&self, obj_expr: &Expr, field: &str) -> Result<usize, String> {
-        if let ExprKind::Ident(vname) = &obj_expr.kind {
-            if let Some(rname) = self.var_records.get(vname) {
-                if let Some(layout) = self.records.get(rname) {
-                    if let Some(pos) = layout.fields.iter().position(|(f, _)| f == field) {
-                        return Ok(pos);
-                    }
+    fn resolve_field_layout(
+        &self,
+        obj_expr: &Expr,
+        field: &str,
+    ) -> Result<(usize, Option<LlvmFieldLayout>), String> {
+        if let Some(rname) = self.expr_record_name(obj_expr) {
+            if let Some(layout) = self.records.get(&rname) {
+                if let Some((pos, fl)) = layout
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| f.name == field)
+                {
+                    return Ok((pos, Some(fl.clone())));
                 }
             }
         }
-        self.field_to_idx
+        let idx = self
+            .field_to_idx
             .get(field)
             .copied()
-            .ok_or_else(|| format!("unknown field `{}` in LLVM codegen", field))
+            .ok_or_else(|| format!("unknown field `{}` in LLVM codegen", field))?;
+        Ok((idx, None))
+    }
+
+    fn expr_record_name(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(vname) => self.var_records.get(vname).cloned(),
+            ExprKind::RecordLit { name, .. } => Some(name.clone()),
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Ident(f) => self.fn_metas.get(f).and_then(|m| m.ret_record.clone()),
+                _ => None,
+            },
+            ExprKind::Field { target, field } => {
+                if let Some(rname) = self.expr_record_name(target) {
+                    if let Some(layout) = self.records.get(&rname) {
+                        if let Some(fl) = layout.fields.iter().find(|f| f.name == *field) {
+                            return fl.record_ty.clone();
+                        }
+                    }
+                }
+                None
+            }
+            ExprKind::Block(blk) => blk.tail.as_deref().and_then(|t| self.expr_record_name(t)),
+            ExprKind::If { then_block, else_branch, .. } => then_block
+                .tail
+                .as_deref()
+                .and_then(|t| self.expr_record_name(t))
+                .or_else(|| else_branch.as_deref().and_then(|e| self.expr_record_name(e))),
+            _ => None,
+        }
+    }
+
+    fn is_rc_ident(&self, s: &str) -> bool {
+        self.owned_rc_vars.contains(s)
+            || self.borrowed_rc_vars.contains(s)
+            || self.var_records.contains_key(s)
+            || self.text_vars.contains(s)
     }
 
     fn expr_produces_rc(&self, expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::RecordLit { .. } | ExprKind::List(_) | ExprKind::Str(_) => true,
+            ExprKind::Binary { op: BinOp::Concat, .. } => true,
             ExprKind::Ident(s) => {
-                s == "None" || self.owned_rc_vars.contains(s) || self.var_records.contains_key(s)
+                s == "None"
+                    || self.is_rc_ident(s)
+                    || (self.enum_tags.contains_key(s) && !self.var_ptrs.contains_key(s))
+            }
+            ExprKind::Field { target, field } => {
+                if let ExprKind::Ident(ename) = &target.kind {
+                    if self.enum_tags.contains_key(&format!("{}.{}", ename, field)) {
+                        return true;
+                    }
+                }
+                if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
+                    return fl.is_rc;
+                }
+                false
             }
             ExprKind::Call { callee, .. } => match &callee.kind {
                 ExprKind::Ident(f) => {
-                    matches!(f.as_str(), "Ok" | "Err" | "Some" | "push")
-                        || self.enum_tags.contains_key(f)
+                    matches!(f.as_str(), "Ok" | "Err" | "Some" | "push" | "yield_val")
+                        || (self.enum_tags.contains_key(f) && !self.fn_metas.contains_key(f))
                         || self.fn_metas.get(f).is_some_and(|m| m.returns_rc)
                 }
                 ExprKind::Field { field, .. } => field == "parse",
                 _ => false,
             },
+            ExprKind::If { then_block, else_branch, .. } => {
+                else_branch.is_some()
+                    && (then_block.tail.as_deref().is_some_and(|t| self.expr_produces_rc(t))
+                        || else_branch.as_deref().is_some_and(|e| self.expr_produces_rc(e)))
+            }
+            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.expr_produces_rc(&a.body)),
+            ExprKind::Block(blk) => blk.tail.as_deref().is_some_and(|t| self.expr_produces_rc(t)),
             _ => false,
         }
     }
@@ -895,12 +1262,56 @@ impl<'a> LlvmFnGen<'a> {
     fn is_text_expr(&self, expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::Str(_) => true,
+            ExprKind::Binary { op: BinOp::Concat, .. } => true,
             ExprKind::Ident(s) => self.text_vars.contains(s),
+            ExprKind::Field { target, field } => {
+                if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
+                    return fl.is_text;
+                }
+                false
+            }
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Ident(f) => self.fn_metas.get(f).is_some_and(|m| m.returns_text),
+                _ => false,
+            },
+            ExprKind::If { then_block, else_branch, .. } => {
+                then_block.tail.as_deref().is_some_and(|t| self.is_text_expr(t))
+                    || else_branch.as_deref().is_some_and(|e| self.is_text_expr(e))
+            }
+            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.is_text_expr(&a.body)),
+            ExprKind::Block(blk) => blk.tail.as_deref().is_some_and(|t| self.is_text_expr(t)),
             _ => false,
         }
     }
 
-    fn lower_block(&mut self, blk: &Block) -> Result<String, String> {
+    fn load_ident_val(&mut self, s: &str) -> Result<String, String> {
+        let slot = self
+            .var_ptrs
+            .get(s)
+            .cloned()
+            .ok_or_else(|| format!("undefined variable `{}` in LLVM codegen", s))?;
+        if self.inout_vars.contains(s) {
+            let ai = self.fresh_tmp();
+            let ap = self.fresh_tmp();
+            let v = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  {} = load i64, ptr {}\n",
+                ai, slot, ap, ai, v, ap
+            ));
+            Ok(v)
+        } else {
+            let v = self.fresh_tmp();
+            self.code
+                .push_str(&format!("  {} = load i64, ptr {}\n", v, slot));
+            Ok(v)
+        }
+    }
+
+    fn lower_block(&mut self, blk: &Block, want_owned_tail: bool) -> Result<String, String> {
+        let saved = self.save_lexical();
+        let scope_idx = self.rc_scopes.len();
+        self.rc_scopes.push(Vec::new());
+
         let mut last = "0".to_string();
         for stmt in &blk.stmts {
             if self.terminated {
@@ -910,44 +1321,52 @@ impl<'a> LlvmFnGen<'a> {
                 Stmt::Let {
                     name, ty, value, ..
                 } => {
-                    let is_copy_rc = matches!(&value.kind, ExprKind::Ident(src) if self.owned_rc_vars.contains(src) || self.var_records.contains_key(src));
-                    let mut v = self.lower_expr(value)?;
-                    if is_copy_rc {
-                        let inc = self.fresh_tmp();
-                        self.code
-                            .push_str(&format!("  {} = call i64 @tenon_rc_inc(i64 {})\n", inc, v));
-                        v = inc;
-                    }
-                    let slot = self.ensure_var_slot(name);
+                    let produces_rc = if let Some(t) = ty {
+                        is_rc_type_name(&t.display_name(), self.record_names)
+                    } else {
+                        self.expr_produces_rc(value)
+                    };
+                    let v = if produces_rc {
+                        self.lower_expr_owned(value)?
+                    } else {
+                        let mut temps = Vec::new();
+                        let val = self.lower_expr_borrowed(value, &mut temps)?;
+                        self.flush_temps(&temps);
+                        val
+                    };
+                    let slot = self.fresh_var_slot(name);
                     self.code
                         .push_str(&format!("  store i64 {}, ptr {}\n", v, slot));
+
+                    self.var_records.remove(name);
+                    self.text_vars.remove(name);
+                    self.owned_rc_vars.remove(name);
+                    self.borrowed_rc_vars.remove(name);
 
                     if let Some(t) = ty {
                         let tname = t.display_name();
                         if self.records.contains_key(&tname) {
                             self.var_records.insert(name.clone(), tname);
                             self.owned_rc_vars.insert(name.clone());
+                            self.rc_scopes[scope_idx].push((name.clone(), slot));
                         } else if tname == "Text" {
                             self.text_vars.insert(name.clone());
                             self.owned_rc_vars.insert(name.clone());
-                        } else if is_rc_type(t, self.records) {
+                            self.rc_scopes[scope_idx].push((name.clone(), slot));
+                        } else if is_rc_type_name(&tname, self.record_names) {
                             self.owned_rc_vars.insert(name.clone());
+                            self.rc_scopes[scope_idx].push((name.clone(), slot));
                         }
                     } else {
-                        if let ExprKind::RecordLit { name: rname, .. } = &value.kind {
-                            self.var_records.insert(name.clone(), rname.clone());
-                        } else if let ExprKind::Ident(src) = &value.kind {
-                            if let Some(rname) = self.var_records.get(src).cloned() {
-                                self.var_records.insert(name.clone(), rname);
-                            }
-                            if self.text_vars.contains(src) {
-                                self.text_vars.insert(name.clone());
-                            }
-                        } else if matches!(&value.kind, ExprKind::Str(_)) {
+                        if let Some(rname) = self.expr_record_name(value) {
+                            self.var_records.insert(name.clone(), rname);
+                        }
+                        if self.is_text_expr(value) {
                             self.text_vars.insert(name.clone());
                         }
-                        if self.expr_produces_rc(value) {
+                        if produces_rc {
                             self.owned_rc_vars.insert(name.clone());
+                            self.rc_scopes[scope_idx].push((name.clone(), slot));
                         }
                     }
                 }
@@ -961,43 +1380,103 @@ impl<'a> LlvmFnGen<'a> {
                             if matches!(&callee.kind, ExprKind::Ident(f) if f == "push")
                                 && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
                         );
-                        let rhs = self.lower_expr(value)?;
-                        let slot = self.ensure_var_slot(name);
-                        if self.owned_rc_vars.contains(name) && !consuming_push {
+                        let target_is_rc = self.owned_rc_vars.contains(name);
+                        let rhs = if consuming_push {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(value, &mut temps)?;
+                            if temps.last() == Some(&v) {
+                                temps.pop();
+                            }
+                            self.flush_temps(&temps);
+                            v
+                        } else if target_is_rc && *op == AssignOp::Set {
+                            self.lower_expr_owned(value)?
+                        } else {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(value, &mut temps)?;
+                            self.flush_temps(&temps);
+                            v
+                        };
+                        let slot = self
+                            .var_ptrs
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| format!("undefined variable `{}` in LLVM assign", name))?;
+                        let is_inout = self.inout_vars.contains(name);
+                        if target_is_rc && !consuming_push && !is_inout {
                             let old = self.fresh_tmp();
                             self.code.push_str(&format!(
-                                "  {} = load i64, ptr {}\n  call void @tenon_rc_dec(i64 {})\n",
-                                old, slot, old
+                                "  {} = load i64, ptr {}\n  store i64 {}, ptr {}\n  call void @tenon_rc_dec(i64 {})\n",
+                                old, slot, rhs, slot, old
                             ));
+                        } else if is_inout {
+                            let ai = self.fresh_tmp();
+                            let ap = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n",
+                                ai, slot, ap, ai
+                            ));
+                            let new_v = match op {
+                                AssignOp::Set => rhs,
+                                AssignOp::AddSet => {
+                                    let cur = self.fresh_tmp();
+                                    let res = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = load i64, ptr {}\n  {} = add i64 {}, {}\n",
+                                        cur, ap, res, cur, rhs
+                                    ));
+                                    res
+                                }
+                                AssignOp::SubSet => {
+                                    let cur = self.fresh_tmp();
+                                    let res = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = load i64, ptr {}\n  {} = sub i64 {}, {}\n",
+                                        cur, ap, res, cur, rhs
+                                    ));
+                                    res
+                                }
+                            };
+                            self.code
+                                .push_str(&format!("  store i64 {}, ptr {}\n", new_v, ap));
+                        } else {
+                            let new_v = match op {
+                                AssignOp::Set => rhs,
+                                AssignOp::AddSet => {
+                                    let cur = self.fresh_tmp();
+                                    let res = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = load i64, ptr {}\n  {} = add i64 {}, {}\n",
+                                        cur, slot, res, cur, rhs
+                                    ));
+                                    res
+                                }
+                                AssignOp::SubSet => {
+                                    let cur = self.fresh_tmp();
+                                    let res = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = load i64, ptr {}\n  {} = sub i64 {}, {}\n",
+                                        cur, slot, res, cur, rhs
+                                    ));
+                                    res
+                                }
+                            };
+                            self.code
+                                .push_str(&format!("  store i64 {}, ptr {}\n", new_v, slot));
                         }
-                        let new_v = match op {
-                            AssignOp::Set => rhs,
-                            AssignOp::AddSet => {
-                                let cur = self.fresh_tmp();
-                                let res = self.fresh_tmp();
-                                self.code.push_str(&format!(
-                                    "  {} = load i64, ptr {}\n  {} = add i64 {}, {}\n",
-                                    cur, slot, res, cur, rhs
-                                ));
-                                res
-                            }
-                            AssignOp::SubSet => {
-                                let cur = self.fresh_tmp();
-                                let res = self.fresh_tmp();
-                                self.code.push_str(&format!(
-                                    "  {} = load i64, ptr {}\n  {} = sub i64 {}, {}\n",
-                                    cur, slot, res, cur, rhs
-                                ));
-                                res
-                            }
-                        };
-                        self.code
-                            .push_str(&format!("  store i64 {}, ptr {}\n", new_v, slot));
                     }
                     ExprKind::Field { target: obj, field } => {
                         if let ExprKind::Ident(vname) = &obj.kind {
-                            let fidx = self.resolve_field_idx(obj, field)?;
-                            let rhs = self.lower_expr(value)?;
+                            let (fidx, fl) = self.resolve_field_layout(obj, field)?;
+                            let field_is_rc = fl.as_ref().is_some_and(|f| f.is_rc);
+                            let rhs = if field_is_rc && *op == AssignOp::Set {
+                                self.lower_expr_owned(value)?
+                            } else {
+                                let mut temps = Vec::new();
+                                let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                self.flush_temps(&temps);
+                                v
+                            };
                             let slot = self.var_ptrs[vname].clone();
                             let is_inout = self.inout_vars.contains(vname);
                             let cur_h = if is_inout {
@@ -1061,24 +1540,80 @@ impl<'a> LlvmFnGen<'a> {
                     _ => {}
                 },
                 Stmt::Mutate { body, .. } => {
-                    let _ = self.lower_block(body)?;
+                    let _ = self.lower_block(body, false)?;
                 }
                 Stmt::Return { value, .. } => {
-                    let keep = value.as_ref().and_then(|e| match &e.kind {
-                        ExprKind::Ident(s) => Some(s.clone()),
-                        _ => None,
-                    });
+                    let mut move_skip_slot: Option<String> = None;
                     let v = match value {
-                        Some(e) => self.lower_expr(e)?,
+                        Some(e) => {
+                            if self.fn_returns_rc {
+                                if let ExprKind::Ident(rname) = &e.kind {
+                                    if !self.inout_vars.contains(rname) {
+                                        if let Some(slot) = self.var_ptrs.get(rname).cloned() {
+                                            if self.find_owned_slot_in_scopes(&slot, 0) {
+                                                move_skip_slot = Some(slot.clone());
+                                                let lv = self.fresh_tmp();
+                                                self.code.push_str(&format!(
+                                                    "  {} = load i64, ptr {}\n",
+                                                    lv, slot
+                                                ));
+                                                lv
+                                            } else {
+                                                self.lower_expr_owned(e)?
+                                            }
+                                        } else {
+                                            self.lower_expr_owned(e)?
+                                        }
+                                    } else {
+                                        self.lower_expr_owned(e)?
+                                    }
+                                } else {
+                                    self.lower_expr_owned(e)?
+                                }
+                            } else {
+                                let mut temps = Vec::new();
+                                let val = self.lower_expr_borrowed(e, &mut temps)?;
+                                self.flush_temps(&temps);
+                                val
+                            }
+                        }
                         None => "0".into(),
                     };
-                    self.emit_cleanup(keep.as_deref());
+                    self.emit_cleanup_temp_scopes_from(0);
+                    self.emit_cleanup_scopes_from(0, move_skip_slot.as_deref());
                     self.code.push_str(&format!("  ret i64 {}\n", v));
                     self.terminated = true;
-                    return Ok(v);
+                    last = v;
+                    break;
+                }
+                Stmt::Break { .. } => {
+                    let (exit_lbl, rc_depth, temp_depth) = self
+                        .loop_stack
+                        .last()
+                        .map(|l| (l.exit_lbl.clone(), l.rc_scope_depth, l.temp_scope_depth))
+                        .ok_or_else(|| "`break` used outside of `while` loop".to_string())?;
+                    self.emit_cleanup_temp_scopes_from(temp_depth);
+                    self.emit_cleanup_scopes_from(rc_depth, None);
+                    self.code.push_str(&format!("  br label %{}\n", exit_lbl));
+                    self.terminated = true;
+                    break;
+                }
+                Stmt::Continue { .. } => {
+                    let (hdr_lbl, rc_depth, temp_depth) = self
+                        .loop_stack
+                        .last()
+                        .map(|l| (l.hdr_lbl.clone(), l.rc_scope_depth, l.temp_scope_depth))
+                        .ok_or_else(|| "`continue` used outside of `while` loop".to_string())?;
+                    self.emit_cleanup_temp_scopes_from(temp_depth);
+                    self.emit_cleanup_scopes_from(rc_depth, None);
+                    self.code.push_str(&format!("  br label %{}\n", hdr_lbl));
+                    self.terminated = true;
+                    break;
                 }
                 Stmt::Assert { cond, span } => {
-                    let c = self.lower_expr(cond)?;
+                    let mut temps = Vec::new();
+                    let c = self.lower_expr_borrowed(cond, &mut temps)?;
+                    self.flush_temps(&temps);
                     let ok = self.fresh_tmp();
                     let fl = self.fresh_lbl("afail");
                     let cl = self.fresh_lbl("acont");
@@ -1092,13 +1627,22 @@ impl<'a> LlvmFnGen<'a> {
                     let lp = self.fresh_lbl("wbody");
                     let ex = self.fresh_lbl("wexit");
                     self.code.push_str(&format!("  br label %{}\n{}:\n", hdr, hdr));
-                    let c = self.lower_expr(cond)?;
+                    let mut ctemps = Vec::new();
+                    let c = self.lower_expr_borrowed(cond, &mut ctemps)?;
+                    self.flush_temps(&ctemps);
                     let cmp = self.fresh_tmp();
                     self.code.push_str(&format!(
                         "  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n",
                         cmp, c, cmp, lp, ex, lp
                     ));
-                    let _ = self.lower_block(body)?;
+                    self.loop_stack.push(LlvmLoopCtx {
+                        hdr_lbl: hdr.clone(),
+                        exit_lbl: ex.clone(),
+                        rc_scope_depth: self.rc_scopes.len(),
+                        temp_scope_depth: self.temp_rc_scopes.len(),
+                    });
+                    let _ = self.lower_block(body, false)?;
+                    self.loop_stack.pop();
                     if !self.terminated {
                         self.code.push_str(&format!("  br label %{}\n", hdr));
                     }
@@ -1106,19 +1650,510 @@ impl<'a> LlvmFnGen<'a> {
                     self.code.push_str(&format!("{}:\n", ex));
                 }
                 Stmt::Expr { expr, .. } => {
-                    last = self.lower_expr(expr)?;
+                    let mut temps = Vec::new();
+                    last = self.lower_expr_borrowed(expr, &mut temps)?;
+                    if !self.terminated {
+                        self.flush_temps(&temps);
+                    }
                 }
             }
         }
+
+        let mut move_skip_slot: Option<String> = None;
         if !self.terminated {
             if let Some(tail) = &blk.tail {
-                last = self.lower_expr(tail)?;
+                if want_owned_tail {
+                    if let ExprKind::Ident(tname) = &tail.kind {
+                        if !self.inout_vars.contains(tname) {
+                            if let Some(slot) = self.var_ptrs.get(tname).cloned() {
+                                if self.find_owned_slot_in_scopes(&slot, scope_idx) {
+                                    move_skip_slot = Some(slot.clone());
+                                    let lv = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = load i64, ptr {}\n",
+                                        lv, slot
+                                    ));
+                                    last = lv;
+                                } else {
+                                    last = self.lower_expr_owned(tail)?;
+                                }
+                            } else {
+                                last = self.lower_expr_owned(tail)?;
+                            }
+                        } else {
+                            last = self.lower_expr_owned(tail)?;
+                        }
+                    } else {
+                        last = self.lower_expr_owned(tail)?;
+                    }
+                } else {
+                    let mut temps = Vec::new();
+                    last = self.lower_expr_borrowed(tail, &mut temps)?;
+                    if !self.terminated {
+                        self.flush_temps(&temps);
+                    }
+                }
+            }
+            if !self.terminated {
+                self.emit_cleanup_scopes_from(scope_idx, move_skip_slot.as_deref());
             }
         }
+
+        self.rc_scopes.pop();
+        self.restore_lexical(saved);
         Ok(last)
     }
 
-    fn lower_expr(&mut self, expr: &Expr) -> Result<String, String> {
+    fn lower_expr_owned(&mut self, expr: &Expr) -> Result<String, String> {
+        match &expr.kind {
+            ExprKind::Ident(s) => {
+                if s == "self" {
+                    if let Some(sv) = self.self_var.clone() {
+                        let slot = self.var_ptrs[&sv].clone();
+                        let v = self.fresh_tmp();
+                        self.code
+                            .push_str(&format!("  {} = load i64, ptr {}\n", v, slot));
+                        return Ok(v);
+                    }
+                }
+                if s == "None" {
+                    let o = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
+                        o, TAG_NONE
+                    ));
+                    return Ok(o);
+                }
+                if let Some(&tag) = self.enum_tags.get(s) {
+                    if !self.var_ptrs.contains_key(s) {
+                        let o = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
+                            o, tag
+                        ));
+                        return Ok(o);
+                    }
+                }
+                let v = self.load_ident_val(s)?;
+                if self.is_rc_ident(s) {
+                    let inc = self.fresh_tmp();
+                    self.code
+                        .push_str(&format!("  {} = call i64 @tenon_rc_inc(i64 {})\n", inc, v));
+                    Ok(inc)
+                } else {
+                    Ok(v)
+                }
+            }
+            ExprKind::Field { target, field } => {
+                if let ExprKind::Ident(ename) = &target.kind {
+                    let key = format!("{}.{}", ename, field);
+                    if let Some(&tag) = self.enum_tags.get(&key) {
+                        let o = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
+                            o, tag
+                        ));
+                        return Ok(o);
+                    }
+                }
+                let (idx, fl) = self.resolve_field_layout(target, field)?;
+                let mut temps = Vec::new();
+                let obj = self.lower_expr_borrowed(target, &mut temps)?;
+                let mut res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
+                    res, obj, idx
+                ));
+                if fl.as_ref().is_some_and(|f| f.is_rc) {
+                    let inc = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_rc_inc(i64 {})\n",
+                        inc, res
+                    ));
+                    res = inc;
+                }
+                self.flush_temps(&temps);
+                Ok(res)
+            }
+            ExprKind::If {
+                cond,
+                then_block,
+                else_branch,
+            } => self.lower_if(cond, then_block, else_branch.as_deref(), true),
+            ExprKind::Match { scrutinee, arms } => self.lower_match(scrutinee, arms, true),
+            ExprKind::Block(blk) => self.lower_block(blk, true),
+            _ => self.lower_expr_fresh(expr),
+        }
+    }
+
+    fn lower_expr_borrowed(
+        &mut self,
+        expr: &Expr,
+        temps: &mut Vec<String>,
+    ) -> Result<String, String> {
+        match &expr.kind {
+            ExprKind::Int(n) => Ok(n.to_string()),
+            ExprKind::Bool(b) => Ok(if *b { "1" } else { "0" }.into()),
+            ExprKind::Ident(s) => {
+                if s == "self" {
+                    if let Some(sv) = self.self_var.clone() {
+                        let slot = self.var_ptrs[&sv].clone();
+                        let v = self.fresh_tmp();
+                        self.code
+                            .push_str(&format!("  {} = load i64, ptr {}\n", v, slot));
+                        return Ok(v);
+                    }
+                }
+                if s == "None" {
+                    let o = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
+                        o, TAG_NONE
+                    ));
+                    temps.push(o.clone());
+                    return Ok(o);
+                }
+                if let Some(&tag) = self.enum_tags.get(s) {
+                    if !self.var_ptrs.contains_key(s) {
+                        let o = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
+                            o, tag
+                        ));
+                        temps.push(o.clone());
+                        return Ok(o);
+                    }
+                }
+                self.load_ident_val(s)
+            }
+            ExprKind::Field { target, field } => {
+                if let ExprKind::Ident(ename) = &target.kind {
+                    let key = format!("{}.{}", ename, field);
+                    if let Some(&tag) = self.enum_tags.get(&key) {
+                        let o = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
+                            o, tag
+                        ));
+                        temps.push(o.clone());
+                        return Ok(o);
+                    }
+                }
+                let (idx, _) = self.resolve_field_layout(target, field)?;
+                let obj = self.lower_expr_borrowed(target, temps)?;
+                let res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
+                    res, obj, idx
+                ));
+                Ok(res)
+            }
+            ExprKind::If {
+                cond,
+                then_block,
+                else_branch,
+            } => {
+                let want_owned = self.expr_produces_rc(expr);
+                let v = self.lower_if(cond, then_block, else_branch.as_deref(), want_owned)?;
+                if want_owned && !self.terminated {
+                    temps.push(v.clone());
+                }
+                Ok(v)
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                let want_owned = self.expr_produces_rc(expr);
+                let v = self.lower_match(scrutinee, arms, want_owned)?;
+                if want_owned && !self.terminated {
+                    temps.push(v.clone());
+                }
+                Ok(v)
+            }
+            ExprKind::Block(blk) => {
+                let want_owned = self.expr_produces_rc(expr);
+                let v = self.lower_block(blk, want_owned)?;
+                if want_owned && !self.terminated {
+                    temps.push(v.clone());
+                }
+                Ok(v)
+            }
+            _ => {
+                let v = self.lower_expr_fresh(expr)?;
+                if self.expr_produces_rc(expr) {
+                    temps.push(v.clone());
+                }
+                Ok(v)
+            }
+        }
+    }
+
+    fn lower_if(
+        &mut self,
+        cond: &Expr,
+        then_block: &Block,
+        else_branch: Option<&Expr>,
+        want_owned: bool,
+    ) -> Result<String, String> {
+        let mut ctemps = Vec::new();
+        let c = self.lower_expr_borrowed(cond, &mut ctemps)?;
+        self.flush_temps(&ctemps);
+
+        let cmp = self.fresh_tmp();
+        self.slot_id += 1;
+        let res_slot = format!("%ifres_{}", self.slot_id);
+        self.entry_allocas.push_str(&format!(
+            "  {} = alloca i64\n  store i64 0, ptr {}\n",
+            res_slot, res_slot
+        ));
+        let tl = self.fresh_lbl("then");
+        let el = self.fresh_lbl("else");
+        let ml = self.fresh_lbl("endif");
+        self.code.push_str(&format!(
+            "  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n",
+            cmp, c, cmp, tl, el, tl
+        ));
+        let tv = self.lower_block(then_block, want_owned)?;
+        let then_term = self.terminated;
+        if !then_term {
+            self.code.push_str(&format!(
+                "  store i64 {}, ptr {}\n  br label %{}\n",
+                tv, res_slot, ml
+            ));
+        }
+        self.terminated = false;
+        self.code.push_str(&format!("{}:\n", el));
+        let ev = match else_branch {
+            Some(eb) => {
+                if want_owned {
+                    self.lower_expr_owned(eb)?
+                } else {
+                    let mut etemps = Vec::new();
+                    let v = self.lower_expr_borrowed(eb, &mut etemps)?;
+                    if !self.terminated {
+                        self.flush_temps(&etemps);
+                    }
+                    v
+                }
+            }
+            None => "0".into(),
+        };
+        let else_term = self.terminated;
+        if !else_term {
+            self.code.push_str(&format!(
+                "  store i64 {}, ptr {}\n  br label %{}\n",
+                ev, res_slot, ml
+            ));
+        }
+        self.code.push_str(&format!("{}:\n", ml));
+        if then_term && else_term {
+            self.code.push_str("  unreachable\n");
+            self.terminated = true;
+            return Ok("0".into());
+        }
+        self.terminated = false;
+        let out = self.fresh_tmp();
+        self.code
+            .push_str(&format!("  {} = load i64, ptr {}\n", out, res_slot));
+        Ok(out)
+    }
+
+    fn lower_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        want_owned: bool,
+    ) -> Result<String, String> {
+        let parse_rname = match &scrutinee.kind {
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Field { target, field } if field == "parse" => match &target.kind {
+                    ExprKind::Ident(rn) => Some(rn.clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        let is_variant = arms
+            .iter()
+            .any(|a| a.patterns.iter().any(|p| matches!(p, Pattern::Variant { .. })));
+        let is_str = arms
+            .iter()
+            .any(|a| a.patterns.iter().any(|p| matches!(p, Pattern::Str(_, _))));
+
+        let mut mtemps = Vec::new();
+        let sv = self.lower_expr_borrowed(scrutinee, &mut mtemps)?;
+        let temp_idx = self.temp_rc_scopes.len();
+        self.temp_rc_scopes.push(mtemps);
+
+        let cmp_val = if is_variant {
+            let tg = self.fresh_tmp();
+            self.code
+                .push_str(&format!("  {} = call i64 @tenon_rc_get_tag(i64 {})\n", tg, sv));
+            tg
+        } else {
+            sv.clone()
+        };
+
+        self.slot_id += 1;
+        let res_slot = format!("%mres_{}", self.slot_id);
+        self.entry_allocas.push_str(&format!(
+            "  {} = alloca i64\n  store i64 0, ptr {}\n",
+            res_slot, res_slot
+        ));
+        let end_l = self.fresh_lbl("mend");
+        let mut any_reachable = false;
+
+        for arm in arms {
+            let is_wild = arm
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Wildcard(_)));
+            if is_wild {
+                let v = if want_owned {
+                    self.lower_expr_owned(&arm.body)?
+                } else {
+                    let mut atemps = Vec::new();
+                    let av = self.lower_expr_borrowed(&arm.body, &mut atemps)?;
+                    if !self.terminated {
+                        self.flush_temps(&atemps);
+                    }
+                    av
+                };
+                if !self.terminated {
+                    self.code.push_str(&format!(
+                        "  store i64 {}, ptr {}\n  br label %{}\n",
+                        v, res_slot, end_l
+                    ));
+                    any_reachable = true;
+                }
+                self.terminated = false;
+                self.code.push_str(&format!("{}:\n", end_l));
+                let mt = self.temp_rc_scopes.pop().unwrap();
+                if !any_reachable {
+                    self.code.push_str("  unreachable\n");
+                    self.terminated = true;
+                    return Ok("0".into());
+                }
+                self.flush_temps(&mt);
+                let out = self.fresh_tmp();
+                self.code
+                    .push_str(&format!("  {} = load i64, ptr {}\n", out, res_slot));
+                return Ok(out);
+            }
+
+            let mut cond_var: Option<String> = None;
+            let mut vbind: Option<(String, bool)> = None;
+            for p in &arm.patterns {
+                let eq = match p {
+                    Pattern::Int(n, _) => {
+                        let e = self.fresh_tmp();
+                        self.code
+                            .push_str(&format!("  {} = icmp eq i64 {}, {}\n", e, cmp_val, n));
+                        e
+                    }
+                    Pattern::Bool(b, _) => {
+                        let e = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = icmp eq i64 {}, {}\n",
+                            e,
+                            cmp_val,
+                            if *b { 1 } else { 0 }
+                        ));
+                        e
+                    }
+                    Pattern::Str(s, _) if is_str => {
+                        let gname = format!(".str.{}", self.string_globals.len());
+                        self.string_globals.push((gname.clone(), s.clone()));
+                        let pi = self.fresh_tmp();
+                        let ptxt = self.fresh_tmp();
+                        let teq = self.fresh_tmp();
+                        let e = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = ptrtoint ptr @{} to i64\n  {} = call i64 @tenon_text_new(i64 {}, i64 {})\n  {} = call i64 @tenon_text_eq(i64 {}, i64 {})\n  call void @tenon_rc_dec(i64 {})\n  {} = icmp ne i64 {}, 0\n",
+                            pi, gname, ptxt, pi, s.len(), teq, cmp_val, ptxt, ptxt, e, teq
+                        ));
+                        e
+                    }
+                    Pattern::Variant { name, binding, .. } => {
+                        let t = *self
+                            .enum_tags
+                            .get(name)
+                            .ok_or_else(|| format!("unknown variant `{}` in LLVM match", name))?;
+                        if let Some(bn) = binding {
+                            vbind = Some((bn.clone(), name == "Ok"));
+                        }
+                        let e = self.fresh_tmp();
+                        self.code
+                            .push_str(&format!("  {} = icmp eq i64 {}, {}\n", e, cmp_val, t));
+                        e
+                    }
+                    _ => continue,
+                };
+                cond_var = Some(match cond_var {
+                    Some(prev) => {
+                        let o = self.fresh_tmp();
+                        self.code
+                            .push_str(&format!("  {} = or i1 {}, {}\n", o, prev, eq));
+                        o
+                    }
+                    None => eq,
+                });
+            }
+
+            let mat_l = self.fresh_lbl("marm");
+            let nxt_l = self.fresh_lbl("mnxt");
+            let c = cond_var.unwrap_or_else(|| "false".into());
+            self.code.push_str(&format!(
+                "  br i1 {}, label %{}, label %{}\n{}:\n",
+                c, mat_l, nxt_l, mat_l
+            ));
+            let saved_arm = self.save_lexical();
+            if let Some((bn, is_ok)) = vbind {
+                let pay = self.fresh_tmp();
+                let bslot = self.fresh_var_slot(&bn);
+                self.code.push_str(&format!(
+                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 0)\n  store i64 {}, ptr {}\n",
+                    pay, sv, pay, bslot
+                ));
+                if is_ok {
+                    if let Some(rn) = &parse_rname {
+                        self.var_records.insert(bn.clone(), rn.clone());
+                        self.borrowed_rc_vars.insert(bn);
+                    }
+                }
+            }
+            let av = if want_owned {
+                self.lower_expr_owned(&arm.body)?
+            } else {
+                let mut atemps = Vec::new();
+                let v = self.lower_expr_borrowed(&arm.body, &mut atemps)?;
+                if !self.terminated {
+                    self.flush_temps(&atemps);
+                }
+                v
+            };
+            self.restore_lexical(saved_arm);
+            if !self.terminated {
+                self.code.push_str(&format!(
+                    "  store i64 {}, ptr {}\n  br label %{}\n",
+                    av, res_slot, end_l
+                ));
+                any_reachable = true;
+            }
+            self.terminated = false;
+            self.code.push_str(&format!("{}:\n", nxt_l));
+        }
+
+        self.code
+            .push_str(&format!("  br label %{}\n{}:\n", end_l, end_l));
+        let mt = self.temp_rc_scopes.remove(temp_idx);
+        self.flush_temps(&mt);
+        let out = self.fresh_tmp();
+        self.code
+            .push_str(&format!("  {} = load i64, ptr {}\n", out, res_slot));
+        Ok(out)
+    }
+
+    fn lower_expr_fresh(&mut self, expr: &Expr) -> Result<String, String> {
         match &expr.kind {
             ExprKind::Int(n) => Ok(n.to_string()),
             ExprKind::Bool(b) => Ok(if *b { "1" } else { "0" }.into()),
@@ -1133,51 +2168,6 @@ impl<'a> LlvmFnGen<'a> {
                 ));
                 Ok(obj)
             }
-            ExprKind::Ident(s) => {
-                if s == "self" {
-                    if let Some(sv) = self.self_var.clone() {
-                        let slot = self.var_ptrs[&sv].clone();
-                        let v = self.fresh_tmp();
-                        self.code
-                            .push_str(&format!("  {} = load i64, ptr {}\n", v, slot));
-                        return Ok(v);
-                    }
-                }
-                if s == "None" {
-                    let o = self.fresh_tmp();
-                    self.code
-                        .push_str(&format!("  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n", o, TAG_NONE));
-                    return Ok(o);
-                }
-                if let Some(&tag) = self.enum_tags.get(s) {
-                    if !self.var_ptrs.contains_key(s) {
-                        let o = self.fresh_tmp();
-                        self.code
-                            .push_str(&format!("  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n", o, tag));
-                        return Ok(o);
-                    }
-                }
-                let slot = self
-                    .var_ptrs
-                    .get(s)
-                    .cloned()
-                    .ok_or_else(|| format!("undefined variable `{}` in LLVM codegen", s))?;
-                if self.inout_vars.contains(s) {
-                    let ai = self.fresh_tmp();
-                    let ap = self.fresh_tmp();
-                    let v = self.fresh_tmp();
-                    self.code.push_str(&format!(
-                        "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  {} = load i64, ptr {}\n",
-                        ai, slot, ap, ai, v, ap
-                    ));
-                    Ok(v)
-                } else {
-                    let v = self.fresh_tmp();
-                    self.code
-                        .push_str(&format!("  {} = load i64, ptr {}\n", v, slot));
-                    Ok(v)
-                }
-            }
             ExprKind::RecordLit { name, fields, .. } => {
                 let layout = self
                     .records
@@ -1191,9 +2181,27 @@ impl<'a> LlvmFnGen<'a> {
                     layout.tag,
                     layout.fields.len()
                 ));
+                if layout.rc_mask != 0 {
+                    self.code.push_str(&format!(
+                        "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                        obj, layout.rc_mask
+                    ));
+                }
                 for (fname, fexpr) in fields {
-                    let fv = self.lower_expr(fexpr)?;
-                    if let Some(idx) = layout.fields.iter().position(|(f, _)| f == fname) {
+                    if let Some((idx, fl)) = layout
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .find(|(_, f)| f.name == *fname)
+                    {
+                        let fv = if fl.is_rc {
+                            self.lower_expr_owned(fexpr)?
+                        } else {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(fexpr, &mut temps)?;
+                            self.flush_temps(&temps);
+                            v
+                        };
                         self.code.push_str(&format!(
                             "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
                             obj, idx, fv
@@ -1211,7 +2219,9 @@ impl<'a> LlvmFnGen<'a> {
                     elems.len()
                 ));
                 for (idx, e) in elems.iter().enumerate() {
-                    let ev = self.lower_expr(e)?;
+                    let mut temps = Vec::new();
+                    let ev = self.lower_expr_borrowed(e, &mut temps)?;
+                    self.flush_temps(&temps);
                     self.code.push_str(&format!(
                         "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
                         obj, idx, ev
@@ -1220,38 +2230,21 @@ impl<'a> LlvmFnGen<'a> {
                 Ok(obj)
             }
             ExprKind::Index { target, index } => {
-                let t = self.lower_expr(target)?;
-                let i = self.lower_expr(index)?;
+                let mut temps = Vec::new();
+                let t = self.lower_expr_borrowed(target, &mut temps)?;
+                let i = self.lower_expr_borrowed(index, &mut temps)?;
                 let res = self.fresh_tmp();
                 self.code.push_str(&format!(
                     "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
                     res, t, i
                 ));
-                Ok(res)
-            }
-            ExprKind::Field { target, field } => {
-                if let ExprKind::Ident(ename) = &target.kind {
-                    let key = format!("{}.{}", ename, field);
-                    if let Some(&tag) = self.enum_tags.get(&key) {
-                        let o = self.fresh_tmp();
-                        self.code.push_str(&format!(
-                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
-                            o, tag
-                        ));
-                        return Ok(o);
-                    }
-                }
-                let idx = self.resolve_field_idx(target, field)?;
-                let obj = self.lower_expr(target)?;
-                let res = self.fresh_tmp();
-                self.code.push_str(&format!(
-                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
-                    res, obj, idx
-                ));
+                self.flush_temps(&temps);
                 Ok(res)
             }
             ExprKind::Unary { op, expr } => {
-                let v = self.lower_expr(expr)?;
+                let mut temps = Vec::new();
+                let v = self.lower_expr_borrowed(expr, &mut temps)?;
+                self.flush_temps(&temps);
                 let r = self.fresh_tmp();
                 match op {
                     UnOp::Neg => self.code.push_str(&format!("  {} = sub i64 0, {}\n", r, v)),
@@ -1265,16 +2258,97 @@ impl<'a> LlvmFnGen<'a> {
                 }
                 Ok(r)
             }
+            ExprKind::Binary {
+                op: BinOp::And,
+                left,
+                right,
+            } => {
+                self.slot_id += 1;
+                let slot = format!("%and_{}", self.slot_id);
+                self.entry_allocas.push_str(&format!(
+                    "  {} = alloca i64\n  store i64 0, ptr {}\n",
+                    slot, slot
+                ));
+                let mut ltemps = Vec::new();
+                let l = self.lower_expr_borrowed(left, &mut ltemps)?;
+                self.flush_temps(&ltemps);
+                let lb = self.fresh_tmp();
+                let rhs_l = self.fresh_lbl("and_rhs");
+                let end_l = self.fresh_lbl("and_end");
+                self.code.push_str(&format!(
+                    "  store i64 0, ptr {}\n  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n",
+                    slot, lb, l, lb, rhs_l, end_l, rhs_l
+                ));
+                let mut rtemps = Vec::new();
+                let r = self.lower_expr_borrowed(right, &mut rtemps)?;
+                self.flush_temps(&rtemps);
+                let rb = self.fresh_tmp();
+                let rz = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = icmp ne i64 {}, 0\n  {} = zext i1 {} to i64\n  store i64 {}, ptr {}\n  br label %{}\n{}:\n",
+                    rb, r, rz, rb, rz, slot, end_l, end_l
+                ));
+                let out = self.fresh_tmp();
+                self.code
+                    .push_str(&format!("  {} = load i64, ptr {}\n", out, slot));
+                Ok(out)
+            }
+            ExprKind::Binary {
+                op: BinOp::Or,
+                left,
+                right,
+            } => {
+                self.slot_id += 1;
+                let slot = format!("%or_{}", self.slot_id);
+                self.entry_allocas.push_str(&format!(
+                    "  {} = alloca i64\n  store i64 0, ptr {}\n",
+                    slot, slot
+                ));
+                let mut ltemps = Vec::new();
+                let l = self.lower_expr_borrowed(left, &mut ltemps)?;
+                self.flush_temps(&ltemps);
+                let lb = self.fresh_tmp();
+                let rhs_l = self.fresh_lbl("or_rhs");
+                let end_l = self.fresh_lbl("or_end");
+                self.code.push_str(&format!(
+                    "  store i64 1, ptr {}\n  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n",
+                    slot, lb, l, lb, end_l, rhs_l, rhs_l
+                ));
+                let mut rtemps = Vec::new();
+                let r = self.lower_expr_borrowed(right, &mut rtemps)?;
+                self.flush_temps(&rtemps);
+                let rb = self.fresh_tmp();
+                let rz = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = icmp ne i64 {}, 0\n  {} = zext i1 {} to i64\n  store i64 {}, ptr {}\n  br label %{}\n{}:\n",
+                    rb, r, rz, rb, rz, slot, end_l, end_l
+                ));
+                let out = self.fresh_tmp();
+                self.code
+                    .push_str(&format!("  {} = load i64, ptr {}\n", out, slot));
+                Ok(out)
+            }
             ExprKind::Binary { op, left, right } => {
                 let tcmp = self.is_text_expr(left) || self.is_text_expr(right);
-                let l = self.lower_expr(left)?;
-                let r = self.lower_expr(right)?;
+                let mut temps = Vec::new();
+                let l = self.lower_expr_borrowed(left, &mut temps)?;
+                let r = self.lower_expr_borrowed(right, &mut temps)?;
+                if *op == BinOp::Concat {
+                    let res = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_str_concat(i64 {}, i64 {})\n",
+                        res, l, r
+                    ));
+                    self.flush_temps(&temps);
+                    return Ok(res);
+                }
                 if tcmp && matches!(op, BinOp::Eq | BinOp::Ne) {
                     let eq = self.fresh_tmp();
                     self.code.push_str(&format!(
                         "  {} = call i64 @tenon_text_eq(i64 {}, i64 {})\n",
                         eq, l, r
                     ));
+                    self.flush_temps(&temps);
                     if *op == BinOp::Eq {
                         return Ok(eq);
                     }
@@ -1286,6 +2360,7 @@ impl<'a> LlvmFnGen<'a> {
                     ));
                     return Ok(res);
                 }
+                self.flush_temps(&temps);
                 let res = self.fresh_tmp();
                 match op {
                     BinOp::Add => self.code.push_str(&format!("  {} = add i64 {}, {}\n", res, l, r)),
@@ -1311,214 +2386,20 @@ impl<'a> LlvmFnGen<'a> {
                             c, pred, l, r, res, c
                         ));
                     }
-                    BinOp::And | BinOp::Or => {
-                        let lb = self.fresh_tmp();
-                        let rb = self.fresh_tmp();
-                        let comb = self.fresh_tmp();
-                        let iop = if *op == BinOp::And { "and" } else { "or" };
-                        self.code.push_str(&format!(
-                            "  {} = icmp ne i64 {}, 0\n  {} = icmp ne i64 {}, 0\n  {} = {} i1 {}, {}\n  {} = zext i1 {} to i64\n",
-                            lb, l, rb, r, comb, iop, lb, rb, res, comb
-                        ));
-                    }
                     other => return Err(format!("unsupported op {:?} in LLVM codegen", other)),
                 }
                 Ok(res)
             }
-            ExprKind::If {
-                cond,
-                then_block,
-                else_branch,
-            } => {
-                let c = self.lower_expr(cond)?;
-                let cmp = self.fresh_tmp();
-                let res_slot = format!("%ifres_{}", self.lbl + 1);
-                self.entry_allocas.push_str(&format!(
-                    "  {} = alloca i64\n  store i64 0, ptr {}\n",
-                    res_slot, res_slot
-                ));
-                let tl = self.fresh_lbl("then");
-                let el = self.fresh_lbl("else");
-                let ml = self.fresh_lbl("endif");
-                self.code.push_str(&format!(
-                    "  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n",
-                    cmp, c, cmp, tl, el, tl
-                ));
-                let tv = self.lower_block(then_block)?;
-                if !self.terminated {
-                    self.code.push_str(&format!(
-                        "  store i64 {}, ptr {}\n  br label %{}\n",
-                        tv, res_slot, ml
-                    ));
-                }
-                self.terminated = false;
-                self.code.push_str(&format!("{}:\n", el));
-                let ev = match else_branch {
-                    Some(eb) => self.lower_expr(eb)?,
-                    None => "0".into(),
-                };
-                if !self.terminated {
-                    self.code.push_str(&format!(
-                        "  store i64 {}, ptr {}\n  br label %{}\n",
-                        ev, res_slot, ml
-                    ));
-                }
-                self.terminated = false;
-                self.code.push_str(&format!("{}:\n", ml));
-                let out = self.fresh_tmp();
-                self.code
-                    .push_str(&format!("  {} = load i64, ptr {}\n", out, res_slot));
-                Ok(out)
-            }
-            ExprKind::Match { scrutinee, arms } => {
-                let is_temp_parse = matches!(
-                    &scrutinee.kind,
-                    ExprKind::Call { callee, .. }
-                    if matches!(&callee.kind, ExprKind::Field { field, .. } if field == "parse")
-                );
-                let parse_rname = match &scrutinee.kind {
-                    ExprKind::Call { callee, .. } => match &callee.kind {
-                        ExprKind::Field { target, field } if field == "parse" => {
-                            match &target.kind {
-                                ExprKind::Ident(rn) => Some(rn.clone()),
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                let is_variant = arms
-                    .iter()
-                    .any(|a| a.patterns.iter().any(|p| matches!(p, Pattern::Variant { .. })));
-
-                let sv = self.lower_expr(scrutinee)?;
-                let cmp_val = if is_variant {
-                    let tg = self.fresh_tmp();
-                    self.code
-                        .push_str(&format!("  {} = call i64 @tenon_rc_get_tag(i64 {})\n", tg, sv));
-                    tg
-                } else {
-                    sv.clone()
-                };
-
-                let res_slot = format!("%mres_{}", self.lbl + 1);
-                self.entry_allocas.push_str(&format!(
-                    "  {} = alloca i64\n  store i64 0, ptr {}\n",
-                    res_slot, res_slot
-                ));
-                let end_l = self.fresh_lbl("mend");
-
-                for arm in arms {
-                    let is_wild = arm
-                        .patterns
-                        .iter()
-                        .any(|p| matches!(p, Pattern::Wildcard(_)));
-                    if is_wild {
-                        let v = self.lower_expr(&arm.body)?;
-                        if is_temp_parse {
-                            self.code.push_str(&format!("  call void @tenon_rc_dec(i64 {})\n", sv));
-                        }
-                        self.code.push_str(&format!(
-                            "  store i64 {}, ptr {}\n  br label %{}\n",
-                            v, res_slot, end_l
-                        ));
-                        self.code.push_str(&format!("{}:\n", end_l));
-                        let out = self.fresh_tmp();
-                        self.code
-                            .push_str(&format!("  {} = load i64, ptr {}\n", out, res_slot));
-                        return Ok(out);
-                    }
-
-                    let mut cond_var: Option<String> = None;
-                    let mut vbind: Option<(String, bool)> = None;
-                    for p in &arm.patterns {
-                        let pval = match p {
-                            Pattern::Int(n, _) => *n,
-                            Pattern::Bool(b, _) => if *b { 1 } else { 0 },
-                            Pattern::Variant { name, binding, .. } => {
-                                let t = *self.enum_tags.get(name).ok_or_else(|| {
-                                    format!("unknown variant `{}` in LLVM match", name)
-                                })?;
-                                if let Some(bn) = binding {
-                                    vbind = Some((bn.clone(), name == "Ok"));
-                                }
-                                t
-                            }
-                            _ => continue,
-                        };
-                        let eq = self.fresh_tmp();
-                        self.code.push_str(&format!(
-                            "  {} = icmp eq i64 {}, {}\n",
-                            eq, cmp_val, pval
-                        ));
-                        cond_var = Some(match cond_var {
-                            Some(prev) => {
-                                let o = self.fresh_tmp();
-                                self.code
-                                    .push_str(&format!("  {} = or i1 {}, {}\n", o, prev, eq));
-                                o
-                            }
-                            None => eq,
-                        });
-                    }
-                    let mat_l = self.fresh_lbl("marm");
-                    let nxt_l = self.fresh_lbl("mnxt");
-                    let c = cond_var.unwrap_or_else(|| "false".into());
-                    self.code.push_str(&format!(
-                        "  br i1 {}, label %{}, label %{}\n{}:\n",
-                        c, mat_l, nxt_l, mat_l
-                    ));
-                    let mut inner_rec: Option<String> = None;
-                    if let Some((bn, is_ok)) = vbind {
-                        let pay = self.fresh_tmp();
-                        let bslot = self.ensure_var_slot(&bn);
-                        self.code.push_str(&format!(
-                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 0)\n  store i64 {}, ptr {}\n",
-                            pay, sv, pay, bslot
-                        ));
-                        if is_ok {
-                            if let Some(rn) = &parse_rname {
-                                self.var_records.insert(bn, rn.clone());
-                                inner_rec = Some(pay);
-                            }
-                        }
-                    }
-                    let av = self.lower_expr(&arm.body)?;
-                    if is_temp_parse {
-                        if let Some(ir) = inner_rec {
-                            if !self.expr_produces_rc(&arm.body) {
-                                self.code
-                                    .push_str(&format!("  call void @tenon_rc_dec(i64 {})\n", ir));
-                            }
-                        }
-                        self.code
-                            .push_str(&format!("  call void @tenon_rc_dec(i64 {})\n", sv));
-                    }
-                    self.code.push_str(&format!(
-                        "  store i64 {}, ptr {}\n  br label %{}\n{}:\n",
-                        av, res_slot, end_l, nxt_l
-                    ));
-                }
-
-                if is_temp_parse {
-                    self.code
-                        .push_str(&format!("  call void @tenon_rc_dec(i64 {})\n", sv));
-                }
-                self.code
-                    .push_str(&format!("  br label %{}\n{}:\n", end_l, end_l));
-                let out = self.fresh_tmp();
-                self.code
-                    .push_str(&format!("  {} = load i64, ptr {}\n", out, res_slot));
-                Ok(out)
-            }
-            ExprKind::Block(blk) => self.lower_block(blk),
             ExprKind::Call { callee, args } => match &callee.kind {
                 ExprKind::Field { target, field } if field == "parse" => {
                     if let ExprKind::Ident(rname) = &target.kind {
+                        let mut temps = Vec::new();
                         let mut avals = Vec::new();
                         for a in args {
-                            avals.push(format!("i64 {}", self.lower_expr(&a.value)?));
+                            avals.push(format!(
+                                "i64 {}",
+                                self.lower_expr_borrowed(&a.value, &mut temps)?
+                            ));
                         }
                         let res = self.fresh_tmp();
                         self.code.push_str(&format!(
@@ -1527,13 +2408,57 @@ impl<'a> LlvmFnGen<'a> {
                             sanitize(rname),
                             avals.join(", ")
                         ));
+                        self.flush_temps(&temps);
                         return Ok(res);
                     }
                     Err("unsupported `.parse()` target in LLVM".into())
                 }
+                ExprKind::Field { target, field } => {
+                    if let ExprKind::Ident(ename) = &target.kind {
+                        let key = format!("{}.{}", ename, field);
+                        if let Some(&tag) = self.enum_tags.get(&key) {
+                            let o = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 {})\n",
+                                o,
+                                tag,
+                                args.len()
+                            ));
+                            let mut rc_mask = 0u64;
+                            for (i, a) in args.iter().enumerate() {
+                                let is_rc = self.expr_produces_rc(&a.value);
+                                let av = if is_rc {
+                                    if i < 64 {
+                                        rc_mask |= 1u64 << i;
+                                    }
+                                    self.lower_expr_owned(&a.value)?
+                                } else {
+                                    let mut temps = Vec::new();
+                                    let v = self.lower_expr_borrowed(&a.value, &mut temps)?;
+                                    self.flush_temps(&temps);
+                                    v
+                                };
+                                self.code.push_str(&format!(
+                                    "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
+                                    o, i, av
+                                ));
+                            }
+                            if rc_mask != 0 {
+                                self.code.push_str(&format!(
+                                    "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                    o, rc_mask as i64
+                                ));
+                            }
+                            return Ok(o);
+                        }
+                    }
+                    Err("unsupported method call in LLVM codegen".into())
+                }
                 ExprKind::Ident(fname) => {
                     if fname == "print_int" && args.len() == 1 {
-                        let v = self.lower_expr(&args[0].value)?;
+                        let mut temps = Vec::new();
+                        let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        self.flush_temps(&temps);
                         let res = self.fresh_tmp();
                         self.code.push_str(&format!(
                             "  {} = call i64 @tenon_rt_print_int(i64 {})\n",
@@ -1542,26 +2467,32 @@ impl<'a> LlvmFnGen<'a> {
                         return Ok(res);
                     }
                     if fname == "len" && args.len() == 1 {
-                        let v = self.lower_expr(&args[0].value)?;
+                        let mut temps = Vec::new();
+                        let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
                         let res = self.fresh_tmp();
                         self.code.push_str(&format!(
                             "  {} = call i64 @tenon_rc_get_len(i64 {})\n",
                             res, v
                         ));
+                        self.flush_temps(&temps);
                         return Ok(res);
                     }
                     if fname == "push" && args.len() == 2 {
-                        let xs = self.lower_expr(&args[0].value)?;
-                        let val = self.lower_expr(&args[1].value)?;
+                        let mut temps = Vec::new();
+                        let xs = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let val = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
                         let res = self.fresh_tmp();
                         self.code.push_str(&format!(
                             "  {} = call i64 @tenon_list_push(i64 {}, i64 {})\n",
                             res, xs, val
                         ));
+                        self.flush_temps(&temps);
                         return Ok(res);
                     }
                     if fname == "yield_val" && args.len() == 1 {
-                        let v = self.lower_expr(&args[0].value)?;
+                        let mut temps = Vec::new();
+                        let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        self.flush_temps(&temps);
                         let res = self.fresh_tmp();
                         self.code.push_str(&format!(
                             "  {} = call i64 @tenon_async_yield_create(i64 {})\n",
@@ -1570,12 +2501,31 @@ impl<'a> LlvmFnGen<'a> {
                         return Ok(res);
                     }
                     if fname == "block_on" && args.len() == 1 {
-                        let f = self.lower_expr(&args[0].value)?;
+                        let f = self.lower_expr_owned(&args[0].value)?;
                         let res = self.fresh_tmp();
                         self.code.push_str(&format!(
                             "  {} = call i64 @tenon_async_block_on(i64 {})\n",
                             res, f
                         ));
+                        return Ok(res);
+                    }
+                    if let Some(&csym) = self.syscall_map.get(fname) {
+                        let mut temps = Vec::new();
+                        let mut avals = Vec::new();
+                        for a in args {
+                            avals.push(format!(
+                                "i64 {}",
+                                self.lower_expr_borrowed(&a.value, &mut temps)?
+                            ));
+                        }
+                        let res = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @{}({})\n",
+                            res,
+                            csym,
+                            avals.join(", ")
+                        ));
+                        self.flush_temps(&temps);
                         return Ok(res);
                     }
                     if let Some(&tag) = self.enum_tags.get(fname) {
@@ -1587,11 +2537,29 @@ impl<'a> LlvmFnGen<'a> {
                                 tag,
                                 args.len()
                             ));
+                            let mut rc_mask = 0u64;
                             for (i, a) in args.iter().enumerate() {
-                                let av = self.lower_expr(&a.value)?;
+                                let is_rc = self.expr_produces_rc(&a.value);
+                                let av = if is_rc {
+                                    if i < 64 {
+                                        rc_mask |= 1u64 << i;
+                                    }
+                                    self.lower_expr_owned(&a.value)?
+                                } else {
+                                    let mut temps = Vec::new();
+                                    let v = self.lower_expr_borrowed(&a.value, &mut temps)?;
+                                    self.flush_temps(&temps);
+                                    v
+                                };
                                 self.code.push_str(&format!(
                                     "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
                                     o, i, av
+                                ));
+                            }
+                            if rc_mask != 0 {
+                                self.code.push_str(&format!(
+                                    "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                    o, rc_mask as i64
                                 ));
                             }
                             return Ok(o);
@@ -1599,6 +2567,7 @@ impl<'a> LlvmFnGen<'a> {
                     }
 
                     let meta = self.fn_metas.get(fname).cloned();
+                    let mut temps = Vec::new();
                     let mut avals = Vec::new();
                     let mut writebacks: Vec<(String, String)> = Vec::new();
                     for (idx, a) in args.iter().enumerate() {
@@ -1608,9 +2577,9 @@ impl<'a> LlvmFnGen<'a> {
                             .unwrap_or(false);
                         if is_inout {
                             if let ExprKind::Ident(vn) = &a.value.kind {
-                                let cur = self.lower_expr(&a.value)?;
-                                let tmp_slot = format!("%io_{}_{}", self.tmp + 1, idx);
-                                self.tmp += 1;
+                                let cur = self.load_ident_val(vn)?;
+                                self.slot_id += 1;
+                                let tmp_slot = format!("%io_{}_{}", self.slot_id, idx);
                                 self.entry_allocas
                                     .push_str(&format!("  {} = alloca i64\n", tmp_slot));
                                 let addr_i = self.fresh_tmp();
@@ -1624,7 +2593,7 @@ impl<'a> LlvmFnGen<'a> {
                                 return Err("inout arg must be variable".into());
                             }
                         } else {
-                            let av = self.lower_expr(&a.value)?;
+                            let av = self.lower_expr_borrowed(&a.value, &mut temps)?;
                             avals.push(format!("i64 {}", av));
                         }
                     }
@@ -1635,6 +2604,7 @@ impl<'a> LlvmFnGen<'a> {
                         sanitize(fname),
                         avals.join(", ")
                     ));
+                    self.flush_temps(&temps);
                     for (vn, tmp_slot) in writebacks {
                         let updated = self.fresh_tmp();
                         let vslot = self.var_ptrs[&vn].clone();
@@ -1663,7 +2633,13 @@ impl<'a> LlvmFnGen<'a> {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -1750,5 +2726,42 @@ pub fn main() Int {
         assert!(stdout.contains("main() => 79"), "unexpected stdout: {}", stdout);
         assert!(stdout.contains("live_objects=0"), "leaked objects: {}", stdout);
         assert!(stdout.contains("async_suspends=2"), "missing suspensions: {}", stdout);
+    }
+
+    #[test]
+    fn llvm_aot_links_tenon_rt_and_runs_core_syscalls() {
+        let src = r#"
+pub record Msg {
+    tag Text
+    body Text
+}
+
+pub fn build_msg(t Text, b Text) Msg {
+    Msg { tag = "[" ++ t ++ "]", body = b }
+}
+
+pub fn main() Int {
+    let m = build_msg("OK", "hello tenon")
+    let sub = str_slice(m.body, 0, 5)
+    assert sub == "hello"
+    let _ = sys_write_stdout(m.tag ++ " " ++ sub ++ "\n")
+    0
+}
+"#;
+        let prog = parse(src).unwrap();
+        let bin = std::env::temp_dir().join(format!("tenon_llvm_rt_test_{}", std::process::id()));
+        let art = compile_to_native_binary(&prog, &bin, None, "O2").unwrap();
+        assert!(art.binary_bytes > 4096);
+
+        let run = Command::new(&bin).output().unwrap();
+        let _ = fs::remove_file(&bin);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "native LLVM+tenon_rt binary failed: stdout={} stderr={}",
+            stdout,
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(stdout.trim(), "[OK] hello");
     }
 }

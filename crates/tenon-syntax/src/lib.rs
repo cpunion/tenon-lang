@@ -7,6 +7,77 @@ pub use ast::*;
 pub use parser::parse;
 pub use span::{ParseError, Span};
 
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Load a `.tn` source file and recursively resolve all `import "path.tn"` declarations
+/// in topological order with cycle-safe deduplication.
+pub fn load_program_with_imports(entry: &Path) -> Result<Program, String> {
+    let mut visited = BTreeSet::new();
+    let mut items = Vec::new();
+    load_module_recursive(entry, &mut visited, &mut items)?;
+    Ok(Program { items })
+}
+
+fn resolve_import_path(current_file: &Path, import_rel: &str) -> Result<PathBuf, String> {
+    let rel = Path::new(import_rel);
+    if rel.is_absolute() && rel.exists() {
+        return Ok(rel.to_path_buf());
+    }
+    let parent = current_file.parent().unwrap_or_else(|| Path::new("."));
+    let direct = parent.join(rel);
+    if direct.exists() {
+        return Ok(direct);
+    }
+    // Walk up ancestor directories so `import "std/text.tn"` resolves from any example/subdir
+    let mut cur = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    for _ in 0..8 {
+        let cand = cur.join(rel);
+        if cand.exists() {
+            return Ok(cand);
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let cand = cwd.join(rel);
+        if cand.exists() {
+            return Ok(cand);
+        }
+    }
+    Err(format!(
+        "cannot resolve import `{}` from `{}`",
+        import_rel,
+        current_file.display()
+    ))
+}
+
+fn load_module_recursive(
+    file: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    out_items: &mut Vec<Item>,
+) -> Result<(), String> {
+    let canon = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    if !visited.insert(canon.clone()) {
+        return Ok(());
+    }
+    let src = fs::read_to_string(&canon)
+        .map_err(|e| format!("failed to read `{}`: {}", file.display(), e))?;
+    let prog = parse(&src).map_err(|e| format!("{}: {}", file.display(), e))?;
+    for item in prog.items {
+        match item {
+            Item::Import { path, .. } => {
+                let target = resolve_import_path(&canon, &path)?;
+                load_module_recursive(&target, visited, out_items)?;
+            }
+            other => out_items.push(other),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +155,43 @@ view TasksListView from TaskAuthority {
 "#;
         let prog = parse(src).expect("should parse evolution and sync view");
         assert_eq!(prog.items.len(), 3);
+    }
+
+    #[test]
+    fn resolves_recursive_imports_utf8_and_loop_control() {
+        let dir = std::env::temp_dir().join(format!("tenon_import_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("std")).unwrap();
+        fs::write(
+            dir.join("std/base.tn"),
+            "pub fn greet() Text { \"你好 Tenon\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("std/helper.tn"),
+            "import \"std/base.tn\"\npub fn count_to(n Int) Int {\n  var i = 0\n  while i < n {\n    i += 1\n    if i == 2 { continue }\n    if i == 5 { break }\n  }\n  i\n}\n",
+        )
+        .unwrap();
+        let entry = dir.join("app.tn");
+        fs::write(
+            &entry,
+            "import \"std/helper.tn\"\nimport \"std/base.tn\"\npub fn main() Int { count_to(10) }\n",
+        )
+        .unwrap();
+
+        let prog = load_program_with_imports(&entry).expect("should load with imports");
+        let _ = fs::remove_dir_all(&dir);
+        // base.tn deduplicated: greet, count_to, main
+        assert_eq!(prog.items.len(), 3);
+        if let Item::Fn(f) = &prog.items[0] {
+            assert_eq!(f.name, "greet");
+            if let Some(tail) = &f.body.tail {
+                assert_eq!(tail.kind, ExprKind::Str("你好 Tenon".into()));
+            } else {
+                panic!("expected tail str");
+            }
+        } else {
+            panic!("expected greet first");
+        }
     }
 }
