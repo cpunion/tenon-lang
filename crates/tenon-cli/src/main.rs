@@ -35,6 +35,7 @@ async fn main() -> ExitCode {
         "authority" => cmd_authority(&args[2..]).await,
         "worker" => cmd_worker(&args[2..]).await,
         "cluster-demo" => cmd_cluster_demo(&args[2..]).await,
+        "build-wasm" => cmd_build_wasm(&args[2..]),
         "-h" | "--help" | "help" => {
             print_usage();
             ExitCode::SUCCESS
@@ -64,7 +65,8 @@ USAGE:
                                                   Run standalone Authority + Fenced Proxy + SSE Gateway
   tenon worker --authority http://127.0.0.1:8787 --id worker-1 [--session main] [--delay-ms 40] [--takeover] [--once]
                                                   Run standalone Worker OS process with Fabric Sandbox
-  tenon cluster-demo <app.tn>                     Spawn real multi-process cluster (Authority + 2 Workers + SIGKILL failover + 410 reset)"#
+  tenon cluster-demo <app.tn>                     Spawn real multi-process cluster (Authority + 2 Workers + SIGKILL failover + 410 reset)
+  tenon build-wasm <app.tn> [-o <out.wasm>]       Compile declarative .tn view/pacing directly to binary WebAssembly client store"#
     );
 }
 
@@ -630,10 +632,14 @@ async fn cmd_serve(args: &[String]) -> ExitCode {
 }
 
 async fn smoke_test_live_http_sse(addr: &str) -> Result<(usize, bool, usize), String> {
-    // 1. GET /
+    // 1. GET / & GET /tenon_client_store.wasm
     let ui_resp = http_request(addr, "GET", "/", None).await?;
-    if !ui_resp.starts_with("HTTP/1.1 200") || !ui_resp.contains("COALESCE_MS = 33") {
-        return Err("GET / did not serve expected 33ms Web UI".into());
+    if !ui_resp.starts_with("HTTP/1.1 200") || !ui_resp.contains("tenon_client_store.wasm") {
+        return Err("GET / did not serve expected WASM-backed 33ms Web UI".into());
+    }
+    let wasm_resp = http_request(addr, "GET", "/tenon_client_store.wasm", None).await?;
+    if !wasm_resp.starts_with("HTTP/1.1 200") || !wasm_resp.contains("application/wasm") {
+        return Err("GET /tenon_client_store.wasm did not return valid application/wasm".into());
     }
 
     // 2. GET /api/manifest
@@ -1041,4 +1047,72 @@ async fn cmd_cluster_demo(args: &[String]) -> ExitCode {
         eprintln!("MULTI-PROCESS CLUSTER DEMO FAILED; state={}", state_body);
         ExitCode::from(1)
     }
+}
+
+fn cmd_build_wasm(args: &[String]) -> ExitCode {
+    let Some(file) = args.iter().find(|a| !a.starts_with('-')) else {
+        eprintln!("usage: tenon build-wasm <app.tn> [-o <out.wasm>]");
+        return ExitCode::from(2);
+    };
+    let out_path = args
+        .windows(2)
+        .find(|w| w[0] == "-o")
+        .map(|w| w[1].as_str())
+        .unwrap_or("target/tenon_client_store.wasm");
+
+    let prog = match load_and_parse(file) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    let report = check_program(&prog);
+    if !report.ok {
+        eprintln!("FAIL-CLOSED: verification failed for `{}`.", file);
+        return ExitCode::from(1);
+    }
+    let Some(manifest) = report.manifest else {
+        eprintln!("error: `{}` has no distributed views/subscribers.", file);
+        return ExitCode::from(1);
+    };
+
+    let coalesce_ms = manifest
+        .subscribers
+        .iter()
+        .find(|s| s.kind == "client")
+        .and_then(|s| s.coalesce_ms)
+        .unwrap_or(33) as u32;
+    let debounce_cards_ms = manifest
+        .subscribers
+        .iter()
+        .find(|s| s.kind == "client")
+        .and_then(|s| s.debounce_cards_ms)
+        .unwrap_or(100) as u32;
+    let anti_join = manifest.views.iter().any(|v| v.uses_anti_join_overlay);
+
+    let bytes = tenon_codegen::wasm_client::compile_wasm_client_store(
+        tenon_codegen::wasm_client::WasmClientConfig {
+            coalesce_ms,
+            anti_join,
+            debounce_cards_ms,
+        },
+    );
+    if let Some(parent) = Path::new(out_path).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Err(e) = fs::write(out_path, &bytes) {
+        eprintln!("failed to write `{}`: {}", out_path, e);
+        return ExitCode::from(1);
+    }
+    println!(
+        "Compiled `{}` -> `{}` ({} bytes, coalesce={}ms, debounce_cards={}ms, anti_join={})",
+        file,
+        out_path,
+        bytes.len(),
+        coalesce_ms,
+        debounce_cards_ms,
+        anti_join
+    );
+    ExitCode::SUCCESS
 }

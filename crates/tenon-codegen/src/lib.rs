@@ -1,4 +1,5 @@
 pub mod perceus;
+pub mod wasm_client;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{

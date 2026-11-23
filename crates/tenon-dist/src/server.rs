@@ -89,6 +89,23 @@ async fn handle_conn(
         return Ok(());
     }
 
+    if method == "GET" && path == "/tenon_client_store.wasm" {
+        let wasm_bytes = tenon_codegen::wasm_client::compile_wasm_client_store(
+            tenon_codegen::wasm_client::WasmClientConfig {
+                coalesce_ms: kernel.web_coalesce_ms() as u32,
+                anti_join: kernel.uses_anti_join(),
+                debounce_cards_ms: kernel.web_debounce_cards_ms() as u32,
+            },
+        );
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/wasm\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            wasm_bytes.len()
+        );
+        sock.write_all(header.as_bytes()).await?;
+        sock.write_all(&wasm_bytes).await?;
+        return Ok(());
+    }
+
     if method == "GET" && path == "/api/manifest" {
         let json = serde_json::to_string_pretty(&kernel.manifest)?;
         write_http(&mut sock, 200, "application/json", &json).await?;
@@ -427,14 +444,34 @@ fn render_web_ui(coalesce_ms: u64) -> String {
   </div>
 <script>
 const COALESCE_MS = {coalesce_ms};
-let state = {{ history: [], queued: [], live: null, phase: 'idle', branch: 1, epoch: 0, renders: 0, deltas: 0 }};
+let wasmStore = null;
+let state = {{ history: [], queued: [], live: null, phase: 'idle', branch: 1, epoch: 0, renders: 0, deltas: 0, antiJoins: 0 }};
 let pendingDelta = '';
 let coalesceTimer = null;
 
+function hashRun(s) {{
+  let h = 0;
+  if (!s) return 0;
+  for (let i = 0; i < s.length; i++) h = ((h * 31) + s.charCodeAt(i)) | 0;
+  return h === 0 ? 1 : h;
+}}
+
+(async () => {{
+  try {{
+    const resp = await fetch('/tenon_client_store.wasm');
+    const bytes = await resp.arrayBuffer();
+    const {{ instance }} = await WebAssembly.instantiate(bytes);
+    wasmStore = instance.exports;
+  }} catch (e) {{
+    console.warn('Wasm store fallback:', e);
+  }}
+}})();
+
 function render() {{
   state.renders++;
+  const mode = wasmStore ? `WASM(${{wasmStore.coalesce_window_ms()}}ms, anti_joins=${{wasmStore.anti_join_handoffs()}})` : `JS(${{COALESCE_MS}}ms)`;
   document.getElementById('status').textContent =
-    `branch=#${{state.branch}} | exec_epoch=${{state.epoch}} | phase=${{state.phase}} | deltas=${{state.deltas}} | coalesced_renders=${{state.renders}} (window=${{COALESCE_MS}}ms)`;
+    `branch=#${{state.branch}} | exec_epoch=${{state.epoch}} | phase=${{state.phase}} | deltas=${{state.deltas}} | renders=${{state.renders}} | engine=${{mode}}`;
   const el = document.getElementById('timeline');
   el.innerHTML = '';
   for (const t of state.history) {{
@@ -459,6 +496,7 @@ function render() {{
 
 function flushCoalesced() {{
   coalesceTimer = null;
+  if (wasmStore) wasmStore.flush_due(Math.floor(performance.now()));
   if (pendingDelta && state.live) {{
     state.live.text += pendingDelta;
     pendingDelta = '';
@@ -477,6 +515,10 @@ es.onmessage = (ev) => {{
     state.phase = f.view.phase;
     state.branch = f.view.active_branch;
     state.epoch = f.view.exec_epoch;
+    const lastAsst = [...state.history].reverse().find(t => t.role === 'assistant');
+    if (wasmStore) {{
+      wasmStore.on_snapshot(state.branch, state.epoch, lastAsst ? hashRun(lastAsst.run_id) : 0);
+    }}
     state.live = f.live_bubble;
     render(); // immediate bypass of debounce!
   }} else if (f.event === 'session.delta') {{
@@ -486,8 +528,18 @@ es.onmessage = (ev) => {{
     }}
     state.live.through_seq = f.seq;
     pendingDelta += f.delta;
-    if (!coalesceTimer) {{
-      coalesceTimer = setTimeout(flushCoalesced, COALESCE_MS);
+    const nowMs = Math.floor(performance.now());
+    const shouldRenderNow = wasmStore
+      ? wasmStore.on_delta(f.branch_id, hashRun(f.run_id), f.seq, f.delta.length, nowMs) === 1
+      : false;
+    if (shouldRenderNow) {{
+      if (coalesceTimer) {{ clearTimeout(coalesceTimer); coalesceTimer = null; }}
+      state.live.text += pendingDelta;
+      pendingDelta = '';
+      render();
+    }} else if (!coalesceTimer) {{
+      const win = wasmStore ? wasmStore.coalesce_window_ms() : COALESCE_MS;
+      coalesceTimer = setTimeout(flushCoalesced, win);
     }}
   }}
 }};

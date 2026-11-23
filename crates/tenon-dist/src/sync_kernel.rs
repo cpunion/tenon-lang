@@ -134,6 +134,19 @@ impl UniversalSyncKernel {
             .unwrap_or(33)
     }
 
+    pub fn web_debounce_cards_ms(&self) -> u64 {
+        self.manifest
+            .subscribers
+            .iter()
+            .find(|s| s.kind == "client")
+            .and_then(|s| s.debounce_cards_ms)
+            .unwrap_or(100)
+    }
+
+    pub fn uses_anti_join(&self) -> bool {
+        self.manifest.views.iter().any(|v| v.uses_anti_join_overlay)
+    }
+
     /// Fenced Effect Proxy: emits one volatile token delta ONLY IF `slice.exec_epoch == current_epoch`!
     /// Strictly 0 DB writes!
     pub fn proxy_emit_token(
@@ -307,8 +320,76 @@ impl UniversalSyncKernel {
             exec_epoch: slice.exec_epoch,
         });
         self.publish_snapshot(session_id, None);
-        self.drive_claimed_slice(slice, token_delay_ms).await?;
+        let llm_cfg = crate::llm::LlmConfig::from_env();
+        let webhook = std::env::var("TENON_CHANNEL_WEBHOOK_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .map(|u| {
+                crate::channels::ChannelWebhookAdapter::new(u, self.manifest.subscribers.clone())
+            });
+        self.drive_claimed_slice_with_llm(slice, llm_cfg.as_ref(), webhook.as_ref(), token_delay_ms)
+            .await?;
         Ok(true)
+    }
+
+    /// Drive a claimed slice through either a REAL OpenAI-compatible streaming LLM (if `TENON_LLM_BASE_URL` is set)
+    /// OR the built-in deterministic token generator, with Hard EffectProxy Fencing on every token!
+    pub async fn drive_claimed_slice_with_llm(
+        &self,
+        slice: ExecSlice,
+        llm_cfg: Option<&crate::llm::LlmConfig>,
+        webhook: Option<&crate::channels::ChannelWebhookAdapter>,
+        token_delay_ms: u64,
+    ) -> Result<bool, String> {
+        if let Some(cfg) = llm_cfg {
+            let mut full = String::new();
+            let mut prefix_snapshots = Vec::new();
+            let slice_ref = &slice;
+            let res = crate::llm::stream_openai_sse(cfg, &slice.prompt, |seq, tok| {
+                self.proxy_emit_token(slice_ref, seq, tok)
+                    .map_err(|e| e.to_string())?;
+                full.push_str(tok);
+                prefix_snapshots.push(full.clone());
+                Ok(())
+            })
+            .await;
+
+            if let Some(wh) = webhook {
+                for pref in &prefix_snapshots {
+                    wh.on_streaming_prefix(pref).await;
+                }
+            }
+
+            if res.is_err() {
+                let _ = self.authority.append_late_receipt(
+                    &format!("att_llm_{}_e{}", slice.run_id, slice.exec_epoch),
+                    &slice.session_id,
+                    slice.branch_id,
+                    slice.exec_epoch,
+                    "aborted_by_fence",
+                    &full,
+                );
+                return Ok(false);
+            }
+
+            return match self.authority.commit_turn_fenced(&slice, &full) {
+                Ok(_) => {
+                    self.record_trace(TraceEvent::CommitTurn {
+                        session_id: slice.session_id.clone(),
+                        branch_id: slice.branch_id,
+                        exec_epoch: slice.exec_epoch,
+                        run_id: slice.run_id.clone(),
+                    });
+                    self.publish_snapshot(&slice.session_id, Some(&full));
+                    if let Some(wh) = webhook {
+                        wh.on_final_committed(&full).await;
+                    }
+                    Ok(true)
+                }
+                Err(_) => Ok(false),
+            };
+        }
+        self.drive_claimed_slice(slice, token_delay_ms).await
     }
 
     pub async fn drive_claimed_slice(

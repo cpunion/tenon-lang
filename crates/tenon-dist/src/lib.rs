@@ -1,4 +1,6 @@
 pub mod authority;
+pub mod channels;
+pub mod llm;
 pub mod sandbox;
 pub mod server;
 pub mod sync_kernel;
@@ -332,5 +334,111 @@ mod tests {
             authority::SyncSinceResult::Incremental { .. } => {}
             other => panic!("expected Incremental catchup, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn live_openai_sse_stream_and_webhook_channels_work_end_to_end() {
+        let llm_addr = llm::spawn_mock_openai_sse_server(vec![
+            "Tenon ".into(),
+            "streams ".into(),
+            "verified ".into(),
+            "tokens ".into(),
+            "safely.".into(),
+        ])
+        .await
+        .unwrap();
+        let (wh_addr, wh_events) = channels::spawn_mock_webhook_receiver().await.unwrap();
+
+        let manifest = DistributedAppManifest {
+            partitioned_entities: vec!["AgentSession".into()],
+            streams: vec![],
+            views: vec![ResolvedViewSpec {
+                name: "SessionMsgList".into(),
+                sync_id: "session.msg_list".into(),
+                archetype: SyncArchetypeKind::FencedIncremental,
+                max_items: 50,
+                max_payload_bytes: 16 * 1024 * 1024,
+                max_frame_bytes: 4 * 1024 * 1024,
+                journal_budget_bytes: Some(16 * 1024 * 1024),
+                bounded_reset: true,
+                uses_anti_join_overlay: true,
+            }],
+            subscribers: vec![
+                ResolvedSubscriberSpec {
+                    name: "OutboundChannelSink_telegram".into(),
+                    kind: "channel".into(),
+                    channel_id: Some("telegram".into()),
+                    bound_view: "SessionMsgList".into(),
+                    coalesce_ms: None,
+                    throttle_ms: Some(1200),
+                    split_bytes: Some(18), // Force multi-chunk split verification!
+                    debounce_cards_ms: None,
+                    dead_stream_eliminated: false,
+                    persist_overlay_forbidden: true,
+                },
+                ResolvedSubscriberSpec {
+                    name: "OutboundChannelSink_email".into(),
+                    kind: "channel".into(),
+                    channel_id: Some("email".into()),
+                    bound_view: "SessionMsgList".into(),
+                    coalesce_ms: None,
+                    throttle_ms: None,
+                    split_bytes: None,
+                    debounce_cards_ms: None,
+                    dead_stream_eliminated: true,
+                    persist_overlay_forbidden: true,
+                },
+            ],
+        };
+
+        let wh = channels::ChannelWebhookAdapter::new(&wh_addr, manifest.subscribers.clone());
+        let store = AuthorityStore::open(Path::new(":memory:")).unwrap();
+        let kernel = UniversalSyncKernel::new(store, manifest);
+        kernel.authority.send_message("main", "llm_1", "hello llm").unwrap();
+        let slice = kernel.authority.claim_slice("main", "w-llm", false).unwrap().unwrap();
+        kernel.record_trace(TraceEvent::ClaimSlice {
+            session_id: slice.session_id.clone(),
+            worker_id: slice.worker_id.clone(),
+            branch_id: slice.branch_id,
+            exec_epoch: slice.exec_epoch,
+        });
+
+        let llm_cfg = llm::LlmConfig {
+            base_addr: llm_addr,
+            path: "/v1/chat/completions".into(),
+            api_key: None,
+            model: "tenon-mock".into(),
+        };
+        let committed = kernel
+            .drive_claimed_slice_with_llm(slice, Some(&llm_cfg), Some(&wh), 0)
+            .await
+            .unwrap();
+        assert!(committed);
+        assert_eq!(*kernel.db_token_writes.lock().unwrap(), 0);
+        assert!(verify_runtime_trace(&kernel.snapshot_trace()).ok);
+
+        let evs = wh_events.lock().unwrap().clone();
+        // Email dead-stream elimination: 0 draft_edit events, 1 final_send event!
+        let email_drafts = evs
+            .iter()
+            .filter(|e| e.channel_id == "email" && e.mode == "draft_edit")
+            .count();
+        let email_finals = evs
+            .iter()
+            .filter(|e| e.channel_id == "email" && e.mode == "final_send")
+            .count();
+        assert_eq!(email_drafts, 0);
+        assert_eq!(email_finals, 1);
+        // Telegram: throttled to 1 draft_edit + chunk-split final_send (37 bytes / 18 = 3 chunks)!
+        let tg_drafts = evs
+            .iter()
+            .filter(|e| e.channel_id == "telegram" && e.mode == "draft_edit")
+            .count();
+        let tg_final_chunks = evs
+            .iter()
+            .filter(|e| e.channel_id == "telegram" && e.mode == "final_send")
+            .count();
+        assert_eq!(tg_drafts, 1);
+        assert_eq!(tg_final_chunks, 3);
     }
 }
