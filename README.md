@@ -171,6 +171,7 @@ evolution Order: v1 <-> v2 {
 | [04 — 系统级版本演化与兼容性推导引擎](docs/04-system-evolution-and-compatibility.md) | `@evolve` 双轨身份与 `evolution.lock`；API/Wire/Storage/In-Flight 四维 SMT 兼容性推导矩阵；一等双向演化透镜（Bidirectional Lens）与四大形式化证明定律；在线 Expand-Contract 滚动发布计划推导与 Append-Only 部署账本。 |
 | [05 — 内存模型、并发与编译器实现路线](docs/05-memory-concurrency-and-compiler-architecture.md) | MVS + 原生栈 / Goose 多数据栈 / Perceus 原地复用三层内存引擎；`Store[T] + Handle + phase` 可控长期图；显式效应与结构化并发；Query 增量编译器架构、IR 分层、Cranelift(Dev) + LLVM(Release) 双后端、M0–M4 里程碑与可证伪验收门禁。 |
 | [06 — 调和状态机形式化、分布式同步协议推导与通用微内核演化](docs/06-reconciliation-and-distributed-sync-calculus.md) | 对接 [`dast-os-kernel`](../../dast.ai/dast-os-kernel/README.md) 需求：一等三轴状态/锁序格/防 ABA 令牌/双围栏线性 Attempt；从声明式状态与性能/数据量硬预算推导并验证同步画像；极简参数化通用 `SyncArchetype` 微内核（1 套实现 + N 模块零胶水适配 + 可扩充自演化）；单源双编译消灭代码与 TLA+ 两张皮。 |
+| [07 — 重思 `dast-os-kernel`：全新架构提案与七维声明式响应式数据流编译](docs/07-dast-os-rethink-and-reactive-dataflow.md) | 客观拆解 `dast-os-kernel` 的本质真理与偶然复杂度；提出**分片单写者 + 双端硬 Fencing + 不可变 Turn DAG** 全新架构；总结**七维完备声明模型**，展示如何声明式建立 `LLM 流 → msg_list → 多端 33ms 帧合并 & 多渠道节流` 的端到端依赖并直编为服务端原生/客户端 Wasm & Native 可执行代码。 |
 
 ---
 
