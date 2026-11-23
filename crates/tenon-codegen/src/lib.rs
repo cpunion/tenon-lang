@@ -1,3 +1,4 @@
+pub mod llvm_aot;
 pub mod perceus;
 pub mod wasm_client;
 

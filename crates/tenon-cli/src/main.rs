@@ -35,6 +35,7 @@ async fn main() -> ExitCode {
         "authority" => cmd_authority(&args[2..]).await,
         "worker" => cmd_worker(&args[2..]).await,
         "cluster-demo" => cmd_cluster_demo(&args[2..]).await,
+        "build" => cmd_build_aot(&args[2..]),
         "build-wasm" => cmd_build_wasm(&args[2..]),
         "-h" | "--help" | "help" => {
             print_usage();
@@ -66,6 +67,8 @@ USAGE:
   tenon worker --authority http://127.0.0.1:8787 --id worker-1 [--session main] [--delay-ms 40] [--takeover] [--once]
                                                   Run standalone Worker OS process with Fabric Sandbox
   tenon cluster-demo <app.tn>                     Spawn real multi-process cluster (Authority + 2 Workers + SIGKILL failover + 410 reset)
+  tenon build <file.tn> -o <bin> [--emit-llvm <file.ll>] [--opt O0|O2|O3]
+                                                  Verify (Fail-Closed) & AOT-compile to standalone native binary via LLVM
   tenon build-wasm <app.tn> [-o <out.wasm>]       Compile declarative .tn view/pacing directly to binary WebAssembly client store"#
     );
 }
@@ -1120,4 +1123,80 @@ fn cmd_build_wasm(args: &[String]) -> ExitCode {
         anti_join
     );
     ExitCode::SUCCESS
+}
+
+fn cmd_build_aot(args: &[String]) -> ExitCode {
+    let mut file_arg: Option<&str> = None;
+    let mut skip = false;
+    for a in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if a == "-o" || a == "--emit-llvm" || a == "--opt" {
+            skip = true;
+            continue;
+        }
+        if !a.starts_with('-') {
+            file_arg = Some(a.as_str());
+            break;
+        }
+    }
+    let Some(file) = file_arg else {
+        eprintln!("usage: tenon build <file.tn> [-o <bin>] [--emit-llvm <file.ll>] [--opt O3]");
+        return ExitCode::from(2);
+    };
+    let out_bin = args
+        .windows(2)
+        .find(|w| w[0] == "-o")
+        .map(|w| w[1].as_str())
+        .unwrap_or("target/tenon_out");
+    let emit_ll = args
+        .windows(2)
+        .find(|w| w[0] == "--emit-llvm")
+        .map(|w| Path::new(w[1].as_str()));
+    let opt = args
+        .windows(2)
+        .find(|w| w[0] == "--opt")
+        .map(|w| w[1].as_str())
+        .unwrap_or("O3");
+
+    let prog = match load_and_parse(file) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    let report = check_program(&prog);
+    if !report.ok {
+        eprintln!("FAIL-CLOSED: verification failed for `{}`; refusing AOT build.", file);
+        for d in &report.diagnostics {
+            eprintln!("  error[{}] line {}: {}", d.code, d.span.line, d.message);
+            for n in &d.notes {
+                eprintln!("    note: {}", n);
+            }
+        }
+        return ExitCode::from(1);
+    }
+
+    match tenon_codegen::llvm_aot::compile_to_native_binary(&prog, Path::new(out_bin), emit_ll, opt)
+    {
+        Ok(art) => {
+            println!(
+                "LLVM AOT Built `{}` -> `{}` ({} bytes native binary, {} bytes LLVM IR, opt={}, {} proofs verified)",
+                file,
+                art.output_path,
+                art.binary_bytes,
+                art.llvm_ir_bytes,
+                art.opt_level,
+                report.proofs.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("LLVM AOT build failed: {}", e);
+            ExitCode::from(1)
+        }
+    }
 }
