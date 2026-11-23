@@ -1,0 +1,147 @@
+// Tenon Standard Library: std/tools.tn
+// Pure-Tenon workspace-guarded file & shell tools built on minimal OS syscalls.
+
+import "std/text.tn"
+
+pub fn is_safe_rel_path(path Text) Bool {
+    if len(path) == 0 {
+        return false
+    }
+    if str_starts_with(path, "/") {
+        return false
+    }
+    if str_contains(path, "..") {
+        return false
+    }
+    true
+}
+
+pub fn resolve_ws_path(workspace Text, path Text) Text {
+    if len(path) == 0 || path == "." {
+        return workspace
+    }
+    workspace ++ "/" ++ path
+}
+
+pub fn shell_quote(s Text) Text {
+    "'" ++ str_replace_all(s, "'", "'\\''") ++ "'"
+}
+
+pub fn truncate_output(s Text, max_bytes Int) Text {
+    if len(s) <= max_bytes {
+        return s
+    }
+    str_slice(s, 0, max_bytes) ++ "\n... (truncated, total " ++ int_to_text(len(s)) ++ " bytes)"
+}
+
+pub fn tool_read_file(workspace Text, path Text) Text {
+    if !is_safe_rel_path(path) {
+        return "error: path `" ++ path ++ "` escapes workspace or is empty"
+    }
+    let full = resolve_ws_path(workspace, path)
+    let raw = sys_read_file(full)
+    if !sys_file_ok() {
+        return "error: cannot read `" ++ path ++ "`: " ++ raw
+    }
+    let n = len(raw)
+    if n == 0 {
+        return "(empty file)"
+    }
+    var out = ""
+    var pos = 0
+    var line_no = 1
+    while pos < n {
+        var nl = str_index_of_from(raw, "\n", pos)
+        if nl < 0 {
+            nl = n
+        }
+        let line = str_slice(raw, pos, nl)
+        out = out ++ int_to_text(line_no) ++ ": " ++ line ++ "\n"
+        pos = nl + 1
+        line_no += 1
+        if len(out) > 16000 {
+            out = out ++ "... (truncated at line " ++ int_to_text(line_no) ++ ")\n"
+            break
+        }
+    }
+    out
+}
+
+pub fn tool_write_file(workspace Text, path Text, content Text) Text {
+    if !is_safe_rel_path(path) {
+        return "error: path `" ++ path ++ "` escapes workspace or is empty"
+    }
+    let full = resolve_ws_path(workspace, path)
+    let ok = sys_write_file(full, content)
+    if ok {
+        return "ok: wrote " ++ int_to_text(len(content)) ++ " bytes to " ++ path
+    }
+    "error: failed to write " ++ path
+}
+
+pub fn tool_edit_file(workspace Text, path Text, target Text, replacement Text) Text {
+    if !is_safe_rel_path(path) {
+        return "error: path `" ++ path ++ "` escapes workspace or is empty"
+    }
+    if len(target) == 0 {
+        return "error: target must be non-empty"
+    }
+    let full = resolve_ws_path(workspace, path)
+    let raw = sys_read_file(full)
+    if !sys_file_ok() {
+        return "error: cannot read `" ++ path ++ "`: " ++ raw
+    }
+    let pos = str_index_of(raw, target)
+    if pos < 0 {
+        return "error: target snippet not found in " ++ path
+    }
+    let updated = str_replace_first(raw, target, replacement)
+    let ok = sys_write_file(full, updated)
+    if ok {
+        return "ok: edited " ++ path ++ " (" ++ int_to_text(len(updated)) ++ " bytes)"
+    }
+    "error: failed to write updated " ++ path
+}
+
+pub fn tool_list_dir(workspace Text, path Text) Text {
+    if len(path) > 0 && path != "." && !is_safe_rel_path(path) {
+        return "error: path `" ++ path ++ "` escapes workspace"
+    }
+    let full = resolve_ws_path(workspace, path)
+    let cmd = "cd " ++ shell_quote(full) ++ " && find . -maxdepth 3 -not -path '*/.git*' -not -path '*/target*' -not -path '*/node_modules*' | sort | head -n 200"
+    let out = sys_exec(cmd)
+    let code = sys_exec_exit_code()
+    if code != 0 {
+        return "error (exit " ++ int_to_text(code) ++ "): " ++ out
+    }
+    if len(str_trim(out)) == 0 {
+        return "(empty directory)"
+    }
+    truncate_output(out, 12000)
+}
+
+pub fn tool_grep(workspace Text, query Text, path Text) Text {
+    if len(query) == 0 {
+        return "error: empty grep query"
+    }
+    if len(path) > 0 && path != "." && !is_safe_rel_path(path) {
+        return "error: path `" ++ path ++ "` escapes workspace"
+    }
+    let full = resolve_ws_path(workspace, path)
+    let cmd = "cd " ++ shell_quote(full) ++ " && grep -rn --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules -- " ++ shell_quote(query) ++ " . | head -n 80"
+    let out = sys_exec(cmd)
+    if len(str_trim(out)) == 0 {
+        return "(no matches)"
+    }
+    truncate_output(out, 12000)
+}
+
+pub fn tool_shell(workspace Text, command Text) Text {
+    if len(str_trim(command)) == 0 {
+        return "error: empty command"
+    }
+    let cmd = "cd " ++ shell_quote(workspace) ++ " && " ++ command
+    let out = sys_exec(cmd)
+    let code = sys_exec_exit_code()
+    "exit_code=" ++ int_to_text(code) ++ "\n" ++ truncate_output(out, 14000)
+}

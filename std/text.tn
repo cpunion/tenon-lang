@@ -1,0 +1,201 @@
+// Tenon Standard Library: std/text.tn
+// 100% pure-Tenon string utilities built solely on `len`, `byte_at`, `str_slice`, `byte_to_text`, and `++`.
+
+pub fn is_space_byte(b Int) Bool {
+    b == 32 || b == 9 || b == 10 || b == 13
+}
+
+pub fn str_starts_with(s Text, prefix Text) Bool {
+    let plen = len(prefix)
+    if plen > len(s) {
+        return false
+    }
+    if plen == 0 {
+        return true
+    }
+    str_slice(s, 0, plen) == prefix
+}
+
+pub fn str_ends_with(s Text, suffix Text) Bool {
+    let slen = len(s)
+    let xlen = len(suffix)
+    if xlen > slen {
+        return false
+    }
+    if xlen == 0 {
+        return true
+    }
+    str_slice(s, slen - xlen, slen) == suffix
+}
+
+pub fn str_strip_prefix(s Text, prefix Text) Text {
+    if str_starts_with(s, prefix) {
+        return str_slice(s, len(prefix), len(s))
+    }
+    s
+}
+
+pub fn str_trim(s Text) Text {
+    let n = len(s)
+    var start = 0
+    while start < n && is_space_byte(byte_at(s, start)) {
+        start += 1
+    }
+    var end = n
+    while end > start && is_space_byte(byte_at(s, end - 1)) {
+        end -= 1
+    }
+    str_slice(s, start, end)
+}
+
+pub fn str_index_of_from(s Text, needle Text, start Int) Int {
+    let slen = len(s)
+    let nlen = len(needle)
+    if nlen == 0 {
+        if start < 0 {
+            return 0
+        }
+        if start > slen {
+            return slen
+        }
+        return start
+    }
+    if nlen > slen {
+        return -1
+    }
+    let first = byte_at(needle, 0)
+    var i = start
+    if i < 0 {
+        i = 0
+    }
+    let limit = slen - nlen
+    while i <= limit {
+        if byte_at(s, i) == first {
+            var matched = true
+            var j = 1
+            while j < nlen {
+                if byte_at(s, i + j) != byte_at(needle, j) {
+                    matched = false
+                    break
+                }
+                j += 1
+            }
+            if matched {
+                return i
+            }
+        }
+        i += 1
+    }
+    -1
+}
+
+pub fn str_index_of(s Text, needle Text) Int {
+    str_index_of_from(s, needle, 0)
+}
+
+pub fn str_contains(s Text, needle Text) Bool {
+    str_index_of(s, needle) >= 0
+}
+
+pub fn str_replace_first(s Text, target Text, replacement Text) Text {
+    let tlen = len(target)
+    if tlen == 0 {
+        return s
+    }
+    let pos = str_index_of(s, target)
+    if pos < 0 {
+        return s
+    }
+    let left = str_slice(s, 0, pos)
+    let right = str_slice(s, pos + tlen, len(s))
+    left ++ replacement ++ right
+}
+
+pub fn str_replace_all(s Text, target Text, replacement Text) Text {
+    let tlen = len(target)
+    if tlen == 0 {
+        return s
+    }
+    let slen = len(s)
+    var out = ""
+    var pos = 0
+    while pos <= slen {
+        let idx = str_index_of_from(s, target, pos)
+        if idx < 0 {
+            out = out ++ str_slice(s, pos, slen)
+            break
+        }
+        out = out ++ str_slice(s, pos, idx) ++ replacement
+        pos = idx + tlen
+    }
+    out
+}
+
+pub fn int_to_text(n Int) Text {
+    if n == 0 {
+        return "0"
+    }
+    var neg = false
+    var v = n
+    if v < 0 {
+        neg = true
+        v = -v
+    }
+    var rev = ""
+    while v > 0 {
+        let d = v % 10
+        rev = byte_to_text(48 + d) ++ rev
+        v = v / 10
+    }
+    if neg {
+        return "-" ++ rev
+    }
+    rev
+}
+
+pub fn text_to_int(s Text) Int {
+    let n = len(s)
+    var i = 0
+    while i < n && is_space_byte(byte_at(s, i)) {
+        i += 1
+    }
+    var neg = false
+    if i < n && byte_at(s, i) == 45 {
+        neg = true
+        i += 1
+    }
+    var acc = 0
+    while i < n {
+        let b = byte_at(s, i)
+        if b < 48 || b > 57 {
+            break
+        }
+        acc = acc * 10 + (b - 48)
+        i += 1
+    }
+    if neg {
+        return -acc
+    }
+    acc
+}
+
+pub fn hex_nibble(n Int) Text {
+    let d = n % 16
+    if d < 10 {
+        return byte_to_text(48 + d)
+    }
+    byte_to_text(97 + (d - 10))
+}
+
+pub fn parse_hex_digit(b Int) Int {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 65 && b <= 70 {
+        return 10 + (b - 65)
+    }
+    if b >= 97 && b <= 102 {
+        return 10 + (b - 97)
+    }
+    -1
+}

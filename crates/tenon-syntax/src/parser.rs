@@ -1848,19 +1848,20 @@ impl Parser {
                     })
                 }
             }
-            TokenKind::View | TokenKind::Stream | TokenKind::Policy | TokenKind::Bounds | TokenKind::From => {
-                let name = match tok.kind {
-                    TokenKind::View => "view",
-                    TokenKind::Stream => "stream",
-                    TokenKind::Policy => "policy",
-                    TokenKind::Bounds => "bounds",
-                    TokenKind::From => "from",
-                    _ => unreachable!(),
-                };
-                self.bump();
+            TokenKind::View
+            | TokenKind::Stream
+            | TokenKind::Policy
+            | TokenKind::Bounds
+            | TokenKind::From
+            | TokenKind::Output
+            | TokenKind::Pacing
+            | TokenKind::Bind
+            | TokenKind::Archive
+            | TokenKind::Retain => {
+                let (name, span) = self.expect_ident()?;
                 Ok(Expr {
-                    kind: ExprKind::Ident(name.into()),
-                    span: tok.span,
+                    kind: ExprKind::Ident(name),
+                    span,
                 })
             }
             TokenKind::Forall => {

@@ -1,0 +1,18 @@
+// Tenon Standard Library: std/io.tn
+// Console I/O built directly on minimal OS syscalls.
+
+pub fn print(s Text) Int {
+    sys_write_stdout(s)
+}
+
+pub fn println(s Text) Int {
+    sys_write_stdout(s ++ "\n")
+}
+
+pub fn read_line() Text {
+    sys_read_line()
+}
+
+pub fn is_eof() Bool {
+    sys_is_eof()
+}

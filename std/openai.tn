@@ -1,0 +1,194 @@
+// Tenon Standard Library: std/openai.tn
+// 100% pure-Tenon OpenAI Responses API (/v1/responses) streaming SSE client
+// configured for dast-os OpenAI models (gpt-6-luna, gpt-6.1-terra, gpt-6.1-sol, gpt-6-astra).
+
+import "std/io.tn"
+import "std/text.tn"
+import "std/json.tn"
+import "std/env.tn"
+
+pub record OpenAITurnResult {
+    output_items_json Text
+    calls_json        Text
+    call_count        Int
+    input_tokens      Int
+    cached_tokens     Int
+    output_tokens     Int
+    error             Text
+}
+
+pub fn resolve_dast_model(alias Text) Text {
+    let m = str_trim(alias)
+    if m == "luna" || m == "" {
+        return "gpt-6-luna"
+    }
+    if m == "terra" {
+        return "gpt-6.1-terra"
+    }
+    if m == "sol" {
+        return "gpt-6.1-sol"
+    }
+    if m == "astra" {
+        return "gpt-6-astra"
+    }
+    m
+}
+
+pub fn resolve_dast_effort(model Text) Text {
+    if model == "gpt-6-luna" {
+        return "low"
+    }
+    if model == "gpt-6-astra" {
+        return "high"
+    }
+    "medium"
+}
+
+pub fn openai_user_item(text Text) Text {
+    "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":" ++ json_quote(text) ++ "}]}"
+}
+
+pub fn openai_tool_output_item(call_id Text, tool_output Text) Text {
+    "{\"type\":\"function_call_output\",\"call_id\":" ++ json_quote(call_id) ++ ",\"output\":" ++ json_quote(tool_output) ++ "}"
+}
+
+pub fn json_csv_append(csv Text, elem Text) Text {
+    if len(elem) == 0 {
+        return csv
+    }
+    if len(csv) == 0 {
+        return elem
+    }
+    csv ++ "," ++ elem
+}
+
+pub fn openai_stream_turn(
+    api_key Text,
+    model Text,
+    effort Text,
+    session_id Text,
+    instructions Text,
+    input_items_csv Text,
+    tools_json Text,
+    stream_to_stdout Bool
+) OpenAITurnResult {
+    let base_url = env_or_dotenv("OPENAI_BASE_URL")
+    var endpoint = "https://api.openai.com/v1/responses"
+    if len(base_url) > 0 {
+        if str_ends_with(base_url, "/responses") {
+            endpoint = base_url
+        } else if str_ends_with(base_url, "/") {
+            endpoint = base_url ++ "responses"
+        } else {
+            endpoint = base_url ++ "/responses"
+        }
+    }
+
+    let body = "{" ++
+        "\"model\":" ++ json_quote(model) ++
+        ",\"instructions\":" ++ json_quote(instructions) ++
+        ",\"input\":[" ++ input_items_csv ++ "]" ++
+        ",\"tools\":" ++ tools_json ++
+        ",\"stream\":true" ++
+        ",\"store\":false" ++
+        ",\"reasoning\":{\"effort\":" ++ json_quote(effort) ++ "}" ++
+        ",\"include\":[\"reasoning.encrypted_content\"]" ++
+        ",\"prompt_cache_key\":" ++ json_quote("tenon-agent:" ++ session_id) ++
+        "}"
+
+    let h = sys_http_sse_open(endpoint, api_key, body)
+    var out_items_csv = ""
+    var calls_csv = ""
+    var call_count = 0
+    var in_tok = 0
+    var cached_tok = 0
+    var out_tok = 0
+    var err_msg = ""
+    var printed_any = false
+
+    while !sys_http_sse_eof(h) {
+        let line = sys_http_sse_next_line(h)
+        if sys_http_sse_eof(h) {
+            break
+        }
+        if !str_starts_with(line, "data:") {
+            continue
+        }
+        let data = str_trim(str_strip_prefix(line, "data:"))
+        if len(data) == 0 || data == "[DONE]" {
+            continue
+        }
+        let ev_type = json_get_string(data, "type")
+        if ev_type == "response.output_text.delta" {
+            let delta = json_get_string(data, "delta")
+            if stream_to_stdout && len(delta) > 0 {
+                let _ = print(delta)
+                printed_any = true
+            }
+        } else if ev_type == "response.output_item.done" {
+            let item = json_get_object_raw(data, "item")
+            if len(item) > 0 {
+                let itype = json_get_string(item, "type")
+                if itype == "function_call" || itype == "message" || itype == "reasoning" {
+                    out_items_csv = json_csv_append(out_items_csv, item)
+                }
+                if itype == "function_call" {
+                    calls_csv = json_csv_append(calls_csv, item)
+                    call_count += 1
+                }
+            }
+        } else if ev_type == "response.completed" {
+            let resp = json_get_object_raw(data, "response")
+            let usage = json_get_object_raw(resp, "usage")
+            if len(usage) > 0 {
+                in_tok = json_get_int(usage, "input_tokens")
+                out_tok = json_get_int(usage, "output_tokens")
+                let det = json_get_object_raw(usage, "input_tokens_details")
+                if len(det) > 0 {
+                    cached_tok = json_get_int(det, "cached_tokens")
+                }
+            }
+        } else if ev_type == "response.failed" {
+            let resp = json_get_object_raw(data, "response")
+            let eobj = json_get_object_raw(resp, "error")
+            let em = json_get_string(eobj, "message")
+            if len(em) > 0 {
+                err_msg = em
+            } else {
+                err_msg = "OpenAI response.failed: " ++ data
+            }
+        } else if ev_type == "error" {
+            let em = json_get_string(data, "message")
+            if len(em) > 0 {
+                err_msg = em
+            } else {
+                let eobj = json_get_object_raw(data, "error")
+                let em2 = json_get_string(eobj, "message")
+                if len(em2) > 0 {
+                    err_msg = em2
+                } else {
+                    err_msg = "OpenAI error event: " ++ data
+                }
+            }
+        }
+    }
+
+    let net_err = sys_http_sse_error(h)
+    let _ = sys_http_sse_close(h)
+    if len(net_err) > 0 && len(err_msg) == 0 {
+        err_msg = net_err
+    }
+    if printed_any && stream_to_stdout {
+        let _ = println("")
+    }
+
+    OpenAITurnResult {
+        output_items_json = out_items_csv,
+        calls_json = "[" ++ calls_csv ++ "]",
+        call_count = call_count,
+        input_tokens = in_tok,
+        cached_tokens = cached_tok,
+        output_tokens = out_tok,
+        error = err_msg
+    }
+}

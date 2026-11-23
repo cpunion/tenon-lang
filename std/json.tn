@@ -1,0 +1,340 @@
+// Tenon Standard Library: std/json.tn
+// 100% pure-Tenon structural JSON encoder and depth-aware parser!
+
+import "std/text.tn"
+
+pub fn json_escape(s Text) Text {
+    let n = len(s)
+    var out = ""
+    var run_start = 0
+    var i = 0
+    while i < n {
+        let b = byte_at(s, i)
+        if b == 34 || b == 92 || b == 10 || b == 13 || b == 9 || b < 32 {
+            if i > run_start {
+                out = out ++ str_slice(s, run_start, i)
+            }
+            if b == 34 {
+                out = out ++ "\\\""
+            } else if b == 92 {
+                out = out ++ "\\\\"
+            } else if b == 10 {
+                out = out ++ "\\n"
+            } else if b == 13 {
+                out = out ++ "\\r"
+            } else if b == 9 {
+                out = out ++ "\\t"
+            } else {
+                let hi = b / 16
+                let lo = b % 16
+                out = out ++ "\\u00" ++ hex_nibble(hi) ++ hex_nibble(lo)
+            }
+            run_start = i + 1
+        }
+        i += 1
+    }
+    if run_start == 0 {
+        return s
+    }
+    if n > run_start {
+        out = out ++ str_slice(s, run_start, n)
+    }
+    out
+}
+
+pub fn json_quote(s Text) Text {
+    "\"" ++ json_escape(s) ++ "\""
+}
+
+pub fn codepoint_to_utf8(cp Int) Text {
+    if cp < 0 {
+        return ""
+    }
+    if cp < 128 {
+        return byte_to_text(cp)
+    }
+    if cp < 2048 {
+        let b1 = 192 + (cp / 64)
+        let b2 = 128 + (cp % 64)
+        return byte_to_text(b1) ++ byte_to_text(b2)
+    }
+    let b1 = 224 + (cp / 4096)
+    let b2 = 128 + ((cp / 64) % 64)
+    let b3 = 128 + (cp % 64)
+    byte_to_text(b1) ++ byte_to_text(b2) ++ byte_to_text(b3)
+}
+
+pub fn json_unescape(raw Text) Text {
+    let n = len(raw)
+    var out = ""
+    var run_start = 0
+    var i = 0
+    while i < n {
+        if byte_at(raw, i) == 92 && i + 1 < n {
+            if i > run_start {
+                out = out ++ str_slice(raw, run_start, i)
+            }
+            let esc = byte_at(raw, i + 1)
+            if esc == 110 {
+                out = out ++ "\n"
+                i += 2
+            } else if esc == 114 {
+                out = out ++ "\r"
+                i += 2
+            } else if esc == 116 {
+                out = out ++ "\t"
+                i += 2
+            } else if esc == 34 {
+                out = out ++ "\""
+                i += 2
+            } else if esc == 92 {
+                out = out ++ "\\"
+                i += 2
+            } else if esc == 47 {
+                out = out ++ "/"
+                i += 2
+            } else if esc == 98 {
+                out = out ++ byte_to_text(8)
+                i += 2
+            } else if esc == 102 {
+                out = out ++ byte_to_text(12)
+                i += 2
+            } else if esc == 117 && i + 5 < n {
+                let h0 = parse_hex_digit(byte_at(raw, i + 2))
+                let h1 = parse_hex_digit(byte_at(raw, i + 3))
+                let h2 = parse_hex_digit(byte_at(raw, i + 4))
+                let h3 = parse_hex_digit(byte_at(raw, i + 5))
+                if h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0 {
+                    let cp = h0 * 4096 + h1 * 256 + h2 * 16 + h3
+                    out = out ++ codepoint_to_utf8(cp)
+                    i += 6
+                } else {
+                    out = out ++ byte_to_text(esc)
+                    i += 2
+                }
+            } else {
+                out = out ++ byte_to_text(esc)
+                i += 2
+            }
+            run_start = i
+        } else {
+            i += 1
+        }
+    }
+    if run_start == 0 {
+        return raw
+    }
+    if n > run_start {
+        out = out ++ str_slice(raw, run_start, n)
+    }
+    out
+}
+
+pub fn json_skip_ws(s Text, pos Int) Int {
+    let n = len(s)
+    var i = pos
+    while i < n && is_space_byte(byte_at(s, i)) {
+        i += 1
+    }
+    i
+}
+
+// Given `pos` pointing at an opening `"`, returns the index right AFTER the closing `"`, or -1.
+pub fn json_scan_string_end(s Text, pos Int) Int {
+    let n = len(s)
+    if pos >= n || byte_at(s, pos) != 34 {
+        return -1
+    }
+    var i = pos + 1
+    while i < n {
+        let b = byte_at(s, i)
+        if b == 92 {
+            i += 2
+            continue
+        }
+        if b == 34 {
+            return i + 1
+        }
+        i += 1
+    }
+    -1
+}
+
+// Given `pos` pointing at the start of any JSON value, returns the index right AFTER that value.
+pub fn json_skip_value(s Text, pos Int) Int {
+    let n = len(s)
+    var i = json_skip_ws(s, pos)
+    if i >= n {
+        return n
+    }
+    let first = byte_at(s, i)
+    if first == 34 {
+        let end = json_scan_string_end(s, i)
+        if end < 0 {
+            return n
+        }
+        return end
+    }
+    if first == 123 || first == 91 {
+        var depth = 0
+        var in_str = false
+        while i < n {
+            let b = byte_at(s, i)
+            if in_str {
+                if b == 92 {
+                    i += 2
+                    continue
+                }
+                if b == 34 {
+                    in_str = false
+                }
+                i += 1
+                continue
+            }
+            if b == 34 {
+                in_str = true
+            } else if b == 123 || b == 91 {
+                depth += 1
+            } else if b == 125 || b == 93 {
+                depth -= 1
+                if depth == 0 {
+                    return i + 1
+                }
+            }
+            i += 1
+        }
+        return n
+    }
+    // Primitive token: number, true, false, null
+    while i < n {
+        let b = byte_at(s, i)
+        if b == 44 || b == 125 || b == 93 || is_space_byte(b) {
+            break
+        }
+        i += 1
+    }
+    i
+}
+
+// Find direct member `key` in a JSON object `{...}`, returning the byte index of its value, or -1.
+pub fn json_find_value_pos(obj Text, key Text) Int {
+    let n = len(obj)
+    var i = json_skip_ws(obj, 0)
+    if i >= n || byte_at(obj, i) != 123 {
+        return -1
+    }
+    i = json_skip_ws(obj, i + 1)
+    while i < n {
+        if byte_at(obj, i) == 125 {
+            return -1
+        }
+        if byte_at(obj, i) != 34 {
+            return -1
+        }
+        let key_end = json_scan_string_end(obj, i)
+        if key_end < 0 {
+            return -1
+        }
+        let k = str_slice(obj, i + 1, key_end - 1)
+        i = json_skip_ws(obj, key_end)
+        if i >= n || byte_at(obj, i) != 58 {
+            return -1
+        }
+        let val_pos = json_skip_ws(obj, i + 1)
+        if k == key {
+            return val_pos
+        }
+        let after_val = json_skip_value(obj, val_pos)
+        i = json_skip_ws(obj, after_val)
+        if i < n && byte_at(obj, i) == 44 {
+            i = json_skip_ws(obj, i + 1)
+        }
+    }
+    -1
+}
+
+pub fn json_get_raw(obj Text, key Text) Text {
+    let pos = json_find_value_pos(obj, key)
+    if pos < 0 {
+        return ""
+    }
+    let end = json_skip_value(obj, pos)
+    str_slice(obj, pos, end)
+}
+
+pub fn json_get_object_raw(obj Text, key Text) Text {
+    let pos = json_find_value_pos(obj, key)
+    if pos < 0 || byte_at(obj, pos) != 123 {
+        return ""
+    }
+    let end = json_skip_value(obj, pos)
+    str_slice(obj, pos, end)
+}
+
+pub fn json_get_string(obj Text, key Text) Text {
+    let pos = json_find_value_pos(obj, key)
+    if pos < 0 || byte_at(obj, pos) != 34 {
+        return ""
+    }
+    let end = json_scan_string_end(obj, pos)
+    if end < 0 {
+        return ""
+    }
+    let raw = str_slice(obj, pos + 1, end - 1)
+    json_unescape(raw)
+}
+
+pub fn json_get_int(obj Text, key Text) Int {
+    let raw = json_get_raw(obj, key)
+    if len(raw) == 0 {
+        return 0
+    }
+    text_to_int(raw)
+}
+
+pub fn json_array_len(arr Text) Int {
+    let n = len(arr)
+    var i = json_skip_ws(arr, 0)
+    if i >= n || byte_at(arr, i) != 91 {
+        return 0
+    }
+    i = json_skip_ws(arr, i + 1)
+    var count = 0
+    while i < n {
+        if byte_at(arr, i) == 93 {
+            return count
+        }
+        count += 1
+        let next = json_skip_value(arr, i)
+        i = json_skip_ws(arr, next)
+        if i < n && byte_at(arr, i) == 44 {
+            i = json_skip_ws(arr, i + 1)
+        }
+    }
+    count
+}
+
+pub fn json_array_get_raw(arr Text, target_idx Int) Text {
+    let n = len(arr)
+    var i = json_skip_ws(arr, 0)
+    if i >= n || byte_at(arr, i) != 91 {
+        return ""
+    }
+    i = json_skip_ws(arr, i + 1)
+    var idx = 0
+    while i < n {
+        if byte_at(arr, i) == 93 {
+            return ""
+        }
+        let end = json_skip_value(arr, i)
+        if idx == target_idx {
+            return str_slice(arr, i, end)
+        }
+        idx += 1
+        i = json_skip_ws(arr, end)
+        if i < n && byte_at(arr, i) == 44 {
+            i = json_skip_ws(arr, i + 1)
+        }
+    }
+    ""
+}
