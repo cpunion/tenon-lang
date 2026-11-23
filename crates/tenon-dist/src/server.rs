@@ -1,22 +1,35 @@
+use crate::authority::{ExecSlice, SyncSinceResult};
 use crate::sync_kernel::{MuxFrame, UniversalSyncKernel};
 use std::sync::Arc;
+use tenon_verify::{TraceEvent, verify_runtime_trace};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Minimal HTTP/1.1 + Unified Multiplexed SSE Gateway (`GET /api/client/stream`)
 /// + live Web UI demonstrating compiled `coalesce_window(33ms)` frame batching & Anti-Join overlay!
 pub async fn serve_http(kernel: Arc<UniversalSyncKernel>, addr: &str) -> Result<String, String> {
+    serve_http_with_options(kernel, addr, true).await
+}
+
+/// Start Authority HTTP/SSE/RPC server, optionally disabling the built-in in-process worker
+/// so external `tenon worker` OS processes drive execution via `/rpc/*`!
+pub async fn serve_http_with_options(
+    kernel: Arc<UniversalSyncKernel>,
+    addr: &str,
+    enable_builtin_worker: bool,
+) -> Result<String, String> {
     let listener = TcpListener::bind(addr).await.map_err(|e| e.to_string())?;
     let bound = listener.local_addr().map_err(|e| e.to_string())?.to_string();
 
-    // Background worker loop automatically draining runnable sessions
-    let wk = kernel.clone();
-    tokio::spawn(async move {
-        loop {
-            let _ = wk.run_worker_once("main", "worker-auto-1", 40).await;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    });
+    if enable_builtin_worker {
+        let wk = kernel.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = wk.run_worker_once("main", "worker-auto-1", 40).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+    }
 
     tokio::spawn(async move {
         loop {
@@ -86,6 +99,162 @@ async fn handle_conn(
         let stats = kernel.channel_stats.lock().unwrap().clone();
         let json = serde_json::to_string_pretty(&stats)?;
         write_http(&mut sock, 200, "application/json", &json).await?;
+        return Ok(());
+    }
+
+    if method == "GET" && path == "/api/state" {
+        let view = kernel.authority.read_session_view("main")?;
+        let json = serde_json::to_string_pretty(&view)?;
+        write_http(&mut sock, 200, "application/json", &json).await?;
+        return Ok(());
+    }
+
+    if method == "GET" && path == "/api/trace" {
+        let report = verify_runtime_trace(&kernel.snapshot_trace());
+        let json = serde_json::to_string_pretty(&report)?;
+        write_http(&mut sock, 200, "application/json", &json).await?;
+        return Ok(());
+    }
+
+    if method == "GET" && path.starts_with("/api/sessions/main/sync") {
+        let since_seq: i64 = path
+            .split_once("since_seq=")
+            .and_then(|(_, q)| q.split('&').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        match kernel.authority.sync_since("main", since_seq)? {
+            SyncSinceResult::ResetRequired {
+                floor_seq,
+                head_seq,
+            } => {
+                kernel.record_trace(TraceEvent::SyncGapReset410 {
+                    session_id: "main".into(),
+                    since_seq: since_seq.max(0) as u64,
+                    floor_seq: floor_seq.max(0) as u64,
+                });
+                let body = serde_json::json!({
+                    "error": "reset_required",
+                    "floor_seq": floor_seq,
+                    "head_seq": head_seq
+                })
+                .to_string();
+                write_http(&mut sock, 410, "application/json", &body).await?;
+            }
+            inc => {
+                write_http(&mut sock, 200, "application/json", &serde_json::to_string(&inc)?).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    if method == "POST" && path == "/api/admin/gc_floor" {
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_default();
+        let retain = v["retain_last"].as_i64().unwrap_or(1);
+        let (floor, head) = kernel.authority.gc_journal_floor("main", retain)?;
+        let resp = serde_json::json!({ "ok": true, "floor_seq": floor, "head_seq": head }).to_string();
+        write_http(&mut sock, 200, "application/json", &resp).await?;
+        return Ok(());
+    }
+
+    // --- External Worker OS Process RPCs (Hard-Fenced!) ---
+    if method == "POST" && path == "/rpc/claim" {
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_default();
+        let sid = v["session_id"].as_str().unwrap_or("main");
+        let wid = v["worker_id"].as_str().unwrap_or("worker-ext");
+        let force = v["force_takeover"].as_bool().unwrap_or(false);
+        kernel.authority.ensure_session(sid)?;
+        if let Some(slice) = kernel.authority.claim_slice(sid, wid, force)? {
+            kernel.record_trace(TraceEvent::ClaimSlice {
+                session_id: slice.session_id.clone(),
+                worker_id: slice.worker_id.clone(),
+                branch_id: slice.branch_id,
+                exec_epoch: slice.exec_epoch,
+            });
+            kernel.publish_snapshot(sid, None);
+            write_http(&mut sock, 200, "application/json", &serde_json::to_string(&slice)?).await?;
+        } else {
+            write_http(&mut sock, 204, "application/json", "").await?;
+        }
+        return Ok(());
+    }
+
+    if method == "POST" && path == "/rpc/proxy/token" {
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_default();
+        let slice: ExecSlice = serde_json::from_value(v["slice"].clone())?;
+        let seq = v["seq"].as_u64().unwrap_or(1);
+        let delta = v["delta"].as_str().unwrap_or("");
+        match kernel.proxy_emit_token(&slice, seq, delta) {
+            Ok(()) => write_http(&mut sock, 200, "application/json", r#"{"ok":true}"#).await?,
+            Err(e) => {
+                let err = serde_json::json!({ "ok": false, "error": e.to_string() }).to_string();
+                write_http(&mut sock, 409, "application/json", &err).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    if method == "POST" && path == "/rpc/steer/drain" {
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_default();
+        let slice: ExecSlice = serde_json::from_value(v["slice"].clone())?;
+        match kernel.authority.drain_steering_fenced(&slice) {
+            Ok(items) => {
+                write_http(&mut sock, 200, "application/json", &serde_json::to_string(&items)?).await?;
+            }
+            Err(e) => {
+                let err = serde_json::json!({ "ok": false, "error": e.to_string() }).to_string();
+                write_http(&mut sock, 409, "application/json", &err).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    if method == "POST" && path == "/rpc/commit" {
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_default();
+        let slice: ExecSlice = serde_json::from_value(v["slice"].clone())?;
+        let text = v["assistant_text"].as_str().unwrap_or("");
+        match kernel.authority.commit_turn_fenced(&slice, text) {
+            Ok(promoted) => {
+                kernel.record_trace(TraceEvent::CommitTurn {
+                    session_id: slice.session_id.clone(),
+                    branch_id: slice.branch_id,
+                    exec_epoch: slice.exec_epoch,
+                    run_id: slice.run_id.clone(),
+                });
+                kernel.publish_snapshot(&slice.session_id, Some(text));
+                let resp = serde_json::json!({ "ok": true, "promoted_run": promoted }).to_string();
+                write_http(&mut sock, 200, "application/json", &resp).await?;
+            }
+            Err(e) => {
+                let auth_epoch = kernel.authority.current_epoch(&slice.session_id);
+                kernel.record_trace(TraceEvent::StorageCommitRejectedStale {
+                    session_id: slice.session_id.clone(),
+                    worker_epoch: slice.exec_epoch,
+                    auth_epoch,
+                });
+                let err = serde_json::json!({ "ok": false, "error": e.to_string() }).to_string();
+                write_http(&mut sock, 409, "application/json", &err).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    if method == "POST" && path == "/rpc/receipt" {
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_default();
+        let attempt_id = v["attempt_id"].as_str().unwrap_or("att_ext");
+        let session_id = v["session_id"].as_str().unwrap_or("main");
+        let branch_id = v["branch_id"].as_i64().unwrap_or(1);
+        let exec_epoch = v["exec_epoch"].as_i64().unwrap_or(0);
+        let outcome = v["outcome"].as_str().unwrap_or("late");
+        let payload = v["payload"].as_str().unwrap_or("");
+        kernel
+            .authority
+            .append_late_receipt(attempt_id, session_id, branch_id, exec_epoch, outcome, payload)?;
+        kernel.record_trace(TraceEvent::LateReceiptAudit {
+            session_id: session_id.into(),
+            branch_id,
+            exec_epoch,
+        });
+        write_http(&mut sock, 200, "application/json", r#"{"ok":true}"#).await?;
         return Ok(());
     }
 
@@ -195,9 +364,18 @@ async fn write_http(
     ctype: &str,
     body: &str,
 ) -> std::io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        204 => "No Content",
+        404 => "Not Found",
+        409 => "Conflict",
+        410 => "Gone",
+        _ => "Status",
+    };
     let header = format!(
-        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
+        reason,
         ctype,
         body.len()
     );

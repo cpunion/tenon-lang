@@ -37,6 +37,30 @@ pub struct QueuedItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalEntry {
+    pub seq: i64,
+    pub session_id: String,
+    pub event_kind: String,
+    pub payload: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum SyncSinceResult {
+    #[serde(rename = "ok")]
+    Incremental {
+        head_seq: i64,
+        floor_seq: i64,
+        entries: Vec<JournalEntry>,
+    },
+    #[serde(rename = "reset_required")]
+    ResetRequired {
+        floor_seq: i64,
+        head_seq: i64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStateView {
     pub session_id: String,
     pub conv_gen: i64,
@@ -48,6 +72,8 @@ pub struct SessionStateView {
     pub history: Vec<TurnRecord>,
     pub queued: Vec<QueuedItem>,
     pub late_audit_receipts: usize,
+    pub journal_head_seq: i64,
+    pub journal_floor_seq: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,7 +133,17 @@ impl AuthorityStore {
                 phase TEXT NOT NULL DEFAULT 'idle',
                 active_run_id TEXT,
                 active_stream_id TEXT,
-                active_worker TEXT
+                active_worker TEXT,
+                journal_seq INTEGER NOT NULL DEFAULT 0,
+                journal_floor INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS journal_entries (
+                seq INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                event_kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY(session_id, seq)
             );
 
             CREATE TABLE IF NOT EXISTS turns (
@@ -207,10 +243,21 @@ impl AuthorityStore {
             )
             .map_err(|e| e.to_string())?;
             conn.execute(
-                "UPDATE sessions SET phase = 'runnable', active_run_id = ?2 WHERE session_id = ?1",
+                "UPDATE sessions SET phase = 'runnable', active_run_id = ?2, journal_seq = journal_seq + 1 WHERE session_id = ?1",
                 params![session_id, run_id],
             )
             .map_err(|e| e.to_string())?;
+            let seq: i64 = conn
+                .query_row(
+                    "SELECT journal_seq FROM sessions WHERE session_id = ?1",
+                    params![session_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(1);
+            let _ = conn.execute(
+                "INSERT INTO journal_entries(seq, session_id, event_kind, payload) VALUES (?1, ?2, 'send_message', ?3)",
+                params![seq, session_id, text],
+            );
             Ok((run_id, true))
         } else {
             conn.execute(
@@ -568,16 +615,98 @@ impl AuthorityStore {
             Some(next_run)
         } else {
             tx.execute(
-                "UPDATE sessions SET phase = 'idle', active_run_id = NULL, active_stream_id = NULL, active_worker = NULL WHERE session_id = ?1",
+                "UPDATE sessions SET phase = 'idle', active_run_id = NULL, active_stream_id = NULL, active_worker = NULL, journal_seq = journal_seq + 1 WHERE session_id = ?1",
                 params![slice.session_id],
             )
             .map_err(|e| FencingError::Storage(e.to_string()))?;
             None
         };
 
+        let jseq: i64 = tx
+            .query_row(
+                "SELECT journal_seq FROM sessions WHERE session_id = ?1",
+                params![slice.session_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(1);
+        let _ = tx.execute(
+            "INSERT OR REPLACE INTO journal_entries(seq, session_id, event_kind, payload) VALUES (?1, ?2, 'commit_turn', ?3)",
+            params![jseq, slice.session_id, assistant_text],
+        );
+
         tx.commit()
             .map_err(|e| FencingError::Storage(e.to_string()))?;
         Ok(promoted_run)
+    }
+
+    /// Bounded Journal GC: deletes old incremental journal entries and advances `journal_floor`,
+    /// causing stale offline checkpoints (`since_seq < journal_floor`) to receive `410 reset_required`!
+    pub fn gc_journal_floor(
+        &self,
+        session_id: &str,
+        retain_last: i64,
+    ) -> Result<(i64, i64), String> {
+        self.ensure_session(session_id)?;
+        let conn = self.conn.lock().unwrap();
+        let (head, cur_floor): (i64, i64) = conn
+            .query_row(
+                "SELECT journal_seq, journal_floor FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let new_floor = cur_floor.max((head - retain_last).max(1));
+        conn.execute(
+            "DELETE FROM journal_entries WHERE session_id = ?1 AND seq < ?2",
+            params![session_id, new_floor],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE sessions SET journal_floor = ?2 WHERE session_id = ?1",
+            params![session_id, new_floor],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((new_floor, head))
+    }
+
+    /// Incremental catch-up query (`GET /api/sessions/<id>/sync?since_seq=N`):
+    /// Enforces `NoSilentGap`: returns `ResetRequired` (HTTP 410) whenever `since_seq < journal_floor`!
+    pub fn sync_since(&self, session_id: &str, since_seq: i64) -> Result<SyncSinceResult, String> {
+        self.ensure_session(session_id)?;
+        let conn = self.conn.lock().unwrap();
+        let (head_seq, floor_seq): (i64, i64) = conn
+            .query_row(
+                "SELECT journal_seq, journal_floor FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        if since_seq < floor_seq {
+            return Ok(SyncSinceResult::ResetRequired {
+                floor_seq,
+                head_seq,
+            });
+        }
+        let mut stmt = conn
+            .prepare("SELECT seq, session_id, event_kind, payload FROM journal_entries WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC")
+            .map_err(|e| e.to_string())?;
+        let entries: Vec<JournalEntry> = stmt
+            .query_map(params![session_id, since_seq], |r| {
+                Ok(JournalEntry {
+                    seq: r.get(0)?,
+                    session_id: r.get(1)?,
+                    event_kind: r.get(2)?,
+                    payload: r.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(SyncSinceResult::Incremental {
+            head_seq,
+            floor_seq,
+            entries,
+        })
     }
 
     /// ReceiptPort.Append:
@@ -605,16 +734,18 @@ impl AuthorityStore {
     pub fn read_session_view(&self, session_id: &str) -> Result<SessionStateView, String> {
         self.ensure_session(session_id)?;
         let conn = self.conn.lock().unwrap();
-        let (conv_gen, active_branch, exec_epoch, phase, active_run_id, active_stream_id): (
+        let (conv_gen, active_branch, exec_epoch, phase, active_run_id, active_stream_id, journal_head_seq, journal_floor_seq): (
             i64,
             i64,
             i64,
             String,
             Option<String>,
             Option<String>,
+            i64,
+            i64,
         ) = conn
             .query_row(
-                "SELECT conv_gen, active_branch, exec_epoch, phase, active_run_id, active_stream_id FROM sessions WHERE session_id = ?1",
+                "SELECT conv_gen, active_branch, exec_epoch, phase, active_run_id, active_stream_id, journal_seq, journal_floor FROM sessions WHERE session_id = ?1",
                 params![session_id],
                 |r| {
                     Ok((
@@ -624,6 +755,8 @@ impl AuthorityStore {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )
@@ -685,6 +818,8 @@ impl AuthorityStore {
             history,
             queued,
             late_audit_receipts: late_audit_receipts as usize,
+            journal_head_seq,
+            journal_floor_seq,
         })
     }
 }

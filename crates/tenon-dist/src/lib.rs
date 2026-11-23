@@ -1,6 +1,8 @@
 pub mod authority;
+pub mod sandbox;
 pub mod server;
 pub mod sync_kernel;
+pub mod worker;
 
 use authority::{AuthorityStore, FencingError};
 use serde::{Deserialize, Serialize};
@@ -293,5 +295,42 @@ mod tests {
         assert!(summary.followup_promoted_and_completed);
         assert!(summary.zero_db_writes_per_token);
         assert!(summary.anti_join_zero_duplicate_bubbles);
+        assert!(summary.trace_refinement_passed);
+        assert!(summary.trace_events_verified >= 10);
+    }
+
+    #[test]
+    fn fabric_sandbox_and_journal_410_reset_work() {
+        let sb = sandbox::run_fenced_sandbox(
+            "main",
+            2,
+            "check sandbox",
+            std::time::Duration::from_secs(3),
+        )
+        .unwrap();
+        assert_eq!(sb.exit_code, 0);
+        assert!(sb.stdout.contains("epoch=2"));
+        assert!(sb.child_pid > 0);
+
+        let store = AuthorityStore::open(Path::new(":memory:")).unwrap();
+        store.send_message("main", "m1", "first").unwrap();
+        let s1 = store.claim_slice("main", "w1", false).unwrap().unwrap();
+        store.commit_turn_fenced(&s1, "reply1").unwrap();
+        store.send_message("main", "m2", "second").unwrap();
+        let s2 = store.claim_slice("main", "w1", false).unwrap().unwrap();
+        store.commit_turn_fenced(&s2, "reply2").unwrap();
+
+        let (floor, head) = store.gc_journal_floor("main", 1).unwrap();
+        assert!(floor >= 2 && head >= floor);
+        match store.sync_since("main", 0).unwrap() {
+            authority::SyncSinceResult::ResetRequired { floor_seq, .. } => {
+                assert_eq!(floor_seq, floor);
+            }
+            other => panic!("expected 410 ResetRequired, got {:?}", other),
+        }
+        match store.sync_since("main", floor).unwrap() {
+            authority::SyncSinceResult::Incremental { .. } => {}
+            other => panic!("expected Incremental catchup, got {:?}", other),
+        }
     }
 }
