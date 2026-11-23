@@ -10,7 +10,8 @@ use tenon_dist::server::serve_http;
 use tenon_dist::sync_kernel::UniversalSyncKernel;
 use tenon_syntax::{Item, parse};
 use tenon_verify::{
-    ProofTier, check_evolution, check_program, export_tla_specs, run_all_protocol_checks,
+    ProofTier, check_evolution, check_program, check_program_protocols, export_program_tla_specs,
+    export_tla_specs, run_all_protocol_checks,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -392,18 +393,59 @@ fn cmd_modelcheck(args: &[String]) -> ExitCode {
         .windows(2)
         .find(|w| w[0] == "--export-tla")
         .map(|w| w[1].as_str());
+    // Optional `.tn` file argument (skipping flag values like `--export-tla <dir>`)
+    let mut file_arg: Option<&str> = None;
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "--export-tla" {
+            skip_next = true;
+            continue;
+        }
+        if !a.starts_with('-') {
+            file_arg = Some(a.as_str());
+            break;
+        }
+    }
 
-    let report = run_all_protocol_checks();
-    let exported = if let Some(dir) = export_dir {
-        match export_tla_specs(Path::new(dir)) {
-            Ok(files) => files,
+    let (report, exported) = if let Some(path) = file_arg {
+        let prog = match load_and_parse(path) {
+            Ok(p) => p,
             Err(e) => {
-                eprintln!("failed to export TLA+ specs: {}", e);
+                eprintln!("error: {}", e);
                 return ExitCode::from(1);
             }
-        }
+        };
+        let rep = check_program_protocols(&prog);
+        let exp = if let Some(dir) = export_dir {
+            match export_program_tla_specs(&prog, Path::new(dir)) {
+                Ok(files) => files,
+                Err(e) => {
+                    eprintln!("failed to export TLA+ specs: {}", e);
+                    return ExitCode::from(1);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        (rep, exp)
     } else {
-        Vec::new()
+        let rep = run_all_protocol_checks();
+        let exp = if let Some(dir) = export_dir {
+            match export_tla_specs(Path::new(dir)) {
+                Ok(files) => files,
+                Err(e) => {
+                    eprintln!("failed to export TLA+ specs: {}", e);
+                    return ExitCode::from(1);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        (rep, exp)
     };
 
     if as_json {
@@ -415,7 +457,10 @@ fn cmd_modelcheck(args: &[String]) -> ExitCode {
         };
     }
 
-    println!("Tenon L2-b Protocol Model Checker (Positive + Negative Controls):");
+    println!(
+        "Tenon L2-b Protocol Model Checker ({}):",
+        file_arg.unwrap_or("built-in core protocols")
+    );
     for c in &report.cases {
         let status = if c.passed { "PASS" } else { "FAIL" };
         let kind = if c.expect_violation {
@@ -429,7 +474,8 @@ fn cmd_modelcheck(args: &[String]) -> ExitCode {
         );
         if let Some(inv) = &c.violated_invariant {
             println!(
-                "         caught `{}` via trace: {}",
+                "         {} `{}` via trace: {}",
+                if c.passed { "caught" } else { "VIOLATED" },
                 inv,
                 c.counterexample_trace.join(" -> ")
             );
@@ -446,6 +492,7 @@ fn cmd_modelcheck(args: &[String]) -> ExitCode {
         println!("ALL {} PROTOCOL CHECKS PASSED", report.cases.len());
         ExitCode::SUCCESS
     } else {
+        println!("MODEL CHECK FAILED");
         ExitCode::from(1)
     }
 }

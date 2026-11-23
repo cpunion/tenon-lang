@@ -1,0 +1,11 @@
+// Negative Control: Out-of-order lock acquisition violates `SessionLock < StorageTxnLock`!
+// `tenon modelcheck examples/protocols/bad_lock_order.tn` MUST reject with DeadlockFreeLockOrder!
+
+pub lock_lattice KernelLocks {
+    SessionLock < StorageTxnLock < ReceiptLock
+}
+
+@acquires("StorageTxnLock", "SessionLock")
+pub fn deadlock_prone_op(x Int) Int {
+    x
+}

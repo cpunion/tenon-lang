@@ -139,6 +139,23 @@ pub struct LockLatticeDecl {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProtocolVarDecl {
+    pub name: String,
+    pub ty: TypeExpr,
+    pub init: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProtocolActionDecl {
+    pub name: String,
+    pub is_fault: bool,
+    pub guard: Option<Expr>,
+    pub updates: Vec<(String, Expr)>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProtocolDecl {
     pub attrs: Vec<Attr>,
     pub is_pub: bool,
@@ -147,6 +164,9 @@ pub struct ProtocolDecl {
     pub type_params: Vec<String>,
     pub satisfies: Vec<Expr>,
     pub faults: Vec<String>,
+    pub state_vars: Vec<ProtocolVarDecl>,
+    pub actions: Vec<ProtocolActionDecl>,
+    pub fault_actions: Vec<ProtocolActionDecl>,
     pub invariants: Vec<NamedExpr>,
     pub span: Span,
 }

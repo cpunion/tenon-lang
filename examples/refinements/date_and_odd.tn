@@ -1,10 +1,12 @@
-// Tenon M0 Refinement Types & Cross-Field Invariant Demo
-// Demonstrates: Amount > 0, Odd + Odd -> Even, Date leap-year validation,
-// `mutate` atomic update, and Cranelift native JIT execution.
+// Tenon M0/M1 Refinement Types & Cross-Field Invariant Demo
+// Demonstrates reusable refined aliases (`Year`, `Month`, `Amount`, `Odd`, `Even`),
+// cross-field `Date` leap-year validation, and Cranelift native JIT execution.
 
 pub type Amount = Int64 where self > 0
 pub type Odd    = Int64 where self % 2 != 0
 pub type Even   = Int64 where self % 2 == 0
+pub type Year   = Int   where 1 <= self && self <= 9999
+pub type Month  = Int   where 1 <= self && self <= 12
 
 pub pure fn add_odds(a Odd, b Odd) Even {
     a + b
@@ -14,7 +16,7 @@ pub pure fn is_leap_year(y Int) Bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }
 
-pub pure fn days_in_month(y Int, m Int where 1 <= self && self <= 12) Int
+pub pure fn days_in_month(y Year, m Month) Int
     ensures 28 <= result && result <= 31
 {
     match m {
@@ -25,8 +27,8 @@ pub pure fn days_in_month(y Int, m Int where 1 <= self && self <= 12) Int
 }
 
 pub record Date {
-    year  Int where 1 <= self && self <= 9999
-    month Int where 1 <= self && self <= 12
+    year  Year
+    month Month
     day   Int where 1 <= self && self <= days_in_month(year, month)
 }
 

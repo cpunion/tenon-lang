@@ -2,7 +2,7 @@ use crate::authority::{AuthorityStore, ExecSlice, FencingError, SessionStateView
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use tenon_verify::DistributedAppManifest;
+use tenon_verify::{DistributedAppManifest, TraceEvent};
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +81,7 @@ pub struct UniversalSyncKernel {
     pub channel_stats: Arc<Mutex<BTreeMap<String, ChannelDeliveryStats>>>,
     pub db_token_writes: Arc<Mutex<usize>>,
     pub fenced_proxy_rejections: Arc<Mutex<usize>>,
+    pub trace: Arc<Mutex<Vec<TraceEvent>>>,
 }
 
 impl UniversalSyncKernel {
@@ -112,7 +113,16 @@ impl UniversalSyncKernel {
             channel_stats: Arc::new(Mutex::new(ch_map)),
             db_token_writes: Arc::new(Mutex::new(0)),
             fenced_proxy_rejections: Arc::new(Mutex::new(0)),
+            trace: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn record_trace(&self, ev: TraceEvent) {
+        self.trace.lock().unwrap().push(ev);
+    }
+
+    pub fn snapshot_trace(&self) -> Vec<TraceEvent> {
+        self.trace.lock().unwrap().clone()
     }
 
     pub fn web_coalesce_ms(&self) -> u64 {
@@ -135,11 +145,23 @@ impl UniversalSyncKernel {
         let current = self.authority.current_epoch(&slice.session_id);
         if current != slice.exec_epoch {
             *self.fenced_proxy_rejections.lock().unwrap() += 1;
+            self.record_trace(TraceEvent::ProxyRejectedStale {
+                session_id: slice.session_id.clone(),
+                worker_epoch: slice.exec_epoch,
+                auth_epoch: current,
+            });
             return Err(FencingError::StaleEpoch {
                 expected: slice.exec_epoch,
                 actual: current,
             });
         }
+        self.record_trace(TraceEvent::ProxyEmit {
+            session_id: slice.session_id.clone(),
+            branch_id: slice.branch_id,
+            exec_epoch: slice.exec_epoch,
+            run_id: slice.run_id.clone(),
+            seq,
+        });
 
         // Update volatile in-memory prefix (0 DB writes!)
         {
@@ -221,6 +243,17 @@ impl UniversalSyncKernel {
             })
         };
         let seq = *self.head_seq.lock().unwrap();
+        self.record_trace(TraceEvent::SnapshotBuilt {
+            session_id: session_id.to_string(),
+            active_branch: view.active_branch,
+            live_run_id: live_bubble.as_ref().map(|b| b.run_id.clone()),
+            committed_run_ids: view
+                .history
+                .iter()
+                .filter(|t| t.role == "assistant")
+                .map(|t| t.run_id.clone())
+                .collect(),
+        });
         Ok(MuxFrame::Snapshot {
             view,
             live_bubble,
@@ -267,6 +300,12 @@ impl UniversalSyncKernel {
         let Some(slice) = self.authority.claim_slice(session_id, worker_id, false)? else {
             return Ok(false);
         };
+        self.record_trace(TraceEvent::ClaimSlice {
+            session_id: slice.session_id.clone(),
+            worker_id: slice.worker_id.clone(),
+            branch_id: slice.branch_id,
+            exec_epoch: slice.exec_epoch,
+        });
         self.publish_snapshot(session_id, None);
         self.drive_claimed_slice(slice, token_delay_ms).await?;
         Ok(true)
@@ -331,10 +370,22 @@ impl UniversalSyncKernel {
 
         match self.authority.commit_turn_fenced(&slice, &full) {
             Ok(_promoted_followup) => {
+                self.record_trace(TraceEvent::CommitTurn {
+                    session_id: slice.session_id.clone(),
+                    branch_id: slice.branch_id,
+                    exec_epoch: slice.exec_epoch,
+                    run_id: slice.run_id.clone(),
+                });
                 self.publish_snapshot(&slice.session_id, Some(&full));
                 Ok(true)
             }
             Err(_) => {
+                let auth_epoch = self.authority.current_epoch(&slice.session_id);
+                self.record_trace(TraceEvent::StorageCommitRejectedStale {
+                    session_id: slice.session_id.clone(),
+                    worker_epoch: slice.exec_epoch,
+                    auth_epoch,
+                });
                 let _ = self.authority.append_late_receipt(
                     &format!("att_late_{}_e{}", slice.run_id, slice.exec_epoch),
                     &slice.session_id,
@@ -343,6 +394,11 @@ impl UniversalSyncKernel {
                     "late_commit_fenced",
                     &full,
                 );
+                self.record_trace(TraceEvent::LateReceiptAudit {
+                    session_id: slice.session_id.clone(),
+                    branch_id: slice.branch_id,
+                    exec_epoch: slice.exec_epoch,
+                });
                 Ok(false)
             }
         }

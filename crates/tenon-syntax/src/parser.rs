@@ -784,6 +784,9 @@ impl Parser {
         let type_params = self.parse_type_params()?;
         let mut satisfies = Vec::new();
         let mut faults = Vec::new();
+        let mut state_vars = Vec::new();
+        let mut actions = Vec::new();
+        let mut fault_actions = Vec::new();
         let mut invariants = Vec::new();
         loop {
             self.skip_newlines();
@@ -837,18 +840,137 @@ impl Parser {
                     }
                 }
             } else if self.peek().kind == TokenKind::LBrace {
-                let end = self.skip_balanced_braces()?;
-                return Ok(ProtocolDecl {
-                    attrs,
-                    is_pub,
-                    kind,
-                    name,
-                    type_params,
-                    satisfies,
-                    faults,
-                    invariants,
-                    span: start.merge(end),
-                });
+                self.bump(); // '{'
+                loop {
+                    self.skip_newlines();
+                    if self.peek().kind == TokenKind::RBrace {
+                        let end = self.bump().span;
+                        return Ok(ProtocolDecl {
+                            attrs,
+                            is_pub,
+                            kind,
+                            name,
+                            type_params,
+                            satisfies,
+                            faults,
+                            state_vars,
+                            actions,
+                            fault_actions,
+                            invariants,
+                            span: start.merge(end),
+                        });
+                    }
+                    if self.peek().kind == TokenKind::Laws {
+                        self.bump();
+                        self.expect(TokenKind::LBrace)?;
+                        loop {
+                            self.skip_newlines();
+                            if self.peek().kind == TokenKind::RBrace {
+                                self.bump();
+                                break;
+                            }
+                            if self.peek().kind == TokenKind::Invariant {
+                                let ispan = self.bump().span;
+                                let (iname, _) = self.expect_ident()?;
+                                self.expect(TokenKind::Colon)?;
+                                let expr = self.parse_expr()?;
+                                invariants.push(NamedExpr {
+                                    name: iname,
+                                    span: ispan.merge(expr.span),
+                                    expr,
+                                });
+                                self.eat_sep();
+                            } else {
+                                self.bump();
+                            }
+                        }
+                        continue;
+                    }
+                    if self.peek().kind == TokenKind::Invariant {
+                        let ispan = self.bump().span;
+                        let (iname, _) = self.expect_ident()?;
+                        self.expect(TokenKind::Colon)?;
+                        let expr = self.parse_expr()?;
+                        invariants.push(NamedExpr {
+                            name: iname,
+                            span: ispan.merge(expr.span),
+                            expr,
+                        });
+                        self.eat_sep();
+                        continue;
+                    }
+                    if let TokenKind::Ident(kw) = self.peek().kind.clone() {
+                        if kw == "state" && self.peek_ahead_non_nl(1).kind == TokenKind::LBrace {
+                            self.bump();
+                            self.expect(TokenKind::LBrace)?;
+                            loop {
+                                self.skip_newlines();
+                                if self.peek().kind == TokenKind::RBrace {
+                                    self.bump();
+                                    break;
+                                }
+                                let (vname, vstart) = self.expect_ident()?;
+                                let vty = self.parse_type_expr()?;
+                                self.expect(TokenKind::Eq)?;
+                                let init = self.parse_expr()?;
+                                let span = vstart.merge(init.span);
+                                state_vars.push(ProtocolVarDecl {
+                                    name: vname,
+                                    ty: vty,
+                                    init,
+                                    span,
+                                });
+                                self.eat_sep();
+                            }
+                            continue;
+                        }
+                        if kw == "action" || kw == "fault" {
+                            let is_fault = kw == "fault";
+                            let astart = self.bump().span;
+                            let (aname, _) = self.expect_ident()?;
+                            let guard = if matches!(&self.peek_non_nl().kind, TokenKind::Ident(w) if w == "when")
+                            {
+                                self.skip_newlines();
+                                self.bump(); // 'when'
+                                Some(self.parse_expr()?)
+                            } else {
+                                None
+                            };
+                            self.expect(TokenKind::LBrace)?;
+                            let mut updates = Vec::new();
+                            let aend = loop {
+                                self.skip_newlines();
+                                if self.peek().kind == TokenKind::RBrace {
+                                    break self.bump().span;
+                                }
+                                let (target, _) = self.expect_ident()?;
+                                self.expect(TokenKind::Eq)?;
+                                let rhs = self.parse_expr()?;
+                                updates.push((target, rhs));
+                                self.eat_sep();
+                            };
+                            let act = ProtocolActionDecl {
+                                name: aname,
+                                is_fault,
+                                guard,
+                                updates,
+                                span: astart.merge(aend),
+                            };
+                            if is_fault {
+                                fault_actions.push(act);
+                            } else {
+                                actions.push(act);
+                            }
+                            continue;
+                        }
+                    }
+                    // Skip opaque legacy protocol statements cleanly
+                    if self.peek().kind == TokenKind::LBrace {
+                        let _ = self.skip_balanced_braces()?;
+                    } else {
+                        self.bump();
+                    }
+                }
             } else {
                 let end = self.peek().span;
                 return Ok(ProtocolDecl {
@@ -859,6 +981,9 @@ impl Parser {
                     type_params,
                     satisfies,
                     faults,
+                    state_vars,
+                    actions,
+                    fault_actions,
                     invariants,
                     span: start.merge(end),
                 });

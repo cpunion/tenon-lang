@@ -437,7 +437,18 @@ impl CheckerCtx {
         }
 
         for f in &rec.fields {
+            // Collect BOTH refined type-alias predicate (e.g. `type Month = Int where 1 <= self && self <= 12`)
+            // AND any inline field `where` predicate!
+            let mut field_preds: Vec<Expr> = Vec::new();
+            if let Some(alias) = self.type_aliases.get(&f.ty.display_name()) {
+                if let Some(ap) = &alias.predicate {
+                    field_preds.push(ap.clone());
+                }
+            }
             if let Some(pred) = &f.predicate {
+                field_preds.push(pred.clone());
+            }
+            for pred in &field_preds {
                 let fkey = format!("{}.{}", var, f.name);
                 let rewritten = substitute_field_idents(pred, &rec.fields, var);
                 let l0_res = if mutated_any {
@@ -1197,11 +1208,24 @@ fn substitute_self_fields(expr: &Expr) -> Expr {
 
 /// Automatically derive SQLite CHECK clauses from direct scalar predicates on records.
 pub fn derive_sqlite_checks(program: &Program) -> BTreeMap<String, String> {
+    let mut aliases: BTreeMap<String, Expr> = BTreeMap::new();
+    for item in &program.items {
+        if let Item::TypeAlias(ta) = item {
+            if let Some(p) = &ta.predicate {
+                aliases.insert(ta.name.clone(), p.clone());
+            }
+        }
+    }
     let mut checks = BTreeMap::new();
     for item in &program.items {
         if let Item::Record(r) = item {
             let mut clauses = Vec::new();
             for f in &r.fields {
+                if let Some(ap) = aliases.get(&f.ty.display_name()) {
+                    if let Some(sql) = expr_to_sql(ap, Some(&f.name)) {
+                        clauses.push(format!("({})", sql));
+                    }
+                }
                 if let Some(pred) = &f.predicate {
                     if let Some(sql) = expr_to_sql(pred, Some(&f.name)) {
                         clauses.push(format!("({})", sql));

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use sync_kernel::{ChannelDeliveryStats, MuxFrame, UniversalSyncKernel};
-use tenon_verify::DistributedAppManifest;
+use tenon_verify::{DistributedAppManifest, TraceEvent, verify_runtime_trace};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualificationSummary {
@@ -21,6 +21,8 @@ pub struct QualificationSummary {
     pub followup_promoted_and_completed: bool,
     pub zero_db_writes_per_token: bool,
     pub anti_join_zero_duplicate_bubbles: bool,
+    pub trace_refinement_passed: bool,
+    pub trace_events_verified: usize,
     pub web_coalesce_ms: u64,
     pub channel_stats: Vec<ChannelDeliveryStats>,
 }
@@ -40,6 +42,12 @@ pub async fn run_distributed_qualification(
         .authority
         .claim_slice("main", "worker-1", false)?
         .expect("worker-1 should claim slice");
+    kernel.record_trace(TraceEvent::ClaimSlice {
+        session_id: slice_w1.session_id.clone(),
+        worker_id: slice_w1.worker_id.clone(),
+        branch_id: slice_w1.branch_id,
+        exec_epoch: slice_w1.exec_epoch,
+    });
     assert_eq!(slice_w1.exec_epoch, 1);
     assert_eq!(slice_w1.branch_id, 1);
 
@@ -53,6 +61,12 @@ pub async fn run_distributed_qualification(
         .authority
         .claim_slice("main", "worker-2", true)?
         .expect("worker-2 takeover");
+    kernel.record_trace(TraceEvent::ClaimSlice {
+        session_id: slice_w2.session_id.clone(),
+        worker_id: slice_w2.worker_id.clone(),
+        branch_id: slice_w2.branch_id,
+        exec_epoch: slice_w2.exec_epoch,
+    });
     assert_eq!(slice_w2.exec_epoch, 2);
 
     // 3. Stale Worker 1 tries BOTH Proxy emission AND Storage commit -> BOTH MUST BE HARD FENCED!
@@ -62,6 +76,11 @@ pub async fn run_distributed_qualification(
     let stale_storage_commit_rejected =
         matches!(commit_err, Err(FencingError::StaleEpoch { expected: 1, actual: 2 }));
     assert!(stale_storage_commit_rejected);
+    kernel.record_trace(TraceEvent::StorageCommitRejectedStale {
+        session_id: "main".into(),
+        worker_epoch: slice_w1.exec_epoch,
+        auth_epoch: 2,
+    });
 
     // Late receipt from stale Worker 1 is still preserved in ReceiptPort for audit!
     kernel.authority.append_late_receipt(
@@ -72,6 +91,11 @@ pub async fn run_distributed_qualification(
         "fenced_late_fact",
         "usage=12tok",
     )?;
+    kernel.record_trace(TraceEvent::LateReceiptAudit {
+        session_id: "main".into(),
+        branch_id: slice_w1.branch_id,
+        exec_epoch: slice_w1.exec_epoch,
+    });
 
     // 4. Enqueue P0 Steer AND P1 Followup while Worker 2 is executing, then trigger Branch-Aware INTERRUPT!
     kernel.authority.enqueue_steer("main", "old_steer", "old steer to supersede")?;
@@ -81,6 +105,11 @@ pub async fn run_distributed_qualification(
         .authority
         .interrupt("main", "cmd_int_1", "switched topic")
         .map_err(|e| e.to_string())?;
+    kernel.record_trace(TraceEvent::Interrupt {
+        session_id: "main".into(),
+        new_branch: int_out.new_branch,
+        new_epoch: int_out.new_epoch,
+    });
     assert_eq!(int_out.new_branch, 2);
     assert_eq!(int_out.superseded_steers, 1);
     assert_eq!(int_out.preserved_followups, 1);
@@ -96,6 +125,12 @@ pub async fn run_distributed_qualification(
         .authority
         .claim_slice("main", "worker-3", false)?
         .expect("worker-3 claims branch 2");
+    kernel.record_trace(TraceEvent::ClaimSlice {
+        session_id: slice_w3.session_id.clone(),
+        worker_id: slice_w3.worker_id.clone(),
+        branch_id: slice_w3.branch_id,
+        exec_epoch: slice_w3.exec_epoch,
+    });
     assert_eq!(slice_w3.branch_id, 2);
     assert_eq!(slice_w3.exec_epoch, 4);
 
@@ -156,6 +191,15 @@ pub async fn run_distributed_qualification(
         }
     }
 
+    // Verify Runtime Trace Refinement against formal protocol invariants!
+    let trace_rep = verify_runtime_trace(&kernel.snapshot_trace());
+    if !trace_rep.ok {
+        return Err(format!(
+            "runtime trace refinement failed: {:?}",
+            trace_rep.violations
+        ));
+    }
+
     Ok(QualificationSummary {
         single_executor_hard_fenced: true,
         stale_proxy_rejections: *kernel.fenced_proxy_rejections.lock().unwrap(),
@@ -167,6 +211,8 @@ pub async fn run_distributed_qualification(
         followup_promoted_and_completed,
         zero_db_writes_per_token: *kernel.db_token_writes.lock().unwrap() == 0,
         anti_join_zero_duplicate_bubbles: anti_join_ok,
+        trace_refinement_passed: trace_rep.ok,
+        trace_events_verified: trace_rep.events_checked,
         web_coalesce_ms: kernel.web_coalesce_ms(),
         channel_stats,
     })

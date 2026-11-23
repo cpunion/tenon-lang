@@ -1,11 +1,14 @@
-// Tenon M1 Demo: Records, Auto-Derived `Date.parse(...)`, `inout`, `mutate`,
-// Perceus Unique In-Place Reuse (FBIP) & MVS Copy-on-Write, Text & Lists!
+// Tenon M1 Demo: Reusable `Year`/`Month` Aliases, Records, Auto-Derived `Date.parse(...)`,
+// `inout`, `mutate`, Perceus Unique In-Place Reuse (FBIP) & MVS Copy-on-Write, Text & Lists!
+
+pub type Year  = Int where 1 <= self && self <= 9999
+pub type Month = Int where 1 <= self && self <= 12
 
 pub pure fn is_leap_year(y Int) Bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }
 
-pub pure fn days_in_month(y Int, m Int where 1 <= self && self <= 12) Int
+pub pure fn days_in_month(y Year, m Month) Int
     ensures 28 <= result && result <= 31
 {
     match m {
@@ -16,8 +19,8 @@ pub pure fn days_in_month(y Int, m Int where 1 <= self && self <= 12) Int
 }
 
 pub record Date {
-    year  Int where 1 <= self && self <= 9999
-    month Int where 1 <= self && self <= 12
+    year  Year
+    month Month
     day   Int where 1 <= self && self <= days_in_month(year, month)
 }
 
@@ -49,18 +52,24 @@ pub fn main() Int {
     assert b.year == 2023
     assert b.day == 28
 
-    // 3. Auto-derived boundary parser `Date.parse(...)` (Single Source of Truth!)
+    // 3. Auto-derived boundary parser `Date.parse(...)` inherits `Year`/`Month` aliases automatically!
     let ok_day = match Date.parse(2024, 2, 29) {
         Ok(dt) => dt.day
         Err(code) => -code
     }
     assert ok_day == 29
 
-    let bad_err = match Date.parse(2023, 2, 29) {
+    let bad_month = match Date.parse(2024, 13, 1) {
         Ok(dt) => dt.day
         Err(code) => -code
     }
-    assert bad_err == -3
+    assert bad_month == -2
+
+    let bad_day = match Date.parse(2023, 2, 29) {
+        Ok(dt) => dt.day
+        Err(code) => -code
+    }
+    assert bad_day == -3
 
     // 4. Managed Lists & Text values
     let label = "tenon-m1"

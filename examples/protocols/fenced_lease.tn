@@ -1,0 +1,62 @@
+// Tenon M2 Generic Protocol Model Checking Demo
+// Both `lock_lattice` and `protocol state_machine` are compiled directly from `.tn` AST
+// into the built-in Rust BFS explorer AND exported to TLA+ (`.tla` + `.cfg`)!
+
+pub lock_lattice KernelLocks {
+    SessionLock < StorageTxnLock < ReceiptLock
+}
+
+@acquires("SessionLock", "StorageTxnLock", "ReceiptLock")
+pub fn safe_multi_lock_step(x Int) Int {
+    x + 1
+}
+
+pub protocol state_machine CustomFencedLease {
+    state {
+        auth_epoch   Int  = 1
+        w1_epoch     Int  = 1
+        w2_epoch     Int  = 0
+        stale_commit Bool = false
+    }
+
+    action Worker2Takeover when auth_epoch < 3 {
+        auth_epoch = auth_epoch + 1
+        w2_epoch = auth_epoch + 1
+    }
+
+    action Worker1FencedCommit when w1_epoch == auth_epoch {
+        stale_commit = false
+    }
+
+    fault DropStorageFence when w1_epoch < auth_epoch {
+        stale_commit = true
+    }
+
+    laws {
+        invariant NoStaleCommit: !stale_commit
+        invariant EpochPositive: auth_epoch >= 1
+    }
+}
+
+pub protocol state_machine QuotaBudgetProtocol {
+    state {
+        used  Int = 0
+        limit Int = 3
+    }
+
+    action Spend when used < limit {
+        used = used + 1
+    }
+
+    action Refund when used > 0 {
+        used = used - 1
+    }
+
+    fault UncheckedSpend when used == limit {
+        used = used + 1
+    }
+
+    laws {
+        invariant WithinBudget: used >= 0 && used <= limit
+    }
+}

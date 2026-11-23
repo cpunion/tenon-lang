@@ -62,6 +62,8 @@ pub fn check_evolution(v1: &Program, v2: &Program) -> EvolutionReport {
 
     let v1_pure = collect_pure_fns(v1);
     let v2_pure = collect_pure_fns(v2);
+    let v1_aliases = collect_alias_predicates(v1);
+    let v2_aliases = collect_alias_predicates(v2);
 
     let v1_entities = collect_evolve_records(v1);
     let v2_entities = collect_evolve_records(v2);
@@ -94,6 +96,8 @@ pub fn check_evolution(v1: &Program, v2: &Program) -> EvolutionReport {
             rec2,
             &v1_pure,
             &v2_pure,
+            &v1_aliases,
+            &v2_aliases,
             v2_evolutions.get(&rec2.name),
         );
         let resolved = matches!(
@@ -124,12 +128,15 @@ pub fn check_evolution(v1: &Program, v2: &Program) -> EvolutionReport {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare_record_versions(
     eid: &str,
     rec1: &RecordDecl,
     rec2: &RecordDecl,
     v1_pure: &BTreeMap<String, FnDecl>,
     v2_pure: &BTreeMap<String, FnDecl>,
+    v1_aliases: &BTreeMap<String, Expr>,
+    v2_aliases: &BTreeMap<String, Expr>,
     evo_lens: Option<&EvolutionDecl>,
 ) -> EntityCompatReport {
     // Merge pure fns with versioned names (`v1__fn`, `v2__fn`) so buggy v1 `is_leap_year` vs fixed v2 `is_leap_year` coexist cleanly in one Z3 query!
@@ -173,19 +180,29 @@ fn compare_record_versions(
     for (slot, f1) in &f1_map {
         let var = f1.name.clone();
         vars.push(var.clone());
+        let mut subst = BTreeMap::new();
+        subst.insert("self".into(), var.clone());
+        if let Some(ap) = v1_aliases.get(&f1.ty.display_name()) {
+            let renamed = rename_expr_calls(ap, "v1__", v1_pure);
+            if let Ok(s) = encode_expr(&renamed, &subst) {
+                p1_clauses.push(s);
+            }
+        }
         if let Some(pred) = &f1.predicate {
             let renamed = rename_expr_calls(pred, "v1__", v1_pure);
-            let mut subst = BTreeMap::new();
-            subst.insert("self".into(), var.clone());
             if let Ok(s) = encode_expr(&renamed, &subst) {
                 p1_clauses.push(s);
             }
         }
         if let Some(f2) = f2_map.get(slot) {
+            if let Some(ap) = v2_aliases.get(&f2.ty.display_name()) {
+                let renamed = rename_expr_calls(ap, "v2__", v2_pure);
+                if let Ok(s) = encode_expr(&renamed, &subst) {
+                    p2_clauses.push(s);
+                }
+            }
             if let Some(pred) = &f2.predicate {
                 let renamed = rename_expr_calls(pred, "v2__", v2_pure);
-                let mut subst = BTreeMap::new();
-                subst.insert("self".into(), var.clone());
                 if let Ok(s) = encode_expr(&renamed, &subst) {
                     p2_clauses.push(s);
                 }
@@ -533,6 +550,18 @@ fn collect_pure_fns(prog: &Program) -> BTreeMap<String, FnDecl> {
         if let Item::Fn(f) = item {
             if f.is_pure {
                 map.insert(f.name.clone(), f.clone());
+            }
+        }
+    }
+    map
+}
+
+fn collect_alias_predicates(prog: &Program) -> BTreeMap<String, Expr> {
+    let mut map = BTreeMap::new();
+    for item in &prog.items {
+        if let Item::TypeAlias(ta) = item {
+            if let Some(p) = &ta.predicate {
+                map.insert(ta.name.clone(), p.clone());
             }
         }
     }

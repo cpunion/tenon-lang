@@ -29,7 +29,7 @@ extern "C" fn tenon_rt_print_int(val: i64) -> i64 {
 #[derive(Debug, Clone)]
 struct RecordLayout {
     tag: i64,
-    fields: Vec<(String, Option<Expr>)>,
+    fields: Vec<(String, Vec<Expr>)>,
     where_clauses: Vec<Expr>,
 }
 
@@ -97,6 +97,16 @@ impl JitProgram {
         let rt = declare_runtime_funcs(&mut module)?;
         let print_int_id = declare_sig(&mut module, "tenon_rt_print_int", 1, true)?;
 
+        // Collect refined type alias predicates (e.g. `type Month = Int where 1 <= self && self <= 12`)
+        let mut alias_preds: BTreeMap<String, Expr> = BTreeMap::new();
+        for item in &program.items {
+            if let Item::TypeAlias(ta) = item {
+                if let Some(p) = &ta.predicate {
+                    alias_preds.insert(ta.name.clone(), p.clone());
+                }
+            }
+        }
+
         // Collect Records & Enums
         let mut records: BTreeMap<String, RecordLayout> = BTreeMap::new();
         let mut field_to_idx: BTreeMap<String, usize> = BTreeMap::new();
@@ -113,7 +123,14 @@ impl JitProgram {
                 Item::Record(r) if r.type_params.is_empty() => {
                     let mut fields = Vec::new();
                     for (idx, f) in r.fields.iter().enumerate() {
-                        fields.push((f.name.clone(), f.predicate.clone()));
+                        let mut preds = Vec::new();
+                        if let Some(ap) = alias_preds.get(&f.ty.display_name()) {
+                            preds.push(ap.clone());
+                        }
+                        if let Some(fp) = &f.predicate {
+                            preds.push(fp.clone());
+                        }
+                        fields.push((f.name.clone(), preds));
                         field_to_idx.entry(f.name.clone()).or_insert(idx);
                     }
                     records.insert(
@@ -329,9 +346,9 @@ impl JitProgram {
                     terminated: false,
                 };
 
-                // Check each field's `where` predicate in declaration order!
-                for (idx, (fname, pred_opt)) in layout.fields.iter().enumerate() {
-                    if let Some(pred) = pred_opt {
+                // Check each field's refined type-alias + inline `where` predicates in declaration order!
+                for (idx, (fname, preds)) in layout.fields.iter().enumerate() {
+                    for pred in preds {
                         lower.self_var = Some(fname.clone());
                         let cond_val = lower.lower_expr(pred)?;
                         lower.self_var = None;

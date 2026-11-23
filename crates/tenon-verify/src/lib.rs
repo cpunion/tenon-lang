@@ -9,7 +9,10 @@ pub mod sync_solver;
 pub use checker::{CheckReport, Diagnostic, ProofRecord, ProofTier, check_program};
 pub use db::{IncrementalDb, QueryStats};
 pub use evolve::{CompatVerdict, EvolutionReport, check_evolution};
-pub use modelcheck::{ModelCheckSuiteReport, export_tla_specs, run_all_protocol_checks};
+pub use modelcheck::{
+    ModelCheckSuiteReport, TraceEvent, TraceRefinementReport, check_program_protocols,
+    export_program_tla_specs, export_tla_specs, run_all_protocol_checks, verify_runtime_trace,
+};
 pub use sync_solver::{
     DistributedAppManifest, ResolvedStreamSpec, ResolvedSubscriberSpec, ResolvedViewSpec,
     SyncArchetypeKind,
@@ -207,5 +210,68 @@ pub fn shift_safe(inout d Date)
         assert!(db.set_file("a.tn", "pub type Even = Int64 where self % 2 == 0\n"));
         let _ = db.check_file("a.tn").unwrap();
         assert_eq!(db.stats().check_misses, 2);
+    }
+
+    #[test]
+    fn custom_tn_protocol_ast_bfs_lock_lattice_and_trace_refinement() {
+        let src = r#"
+pub lock_lattice KernelLocks {
+    SessionLock < StorageTxnLock < ReceiptLock
+}
+
+@acquires("SessionLock", "StorageTxnLock")
+pub fn ok_locks(x Int) Int { x }
+
+pub protocol state_machine CustomFencedLease {
+    state {
+        auth_epoch   Int  = 1
+        w1_epoch     Int  = 1
+        stale_commit Bool = false
+    }
+    action Takeover when auth_epoch < 3 {
+        auth_epoch = auth_epoch + 1
+    }
+    fault DropFence when w1_epoch < auth_epoch {
+        stale_commit = true
+    }
+    laws {
+        invariant NoStale: !stale_commit
+    }
+}
+"#;
+        let prog = parse(src).unwrap();
+        let rep = check_program_protocols(&prog);
+        assert!(rep.ok, "AST protocol checks failed: {:?}", rep.cases);
+        assert!(rep.cases.iter().any(|c| c.protocol == "CustomFencedLease" && c.case_name == "safety_proof" && c.passed));
+        assert!(rep.cases.iter().any(|c| c.protocol == "CustomFencedLease" && c.case_name == "negative_fault_DropFence" && c.passed));
+
+        // Negative control: bad lock order MUST fail!
+        let bad_lock = parse(r#"
+pub lock_lattice KernelLocks {
+    SessionLock < StorageTxnLock
+}
+@acquires("StorageTxnLock", "SessionLock")
+pub fn bad_fn(x Int) Int { x }
+"#).unwrap();
+        let bad_rep = check_program_protocols(&bad_lock);
+        assert!(!bad_rep.ok, "inverted lock acquisition order must fail");
+
+        // Runtime Trace Refinement positive + negative check!
+        let good_trace = vec![
+            TraceEvent::ClaimSlice { session_id: "s1".into(), worker_id: "w1".into(), branch_id: 1, exec_epoch: 1 },
+            TraceEvent::ProxyEmit { session_id: "s1".into(), branch_id: 1, exec_epoch: 1, run_id: "r1".into(), seq: 1 },
+            TraceEvent::CommitTurn { session_id: "s1".into(), branch_id: 1, exec_epoch: 1, run_id: "r1".into() },
+            TraceEvent::SnapshotBuilt { session_id: "s1".into(), active_branch: 1, live_run_id: None, committed_run_ids: vec!["r1".into()] },
+        ];
+        assert!(verify_runtime_trace(&good_trace).ok);
+
+        let bad_trace = vec![
+            TraceEvent::ClaimSlice { session_id: "s1".into(), worker_id: "w1".into(), branch_id: 1, exec_epoch: 1 },
+            TraceEvent::ClaimSlice { session_id: "s1".into(), worker_id: "w2".into(), branch_id: 1, exec_epoch: 2 },
+            TraceEvent::ProxyEmit { session_id: "s1".into(), branch_id: 1, exec_epoch: 1, run_id: "r1".into(), seq: 2 },
+        ];
+        let bad_tr = verify_runtime_trace(&bad_trace);
+        assert!(!bad_tr.ok);
+        assert!(bad_tr.violations[0].contains("NoStaleProxyCall"));
     }
 }
