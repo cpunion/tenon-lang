@@ -26,6 +26,12 @@
     "onLanguage:tenon"
   ],
   "contributes": {
+    "commands": [
+      {
+        "command": "tenon.restartServer",
+        "title": "Tenon: Restart Language Server"
+      }
+    ],
     "languages": [
       {
         "id": "tenon",

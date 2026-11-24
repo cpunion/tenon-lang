@@ -6,3 +6,5 @@ Cargo.lock
 .DS_Store
 .tenon-cache/
 benchmarks/bin/
+editors/vscode/node_modules/
+*.vsix
