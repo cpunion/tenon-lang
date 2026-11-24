@@ -1,0 +1,86 @@
+// examples/dogfood/quant_backtest.tn — Verified Crypto Trading Backtest & Risk Kernel
+// Compiles to a C-ABI static library (`libquant.a` + `quant.h` + `quant_cgo.go`) called directly
+// from Go/Wails applications with ZERO runtime overhead and statically proved safety:
+//  - Const `Range[LO, HI]` parameter refinements (positive prices, bounded leverage/BPS)
+//  - `@no_heap_alloc` register-only fee/risk math proved overflow-free (`nsw`)
+//  - Flat unboxed `Float64x4` SIMD 4-bar momentum/dot-product signal kernel
+
+pub type Range[LO Int, HI Int] = Int where self >= LO && self <= HI
+pub type PriceCents = Range[1, 1000000000]
+pub type QtyUnits   = Range[1, 1000000]
+pub type FeeBps     = Range[0, 500]
+
+/// Verified order notional & fee check (`@no_heap_alloc`, overflow-free `nsw`).
+/// Returns `1` if order notional + fee fits within `max_notional`, else `0`.
+@export("quant_verify_order_risk")
+@no_heap_alloc
+pub pure fn quant_verify_order_risk(
+    price PriceCents,
+    qty QtyUnits,
+    fee_bps FeeBps,
+    max_notional Int
+) Int {
+    let notional = price * qty
+    let fee = (notional * fee_bps) / 10000
+    if notional + fee <= max_notional { 1 } else { 0 }
+}
+
+/// Verified EMA step in basis points (`alpha_bps` in `[1, 10000]`, `@no_heap_alloc`).
+@export("quant_ema_bps")
+@no_heap_alloc
+pub pure fn quant_ema_bps(
+    prev_ema Range[0, 1000000000],
+    price PriceCents,
+    alpha_bps Range[1, 10000]
+) Int {
+    (alpha_bps * price + (10000 - alpha_bps) * prev_ema) / 10000
+}
+
+/// 4-wide SIMD `Float64x4` weighted factor signal score (returns score scaled by 100).
+@export("quant_simd_signal_score")
+pub fn quant_simd_signal_score(p0 Float, p1 Float, p2 Float, p3 Float) Int {
+    let bars = simd_f64x4_new(p0, p1, p2, p3)
+    let weights = simd_f64x4_new(0.10, 0.20, 0.30, 0.40)
+    let score = simd_f64x4_dot(bars, weights)
+    (score * 100.0) as Int
+}
+
+/// Verified deterministic trend-following backtest over `n` synthetic bars (zero negative cash!).
+@export("quant_backtest_pnl")
+pub fn quant_backtest_pnl(initial_cash Range[10000, 100000000], bars Range[4, 256]) Int {
+    var cash Int = initial_cash
+    var pos = 0
+    var ema = 10000
+    var i = 0
+    while i < bars
+        invariant 0 <= i && i <= bars
+        invariant cash >= 0
+        invariant pos >= 0
+        decreases bars - i
+    {
+        let px = 10000 + ((i * 37) % 800) - 200
+        ema = (2000 * px + 8000 * ema) / 10000
+        if px > ema && pos == 0 && cash >= px {
+            cash = cash - px
+            pos = 1
+        } else if px < ema && pos == 1 {
+            cash = cash + px
+            pos = 0
+        }
+        i += 1
+    }
+    let last_px = 10000 + (((bars - 1) * 37) % 800) - 200
+    let final_equity = cash + pos * last_px
+    final_equity - initial_cash
+}
+
+pub fn main() Int {
+    let ok = quant_verify_order_risk(50000, 2, 10, 200000)
+    let ema = quant_ema_bps(10000, 11000, 2000)
+    let sig = quant_simd_signal_score(100.0, 102.0, 105.0, 110.0)
+    let pnl = quant_backtest_pnl(100000, 32)
+    assert ok == 1
+    assert ema == 10200
+    assert sig == 10590
+    ok + ema + sig + pnl
+}

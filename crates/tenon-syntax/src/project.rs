@@ -1671,3 +1671,111 @@ pub fn format_dep_tree(pkg_dir: &Path) -> Result<String, String> {
     render(&root_name, &graph, 0, &mut out, &mut seen);
     Ok(out)
 }
+
+fn parse_semver_triple(v: &str) -> Option<(u64, u64, u64)> {
+    let clean = v.trim().trim_start_matches('v');
+    let mut parts = clean.split('.');
+    let maj = parts.next()?.parse::<u64>().ok()?;
+    let min = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    let pat = parts
+        .next()
+        .unwrap_or("0")
+        .split('-')
+        .next()
+        .unwrap_or("0")
+        .parse::<u64>()
+        .ok()?;
+    Some((maj, min, pat))
+}
+
+/// Evaluates SemVer constraint expressions (`^1.2.0`, `~1.2.3`, `>=1.0.0`, `<2.0.0`, `1.2.3`).
+pub fn semver_matches(constraint: &str, version: &str) -> bool {
+    let Some((maj, min, pat)) = parse_semver_triple(version) else {
+        return false;
+    };
+    let c = constraint.trim();
+    if c.is_empty() || c == "*" {
+        return true;
+    }
+    for clause in c.split(',') {
+        let cl = clause.trim();
+        let ok = if let Some(rest) = cl.strip_prefix('^') {
+            parse_semver_triple(rest).is_some_and(|(cmaj, cmin, cpat)| {
+                if cmaj > 0 {
+                    maj == cmaj && (min, pat) >= (cmin, cpat)
+                } else if cmin > 0 {
+                    maj == 0 && min == cmin && pat >= cpat
+                } else {
+                    (maj, min, pat) == (0, 0, cpat)
+                }
+            })
+        } else if let Some(rest) = cl.strip_prefix('~') {
+            parse_semver_triple(rest)
+                .is_some_and(|(cmaj, cmin, cpat)| maj == cmaj && min == cmin && pat >= cpat)
+        } else if let Some(rest) = cl.strip_prefix(">=") {
+            parse_semver_triple(rest).is_some_and(|t| (maj, min, pat) >= t)
+        } else if let Some(rest) = cl.strip_prefix("<=") {
+            parse_semver_triple(rest).is_some_and(|t| (maj, min, pat) <= t)
+        } else if let Some(rest) = cl.strip_prefix('>') {
+            parse_semver_triple(rest).is_some_and(|t| (maj, min, pat) > t)
+        } else if let Some(rest) = cl.strip_prefix('<') {
+            parse_semver_triple(rest).is_some_and(|t| (maj, min, pat) < t)
+        } else if let Some(rest) = cl.strip_prefix('=') {
+            parse_semver_triple(rest).is_some_and(|t| (maj, min, pat) == t)
+        } else {
+            parse_semver_triple(cl).is_some_and(|t| (maj, min, pat) == t)
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fetches remote `git` dependencies declared in `tenon.toml` into `~/.tenon/cache/git/`
+/// (with offline cache reuse when the target checkout already exists).
+pub fn sync_git_dependencies(pkg_dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    let canon = fs::canonicalize(pkg_dir).unwrap_or_else(|_| pkg_dir.to_path_buf());
+    let manifest = TenonManifest::load_from_dir(&canon)?
+        .ok_or_else(|| format!("no `tenon.toml` found in `{}`", canon.display()))?;
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let cache_root = home.join(".tenon").join("cache").join("git");
+    let mut synced = Vec::new();
+    for (dep_name, spec) in &manifest.dependencies {
+        if let Some(git_url) = &spec.git {
+            fs::create_dir_all(&cache_root)
+                .map_err(|e| format!("failed to create cache dir `{}`: {}", cache_root.display(), e))?;
+            let rev_slug = spec
+                .rev
+                .as_deref()
+                .unwrap_or("HEAD")
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect::<String>();
+            let dest = cache_root.join(format!("{}-{}", dep_name, rev_slug));
+            if !dest.exists() {
+                let st = std::process::Command::new("git")
+                    .args(["clone", "--depth", "1", git_url, &dest.to_string_lossy()])
+                    .output()
+                    .map_err(|e| format!("failed to invoke git clone for `{}`: {}", dep_name, e))?;
+                if !st.status.success() {
+                    return Err(format!(
+                        "git clone `{}` failed: {}",
+                        git_url,
+                        String::from_utf8_lossy(&st.stderr).trim()
+                    ));
+                }
+                if let Some(rev) = &spec.rev {
+                    let _ = std::process::Command::new("git")
+                        .current_dir(&dest)
+                        .args(["checkout", rev])
+                        .output();
+                }
+            }
+            synced.push((dep_name.clone(), dest));
+        }
+    }
+    Ok(synced)
+}

@@ -51,16 +51,20 @@ pub fn request_id_middleware() Middleware {
     }
 }
 
-/// Emits structured JSON access logs (`{"method","path","status","latency_us"}`) to stdout.
-pub fn structured_log_middleware() Middleware {
+/// Formats a structured JSON access log entry (`{"method","path","status","latency_us"}`).
+pub pure fn format_access_log_json(method Text, path Text, status Int, latency_us Int) Text {
+    "{\"method\":\"" ++ method ++ "\",\"path\":\"" ++ path ++ "\",\"status\":" ++ int_to_text(status) ++ ",\"latency_us\":" ++ int_to_text(latency_us) ++ "}\n"
+}
+
+/// Emits structured JSON access logs to `sink` (e.g. `|line| sys_write_stdout(line)` or an in-memory test collector).
+pub fn structured_log_middleware(sink fn(Text) Int) Middleware {
     |ctx, next| {
         let t0 = time_now_ns()
         let m = ctx.req.method
         let p = ctx.req.path
         let res = next(ctx)
         let dt_us = (time_now_ns() - t0) / 1000
-        let line = "{\"method\":\"" ++ m ++ "\",\"path\":\"" ++ p ++ "\",\"status\":" ++ int_to_text(res.status) ++ ",\"latency_us\":" ++ int_to_text(dt_us) ++ "}\n"
-        let _ = sys_write_stdout(line)
+        let _ = sink(format_access_log_json(m, p, res.status, dt_us))
         res
     }
 }

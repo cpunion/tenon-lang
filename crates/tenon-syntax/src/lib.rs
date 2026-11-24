@@ -15,6 +15,7 @@ pub use parser::{parse, parse_expr_str, parse_with_file_id};
 pub use project::{
     DepSpec, LoadMode, LockedPackage, TenonManifest, discover_test_packages,
     find_enclosing_manifest, format_dep_tree, generate_lockfile, is_test_source_file, load_package,
+    semver_matches, sync_git_dependencies,
     load_package_with_config, load_package_with_overlays, verify_lockfile,
 };
 pub use span::{ParseError, Span};

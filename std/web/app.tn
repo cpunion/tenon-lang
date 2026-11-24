@@ -7,7 +7,6 @@
 import "std/net/http.tn"
 import "std/web/router.tn"
 import "std/web/middleware.tn"
-import "std/os/fs.tn"
 
 // First-class typed HTTP/WebSocket/SSE route attributes (scanned at compile time by `routes_of()`).
 pub attr get(path Text)
@@ -40,7 +39,7 @@ pub pure fn web_app_new() WebApp {
     }
 }
 
-pure fn infer_mime_type(path Text) Text {
+pub pure fn infer_mime_type(path Text) Text {
     if path.ends_with(".html") || path.ends_with(".htm") { "text/html; charset=utf-8" }
     else if path.ends_with(".js") || path.ends_with(".mjs") { "application/javascript; charset=utf-8" }
     else if path.ends_with(".css") { "text/css; charset=utf-8" }
@@ -50,15 +49,19 @@ pure fn infer_mime_type(path Text) Text {
     else { "text/plain; charset=utf-8" }
 }
 
-/// Path-traversal-safe static file response helper (rejects `..` and leading `/` escapes).
-pub fn serve_static_file(root_dir Text, rel_path Text) HttpResponse {
-    if len(rel_path) == 0 || rel_path.contains("..") || byte_at(rel_path, 0) == 47 {
+/// Validates that a relative static asset path cannot escape its root directory (blocks `..` & leading `/`).
+pub pure fn static_path_is_safe(rel_path Text) Bool {
+    len(rel_path) > 0 && !rel_path.contains("..") && byte_at(rel_path, 0) != 47
+}
+
+/// Path-traversal-safe static asset response builder using an injectable file loader (`loader(full_path)`).
+pub pure fn serve_static_with(root_dir Text, rel_path Text, loader fn(Text) Option[Text]) HttpResponse {
+    if !static_path_is_safe(rel_path) {
         return http_bad_request("invalid static file path")
     }
-    let full = root_dir ++ "/" ++ rel_path
-    match fs_read(full) {
-        Ok(content) => http_response(200, infer_mime_type(rel_path), content)
-        Err(_) => http_not_found("static file not found")
+    match loader(root_dir ++ "/" ++ rel_path) {
+        Some(content) => http_response(200, infer_mime_type(rel_path), content)
+        None => http_not_found("static file not found")
     }
 }
 
@@ -92,13 +95,13 @@ impl WebApp {
         self.route("DELETE", path, handler)
     }
 
-    /// Mounts a path-traversal-safe static directory at `prefix/*file` (e.g. `"/static"`).
-    pub fn static_dir(self, prefix Text, root_dir Text) WebApp {
+    /// Mounts a path-traversal-safe static handler at `prefix/*file` using an injectable loader.
+    pub pure fn static_dir_with(self, prefix Text, root_dir Text, loader fn(Text) Option[Text]) WebApp {
         let dir = root_dir
         let pat = prefix ++ "/*file"
         self.get(pat, |ctx| {
             match ctx.param("file") {
-                Some(rel) => serve_static_file(dir, rel)
+                Some(rel) => serve_static_with(dir, rel, loader)
                 None => http_not_found("missing file path")
             }
         })

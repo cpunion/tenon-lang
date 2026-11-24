@@ -46,6 +46,9 @@ async fn main() -> ExitCode {
         "build-wasm" => cmd_build_wasm(&args[2..]),
         "verify-proofs" => cmd_verify_proofs(&args[2..]),
         "pkg" => cmd_pkg(&args[2..]),
+        "new" => cmd_new(&args[2..]),
+        "doc" => cmd_doc(&args[2..]),
+        "bench" => cmd_bench(&args[2..]),
         "fmt" => cmd_fmt(&args[2..]),
         "lsp" => lsp::run_lsp_stdio(),
         "-h" | "--help" | "help" => {
@@ -62,30 +65,33 @@ async fn main() -> ExitCode {
 
 fn print_usage() {
     println!(
-        r#"tenon — Verified Systems & Distributed Application Language (M0 Prototype)
+        r#"tenon — Verified Systems, Web & Distributed Application Language
 
 USAGE:
-  tenon check <file.tn> [--json]                  Run L0 + L1 (Z3) Fail-Closed verification & Protocol Solver
+  tenon check <file.tn> [--json] [--emit-proofs <dir>] [--emit-repro-test <out.tn>]
+                                                  Run L0 + L1 (Z3) Fail-Closed verification & Protocol Solver
+  tenon verify-proofs <dir> [--solver z3|cvc5|auto]
+                                                  Independently audit exported SMT-LIB2 proof certificates
   tenon run <file.tn>                             Verify and execute `main()` via Cranelift native JIT
   tenon test [file.tn|pkg_dir] [--filter <substr>] [-r|--recursive] [--no-leak-check]
                                                   Verify and run `test fn` tests with per-test Perceus zero-leak checks
-  tenon evolve check <v1.tn> <v2.tn> [--json]     Verify schema evolution compatibility & bidirectional lenses
-  tenon modelcheck [file.tn] [--export-tla <dir>] [--json]
-                                                  Run L2-b protocol model checker (built-in or .tn AST)
-  tenon serve <app.tn> [--addr 127.0.0.1:8787] [--db <path>] [--demo]
-                                                  Compile & run single-process distributed runtime + SSE Web UI
-  tenon authority <app.tn> [--addr 127.0.0.1:8787] [--db <path>]
-                                                  Run standalone Authority + Fenced Proxy + SSE Gateway
-  tenon worker --authority http://127.0.0.1:8787 --id worker-1 [--session main] [--delay-ms 40] [--takeover] [--once]
-                                                  Run standalone Worker OS process with Fabric Sandbox
-  tenon cluster-demo <app.tn>                     Spawn real multi-process cluster (Authority + 2 Workers + SIGKILL failover + 410 reset)
-  tenon agent [--model luna|sol|terra|astra|<id>] [--workspace <dir>] [--spec <app.tn>] [--db <sqlite>] [--env-file <path>] [-p "<prompt>"]
-                                                  Interactive CLI Agent powered by real OpenAI Responses API (dast-os models) + shell & file tools
-  tenon build <file.tn> -o <out> [--opt O0|O2|O3] [--lib static|shared] [--emit-header <h>] [--emit-llvm <ll>] [-g|--debug] [-l <lib>] [-L <dir>] [--c-src <file.c>]
-                                                  Verify (Fail-Closed) & AOT-compile to native binary / C static or shared library via LLVM
-  tenon build-wasm <app.tn> [-o <out.wasm>]       Compile declarative .tn view/pacing directly to binary WebAssembly client store
-  tenon fmt <file.tn> [--check]                   Format Tenon source file with canonical indentation & spacing
-  tenon lsp                                       Run Language Server Protocol (JSON-RPC 2.0 over stdio) for VS Code / editors"#
+  tenon build <file.tn> -o <out> [--opt O0|O2|O3] [--target <triple|wasm32>] [--lib static|shared]
+        [--checked-overflow] [--emit-header <h>] [--emit-llvm <ll>] [--emit-ts <dts>]
+        [--emit-swift <sw>] [--emit-kotlin <kt>] [--emit-go <go>] [-g|--debug] [-l <lib>] [-L <dir>] [--c-src <c>]
+                                                  Verify (Fail-Closed) & AOT-compile to native/Wasm32/C-ABI libraries
+  tenon build-wasm <app.tn> [-o <out.wasm>]       Compile declarative .tn view/pacing to binary WebAssembly store
+  tenon evolve check <v1.tn> <v2.tn> [--lock <file>] [--emit-migration <sql>] [--json]
+                                                  Verify schema evolution compatibility, ledger & Expand-Contract SQL
+  tenon modelcheck [file.tn] [--export-tla <dir>] [--replay <trace.jsonl>] [--json]
+                                                  Run L2-b protocol safety/liveness model checker & trace replay
+  tenon pkg <lock|verify|tree|add|sync> [dir]     Manage `tenon.toml`, `tenon.lock` SHA-256 ledger & git deps
+  tenon new <name> [--cli|--lib|--web]            Scaffold a new Tenon project with tests & manifest
+  tenon doc <file_or_dir> [-o <dir>] [--format md|html|both]
+                                                  Generate Markdown & HTML API reference from verified AST
+  tenon bench <file.tn> [--iters <N>]             Compile with LLVM -O3 and run timed benchmark iterations
+  tenon serve|authority|worker|cluster-demo|agent Distributed runtime, Fenced Authority/Worker & CLI Agent
+  tenon fmt <file.tn> [--check]                   Format Tenon source file with canonical indentation
+  tenon lsp                                       Run Language Server Protocol (JSON-RPC 2.0 over stdio)"#
     );
 }
 
@@ -1781,11 +1787,294 @@ fn cmd_pkg(args: &[String]) -> ExitCode {
             println!("Added dependency `{}` to `{}`", dep_name, toml_path.display());
             ExitCode::SUCCESS
         }
+        "sync" => {
+            let dir = PathBuf::from(args.get(1).map(|s| s.as_str()).unwrap_or("."));
+            match tenon_syntax::sync_git_dependencies(&dir) {
+                Ok(synced) => {
+                    println!("Synced {} remote git dependency(ies) in `{}`", synced.len(), dir.display());
+                    for (name, p) in synced {
+                        println!("  {} -> {}", name, p.display());
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    ExitCode::from(1)
+                }
+            }
+        }
         other => {
-            eprintln!("unknown `tenon pkg` command `{}` (expected lock|verify|tree|add)", other);
+            eprintln!("unknown `tenon pkg` command `{}` (expected lock|verify|tree|add|sync)", other);
             ExitCode::from(2)
         }
     }
+}
+
+fn cmd_new(args: &[String]) -> ExitCode {
+    let mut name_opt: Option<&str> = None;
+    let mut template = "cli";
+    for a in args {
+        match a.as_str() {
+            "--web" => template = "web",
+            "--lib" => template = "lib",
+            "--cli" => template = "cli",
+            s if !s.starts_with('-') && name_opt.is_none() => name_opt = Some(s),
+            _ => {}
+        }
+    }
+    let Some(name) = name_opt else {
+        eprintln!("usage: tenon new <project_dir> [--cli|--lib|--web]");
+        return ExitCode::from(2);
+    };
+    let dir = PathBuf::from(name);
+    let pkg_name = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tenon_app");
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!("failed to create `{}`: {}", dir.display(), e);
+        return ExitCode::from(1);
+    }
+    let manifest = format!(
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\n",
+        pkg_name
+    );
+    let _ = fs::write(dir.join("tenon.toml"), manifest);
+    match template {
+        "lib" => {
+            let lib_src = format!(
+                "// {} — Verified Tenon Library\n\npub type Positive = Int where self > 0\n\npub pure fn add_pos(a Positive, b Positive) Positive {{\n    a + b\n}}\n",
+                pkg_name
+            );
+            let test_src = "test fn test_add_pos() {\n    assert add_pos(2, 3) == 5\n}\n";
+            let _ = fs::write(dir.join("lib.tn"), lib_src);
+            let _ = fs::write(dir.join("lib_test.tn"), test_src);
+        }
+        "web" => {
+            let web_src = format!(
+                "// {} — Tenon Web Service\nimport \"std/web/app.tn\"\n\n@get(\"/health\")\npub pure fn health(ctx Context) HttpResponse {{\n    ctx.ok(\"ok\")\n}}\n\ngen!(mount_annotated_routes())\n\npub fn main() Int {{\n    let app = mount_routes(web_app_new())\n    let h = app.into_handler()\n    let req = HttpRequest {{ method = \"GET\", target = \"/health\", path = \"/health\", query = \"\", headers = [], body = \"\", keep_alive = true }}\n    h(req).status\n}}\n",
+                pkg_name
+            );
+            let test_src = "test fn test_health() {\n    assert main() == 200\n}\n";
+            let _ = fs::write(dir.join("main.tn"), web_src);
+            let _ = fs::write(dir.join("main_test.tn"), test_src);
+        }
+        _ => {
+            let cli_src = format!(
+                "// {} — Verified Tenon CLI Application\n\npub type Range[LO Int, HI Int] = Int where self >= LO && self <= HI\n\npub pure fn clamp_score(x Range[0, 100]) Range[0, 200] {{\n    x * 2\n}}\n\npub fn main() Int {{\n    clamp_score(21)\n}}\n",
+                pkg_name
+            );
+            let test_src = "test fn test_clamp_score() {\n    assert clamp_score(21) == 42\n}\n";
+            let _ = fs::write(dir.join("main.tn"), cli_src);
+            let _ = fs::write(dir.join("main_test.tn"), test_src);
+        }
+    }
+    println!("Created Tenon {} project -> `{}`", template, dir.display());
+    ExitCode::SUCCESS
+}
+
+fn cmd_doc(args: &[String]) -> ExitCode {
+    let mut target_opt: Option<&str> = None;
+    let mut out_dir = PathBuf::from("target/tenon-doc");
+    let mut format = "both";
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" if i + 1 < args.len() => {
+                out_dir = PathBuf::from(&args[i + 1]);
+                i += 2;
+            }
+            "--format" if i + 1 < args.len() => {
+                format = args[i + 1].as_str();
+                i += 2;
+            }
+            s if !s.starts_with('-') && target_opt.is_none() => {
+                target_opt = Some(s);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(target) = target_opt else {
+        eprintln!("usage: tenon doc <file.tn|pkg_dir> [-o <out_dir>] [--format md|html|both]");
+        return ExitCode::from(2);
+    };
+    let prog = match load_and_parse(target) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = fs::create_dir_all(&out_dir) {
+        eprintln!("failed to create `{}`: {}", out_dir.display(), e);
+        return ExitCode::from(1);
+    }
+
+    let target_canon = fs::canonicalize(target)
+        .unwrap_or_else(|_| PathBuf::from(target))
+        .to_string_lossy()
+        .to_string();
+    let target_fid: Option<u32> = prog
+        .source_files
+        .iter()
+        .position(|sf| sf == &target_canon)
+        .map(|idx| idx as u32);
+
+    let mut md = format!("# Tenon API Reference — `{}`\n\n", target);
+    let mut html_items = String::new();
+    let mut count = 0usize;
+    for item in &prog.items {
+        let fid = match item {
+            Item::TypeAlias(d) => d.span.file_id,
+            Item::Record(d) => d.span.file_id,
+            Item::Enum(d) => d.span.file_id,
+            Item::Interface(d) => d.span.file_id,
+            Item::Fn(d) => d.span.file_id,
+            _ => 0,
+        };
+        if let Some(tfid) = target_fid {
+            if fid != tfid {
+                continue;
+            }
+        }
+        match item {
+            Item::TypeAlias(ta) if ta.is_pub => {
+                count += 1;
+                let sig = format!("pub type {} = {}", ta.name, ta.base.display_name());
+                md.push_str(&format!("### `{}`\n\n", sig));
+                html_items.push_str(&format!("<section class='item'><h3><code>{}</code></h3><span class='badge'>type</span></section>\n", sig));
+            }
+            Item::Record(r) if r.is_pub => {
+                count += 1;
+                md.push_str(&format!("### `pub record {}`\n", r.name));
+                let mut fields_html = String::new();
+                for fl in &r.fields {
+                    md.push_str(&format!("- `{}`: `{}`\n", fl.name, fl.ty.display_name()));
+                    fields_html.push_str(&format!("<li><code>{}</code>: <code>{}</code></li>", fl.name, fl.ty.display_name()));
+                }
+                md.push('\n');
+                html_items.push_str(&format!("<section class='item'><h3><code>pub record {}</code></h3><span class='badge'>record</span><ul>{}</ul></section>\n", r.name, fields_html));
+            }
+            Item::Enum(e) if e.is_pub => {
+                count += 1;
+                let vars: Vec<String> = e.variants.iter().map(|v| v.name.clone()).collect();
+                md.push_str(&format!("### `pub enum {}`\nVariants: `{}`\n\n", e.name, vars.join(" | ")));
+                html_items.push_str(&format!("<section class='item'><h3><code>pub enum {}</code></h3><span class='badge'>enum</span><p>Variants: <code>{}</code></p></section>\n", e.name, vars.join(" | ")));
+            }
+            Item::Interface(iface) if iface.is_pub => {
+                count += 1;
+                md.push_str(&format!("### `pub interface {}`\n\n", iface.name));
+                html_items.push_str(&format!("<section class='item'><h3><code>pub interface {}</code></h3><span class='badge'>interface</span></section>\n", iface.name));
+            }
+            Item::Fn(f) if f.is_pub && !f.is_test => {
+                count += 1;
+                let ps: Vec<String> = f.params.iter().map(|p| format!("{} {}", p.name, p.ty.display_name())).collect();
+                let rt = f.ret_ty.as_ref().map(|t| format!(" {}", t.display_name())).unwrap_or_default();
+                let effs = f.declared_effects();
+                let eff_str = if effs.is_empty() { String::new() } else { format!(" / {}", effs.join(", ")) };
+                let prefix = if f.is_pure { "pub pure fn" } else if f.is_async { "pub async fn" } else { "pub fn" };
+                let sig = format!("{} {}({}){}{}", prefix, f.name, ps.join(", "), rt, eff_str);
+                md.push_str(&format!("### `{}`\n\n", sig));
+                html_items.push_str(&format!("<section class='item'><h3><code>{}</code></h3><span class='badge'>fn</span></section>\n", sig));
+            }
+            _ => {}
+        }
+    }
+    if format == "md" || format == "both" {
+        let _ = fs::write(out_dir.join("API.md"), &md);
+    }
+    if format == "html" || format == "both" {
+        let html = format!(
+            "<!doctype html><html><head><meta charset='utf-8'><title>Tenon Docs: {}</title><style>body{{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;background:#0f172a;color:#e2e8f0}}h1{{color:#38bdf8}}.item{{background:#1e293b;border-radius:10px;padding:1rem 1.2rem;margin:1rem 0;border:1px solid #334155}}.badge{{display:inline-block;background:#0284c7;color:#fff;font-size:.75rem;padding:2px 8px;border-radius:999px;margin-bottom:.4rem}}code{{color:#f8fafc}}</style></head><body><h1>Tenon API Reference: {}</h1>{}</body></html>",
+            target, target, html_items
+        );
+        let _ = fs::write(out_dir.join("index.html"), html);
+    }
+    println!("Generated Tenon API docs ({} public item(s)) -> `{}`", count, out_dir.display());
+    ExitCode::SUCCESS
+}
+
+fn cmd_bench(args: &[String]) -> ExitCode {
+    let mut file_opt: Option<&str> = None;
+    let mut iters = 5usize;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--iters" if i + 1 < args.len() => {
+                iters = args[i + 1].parse().unwrap_or(5).max(1);
+                i += 2;
+            }
+            s if !s.starts_with('-') && file_opt.is_none() => {
+                file_opt = Some(s);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(file) = file_opt else {
+        eprintln!("usage: tenon bench <file.tn> [--iters <N>]");
+        return ExitCode::from(2);
+    };
+    let prog = match load_and_parse(file) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    let report = check_program(&prog);
+    if !report.ok {
+        eprintln!("FAIL-CLOSED: verification failed for `{}`", file);
+        return ExitCode::from(1);
+    }
+    let bin = std::env::temp_dir().join(format!("tenon_bench_{}", std::process::id()));
+    let mut opts = tenon_codegen::llvm_aot::BuildOptions::default();
+    opts.apply_verified_mir(&report.mir);
+    let art = match tenon_codegen::llvm_aot::compile_with_options(&prog, &bin, &opts) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("benchmark build failed: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    // 1 warmup + `iters` measured runs
+    let _ = std::process::Command::new(&bin).output();
+    let mut samples_ms = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t0 = std::time::Instant::now();
+        let out = std::process::Command::new(&bin).output();
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        match out {
+            Ok(o) if o.status.success() => samples_ms.push(ms),
+            Ok(o) => {
+                eprintln!("benchmark exited with {:?}: {}", o.status, String::from_utf8_lossy(&o.stderr));
+                let _ = fs::remove_file(&bin);
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("benchmark failed to execute: {}", e);
+                let _ = fs::remove_file(&bin);
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let _ = fs::remove_file(&bin);
+    samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = samples_ms[samples_ms.len() / 2];
+    let min_ms = samples_ms[0];
+    let max_ms = *samples_ms.last().unwrap();
+    println!(
+        "BENCH `{}` ({} iters, LLVM -O3, {:.1} KB, {} proofs): median={:.2}ms min={:.2}ms max={:.2}ms",
+        file,
+        iters,
+        art.binary_bytes as f64 / 1024.0,
+        report.proofs.len(),
+        median,
+        min_ms,
+        max_ms
+    );
+    ExitCode::SUCCESS
 }
 
 fn format_tenon_source(src: &str) -> String {

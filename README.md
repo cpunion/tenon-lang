@@ -11,24 +11,26 @@
 前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）、`z3`、LLVM `clang`（已验证 LLVM 22.1.8；可选 `node` 验证编译出的 `.wasm`）。
 
 ```bash
-# 1. 全工作区 64 项自动化测试（含 P0–P3 全栈能力：`VerifiedMir` + `nsw`/溢出检查消除 + 逃逸分析 + `@fip`；Const 精化 `Range[LO, HI]` + `forall`/`exists` Z3 Array 理论 + 高阶函数契约 + LSP Inlay Hints/Quick Fix/References/Rename/Semantic Tokens + `F5` DWARF 调试；`async/await` 融合 `kqueue` + RFC 6455 WebSocket + SSE + OpenSSL TLS + SQLite3 `CHECK` 驱动 + Postgres v3 + `tenon pkg lock|verify|tree` + `--target` 交叉编译；通用 Wasm32 + TS/Swift/Kotlin 绑定 + `@evolve` `evolution.lock`/Expand-Contract SQL + 独立 `.smt2` 证明证书 + 撮合风控/文档自举 Dogfooding）
+# 1. 全工作区 69 项自动化测试（含全部 Next P0–P3 能力：平面未装箱 `List[SimdVec]` 使 `07_simd_dot` 降至 1.02x C、`alloca` 栈提升与 `@arena` 64 KiB Slab Arena、签名早停增量编译 + 并行 Z3；OpenSSL TLS 1.3 双向 HTTPS、PostgreSQL SCRAM-SHA-256 + Extended Query + `ConnPool`、Radix Trie Web 路由 + `@ws`/`@sse` + 静态文件防穿越；全功能 LLVM `wasm32` + Perceus 线性内存运行时、TS/Swift/Kotlin/Go `cgo` 绑定、效应多态 `[effect E] / E`、Z3 ADT/Set 理论、`tenon verify-proofs` 独立审计器、`--emit-repro-test`、L2 活性与 `--replay`；`tenon new`/`doc`/`bench`/`pkg sync`、三后端差异化模糊测试、Stage-0 自举词法格式化器、Go `cgo` 量化回测库与 Wasm32 A2UI 核）
 cargo test --workspace
 
-# 2. 精化类型别名复用（Year/Month/Odd/Even/Amount）+ 跨字段 Date + 高阶形式化验证闭环（while/old/ghost/lemma/Float Real/BitVec/LLVM 越界消除/refine_cast）+ 独立证明证书导出
+# 2. 精化类型别名复用 + 高阶形式化验证闭环 + 独立证明导出与审计 + 反例转测试
 cargo run --bin tenon -- check examples/refinements/date_and_odd.tn
 cargo run --bin tenon -- run   examples/refinements/date_and_odd.tn
-cargo run --bin tenon -- check examples/refinements/bad_date.tn          # 负例：2023-02-29 编译期拦截
+cargo run --bin tenon -- check examples/refinements/bad_date.tn --emit-repro-test target/repro_test.tn
 cargo run --bin tenon -- check examples/refinements/advanced_verification.tn --emit-proofs target/proof_certs
-cargo run --bin tenon -- run   examples/refinements/advanced_verification.tn
+cargo run --bin tenon -- verify-proofs target/proof_certs --solver auto
 cargo run --bin tenon -- build examples/refinements/advanced_verification.tn -o target/adv_ver_bin --opt O3 --checked-overflow && ./target/adv_ver_bin
 
-# 2b. 生产级 Dogfooding 自举应用（撮合风控引擎 + SQLite3 CHECK + Const Range[LO,HI] + forall Z3 Array + @fip，以及纯 Tenon API 文档生成器）
+# 2b. 生产级 Dogfooding & 自举实战（撮合风控引擎、Go cgo 量化回测静态库、Wasm32 A2UI 响应式核、Stage-0 纯 Tenon 词法格式化器）
 cargo run --bin tenon -- build examples/dogfood/matching_engine.tn -o target/matching_bin --opt O3 && ./target/matching_bin
-cargo run --bin tenon -- build examples/dogfood/tenon_docgen.tn    -o target/docgen_bin   --opt O3 && ./target/docgen_bin
-# 通用 Wasm32 + TypeScript / Swift / Kotlin 跨端绑定 + 包锁文件 + `@evolve` Expand-Contract 迁移 SQL：
-cargo run --bin tenon -- test std/db && cargo run --bin tenon -- test std/net
-cargo run --bin tenon -- pkg tree examples/web_app
-cargo run --bin tenon -- build examples/refinements/date_and_odd.tn --target wasm32 -o target/date.wasm --emit-ts target/date.d.ts --emit-swift target/date.swift --emit-kotlin target/Date.kt
+cargo run --bin tenon -- build examples/bootstrap/tenon_lex_fmt.tn -o target/lex_fmt_bin  --opt O3 && ./target/lex_fmt_bin
+cargo run --bin tenon -- build examples/dogfood/a2ui_wasm_kernel.tn --target wasm32 -o target/a2ui.wasm --emit-ts target/a2ui.d.ts
+cargo run --bin tenon -- build examples/dogfood/quant_backtest.tn --lib static --emit-header examples/dogfood/go_cgo_demo/quant.h --emit-go examples/dogfood/go_cgo_demo/quant_cgo.go -o examples/dogfood/go_cgo_demo/libquant.a
+# 标准库 / 工具链 CLI：`tenon test`, `tenon doc`, `tenon bench`, `tenon new`, `tenon pkg`
+cargo run --bin tenon -- test std/db && cargo run --bin tenon -- test std/net && cargo run --bin tenon -- test examples/web_app
+cargo run --bin tenon -- doc examples/dogfood/quant_backtest.tn -o target/tenon-doc --format both
+cargo run --bin tenon -- bench benchmarks/tenon/07_simd_dot.tn --iters 3
 cargo run --bin tenon -- evolve check examples/dast_os_kernel/kernel_v1.tn examples/dast_os_kernel/kernel_v2.tn --lock target/evolution.lock --emit-migration target/migration.sql
 
 # 3. M1：Perceus 精确 RC 原地复用 + MVS COW + 自动派生 Date.parse(...) + 符号化 mutate Z3 证明

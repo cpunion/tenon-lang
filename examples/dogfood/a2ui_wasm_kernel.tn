@@ -1,0 +1,26 @@
+// examples/dogfood/a2ui_wasm_kernel.tn — Single-Source Reactive A2UI State Kernel for Wasm32!
+// Compiles directly via LLVM `wasm32-unknown-unknown` + Perceus linear-memory runtime into a tiny
+// `.wasm` binary + TypeScript bindings, driving A2UI JSON surface patches in browsers / Node.js V8.
+
+pub record A2UiComponent {
+    id    Text
+    kind  Text
+    label Text
+}
+
+pub pure fn render_a2ui_patch(surface_id Text, comp A2UiComponent, turn_seq Int where self >= 1) Text {
+    let seq_s = if turn_seq == 1 { "1" } else if turn_seq == 2 { "2" } else { "3" }
+    let p1 = "{\"surfaceUpdate\":{\"surfaceId\":\"" ++ surface_id ++ "\",\"seq\":" ++ seq_s
+    let p2 = ",\"components\":[{\"id\":\"" ++ comp.id ++ "\",\"component\":{\"" ++ comp.kind
+    p1 ++ p2 ++ "\":{\"text\":\"" ++ comp.label ++ "\"}}}]}}"
+}
+
+pub fn build_chat_card(title Text) Text {
+    let c = A2UiComponent { id = "card-1", kind = "Text", label = title }
+    render_a2ui_patch("chat-main", c, 1)
+}
+
+pub fn main() Int {
+    let json = build_chat_card("Tenon A2UI Ready")
+    len(json)
+}

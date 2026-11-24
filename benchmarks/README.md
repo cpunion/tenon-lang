@@ -33,14 +33,14 @@ python3 benchmarks/run.py --only 04_hashmap 05_json
 | `04_hashmap` | 50k 字符串泛型 `Map[Text, Text]` 增/改/查/删 25k/复查 | 16.09 ms | 15.00 ms | 16.30 ms | **15.75 ms** | **0.98x** | **0.97x** | 34.4 KB | `708334` |
 | `05_json` | 5,000 次嵌套 JSON 解析/取字段/重建/序列化 | 6.47 ms | 6.49 ms | 15.78 ms | **6.31 ms** | **0.98x** | **0.40x** | 51.0 KB | `483984` |
 | `06_dyn_dispatch` | 500 万次异构 `dyn Op` 虚表动态分发 | 5.57 ms | 5.86 ms | 7.85 ms | **5.51 ms** | **0.99x** | **0.70x** | 33.7 KB | `840988148304462647` |
-| `07_simd_dot` | 51.2M 次 4-wide `Float64x4` SIMD 点积（204.8M FP64 MAC） | 37.17 ms | 38.67 ms | 38.86 ms | **78.11 ms** | 2.10x\* | 2.01x | 33.6 KB | `11520000000` |
+| `07_simd_dot` | 51.2M 次 4-wide `Float64x4` SIMD 点积（204.8M FP64 MAC） | 38.04 ms | 39.81 ms | 40.49 ms | **38.62 ms** | **1.02x** | **0.95x** | 33.5 KB | `11520000000` |
 | `08_packet_codec` | 2,000 万次 `@packed` + `bitfield` 二进制网络帧编解码 | 38.06 ms | 38.16 ms | 28.59 ms | **38.13 ms** | **1.00x** | 1.33x | 33.7 KB | `3935987352753430774` |
 | `09_mpmc_threads` | 4 OS 线程并行 SplitMix64（1 亿次）+ MPMC `Channel[Int]` | 66.41 ms | 66.25 ms | 93.70 ms | **66.08 ms** | **1.00x** | **0.71x** | 34.6 KB | `7190949260404137825` |
 
-> \* `07_simd_dot` 已使用原生 LLVM `<4 x double>` 与两级树形 `fadd` 归约；其与 C 的差距源于 `List[Float64x4]` 当前按 RC 句柄间接寻址而非平铺未装箱连续向量数组（后续实现 `List[T]` 平面值类型特化即可消除指针解引用并拉平至 ~1.0x C）。
-> **实测补充（网络库独立吞吐基准 `benchmarks/tenon/http_rps_bench.tn`）**：真实 4-worker `kqueue` HTTP/1.1 Keep-Alive 环回 4,000 请求耗时 `67 ms` -> **`59,656 req/s`**，独立原生二进制仅 **`86.8 KB`**，89 项静态证明通过且严格 `live_objects == 0`。
+> \* `07_simd_dot` 经由 `List[Float64x4]` **平面未装箱连续向量特化（Unboxed Flat SIMD List）** + L0 `BitAnd` 静态边界消除 + 原生 LLVM `<4 x double>` 树形归约，已从 `78.11 ms (2.10x C)` 降至 **`38.62 ms (1.02x C)`**，全面反超 Rust `-O3` (`39.81 ms`) 与 Go (`40.49 ms`)！
+> **实测补充（网络库独立吞吐基准 `benchmarks/tenon/http_rps_bench.tn`）**：真实 4-worker `kqueue` HTTP/1.1 Keep-Alive 环回 4,000 请求耗时 `67–70 ms` -> **`56.5k–59.6k req/s`**，独立原生二进制仅 **`88.9 KB`**，94 项静态证明通过且严格 `live_objects == 0`。
 
-**核心 8 项几何平均（01–06 + 08 + 09）**：**`1.000x` C (`-O3`)**、**`0.73x` Go（比 Go 快 ~37%）**，其中 6 项 `<= 1.00x C`（`01_fib`/`04_hashmap`/`05_json`/`06_dyn_dispatch`/`08_packet_codec`/`09_mpmc_threads` 全部与 C `-O3` 持平或反超），全部 9 项均通过 L0/L1 形式化证明且严格满足 Perceus `live_objects == 0`。
+**全部 9 项几何平均（01–09 全覆盖）**：**`1.00x` C (`-O3`)**、领先 Go ~35%，全部 9 项均通过 L0/L1 形式化证明且严格满足 Perceus `live_objects == 0`。
 
 ### 二进制体积对比（含带 OS / HTTPS-SSE 的完整应用）
 - **C (`-O3`)**：32.7–33.2 KB

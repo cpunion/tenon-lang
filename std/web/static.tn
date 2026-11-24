@@ -1,0 +1,15 @@
+// std/web/static.tn — OS Filesystem Static Asset Serving for `std/web`
+// Opt-in module so pure HTTP microservices don't pull OS file syscalls unless static files are served.
+
+import "std/web/app.tn"
+import "std/os/fs.tn"
+
+pub fn serve_static_file(root_dir Text, rel_path Text) HttpResponse {
+    if !static_path_is_safe(rel_path) {
+        return http_bad_request("invalid static file path")
+    }
+    match fs_read(root_dir ++ "/" ++ rel_path) {
+        Ok(content) => http_response(200, infer_mime_type(rel_path), content)
+        Err(_) => http_not_found("static file not found")
+    }
+}

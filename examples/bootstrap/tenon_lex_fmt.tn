@@ -1,0 +1,126 @@
+// examples/bootstrap/tenon_lex_fmt.tn — Stage-0 Self-Hosting Compiler Pilot:
+// Pure Tenon Lexer & Canonical Code Formatter!
+// Tokenizes real Tenon source (keywords, identifiers, integers, strings, comments, punctuation)
+// and formats brace-delimited Tenon source with canonical 4-space indentation, `live_objects == 0`.
+
+import "std/text/text.tn"
+import "std/text/builder.tn"
+
+pub const TOK_KW     Int = 1
+pub const TOK_IDENT  Int = 2
+pub const TOK_INT    Int = 3
+pub const TOK_STR    Int = 4
+pub const TOK_SYM    Int = 5
+
+pub record Token {
+    kind Int
+    lex  Text
+}
+
+pure fn is_alpha(b Int) Bool {
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+pure fn is_digit(b Int) Bool {
+    b >= 48 && b <= 57
+}
+
+pure fn is_keyword(s Text) Bool {
+    match s {
+        "pub" | "fn" | "pure" | "let" | "var" | "record" | "enum" | "type"
+            | "where" | "if" | "else" | "while" | "return" | "match"
+            | "import" | "requires" | "ensures" => true
+        _ => false
+    }
+}
+
+pub pure fn lex_tenon(src Text) List[Token] {
+    let n = len(src)
+    var toks List[Token] = []
+    var i = 0
+    while i < n {
+        let b = byte_at(src, i)
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            i += 1
+        } else if b == 47 && i + 1 < n && byte_at(src, i + 1) == 47 {
+            while i < n && byte_at(src, i) != 10 {
+                i += 1
+            }
+        } else if is_alpha(b) {
+            let st = i
+            while i < n && (is_alpha(byte_at(src, i)) || is_digit(byte_at(src, i))) {
+                i += 1
+            }
+            let word = str_slice(src, st, i)
+            let k = if is_keyword(word) { TOK_KW } else { TOK_IDENT }
+            toks = push(toks, Token { kind = k, lex = word })
+        } else if is_digit(b) {
+            let st = i
+            while i < n && is_digit(byte_at(src, i)) {
+                i += 1
+            }
+            toks = push(toks, Token { kind = TOK_INT, lex = str_slice(src, st, i) })
+        } else if b == 34 {
+            let st = i
+            i += 1
+            while i < n && byte_at(src, i) != 34 {
+                if byte_at(src, i) == 92 && i + 1 < n {
+                    i += 2
+                } else {
+                    i += 1
+                }
+            }
+            if i < n { i += 1 }
+            toks = push(toks, Token { kind = TOK_STR, lex = str_slice(src, st, i) })
+        } else {
+            toks = push(toks, Token { kind = TOK_SYM, lex = str_slice(src, i, i + 1) })
+            i += 1
+        }
+    }
+    toks
+}
+
+pub pure fn format_tenon_self(src Text) Text {
+    let n = len(src)
+    var out = TextBuilder.new()
+    var indent = 0
+    var pos = 0
+    while pos < n {
+        var eol = pos
+        while eol < n && byte_at(src, eol) != 10 {
+            eol += 1
+        }
+        let line = str_slice(src, pos, eol).trim()
+        pos = eol + 1
+        if len(line) == 0 {
+            continue
+        }
+        if byte_at(line, 0) == 125 && indent > 0 {
+            indent -= 1
+        }
+        var sp = 0
+        while sp < indent * 4 {
+            out.push_byte(32)
+            sp += 1
+        }
+        out.push_str(line)
+        out.push_byte(10)
+        if byte_at(line, len(line) - 1) == 123 {
+            indent += 1
+        }
+    }
+    out.finish()
+}
+
+pub fn main() Int {
+    let sample = "// self-hosted pilot\npub pure fn add(a Int, b Int) Int {\nlet s = a + b\nreturn s\n}\n"
+    let toks = lex_tenon(sample)
+    let formatted = format_tenon_self(sample)
+    assert len(toks) == 22
+    assert toks[0].kind == TOK_KW && toks[0].lex == "pub"
+    assert toks[2].kind == TOK_KW && toks[2].lex == "fn"
+    assert toks[3].kind == TOK_IDENT && toks[3].lex == "add"
+    assert formatted.contains("    let s = a + b\n")
+    assert formatted.contains("    return s\n")
+    len(toks)
+}

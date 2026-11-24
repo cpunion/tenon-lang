@@ -1,0 +1,58 @@
+name: Tenon CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y z3 clang lld libsqlite3-dev libssl-dev pkg-config nodejs npm python3
+
+      - name: Install native dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install z3 llvm openssl@3 node python3
+          echo "$(brew --prefix llvm)/bin" >> $GITHUB_PATH
+
+      - name: Workspace unit & integration tests (0 warnings)
+        run: cargo test --workspace
+
+      - name: Build release CLI binary
+        run: cargo build --release --bin tenon
+
+      - name: Run pure Tenon standard library & web framework tests (Perceus live=0)
+        run: |
+          ./target/release/tenon test std/db
+          ./target/release/tenon test std/net
+          ./target/release/tenon test examples/web_app
+          ./target/release/tenon test -r examples/modules_demo
+
+      - name: Export & independently audit SMT-LIB2 proof certificates
+        run: |
+          ./target/release/tenon check examples/refinements/advanced_verification.tn --emit-proofs target/ci_proofs
+          ./target/release/tenon verify-proofs target/ci_proofs --solver auto
+
+      - name: Multi-language benchmark compile & verification gate
+        run: python3 benchmarks/run.py --check-only
+
+      - name: VS Code extension grammar & live LSP smoke tests
+        run: |
+          cd editors/vscode
+          npm test

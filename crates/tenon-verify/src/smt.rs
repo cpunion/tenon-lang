@@ -23,20 +23,19 @@ pub struct ExportedProofCert {
     pub smtlib2: String,
 }
 
-static PROOF_RECORDER: OnceLock<Mutex<Option<Vec<ExportedProofCert>>>> = OnceLock::new();
-
-fn recorder() -> &'static Mutex<Option<Vec<ExportedProofCert>>> {
-    PROOF_RECORDER.get_or_init(|| Mutex::new(None))
+thread_local! {
+    static PROOF_RECORDER: std::cell::RefCell<Option<Vec<ExportedProofCert>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Starts recording standalone SMT-LIB2 proof certificates for all proved L1 obligations.
+/// Starts recording standalone SMT-LIB2 proof certificates on the current thread for all proved L1 obligations.
 pub fn begin_proof_recording() {
-    *recorder().lock().unwrap() = Some(Vec::new());
+    PROOF_RECORDER.with(|r| *r.borrow_mut() = Some(Vec::new()));
 }
 
-/// Stops recording and returns all captured standalone SMT-LIB2 proof certificates.
+/// Stops recording on the current thread and returns all captured standalone SMT-LIB2 proof certificates.
 pub fn end_proof_recording() -> Vec<ExportedProofCert> {
-    recorder().lock().unwrap().take().unwrap_or_default()
+    PROOF_RECORDER.with(|r| r.borrow_mut().take().unwrap_or_default())
 }
 
 /// Writes standalone `.smt2` proof certificates + `proof_manifest.json` to `dir`.
@@ -162,22 +161,24 @@ pub fn verify_proof_certificates_dir(
 }
 
 fn maybe_record_proved_cert(hash: &str, script: &str) {
-    let mut guard = recorder().lock().unwrap();
-    if let Some(list) = guard.as_mut() {
-        let idx = list.len() + 1;
-        // Standalone certificate omits `(get-model)` so offline `z3 file.smt2` returns clean `unsat` (exit 0)
-        let cert_script = format!(
-            "; Tenon Independent SMT-LIB2 Proof Certificate #{}\n; SHA-256: {}\n; Verify independently: z3 <file.smt2>  (expected: unsat)\n{}",
-            idx,
-            hash,
-            script.replace("(get-model)\n", "")
-        );
-        list.push(ExportedProofCert {
-            index: idx,
-            sha256: hash.to_string(),
-            smtlib2: cert_script,
-        });
-    }
+    PROOF_RECORDER.with(|r| {
+        let mut guard = r.borrow_mut();
+        if let Some(list) = guard.as_mut() {
+            let idx = list.len() + 1;
+            // Standalone certificate omits `(get-model)` so offline `z3 file.smt2` returns clean `unsat` (exit 0)
+            let cert_script = format!(
+                "; Tenon Independent SMT-LIB2 Proof Certificate #{}\n; SHA-256: {}\n; Verify independently: z3 <file.smt2>  (expected: unsat)\n{}",
+                idx,
+                hash,
+                script.replace("(get-model)\n", "")
+            );
+            list.push(ExportedProofCert {
+                index: idx,
+                sha256: hash.to_string(),
+                smtlib2: cert_script,
+            });
+        }
+    });
 }
 
 fn disk_cache_path() -> Option<PathBuf> {

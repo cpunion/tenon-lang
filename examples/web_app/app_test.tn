@@ -33,8 +33,10 @@ test fn radix_router_and_static_security_work() {
     assert hw.route_idx == 3 && hw.params[0].value == "js/app.js"
 
     // Path traversal attack (`..`) MUST be rejected with 400 Bad Request
-    let bad = serve_static_file("examples/web_app", "../secret.txt")
+    let bad = serve_static_with("examples/web_app", "../secret.txt", |_| Some("secret"))
     assert bad.status == 400
+    let ok_js = serve_static_with("examples/web_app", "app.js", |_| Some("console.log(1)"))
+    assert ok_js.status == 200 && ok_js.body == "console.log(1)"
 }
 
 test fn web_app_end_to_end_live_http_and_openapi() {
