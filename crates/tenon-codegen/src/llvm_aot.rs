@@ -1,10 +1,11 @@
 use crate::lower_interfaces::{DynInterfaceLayout, prepare_program_for_codegen};
 use crate::perceus::{
-    RC_MASK_ALL, TAG_DYN, TAG_ERR, TAG_LIST, TAG_NONE, TAG_OK, TAG_RECORD_BASE, TAG_SOME,
+    RC_MASK_ALL, TAG_CLOSURE, TAG_DYN, TAG_ERR, TAG_LIST, TAG_NONE, TAG_OK, TAG_RECORD_BASE,
+    TAG_SOME, TAG_TUPLE,
 };
 use crate::{
-    CORE_SYSCALLS, generic_ty, is_rc_type_expr, is_text_type_expr, named_ty, resolve_alias_ty,
-    split_async_segments,
+    CORE_SYSCALLS, generic_ty, is_float_type_expr, is_rc_type_expr, is_text_type_expr, named_ty,
+    resolve_alias_ty, split_async_segments,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -54,6 +55,7 @@ struct LlvmFnMeta {
 }
 
 const TENON_AOT_RUNTIME_C: &str = r#"
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -312,6 +314,60 @@ int64_t tenon_str_concat(int64_t a, int64_t b) {
     if (la > 0) memcpy(dst, (const void*)((TenonObj*)(uintptr_t)a)->fields, (size_t)la);
     if (lb > 0) memcpy(dst + la, (const void*)((TenonObj*)(uintptr_t)b)->fields, (size_t)lb);
     return (int64_t)(uintptr_t)obj;
+}
+
+int64_t tenon_int_to_float(int64_t v) {
+    union { double d; int64_t i; } u;
+    u.d = (double)v;
+    return u.i;
+}
+
+int64_t tenon_float_to_int(int64_t bits) {
+    union { double d; int64_t i; } u;
+    u.i = bits;
+    return (int64_t)u.d;
+}
+
+int64_t tenon_float_to_text(int64_t bits) {
+    union { double d; int64_t i; } u;
+    u.i = bits;
+    double d = (u.d == 0.0) ? 0.0 : u.d;
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%.15g", d);
+    if (n < 0) n = 0;
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    return tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)n);
+}
+
+int64_t tenon_parse_float(int64_t s) {
+    union { double d; int64_t i; } u;
+    if (s == 0) { u.d = NAN; return u.i; }
+    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
+    size_t n = (size_t)hdr->len;
+    char tmp[128];
+    char* buf = n < sizeof(tmp) ? tmp : (char*)malloc(n + 1);
+    if (n > 0) memcpy(buf, (const void*)hdr->fields, n);
+    buf[n] = '\0';
+    char* end = NULL;
+    double v = strtod(buf, &end);
+    while (end && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) end++;
+    int ok = (end != buf && end && *end == '\0');
+    if (buf != tmp) free(buf);
+    u.d = ok ? v : NAN;
+    return u.i;
+}
+
+int64_t tenon_float_is_nan(int64_t bits) {
+    union { double d; int64_t i; } u;
+    u.i = bits;
+    return isnan(u.d) ? 1 : 0;
+}
+
+int64_t tenon_float_bits(int64_t bits) {
+    union { double d; int64_t i; } u;
+    u.i = bits;
+    if (u.d == 0.0) { u.d = 0.0; return u.i; }
+    return bits;
 }
 
 typedef struct {
@@ -1482,6 +1538,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
                 param_tys: vec![named_ty("Any"); spec.arity],
                 ret_ty: Some(if spec.returns_text {
                     named_ty("Text")
+                } else if spec.returns_float {
+                    named_ty("Float")
                 } else {
                     named_ty("Int")
                 }),
@@ -1920,6 +1978,7 @@ impl<'a> LlvmFnGen<'a> {
     fn infer_expr_type_with(&self, expr: &Expr, extra_vars: &BTreeMap<String, TypeExpr>) -> TypeExpr {
         match &expr.kind {
             ExprKind::Int(_) => named_ty("Int"),
+            ExprKind::Float(_) => named_ty("Float"),
             ExprKind::Bool(_) => named_ty("Bool"),
             ExprKind::Str(_) => named_ty("Text"),
             ExprKind::Ident(s) => {
@@ -1945,14 +2004,42 @@ impl<'a> LlvmFnGen<'a> {
                     generic_ty("List", vec![named_ty("Any")])
                 }
             }
+            ExprKind::Tuple(elems) => TypeExpr::Tuple(
+                elems.iter().map(|e| self.infer_expr_type_with(e, extra_vars)).collect(),
+                expr.span,
+            ),
+            ExprKind::TupleIndex { target, index } => {
+                let tt = resolve_alias_ty(&self.infer_expr_type_with(target, extra_vars), self.alias_bases);
+                if let TypeExpr::Tuple(es, _) = tt {
+                    if let Some(et) = es.get(*index) {
+                        return et.clone();
+                    }
+                }
+                named_ty("Any")
+            }
             ExprKind::Binary { op: BinOp::Concat, .. } => named_ty("Text"),
             ExprKind::Binary {
                 op: BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or,
                 ..
             } => named_ty("Bool"),
-            ExprKind::Binary { .. } => named_ty("Int"),
+            ExprKind::Binary { op, left, right } => {
+                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
+                    && (is_float_type_expr(&self.infer_expr_type_with(left, extra_vars), self.alias_bases)
+                        || is_float_type_expr(&self.infer_expr_type_with(right, extra_vars), self.alias_bases))
+                {
+                    named_ty("Float")
+                } else {
+                    named_ty("Int")
+                }
+            }
             ExprKind::Unary { op: UnOp::Not, .. } => named_ty("Bool"),
-            ExprKind::Unary { op: UnOp::Neg, .. } => named_ty("Int"),
+            ExprKind::Unary { op: UnOp::Neg, expr: inner } => {
+                if is_float_type_expr(&self.infer_expr_type_with(inner, extra_vars), self.alias_bases) {
+                    named_ty("Float")
+                } else {
+                    named_ty("Int")
+                }
+            }
             ExprKind::Field { target, field } => {
                 if let ExprKind::Ident(ename) = &target.kind {
                     if let Some(vl) = self.enum_variants.get(&format!("{}.{}", ename, field)) {
@@ -2000,6 +2087,30 @@ impl<'a> LlvmFnGen<'a> {
                     named_ty("Any")
                 }
                 ExprKind::Ident(f) => {
+                    if f == "__make_closure" {
+                        if let Some(a0) = args.first() {
+                            if let ExprKind::Str(csym) = &a0.value.kind {
+                                if let Some(meta) = self.fn_metas.get(csym) {
+                                    return TypeExpr::Fn {
+                                        params: meta.param_tys.iter().skip(1).cloned().collect(),
+                                        ret: meta.ret_ty.clone().map(Box::new),
+                                        span: expr.span,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    if f == "__call_closure" {
+                        if let Some(a0) = args.first() {
+                            let cty = resolve_alias_ty(
+                                &self.infer_expr_type_with(&a0.value, extra_vars),
+                                self.alias_bases,
+                            );
+                            if let TypeExpr::Fn { ret, .. } = cty {
+                                return ret.map(|r| *r).unwrap_or_else(|| named_ty("Any"));
+                            }
+                        }
+                    }
                     if f == "__box_dyn" {
                         if let Some(a1) = args.get(1) {
                             if let ExprKind::Str(vsym) = &a1.value.kind {
@@ -2062,14 +2173,7 @@ impl<'a> LlvmFnGen<'a> {
                 for arm in arms {
                     let mut arm_vars = extra_vars.clone();
                     for p in &arm.patterns {
-                        if let Pattern::Variant { name, binding: Some(bname), .. } = p {
-                            if bname != "_" {
-                                arm_vars.insert(
-                                    bname.clone(),
-                                    self.infer_match_binding_type(&st, name),
-                                );
-                            }
-                        }
+                        self.bind_pattern_types_for_infer(&st, p, &mut arm_vars);
                     }
                     let t = self.infer_expr_type_with(&arm.body, &arm_vars);
                     if t.display_name() != "Any" {
@@ -2080,6 +2184,37 @@ impl<'a> LlvmFnGen<'a> {
             }
             ExprKind::Block(blk) => self.infer_block_type_with(blk, extra_vars),
             _ => named_ty("Any"),
+        }
+    }
+
+    fn bind_pattern_types_for_infer(&self, sty: &TypeExpr, pat: &Pattern, out: &mut BTreeMap<String, TypeExpr>) {
+        let base = resolve_alias_ty(sty, self.alias_bases);
+        match pat {
+            Pattern::Ident(s, _) if s != "_" => {
+                out.insert(s.clone(), sty.clone());
+            }
+            Pattern::Tuple(ps, _) => {
+                let elems = match &base {
+                    TypeExpr::Tuple(es, _) => es.clone(),
+                    _ => Vec::new(),
+                };
+                for (i, sp) in ps.iter().enumerate() {
+                    let ety = elems.get(i).cloned().unwrap_or_else(|| named_ty("Any"));
+                    self.bind_pattern_types_for_infer(&ety, sp, out);
+                }
+            }
+            Pattern::Variant { name, binding: Some(b), .. } if b != "_" => {
+                let ptys = self.resolve_variant_payload_tys(&base, name);
+                out.insert(b.clone(), ptys.into_iter().next().unwrap_or_else(|| named_ty("Any")));
+            }
+            Pattern::VariantMulti { name, patterns, .. } => {
+                let ptys = self.resolve_variant_payload_tys(&base, name);
+                for (i, sp) in patterns.iter().enumerate() {
+                    let pty = ptys.get(i).cloned().unwrap_or_else(|| named_ty("Any"));
+                    self.bind_pattern_types_for_infer(&pty, sp, out);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2134,12 +2269,20 @@ impl<'a> LlvmFnGen<'a> {
             return true;
         }
         match &expr.kind {
-            ExprKind::RecordLit { .. } | ExprKind::List(_) | ExprKind::Str(_) => true,
+            ExprKind::RecordLit { .. } | ExprKind::List(_) | ExprKind::Tuple(_) | ExprKind::Str(_) => true,
             ExprKind::Binary { op: BinOp::Concat, .. } => true,
             ExprKind::Ident(s) => {
                 s == "None"
                     || self.is_rc_ident(s)
                     || (self.enum_tags.contains_key(s) && !self.var_ptrs.contains_key(s))
+            }
+            ExprKind::TupleIndex { target, index } => {
+                let tt = resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases);
+                if let TypeExpr::Tuple(es, _) = tt {
+                    es.get(*index).is_some_and(|et| self.type_is_rc(et))
+                } else {
+                    false
+                }
             }
             ExprKind::Field { target, field } => {
                 if let ExprKind::Ident(ename) = &target.kind {
@@ -2160,7 +2303,7 @@ impl<'a> LlvmFnGen<'a> {
                 ExprKind::Ident(f) => {
                     matches!(
                         f.as_str(),
-                        "Ok" | "Err" | "Some" | "push" | "list_filled" | "list_pop_shrink" | "yield_val" | "__box_dyn"
+                        "Ok" | "Err" | "Some" | "push" | "list_filled" | "list_pop_shrink" | "yield_val" | "__box_dyn" | "__make_closure"
                     )
                         || (self.enum_tags.contains_key(f) && !self.fn_metas.contains_key(f))
                         || self.fn_metas.get(f).is_some_and(|m| m.returns_rc)
@@ -2209,6 +2352,97 @@ impl<'a> LlvmFnGen<'a> {
             ExprKind::Block(blk) => blk.tail.as_deref().is_some_and(|t| self.is_text_expr(t)),
             _ => false,
         }
+    }
+
+    fn is_float_expr(&self, expr: &Expr) -> bool {
+        let ty = self.infer_expr_type(expr);
+        if is_float_type_expr(&ty, self.alias_bases) {
+            return true;
+        }
+        match &expr.kind {
+            ExprKind::Float(_) => true,
+            ExprKind::Unary { op: UnOp::Neg, expr: inner } => self.is_float_expr(inner),
+            ExprKind::Binary { op, left, right }
+                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) =>
+            {
+                self.is_float_expr(left) || self.is_float_expr(right)
+            }
+            ExprKind::If { then_block, else_branch, .. } => {
+                then_block.tail.as_deref().is_some_and(|t| self.is_float_expr(t))
+                    || else_branch.as_deref().is_some_and(|e| self.is_float_expr(e))
+            }
+            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.is_float_expr(&a.body)),
+            ExprKind::Block(blk) => blk.tail.as_deref().is_some_and(|t| self.is_float_expr(t)),
+            _ => false,
+        }
+    }
+
+    fn resolve_variant_payload_tys(&self, scrutinee_base: &TypeExpr, variant_name: &str) -> Vec<TypeExpr> {
+        if variant_name == "Some" {
+            if let TypeExpr::Named { name, args, .. } = scrutinee_base {
+                if name == "Option" && !args.is_empty() {
+                    return vec![args[0].clone()];
+                }
+            }
+            return vec![named_ty("Any")];
+        }
+        if variant_name == "Ok" {
+            if let TypeExpr::Named { name, args, .. } = scrutinee_base {
+                if name == "Result" && !args.is_empty() {
+                    return vec![args[0].clone()];
+                }
+            }
+            return vec![named_ty("Any")];
+        }
+        if variant_name == "Err" {
+            if let TypeExpr::Named { name, args, .. } = scrutinee_base {
+                if name == "Result" && args.len() >= 2 {
+                    return vec![args[1].clone()];
+                }
+            }
+            return vec![named_ty("Any")];
+        }
+        if let Some(vl) = self.enum_variants.get(variant_name) {
+            return vl.payload_tys.clone();
+        }
+        Vec::new()
+    }
+
+    fn emit_compound_op(&mut self, cur: &str, rhs: &str, op: AssignOp, is_float: bool) -> String {
+        if is_float {
+            let cf = self.fresh_tmp();
+            let rf = self.fresh_tmp();
+            let fop = match op {
+                AssignOp::AddSet => "fadd",
+                AssignOp::SubSet => "fsub",
+                AssignOp::MulSet => "fmul",
+                AssignOp::DivSet => "fdiv",
+                _ => return rhs.to_string(),
+            };
+            let fres = self.fresh_tmp();
+            let res = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = bitcast i64 {} to double\n  {} = bitcast i64 {} to double\n  {} = {} double {}, {}\n  {} = bitcast double {} to i64\n",
+                cf, cur, rf, rhs, fres, fop, cf, rf, res, fres
+            ));
+            return res;
+        }
+        let iop = match op {
+            AssignOp::Set => return rhs.to_string(),
+            AssignOp::AddSet => "add",
+            AssignOp::SubSet => "sub",
+            AssignOp::MulSet => "mul",
+            AssignOp::DivSet => "sdiv",
+            AssignOp::BitAndSet => "and",
+            AssignOp::BitOrSet => "or",
+            AssignOp::BitXorSet => "xor",
+            AssignOp::ShlSet => "shl",
+            AssignOp::ShrSet => "lshr",
+        };
+        let res = self.fresh_tmp();
+        self.code
+            .push_str(&format!("  {} = {} i64 {}, {}\n", res, iop, cur, rhs));
+        res
     }
 
     fn infer_match_binding_type(&self, scrutinee_ty: &TypeExpr, variant_name: &str) -> TypeExpr {
@@ -2693,51 +2927,31 @@ impl<'a> LlvmFnGen<'a> {
                                     old, ap, rhs, ap, old
                                 ));
                             } else {
-                                let new_v = match op {
-                                    AssignOp::Set => rhs,
-                                    AssignOp::AddSet => {
-                                        let cur = self.fresh_tmp();
-                                        let res = self.fresh_tmp();
-                                        self.code.push_str(&format!(
-                                            "  {} = load i64, ptr {}\n  {} = add i64 {}, {}\n",
-                                            cur, ap, res, cur, rhs
-                                        ));
-                                        res
-                                    }
-                                    AssignOp::SubSet => {
-                                        let cur = self.fresh_tmp();
-                                        let res = self.fresh_tmp();
-                                        self.code.push_str(&format!(
-                                            "  {} = load i64, ptr {}\n  {} = sub i64 {}, {}\n",
-                                            cur, ap, res, cur, rhs
-                                        ));
-                                        res
-                                    }
+                                let is_flt = target_ty
+                                    .as_ref()
+                                    .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
+                                    || self.is_float_expr(value);
+                                let new_v = if *op == AssignOp::Set {
+                                    rhs
+                                } else {
+                                    let cur = self.fresh_tmp();
+                                    self.code.push_str(&format!("  {} = load i64, ptr {}\n", cur, ap));
+                                    self.emit_compound_op(&cur, &rhs, *op, is_flt)
                                 };
                                 self.code
                                     .push_str(&format!("  store i64 {}, ptr {}\n", new_v, ap));
                             }
                         } else {
-                            let new_v = match op {
-                                AssignOp::Set => rhs,
-                                AssignOp::AddSet => {
-                                    let cur = self.fresh_tmp();
-                                    let res = self.fresh_tmp();
-                                    self.code.push_str(&format!(
-                                        "  {} = load i64, ptr {}\n  {} = add i64 {}, {}\n",
-                                        cur, slot, res, cur, rhs
-                                    ));
-                                    res
-                                }
-                                AssignOp::SubSet => {
-                                    let cur = self.fresh_tmp();
-                                    let res = self.fresh_tmp();
-                                    self.code.push_str(&format!(
-                                        "  {} = load i64, ptr {}\n  {} = sub i64 {}, {}\n",
-                                        cur, slot, res, cur, rhs
-                                    ));
-                                    res
-                                }
+                            let is_flt = target_ty
+                                .as_ref()
+                                .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
+                                || self.is_float_expr(value);
+                            let new_v = if *op == AssignOp::Set {
+                                rhs
+                            } else {
+                                let cur = self.fresh_tmp();
+                                self.code.push_str(&format!("  {} = load i64, ptr {}\n", cur, slot));
+                                self.emit_compound_op(&cur, &rhs, *op, is_flt)
                             };
                             self.code
                                 .push_str(&format!("  store i64 {}, ptr {}\n", new_v, slot));
@@ -2789,26 +3003,18 @@ impl<'a> LlvmFnGen<'a> {
                                 self.code
                                     .push_str(&format!("  store i64 {}, ptr {}\n", uniq, slot));
                             }
-                            let new_fv = match op {
-                                AssignOp::Set => rhs,
-                                AssignOp::AddSet => {
-                                    let cf = self.fresh_tmp();
-                                    let res = self.fresh_tmp();
-                                    self.code.push_str(&format!(
-                                        "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
-                                        cf, uniq, fidx, res, cf, rhs
-                                    ));
-                                    res
-                                }
-                                AssignOp::SubSet => {
-                                    let cf = self.fresh_tmp();
-                                    let res = self.fresh_tmp();
-                                    self.code.push_str(&format!(
-                                        "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
-                                        cf, uniq, fidx, res, cf, rhs
-                                    ));
-                                    res
-                                }
+                            let is_flt = field_ty
+                                .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
+                                || self.is_float_expr(value);
+                            let new_fv = if *op == AssignOp::Set {
+                                rhs
+                            } else {
+                                let cf = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
+                                    cf, uniq, fidx
+                                ));
+                                self.emit_compound_op(&cf, &rhs, *op, is_flt)
                             };
                             let setter = if *op != AssignOp::Set {
                                 "@__tn_slot_set_prim"
@@ -2889,26 +3095,19 @@ impl<'a> LlvmFnGen<'a> {
                                 } else {
                                     "@__tn_list_get"
                                 };
-                                let new_val = match op {
-                                    AssignOp::Set => rhs,
-                                    AssignOp::AddSet => {
-                                        let ce = self.fresh_tmp();
-                                        let res = self.fresh_tmp();
-                                        self.code.push_str(&format!(
-                                            "  {} = call i64 {}(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
-                                            ce, getter, uniq_list, idx_v, res, ce, rhs
-                                        ));
-                                        res
-                                    }
-                                    AssignOp::SubSet => {
-                                        let ce = self.fresh_tmp();
-                                        let res = self.fresh_tmp();
-                                        self.code.push_str(&format!(
-                                            "  {} = call i64 {}(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
-                                            ce, getter, uniq_list, idx_v, res, ce, rhs
-                                        ));
-                                        res
-                                    }
+                                let is_flt = elem_ty
+                                    .as_ref()
+                                    .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
+                                    || self.is_float_expr(value);
+                                let new_val = if *op == AssignOp::Set {
+                                    rhs
+                                } else {
+                                    let ce = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = call i64 {}(i64 {}, i64 {})\n",
+                                        ce, getter, uniq_list, idx_v
+                                    ));
+                                    self.emit_compound_op(&ce, &rhs, *op, is_flt)
                                 };
                                 let setter = if *op != AssignOp::Set {
                                     if is_always_uniq { "@__tn_list_set_prim_nonnull" } else { "@__tn_list_set_prim" }
@@ -2979,26 +3178,19 @@ impl<'a> LlvmFnGen<'a> {
                                         uniq_list, RC_MASK_ALL as i64
                                     ));
                                 }
-                                let new_val = match op {
-                                    AssignOp::Set => rhs,
-                                    AssignOp::AddSet => {
-                                        let ce = self.fresh_tmp();
-                                        let res = self.fresh_tmp();
-                                        self.code.push_str(&format!(
-                                            "  {} = call i64 @__tn_list_get(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
-                                            ce, uniq_list, idx_v, res, ce, rhs
-                                        ));
-                                        res
-                                    }
-                                    AssignOp::SubSet => {
-                                        let ce = self.fresh_tmp();
-                                        let res = self.fresh_tmp();
-                                        self.code.push_str(&format!(
-                                            "  {} = call i64 @__tn_list_get(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
-                                            ce, uniq_list, idx_v, res, ce, rhs
-                                        ));
-                                        res
-                                    }
+                                let is_flt = elem_ty
+                                    .as_ref()
+                                    .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
+                                    || self.is_float_expr(value);
+                                let new_val = if *op == AssignOp::Set {
+                                    rhs
+                                } else {
+                                    let ce = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = call i64 @__tn_list_get(i64 {}, i64 {})\n",
+                                        ce, uniq_list, idx_v
+                                    ));
+                                    self.emit_compound_op(&ce, &rhs, *op, is_flt)
                                 };
                                 let setter = if *op != AssignOp::Set {
                                     "@__tn_list_set_prim"
@@ -3140,6 +3332,7 @@ impl<'a> LlvmFnGen<'a> {
                         self.flush_temps(&temps);
                     }
                 }
+                Stmt::LetTuple { .. } | Stmt::For { .. } => {}
             }
         }
 
@@ -3271,6 +3464,51 @@ impl<'a> LlvmFnGen<'a> {
                 self.flush_temps(&temps);
                 Ok(res)
             }
+            ExprKind::TupleIndex { target, index } => {
+                let elem_is_rc = match resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases) {
+                    TypeExpr::Tuple(es, _) => es.get(*index).is_some_and(|et| self.type_is_rc(et)),
+                    _ => expected_ty.is_some_and(|t| self.type_is_rc(t)),
+                };
+                let mut temps = Vec::new();
+                let t = self.lower_expr_borrowed(target, &mut temps)?;
+                let mut res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
+                    res, t, index
+                ));
+                if elem_is_rc {
+                    let inc = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @__tn_rc_inc(i64 {})\n",
+                        inc, res
+                    ));
+                    res = inc;
+                }
+                self.flush_temps(&temps);
+                Ok(res)
+            }
+            ExprKind::Call { callee, args }
+                if matches!(&callee.kind, ExprKind::Ident(f) if f == "__closure_get") && args.len() == 2 =>
+            {
+                let mut temps = Vec::new();
+                let env = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let mut res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
+                    res, env, idx
+                ));
+                if expected_ty.is_some_and(|t| self.type_is_rc(t)) {
+                    let inc = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @__tn_rc_inc(i64 {})\n",
+                        inc, res
+                    ));
+                    res = inc;
+                }
+                self.flush_temps(&temps);
+                Ok(res)
+            }
             ExprKind::If {
                 cond,
                 then_block,
@@ -3291,6 +3529,7 @@ impl<'a> LlvmFnGen<'a> {
     ) -> Result<String, String> {
         match &expr.kind {
             ExprKind::Int(n) => Ok(n.to_string()),
+            ExprKind::Float(x) => Ok((x.to_bits() as i64).to_string()),
             ExprKind::Bool(b) => Ok(if *b { "1" } else { "0" }.into()),
             ExprKind::Str(s) => {
                 let gname = self.intern_string_global(s);
@@ -3344,6 +3583,15 @@ impl<'a> LlvmFnGen<'a> {
                 self.code.push_str(&format!(
                     "  {} = call i64 {}(i64 {}, i64 {})\n",
                     res, getter, t, i
+                ));
+                Ok(res)
+            }
+            ExprKind::TupleIndex { target, index } => {
+                let t = self.lower_expr_borrowed(target, temps)?;
+                let res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
+                    res, t, index
                 ));
                 Ok(res)
             }
@@ -3456,6 +3704,133 @@ impl<'a> LlvmFnGen<'a> {
         Ok(out)
     }
 
+    fn emit_pattern_check(
+        &mut self,
+        val: &str,
+        ty: &TypeExpr,
+        pat: &Pattern,
+        fail_lbl: &str,
+        bindings: &mut Vec<(String, String, TypeExpr)>,
+    ) -> Result<(), String> {
+        let base = resolve_alias_ty(ty, self.alias_bases);
+        match pat {
+            Pattern::Wildcard(_) => Ok(()),
+            Pattern::Ident(name, _) => {
+                if name != "_" {
+                    bindings.push((name.clone(), val.to_string(), ty.clone()));
+                }
+                Ok(())
+            }
+            Pattern::Int(n, _) => {
+                let eq = self.fresh_tmp();
+                let ok_l = self.fresh_lbl("pok");
+                self.code.push_str(&format!(
+                    "  {} = icmp eq i64 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n",
+                    eq, val, n, eq, ok_l, fail_lbl, ok_l
+                ));
+                Ok(())
+            }
+            Pattern::Bool(b, _) => {
+                let eq = self.fresh_tmp();
+                let ok_l = self.fresh_lbl("pok");
+                self.code.push_str(&format!(
+                    "  {} = icmp eq i64 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n",
+                    eq,
+                    val,
+                    if *b { 1 } else { 0 },
+                    eq,
+                    ok_l,
+                    fail_lbl,
+                    ok_l
+                ));
+                Ok(())
+            }
+            Pattern::Str(s, _) => {
+                let gname = self.intern_string_global(s);
+                let ptxt = self.fresh_tmp();
+                let teq = self.fresh_tmp();
+                let eq = self.fresh_tmp();
+                let ok_l = self.fresh_lbl("pok");
+                self.code.push_str(&format!(
+                    "  {} = ptrtoint ptr @{} to i64\n  {} = call i64 @__tn_text_eq(i64 {}, i64 {})\n  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n",
+                    ptxt, gname, teq, val, ptxt, eq, teq, eq, ok_l, fail_lbl, ok_l
+                ));
+                Ok(())
+            }
+            Pattern::Tuple(subpats, _) => {
+                let elems = match &base {
+                    TypeExpr::Tuple(es, _) => es.clone(),
+                    _ => Vec::new(),
+                };
+                for (idx, sp) in subpats.iter().enumerate() {
+                    if matches!(sp, Pattern::Wildcard(_)) {
+                        continue;
+                    }
+                    let ev = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
+                        ev, val, idx
+                    ));
+                    let ety = elems.get(idx).cloned().unwrap_or_else(|| named_ty("Any"));
+                    self.emit_pattern_check(&ev, &ety, sp, fail_lbl, bindings)?;
+                }
+                Ok(())
+            }
+            Pattern::Variant { name, binding, .. } => {
+                let t = *self
+                    .enum_tags
+                    .get(name)
+                    .ok_or_else(|| format!("unknown variant `{}` in LLVM match", name))?;
+                let tg = self.fresh_tmp();
+                let eq = self.fresh_tmp();
+                let ok_l = self.fresh_lbl("vok");
+                self.code.push_str(&format!(
+                    "  {} = call i64 @__tn_rc_tag(i64 {})\n  {} = icmp eq i64 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n",
+                    tg, val, eq, tg, t, eq, ok_l, fail_lbl, ok_l
+                ));
+                if let Some(bn) = binding {
+                    if bn != "_" {
+                        let pay = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @__tn_slot_get(i64 {}, i64 0)\n",
+                            pay, val
+                        ));
+                        let bty = self.infer_match_binding_type(ty, name);
+                        bindings.push((bn.clone(), pay, bty));
+                    }
+                }
+                Ok(())
+            }
+            Pattern::VariantMulti { name, patterns, .. } => {
+                let t = *self
+                    .enum_tags
+                    .get(name)
+                    .ok_or_else(|| format!("unknown variant `{}` in LLVM match", name))?;
+                let tg = self.fresh_tmp();
+                let eq = self.fresh_tmp();
+                let ok_l = self.fresh_lbl("vok");
+                self.code.push_str(&format!(
+                    "  {} = call i64 @__tn_rc_tag(i64 {})\n  {} = icmp eq i64 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n",
+                    tg, val, eq, tg, t, eq, ok_l, fail_lbl, ok_l
+                ));
+                let ptys = self.resolve_variant_payload_tys(&base, name);
+                for (idx, sp) in patterns.iter().enumerate() {
+                    if matches!(sp, Pattern::Wildcard(_)) {
+                        continue;
+                    }
+                    let fv = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
+                        fv, val, idx
+                    ));
+                    let pty = ptys.get(idx).cloned().unwrap_or_else(|| named_ty("Any"));
+                    self.emit_pattern_check(&fv, &pty, sp, fail_lbl, bindings)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn lower_match(
         &mut self,
         scrutinee: &Expr,
@@ -3464,26 +3839,11 @@ impl<'a> LlvmFnGen<'a> {
         expected_ty: Option<&TypeExpr>,
     ) -> Result<String, String> {
         let scrutinee_ty = self.infer_expr_type(scrutinee);
-        let is_variant = arms
-            .iter()
-            .any(|a| a.patterns.iter().any(|p| matches!(p, Pattern::Variant { .. })));
-        let is_str = arms
-            .iter()
-            .any(|a| a.patterns.iter().any(|p| matches!(p, Pattern::Str(_, _))));
 
         let mut mtemps = Vec::new();
         let sv = self.lower_expr_borrowed(scrutinee, &mut mtemps)?;
         let temp_idx = self.temp_rc_scopes.len();
         self.temp_rc_scopes.push(mtemps);
-
-        let cmp_val = if is_variant {
-            let tg = self.fresh_tmp();
-            self.code
-                .push_str(&format!("  {} = call i64 @__tn_rc_tag(i64 {})\n", tg, sv));
-            tg
-        } else {
-            sv.clone()
-        };
 
         self.slot_id += 1;
         let res_slot = format!("%mres_{}", self.slot_id);
@@ -3496,10 +3856,8 @@ impl<'a> LlvmFnGen<'a> {
 
         for arm in arms {
             let is_wild = arm.guard.is_none()
-                && arm
-                    .patterns
-                    .iter()
-                    .any(|p| matches!(p, Pattern::Wildcard(_)));
+                && arm.patterns.len() == 1
+                && matches!(arm.patterns[0], Pattern::Wildcard(_));
             if is_wild {
                 let v = if want_owned {
                     self.lower_expr_owned(&arm.body, expected_ty)?
@@ -3533,88 +3891,39 @@ impl<'a> LlvmFnGen<'a> {
                 return Ok(out);
             }
 
-            let mut cond_var: Option<String> = None;
-            let mut vbind: Option<(String, String)> = None;
-            for p in &arm.patterns {
-                let eq = match p {
-                    Pattern::Wildcard(_) => {
-                        let e = self.fresh_tmp();
-                        self.code.push_str(&format!("  {} = icmp eq i64 1, 1\n", e));
-                        e
+            let nxt_l = self.fresh_lbl("mnxt");
+            let mut bindings: Vec<(String, String, TypeExpr)> = Vec::new();
+
+            if arm.patterns.len() == 1 {
+                self.emit_pattern_check(&sv, &scrutinee_ty, &arm.patterns[0], &nxt_l, &mut bindings)?;
+            } else {
+                let mat_l = self.fresh_lbl("marm");
+                for (pi, p) in arm.patterns.iter().enumerate() {
+                    let fail_target = if pi + 1 < arm.patterns.len() {
+                        self.fresh_lbl("mor")
+                    } else {
+                        nxt_l.clone()
+                    };
+                    let mut pbinds = Vec::new();
+                    self.emit_pattern_check(&sv, &scrutinee_ty, p, &fail_target, &mut pbinds)?;
+                    self.code.push_str(&format!("  br label %{}\n", mat_l));
+                    if pi + 1 < arm.patterns.len() {
+                        self.code.push_str(&format!("{}:\n", fail_target));
                     }
-                    Pattern::Int(n, _) => {
-                        let e = self.fresh_tmp();
-                        self.code
-                            .push_str(&format!("  {} = icmp eq i64 {}, {}\n", e, cmp_val, n));
-                        e
-                    }
-                    Pattern::Bool(b, _) => {
-                        let e = self.fresh_tmp();
-                        self.code.push_str(&format!(
-                            "  {} = icmp eq i64 {}, {}\n",
-                            e,
-                            cmp_val,
-                            if *b { 1 } else { 0 }
-                        ));
-                        e
-                    }
-                    Pattern::Str(s, _) if is_str => {
-                        let gname = self.intern_string_global(s);
-                        let ptxt = self.fresh_tmp();
-                        let teq = self.fresh_tmp();
-                        let e = self.fresh_tmp();
-                        self.code.push_str(&format!(
-                            "  {} = ptrtoint ptr @{} to i64\n  {} = call i64 @__tn_text_eq(i64 {}, i64 {})\n  {} = icmp ne i64 {}, 0\n",
-                            ptxt, gname, teq, cmp_val, ptxt, e, teq
-                        ));
-                        e
-                    }
-                    Pattern::Variant { name, binding, .. } => {
-                        let t = *self
-                            .enum_tags
-                            .get(name)
-                            .ok_or_else(|| format!("unknown variant `{}` in LLVM match", name))?;
-                        if let Some(bn) = binding {
-                            if bn != "_" {
-                                vbind = Some((bn.clone(), name.clone()));
-                            }
-                        }
-                        let e = self.fresh_tmp();
-                        self.code
-                            .push_str(&format!("  {} = icmp eq i64 {}, {}\n", e, cmp_val, t));
-                        e
-                    }
-                    _ => continue,
-                };
-                cond_var = Some(match cond_var {
-                    Some(prev) => {
-                        let o = self.fresh_tmp();
-                        self.code
-                            .push_str(&format!("  {} = or i1 {}, {}\n", o, prev, eq));
-                        o
-                    }
-                    None => eq,
-                });
+                }
+                self.code.push_str(&format!("{}:\n", mat_l));
             }
 
-            let mat_l = self.fresh_lbl("marm");
-            let nxt_l = self.fresh_lbl("mnxt");
-            let c = cond_var.unwrap_or_else(|| "false".into());
-            self.code.push_str(&format!(
-                "  br i1 {}, label %{}, label %{}\n{}:\n",
-                c, mat_l, nxt_l, mat_l
-            ));
             let saved_arm = self.save_lexical();
-            if let Some((bn, vname)) = vbind {
-                let pay = self.fresh_tmp();
+            for (bn, bval, bty) in bindings {
                 let bslot = self.fresh_var_slot(&bn);
-                self.code.push_str(&format!(
-                    "  {} = call i64 @__tn_slot_get(i64 {}, i64 0)\n  store i64 {}, ptr {}\n",
-                    pay, sv, pay, bslot
-                ));
-                let bty = self.infer_match_binding_type(&scrutinee_ty, &vname);
+                self.code
+                    .push_str(&format!("  store i64 {}, ptr {}\n", bval, bslot));
+                self.owned_rc_vars.remove(&bn);
                 if self.type_is_rc(&bty) {
                     self.borrowed_rc_vars.insert(bn.clone());
+                } else {
+                    self.borrowed_rc_vars.remove(&bn);
                 }
                 self.var_types.insert(bn, bty);
             }
@@ -3668,6 +3977,7 @@ impl<'a> LlvmFnGen<'a> {
     ) -> Result<String, String> {
         match &expr.kind {
             ExprKind::Int(n) => Ok(n.to_string()),
+            ExprKind::Float(x) => Ok((x.to_bits() as i64).to_string()),
             ExprKind::Bool(b) => Ok(if *b { "1" } else { "0" }.into()),
             ExprKind::Str(s) => {
                 let gname = self.intern_string_global(s);
@@ -3753,13 +4063,65 @@ impl<'a> LlvmFnGen<'a> {
                 }
                 Ok(obj)
             }
+            ExprKind::Tuple(elems) => {
+                let exp_elems = expected_ty.and_then(|t| match resolve_alias_ty(t, self.alias_bases) {
+                    TypeExpr::Tuple(es, _) => Some(es),
+                    _ => None,
+                });
+                let obj = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 {})\n",
+                    obj,
+                    TAG_TUPLE,
+                    elems.len()
+                ));
+                let mut rc_mask = 0u64;
+                for (idx, e) in elems.iter().enumerate() {
+                    let ety = exp_elems.as_ref().and_then(|es| es.get(idx));
+                    let is_rc = ety.is_some_and(|t| self.type_is_rc(t)) || self.expr_produces_rc(e);
+                    let ev = if is_rc {
+                        if idx < 64 {
+                            rc_mask |= 1u64 << idx;
+                        }
+                        self.lower_expr_owned(e, ety)?
+                    } else {
+                        let mut temps = Vec::new();
+                        let v = self.lower_expr_borrowed(e, &mut temps)?;
+                        self.flush_temps(&temps);
+                        v
+                    };
+                    self.code.push_str(&format!(
+                        "  call void @__tn_slot_set_prim(i64 {}, i64 {}, i64 {})\n",
+                        obj, idx, ev
+                    ));
+                }
+                if rc_mask != 0 {
+                    self.code.push_str(&format!(
+                        "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
+                        obj, rc_mask as i64
+                    ));
+                }
+                Ok(obj)
+            }
             ExprKind::Unary { op, expr } => {
+                let is_flt = self.is_float_expr(expr);
                 let mut temps = Vec::new();
                 let v = self.lower_expr_borrowed(expr, &mut temps)?;
                 self.flush_temps(&temps);
                 let r = self.fresh_tmp();
                 match op {
-                    UnOp::Neg => self.code.push_str(&format!("  {} = sub i64 0, {}\n", r, v)),
+                    UnOp::Neg => {
+                        if is_flt {
+                            let fv = self.fresh_tmp();
+                            let nf = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = bitcast i64 {} to double\n  {} = fneg double {}\n  {} = bitcast double {} to i64\n",
+                                fv, v, nf, fv, r, nf
+                            ));
+                        } else {
+                            self.code.push_str(&format!("  {} = sub i64 0, {}\n", r, v));
+                        }
+                    }
                     UnOp::Not => {
                         let c = self.fresh_tmp();
                         self.code.push_str(&format!(
@@ -3842,6 +4204,7 @@ impl<'a> LlvmFnGen<'a> {
             }
             ExprKind::Binary { op, left, right } => {
                 let tcmp = self.is_text_expr(left) || self.is_text_expr(right);
+                let float_op = self.is_float_expr(left) || self.is_float_expr(right);
                 let mut temps = Vec::new();
                 let l = self.lower_expr_borrowed(left, &mut temps)?;
                 let r = self.lower_expr_borrowed(right, &mut temps)?;
@@ -3873,6 +4236,49 @@ impl<'a> LlvmFnGen<'a> {
                     return Ok(res);
                 }
                 self.flush_temps(&temps);
+                if float_op {
+                    let lf = self.fresh_tmp();
+                    let rf = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = bitcast i64 {} to double\n  {} = bitcast i64 {} to double\n",
+                        lf, l, rf, r
+                    ));
+                    let res = self.fresh_tmp();
+                    match op {
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                            let fop = match op {
+                                BinOp::Add => "fadd",
+                                BinOp::Sub => "fsub",
+                                BinOp::Mul => "fmul",
+                                BinOp::Div => "fdiv",
+                                _ => unreachable!(),
+                            };
+                            let fres = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = {} double {}, {}\n  {} = bitcast double {} to i64\n",
+                                fres, fop, lf, rf, res, fres
+                            ));
+                        }
+                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                            let pred = match op {
+                                BinOp::Eq => "oeq",
+                                BinOp::Ne => "une",
+                                BinOp::Lt => "olt",
+                                BinOp::Le => "ole",
+                                BinOp::Gt => "ogt",
+                                BinOp::Ge => "oge",
+                                _ => unreachable!(),
+                            };
+                            let c = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = fcmp {} double {}, {}\n  {} = zext i1 {} to i64\n",
+                                c, pred, lf, rf, res, c
+                            ));
+                        }
+                        other => return Err(format!("unsupported float op {:?} in LLVM codegen", other)),
+                    }
+                    return Ok(res);
+                }
                 let res = self.fresh_tmp();
                 match op {
                     BinOp::Add => self.code.push_str(&format!("  {} = add i64 {}, {}\n", res, l, r)),
@@ -4040,6 +4446,94 @@ impl<'a> LlvmFnGen<'a> {
                     ))
                 }
                 ExprKind::Ident(fname) => {
+                    if fname == "__make_closure" && args.len() >= 2 {
+                        let csym = match &args[0].value.kind {
+                            ExprKind::Str(s) => s.clone(),
+                            _ => return Err("__make_closure expects closure fn symbol".into()),
+                        };
+                        let rc_mask = match &args[1].value.kind {
+                            ExprKind::Int(m) => *m,
+                            _ => 0,
+                        };
+                        let captures = &args[2..];
+                        let obj = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 {})\n",
+                            obj,
+                            TAG_CLOSURE,
+                            1 + captures.len()
+                        ));
+                        if rc_mask != 0 {
+                            self.code.push_str(&format!(
+                                "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                obj, rc_mask
+                            ));
+                        }
+                        let fptr = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = ptrtoint ptr @tenon_fn_{} to i64\n  call void @__tn_slot_set_prim(i64 {}, i64 0, i64 {})\n",
+                            fptr,
+                            sanitize(&csym),
+                            obj,
+                            fptr
+                        ));
+                        for (k, cap) in captures.iter().enumerate() {
+                            let bit = 1i64.checked_shl((k + 1) as u32).unwrap_or(0);
+                            let is_rc = (rc_mask & bit) != 0;
+                            let cv = if is_rc {
+                                self.lower_expr_owned(&cap.value, None)?
+                            } else {
+                                let mut temps = Vec::new();
+                                let v = self.lower_expr_borrowed(&cap.value, &mut temps)?;
+                                self.flush_temps(&temps);
+                                v
+                            };
+                            self.code.push_str(&format!(
+                                "  call void @__tn_slot_set_prim(i64 {}, i64 {}, i64 {})\n",
+                                obj,
+                                k + 1,
+                                cv
+                            ));
+                        }
+                        return Ok(obj);
+                    }
+                    if fname == "__closure_get" && args.len() == 2 {
+                        let mut temps = Vec::new();
+                        let env = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        let res = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
+                            res, env, idx
+                        ));
+                        self.flush_temps(&temps);
+                        return Ok(res);
+                    }
+                    if fname == "__call_closure" && !args.is_empty() {
+                        let mut temps = Vec::new();
+                        let cl_val = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let mut call_args = Vec::with_capacity(args.len());
+                        call_args.push(format!("i64 {}", cl_val));
+                        for a in &args[1..] {
+                            let av = self.lower_expr_borrowed(&a.value, &mut temps)?;
+                            call_args.push(format!("i64 {}", av));
+                        }
+                        let fn_i64 = self.fresh_tmp();
+                        let fn_ptr = self.fresh_tmp();
+                        let res = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @__tn_slot_get(i64 {}, i64 0)\n  {} = inttoptr i64 {} to ptr\n  {} = call i64 {}({})\n",
+                            fn_i64,
+                            cl_val,
+                            fn_ptr,
+                            fn_i64,
+                            res,
+                            fn_ptr,
+                            call_args.join(", ")
+                        ));
+                        self.flush_temps(&temps);
+                        return Ok(res);
+                    }
                     if fname == "__box_dyn" && args.len() == 3 {
                         let vsym = match &args[1].value.kind {
                             ExprKind::Str(s) => s.clone(),
@@ -4503,19 +4997,31 @@ fn stmt_keeps_unique(stmt: &Stmt, name: &str) -> bool {
         }
         Stmt::Expr { expr, .. } => expr_keeps_unique(expr, name),
         Stmt::Break { .. } | Stmt::Continue { .. } => true,
+        Stmt::LetTuple { .. } | Stmt::For { .. } => false,
+    }
+}
+
+fn pattern_mentions_name(pat: &Pattern, name: &str) -> bool {
+    match pat {
+        Pattern::Ident(s, _) => s == name,
+        Pattern::Variant { binding: Some(b), .. } => b == name,
+        Pattern::VariantMulti { patterns, .. } | Pattern::Tuple(patterns, _) => {
+            patterns.iter().any(|p| pattern_mentions_name(p, name))
+        }
+        _ => false,
     }
 }
 
 fn expr_keeps_unique(expr: &Expr, name: &str) -> bool {
     match &expr.kind {
         ExprKind::Ident(s) => s != name,
-        ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Str(_) => true,
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) => true,
         ExprKind::Index { target, index } => {
             let t_ok = matches!(&target.kind, ExprKind::Ident(s) if s == name)
                 || expr_keeps_unique(target, name);
             t_ok && expr_keeps_unique(index, name)
         }
-        ExprKind::Field { target, .. } => {
+        ExprKind::Field { target, .. } | ExprKind::TupleIndex { target, .. } => {
             matches!(&target.kind, ExprKind::Ident(s) if s == name)
                 || expr_keeps_unique(target, name)
         }
@@ -4536,7 +5042,7 @@ fn expr_keeps_unique(expr: &Expr, name: &str) -> bool {
         ExprKind::RecordLit { fields, .. } => {
             fields.iter().all(|(_, e)| expr_keeps_unique(e, name))
         }
-        ExprKind::List(es) => es.iter().all(|e| expr_keeps_unique(e, name)),
+        ExprKind::List(es) | ExprKind::Tuple(es) => es.iter().all(|e| expr_keeps_unique(e, name)),
         ExprKind::If {
             cond,
             then_block,
@@ -4553,9 +5059,7 @@ fn expr_keeps_unique(expr: &Expr, name: &str) -> bool {
                 return false;
             }
             arms.iter().all(|a| {
-                let shadows = a.patterns.iter().any(|p| {
-                    matches!(p, Pattern::Variant { binding: Some(b), .. } if b == name)
-                });
+                let shadows = a.patterns.iter().any(|p| pattern_mentions_name(p, name));
                 !shadows
                     && a.guard.as_ref().is_none_or(|g| expr_keeps_unique(g, name))
                     && expr_keeps_unique(&a.body, name)
@@ -4798,5 +5302,179 @@ pub fn main() Int {
             String::from_utf8_lossy(&run.stderr)
         );
         assert_eq!(stdout.trim(), "Hello World|NiHao, World");
+    }
+
+    #[test]
+    fn llvm_aot_p0_expressiveness_zero_leaks() {
+        let src = r#"
+pub type NonNegative = Int where self >= 0
+
+pub interface Display {
+    pure fn display(self) Text
+}
+pub interface Eq {
+    pure fn eq(self, other Self) Bool
+}
+pub interface Hash {
+    pure fn hash(self) NonNegative
+}
+
+impl Display for Text {
+    pub pure fn display(self) Text { self }
+}
+impl Display for Float {
+    pub pure fn display(self) Text { float_to_text(self) }
+}
+impl Eq for Int {
+    pub pure fn eq(self, other Int) Bool { self == other }
+}
+impl Hash for Int {
+    pub pure fn hash(self) NonNegative { self & 9223372036854775807 }
+}
+impl Eq for Text {
+    pub pure fn eq(self, other Text) Bool { self == other }
+}
+impl Hash for Text {
+    pub pure fn hash(self) NonNegative { len(self) }
+}
+
+@derive(Eq, Hash)
+pub record TagPt {
+    x   Int
+    tag Text
+}
+
+pub enum Tree[T] {
+    Empty
+    Leaf(T)
+    Node(Tree[T], T, Tree[T])
+}
+
+pub pure fn sum_tree(t Tree[Int]) Int {
+    match t {
+        Empty => 0
+        Leaf(v) => v
+        Node(Leaf(a), v, Leaf(b)) => a + v + b
+        Node(l, v, r) => sum_tree(l) + v + sum_tree(r)
+    }
+}
+
+pub pure fn join_tree(t Tree[Text]) Text {
+    match t {
+        Empty => ""
+        Leaf(s) => s
+        Node(l, s, r) => join_tree(l) ++ s ++ join_tree(r)
+    }
+}
+
+pub pure fn make_greeter(prefix Text, bump Int) fn(Text) Text {
+    |who| prefix ++ who ++ if bump > 0 { "!" } else { "." }
+}
+
+pub pure fn try_chain_res(ok_flag Bool) Result[Int, Text] {
+    let alive = "keep_me_rc"
+    let first Result[Int, Text] = if ok_flag { Ok(10) } else { Err("fail:" ++ alive) }
+    let a = first?
+    let second Result[Int, Text] = Ok(a + len(alive))
+    let b = second?
+    Ok(b)
+}
+
+pub pure fn try_chain_opt(present Bool) Option[Int] {
+    let alive = "opt_rc"
+    let o Option[Int] = if present { Some(20) } else { None }
+    let v = o?
+    Some(v + len(alive))
+}
+
+pub fn main() Int {
+    var f = 2.0
+    f += 1.5
+    f *= 2.0
+    f /= 3.5
+    assert f == 2.0
+    assert float_to_int(3.9) == 3
+    assert int_to_float(5) == 5.0
+    assert parse_float("1.25") == 1.25
+    assert !float_is_nan(f)
+
+    let g = make_greeter("hi ", 1)
+    assert g("tenon") == "hi tenon!"
+
+    var acc = 0
+    for i in 0..8 {
+        if i == 2 { continue }
+        if i == 6 { break }
+        acc += i
+    }
+    assert acc == 13
+
+    let r = 1..5
+    var rsum = 0
+    for k in r { rsum += k }
+    assert rsum == 10
+
+    var lsum = 0
+    let ws = ["a", "bb", "ccc"]
+    for w in ws { lsum += len(w) }
+    assert lsum == 6
+
+    var bits = 4
+    bits <<= 2
+    bits >>= 1
+    bits |= 3
+    bits &= 10
+    bits ^= 6
+    bits *= 3
+    bits /= 4
+    assert bits == 9
+
+    assert match try_chain_res(true) { Ok(v) => v Err(_) => -1 } == 20
+    assert match try_chain_res(false) { Ok(_) => "" Err(e) => e } == "fail:keep_me_rc"
+    assert match try_chain_opt(true) { Some(v) => v None => -1 } == 26
+    assert match try_chain_opt(false) { Some(_) => 1 None => 0 } == 0
+
+    let tup = (7, "abc", 1.5)
+    let (tn, ts, tf) = tup
+    assert tn == 7 && ts == "abc" && tf == 1.5 && tup.0 == 7
+    let nested Option[Result[(Int, Text), Text]] = Some(Ok((4, "xy")))
+    let nv = match nested {
+        Some(Ok((n, s))) => n + len(s)
+        Some(Err(_)) => -1
+        None => -2
+    }
+    assert nv == 6
+
+    let it Tree[Int] = Node(Node(Leaf(1), 2, Leaf(3)), 4, Leaf(5))
+    assert sum_tree(it) == 15
+    let tt Tree[Text] = Node(Leaf("te"), "n", Leaf("on"))
+    assert join_tree(tt) == "tenon"
+
+    let fs = f"{ts}={tf}"
+    assert fs == "abc=1.5"
+
+    let p1 = TagPt { x = 1, tag = "k" }
+    let p2 = TagPt { x = 1, tag = "k" }
+    let p3 = TagPt { x = 2, tag = "k" }
+    assert p1 == p2 && p1 != p3
+    42
+}
+"#;
+        let prog = parse(src).unwrap();
+        let bin = std::env::temp_dir().join(format!("tenon_llvm_p0_test_{}", std::process::id()));
+        let art = compile_to_native_binary(&prog, &bin, None, "O3").unwrap();
+        assert!(art.binary_bytes > 4096);
+
+        let run = Command::new(&bin).output().unwrap();
+        let _ = fs::remove_file(&bin);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "native LLVM P0 expressiveness binary failed: stdout={} stderr={}",
+            stdout,
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(stdout.contains("main() => 42"), "unexpected stdout: {}", stdout);
+        assert!(stdout.contains("live_objects=0"), "leaked objects in LLVM AOT: {}", stdout);
     }
 }

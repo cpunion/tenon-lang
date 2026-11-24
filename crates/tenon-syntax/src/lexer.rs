@@ -5,7 +5,9 @@ pub enum TokenKind {
     // Literals & Identifiers
     Ident(String),
     Int(i64),
+    Float(u64),
     Str(String),
+    FStr(String),
 
     // Keywords
     Import,
@@ -18,6 +20,7 @@ pub enum TokenKind {
     Interface,
     Impl,
     For,
+    In,
     Dyn,
     Fn,
     Pure,
@@ -79,6 +82,8 @@ pub enum TokenKind {
     Semi,
     Colon,
     Dot,
+    DotDot,
+    Question,
     At,
     Eq,
     EqEq,
@@ -94,15 +99,22 @@ pub enum TokenKind {
     Minus,
     MinusEq,
     Star,
+    StarEq,
     Slash,
+    SlashEq,
     Percent,
     Amp,
+    AmpEq,
     AmpAmp,
     Pipe,
+    PipeEq,
     PipePipe,
     Caret,
+    CaretEq,
     Shl,
+    ShlEq,
     Shr,
+    ShrEq,
     FatArrow,
     Bidirectional, // <->
     Newline,
@@ -226,10 +238,63 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                     span: Span::new(start, i, sline, scol),
                 });
             }
+            'f' if i + 1 < bytes.len() && bytes[i + 1] == b'"' => {
+                let start = i;
+                let sline = line;
+                let scol = col;
+                i += 2;
+                col += 2;
+                let mut raw: Vec<u8> = Vec::new();
+                let mut closed = false;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if b == b'"' {
+                        i += 1;
+                        col += 1;
+                        closed = true;
+                        break;
+                    }
+                    if b == b'\\' && i + 1 < bytes.len() {
+                        i += 1;
+                        col += 1;
+                        match bytes[i] {
+                            b'n' => raw.push(b'\n'),
+                            b't' => raw.push(b'\t'),
+                            b'r' => raw.push(b'\r'),
+                            b'\\' => raw.push(b'\\'),
+                            b'"' => raw.push(b'"'),
+                            other => raw.push(other),
+                        }
+                        i += 1;
+                        col += 1;
+                    } else {
+                        if b == b'\n' {
+                            line += 1;
+                            col = 1;
+                        } else {
+                            col += 1;
+                        }
+                        raw.push(b);
+                        i += 1;
+                    }
+                }
+                if !closed {
+                    return Err(ParseError {
+                        message: "unterminated interpolated string literal".into(),
+                        span: Span::new(start, i, sline, scol),
+                    });
+                }
+                let s = String::from_utf8_lossy(&raw).into_owned();
+                tokens.push(Token {
+                    kind: TokenKind::FStr(s),
+                    span: Span::new(start, i, sline, scol),
+                });
+            }
             '0'..='9' => {
                 let start = i;
                 let scol = col;
                 let mut num_str = String::new();
+                let mut is_float = false;
                 while i < bytes.len() {
                     let c = bytes[i] as char;
                     if c.is_ascii_digit() {
@@ -243,14 +308,74 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                         break;
                     }
                 }
-                let val: i64 = num_str.parse().map_err(|_| ParseError {
-                    message: format!("invalid integer literal `{}`", num_str),
-                    span: Span::new(start, i, line, scol),
-                })?;
-                tokens.push(Token {
-                    kind: TokenKind::Int(val),
-                    span: Span::new(start, i, line, scol),
-                });
+                if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
+                    is_float = true;
+                    num_str.push('.');
+                    i += 1;
+                    col += 1;
+                    while i < bytes.len() {
+                        let c = bytes[i] as char;
+                        if c.is_ascii_digit() {
+                            num_str.push(c);
+                            i += 1;
+                            col += 1;
+                        } else if c == '_' {
+                            i += 1;
+                            col += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+                    let mut look = i + 1;
+                    if look < bytes.len() && (bytes[look] == b'+' || bytes[look] == b'-') {
+                        look += 1;
+                    }
+                    if look < bytes.len() && bytes[look].is_ascii_digit() {
+                        is_float = true;
+                        num_str.push(bytes[i] as char);
+                        i += 1;
+                        col += 1;
+                        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                            num_str.push(bytes[i] as char);
+                            i += 1;
+                            col += 1;
+                        }
+                        while i < bytes.len() {
+                            let c = bytes[i] as char;
+                            if c.is_ascii_digit() {
+                                num_str.push(c);
+                                i += 1;
+                                col += 1;
+                            } else if c == '_' {
+                                i += 1;
+                                col += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if is_float {
+                    let val: f64 = num_str.parse().map_err(|_| ParseError {
+                        message: format!("invalid float literal `{}`", num_str),
+                        span: Span::new(start, i, line, scol),
+                    })?;
+                    tokens.push(Token {
+                        kind: TokenKind::Float(val.to_bits()),
+                        span: Span::new(start, i, line, scol),
+                    });
+                } else {
+                    let val: i64 = num_str.parse().map_err(|_| ParseError {
+                        message: format!("invalid integer literal `{}`", num_str),
+                        span: Span::new(start, i, line, scol),
+                    })?;
+                    tokens.push(Token {
+                        kind: TokenKind::Int(val),
+                        span: Span::new(start, i, line, scol),
+                    });
+                }
             }
             'a'..='z' | 'A'..='Z' | '_' => {
                 let start = i;
@@ -276,6 +401,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                     "interface" => TokenKind::Interface,
                     "impl" => TokenKind::Impl,
                     "for" => TokenKind::For,
+                    "in" => TokenKind::In,
                     "dyn" => TokenKind::Dyn,
                     "fn" => TokenKind::Fn,
                     "pure" => TokenKind::Pure,
@@ -338,6 +464,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 let rem = &src[i..];
                 let (kind, len) = if rem.starts_with("<->") {
                     (TokenKind::Bidirectional, 3)
+                } else if rem.starts_with("<<=") {
+                    (TokenKind::ShlEq, 3)
+                } else if rem.starts_with(">>=") {
+                    (TokenKind::ShrEq, 3)
+                } else if rem.starts_with("..") {
+                    (TokenKind::DotDot, 2)
                 } else if rem.starts_with("<<") {
                     (TokenKind::Shl, 2)
                 } else if rem.starts_with(">>") {
@@ -362,6 +494,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                     (TokenKind::PlusEq, 2)
                 } else if rem.starts_with("-=") {
                     (TokenKind::MinusEq, 2)
+                } else if rem.starts_with("*=") {
+                    (TokenKind::StarEq, 2)
+                } else if rem.starts_with("/=") {
+                    (TokenKind::SlashEq, 2)
+                } else if rem.starts_with("&=") {
+                    (TokenKind::AmpEq, 2)
+                } else if rem.starts_with("|=") {
+                    (TokenKind::PipeEq, 2)
+                } else if rem.starts_with("^=") {
+                    (TokenKind::CaretEq, 2)
                 } else {
                     match ch {
                         '(' => (TokenKind::LParen, 1),
@@ -374,6 +516,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                         ';' => (TokenKind::Semi, 1),
                         ':' => (TokenKind::Colon, 1),
                         '.' => (TokenKind::Dot, 1),
+                        '?' => (TokenKind::Question, 1),
                         '@' => (TokenKind::At, 1),
                         '=' => (TokenKind::Eq, 1),
                         '!' => (TokenKind::Bang, 1),

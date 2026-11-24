@@ -151,7 +151,9 @@ fn rewrite_fn_aliases(f: &mut FnDecl, aliases: &BTreeMap<String, (String, BTreeS
 fn rewrite_block_aliases(blk: &mut Block, aliases: &BTreeMap<String, (String, BTreeSet<String>)>) {
     for s in &mut blk.stmts {
         match s {
-            Stmt::Let { value, .. } => rewrite_expr_aliases(value, aliases),
+            Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => {
+                rewrite_expr_aliases(value, aliases)
+            }
             Stmt::Assign { target, value, .. } => {
                 rewrite_expr_aliases(target, aliases);
                 rewrite_expr_aliases(value, aliases);
@@ -162,6 +164,10 @@ fn rewrite_block_aliases(blk: &mut Block, aliases: &BTreeMap<String, (String, BT
             Stmt::Mutate { body, .. } => rewrite_block_aliases(body, aliases),
             Stmt::While { cond, body, .. } => {
                 rewrite_expr_aliases(cond, aliases);
+                rewrite_block_aliases(body, aliases);
+            }
+            Stmt::For { iter, body, .. } => {
+                rewrite_expr_aliases(iter, aliases);
                 rewrite_block_aliases(body, aliases);
             }
             _ => {}
@@ -202,9 +208,18 @@ fn rewrite_expr_aliases(expr: &mut Expr, aliases: &BTreeMap<String, (String, BTr
             rewrite_expr_aliases(left, aliases);
             rewrite_expr_aliases(right, aliases);
         }
-        ExprKind::Unary { expr: inner, .. } | ExprKind::Await(inner) | ExprKind::Old(inner) => {
+        ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Await(inner)
+        | ExprKind::Old(inner)
+        | ExprKind::Try(inner)
+        | ExprKind::TupleIndex { target: inner, .. } => {
             rewrite_expr_aliases(inner, aliases);
         }
+        ExprKind::Range { start, end } => {
+            rewrite_expr_aliases(start, aliases);
+            rewrite_expr_aliases(end, aliases);
+        }
+        ExprKind::Lambda { body, .. } => rewrite_expr_aliases(body, aliases),
         ExprKind::Index { target, index } => {
             rewrite_expr_aliases(target, aliases);
             rewrite_expr_aliases(index, aliases);

@@ -98,7 +98,7 @@ impl[K Hash + Eq, V] Map[K, V] {
             if idx == -1 {
                 return None
             }
-            if idx >= 0 && self.hashes[idx] == h && self.keys[idx].eq(key) {
+            if idx >= 0 && self.hashes[idx] == h && self.keys[idx] == key {
                 return Some(self.vals[idx])
             }
             slot = (slot + 1) & mask
@@ -175,7 +175,7 @@ impl[K Hash + Eq, V] Map[K, V] {
                 if first_tombstone < 0 {
                     first_tombstone = slot
                 }
-            } else if self.hashes[idx] == h && self.keys[idx].eq(key) {
+            } else if self.hashes[idx] == h && self.keys[idx] == key {
                 self.vals[idx] = val
                 return
             }
@@ -205,7 +205,7 @@ impl[K Hash + Eq, V] Map[K, V] {
             if idx == -1 {
                 return None
             }
-            if idx >= 0 && self.hashes[idx] == h && self.keys[idx].eq(key) {
+            if idx >= 0 && self.hashes[idx] == h && self.keys[idx] == key {
                 let old_val = self.vals[idx]
                 let last_idx = self.keys.len() - 1
                 self.buckets[slot] = -2

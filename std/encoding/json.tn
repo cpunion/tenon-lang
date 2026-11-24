@@ -22,6 +22,7 @@ pub enum JsonValue {
     JNull
     JBool(Bool)
     JInt(Int)
+    JFloat(Float)
     JStr(Text)
     JArr(List[JsonValue])
     JObj(List[JsonEntry])
@@ -87,6 +88,7 @@ pub pure fn json_arr_push(arr JsonValue, item JsonValue) JsonValue {
         }
         JBool(_) => arr
         JInt(_) => arr
+        JFloat(_) => arr
         JStr(_) => arr
         JObj(_) => arr
     }
@@ -114,6 +116,7 @@ pub pure fn json_obj_set(obj JsonValue, key Text, val JsonValue) JsonValue {
         }
         JBool(_) => obj
         JInt(_) => obj
+        JFloat(_) => obj
         JStr(_) => obj
         JArr(_) => obj
     }
@@ -135,6 +138,7 @@ pub pure fn json_get(v JsonValue, key Text) Option[JsonValue] {
         JNull => None
         JBool(_) => None
         JInt(_) => None
+        JFloat(_) => None
         JStr(_) => None
         JArr(_) => None
     }
@@ -146,6 +150,7 @@ pub pure fn json_at(v JsonValue, idx NonNegative) Option[JsonValue] {
         JNull => None
         JBool(_) => None
         JInt(_) => None
+        JFloat(_) => None
         JStr(_) => None
         JObj(_) => None
     }
@@ -159,6 +164,7 @@ pub pure fn json_len(v JsonValue) NonNegative {
         JNull => 0
         JBool(_) => 0
         JInt(_) => 0
+        JFloat(_) => 0
     }
 }
 
@@ -168,6 +174,7 @@ pub pure fn json_as_str(v JsonValue) Option[Text] {
         JNull => None
         JBool(_) => None
         JInt(_) => None
+        JFloat(_) => None
         JArr(_) => None
         JObj(_) => None
     }
@@ -176,6 +183,19 @@ pub pure fn json_as_str(v JsonValue) Option[Text] {
 pub pure fn json_as_int(v JsonValue) Option[Int] {
     match v {
         JInt(n) => Some(n)
+        JNull => None
+        JBool(_) => None
+        JFloat(_) => None
+        JStr(_) => None
+        JArr(_) => None
+        JObj(_) => None
+    }
+}
+
+pub pure fn json_as_float(v JsonValue) Option[Float] {
+    match v {
+        JFloat(f) => Some(f)
+        JInt(n) => Some(int_to_float(n))
         JNull => None
         JBool(_) => None
         JStr(_) => None
@@ -189,6 +209,7 @@ pub pure fn json_as_bool(v JsonValue) Option[Bool] {
         JBool(b) => Some(b)
         JNull => None
         JInt(_) => None
+        JFloat(_) => None
         JStr(_) => None
         JArr(_) => None
         JObj(_) => None
@@ -205,6 +226,13 @@ pub pure fn json_get_str(v JsonValue, key Text) Option[Text] {
 pub pure fn json_get_int(v JsonValue, key Text) Option[Int] {
     match json_get(v, key) {
         Some(inner) => json_as_int(inner)
+        None => None
+    }
+}
+
+pub pure fn json_get_float(v JsonValue, key Text) Option[Float] {
+    match json_get(v, key) {
+        Some(inner) => json_as_float(inner)
         None => None
     }
 }
@@ -232,9 +260,11 @@ impl JsonValue {
     pub pure fn is_empty(self) Bool { json_len(self) == 0 }
     pub pure fn as_str(self) Option[Text] { json_as_str(self) }
     pub pure fn as_int(self) Option[Int] { json_as_int(self) }
+    pub pure fn as_float(self) Option[Float] { json_as_float(self) }
     pub pure fn as_bool(self) Option[Bool] { json_as_bool(self) }
     pub pure fn get_str(self, key Text) Option[Text] { json_get_str(self, key) }
     pub pure fn get_int(self, key Text) Option[Int] { json_get_int(self, key) }
+    pub pure fn get_float(self, key Text) Option[Float] { json_get_float(self, key) }
     pub pure fn get_bool(self, key Text) Option[Bool] { json_get_bool(self, key) }
     pub pure fn set(self, key Text, val JsonValue) JsonValue { json_obj_set(self, key, val) }
     pub pure fn put(inout self, key Text, val JsonValue) {
@@ -261,6 +291,7 @@ impl JsonValue {
             }
             JBool(_) => {}
             JInt(_) => {}
+            JFloat(_) => {}
             JStr(_) => {}
             JArr(_) => {}
         }
@@ -281,6 +312,7 @@ impl JsonValue {
             }
             JBool(_) => {}
             JInt(_) => {}
+            JFloat(_) => {}
             JStr(_) => {}
             JObj(_) => {}
         }
@@ -354,6 +386,13 @@ pub pure fn json_write_value(b TextBuilder, v JsonValue) {
         }
         JInt(n) => {
             b.push(n.to_text())
+        }
+        JFloat(f) => {
+            let s = float_to_text(f)
+            b.push(s)
+            if !s.contains(".") && !s.contains("e") && !s.contains("E") {
+                b.push(".0")
+            }
         }
         JStr(s) => {
             b.push_byte(34)
@@ -573,20 +612,44 @@ pure fn json_parse_number_cursor(src Text, n Int, inout pos Int, inout err_pos I
             break
         }
     }
+    var is_float = false
     if i < n && byte_at(src, i) == 46 {
+        is_float = true
         i += 1
+        if i >= n || !is_digit_byte(byte_at(src, i)) {
+            err_pos = i
+            err_msg = "expected digit after '.' in JSON number"
+            return JNull
+        }
         while i < n && is_digit_byte(byte_at(src, i)) {
             i += 1
         }
     }
     if i < n && (byte_at(src, i) == 101 || byte_at(src, i) == 69) {
+        is_float = true
         i += 1
         if i < n && (byte_at(src, i) == 43 || byte_at(src, i) == 45) {
             i += 1
         }
+        if i >= n || !is_digit_byte(byte_at(src, i)) {
+            err_pos = i
+            err_msg = "expected digit in JSON number exponent"
+            return JNull
+        }
         while i < n && is_digit_byte(byte_at(src, i)) {
             i += 1
         }
+    }
+    if is_float {
+        let raw = str_slice(src, start, i)
+        let f = parse_float(raw)
+        if float_is_nan(f) {
+            err_pos = start
+            err_msg = "invalid JSON float"
+            return JNull
+        }
+        pos = i
+        return JFloat(f)
     }
     pos = i
     if neg { JInt(-acc) } else { JInt(acc) }

@@ -33,6 +33,54 @@ impl Eq for Text {
     }
 }
 
+impl Eq for Float {
+    pub pure fn eq(self, other Float) Bool {
+        self == other
+    }
+}
+
+impl Hash for Float {
+    pub pure fn hash(self) NonNegative {
+        var h = float_bits(self)
+        h = (h ^ (h >> 30)) * 490278349
+        h = (h ^ (h >> 27)) * 16777619
+        h = h ^ (h >> 31)
+        h & 9223372036854775807
+    }
+}
+
+impl Display for Float {
+    pub pure fn display(self) Text {
+        float_to_text(self)
+    }
+}
+
+impl Float {
+    pub pure fn to_int(self) Int {
+        float_to_int(self)
+    }
+
+    pub pure fn to_text(self) Text {
+        float_to_text(self)
+    }
+
+    pub pure fn abs(self) Float {
+        if self < 0.0 { -self } else { self }
+    }
+
+    pub pure fn is_nan(self) Bool {
+        float_is_nan(self)
+    }
+
+    pub pure fn parse(s Text) Result[Float, Text] {
+        let v = parse_float(s)
+        if float_is_nan(v) {
+            return Err("invalid float")
+        }
+        Ok(v)
+    }
+}
+
 pub interface Writer {
     fn write_str(inout self, s Text) Int
         ensures result >= 0
@@ -106,6 +154,65 @@ impl[T] List[T] {
         let empty List[T] = []
         self = empty
     }
+
+    pub pure fn map[U](self, f fn(T) U) List[U] {
+        var out List[U] = []
+        for x in self {
+            out.push(f(x))
+        }
+        out
+    }
+
+    pub pure fn filter(self, pred fn(T) Bool) List[T] {
+        var out List[T] = []
+        for x in self {
+            if pred(x) {
+                out.push(x)
+            }
+        }
+        out
+    }
+
+    pub pure fn fold[U](self, init U, f fn(U, T) U) U {
+        var acc = init
+        for x in self {
+            acc = f(acc, x)
+        }
+        acc
+    }
+
+    pub pure fn any(self, pred fn(T) Bool) Bool {
+        for x in self {
+            if pred(x) {
+                return true
+            }
+        }
+        false
+    }
+
+    pub pure fn all(self, pred fn(T) Bool) Bool {
+        for x in self {
+            if !pred(x) {
+                return false
+            }
+        }
+        true
+    }
+
+    pub pure fn find_by(self, pred fn(T) Bool) Option[T] {
+        for x in self {
+            if pred(x) {
+                return Some(x)
+            }
+        }
+        None
+    }
+
+    pub fn each(self, f fn(T)) {
+        for x in self {
+            f(x)
+        }
+    }
 }
 
 impl[T] Option[T] {
@@ -129,6 +236,20 @@ impl[T] Option[T] {
             None => fallback
         }
     }
+
+    pub pure fn map[U](self, f fn(T) U) Option[U] {
+        match self {
+            Some(v) => Some(f(v))
+            None => None
+        }
+    }
+
+    pub pure fn and_then[U](self, f fn(T) Option[U]) Option[U] {
+        match self {
+            Some(v) => f(v)
+            None => None
+        }
+    }
 }
 
 impl[T, E] Result[T, E] {
@@ -150,6 +271,27 @@ impl[T, E] Result[T, E] {
         match self {
             Ok(v) => v
             Err(_) => fallback
+        }
+    }
+
+    pub pure fn map[U](self, f fn(T) U) Result[U, E] {
+        match self {
+            Ok(v) => Ok(f(v))
+            Err(e) => Err(e)
+        }
+    }
+
+    pub pure fn map_err[E2](self, f fn(E) E2) Result[T, E2] {
+        match self {
+            Ok(v) => Ok(v)
+            Err(e) => Err(f(e))
+        }
+    }
+
+    pub pure fn and_then[U](self, f fn(T) Result[U, E]) Result[U, E] {
+        match self {
+            Ok(v) => f(v)
+            Err(e) => Err(e)
         }
     }
 }

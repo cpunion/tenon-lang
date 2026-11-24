@@ -124,6 +124,51 @@ pub extern "C" fn tenon_str_concat(a: i64, b: i64) -> i64 {
 }
 
 // =========================================================================
+// 1c. Minimal IEEE-754 Float64 Primitives (6)
+// =========================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_int_to_float(v: i64) -> i64 {
+    (v as f64).to_bits() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_float_to_int(bits: i64) -> i64 {
+    f64::from_bits(bits as u64) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_float_to_text(bits: i64) -> i64 {
+    let v = f64::from_bits(bits as u64);
+    let clean = if v == 0.0 { 0.0 } else { v };
+    make_text(&format!("{}", clean))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_parse_float(s: i64) -> i64 {
+    let txt = read_text(s);
+    match txt.trim().parse::<f64>() {
+        Ok(v) => v.to_bits() as i64,
+        Err(_) => f64::NAN.to_bits() as i64,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_float_is_nan(bits: i64) -> i64 {
+    if f64::from_bits(bits as u64).is_nan() { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_float_bits(bits: i64) -> i64 {
+    let v = f64::from_bits(bits as u64);
+    if v == 0.0 {
+        0.0f64.to_bits() as i64
+    } else {
+        bits
+    }
+}
+
+// =========================================================================
 // 2. Minimal OS / I/O / Filesystem / Process Syscalls (10)
 // =========================================================================
 

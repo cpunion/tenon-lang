@@ -1,0 +1,54 @@
+// Tenon Standard Library — Layer 1: std/collections/set.tn
+// High-performance generic O(1) Hash Set `Set[T Hash + Eq]` backed by monomorphized `Map[T, Bool]`.
+
+import "std/core/types.tn"
+import "std/core/ops.tn"
+import "std/collections/map.tn"
+
+pub record Set[T Hash + Eq] {
+    inner Map[T, Bool]
+}
+
+impl[T Hash + Eq] Set[T] {
+    pub pure fn new() Set[T] {
+        Set { inner = Map[T, Bool].new() }
+    }
+
+    pub pure fn with_capacity(expected_items NonNegative) Set[T] {
+        Set { inner = Map[T, Bool].with_capacity(expected_items) }
+    }
+
+    pub pure fn len(self) NonNegative {
+        self.inner.len()
+    }
+
+    pub pure fn is_empty(self) Bool {
+        self.inner.is_empty()
+    }
+
+    pub pure fn contains(self, item T) Bool {
+        self.inner.has(item)
+    }
+
+    /// Inserts `item` into the set. Returns `true` if the item was newly added.
+    pub pure fn insert(inout self, item T) Bool {
+        if self.inner.has(item) {
+            return false
+        }
+        self.inner.set(item, true)
+        true
+    }
+
+    /// Removes `item` from the set. Returns `true` if the item was present.
+    pub pure fn remove(inout self, item T) Bool {
+        self.inner.remove(item).is_some()
+    }
+
+    pub pure fn items(self) List[T] {
+        self.inner.keys()
+    }
+
+    pub pure fn clear(inout self) {
+        self.inner.clear()
+    }
+}

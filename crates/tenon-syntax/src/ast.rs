@@ -130,6 +130,8 @@ pub struct EnumDecl {
     pub is_pub: bool,
     pub name: String,
     pub type_params: Vec<String>,
+    #[serde(default)]
+    pub type_param_bounds: BTreeMap<String, Vec<String>>,
     pub variants: Vec<VariantDecl>,
     pub span: Span,
 }
@@ -287,6 +289,11 @@ pub enum TypeExpr {
         span: Span,
     },
     Tuple(Vec<TypeExpr>, Span),
+    Fn {
+        params: Vec<TypeExpr>,
+        ret: Option<Box<TypeExpr>>,
+        span: Span,
+    },
 }
 
 impl TypeExpr {
@@ -335,6 +342,13 @@ impl TypeExpr {
                 let parts: Vec<_> = elems.iter().map(|e| e.display_name()).collect();
                 format!("({})", parts.join(", "))
             }
+            TypeExpr::Fn { params, ret, .. } => {
+                let parts: Vec<_> = params.iter().map(|e| e.display_name()).collect();
+                match ret {
+                    Some(r) => format!("fn({}) {}", parts.join(", "), r.display_name()),
+                    None => format!("fn({})", parts.join(", ")),
+                }
+            }
         }
     }
 }
@@ -347,9 +361,29 @@ pub struct Block {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ForBinding {
+    Ident(String),
+    Tuple(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LambdaParam {
+    pub name: String,
+    pub ty: Option<TypeExpr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Stmt {
     Let {
         name: String,
+        ty: Option<TypeExpr>,
+        value: Expr,
+        is_mut: bool,
+        span: Span,
+    },
+    LetTuple {
+        names: Vec<String>,
         ty: Option<TypeExpr>,
         value: Expr,
         is_mut: bool,
@@ -381,6 +415,12 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    For {
+        binding: ForBinding,
+        iter: Expr,
+        body: Block,
+        span: Span,
+    },
     Break {
         span: Span,
     },
@@ -398,6 +438,13 @@ pub enum AssignOp {
     Set,
     AddSet,
     SubSet,
+    MulSet,
+    DivSet,
+    BitAndSet,
+    BitOrSet,
+    BitXorSet,
+    ShlSet,
+    ShrSet,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -409,6 +456,7 @@ pub struct Expr {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExprKind {
     Int(i64),
+    Float(f64),
     Bool(bool),
     Str(String),
     Ident(String),
@@ -433,9 +481,23 @@ pub enum ExprKind {
         target: Box<Expr>,
         field: String,
     },
+    TupleIndex {
+        target: Box<Expr>,
+        index: usize,
+    },
     Index {
         target: Box<Expr>,
         index: Box<Expr>,
+    },
+    Try(Box<Expr>),
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+    },
+    Lambda {
+        params: Vec<LambdaParam>,
+        ret_ty: Option<TypeExpr>,
+        body: Box<Expr>,
     },
     RecordLit {
         name: String,
@@ -493,6 +555,12 @@ pub enum Pattern {
         binding: Option<String>,
         span: Span,
     },
+    VariantMulti {
+        name: String,
+        patterns: Vec<Pattern>,
+        span: Span,
+    },
+    Tuple(Vec<Pattern>, Span),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

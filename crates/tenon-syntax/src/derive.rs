@@ -189,7 +189,11 @@ fn is_int_name(name: &str) -> bool {
     matches!(name, "Int" | "Int64" | "Int32" | "UInt16" | "USize")
 }
 
-/// Expand `@derive(ToJson, FromJson, JsonSchema)` on records and enums into standard `impl` items.
+fn is_float_name(name: &str) -> bool {
+    matches!(name, "Float" | "Float64" | "Float32")
+}
+
+/// Expand `@derive(ToJson, FromJson, JsonSchema, Eq, Hash)` on records and enums into standard `impl` items.
 pub fn expand_derives(program: &mut Program) {
     let mut aliases: BTreeMap<String, TypeAliasDecl> = BTreeMap::new();
     for item in &program.items {
@@ -205,6 +209,12 @@ pub fn expand_derives(program: &mut Program) {
                 let derives = extract_derives(&rec.attrs);
                 if derives.is_empty() {
                     continue;
+                }
+                if derives.iter().any(|d| d == "Eq") {
+                    generated.push(Item::Impl(derive_record_eq(rec)));
+                }
+                if derives.iter().any(|d| d == "Hash") {
+                    generated.push(Item::Impl(derive_record_hash(rec)));
                 }
                 if derives.iter().any(|d| d == "ToJson" || d == "Serialize") {
                     generated.push(Item::Impl(derive_record_to_json(rec, &aliases)));
@@ -243,8 +253,11 @@ fn encode_value_expr(
     let base = resolve_base(ty, aliases);
     match base {
         TypeExpr::Named { name, args, .. } => {
-            if is_int_name(name) {
+            if is_int_name(&name) {
                 return call("JInt", vec![val]);
+            }
+            if is_float_name(&name) {
+                return call("JFloat", vec![val]);
             }
             if name == "Bool" {
                 return call("JBool", vec![val]);
@@ -509,6 +522,46 @@ fn decode_value_expr(
                                     kind: ExprKind::Block(Block {
                                         stmts: vec![return_expr(json_err(&format!(
                                             "expected integer for `{}`",
+                                            field_label
+                                        )))],
+                                        tail: None,
+                                        span: sp(),
+                                    }),
+                                    span: sp(),
+                                },
+                                span: sp(),
+                            },
+                        ],
+                    },
+                    span: sp(),
+                };
+            }
+            if is_float_name(&name) {
+                return Expr {
+                    kind: ExprKind::Match {
+                        scrutinee: Box::new(call("json_as_float", vec![jval])),
+                        arms: vec![
+                            MatchArm {
+                                patterns: vec![Pattern::Variant {
+                                    name: "Some".into(),
+                                    binding: Some(format!("__f_{}", depth)),
+                                    span: sp(),
+                                }],
+                                guard: None,
+                                body: ident(&format!("__f_{}", depth)),
+                                span: sp(),
+                            },
+                            MatchArm {
+                                patterns: vec![Pattern::Variant {
+                                    name: "None".into(),
+                                    binding: None,
+                                    span: sp(),
+                                }],
+                                guard: None,
+                                body: Expr {
+                                    kind: ExprKind::Block(Block {
+                                        stmts: vec![return_expr(json_err(&format!(
+                                            "expected number for `{}`",
                                             field_label
                                         )))],
                                         tail: None,
@@ -1211,6 +1264,15 @@ fn schema_for_type(
                         ),
                     ));
                 }
+            } else if is_float_name(&name) {
+                stmts.push(let_stmt(&var_name, None, call("json_obj_new", vec![]), true));
+                stmts.push(assign_ident(
+                    &var_name,
+                    call(
+                        "json_obj_set",
+                        vec![ident(&var_name), str_lit("type"), call("JStr", vec![str_lit("number")])],
+                    ),
+                ));
             } else if name == "Bool" {
                 stmts.push(let_stmt(&var_name, None, call("json_obj_new", vec![]), true));
                 stmts.push(assign_ident(
@@ -1661,5 +1723,153 @@ fn derive_enum_from_json(en: &EnumDecl, aliases: &BTreeMap<String, TypeAliasDecl
         assoc_bindings: vec![],
         methods: vec![method],
         span: en.span,
+    }
+}
+
+fn derive_record_eq(rec: &RecordDecl) -> ImplDecl {
+    let body_expr = if rec.fields.is_empty() {
+        Expr {
+            kind: ExprKind::Bool(true),
+            span: sp(),
+        }
+    } else {
+        let mut iter = rec.fields.iter().map(|f| {
+            method_call(
+                field_access(ident("self"), &f.name),
+                "eq",
+                vec![field_access(ident("other"), &f.name)],
+            )
+        });
+        let mut acc = iter.next().unwrap();
+        for cmp in iter {
+            acc = Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::And,
+                    left: Box::new(acc),
+                    right: Box::new(cmp),
+                },
+                span: sp(),
+            };
+        }
+        acc
+    };
+
+    let method = FnDecl {
+        attrs: vec![],
+        is_pub: true,
+        is_pure: true,
+        is_async: false,
+        is_test: false,
+        name: "eq".into(),
+        type_params: vec![],
+        type_param_bounds: BTreeMap::new(),
+        params: vec![
+            ParamDecl {
+                is_inout: false,
+                is_comptime: false,
+                name: "self".into(),
+                ty: named(&rec.name),
+                predicate: None,
+                span: sp(),
+            },
+            ParamDecl {
+                is_inout: false,
+                is_comptime: false,
+                name: "other".into(),
+                ty: named(&rec.name),
+                predicate: None,
+                span: sp(),
+            },
+        ],
+        ret_ty: Some(named("Bool")),
+        requires: vec![],
+        ensures: vec![],
+        body: Block {
+            stmts: vec![],
+            tail: Some(Box::new(body_expr)),
+            span: sp(),
+        },
+        span: rec.span,
+    };
+
+    ImplDecl {
+        attrs: vec![],
+        type_params: vec![],
+        type_param_bounds: BTreeMap::new(),
+        interface: Some(named("Eq")),
+        target_ty: named(&rec.name),
+        assoc_bindings: vec![],
+        methods: vec![method],
+        span: rec.span,
+    }
+}
+
+fn derive_record_hash(rec: &RecordDecl) -> ImplDecl {
+    let mut stmts = vec![let_stmt("__h", None, int_lit(2166136261), true)];
+    for f in &rec.fields {
+        let fh = method_call(field_access(ident("self"), &f.name), "hash", vec![]);
+        let mixed = Expr {
+            kind: ExprKind::Binary {
+                op: BinOp::Mul,
+                left: Box::new(Expr {
+                    kind: ExprKind::Binary {
+                        op: BinOp::BitXor,
+                        left: Box::new(ident("__h")),
+                        right: Box::new(fh),
+                    },
+                    span: sp(),
+                }),
+                right: Box::new(int_lit(16777619)),
+            },
+            span: sp(),
+        };
+        stmts.push(assign_ident("__h", mixed));
+    }
+    let final_expr = Expr {
+        kind: ExprKind::Binary {
+            op: BinOp::BitAnd,
+            left: Box::new(ident("__h")),
+            right: Box::new(int_lit(9223372036854775807)),
+        },
+        span: sp(),
+    };
+
+    let method = FnDecl {
+        attrs: vec![],
+        is_pub: true,
+        is_pure: true,
+        is_async: false,
+        is_test: false,
+        name: "hash".into(),
+        type_params: vec![],
+        type_param_bounds: BTreeMap::new(),
+        params: vec![ParamDecl {
+            is_inout: false,
+            is_comptime: false,
+            name: "self".into(),
+            ty: named(&rec.name),
+            predicate: None,
+            span: sp(),
+        }],
+        ret_ty: Some(named("NonNegative")),
+        requires: vec![],
+        ensures: vec![],
+        body: Block {
+            stmts,
+            tail: Some(Box::new(final_expr)),
+            span: sp(),
+        },
+        span: rec.span,
+    };
+
+    ImplDecl {
+        attrs: vec![],
+        type_params: vec![],
+        type_param_bounds: BTreeMap::new(),
+        interface: Some(named("Hash")),
+        target_ty: named(&rec.name),
+        assoc_bindings: vec![],
+        methods: vec![method],
+        span: rec.span,
     }
 }

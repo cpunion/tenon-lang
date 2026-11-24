@@ -63,6 +63,13 @@ const BUILTIN_SIGS: &[BuiltinSig] = &[
     BuiltinSig { name: "str_slice", arity: 3, is_pure: true, allocates: true, param_types: &["Text", "Int", "Int"], ret_type: "Text" },
     BuiltinSig { name: "byte_to_text", arity: 1, is_pure: true, allocates: true, param_types: &["Int"], ret_type: "Text" },
     BuiltinSig { name: "str_concat", arity: 2, is_pure: true, allocates: true, param_types: &["Text", "Text"], ret_type: "Text" },
+    // 6 Minimal IEEE-754 Float64 primitives (pure)
+    BuiltinSig { name: "int_to_float", arity: 1, is_pure: true, allocates: false, param_types: &["Int"], ret_type: "Float" },
+    BuiltinSig { name: "float_to_int", arity: 1, is_pure: true, allocates: false, param_types: &["Float"], ret_type: "Int" },
+    BuiltinSig { name: "float_to_text", arity: 1, is_pure: true, allocates: true, param_types: &["Float"], ret_type: "Text" },
+    BuiltinSig { name: "parse_float", arity: 1, is_pure: true, allocates: false, param_types: &["Text"], ret_type: "Float" },
+    BuiltinSig { name: "float_is_nan", arity: 1, is_pure: true, allocates: false, param_types: &["Float"], ret_type: "Bool" },
+    BuiltinSig { name: "float_bits", arity: 1, is_pure: true, allocates: false, param_types: &["Float"], ret_type: "Int" },
     // 4 O(n) Byte buffer primitives (pure)
     BuiltinSig { name: "buf_new", arity: 0, is_pure: true, allocates: true, param_types: &[], ret_type: "Int" },
     BuiltinSig { name: "buf_push_str", arity: 2, is_pure: true, allocates: true, param_types: &["Int", "Text"], ret_type: "Int" },
@@ -168,6 +175,7 @@ fn type_head_name(ty: &TypeExpr) -> String {
         TypeExpr::Named { name, .. } => name.clone(),
         TypeExpr::Dyn { interface, .. } => format!("dyn {}", interface),
         TypeExpr::Tuple(_, _) => "Tuple".into(),
+        TypeExpr::Fn { .. } => "Fn".into(),
     }
 }
 
@@ -204,6 +212,11 @@ fn subst_type_expr(ty: &TypeExpr, subst: &BTreeMap<String, TypeExpr>) -> TypeExp
             es.iter().map(|e| subst_type_expr(e, subst)).collect(),
             *span,
         ),
+        TypeExpr::Fn { params, ret, span } => TypeExpr::Fn {
+            params: params.iter().map(|p| subst_type_expr(p, subst)).collect(),
+            ret: ret.as_ref().map(|r| Box::new(subst_type_expr(r, subst))),
+            span: *span,
+        },
     }
 }
 
@@ -337,11 +350,19 @@ impl CheckerCtx {
                 } else {
                     for m in &imp.methods {
                         let mut sub = subst_fn_self(m, &imp.target_ty);
+                        // Prepend impl-level type params (e.g. `T` on `impl[T] List[T]`) before method-level type params (e.g. `U` on `fn map[U]`)
+                        let mut combined_tps = Vec::new();
                         for tp in &imp.type_params {
-                            if !sub.type_params.contains(tp) {
-                                sub.type_params.push(tp.clone());
+                            if !combined_tps.contains(tp) {
+                                combined_tps.push(tp.clone());
                             }
                         }
+                        for tp in &sub.type_params {
+                            if !combined_tps.contains(tp) {
+                                combined_tps.push(tp.clone());
+                            }
+                        }
+                        sub.type_params = combined_tps;
                         for (tp, bs) in &imp.type_param_bounds {
                             sub.type_param_bounds
                                 .entry(tp.clone())
@@ -530,6 +551,14 @@ impl CheckerCtx {
                     self.check_dyn_type_valid(e, span);
                 }
             }
+            TypeExpr::Fn { params, ret, .. } => {
+                for p in params {
+                    self.check_dyn_type_valid(p, span);
+                }
+                if let Some(r) = ret {
+                    self.check_dyn_type_valid(r, span);
+                }
+            }
         }
     }
 
@@ -593,6 +622,8 @@ impl CheckerCtx {
         if let Some(rt) = &out.ret_ty {
             out.ret_ty = Some(subst_type_expr(rt, &subst));
         }
+        // Keep only remaining unbound method-level type parameters (e.g. `U` in `List[T].map[U]`)
+        out.type_params = m.type_params.iter().skip(type_args.len()).cloned().collect();
         out
     }
 
@@ -618,44 +649,78 @@ impl CheckerCtx {
         None
     }
 
-    fn instantiate_assoc_method_from_args(
+    fn unify_type_pattern(
+        pat: &TypeExpr,
+        actual: &TypeExpr,
+        tps: &[String],
+        subst: &mut BTreeMap<String, TypeExpr>,
+    ) {
+        match (pat, actual) {
+            (TypeExpr::Named { name, args, .. }, _)
+                if args.is_empty() && tps.contains(name) =>
+            {
+                if actual.display_name() != "Any" {
+                    subst.entry(name.clone()).or_insert_with(|| actual.clone());
+                }
+            }
+            (
+                TypeExpr::Named { name: pn, args: pa, .. },
+                TypeExpr::Named { name: an, args: aa, .. },
+            ) if pn == an && pa.len() == aa.len() => {
+                for (x, y) in pa.iter().zip(aa.iter()) {
+                    Self::unify_type_pattern(x, y, tps, subst);
+                }
+            }
+            (TypeExpr::Tuple(pe, _), TypeExpr::Tuple(ae, _)) if pe.len() == ae.len() => {
+                for (x, y) in pe.iter().zip(ae.iter()) {
+                    Self::unify_type_pattern(x, y, tps, subst);
+                }
+            }
+            (
+                TypeExpr::Fn { params: pp, ret: pr, .. },
+                TypeExpr::Fn { params: ap, ret: ar, .. },
+            ) if pp.len() == ap.len() => {
+                for (x, y) in pp.iter().zip(ap.iter()) {
+                    Self::unify_type_pattern(x, y, tps, subst);
+                }
+                if let (Some(pr_ty), Some(ar_ty)) = (pr, ar) {
+                    Self::unify_type_pattern(pr_ty, ar_ty, tps, subst);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn instantiate_method_from_args(
         &self,
         m: &FnDecl,
+        has_self: bool,
         args: &[CallArg],
         var_types: &BTreeMap<String, TypeExpr>,
     ) -> FnDecl {
         if m.type_params.is_empty() {
             return m.clone();
         }
-        fn unify(
-            pat: &TypeExpr,
-            actual: &TypeExpr,
-            tps: &[String],
-            subst: &mut BTreeMap<String, TypeExpr>,
-        ) {
-            match (pat, actual) {
-                (TypeExpr::Named { name, args, .. }, _)
-                    if args.is_empty() && tps.contains(name) =>
-                {
-                    if actual.display_name() != "Any" {
-                        subst.entry(name.clone()).or_insert_with(|| actual.clone());
-                    }
-                }
-                (
-                    TypeExpr::Named { name: pn, args: pa, .. },
-                    TypeExpr::Named { name: an, args: aa, .. },
-                ) if pn == an && pa.len() == aa.len() => {
-                    for (x, y) in pa.iter().zip(aa.iter()) {
-                        unify(x, y, tps, subst);
-                    }
-                }
-                _ => {}
+        let explicit_params = if has_self && m.params.first().is_some_and(|p| p.name == "self") {
+            &m.params[1..]
+        } else {
+            &m.params[..]
+        };
+        let mut subst = BTreeMap::new();
+        // Pass 1: unify non-lambda arguments first (e.g. `init U` in `fold(init, |acc, x| ...)`!)
+        for (p, a) in explicit_params.iter().zip(args.iter()) {
+            if !matches!(a.value.kind, ExprKind::Lambda { .. }) {
+                let aty = self.infer_expr_type(&a.value, var_types);
+                Self::unify_type_pattern(&p.ty, &aty, &m.type_params, &mut subst);
             }
         }
-        let mut subst = BTreeMap::new();
-        for (p, a) in m.params.iter().zip(args.iter()) {
-            let aty = self.infer_expr_type(&a.value, var_types);
-            unify(&p.ty, &aty, &m.type_params, &mut subst);
+        // Pass 2: unify lambda arguments using expected parameter types after substituting Pass 1!
+        for (p, a) in explicit_params.iter().zip(args.iter()) {
+            if matches!(a.value.kind, ExprKind::Lambda { .. }) {
+                let expected_pty = subst_type_expr(&p.ty, &subst);
+                let aty = self.infer_expr_type_expected(&a.value, Some(&expected_pty), var_types);
+                Self::unify_type_pattern(&p.ty, &aty, &m.type_params, &mut subst);
+            }
         }
         for tp in &m.type_params {
             subst.entry(tp.clone()).or_insert_with(|| named_ty("Any"));
@@ -667,38 +732,93 @@ impl CheckerCtx {
         if let Some(rt) = &out.ret_ty {
             out.ret_ty = Some(subst_type_expr(rt, &subst));
         }
+        out.type_params.clear();
         out
     }
 
+    fn instantiate_assoc_method_from_args(
+        &self,
+        m: &FnDecl,
+        args: &[CallArg],
+        var_types: &BTreeMap<String, TypeExpr>,
+    ) -> FnDecl {
+        self.instantiate_method_from_args(m, false, args, var_types)
+    }
+
     fn check_type_bounds(&mut self, ty: &TypeExpr, span: Span) {
-        if let TypeExpr::Named { name, args, .. } = ty {
-            if let Some(rec) = self.records.get(name).cloned() {
-                for (tp, ta) in rec.type_params.iter().zip(args.iter()) {
-                    if ta.display_name() != "Any" && !self.cur_type_params.contains(&ta.display_name()) {
-                        if let Some(bounds) = rec.type_param_bounds.get(tp) {
-                            for b in bounds {
-                                if !self.type_implements(ta, b) {
-                                    self.diagnostics.push(Diagnostic {
-                                        code: "E0505".into(),
-                                        message: format!(
-                                            "type `{}` does not satisfy interface bound `{}` for type parameter `{}` of `{}`",
-                                            ta.display_name(),
-                                            b,
-                                            tp,
-                                            name
-                                        ),
-                                        span,
-                                        notes: vec![format!("add `impl {} for {} {{ ... }}`", b, ta.display_name())],
-                                        counterexample: BTreeMap::new(),
-                                    });
+        match ty {
+            TypeExpr::Named { name, args, .. } => {
+                if let Some(rec) = self.records.get(name).cloned() {
+                    for (tp, ta) in rec.type_params.iter().zip(args.iter()) {
+                        if ta.display_name() != "Any" && !self.cur_type_params.contains(&ta.display_name()) {
+                            if let Some(bounds) = rec.type_param_bounds.get(tp) {
+                                for b in bounds {
+                                    if !self.type_implements(ta, b) {
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0505".into(),
+                                            message: format!(
+                                                "type `{}` does not satisfy interface bound `{}` for type parameter `{}` of `{}`",
+                                                ta.display_name(),
+                                                b,
+                                                tp,
+                                                name
+                                            ),
+                                            span,
+                                            notes: vec![format!("add `impl {} for {} {{ ... }}`", b, ta.display_name())],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                if let Some(en) = self.enums.get(name).cloned() {
+                    for (tp, ta) in en.type_params.iter().zip(args.iter()) {
+                        if ta.display_name() != "Any" && !self.cur_type_params.contains(&ta.display_name()) {
+                            if let Some(bounds) = en.type_param_bounds.get(tp) {
+                                for b in bounds {
+                                    if !self.type_implements(ta, b) {
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0505".into(),
+                                            message: format!(
+                                                "type `{}` does not satisfy interface bound `{}` for type parameter `{}` of `{}`",
+                                                ta.display_name(),
+                                                b,
+                                                tp,
+                                                name
+                                            ),
+                                            span,
+                                            notes: vec![format!("add `impl {} for {} {{ ... }}`", b, ta.display_name())],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for a in args {
+                    self.check_type_bounds(a, span);
+                }
             }
-            for a in args {
-                self.check_type_bounds(a, span);
+            TypeExpr::Tuple(es, _) => {
+                for e in es {
+                    self.check_type_bounds(e, span);
+                }
+            }
+            TypeExpr::Fn { params, ret, .. } => {
+                for p in params {
+                    self.check_type_bounds(p, span);
+                }
+                if let Some(r) = ret {
+                    self.check_type_bounds(r, span);
+                }
+            }
+            TypeExpr::Dyn { args, .. } => {
+                for a in args {
+                    self.check_type_bounds(a, span);
+                }
             }
         }
     }
@@ -710,7 +830,20 @@ impl CheckerCtx {
             || self.cur_type_params.contains(name)
             || matches!(
                 name,
-                "Int" | "Int64" | "Int32" | "UInt16" | "USize" | "Bool" | "Text" | "Option" | "Result" | "List"
+                "Int"
+                    | "Int64"
+                    | "Int32"
+                    | "UInt16"
+                    | "USize"
+                    | "Float"
+                    | "Float64"
+                    | "Float32"
+                    | "Bool"
+                    | "Text"
+                    | "Option"
+                    | "Result"
+                    | "List"
+                    | "Range"
             )
     }
 
@@ -943,6 +1076,32 @@ impl CheckerCtx {
         false
     }
 
+    fn is_float_type_name(&self, name: &str) -> bool {
+        if matches!(name, "Float" | "Float64" | "Float32") {
+            return true;
+        }
+        if let Some(alias) = self.type_aliases.get(name) {
+            if let TypeExpr::Named { name: base, .. } = self.resolve_base_type(&alias.base) {
+                return matches!(base.as_str(), "Float" | "Float64" | "Float32");
+            }
+        }
+        false
+    }
+
+    fn is_float_ty(&self, ty: &TypeExpr) -> bool {
+        matches!(
+            self.resolve_base_type(ty),
+            TypeExpr::Named { ref name, .. } if self.is_float_type_name(name)
+        )
+    }
+
+    fn is_int_ty(&self, ty: &TypeExpr) -> bool {
+        matches!(
+            self.resolve_base_type(ty),
+            TypeExpr::Named { ref name, .. } if self.is_int_type_name(name)
+        )
+    }
+
     fn expr_smt_encodable(&self, expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => true,
@@ -984,6 +1143,9 @@ impl CheckerCtx {
                 if self.is_int_type_name(en) && self.is_int_type_name(an) {
                     return true;
                 }
+                if self.is_float_type_name(en) && self.is_float_type_name(an) {
+                    return true;
+                }
                 if en != an {
                     return false;
                 }
@@ -1004,6 +1166,21 @@ impl CheckerCtx {
                         .zip(as_.iter())
                         .all(|(x, y)| self.types_compatible(x, y))
             }
+            (
+                TypeExpr::Fn { params: ep, ret: er, .. },
+                TypeExpr::Fn { params: ap, ret: ar, .. },
+            ) => {
+                ep.len() == ap.len()
+                    && ep
+                        .iter()
+                        .zip(ap.iter())
+                        .all(|(x, y)| self.types_compatible(x, y))
+                    && match (er, ar) {
+                        (None, _) => true,
+                        (Some(e), Some(a)) => self.types_compatible(e, a),
+                        (Some(e), None) => e.display_name() == "Any",
+                    }
+            }
             _ => false,
         }
     }
@@ -1013,8 +1190,18 @@ impl CheckerCtx {
         expr: &Expr,
         var_types: &BTreeMap<String, TypeExpr>,
     ) -> TypeExpr {
+        self.infer_expr_type_expected(expr, None, var_types)
+    }
+
+    fn infer_expr_type_expected(
+        &self,
+        expr: &Expr,
+        expected: Option<&TypeExpr>,
+        var_types: &BTreeMap<String, TypeExpr>,
+    ) -> TypeExpr {
         match &expr.kind {
             ExprKind::Int(_) => named_ty("Int"),
+            ExprKind::Float(_) => named_ty("Float"),
             ExprKind::Bool(_) => named_ty("Bool"),
             ExprKind::Str(_) => named_ty("Text"),
             ExprKind::Ident(s) => {
@@ -1025,6 +1212,14 @@ impl CheckerCtx {
                     return ty.clone();
                 }
                 if let Some(vi) = self.enum_variants.get(s) {
+                    if let Some(ed) = self.enums.get(&vi.enum_name) {
+                        if !ed.type_params.is_empty() {
+                            return generic_ty(
+                                &vi.enum_name,
+                                vec![named_ty("Any"); ed.type_params.len()],
+                            );
+                        }
+                    }
                     return named_ty(&vi.enum_name);
                 }
                 named_ty("Any")
@@ -1033,35 +1228,10 @@ impl CheckerCtx {
                 if let Some(rec) = self.records.get(name) {
                     if !rec.type_params.is_empty() {
                         let mut subst = BTreeMap::new();
-                        fn unify_rec(
-                            pat: &TypeExpr,
-                            actual: &TypeExpr,
-                            tps: &[String],
-                            subst: &mut BTreeMap<String, TypeExpr>,
-                        ) {
-                            match (pat, actual) {
-                                (TypeExpr::Named { name, args, .. }, _)
-                                    if args.is_empty() && tps.contains(name) =>
-                                {
-                                    if actual.display_name() != "Any" {
-                                        subst.entry(name.clone()).or_insert_with(|| actual.clone());
-                                    }
-                                }
-                                (
-                                    TypeExpr::Named { name: pn, args: pa, .. },
-                                    TypeExpr::Named { name: an, args: aa, .. },
-                                ) if pn == an && pa.len() == aa.len() => {
-                                    for (x, y) in pa.iter().zip(aa.iter()) {
-                                        unify_rec(x, y, tps, subst);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
                         for (fname, fval) in fields {
                             if let Some(fd) = rec.fields.iter().find(|f| f.name == *fname) {
                                 let aty = self.infer_expr_type(fval, var_types);
-                                unify_rec(&fd.ty, &aty, &rec.type_params, &mut subst);
+                                Self::unify_type_pattern(&fd.ty, &aty, &rec.type_params, &mut subst);
                             }
                         }
                         let targs: Vec<TypeExpr> = rec
@@ -1085,18 +1255,86 @@ impl CheckerCtx {
                 elems.iter().map(|e| self.infer_expr_type(e, var_types)).collect(),
                 expr.span,
             ),
-            ExprKind::Unary { op, .. } => match op {
-                UnOp::Neg => named_ty("Int"),
+            ExprKind::TupleIndex { target, index } => {
+                let t = self.resolve_base_type(&self.infer_expr_type(target, var_types));
+                if let TypeExpr::Tuple(elems, _) = t {
+                    if let Some(et) = elems.get(*index) {
+                        return et.clone();
+                    }
+                }
+                named_ty("Any")
+            }
+            ExprKind::Range { .. } => generic_ty("Range", vec![named_ty("Int")]),
+            ExprKind::Try(inner) => {
+                let inner_ty = self.resolve_base_type(&self.infer_expr_type(inner, var_types));
+                if let TypeExpr::Named { name, args, .. } = inner_ty {
+                    if (name == "Result" || name == "Option") && !args.is_empty() {
+                        return args[0].clone();
+                    }
+                }
+                named_ty("Any")
+            }
+            ExprKind::Lambda { params, ret_ty, body } => {
+                let (exp_params, exp_ret): (Vec<TypeExpr>, Option<TypeExpr>) = match expected
+                    .map(|t| self.resolve_base_type(t))
+                {
+                    Some(TypeExpr::Fn { params: ep, ret: er, .. }) => {
+                        (ep, er.map(|r| *r))
+                    }
+                    _ => (Vec::new(), None),
+                };
+                let mut lam_vars = var_types.clone();
+                let mut resolved_params = Vec::with_capacity(params.len());
+                for (i, p) in params.iter().enumerate() {
+                    let pty = p
+                        .ty
+                        .clone()
+                        .or_else(|| exp_params.get(i).cloned())
+                        .unwrap_or_else(|| named_ty("Any"));
+                    if p.name != "_" {
+                        lam_vars.insert(p.name.clone(), pty.clone());
+                    }
+                    resolved_params.push(pty);
+                }
+                let inferred_ret = if let Some(rt) = ret_ty {
+                    Some(Box::new(rt.clone()))
+                } else if matches!(&body.kind, ExprKind::Block(b) if b.tail.is_none()) {
+                    None
+                } else {
+                    Some(Box::new(self.infer_expr_type_expected(
+                        body,
+                        exp_ret.as_ref(),
+                        &lam_vars,
+                    )))
+                };
+                TypeExpr::Fn {
+                    params: resolved_params,
+                    ret: inferred_ret,
+                    span: expr.span,
+                }
+            }
+            ExprKind::Unary { op, expr: inner } => match op {
+                UnOp::Neg => {
+                    if self.is_float_ty(&self.infer_expr_type(inner, var_types)) {
+                        named_ty("Float")
+                    } else {
+                        named_ty("Int")
+                    }
+                }
                 UnOp::Not => named_ty("Bool"),
             },
-            ExprKind::Binary { op, .. } => match op {
+            ExprKind::Binary { op, left, right } => match op {
                 BinOp::Concat => named_ty("Text"),
-                BinOp::Add
-                | BinOp::Sub
-                | BinOp::Mul
-                | BinOp::Div
-                | BinOp::Mod
-                | BinOp::BitAnd
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                    if self.is_float_ty(&self.infer_expr_type(left, var_types))
+                        || self.is_float_ty(&self.infer_expr_type(right, var_types))
+                    {
+                        named_ty("Float")
+                    } else {
+                        named_ty("Int")
+                    }
+                }
+                BinOp::BitAnd
                 | BinOp::BitOr
                 | BinOp::BitXor
                 | BinOp::Shl
@@ -1106,6 +1344,14 @@ impl CheckerCtx {
             ExprKind::Field { target, field } => {
                 if let ExprKind::Ident(ename) = &target.kind {
                     if let Some(vi) = self.enum_variants.get(&format!("{}.{}", ename, field)) {
+                        if let Some(ed) = self.enums.get(&vi.enum_name) {
+                            if !ed.type_params.is_empty() {
+                                return generic_ty(
+                                    &vi.enum_name,
+                                    vec![named_ty("Any"); ed.type_params.len()],
+                                );
+                            }
+                        }
                         return named_ty(&vi.enum_name);
                     }
                 }
@@ -1159,7 +1405,7 @@ impl CheckerCtx {
                     }
                     if let ExprKind::Ident(ename) = &target.kind {
                         if let Some(vi) = self.enum_variants.get(&format!("{}.{}", ename, field)) {
-                            return named_ty(&vi.enum_name);
+                            return self.infer_variant_ctor_type(vi, args, var_types);
                         }
                         if !var_types.contains_key(ename) && self.is_known_type_name(ename) {
                             if let Some(m) = self.resolve_assoc_method_sig(ename, field) {
@@ -1170,7 +1416,13 @@ impl CheckerCtx {
                     }
                     let recv_ty = self.infer_expr_type(target, var_types);
                     if let Some(m) = self.resolve_method_sig(&recv_ty, field) {
-                        return m.ret_ty.unwrap_or_else(|| named_ty("Any"));
+                        let inst = self.instantiate_method_from_args(&m, true, args, var_types);
+                        return inst.ret_ty.unwrap_or_else(|| named_ty("Any"));
+                    }
+                    // Callable field on a record (e.g. `obj.callback(x)`)
+                    let fty = self.resolve_base_type(&self.infer_expr_type(callee, var_types));
+                    if let TypeExpr::Fn { ret, .. } = fty {
+                        return ret.map(|r| *r).unwrap_or_else(|| named_ty("Any"));
                     }
                     named_ty("Any")
                 }
@@ -1189,6 +1441,11 @@ impl CheckerCtx {
                     named_ty("Any")
                 }
                 ExprKind::Ident(fname) => {
+                    if let Some(vty) = var_types.get(fname) {
+                        if let TypeExpr::Fn { ret, .. } = self.resolve_base_type(vty) {
+                            return ret.map(|r| *r).unwrap_or_else(|| named_ty("Any"));
+                        }
+                    }
                     if fname == "Ok" && args.len() == 1 {
                         return generic_ty(
                             "Result",
@@ -1224,10 +1481,11 @@ impl CheckerCtx {
                         return self.infer_expr_type(&args[0].value, var_types);
                     }
                     if let Some(fdecl) = self.all_fns.get(fname) {
-                        return fdecl.ret_ty.clone().unwrap_or_else(|| named_ty("Any"));
+                        let inst = self.instantiate_method_from_args(fdecl, false, args, var_types);
+                        return inst.ret_ty.unwrap_or_else(|| named_ty("Any"));
                     }
                     if let Some(vi) = self.enum_variants.get(fname) {
-                        return named_ty(&vi.enum_name);
+                        return self.infer_variant_ctor_type(vi, args, var_types);
                     }
                     if let Some(b) = lookup_builtin(fname) {
                         return if b.ret_type == "List[Any]" {
@@ -1242,17 +1500,24 @@ impl CheckerCtx {
                     }
                     named_ty("Any")
                 }
-                _ => named_ty("Any"),
+                _ => {
+                    let cty = self.resolve_base_type(&self.infer_expr_type(callee, var_types));
+                    if let TypeExpr::Fn { ret, .. } = cty {
+                        ret.map(|r| *r).unwrap_or_else(|| named_ty("Any"))
+                    } else {
+                        named_ty("Any")
+                    }
+                }
             },
             ExprKind::If { then_block, else_branch, .. } => {
                 if let Some(t) = &then_block.tail {
-                    let ty = self.infer_expr_type(t, var_types);
+                    let ty = self.infer_expr_type_expected(t, expected, var_types);
                     if ty.display_name() != "Any" {
                         return ty;
                     }
                 }
                 if let Some(eb) = else_branch {
-                    return self.infer_expr_type(eb, var_types);
+                    return self.infer_expr_type_expected(eb, expected, var_types);
                 }
                 named_ty("Any")
             }
@@ -1261,7 +1526,7 @@ impl CheckerCtx {
                 for arm in arms {
                     let mut arm_vars = var_types.clone();
                     self.bind_match_arm_types(&st, arm, &mut arm_vars);
-                    let aty = self.infer_expr_type(&arm.body, &arm_vars);
+                    let aty = self.infer_expr_type_expected(&arm.body, expected, &arm_vars);
                     if aty.display_name() != "Any" {
                         return aty;
                     }
@@ -1270,7 +1535,7 @@ impl CheckerCtx {
             }
             ExprKind::Block(b) => {
                 if let Some(t) = &b.tail {
-                    self.infer_expr_type(t, var_types)
+                    self.infer_expr_type_expected(t, expected, var_types)
                 } else {
                     named_ty("Any")
                 }
@@ -1280,50 +1545,130 @@ impl CheckerCtx {
         }
     }
 
+    fn infer_variant_ctor_type(
+        &self,
+        vi: &VariantInfo,
+        args: &[CallArg],
+        var_types: &BTreeMap<String, TypeExpr>,
+    ) -> TypeExpr {
+        if let Some(ed) = self.enums.get(&vi.enum_name) {
+            if !ed.type_params.is_empty() {
+                let mut subst = BTreeMap::new();
+                for (pty, a) in vi.payload_tys.iter().zip(args.iter()) {
+                    let aty = self.infer_expr_type(&a.value, var_types);
+                    Self::unify_type_pattern(pty, &aty, &ed.type_params, &mut subst);
+                }
+                let targs: Vec<TypeExpr> = ed
+                    .type_params
+                    .iter()
+                    .map(|tp| subst.get(tp).cloned().unwrap_or_else(|| named_ty("Any")))
+                    .collect();
+                return generic_ty(&vi.enum_name, targs);
+            }
+        }
+        named_ty(&vi.enum_name)
+    }
+
+    fn resolve_variant_payload_tys(&self, scrutinee_base: &TypeExpr, variant_name: &str) -> Vec<TypeExpr> {
+        let short = variant_name.rsplit('.').next().unwrap_or(variant_name);
+        if short == "Some" {
+            if let TypeExpr::Named { name: tn, args, .. } = scrutinee_base {
+                if tn == "Option" && !args.is_empty() {
+                    return vec![args[0].clone()];
+                }
+            }
+            return vec![named_ty("Any")];
+        }
+        if short == "Ok" {
+            if let TypeExpr::Named { name: tn, args, .. } = scrutinee_base {
+                if tn == "Result" && !args.is_empty() {
+                    return vec![args[0].clone()];
+                }
+            }
+            return vec![named_ty("Any")];
+        }
+        if short == "Err" {
+            if let TypeExpr::Named { name: tn, args, .. } = scrutinee_base {
+                if tn == "Result" && args.len() >= 2 {
+                    return vec![args[1].clone()];
+                }
+            }
+            return vec![named_ty("Any")];
+        }
+        if let Some(vi) = self.enum_variants.get(variant_name).or_else(|| self.enum_variants.get(short)) {
+            if let Some(ed) = self.enums.get(&vi.enum_name) {
+                if !ed.type_params.is_empty() {
+                    if let TypeExpr::Named { args, .. } = scrutinee_base {
+                        if !args.is_empty() {
+                            let mut subst = BTreeMap::new();
+                            for (tp, ta) in ed.type_params.iter().zip(args.iter()) {
+                                subst.insert(tp.clone(), ta.clone());
+                            }
+                            return vi
+                                .payload_tys
+                                .iter()
+                                .map(|pty| subst_type_expr(pty, &subst))
+                                .collect();
+                        }
+                    }
+                }
+            }
+            return vi.payload_tys.clone();
+        }
+        Vec::new()
+    }
+
+    fn bind_pattern_types(
+        &self,
+        scrutinee_ty: &TypeExpr,
+        pat: &Pattern,
+        arm_vars: &mut BTreeMap<String, TypeExpr>,
+    ) {
+        let base = self.resolve_base_type(scrutinee_ty);
+        match pat {
+            Pattern::Ident(name, _) => {
+                if name != "_" {
+                    arm_vars.insert(name.clone(), scrutinee_ty.clone());
+                }
+            }
+            Pattern::Tuple(pats, _) => {
+                if let TypeExpr::Tuple(elems, _) = &base {
+                    for (i, sp) in pats.iter().enumerate() {
+                        let ety = elems.get(i).cloned().unwrap_or_else(|| named_ty("Any"));
+                        self.bind_pattern_types(&ety, sp, arm_vars);
+                    }
+                } else {
+                    for sp in pats {
+                        self.bind_pattern_types(&named_ty("Any"), sp, arm_vars);
+                    }
+                }
+            }
+            Pattern::Variant { name, binding: Some(bname), .. } => {
+                if bname != "_" {
+                    let ptys = self.resolve_variant_payload_tys(&base, name);
+                    let ty = ptys.into_iter().next().unwrap_or_else(|| named_ty("Any"));
+                    arm_vars.insert(bname.clone(), ty);
+                }
+            }
+            Pattern::VariantMulti { name, patterns, .. } => {
+                let ptys = self.resolve_variant_payload_tys(&base, name);
+                for (i, sp) in patterns.iter().enumerate() {
+                    let pty = ptys.get(i).cloned().unwrap_or_else(|| named_ty("Any"));
+                    self.bind_pattern_types(&pty, sp, arm_vars);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn bind_match_arm_types(
         &self,
         scrutinee_ty: &TypeExpr,
         arm: &MatchArm,
         arm_vars: &mut BTreeMap<String, TypeExpr>,
     ) {
-        let base = self.resolve_base_type(scrutinee_ty);
         for p in &arm.patterns {
-            if let Pattern::Variant { name, binding: Some(bname), .. } = p {
-                if bname == "_" {
-                    continue;
-                }
-                if name == "Some" {
-                    if let TypeExpr::Named { name: tn, args, .. } = &base {
-                        if tn == "Option" && !args.is_empty() {
-                            arm_vars.insert(bname.clone(), args[0].clone());
-                            continue;
-                        }
-                    }
-                }
-                if name == "Ok" {
-                    if let TypeExpr::Named { name: tn, args, .. } = &base {
-                        if tn == "Result" && !args.is_empty() {
-                            arm_vars.insert(bname.clone(), args[0].clone());
-                            continue;
-                        }
-                    }
-                }
-                if name == "Err" {
-                    if let TypeExpr::Named { name: tn, args, .. } = &base {
-                        if tn == "Result" && args.len() >= 2 {
-                            arm_vars.insert(bname.clone(), args[1].clone());
-                            continue;
-                        }
-                    }
-                }
-                if let Some(vi) = self.enum_variants.get(name) {
-                    if let Some(pty) = vi.payload_tys.first() {
-                        arm_vars.insert(bname.clone(), pty.clone());
-                        continue;
-                    }
-                }
-                arm_vars.insert(bname.clone(), named_ty("Any"));
-            }
+            self.bind_pattern_types(scrutinee_ty, p, arm_vars);
         }
     }
 
@@ -1400,7 +1745,7 @@ impl CheckerCtx {
         // 5. Verify return type & refinement on final tail expression (early `Stmt::Return` paths were already checked!)
         if let Some(ret_expr) = &tail_expr {
             if let Some(ret_ty) = &f.ret_ty {
-                let actual_ty = self.infer_expr_type(ret_expr, &var_types);
+                let actual_ty = self.infer_expr_type_expected(ret_expr, Some(ret_ty), &var_types);
                 if !self.types_compatible(ret_ty, &actual_ty) {
                     self.diagnostics.push(Diagnostic {
                         code: "E0205".into(),
@@ -1448,7 +1793,7 @@ impl CheckerCtx {
     ) {
         for s in &blk.stmts {
             match s {
-                Stmt::Let { value, .. } => {
+                Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => {
                     self.check_expr_effects(value, in_async, in_pure, no_heap, fn_name, inside_block_on);
                 }
                 Stmt::Assign { value, .. } => {
@@ -1465,6 +1810,10 @@ impl CheckerCtx {
                 }
                 Stmt::While { cond, body, .. } => {
                     self.check_expr_effects(cond, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                    self.check_block_effects(body, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+                Stmt::For { iter, body, .. } => {
+                    self.check_expr_effects(iter, in_async, in_pure, no_heap, fn_name, inside_block_on);
                     self.check_block_effects(body, in_async, in_pure, no_heap, fn_name, inside_block_on);
                 }
                 _ => {}
@@ -1707,6 +2056,45 @@ impl CheckerCtx {
             ExprKind::Block(b) => {
                 self.check_block_effects(b, in_async, in_pure, no_heap, fn_name, inside_block_on);
             }
+            ExprKind::Tuple(elems) => {
+                if no_heap {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0701".into(),
+                        message: format!(
+                            "`@no_heap_alloc` contract violated in `{}`: heap tuple allocation",
+                            fn_name
+                        ),
+                        span: expr.span,
+                        notes: vec!["avoid tuple allocations inside `@no_heap_alloc` functions".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+                for e in elems {
+                    self.check_expr_effects(e, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+            }
+            ExprKind::TupleIndex { target, .. } | ExprKind::Try(target) => {
+                self.check_expr_effects(target, in_async, in_pure, no_heap, fn_name, inside_block_on);
+            }
+            ExprKind::Range { start, end } => {
+                self.check_expr_effects(start, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                self.check_expr_effects(end, in_async, in_pure, no_heap, fn_name, inside_block_on);
+            }
+            ExprKind::Lambda { body, .. } => {
+                if no_heap {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0701".into(),
+                        message: format!(
+                            "`@no_heap_alloc` contract violated in `{}`: closure allocation",
+                            fn_name
+                        ),
+                        span: expr.span,
+                        notes: vec!["avoid closures inside `@no_heap_alloc` functions".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+                self.check_expr_effects(body, false, in_pure, no_heap, fn_name, false);
+            }
             _ => {}
         }
     }
@@ -1793,18 +2181,29 @@ impl CheckerCtx {
                     is_mut,
                     span,
                 } => {
-                    self.check_expr(
-                        value,
-                        cur_fn,
-                        env,
-                        smt_int_vars,
-                        smt_premises,
-                        var_types,
-                        mutable_vars,
-                        active_mutate,
-                        saw_return,
-                    );
-                    let inferred = self.infer_expr_type(value, var_types);
+                    if let ExprKind::Lambda { params, ret_ty, body } = &value.kind {
+                        self.check_lambda(
+                            params,
+                            ret_ty.as_ref(),
+                            body,
+                            ty.as_ref(),
+                            var_types,
+                            value.span,
+                        );
+                    } else {
+                        self.check_expr(
+                            value,
+                            cur_fn,
+                            env,
+                            smt_int_vars,
+                            smt_premises,
+                            var_types,
+                            mutable_vars,
+                            active_mutate,
+                            saw_return,
+                        );
+                    }
+                    let inferred = self.infer_expr_type_expected(value, ty.as_ref(), var_types);
                     let effective_ty = if let Some(t) = ty {
                         self.check_dyn_type_valid(t, *span);
                         self.check_type_bounds(t, *span);
@@ -2058,24 +2457,35 @@ impl CheckerCtx {
                                     });
                                 }
                             }
-                            let new_expr = match op {
-                                AssignOp::Set => value.clone(),
-                                AssignOp::AddSet => Expr {
-                                    kind: ExprKind::Binary {
-                                        op: BinOp::Add,
-                                        left: Box::new(target.clone()),
-                                        right: Box::new(value.clone()),
-                                    },
-                                    span: *span,
-                                },
-                                AssignOp::SubSet => Expr {
-                                    kind: ExprKind::Binary {
-                                        op: BinOp::Sub,
-                                        left: Box::new(target.clone()),
-                                        right: Box::new(value.clone()),
-                                    },
-                                    span: *span,
-                                },
+                            let new_expr = match assign_op_to_binop(*op) {
+                                None => value.clone(),
+                                Some(bop) => {
+                                    if matches!(bop, BinOp::Div) {
+                                        let lhs_is_float = var_types
+                                            .get(vname)
+                                            .is_some_and(|t| self.is_float_ty(t));
+                                        if !lhs_is_float {
+                                            let denom = env.eval_abs_int(value, None);
+                                            if !denom.non_zero {
+                                                self.diagnostics.push(Diagnostic {
+                                                    code: "E0430".into(),
+                                                    message: "potential division by zero in `/=`: denominator is not proved NonZero".into(),
+                                                    span: *span,
+                                                    notes: vec!["guard denominator with `if denom != 0`".into()],
+                                                    counterexample: BTreeMap::new(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    Expr {
+                                        kind: ExprKind::Binary {
+                                            op: bop,
+                                            left: Box::new(target.clone()),
+                                            right: Box::new(value.clone()),
+                                        },
+                                        span: *span,
+                                    }
+                                }
                             };
                             let new_abs = env.eval_abs_int(&new_expr, None);
                             env.set_int(vname.clone(), new_abs);
@@ -2137,19 +2547,11 @@ impl CheckerCtx {
                                             });
                                         }
                                         let fkey = format!("{}.{}", var, field);
-                                        let new_val_expr = match op {
-                                            AssignOp::Set => value.clone(),
-                                            AssignOp::AddSet => Expr {
+                                        let new_val_expr = match assign_op_to_binop(*op) {
+                                            None => value.clone(),
+                                            Some(bop) => Expr {
                                                 kind: ExprKind::Binary {
-                                                    op: BinOp::Add,
-                                                    left: Box::new(target.clone()),
-                                                    right: Box::new(value.clone()),
-                                                },
-                                                span: *span,
-                                            },
-                                            AssignOp::SubSet => Expr {
-                                                kind: ExprKind::Binary {
-                                                    op: BinOp::Sub,
+                                                    op: bop,
                                                     left: Box::new(target.clone()),
                                                     right: Box::new(value.clone()),
                                                 },
@@ -2356,19 +2758,30 @@ impl CheckerCtx {
                 Stmt::Return { value, span } => {
                     *saw_return = true;
                     if let Some(e) = value {
-                        self.check_expr(
-                            e,
-                            cur_fn,
-                            env,
-                            smt_int_vars,
-                            smt_premises,
-                            var_types,
-                            mutable_vars,
-                            active_mutate,
-                            saw_return,
-                        );
+                        if let ExprKind::Lambda { params, ret_ty, body } = &e.kind {
+                            self.check_lambda(
+                                params,
+                                ret_ty.as_ref(),
+                                body,
+                                cur_fn.ret_ty.as_ref(),
+                                var_types,
+                                e.span,
+                            );
+                        } else {
+                            self.check_expr(
+                                e,
+                                cur_fn,
+                                env,
+                                smt_int_vars,
+                                smt_premises,
+                                var_types,
+                                mutable_vars,
+                                active_mutate,
+                                saw_return,
+                            );
+                        }
                         if let Some(ret_ty) = &cur_fn.ret_ty {
-                            let actual_ty = self.infer_expr_type(e, var_types);
+                            let actual_ty = self.infer_expr_type_expected(e, Some(ret_ty), var_types);
                             if !self.types_compatible(ret_ty, &actual_ty) {
                                 self.diagnostics.push(Diagnostic {
                                     code: "E0205".into(),
@@ -2398,21 +2811,372 @@ impl CheckerCtx {
                         }
                     }
                 }
+                Stmt::LetTuple {
+                    names,
+                    ty,
+                    value,
+                    is_mut,
+                    span,
+                } => {
+                    self.check_expr(
+                        value,
+                        cur_fn,
+                        env,
+                        smt_int_vars,
+                        smt_premises,
+                        var_types,
+                        mutable_vars,
+                        active_mutate,
+                        saw_return,
+                    );
+                    let inferred = self.infer_expr_type(value, var_types);
+                    let effective_ty = if let Some(t) = ty {
+                        self.check_dyn_type_valid(t, *span);
+                        self.check_type_bounds(t, *span);
+                        if !self.types_compatible(t, &inferred) {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0205".into(),
+                                message: format!(
+                                    "type mismatch in tuple binding: expected `{}`, found `{}`",
+                                    t.display_name(),
+                                    inferred.display_name()
+                                ),
+                                span: *span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                        t.clone()
+                    } else {
+                        inferred
+                    };
+                    let base = self.resolve_base_type(&effective_ty);
+                    match base {
+                        TypeExpr::Tuple(elems, _) => {
+                            if elems.len() != names.len() {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0205".into(),
+                                    message: format!(
+                                        "tuple destructuring arity mismatch: expected {} element(s), found {}",
+                                        elems.len(),
+                                        names.len()
+                                    ),
+                                    span: *span,
+                                    notes: vec![],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                            for (i, n) in names.iter().enumerate() {
+                                if n == "_" {
+                                    continue;
+                                }
+                                let ety = elems.get(i).cloned().unwrap_or_else(|| named_ty("Any"));
+                                var_types.insert(n.clone(), ety.clone());
+                                if *is_mut {
+                                    mutable_vars.insert(n.clone());
+                                } else {
+                                    mutable_vars.remove(n);
+                                }
+                                self.assume_type_facts(n, &ety, env, smt_int_vars, smt_premises);
+                            }
+                        }
+                        TypeExpr::Named { ref name, .. } if name == "Any" => {
+                            for n in names {
+                                if n != "_" {
+                                    var_types.insert(n.clone(), named_ty("Any"));
+                                    if *is_mut {
+                                        mutable_vars.insert(n.clone());
+                                    } else {
+                                        mutable_vars.remove(n);
+                                    }
+                                }
+                            }
+                        }
+                        other => {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0205".into(),
+                                message: format!(
+                                    "cannot destructure non-tuple type `{}`",
+                                    other.display_name()
+                                ),
+                                span: *span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                }
+                Stmt::For {
+                    binding,
+                    iter,
+                    body,
+                    span,
+                } => {
+                    // Soundly widen variables mutated inside the `for` loop body!
+                    let mut mutated = BTreeSet::new();
+                    collect_mutated_vars_in_block(body, &mut mutated);
+                    for mv in &mutated {
+                        env.ints.remove(mv);
+                        env.bools.remove(mv);
+                        env.diffs.retain(|(a, b), _| a != mv && b != mv);
+                        smt_premises.retain(|(p, _)| !expr_mentions_ident(p, mv));
+                        if let Some(mty) = var_types.get(mv).cloned() {
+                            self.assume_type_facts(mv, &mty, env, smt_int_vars, smt_premises);
+                        }
+                    }
+                    self.check_expr(
+                        iter,
+                        cur_fn,
+                        env,
+                        smt_int_vars,
+                        smt_premises,
+                        var_types,
+                        mutable_vars,
+                        active_mutate,
+                        saw_return,
+                    );
+                    let iter_ty = self.resolve_base_type(&self.infer_expr_type(iter, var_types));
+                    let mut body_env = env.clone();
+                    let mut body_vars = smt_int_vars.clone();
+                    let mut body_premises = smt_premises.clone();
+                    let mut body_types = var_types.clone();
+                    let mut body_mut = mutable_vars.clone();
+
+                    match &iter_ty {
+                        TypeExpr::Named { name, args, .. } if name == "Range" => match binding {
+                            ForBinding::Ident(v) => {
+                                if v != "_" {
+                                    body_types.insert(v.clone(), named_ty("Int"));
+                                    body_mut.remove(v);
+                                    body_vars.insert(v.clone());
+                                    if let ExprKind::Range { start, end } = &iter.kind {
+                                        let ge = Expr {
+                                            kind: ExprKind::Binary {
+                                                op: BinOp::Ge,
+                                                left: Box::new(Expr {
+                                                    kind: ExprKind::Ident(v.clone()),
+                                                    span: *span,
+                                                }),
+                                                right: start.clone(),
+                                            },
+                                            span: *span,
+                                        };
+                                        let lt = Expr {
+                                            kind: ExprKind::Binary {
+                                                op: BinOp::Lt,
+                                                left: Box::new(Expr {
+                                                    kind: ExprKind::Ident(v.clone()),
+                                                    span: *span,
+                                                }),
+                                                right: end.clone(),
+                                            },
+                                            span: *span,
+                                        };
+                                        body_env.assume_expr(&ge, None);
+                                        body_env.assume_expr(&lt, None);
+                                        body_premises.push((ge, BTreeMap::new()));
+                                        body_premises.push((lt, BTreeMap::new()));
+                                    }
+                                }
+                            }
+                            ForBinding::Tuple(_) => {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0205".into(),
+                                    message: "cannot destructure `Int` range item as tuple in `for` loop".into(),
+                                    span: *span,
+                                    notes: vec![],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                        },
+                        TypeExpr::Named { name, args, .. } if name == "List" => {
+                            let elem_ty = args.first().cloned().unwrap_or_else(|| named_ty("Any"));
+                            match binding {
+                                ForBinding::Ident(v) => {
+                                    if v != "_" {
+                                        body_types.insert(v.clone(), elem_ty.clone());
+                                        body_mut.remove(v);
+                                        self.assume_type_facts(
+                                            v,
+                                            &elem_ty,
+                                            &mut body_env,
+                                            &mut body_vars,
+                                            &mut body_premises,
+                                        );
+                                    }
+                                }
+                                ForBinding::Tuple(names) => {
+                                    let eb = self.resolve_base_type(&elem_ty);
+                                    match eb {
+                                        TypeExpr::Tuple(elems, _) => {
+                                            if elems.len() != names.len() {
+                                                self.diagnostics.push(Diagnostic {
+                                                    code: "E0205".into(),
+                                                    message: format!(
+                                                        "for-loop tuple pattern expects {} element(s), found {}",
+                                                        elems.len(),
+                                                        names.len()
+                                                    ),
+                                                    span: *span,
+                                                    notes: vec![],
+                                                    counterexample: BTreeMap::new(),
+                                                });
+                                            }
+                                            for (i, n) in names.iter().enumerate() {
+                                                if n != "_" {
+                                                    let ety = elems.get(i).cloned().unwrap_or_else(|| named_ty("Any"));
+                                                    body_types.insert(n.clone(), ety.clone());
+                                                    body_mut.remove(n);
+                                                    self.assume_type_facts(
+                                                        n,
+                                                        &ety,
+                                                        &mut body_env,
+                                                        &mut body_vars,
+                                                        &mut body_premises,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        TypeExpr::Named { ref name, .. } if name == "Any" => {
+                                            for n in names {
+                                                if n != "_" {
+                                                    body_types.insert(n.clone(), named_ty("Any"));
+                                                    body_mut.remove(n);
+                                                }
+                                            }
+                                        }
+                                        other => {
+                                            self.diagnostics.push(Diagnostic {
+                                                code: "E0205".into(),
+                                                message: format!(
+                                                    "cannot destructure list element `{}` as tuple in `for` loop",
+                                                    other.display_name()
+                                                ),
+                                                span: *span,
+                                                notes: vec![],
+                                                counterexample: BTreeMap::new(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        TypeExpr::Named { name, args, .. } if name == "Map" => {
+                            let k_ty = args.first().cloned().unwrap_or_else(|| named_ty("Any"));
+                            let v_ty = args.get(1).cloned().unwrap_or_else(|| named_ty("Any"));
+                            match binding {
+                                ForBinding::Tuple(names) if names.len() == 2 => {
+                                    if names[0] != "_" {
+                                        body_types.insert(names[0].clone(), k_ty.clone());
+                                        body_mut.remove(&names[0]);
+                                        self.assume_type_facts(
+                                            &names[0],
+                                            &k_ty,
+                                            &mut body_env,
+                                            &mut body_vars,
+                                            &mut body_premises,
+                                        );
+                                    }
+                                    if names[1] != "_" {
+                                        body_types.insert(names[1].clone(), v_ty.clone());
+                                        body_mut.remove(&names[1]);
+                                        self.assume_type_facts(
+                                            &names[1],
+                                            &v_ty,
+                                            &mut body_env,
+                                            &mut body_vars,
+                                            &mut body_premises,
+                                        );
+                                    }
+                                }
+                                ForBinding::Ident(k) => {
+                                    if k != "_" {
+                                        body_types.insert(k.clone(), k_ty.clone());
+                                        body_mut.remove(k);
+                                        self.assume_type_facts(
+                                            k,
+                                            &k_ty,
+                                            &mut body_env,
+                                            &mut body_vars,
+                                            &mut body_premises,
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    self.diagnostics.push(Diagnostic {
+                                        code: "E0205".into(),
+                                        message: "`for` over `Map` expects `for (k, v) in m` or `for k in m`".into(),
+                                        span: *span,
+                                        notes: vec![],
+                                        counterexample: BTreeMap::new(),
+                                    });
+                                }
+                            }
+                        }
+                        TypeExpr::Named { name, .. } if name == "Any" => match binding {
+                            ForBinding::Ident(v) => {
+                                if v != "_" {
+                                    body_types.insert(v.clone(), named_ty("Any"));
+                                    body_mut.remove(v);
+                                }
+                            }
+                            ForBinding::Tuple(names) => {
+                                for n in names {
+                                    if n != "_" {
+                                        body_types.insert(n.clone(), named_ty("Any"));
+                                        body_mut.remove(n);
+                                    }
+                                }
+                            }
+                        },
+                        other => {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0205".into(),
+                                message: format!(
+                                    "cannot iterate over `{}` in `for` loop (expected Range, List, or Map)",
+                                    other.display_name()
+                                ),
+                                span: *span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                    let _ = self.check_block(
+                        body,
+                        cur_fn,
+                        &mut body_env,
+                        &mut body_vars,
+                        &mut body_premises,
+                        &mut body_types,
+                        &mut body_mut,
+                        active_mutate,
+                        saw_return,
+                    );
+                }
                 Stmt::Break { .. } | Stmt::Continue { .. } => {}
             }
         }
         if let Some(tail) = &blk.tail {
-            self.check_expr(
-                tail,
-                cur_fn,
-                env,
-                smt_int_vars,
-                smt_premises,
-                var_types,
-                mutable_vars,
-                active_mutate,
-                saw_return,
-            );
+            if let ExprKind::Lambda { params, ret_ty, body } = &tail.kind {
+                let exp = match cur_fn.ret_ty.as_ref().map(|t| self.resolve_base_type(t)) {
+                    Some(t @ TypeExpr::Fn { .. }) => Some(t),
+                    _ => None,
+                };
+                self.check_lambda(params, ret_ty.as_ref(), body, exp.as_ref(), var_types, tail.span);
+            } else {
+                self.check_expr(
+                    tail,
+                    cur_fn,
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    var_types,
+                    mutable_vars,
+                    active_mutate,
+                    saw_return,
+                );
+            }
             return Some((**tail).clone());
         }
         None
@@ -2642,7 +3406,91 @@ impl CheckerCtx {
                     active_mutate,
                     saw_return,
                 );
-                if matches!(op, BinOp::Div | BinOp::Mod) {
+                let lt = self.resolve_base_type(&self.infer_expr_type(left, var_types));
+                let rt = self.resolve_base_type(&self.infer_expr_type(right, var_types));
+                let l_float = self.is_float_ty(&lt);
+                let r_float = self.is_float_ty(&rt);
+                let l_int = self.is_int_ty(&lt);
+                let r_int = self.is_int_ty(&rt);
+                match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                        if (l_float && r_int) || (l_int && r_float) {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0205".into(),
+                                message: format!(
+                                    "cannot mix `{}` and `{}` in arithmetic expression",
+                                    lt.display_name(),
+                                    rt.display_name()
+                                ),
+                                span: expr.span,
+                                notes: vec!["convert explicitly with `.to_float()` or `.to_int()`".into()],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+                        if l_float || r_float {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0205".into(),
+                                message: "bitwise operators are not supported on `Float`".into(),
+                                span: expr.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        if (l_float && r_int) || (l_int && r_float) {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0205".into(),
+                                message: format!(
+                                    "cannot compare `{}` and `{}`",
+                                    lt.display_name(),
+                                    rt.display_name()
+                                ),
+                                span: expr.span,
+                                notes: vec!["convert explicitly with `.to_float()` or `.to_int()`".into()],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                    BinOp::Eq | BinOp::Ne => {
+                        if !self.types_compatible(&lt, &rt) {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0205".into(),
+                                message: format!(
+                                    "cannot compare `{}` and `{}` for equality",
+                                    lt.display_name(),
+                                    rt.display_name()
+                                ),
+                                span: expr.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        } else if let TypeExpr::Named { name: ln, .. } = &lt {
+                            let is_prim = ln == "Any"
+                                || ln == "Bool"
+                                || ln == "Text"
+                                || self.is_int_type_name(ln)
+                                || self.is_float_type_name(ln)
+                                || self.enums.contains_key(ln);
+                            if !is_prim && !self.type_implements(&lt, "Eq") {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0505".into(),
+                                    message: format!(
+                                        "cannot compare `{}` with `==`/`!=`: type does not implement `Eq`",
+                                        lt.display_name()
+                                    ),
+                                    span: expr.span,
+                                    notes: vec![format!("add `@derive(Eq)` or `impl Eq for {} {{ ... }}`", lt.display_name())],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if matches!(op, BinOp::Div | BinOp::Mod) && !l_float && !r_float {
                     let denom = env.eval_abs_int(right, None);
                     if !denom.non_zero {
                         let ne_zero = Expr {
@@ -2692,6 +3540,190 @@ impl CheckerCtx {
                     active_mutate,
                     saw_return,
                 );
+            }
+            ExprKind::Try(inner) => {
+                self.check_expr(
+                    inner,
+                    cur_fn,
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    var_types,
+                    mutable_vars,
+                    active_mutate,
+                    saw_return,
+                );
+                let inner_ty = self.resolve_base_type(&self.infer_expr_type(inner, var_types));
+                let fn_ret = cur_fn.ret_ty.as_ref().map(|t| self.resolve_base_type(t));
+                match &inner_ty {
+                    TypeExpr::Named { name, args, .. } if name == "Result" => match &fn_ret {
+                        Some(TypeExpr::Named { name: rn, args: rargs, .. }) if rn == "Result" => {
+                            if args.len() >= 2 && rargs.len() >= 2 && !self.types_compatible(&rargs[1], &args[1]) {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0205".into(),
+                                    message: format!(
+                                        "`?` error type mismatch in `{}`: function returns error `{}`, expression has error `{}`",
+                                        cur_fn.name,
+                                        rargs[1].display_name(),
+                                        args[1].display_name()
+                                    ),
+                                    span: expr.span,
+                                    notes: vec![],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                        }
+                        Some(TypeExpr::Named { name: rn, .. }) if rn == "Any" => {}
+                        _ => {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0208".into(),
+                                message: format!(
+                                    "operator `?` on `Result` can only be used in a function returning `Result`, but `{}` returns `{}`",
+                                    cur_fn.name,
+                                    cur_fn
+                                        .ret_ty
+                                        .as_ref()
+                                        .map(|t| t.display_name())
+                                        .unwrap_or_else(|| "()".into())
+                                ),
+                                span: expr.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    },
+                    TypeExpr::Named { name, .. } if name == "Option" => match &fn_ret {
+                        Some(TypeExpr::Named { name: rn, .. }) if rn == "Option" || rn == "Any" => {}
+                        _ => {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0208".into(),
+                                message: format!(
+                                    "operator `?` on `Option` can only be used in a function returning `Option`, but `{}` returns `{}`",
+                                    cur_fn.name,
+                                    cur_fn
+                                        .ret_ty
+                                        .as_ref()
+                                        .map(|t| t.display_name())
+                                        .unwrap_or_else(|| "()".into())
+                                ),
+                                span: expr.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    },
+                    TypeExpr::Named { name, .. } if name == "Any" => {}
+                    other => {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0208".into(),
+                            message: format!(
+                                "operator `?` requires `Result` or `Option`, found `{}`",
+                                other.display_name()
+                            ),
+                            span: expr.span,
+                            notes: vec![],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                }
+            }
+            ExprKind::TupleIndex { target, index } => {
+                self.check_expr(
+                    target,
+                    cur_fn,
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    var_types,
+                    mutable_vars,
+                    active_mutate,
+                    saw_return,
+                );
+                let tty = self.resolve_base_type(&self.infer_expr_type(target, var_types));
+                match tty {
+                    TypeExpr::Tuple(elems, _) => {
+                        if *index >= elems.len() {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0206".into(),
+                                message: format!(
+                                    "tuple index `.{}` out of bounds for {}-tuple",
+                                    index,
+                                    elems.len()
+                                ),
+                                span: expr.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                    TypeExpr::Named { ref name, .. } if name == "Any" => {}
+                    other => {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0206".into(),
+                            message: format!(
+                                "cannot use tuple index `.{}` on non-tuple type `{}`",
+                                index,
+                                other.display_name()
+                            ),
+                            span: expr.span,
+                            notes: vec![],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                }
+            }
+            ExprKind::Range { start, end } => {
+                self.check_expr(
+                    start,
+                    cur_fn,
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    var_types,
+                    mutable_vars,
+                    active_mutate,
+                    saw_return,
+                );
+                self.check_expr(
+                    end,
+                    cur_fn,
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    var_types,
+                    mutable_vars,
+                    active_mutate,
+                    saw_return,
+                );
+                let st = self.infer_expr_type(start, var_types);
+                let et = self.infer_expr_type(end, var_types);
+                if !self.types_compatible(&named_ty("Int"), &st) {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0205".into(),
+                        message: format!(
+                            "range start expects `Int`, found `{}`",
+                            st.display_name()
+                        ),
+                        span: start.span,
+                        notes: vec![],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+                if !self.types_compatible(&named_ty("Int"), &et) {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0205".into(),
+                        message: format!(
+                            "range end expects `Int`, found `{}`",
+                            et.display_name()
+                        ),
+                        span: end.span,
+                        notes: vec![],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+            }
+            ExprKind::Lambda { params, ret_ty, body } => {
+                self.check_lambda(params, ret_ty.as_ref(), body, None, var_types, expr.span);
             }
             ExprKind::List(elems) | ExprKind::Tuple(elems) => {
                 for e in elems {
@@ -2877,19 +3909,23 @@ impl CheckerCtx {
                 }
             }
             ExprKind::Call { callee, args } => {
+                // Check non-lambda arguments upfront; lambda arguments are checked with bidirectional expected fn types!
                 for a in args {
-                    self.check_expr(
-                        &a.value,
-                        cur_fn,
-                        env,
-                        smt_int_vars,
-                        smt_premises,
-                        var_types,
-                        mutable_vars,
-                        active_mutate,
-                        saw_return,
-                    );
+                    if !matches!(a.value.kind, ExprKind::Lambda { .. }) {
+                        self.check_expr(
+                            &a.value,
+                            cur_fn,
+                            env,
+                            smt_int_vars,
+                            smt_premises,
+                            var_types,
+                            mutable_vars,
+                            active_mutate,
+                            saw_return,
+                        );
+                    }
                 }
+                let mut lambdas_checked = false;
                 match &callee.kind {
                     ExprKind::Field { target, field }
                         if field == "parse"
@@ -2922,21 +3958,7 @@ impl CheckerCtx {
                                 if let Some(vi) =
                                     self.enum_variants.get(&format!("{}.{}", ename, field)).cloned()
                                 {
-                                    if args.len() != vi.payload_tys.len() {
-                                        self.diagnostics.push(Diagnostic {
-                                            code: "E0202".into(),
-                                            message: format!(
-                                                "variant `{}.{}` expects {} argument(s), found {}",
-                                                ename,
-                                                field,
-                                                vi.payload_tys.len(),
-                                                args.len()
-                                            ),
-                                            span: expr.span,
-                                            notes: vec![],
-                                            counterexample: BTreeMap::new(),
-                                        });
-                                    }
+                                    self.check_variant_ctor_args(&format!("{}.{}", ename, field), &vi, args, var_types, expr.span);
                                 }
                             }
                         } else if let ExprKind::GenericInst { expr: inner, type_args } = &target.kind {
@@ -2985,6 +4007,7 @@ impl CheckerCtx {
                                             active_mutate,
                                             expr.span,
                                         );
+                                        lambdas_checked = true;
                                     } else {
                                         self.diagnostics.push(Diagnostic {
                                             code: "E0207".into(),
@@ -3018,6 +4041,7 @@ impl CheckerCtx {
                                         active_mutate,
                                         expr.span,
                                     );
+                                    lambdas_checked = true;
                                 } else {
                                     self.diagnostics.push(Diagnostic {
                                         code: "E0207".into(),
@@ -3031,7 +4055,7 @@ impl CheckerCtx {
                                     });
                                 }
                             } else {
-                                // Receiver method call on variable `target.field(args)`
+                                // Receiver method call on variable `target.field(args)` (or callable record field!)
                                 self.check_expr(
                                     target,
                                     cur_fn,
@@ -3045,9 +4069,10 @@ impl CheckerCtx {
                                 );
                                 let recv_ty = self.infer_expr_type(target, var_types);
                                 if let Some(mdecl) = self.resolve_method_sig(&recv_ty, field) {
+                                    let inst = self.instantiate_method_from_args(&mdecl, true, args, var_types);
                                     self.check_method_call_contract(
                                         &format!("{}.{}", recv_ty.display_name(), field),
-                                        &mdecl,
+                                        &inst,
                                         Some(target),
                                         args,
                                         cur_fn,
@@ -3059,6 +4084,18 @@ impl CheckerCtx {
                                         active_mutate,
                                         expr.span,
                                     );
+                                    lambdas_checked = true;
+                                } else if let TypeExpr::Fn { params, .. } =
+                                    self.resolve_base_type(&self.infer_expr_type(callee, var_types))
+                                {
+                                    self.check_indirect_fn_call(
+                                        &format!("{}.{}", recv_ty.display_name(), field),
+                                        &params,
+                                        args,
+                                        var_types,
+                                        expr.span,
+                                    );
+                                    lambdas_checked = true;
                                 } else if recv_ty.display_name() != "Any" {
                                     self.diagnostics.push(Diagnostic {
                                         code: "E0207".into(),
@@ -3088,9 +4125,10 @@ impl CheckerCtx {
                             );
                             let recv_ty = self.infer_expr_type(target, var_types);
                             if let Some(mdecl) = self.resolve_method_sig(&recv_ty, field) {
+                                let inst = self.instantiate_method_from_args(&mdecl, true, args, var_types);
                                 self.check_method_call_contract(
                                     &format!("{}.{}", recv_ty.display_name(), field),
-                                    &mdecl,
+                                    &inst,
                                     Some(target),
                                     args,
                                     cur_fn,
@@ -3102,6 +4140,18 @@ impl CheckerCtx {
                                     active_mutate,
                                     expr.span,
                                 );
+                                lambdas_checked = true;
+                            } else if let TypeExpr::Fn { params, .. } =
+                                self.resolve_base_type(&self.infer_expr_type(callee, var_types))
+                            {
+                                self.check_indirect_fn_call(
+                                    &format!("{}.{}", recv_ty.display_name(), field),
+                                    &params,
+                                    args,
+                                    var_types,
+                                    expr.span,
+                                );
+                                lambdas_checked = true;
                             } else if recv_ty.display_name() != "Any" {
                                 self.diagnostics.push(Diagnostic {
                                     code: "E0207".into(),
@@ -3164,235 +4214,60 @@ impl CheckerCtx {
                                     active_mutate,
                                     expr.span,
                                 );
+                                lambdas_checked = true;
                             }
                         }
                     }
                     ExprKind::Ident(fname) => {
-                        if let Some(fdecl) = self.all_fns.get(fname).cloned() {
-                            // Infer generic type parameter bindings & verify interface bounds `[T Tool]`!
-                            let mut inferred_tp: BTreeMap<String, TypeExpr> = BTreeMap::new();
-                            if !fdecl.type_params.is_empty() {
-                                for (p, a) in fdecl.params.iter().zip(args.iter()) {
-                                    if let TypeExpr::Named { name: pname, args: pargs, .. } = &p.ty {
-                                        if pargs.is_empty() && fdecl.type_params.contains(pname) {
-                                            let aty = self.infer_expr_type(&a.value, var_types);
-                                            inferred_tp.entry(pname.clone()).or_insert(aty);
-                                        }
-                                    }
-                                }
-                                for (tp, concrete_ty) in &inferred_tp {
-                                    if let Some(bounds) = fdecl.type_param_bounds.get(tp) {
-                                        for b in bounds {
-                                            if !self.type_implements(concrete_ty, b) {
-                                                self.diagnostics.push(Diagnostic {
-                                                    code: "E0505".into(),
-                                                    message: format!(
-                                                        "type `{}` does not implement interface `{}` required by `{}`",
-                                                        concrete_ty.display_name(),
-                                                        b,
-                                                        fname
-                                                    ),
-                                                    span: expr.span,
-                                                    notes: vec![format!("add `impl {} for {} {{ ... }}`", b, concrete_ty.display_name())],
-                                                    counterexample: BTreeMap::new(),
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if args.len() != fdecl.params.len() {
-                                self.diagnostics.push(Diagnostic {
-                                    code: "E0202".into(),
-                                    message: format!(
-                                        "function `{}` expects {} argument(s), found {}",
-                                        fname,
-                                        fdecl.params.len(),
-                                        args.len()
-                                    ),
-                                    span: expr.span,
-                                    notes: vec![],
-                                    counterexample: BTreeMap::new(),
-                                });
-                            }
-                            let mut inout_vars_seen = BTreeSet::new();
-                            let mut param_arg_map: BTreeMap<String, Expr> = BTreeMap::new();
-                            let mut mutated_inout_targets: Vec<(String, TypeExpr)> = Vec::new();
-                            for (p, a) in fdecl.params.iter().zip(args.iter()) {
-                                param_arg_map.insert(p.name.clone(), a.value.clone());
-                                let expected_pty = if inferred_tp.is_empty() {
-                                    p.ty.clone()
-                                } else {
-                                    subst_type_expr(&p.ty, &inferred_tp)
-                                };
-                                let actual_ty = self.infer_expr_type(&a.value, var_types);
-                                if let TypeExpr::Dyn { interface, .. } = &expected_pty {
-                                    if !self.type_implements(&actual_ty, interface) {
-                                        self.diagnostics.push(Diagnostic {
-                                            code: "E0505".into(),
-                                            message: format!(
-                                                "argument `{}` of `{}`: type `{}` does not implement interface `{}`",
-                                                p.name,
-                                                fname,
-                                                actual_ty.display_name(),
-                                                interface
-                                            ),
-                                            span: a.value.span,
-                                            notes: vec![format!("add `impl {} for {} {{ ... }}`", interface, actual_ty.display_name())],
-                                            counterexample: BTreeMap::new(),
-                                        });
-                                    } else if !matches!(actual_ty, TypeExpr::Dyn { .. })
-                                        && cur_fn.attrs.iter().any(|at| at.name == "no_heap_alloc")
-                                    {
-                                        self.diagnostics.push(Diagnostic {
-                                            code: "E0701".into(),
-                                            message: format!(
-                                                "`@no_heap_alloc` contract violated in `{}`: boxing `{}` into `dyn {}` allocates",
-                                                cur_fn.name,
-                                                actual_ty.display_name(),
-                                                interface
-                                            ),
-                                            span: a.value.span,
-                                            notes: vec![],
-                                            counterexample: BTreeMap::new(),
-                                        });
-                                    }
-                                } else if !self.types_compatible(&expected_pty, &actual_ty) {
-                                    self.diagnostics.push(Diagnostic {
-                                        code: "E0205".into(),
-                                        message: format!(
-                                            "type mismatch for argument `{}` of `{}`: expected `{}`, found `{}`",
-                                            p.name,
-                                            fname,
-                                            expected_pty.display_name(),
-                                            actual_ty.display_name()
-                                        ),
-                                        span: a.value.span,
-                                        notes: vec![],
-                                        counterexample: BTreeMap::new(),
-                                    });
-                                }
-                                if p.is_inout {
-                                    if let ExprKind::Ident(v) = &a.value.kind {
-                                        if !inout_vars_seen.insert(v.clone()) {
-                                            self.diagnostics.push(Diagnostic {
-                                                code: "E0501".into(),
-                                                message: format!(
-                                                    "MVS exclusivity violation: variable `{}` passed to multiple `inout` parameters of `{}`",
-                                                    v, fname
-                                                ),
-                                                span: a.value.span,
-                                                notes: vec!["Tenon forbids overlapping mutable aliases".into()],
-                                                counterexample: BTreeMap::new(),
-                                            });
-                                        }
-                                        if active_mutate.as_deref() == Some(v.as_str()) {
-                                            self.diagnostics.push(Diagnostic {
-                                                code: "E0502".into(),
-                                                message: format!(
-                                                    "cannot pass `{}` (currently unsealed inside `mutate {}`) to `{}`",
-                                                    v, v, fname
-                                                ),
-                                                span: a.value.span,
-                                                notes: vec!["record invariant is temporarily suspended inside `mutate`".into()],
-                                                counterexample: BTreeMap::new(),
-                                            });
-                                        }
-                                        if !mutable_vars.contains(v) && var_types.contains_key(v) {
-                                            self.diagnostics.push(Diagnostic {
-                                                code: "E0203".into(),
-                                                message: format!(
-                                                    "cannot pass immutable binding `{}` to `inout` parameter `{}` of `{}`",
-                                                    v, p.name, fname
-                                                ),
-                                                span: a.value.span,
-                                                notes: vec![format!("declare `{}` with `var`", v)],
-                                                counterexample: BTreeMap::new(),
-                                            });
-                                        }
-                                        mutated_inout_targets.push((v.clone(), p.ty.clone()));
-                                    }
-                                }
-                                // Verify refined type alias on argument
-                                self.check_expr_satisfies_type(
-                                    &a.value,
-                                    &p.ty,
+                        if let Some(vty) = var_types.get(fname).cloned() {
+                            if let TypeExpr::Fn { params, .. } = self.resolve_base_type(&vty) {
+                                self.check_indirect_fn_call(fname, &params, args, var_types, expr.span);
+                                lambdas_checked = true;
+                            } else if let Some(fdecl) = self.all_fns.get(fname).cloned() {
+                                self.check_direct_fn_call(
+                                    fname,
+                                    &fdecl,
+                                    args,
+                                    cur_fn,
                                     env,
                                     smt_int_vars,
                                     smt_premises,
-                                    &format!("argument `{}` of `{}`", p.name, fname),
-                                    a.value.span,
-                                );
-                                // Verify inline parameter `where` predicate at call site!
-                                if let Some(pred) = &p.predicate {
-                                    self.check_predicate_obligation(
-                                        pred,
-                                        Some(&a.value),
-                                        env,
-                                        smt_int_vars,
-                                        smt_premises,
-                                        &format!("parameter `{}` predicate of `{}`", p.name, fname),
-                                        "E0440",
-                                        "E0441",
-                                        a.value.span,
-                                    );
-                                }
-                            }
-                            // Verify every `requires` precondition at the call site!
-                            for req in &fdecl.requires {
-                                let instantiated = substitute_expr_idents(req, &param_arg_map);
-                                self.check_predicate_obligation(
-                                    &instantiated,
-                                    None,
-                                    env,
-                                    smt_int_vars,
-                                    smt_premises,
-                                    &format!("precondition `requires` of `{}`", fname),
-                                    "E0440",
-                                    "E0441",
+                                    var_types,
+                                    mutable_vars,
+                                    active_mutate,
                                     expr.span,
                                 );
-                            }
-                            // After `inout` call, widen mutated target fields to their record invariants!
-                            for (v, pty) in mutated_inout_targets {
-                                let prefix = format!("{}.", v);
-                                env.ints.retain(|k, _| k != &v && !k.starts_with(&prefix));
-                                env.bools.retain(|k, _| k != &v && !k.starts_with(&prefix));
-                                smt_premises.retain(|(p, _)| !expr_mentions_ident(p, &v));
-                                self.assume_type_facts(&v, &pty, env, smt_int_vars, smt_premises);
-                            }
-                        } else if let Some(vi) = self.enum_variants.get(fname).cloned() {
-                            if args.len() != vi.payload_tys.len() {
+                                lambdas_checked = true;
+                            } else {
                                 self.diagnostics.push(Diagnostic {
-                                    code: "E0202".into(),
+                                    code: "E0201".into(),
                                     message: format!(
-                                        "variant `{}` expects {} argument(s), found {}",
+                                        "`{}` of type `{}` is not callable",
                                         fname,
-                                        vi.payload_tys.len(),
-                                        args.len()
+                                        vty.display_name()
                                     ),
                                     span: expr.span,
                                     notes: vec![],
                                     counterexample: BTreeMap::new(),
                                 });
                             }
-                            for (pty, a) in vi.payload_tys.iter().zip(args.iter()) {
-                                let actual_ty = self.infer_expr_type(&a.value, var_types);
-                                if !self.types_compatible(pty, &actual_ty) {
-                                    self.diagnostics.push(Diagnostic {
-                                        code: "E0205".into(),
-                                        message: format!(
-                                            "variant `{}` payload expects `{}`, found `{}`",
-                                            fname,
-                                            pty.display_name(),
-                                            actual_ty.display_name()
-                                        ),
-                                        span: a.value.span,
-                                        notes: vec![],
-                                        counterexample: BTreeMap::new(),
-                                    });
-                                }
-                            }
+                        } else if let Some(fdecl) = self.all_fns.get(fname).cloned() {
+                            self.check_direct_fn_call(
+                                fname,
+                                &fdecl,
+                                args,
+                                cur_fn,
+                                env,
+                                smt_int_vars,
+                                smt_premises,
+                                var_types,
+                                mutable_vars,
+                                active_mutate,
+                                expr.span,
+                            );
+                            lambdas_checked = true;
+                        } else if let Some(vi) = self.enum_variants.get(fname).cloned() {
+                            self.check_variant_ctor_args(fname, &vi, args, var_types, expr.span);
                         } else if let Some(b) = lookup_builtin(fname) {
                             if fname == "push" && args.len() == 2 {
                                 let list_ty = self.resolve_base_type(&self.infer_expr_type(&args[0].value, var_types));
@@ -3461,7 +4336,39 @@ impl CheckerCtx {
                             });
                         }
                     }
-                    _ => {}
+                    _ => {
+                        self.check_expr(
+                            callee,
+                            cur_fn,
+                            env,
+                            smt_int_vars,
+                            smt_premises,
+                            var_types,
+                            mutable_vars,
+                            active_mutate,
+                            saw_return,
+                        );
+                        if let TypeExpr::Fn { params, .. } =
+                            self.resolve_base_type(&self.infer_expr_type(callee, var_types))
+                        {
+                            self.check_indirect_fn_call("<fn>", &params, args, var_types, expr.span);
+                            lambdas_checked = true;
+                        }
+                    }
+                }
+                if !lambdas_checked {
+                    for a in args {
+                        if let ExprKind::Lambda { params, ret_ty, body } = &a.value.kind {
+                            self.check_lambda(
+                                params,
+                                ret_ty.as_ref(),
+                                body,
+                                None,
+                                var_types,
+                                a.value.span,
+                            );
+                        }
+                    }
                 }
             }
             ExprKind::If {
@@ -3543,20 +4450,20 @@ impl CheckerCtx {
                     let mut arm_smt_vars = smt_int_vars.clone();
                     let mut arm_premises = smt_premises.clone();
                     self.bind_match_arm_types(&st, arm, &mut arm_vars);
-                    // Assume type facts for any bound pattern variable
+                    // Assume type facts for all bound pattern variables (including nested & tuple patterns)
+                    let mut bound_names = BTreeSet::new();
                     for p in &arm.patterns {
-                        if let Pattern::Variant { binding: Some(bname), .. } = p {
-                            if bname != "_" {
-                                if let Some(bty) = arm_vars.get(bname).cloned() {
-                                    self.assume_type_facts(
-                                        bname,
-                                        &bty,
-                                        &mut arm_env,
-                                        &mut arm_smt_vars,
-                                        &mut arm_premises,
-                                    );
-                                }
-                            }
+                        collect_pattern_bindings(p, &mut bound_names);
+                    }
+                    for bname in &bound_names {
+                        if let Some(bty) = arm_vars.get(bname).cloned() {
+                            self.assume_type_facts(
+                                bname,
+                                &bty,
+                                &mut arm_env,
+                                &mut arm_smt_vars,
+                                &mut arm_premises,
+                            );
                         }
                     }
                     if let Some(g) = &arm.guard {
@@ -3608,9 +4515,140 @@ impl CheckerCtx {
         }
     }
 
+    fn patterns_exhaust_type(&self, ty: &TypeExpr, pats: &[&Pattern]) -> bool {
+        if pats.is_empty() {
+            return false;
+        }
+        if pats
+            .iter()
+            .any(|p| matches!(p, Pattern::Wildcard(_) | Pattern::Ident(_, _)))
+        {
+            return true;
+        }
+        let base = self.resolve_base_type(ty);
+        match &base {
+            TypeExpr::Tuple(elem_tys, _) => {
+                let tuple_rows: Vec<&[Pattern]> = pats
+                    .iter()
+                    .filter_map(|p| match p {
+                        Pattern::Tuple(ps, _) if ps.len() == elem_tys.len() => Some(ps.as_slice()),
+                        _ => None,
+                    })
+                    .collect();
+                if tuple_rows.is_empty() {
+                    return false;
+                }
+                if tuple_rows
+                    .iter()
+                    .any(|row| row.iter().all(pattern_is_irrefutable))
+                {
+                    return true;
+                }
+                for col_idx in 0..elem_tys.len() {
+                    let col: Vec<&Pattern> = tuple_rows
+                        .iter()
+                        .filter(|r| {
+                            r.iter()
+                                .enumerate()
+                                .all(|(j, sp)| j == col_idx || pattern_is_irrefutable(sp))
+                        })
+                        .map(|r| &r[col_idx])
+                        .collect();
+                    if self.patterns_exhaust_type(&elem_tys[col_idx], &col) {
+                        return true;
+                    }
+                }
+                false
+            }
+            TypeExpr::Named { name: tname, .. } => {
+                let required: Option<Vec<String>> = if tname == "Option" {
+                    Some(vec!["Some".into(), "None".into()])
+                } else if tname == "Result" {
+                    Some(vec!["Ok".into(), "Err".into()])
+                } else if tname == "Bool" {
+                    Some(vec!["true".into(), "false".into()])
+                } else if let Some(ed) = self.enums.get(tname) {
+                    Some(ed.variants.iter().map(|v| v.name.clone()).collect())
+                } else {
+                    None
+                };
+                let Some(req_variants) = required else {
+                    return false;
+                };
+                req_variants
+                    .iter()
+                    .all(|vname| self.variant_covered_by(&base, tname, vname, pats))
+            }
+            _ => false,
+        }
+    }
+
+    fn variant_covered_by(
+        &self,
+        scrutinee_base: &TypeExpr,
+        tname: &str,
+        vname: &str,
+        pats: &[&Pattern],
+    ) -> bool {
+        if tname == "Bool" {
+            let target = vname == "true";
+            return pats
+                .iter()
+                .any(|p| matches!(p, Pattern::Bool(b, _) if *b == target));
+        }
+        let mut multi_rows: Vec<&[Pattern]> = Vec::new();
+        for p in pats {
+            match p {
+                Pattern::Variant { name, .. } => {
+                    let short = name.rsplit('.').next().unwrap_or(name);
+                    if short == vname {
+                        return true;
+                    }
+                }
+                Pattern::VariantMulti { name, patterns, .. } => {
+                    let short = name.rsplit('.').next().unwrap_or(name);
+                    if short == vname {
+                        if patterns.iter().all(pattern_is_irrefutable) {
+                            return true;
+                        }
+                        multi_rows.push(patterns.as_slice());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if multi_rows.is_empty() {
+            return false;
+        }
+        let ptys = self.resolve_variant_payload_tys(scrutinee_base, vname);
+        if ptys.is_empty() {
+            return true;
+        }
+        if ptys.len() == 1 {
+            let sub: Vec<&Pattern> = multi_rows.iter().filter_map(|r| r.first()).collect();
+            return self.patterns_exhaust_type(&ptys[0], &sub);
+        }
+        for col_idx in 0..ptys.len() {
+            let col: Vec<&Pattern> = multi_rows
+                .iter()
+                .filter(|r| {
+                    r.len() == ptys.len()
+                        && r.iter()
+                            .enumerate()
+                            .all(|(j, sp)| j == col_idx || pattern_is_irrefutable(sp))
+                })
+                .map(|r| &r[col_idx])
+                .collect();
+            if self.patterns_exhaust_type(&ptys[col_idx], &col) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn check_match_exhaustiveness(&mut self, scrutinee_ty: &TypeExpr, arms: &[MatchArm], span: Span) {
         let base = self.resolve_base_type(scrutinee_ty);
-        let TypeExpr::Named { name: tname, .. } = base else {
+        let TypeExpr::Named { name: tname, .. } = &base else {
             return;
         };
 
@@ -3620,7 +4658,7 @@ impl CheckerCtx {
             Some(vec!["Ok".into(), "Err".into()])
         } else if tname == "Bool" {
             Some(vec!["true".into(), "false".into()])
-        } else if let Some(ed) = self.enums.get(&tname) {
+        } else if let Some(ed) = self.enums.get(tname) {
             Some(ed.variants.iter().map(|v| v.name.clone()).collect())
         } else {
             None
@@ -3630,32 +4668,17 @@ impl CheckerCtx {
             return;
         };
 
-        let mut covered: BTreeSet<String> = BTreeSet::new();
-        let mut has_wildcard = false;
-        for arm in arms {
-            if arm.guard.is_some() {
-                // Guarded arms cannot guarantee exhaustive coverage of a variant
-                continue;
-            }
-            for p in &arm.patterns {
-                match p {
-                    Pattern::Wildcard(_) | Pattern::Ident(_, _) => {
-                        has_wildcard = true;
-                    }
-                    Pattern::Bool(true, _) => {
-                        covered.insert("true".into());
-                    }
-                    Pattern::Bool(false, _) => {
-                        covered.insert("false".into());
-                    }
-                    Pattern::Variant { name, .. } => {
-                        let short = name.rsplit('.').next().unwrap_or(name).to_string();
-                        covered.insert(short);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let unguarded: Vec<&Pattern> = arms
+            .iter()
+            .filter(|a| a.guard.is_none())
+            .flat_map(|a| a.patterns.iter())
+            .collect();
+
+        let has_wildcard = unguarded.iter().any(|p| match p {
+            Pattern::Wildcard(_) | Pattern::Ident(_, _) => true,
+            Pattern::Tuple(ps, _) => ps.iter().all(pattern_is_irrefutable),
+            _ => false,
+        });
 
         if has_wildcard {
             self.proofs.push(ProofRecord {
@@ -3668,7 +4691,7 @@ impl CheckerCtx {
 
         let missing: Vec<String> = req_variants
             .into_iter()
-            .filter(|v| !covered.contains(v))
+            .filter(|v| !self.variant_covered_by(&base, tname, v, &unguarded))
             .collect();
         if missing.is_empty() {
             self.proofs.push(ProofRecord {
@@ -4110,7 +5133,10 @@ impl CheckerCtx {
         }
         for (p, a) in explicit_params.iter().zip(args.iter()) {
             param_arg_map.insert(p.name.clone(), a.value.clone());
-            let actual_ty = self.infer_expr_type(&a.value, var_types);
+            if let ExprKind::Lambda { params, ret_ty, body } = &a.value.kind {
+                self.check_lambda(params, ret_ty.as_ref(), body, Some(&p.ty), var_types, a.value.span);
+            }
+            let actual_ty = self.infer_expr_type_expected(&a.value, Some(&p.ty), var_types);
             if let TypeExpr::Dyn { interface, .. } = &p.ty {
                 if !self.type_implements(&actual_ty, interface) {
                     self.diagnostics.push(Diagnostic {
@@ -4207,6 +5233,423 @@ impl CheckerCtx {
                 span,
             );
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_direct_fn_call(
+        &mut self,
+        fname: &str,
+        fdecl: &FnDecl,
+        args: &[CallArg],
+        cur_fn: &FnDecl,
+        env: &mut L0Env,
+        smt_int_vars: &mut BTreeSet<String>,
+        smt_premises: &mut Vec<(Expr, BTreeMap<String, String>)>,
+        var_types: &BTreeMap<String, TypeExpr>,
+        mutable_vars: &BTreeSet<String>,
+        active_mutate: &Option<String>,
+        span: Span,
+    ) {
+        // Infer generic type parameter bindings (two-pass: non-lambda then lambda) & verify interface bounds!
+        let mut inferred_tp: BTreeMap<String, TypeExpr> = BTreeMap::new();
+        if !fdecl.type_params.is_empty() {
+            for (p, a) in fdecl.params.iter().zip(args.iter()) {
+                if !matches!(a.value.kind, ExprKind::Lambda { .. }) {
+                    let aty = self.infer_expr_type(&a.value, var_types);
+                    Self::unify_type_pattern(&p.ty, &aty, &fdecl.type_params, &mut inferred_tp);
+                }
+            }
+            for (p, a) in fdecl.params.iter().zip(args.iter()) {
+                if matches!(a.value.kind, ExprKind::Lambda { .. }) {
+                    let expected_pty = subst_type_expr(&p.ty, &inferred_tp);
+                    let aty = self.infer_expr_type_expected(&a.value, Some(&expected_pty), var_types);
+                    Self::unify_type_pattern(&p.ty, &aty, &fdecl.type_params, &mut inferred_tp);
+                }
+            }
+            for (tp, concrete_ty) in &inferred_tp {
+                if let Some(bounds) = fdecl.type_param_bounds.get(tp) {
+                    for b in bounds {
+                        if !self.type_implements(concrete_ty, b) {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0505".into(),
+                                message: format!(
+                                    "type `{}` does not implement interface `{}` required by `{}`",
+                                    concrete_ty.display_name(),
+                                    b,
+                                    fname
+                                ),
+                                span,
+                                notes: vec![format!("add `impl {} for {} {{ ... }}`", b, concrete_ty.display_name())],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if args.len() != fdecl.params.len() {
+            self.diagnostics.push(Diagnostic {
+                code: "E0202".into(),
+                message: format!(
+                    "function `{}` expects {} argument(s), found {}",
+                    fname,
+                    fdecl.params.len(),
+                    args.len()
+                ),
+                span,
+                notes: vec![],
+                counterexample: BTreeMap::new(),
+            });
+        }
+        let mut inout_vars_seen = BTreeSet::new();
+        let mut param_arg_map: BTreeMap<String, Expr> = BTreeMap::new();
+        let mut mutated_inout_targets: Vec<(String, TypeExpr)> = Vec::new();
+        for (p, a) in fdecl.params.iter().zip(args.iter()) {
+            param_arg_map.insert(p.name.clone(), a.value.clone());
+            let expected_pty = if inferred_tp.is_empty() {
+                p.ty.clone()
+            } else {
+                subst_type_expr(&p.ty, &inferred_tp)
+            };
+            if let ExprKind::Lambda { params, ret_ty, body } = &a.value.kind {
+                self.check_lambda(params, ret_ty.as_ref(), body, Some(&expected_pty), var_types, a.value.span);
+            }
+            let actual_ty = self.infer_expr_type_expected(&a.value, Some(&expected_pty), var_types);
+            if let TypeExpr::Dyn { interface, .. } = &expected_pty {
+                if !self.type_implements(&actual_ty, interface) {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0505".into(),
+                        message: format!(
+                            "argument `{}` of `{}`: type `{}` does not implement interface `{}`",
+                            p.name,
+                            fname,
+                            actual_ty.display_name(),
+                            interface
+                        ),
+                        span: a.value.span,
+                        notes: vec![format!("add `impl {} for {} {{ ... }}`", interface, actual_ty.display_name())],
+                        counterexample: BTreeMap::new(),
+                    });
+                } else if !matches!(actual_ty, TypeExpr::Dyn { .. })
+                    && cur_fn.attrs.iter().any(|at| at.name == "no_heap_alloc")
+                {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0701".into(),
+                        message: format!(
+                            "`@no_heap_alloc` contract violated in `{}`: boxing `{}` into `dyn {}` allocates",
+                            cur_fn.name,
+                            actual_ty.display_name(),
+                            interface
+                        ),
+                        span: a.value.span,
+                        notes: vec![],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+            } else if !self.types_compatible(&expected_pty, &actual_ty) {
+                self.diagnostics.push(Diagnostic {
+                    code: "E0205".into(),
+                    message: format!(
+                        "type mismatch for argument `{}` of `{}`: expected `{}`, found `{}`",
+                        p.name,
+                        fname,
+                        expected_pty.display_name(),
+                        actual_ty.display_name()
+                    ),
+                    span: a.value.span,
+                    notes: vec![],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+            if p.is_inout {
+                if let ExprKind::Ident(v) = &a.value.kind {
+                    if !inout_vars_seen.insert(v.clone()) {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0501".into(),
+                            message: format!(
+                                "MVS exclusivity violation: variable `{}` passed to multiple `inout` parameters of `{}`",
+                                v, fname
+                            ),
+                            span: a.value.span,
+                            notes: vec!["Tenon forbids overlapping mutable aliases".into()],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                    if active_mutate.as_deref() == Some(v.as_str()) {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0502".into(),
+                            message: format!(
+                                "cannot pass `{}` (currently unsealed inside `mutate {}`) to `{}`",
+                                v, v, fname
+                            ),
+                            span: a.value.span,
+                            notes: vec!["record invariant is temporarily suspended inside `mutate`".into()],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                    if !mutable_vars.contains(v) && var_types.contains_key(v) {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0203".into(),
+                            message: format!(
+                                "cannot pass immutable binding `{}` to `inout` parameter `{}` of `{}`",
+                                v, p.name, fname
+                            ),
+                            span: a.value.span,
+                            notes: vec![format!("declare `{}` with `var`", v)],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                    mutated_inout_targets.push((v.clone(), p.ty.clone()));
+                }
+            }
+            self.check_expr_satisfies_type(
+                &a.value,
+                &p.ty,
+                env,
+                smt_int_vars,
+                smt_premises,
+                &format!("argument `{}` of `{}`", p.name, fname),
+                a.value.span,
+            );
+            if let Some(pred) = &p.predicate {
+                self.check_predicate_obligation(
+                    pred,
+                    Some(&a.value),
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    &format!("parameter `{}` predicate of `{}`", p.name, fname),
+                    "E0440",
+                    "E0441",
+                    a.value.span,
+                );
+            }
+        }
+        for req in &fdecl.requires {
+            let instantiated = substitute_expr_idents(req, &param_arg_map);
+            self.check_predicate_obligation(
+                &instantiated,
+                None,
+                env,
+                smt_int_vars,
+                smt_premises,
+                &format!("precondition `requires` of `{}`", fname),
+                "E0440",
+                "E0441",
+                span,
+            );
+        }
+        for (v, pty) in mutated_inout_targets {
+            let prefix = format!("{}.", v);
+            env.ints.retain(|k, _| k != &v && !k.starts_with(&prefix));
+            env.bools.retain(|k, _| k != &v && !k.starts_with(&prefix));
+            smt_premises.retain(|(p, _)| !expr_mentions_ident(p, &v));
+            self.assume_type_facts(&v, &pty, env, smt_int_vars, smt_premises);
+        }
+    }
+
+    fn check_indirect_fn_call(
+        &mut self,
+        label: &str,
+        expected_params: &[TypeExpr],
+        args: &[CallArg],
+        var_types: &BTreeMap<String, TypeExpr>,
+        span: Span,
+    ) {
+        if args.len() != expected_params.len() {
+            self.diagnostics.push(Diagnostic {
+                code: "E0202".into(),
+                message: format!(
+                    "function value `{}` expects {} argument(s), found {}",
+                    label,
+                    expected_params.len(),
+                    args.len()
+                ),
+                span,
+                notes: vec![],
+                counterexample: BTreeMap::new(),
+            });
+        }
+        for (ep, a) in expected_params.iter().zip(args.iter()) {
+            if let ExprKind::Lambda { params, ret_ty, body } = &a.value.kind {
+                self.check_lambda(params, ret_ty.as_ref(), body, Some(ep), var_types, a.value.span);
+            }
+            let actual = self.infer_expr_type_expected(&a.value, Some(ep), var_types);
+            if !self.types_compatible(ep, &actual) {
+                self.diagnostics.push(Diagnostic {
+                    code: "E0205".into(),
+                    message: format!(
+                        "type mismatch calling `{}`: expected `{}`, found `{}`",
+                        label,
+                        ep.display_name(),
+                        actual.display_name()
+                    ),
+                    span: a.value.span,
+                    notes: vec![],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+        }
+    }
+
+    fn check_variant_ctor_args(
+        &mut self,
+        label: &str,
+        vi: &VariantInfo,
+        args: &[CallArg],
+        var_types: &BTreeMap<String, TypeExpr>,
+        span: Span,
+    ) {
+        if args.len() != vi.payload_tys.len() {
+            self.diagnostics.push(Diagnostic {
+                code: "E0202".into(),
+                message: format!(
+                    "variant `{}` expects {} argument(s), found {}",
+                    label,
+                    vi.payload_tys.len(),
+                    args.len()
+                ),
+                span,
+                notes: vec![],
+                counterexample: BTreeMap::new(),
+            });
+        }
+        let mut esubst = BTreeMap::new();
+        if let Some(ed) = self.enums.get(&vi.enum_name).cloned() {
+            if !ed.type_params.is_empty() {
+                for (pty, a) in vi.payload_tys.iter().zip(args.iter()) {
+                    let aty = self.infer_expr_type(&a.value, var_types);
+                    Self::unify_type_pattern(pty, &aty, &ed.type_params, &mut esubst);
+                }
+                for (tp, ta) in &esubst {
+                    if ta.display_name() != "Any" && !self.cur_type_params.contains(&ta.display_name()) {
+                        if let Some(bounds) = ed.type_param_bounds.get(tp) {
+                            for b in bounds {
+                                if !self.type_implements(ta, b) {
+                                    self.diagnostics.push(Diagnostic {
+                                        code: "E0505".into(),
+                                        message: format!(
+                                            "type `{}` does not satisfy interface bound `{}` for type parameter `{}` of `{}`",
+                                            ta.display_name(),
+                                            b,
+                                            tp,
+                                            ed.name
+                                        ),
+                                        span,
+                                        notes: vec![format!("add `impl {} for {} {{ ... }}`", b, ta.display_name())],
+                                        counterexample: BTreeMap::new(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (pty, a) in vi.payload_tys.iter().zip(args.iter()) {
+            let expected = if esubst.is_empty() {
+                pty.clone()
+            } else {
+                subst_type_expr(pty, &esubst)
+            };
+            let actual_ty = self.infer_expr_type(&a.value, var_types);
+            if !self.types_compatible(&expected, &actual_ty) {
+                self.diagnostics.push(Diagnostic {
+                    code: "E0205".into(),
+                    message: format!(
+                        "variant `{}` payload expects `{}`, found `{}`",
+                        label,
+                        expected.display_name(),
+                        actual_ty.display_name()
+                    ),
+                    span: a.value.span,
+                    notes: vec![],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+        }
+    }
+
+    fn check_lambda(
+        &mut self,
+        params: &[LambdaParam],
+        ret_ty: Option<&TypeExpr>,
+        body: &Expr,
+        expected: Option<&TypeExpr>,
+        outer_var_types: &BTreeMap<String, TypeExpr>,
+        span: Span,
+    ) {
+        let (exp_params, exp_ret): (Vec<TypeExpr>, Option<TypeExpr>) =
+            match expected.map(|t| self.resolve_base_type(t)) {
+                Some(TypeExpr::Fn { params: ep, ret: er, .. }) => (ep, er.map(|r| *r)),
+                _ => (Vec::new(), None),
+            };
+        let mut lam_vars = outer_var_types.clone();
+        let mut lam_env = L0Env {
+            pure_fns: self.pure_fns.clone(),
+            type_aliases: self.type_aliases.clone(),
+            ..Default::default()
+        };
+        let mut lam_smt_vars = BTreeSet::new();
+        let mut lam_premises = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let pty = p
+                .ty
+                .clone()
+                .or_else(|| exp_params.get(i).cloned())
+                .unwrap_or_else(|| named_ty("Any"));
+            if p.name != "_" {
+                lam_vars.insert(p.name.clone(), pty.clone());
+                self.assume_type_facts(&p.name, &pty, &mut lam_env, &mut lam_smt_vars, &mut lam_premises);
+            }
+        }
+        let effective_ret = ret_ty.cloned().or(exp_ret);
+        let synth_fn = FnDecl {
+            attrs: vec![],
+            is_pub: false,
+            is_pure: false,
+            is_async: false,
+            is_test: false,
+            name: "<lambda>".into(),
+            type_params: vec![],
+            type_param_bounds: BTreeMap::new(),
+            params: vec![],
+            ret_ty: effective_ret.clone(),
+            requires: vec![],
+            ensures: vec![],
+            body: Block { stmts: vec![], tail: None, span },
+            span,
+        };
+        let mut lam_mut = BTreeSet::new();
+        let mut lam_saw_return = false;
+        self.check_expr(
+            body,
+            &synth_fn,
+            &mut lam_env,
+            &mut lam_smt_vars,
+            &mut lam_premises,
+            &lam_vars,
+            &lam_mut,
+            &None,
+            &mut lam_saw_return,
+        );
+        if let Some(rt) = ret_ty {
+            let actual = self.infer_expr_type_expected(body, Some(rt), &lam_vars);
+            if !self.types_compatible(rt, &actual) {
+                self.diagnostics.push(Diagnostic {
+                    code: "E0205".into(),
+                    message: format!(
+                        "lambda return type mismatch: expected `{}`, found `{}`",
+                        rt.display_name(),
+                        actual.display_name()
+                    ),
+                    span: body.span,
+                    notes: vec![],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+        }
+        let _ = &mut lam_mut;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4423,6 +5866,46 @@ impl CheckerCtx {
     }
 }
 
+fn assign_op_to_binop(op: AssignOp) -> Option<BinOp> {
+    match op {
+        AssignOp::Set => None,
+        AssignOp::AddSet => Some(BinOp::Add),
+        AssignOp::SubSet => Some(BinOp::Sub),
+        AssignOp::MulSet => Some(BinOp::Mul),
+        AssignOp::DivSet => Some(BinOp::Div),
+        AssignOp::BitAndSet => Some(BinOp::BitAnd),
+        AssignOp::BitOrSet => Some(BinOp::BitOr),
+        AssignOp::BitXorSet => Some(BinOp::BitXor),
+        AssignOp::ShlSet => Some(BinOp::Shl),
+        AssignOp::ShrSet => Some(BinOp::Shr),
+    }
+}
+
+fn pattern_is_irrefutable(pat: &Pattern) -> bool {
+    match pat {
+        Pattern::Wildcard(_) | Pattern::Ident(_, _) => true,
+        Pattern::Tuple(pats, _) => pats.iter().all(pattern_is_irrefutable),
+        _ => false,
+    }
+}
+
+fn collect_pattern_bindings(pat: &Pattern, out: &mut BTreeSet<String>) {
+    match pat {
+        Pattern::Ident(s, _) if s != "_" => {
+            out.insert(s.clone());
+        }
+        Pattern::Variant { binding: Some(b), .. } if b != "_" => {
+            out.insert(b.clone());
+        }
+        Pattern::VariantMulti { patterns, .. } | Pattern::Tuple(patterns, _) => {
+            for p in patterns {
+                collect_pattern_bindings(p, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn block_always_diverges(blk: &Block) -> bool {
     if blk.stmts.iter().any(|s| {
         matches!(
@@ -4475,7 +5958,9 @@ fn collect_mutated_vars_in_block(blk: &Block, out: &mut BTreeSet<String>) {
                 out.insert(target.clone());
                 collect_mutated_vars_in_block(body, out);
             }
-            Stmt::While { body, .. } => collect_mutated_vars_in_block(body, out),
+            Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                collect_mutated_vars_in_block(body, out);
+            }
             Stmt::Expr { expr, .. } => collect_mutated_vars_in_expr(expr, out),
             _ => {}
         }
@@ -4736,6 +6221,13 @@ fn apply_mutate_block_symbolic(
                                 AssignOp::Set => rhs,
                                 AssignOp::AddSet => format!("(+ {} {})", cur, rhs),
                                 AssignOp::SubSet => format!("(- {} {})", cur, rhs),
+                                AssignOp::MulSet => format!("(* {} {})", cur, rhs),
+                                AssignOp::DivSet => format!("(div {} {})", cur, rhs),
+                                AssignOp::BitAndSet
+                                | AssignOp::BitOrSet
+                                | AssignOp::BitXorSet
+                                | AssignOp::ShlSet
+                                | AssignOp::ShrSet => cur,
                             };
                             sym_fields.insert(field.clone(), updated);
                             *mutated_any = true;

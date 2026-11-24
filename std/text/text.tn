@@ -86,6 +86,10 @@ impl Int {
         int_to_text(self)
     }
 
+    pub pure fn to_float(self) Float {
+        int_to_float(self)
+    }
+
     pub pure fn parse(s Text) Result[Int, Text] {
         s.parse_int()
     }
@@ -340,5 +344,9 @@ impl Text {
             return Ok(-acc)
         }
         Ok(acc)
+    }
+
+    pub pure fn parse_float(self) Result[Float, Text] {
+        Float.parse(self)
     }
 }

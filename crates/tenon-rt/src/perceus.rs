@@ -9,6 +9,8 @@ pub const TAG_LIST: i64 = 4;
 pub const TAG_TEXT: i64 = 5;
 pub const TAG_ASYNC_FRAME: i64 = 6;
 pub const TAG_DYN: i64 = 7;
+pub const TAG_CLOSURE: i64 = 8;
+pub const TAG_TUPLE: i64 = 9;
 pub const TAG_RECORD_BASE: i64 = 100;
 /// Sentinel `rc_mask` meaning EVERY element in `0..len` is an RC pointer (used for `List[T]` of RC `T`).
 pub const RC_MASK_ALL: u64 = u64::MAX;

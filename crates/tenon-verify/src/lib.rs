@@ -751,4 +751,179 @@ pub fn bad_usage() Int {
             rep.diagnostics
         );
     }
+
+    #[test]
+    fn verifies_p0_expressiveness_positive_and_negative_controls() {
+        // 1. Positive suite: Float, closures + untyped param inference, for loops, `?`, tuples,
+        //    generic enum + nested exhaustive match, f-strings, compound ops, @derive(Eq, Hash) + `==`
+        let good = parse(r#"
+pub type NonNegative = Int where self >= 0
+
+pub interface Display {
+    pure fn display(self) Text
+}
+pub interface Eq {
+    pure fn eq(self, other Self) Bool
+}
+pub interface Hash {
+    pure fn hash(self) NonNegative
+}
+
+impl Display for Int {
+    pub pure fn display(self) Text { "int" }
+}
+impl Display for Text {
+    pub pure fn display(self) Text { self }
+}
+impl Eq for Int {
+    pub pure fn eq(self, other Int) Bool { self == other }
+}
+impl Hash for Int {
+    pub pure fn hash(self) NonNegative { self & 9223372036854775807 }
+}
+impl Eq for Text {
+    pub pure fn eq(self, other Text) Bool { self == other }
+}
+impl Hash for Text {
+    pub pure fn hash(self) NonNegative { len(self) }
+}
+
+@derive(Eq, Hash)
+pub record PairRec {
+    id   Int
+    name Text
+}
+
+pub enum Tree[T] {
+    Empty
+    Leaf(T)
+    Node(Tree[T], T, Tree[T])
+}
+
+pub pure fn apply_fn(x Int, f fn(Int) Int) Int {
+    f(x)
+}
+
+pub pure fn try_res(r Result[Int, Text]) Result[Int, Text] {
+    let v = r?
+    Ok(v + 1)
+}
+
+pub pure fn try_opt(o Option[Int]) Option[Int] {
+    let v = o?
+    Some(v * 2)
+}
+
+pub pure fn ok_all() Int {
+    var f = 1.5
+    f += 2.5
+    f *= 2.0
+    f /= 4.0
+    let _ = f < 3.0 && -f < 0.0
+
+    let base = 10
+    let y = apply_fn(5, |x| x + base)
+    let adder fn(Int) Int = |a Int| a + 1
+    let z = adder(y)
+
+    var s = 0
+    for i in 0..5 {
+        s += i
+    }
+    let xs = [1, 2, 3]
+    for x in xs {
+        s += x
+    }
+    s *= 2
+    s /= 2
+    s |= 1
+    s &= 255
+    s ^= 0
+    s <<= 1
+    s >>= 1
+
+    let t = (10, "hi", 2.0)
+    let (a, b, _) = t
+    let msg = f"{b}:{a}:{t.0}"
+    let _ = len(msg)
+
+    let tr Tree[Int] = Node(Leaf(1), 2, Leaf(3))
+    let tv = match tr {
+        Empty => 0
+        Leaf(v) => v
+        Node(Leaf(l), v, Leaf(r)) => l + v + r
+        Node(_, v, _) => v
+    }
+
+    let nested Option[Result[(Int, Text), Text]] = Some(Ok((7, "ok")))
+    let nv = match nested {
+        Some(Ok((n, txt))) => n + len(txt)
+        Some(Err(_)) => 0
+        None => 0
+    }
+
+    let p1 = PairRec { id = 1, name = "a" }
+    let p2 = PairRec { id = 1, name = "a" }
+    let eq_ok = p1 == p2 && !(p1 != p2)
+    if eq_ok { z + s + tv + nv } else { 0 }
+}
+"#)
+        .unwrap();
+        let mut good_exp = good;
+        tenon_syntax::expand_derives(&mut good_exp);
+        let good_rep = check_program(&good_exp);
+        assert!(
+            good_rep.ok,
+            "valid P0 expressiveness suite should verify cleanly, got: {:?}",
+            good_rep.diagnostics
+        );
+
+        // 2. Negative controls: Float+Int (E0205), `?` return mismatch (E0208),
+        //    non-exhaustive nested match (E0301), `==` without Eq (E0505), tuple OOB (E0206)
+        let bad = parse(r#"
+pub record NoEq { x Int }
+
+pub fn bad_float_mix() Float {
+    1.5 + 2
+}
+
+pub fn bad_try_in_int(r Result[Int, Text]) Int {
+    let v = r?
+    v
+}
+
+pub fn bad_try_opt_in_res(o Option[Int]) Result[Int, Text] {
+    let v = o?
+    Ok(v)
+}
+
+pub fn bad_nested_match(o Option[Result[Int, Text]]) Int {
+    match o {
+        Some(Ok(v)) => v
+        None => 0
+    }
+}
+
+pub fn bad_eq_and_tuple() Int {
+    let a = NoEq { x = 1 }
+    let b = NoEq { x = 2 }
+    let _ = a == b
+    let t = (1, 2)
+    t.2
+}
+"#)
+        .unwrap();
+        let bad_rep = check_program(&bad);
+        assert!(!bad_rep.ok);
+        let codes: Vec<&str> = bad_rep.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0205"), "expected E0205 on Float+Int, got {:?}", codes);
+        assert!(
+            codes.iter().filter(|&&c| c == "E0208").count() >= 2,
+            "expected >=2 E0208 on invalid `?`, got {:?}",
+            bad_rep.diagnostics
+        );
+        assert!(codes.contains(&"E0301"), "expected E0301 on non-exhaustive nested match, got {:?}", codes);
+        assert!(codes.contains(&"E0505"), "expected E0505 on `==` without Eq, got {:?}", codes);
+        assert!(codes.contains(&"E0206"), "expected E0206 on tuple index out of bounds, got {:?}", codes);
+    }
 }
