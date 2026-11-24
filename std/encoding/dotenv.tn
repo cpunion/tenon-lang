@@ -1,52 +1,63 @@
 // Tenon Standard Library — Layer 2: std/encoding/dotenv.tn
-// Pure `.env` parser returning structured `TextMap` or `Option[Text]`.
+// Pure `.env` parser returning structured `TextMap` (`Dotenv.parse` & aliased `dotenv.parse`).
 
 import "std/core/types.tn"
 import "std/text/text.tn"
 import "std/collections/map.tn"
 
-pub pure fn dotenv_parse(content Text) TextMap {
-    var out = text_map_new()
-    let n = len(content)
-    var pos = 0
-    while pos < n {
-        let p_ok = clamp_non_neg(pos)
-        let nl = match content.find_from("\n", p_ok) {
-            Some(idx) => idx
-            None => n
-        }
-        let line = str_slice(content, p_ok, nl).trim()
-        pos = nl + 1
-        if line.is_empty() || byte_at(line, 0) == 35 {
-            continue
-        }
-        let clean = match line.strip_prefix("export ") {
-            Some(rest) => rest.trim()
-            None => line
-        }
-        match clean.find("=") {
-            None => { continue }
-            Some(eq) => {
-                if eq == 0 {
-                    continue
-                }
-                let k = str_slice(clean, 0, eq).trim()
-                var v = str_slice(clean, eq + 1, len(clean)).trim()
-                let vlen = len(v)
-                if vlen >= 2 {
-                    let first = byte_at(v, 0)
-                    let last = byte_at(v, vlen - 1)
-                    if (first == 34 && last == 34) || (first == 39 && last == 39) {
-                        v = str_slice(v, 1, vlen - 1)
+pub record Dotenv {
+    entries TextMap
+}
+
+impl Dotenv {
+    pub pure fn parse(content Text) TextMap {
+        var out = TextMap.new()
+        let n = content.len()
+        var pos = 0
+        while pos < n {
+            let p_ok = clamp_non_neg(pos)
+            let nl = content.find_from("\n", p_ok).unwrap_or(n)
+            let line = str_slice(content, p_ok, nl).trim()
+            pos = nl + 1
+            if line.is_empty() || byte_at(line, 0) == 35 {
+                continue
+            }
+            let clean = match line.strip_prefix("export ") {
+                Some(rest) => rest.trim()
+                None => line
+            }
+            match clean.find("=") {
+                None => { continue }
+                Some(eq) => {
+                    if eq == 0 {
+                        continue
                     }
+                    let k = str_slice(clean, 0, eq).trim()
+                    var v = str_slice(clean, eq + 1, clean.len()).trim()
+                    let vlen = v.len()
+                    if vlen >= 2 {
+                        let first = byte_at(v, 0)
+                        let last = byte_at(v, vlen - 1)
+                        if (first == 34 && last == 34) || (first == 39 && last == 39) {
+                            v = str_slice(v, 1, vlen - 1)
+                        }
+                    }
+                    out.set(k, v)
                 }
-                out = out.set(k, v)
             }
         }
+        out
     }
-    out
+
+    pub pure fn lookup(content Text, key Text) Option[Text] {
+        Dotenv.parse(content).get(key)
+    }
+}
+
+pub pure fn dotenv_parse(content Text) TextMap {
+    Dotenv.parse(content)
 }
 
 pub pure fn dotenv_lookup(content Text, key Text) Option[Text] {
-    dotenv_parse(content).get(key)
+    Dotenv.lookup(content, key)
 }

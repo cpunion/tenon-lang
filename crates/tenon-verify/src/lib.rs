@@ -576,4 +576,60 @@ pub fn bad_uses(f dyn Factory) Int {
         assert!(codes.contains(&"E0505"), "expected E0505 unsatisfied interface bound/dyn, got {:?}", codes);
         assert!(codes.contains(&"E0506"), "expected E0506 non-object-safe dyn, got {:?}", codes);
     }
+
+    #[test]
+    fn enforces_oop_list_push_mutability_and_dyn_element_bounds() {
+        let src = r#"
+pub interface Tool {
+    pure fn name(self) Text
+}
+
+pub record GoodTool { id Int }
+pub record NotATool { id Int }
+
+impl Tool for GoodTool {
+    pure fn name(self) Text { "good" }
+}
+
+impl[T] List[T] {
+    pub pure fn push(inout self, item T) {
+        self = push(self, item)
+    }
+}
+
+pub record Holder {
+    tools List[dyn Tool]
+}
+
+impl Holder {
+    pub pure fn bad_imm_field(self, t dyn Tool) {
+        self.tools.push(t)
+    }
+}
+
+pub fn bad_uses() Int {
+    let frozen List[dyn Tool] = []
+    frozen.push(GoodTool { id = 1 })
+
+    var ok List[dyn Tool] = []
+    ok.push(NotATool { id = 2 })
+    0
+}
+"#;
+        let prog = parse(src).unwrap();
+        let rep = check_program(&prog);
+        assert!(!rep.ok);
+        let codes: Vec<&str> = rep.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        let e0203_count = codes.iter().filter(|&&c| c == "E0203").count();
+        assert!(
+            e0203_count >= 2,
+            "expected >=2 E0203 (immutable `let` and immutable `self.tools.push`), got {:?}",
+            rep.diagnostics
+        );
+        assert!(
+            codes.contains(&"E0505"),
+            "expected E0505 when pushing non-Tool into List[dyn Tool], got {:?}",
+            rep.diagnostics
+        );
+    }
 }

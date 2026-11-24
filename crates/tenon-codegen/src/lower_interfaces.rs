@@ -511,7 +511,9 @@ impl LowerCtx {
                 ExprKind::Field { target, field } => {
                     if field == "parse" {
                         if let ExprKind::Ident(rname) = &target.kind {
-                            if self.records.contains_key(rname) {
+                            if self.records.contains_key(rname)
+                                && self.lookup_concrete_method(rname, "parse").is_none()
+                            {
                                 return generic_ty("Result", vec![named_ty(rname), named_ty("Int")]);
                             }
                         }
@@ -547,7 +549,9 @@ impl LowerCtx {
                                     if let Some(rt) = &tmpl.ret_ty {
                                         let mut subst = BTreeMap::new();
                                         for (tp, ra) in tmpl.type_params.iter().zip(rargs.iter()) {
-                                            subst.insert(tp.clone(), ra.clone());
+                                            if ra.display_name() != "Any" {
+                                                subst.insert(tp.clone(), ra.clone());
+                                            }
                                         }
                                         return subst_type(rt, &subst);
                                     }
@@ -1088,10 +1092,12 @@ impl LowerCtx {
                     }
                     // 3. Associated call `Type.method(args)` OR receiver method call `x.method(args)`!
                     ExprKind::Field { target, field } => {
-                        // Preserve `Record.parse(...)` and `Enum.Variant(...)`
+                        // Preserve auto-derived `Record.parse(...)` (unless explicit `impl Record::parse` exists) and `Enum.Variant(...)`
                         if field == "parse" {
                             if let ExprKind::Ident(rname) = &target.kind {
-                                if self.records.contains_key(rname) {
+                                if self.records.contains_key(rname)
+                                    && self.lookup_concrete_method(rname, "parse").is_none()
+                                {
                                     return Expr {
                                         kind: ExprKind::Call {
                                             callee: callee.clone(),
@@ -1176,7 +1182,9 @@ impl LowerCtx {
                                     let final_fn = if let Some(tmpl) = self.generic_templates.get(&mname).cloned() {
                                         let mut subst = BTreeMap::new();
                                         for (tp, ra) in tmpl.type_params.iter().zip(rargs.iter()) {
-                                            subst.insert(tp.clone(), ra.clone());
+                                            if ra.display_name() != "Any" {
+                                                subst.insert(tp.clone(), ra.clone());
+                                            }
                                         }
                                         let inferred = self.infer_generic_subst(&tmpl, &[], &full_args, var_types);
                                         for (k, v) in inferred {

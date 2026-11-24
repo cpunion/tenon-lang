@@ -1,12 +1,11 @@
 // Tenon Interactive CLI Agent — Written 100% in Tenon!
 //
-// Layered architecture:
-//   1. Minimal Language Core (`tenon-rt`: Perceus RC/COW/vtable + minimal byte/buffer/OS/HTTP syscalls)
-//   2. 4-Layer Pure-Tenon Standard Library (`std/core`, `std/text`, `std/collections`, `std/encoding`, `std/os`)
-//   3. Application SDK (`examples/agent/lib/llm.tn` + `examples/agent/lib/tools.tn`)
-//      using `dyn LlmProvider`, `List[dyn Tool]`, `@derive(FromJson, JsonSchema)`, and `SafeRelPath`
-//   4. Formally verified `AgentLease` (Z3 `mutate`), `@no_heap_alloc`, `lock_lattice`, and
-//      `protocol state_machine`, runnable via Cranelift JIT (`live_objects=0`) & LLVM 22 `-O3` AOT!
+// Layered OOP architecture:
+//   1. Minimal Language Core (`tenon-rt`: Perceus RC/COW/vtable + 24 byte/buffer/OS/HTTP syscalls)
+//   2. 4-Layer OOP Pure-Tenon Stdlib (`List.push`, `TextBuilder.new`, `TextMap.new`, `JsonValue`, `Env`, `OsFs`, `HttpStream`)
+//   3. Decoupled Application SDK (`examples/agent/lib/{llm,tools}.tn`): `dyn LlmProvider`, `ToolRegistry` (`List[dyn Tool]`),
+//      `@derive(FromJson, JsonSchema)` + `SafeRelPath`
+//   4. Formally verified `AgentLease` (Z3 `mutate`), `@no_heap_alloc`, `lock_lattice`, and `protocol state_machine`!
 
 import "std/core/types.tn"
 import "std/core/ops.tn"
@@ -39,19 +38,25 @@ pub lock_lattice AgentLocks {
     SessionLease < ToolExec
 }
 
-@acquires("SessionLease")
-pub fn bump_turn_epoch(inout lease AgentLease) {
-    mutate lease {
-        lease.epoch += 1
-        lease.turns_done += 1
+impl AgentLease {
+    pub pure fn new() AgentLease {
+        AgentLease { branch_id = 1, epoch = 0, turns_done = 0 }
     }
-}
 
-@acquires("SessionLease")
-pub fn fork_clean_branch(inout lease AgentLease) {
-    mutate lease {
-        lease.branch_id += 1
-        lease.epoch += 1
+    @acquires("SessionLease")
+    pub fn bump_turn_epoch(inout self) {
+        mutate self {
+            self.epoch += 1
+            self.turns_done += 1
+        }
+    }
+
+    @acquires("SessionLease")
+    pub fn fork_clean_branch(inout self) {
+        mutate self {
+            self.branch_id += 1
+            self.epoch += 1
+        }
     }
 }
 
@@ -85,7 +90,7 @@ pub protocol state_machine TenonCliAgentFence {
 }
 
 // =========================================================================
-// 2. Multi-Round Pure-Tenon ReAct Loop (`dyn LlmProvider` + `List[dyn Tool]`)
+// 2. Multi-Round Pure-Tenon ReAct Loop (`dyn LlmProvider` + `ToolRegistry`)
 // =========================================================================
 
 pub pure fn agent_instructions(workspace Text) Text {
@@ -99,21 +104,20 @@ pub pure fn agent_instructions(workspace Text) Text {
 pub fn run_agent_turn(
     inout lease AgentLease,
     provider dyn LlmProvider,
-    tools List[dyn Tool],
+    registry ToolRegistry,
     workspace Text,
-    conv_items List[JsonValue],
+    inout items List[JsonValue],
     user_prompt Text
-) List[JsonValue] {
-    bump_turn_epoch(lease)
+) {
+    lease.bump_turn_epoch()
     let active_epoch = lease.epoch
     assert is_epoch_valid(lease.epoch, active_epoch)
 
-    let session_id = "tenon-cli-b" ++ int_to_text(lease.branch_id)
+    let session_id = "tenon-cli-b" ++ lease.branch_id.to_text()
     let instructions = agent_instructions(workspace)
-    let tools_schema = build_tools_schema(tools)
+    let tools_schema = registry.schemas()
 
-    var items List[JsonValue] = conv_items
-    items = push(items, llm_user_item(user_prompt))
+    items.push(LlmRequest.user_item(user_prompt))
     var rounds = 0
     var total_tools = 0
     var total_in = 0
@@ -131,29 +135,28 @@ pub fn run_agent_turn(
         }
         match provider.stream_turn(req) {
             Err(err) => {
-                let _ = println("[agent error] " ++ err)
-                return items
+                println("[agent error] " ++ err)
+                return
             }
             Ok(turn) => {
                 var oi = 0
-                while oi < len(turn.output_items) {
-                    items = push(items, turn.output_items[oi])
+                while oi < turn.output_items.len() {
+                    items.push(turn.output_items[oi])
                     oi += 1
                 }
                 total_in += turn.usage.input_tokens
                 total_cached += turn.usage.cached_tokens
                 total_out += turn.usage.output_tokens
 
-                let ncalls = len(turn.tool_calls)
-                if ncalls == 0 {
+                if turn.tool_calls.is_empty() {
                     break
                 }
 
                 var ci = 0
-                while ci < ncalls {
+                while ci < turn.tool_calls.len() {
                     let call = turn.tool_calls[ci]
-                    let tool_out = dispatch_dyn_tool(tools, workspace, call.name, call.arguments)
-                    items = push(items, llm_tool_output_item(call.call_id, tool_out))
+                    let tool_out = registry.dispatch(workspace, call.name, call.arguments)
+                    items.push(LlmRequest.tool_output_item(call.call_id, tool_out))
                     total_tools += 1
                     ci += 1
                 }
@@ -161,75 +164,73 @@ pub fn run_agent_turn(
         }
     }
 
-    let _ = println(
-        "[tenon-agent branch=#" ++ int_to_text(lease.branch_id) ++
-        " epoch=" ++ int_to_text(lease.epoch) ++
+    println(
+        "[tenon-agent branch=#" ++ lease.branch_id.to_text() ++
+        " epoch=" ++ lease.epoch.to_text() ++
         " model=" ++ provider.model_name() ++
-        " rounds=" ++ int_to_text(rounds) ++
-        " tools=" ++ int_to_text(total_tools) ++
-        " in=" ++ int_to_text(total_in) ++
-        " cached=" ++ int_to_text(total_cached) ++
-        " out=" ++ int_to_text(total_out) ++ "]"
+        " rounds=" ++ rounds.to_text() ++
+        " tools=" ++ total_tools.to_text() ++
+        " in=" ++ total_in.to_text() ++
+        " cached=" ++ total_cached.to_text() ++
+        " out=" ++ total_out.to_text() ++ "]"
     )
-    items
 }
 
 // =========================================================================
 // 3. Interactive CLI REPL & Single-Shot Entry Point
 // =========================================================================
 
-pub fn print_help() Int {
-    let _ = println("Commands:")
-    let _ = println("  /model <luna|terra|sol|astra|<id>>  Switch dast-os OpenAI model (hot-swaps dyn LlmProvider)")
-    let _ = println("  /state                              Show verified AgentLease & context info")
-    let _ = println("  /branch                             Fork clean branch (Z3-proved mutate) & clear context")
-    let _ = println("  /clear                              Clear conversation context")
-    let _ = println("  /help                               Show this help message")
-    let _ = println("  /exit                               Exit Tenon CLI Agent")
-    0
+pub fn print_help() {
+    println("Commands:")
+    println("  /model <luna|terra|sol|astra|<id>>  Switch dast-os OpenAI model (hot-swaps dyn LlmProvider)")
+    println("  /state                              Show verified AgentLease & context info")
+    println("  /branch                             Fork clean branch (Z3-proved mutate) & clear context")
+    println("  /clear                              Clear conversation context")
+    println("  /help                               Show this help message")
+    println("  /exit                               Exit Tenon CLI Agent")
 }
 
 pub fn main() Int {
-    let api_key = match env_or_dotenv("OPENAI_API_KEY") {
+    let api_key = match Env.get_or_dotenv("OPENAI_API_KEY") {
         Some(k) => k
         None => {
-            let _ = println("error: OPENAI_API_KEY not found in environment or .env")
+            println("error: OPENAI_API_KEY not found in environment or .env")
             return 1
         }
     }
-    let base_url = env_or_dotenv("OPENAI_BASE_URL")
-    let workspace = env_get("TENON_WORKSPACE").unwrap_or(env_cwd())
-    let initial_model = env_get("TENON_MODEL").unwrap_or("")
+    let base_url = Env.get_or_dotenv("OPENAI_BASE_URL")
+    let workspace = Env.get("TENON_WORKSPACE").unwrap_or(Env.cwd())
+    let initial_model = Env.get("TENON_MODEL").unwrap_or("")
 
-    var provider dyn LlmProvider = openai_provider_new(api_key, base_url, initial_model)
-    let tools List[dyn Tool] = default_agent_tools()
-    var lease AgentLease = AgentLease { branch_id = 1, epoch = 0, turns_done = 0 }
+    var provider dyn LlmProvider = OpenAIProvider.new(api_key, base_url, initial_model)
+    let registry = ToolRegistry.default_agent()
+    var lease = AgentLease.new()
     var conv_items List[JsonValue] = []
 
     // Single-shot mode via TENON_PROMPT="..."
-    match env_get("TENON_PROMPT") {
+    match Env.get("TENON_PROMPT") {
         Some(single_prompt) => {
-            let _ = println("Tenon Pure-Language CLI Agent | model=" ++ provider.model_name() ++ " (" ++ provider.effort_name() ++ ") | workspace=" ++ workspace)
-            conv_items = run_agent_turn(lease, provider, tools, workspace, conv_items, single_prompt)
+            println("Tenon Pure-Language CLI Agent | model=" ++ provider.model_name() ++ " (" ++ provider.effort_name() ++ ") | workspace=" ++ workspace)
+            run_agent_turn(lease, provider, registry, workspace, conv_items, single_prompt)
             return 0
         }
         None => {}
     }
 
     // Interactive REPL mode
-    let _ = println("======================================================================")
-    let _ = println("  Tenon Interactive CLI Agent (100% Pure Tenon + 4-Layer Stdlib + dyn)")
-    let _ = println("  Model:     " ++ provider.model_name() ++ " (reasoning=" ++ provider.effort_name() ++ ")")
-    let _ = println("  Workspace: " ++ workspace)
-    let _ = println("  Tools:     " ++ int_to_text(len(tools)) ++ " registered `dyn Tool` plugins (derived JSON Schema)")
-    let _ = println("  Commands:  /model <luna|terra|sol|astra>  /state  /branch  /clear  /help  /exit")
-    let _ = println("======================================================================")
+    println("======================================================================")
+    println("  Tenon Interactive CLI Agent (100% Pure Tenon + OOP Stdlib + dyn)")
+    println("  Model:     " ++ provider.model_name() ++ " (reasoning=" ++ provider.effort_name() ++ ")")
+    println("  Workspace: " ++ workspace)
+    println("  Tools:     " ++ registry.len().to_text() ++ " registered `dyn Tool` plugins (derived JSON Schema)")
+    println("  Commands:  /model <luna|terra|sol|astra>  /state  /branch  /clear  /help  /exit")
+    println("======================================================================")
 
     while true {
-        let _ = print("\ntenon[" ++ provider.model_name() ++ "]> ")
+        print("\ntenon[" ++ provider.model_name() ++ "]> ")
         let raw_line = match read_line() {
             None => {
-                let _ = println("\nBye.")
+                println("\nBye.")
                 break
             }
             Some(l) => l
@@ -239,50 +240,50 @@ pub fn main() Int {
             continue
         }
         if line == "/exit" || line == "/quit" || line == "exit" || line == "quit" {
-            let _ = println("Bye.")
+            println("Bye.")
             break
         }
         if line == "/help" {
-            let _ = print_help()
+            print_help()
             continue
         }
         match line.strip_prefix("/model ") {
             Some(raw_alias) => {
-                provider = openai_provider_new(api_key, base_url, raw_alias.trim())
-                let _ = println("Switched model -> " ++ provider.model_name() ++ " (reasoning=" ++ provider.effort_name() ++ ")")
+                provider = OpenAIProvider.new(api_key, base_url, raw_alias.trim())
+                println("Switched model -> " ++ provider.model_name() ++ " (reasoning=" ++ provider.effort_name() ++ ")")
                 continue
             }
             None => {}
         }
         if line == "/state" {
-            let _ = println(
-                "lease: branch=#" ++ int_to_text(lease.branch_id) ++
-                " epoch=" ++ int_to_text(lease.epoch) ++
-                " turns_done=" ++ int_to_text(lease.turns_done) ++
+            println(
+                "lease: branch=#" ++ lease.branch_id.to_text() ++
+                " epoch=" ++ lease.epoch.to_text() ++
+                " turns_done=" ++ lease.turns_done.to_text() ++
                 " model=" ++ provider.model_name() ++
                 " effort=" ++ provider.effort_name() ++
                 " workspace=" ++ workspace ++
-                " tools=" ++ int_to_text(len(tools)) ++
-                " context_items=" ++ int_to_text(len(conv_items))
+                " tools=" ++ registry.len().to_text() ++
+                " context_items=" ++ conv_items.len().to_text()
             )
             continue
         }
         if line == "/branch" {
-            fork_clean_branch(lease)
-            conv_items = []
-            let _ = println(
-                "Forked clean branch -> branch=#" ++ int_to_text(lease.branch_id) ++
-                " epoch=" ++ int_to_text(lease.epoch)
+            lease.fork_clean_branch()
+            conv_items.clear()
+            println(
+                "Forked clean branch -> branch=#" ++ lease.branch_id.to_text() ++
+                " epoch=" ++ lease.epoch.to_text()
             )
             continue
         }
         if line == "/clear" {
-            conv_items = []
-            let _ = println("Cleared conversation context.")
+            conv_items.clear()
+            println("Cleared conversation context.")
             continue
         }
 
-        conv_items = run_agent_turn(lease, provider, tools, workspace, conv_items, line)
+        run_agent_turn(lease, provider, registry, workspace, conv_items, line)
     }
     0
 }

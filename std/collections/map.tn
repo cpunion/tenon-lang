@@ -1,7 +1,8 @@
 // Tenon Standard Library — Layer 1: std/collections/map.tn
-// Value-semantic `TextMap` (MVS + Perceus COW) with fluent `impl TextMap` methods.
+// Value-semantic `TextMap` (MVS + Perceus COW) with OOP mutating (`set`/`clear`) & fluent (`with`) methods.
 
 import "std/core/types.tn"
+import "std/core/ops.tn"
 
 pub record TextMapEntry {
     key Text
@@ -12,19 +13,23 @@ pub record TextMap {
     entries List[TextMapEntry]
 }
 
-pub pure fn text_map_new() TextMap {
-    let empty List[TextMapEntry] = []
-    TextMap { entries = empty }
-}
-
 impl TextMap {
-    pub pure fn size(self) NonNegative {
-        len(self.entries)
+    pub pure fn new() TextMap {
+        let empty List[TextMapEntry] = []
+        TextMap { entries = empty }
+    }
+
+    pub pure fn len(self) NonNegative {
+        self.entries.len()
+    }
+
+    pub pure fn is_empty(self) Bool {
+        self.entries.is_empty()
     }
 
     pub pure fn get(self, key Text) Option[Text] {
         var i = 0
-        while i < len(self.entries) {
+        while i < self.entries.len() {
             let e = self.entries[i]
             if e.key == key {
                 return Some(e.val)
@@ -35,29 +40,34 @@ impl TextMap {
     }
 
     pub pure fn has(self, key Text) Bool {
-        match self.get(key) {
-            Some(_) => true
-            None => false
-        }
+        self.get(key).is_some()
     }
 
-    pub pure fn set(self, key Text, val Text) TextMap {
+    pub pure fn with(self, key Text, val Text) TextMap {
         var next List[TextMapEntry] = []
         var replaced = false
         var i = 0
-        while i < len(self.entries) {
+        while i < self.entries.len() {
             let e = self.entries[i]
             if e.key == key {
-                next = push(next, TextMapEntry { key = key, val = val })
+                next.push(TextMapEntry { key = key, val = val })
                 replaced = true
             } else {
-                next = push(next, e)
+                next.push(e)
             }
             i += 1
         }
         if !replaced {
-            next = push(next, TextMapEntry { key = key, val = val })
+            next.push(TextMapEntry { key = key, val = val })
         }
         TextMap { entries = next }
+    }
+
+    pub pure fn set(inout self, key Text, val Text) {
+        self = self.with(key, val)
+    }
+
+    pub pure fn clear(inout self) {
+        self.entries.clear()
     }
 }

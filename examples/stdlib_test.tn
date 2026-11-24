@@ -1,11 +1,13 @@
-// Tenon Standard Library Self-Test (4-Layer Architecture + Interfaces + @derive JSON/Schema)
+// Tenon Standard Library Self-Test (4-Layer OOP Stdlib + Interfaces + @derive JSON/Schema)
 // Verifies:
-//   - Layer 0 (`std/core/types`, `std/core/ops`): refined primitives, `Option`/`Result` methods, `Display`/`Writer`
-//   - Layer 1 (`std/text/text`, `std/text/builder`, `std/collections/map`): `impl Text` methods, O(n) `TextBuilder`, `TextMap`
-//   - Layer 2 (`std/encoding/json`, `std/encoding/dotenv`): `JsonValue` fluent methods, `import ... as json`,
-//     `@derive(ToJson, FromJson, JsonSchema)` with refined `SliceRange` & `SafeRelPath` boundary proofs!
-//   - Layer 3 (`std/os/io`, `std/os/path`, `std/os/fs`, `std/os/env`, `std/os/process`):
-//     `SafeRelPath`, `FsError`, `dyn FileSystem` (`MemFs` + `OsFs`), `dyn Writer` + static `[W Writer]`!
+//   - Layer 0 (`std/core/types`, `std/core/ops`): refined primitives, `List[T]` OOP methods
+//     (`push`/`len`/`get`/`first`/`last`/`clear`), `Option`/`Result` methods, `Display`/`Writer`
+//   - Layer 1 (`std/text/text`, `std/text/builder`, `std/collections/map`):
+//     `Text` & `Int` OOP methods, O(n) `TextBuilder.new()`, COW `TextMap.new()` (`set`/`with`/`clear`)
+//   - Layer 2 (`std/encoding/json`, `std/encoding/dotenv`): `JsonValue.object()` / `JsonValue.parse()`,
+//     `@derive(ToJson, FromJson, JsonSchema)` with refined `SafeRelPath` & `Positive` boundary proofs
+//   - Layer 3 (`std/os/*`): `SafeRelPath.parse()`, `Path.join()`, `MemFs.new()` / `OsFs.new()`,
+//     `dyn FileSystem`, `dyn Writer` + static `[W Writer]`, `Process.exec()`
 
 import "std/core/types.tn"
 import "std/core/ops.tn"
@@ -59,8 +61,41 @@ pub fn roundtrip_fs(inout storage dyn FileSystem, path Text, content Text) Resul
 }
 
 pub fn main() Int {
-    // 1. Layer 0 + Layer 1: Refined types, `impl Text`, `impl Option`/`Result`, `TextMap`, `TextBuilder`
+    // 1. Layer 0: `List[T]` OOP methods (`push`, `len`, `get`, `first`, `last`, `clear`) — zero leaks!
+    var nums List[Int] = []
+    assert nums.is_empty()
+    nums.push(10)
+    nums.push(20)
+    nums.push(30)
+    assert nums.len() == 3
+    assert nums.first().unwrap_or(0) == 10
+    assert nums.get(1).unwrap_or(0) == 20
+    assert nums.last().unwrap_or(0) == 30
+    assert nums.get(9).is_none()
+    nums.clear()
+    assert nums.is_empty()
+
+    var words List[Text] = []
+    words.push("tenon")
+    words.push("oop")
+    assert words.len() == 2
+    assert words.first().unwrap_or("") == "tenon"
+    assert words.last().unwrap_or("") == "oop"
+
+    // List[dyn Display] with `list.push(...)` auto-boxing concrete types!
+    var items List[dyn Display] = []
+    items.push(42)
+    items.push(true)
+    items.push("hello")
+    assert items.len() == 3
+    assert items[0].display() == "42"
+    assert items[1].display() == "true"
+    assert items[2].display() == "hello"
+
+    // 2. Layer 1: `Text` & `Int` OOP methods, `TextMap.new()`, `TextBuilder.new()`
     let r = SliceRange { start = 0, end = 5 }
+    assert "tenon-lang".len() == 10
+    assert "tenon-lang".slice(0, 5) == "tenon"
     assert "tenon-lang".slice_range(r) == "tenon"
     assert "data: {\"a\":1}".starts_with("data:")
     assert "hello.tn".ends_with(".tn")
@@ -71,33 +106,39 @@ pub fn main() Int {
     assert "tenon-lang".contains("lang")
     assert "a b a".replace_first("a", "X") == "X b a"
     assert "a'b'c".replace_all("'", "'\\''") == "a'\\''b'\\''c"
-    assert int_to_text(-42) == "-42"
-    assert "  -12345 ".parse_int().unwrap_or(0) == -12345
+    assert (-42).to_text() == "-42"
+    assert Int.parse("  -12345 ").unwrap_or(0) == -12345
     assert "12x".parse_int().is_err()
     assert div_exact(21, 3) == 7
 
-    var m = text_map_new()
-    m = m.set("lang", "tenon").set("ver", "3")
-    assert m.size() == 2
+    var m = TextMap.new()
+    m.set("lang", "tenon")
+    m.set("ver", "3")
+    assert m.len() == 2
     assert m.has("lang")
     assert m.get("ver").unwrap_or("") == "3"
+    let m2 = m.with("ver", "4")
+    assert m.get("ver").unwrap_or("") == "3"
+    assert m2.get("ver").unwrap_or("") == "4"
+    m.clear()
+    assert m.is_empty()
 
     // Static `[W Writer]` + Dynamic `dyn Writer` (with default method `write_line`!)
-    var tb = text_builder_new()
+    var tb = TextBuilder.new()
     let _ = write_labeled(tb, "tenon", "ok")
     assert tb.finish() == "tenon:ok"
 
-    let tb2 = text_builder_new()
+    let tb2 = TextBuilder.new()
     var dw dyn Writer = tb2
     let _ = write_dyn(dw, "line1")
     assert tb2.finish() == "line1\n"
 
-    // 2. Layer 2: Aliased `json.*` + fluent `JsonValue` methods + O(n) `TextBuilder` serializer!
+    // 3. Layer 2: `JsonValue.parse` / `json.parse` + fluent `JsonValue` methods + O(n) serializer!
     let sample = "{\"type\":\"response.output_item.done\",\"ok\":true,\"empty\":null,\"nums\":[10,20,30],\"item\":{\"arguments\":\"{\\\"path\\\":\\\"demo.txt\\\",\\\"content\\\":\\\"line1\\\\nline2 \\\\u4f60\\\\u597d\\\"}\"}}"
-    let ev = match json.parse(sample) {
+    let ev = match JsonValue.parse(sample) {
         Ok(v) => v
         Err(err) => {
-            let _ = println("json parse error: " ++ err.message)
+            println("json parse error: " ++ err.message)
             return 1
         }
     }
@@ -131,8 +172,8 @@ pub fn main() Int {
     }
     assert bad_pos > 0
 
-    // 3. `@derive(ToJson, FromJson, JsonSchema)` + Generic `json.encode` / `json.decode[T]`!
-    let p_ok = match safe_rel_path_parse("src/main.tn") {
+    // 4. `@derive(ToJson, FromJson, JsonSchema)` + `SafeRelPath.parse` + Generic `json.encode` / `json.decode[T]`!
+    let p_ok = match SafeRelPath.parse("src/main.tn") {
         Ok(p) => p
         Err(_) => { return 2 }
     }
@@ -148,7 +189,7 @@ pub fn main() Int {
     let decoded = match json.decode[FilePatchReq](encoded) {
         Ok(d) => d
         Err(e) => {
-            let _ = println("decode error: " ++ e.message)
+            println("decode error: " ++ e.message)
             return 3
         }
     }
@@ -158,9 +199,7 @@ pub fn main() Int {
     assert decoded.note.unwrap_or("") == "verified"
 
     // Refinement boundary enforcement in derived `FromJson`:
-    // (a) path traversal `../etc/passwd` MUST be rejected!
     assert json.decode[FilePatchReq]("{\"path\":\"../etc/passwd\",\"line_no\":1,\"new_text\":\"x\"}").is_err()
-    // (b) non-positive `line_no: 0` MUST be rejected!
     assert json.decode[FilePatchReq]("{\"path\":\"ok.tn\",\"line_no\":0,\"new_text\":\"x\"}").is_err()
 
     // Derived `JsonSchema` includes description + minimum: 1 from `Positive`!
@@ -183,13 +222,13 @@ pub fn main() Int {
     }
     assert ev_rt == "hello"
 
-    // 4. Layer 2: Aliased `dotenv.parse` returning `TextMap`
+    // 5. Layer 2: `Dotenv.parse` & aliased `dotenv.parse` returning `TextMap`
     let env_map = dotenv.parse("# c\nexport FOO = \"bar_baz\"\nA=1\n")
     assert env_map.get("FOO").unwrap_or("") == "bar_baz"
     assert env_map.get("MISSING").is_none()
 
-    // 5. Layer 3: `dyn FileSystem` with BOTH pure in-memory `MemFs` AND real `OsFs`!
-    var mem dyn FileSystem = mem_fs_new()
+    // 6. Layer 3: `dyn FileSystem` with BOTH pure in-memory `MemFs.new()` AND real `OsFs.new()`!
+    var mem dyn FileSystem = MemFs.new()
     let mem_res = match roundtrip_fs(mem, "virtual/hello.txt", "sandboxed") {
         Ok(txt) => txt
         Err(e) => e.message()
@@ -197,15 +236,15 @@ pub fn main() Int {
     assert mem_res == "sandboxed"
 
     let ws = "/tmp/tenon_stdlib_v3_test_ws"
-    let _ = exec_sh("mkdir -p " ++ shell_quote(ws))
-    var real_fs dyn FileSystem = os_fs_new()
-    let os_res = match roundtrip_fs(real_fs, path_join(ws, "real.txt"), "from os_fs") {
+    let _ = Process.exec("mkdir -p " ++ Path.shell_quote(ws))
+    var real_fs dyn FileSystem = OsFs.new()
+    let os_res = match roundtrip_fs(real_fs, Path.join(ws, "real.txt"), "from os_fs") {
         Ok(txt) => txt
         Err(e) => e.message()
     }
     assert os_res == "from os_fs"
-    let _ = exec_sh("rm -rf " ++ shell_quote(ws))
+    let _ = Process.exec("rm -rf " ++ Path.shell_quote(ws))
 
-    let _ = println("PASS: Tenon 4-Layer Standard Library + Interfaces (Static & dyn) + @derive JSON/Schema verified!")
+    println("PASS: Tenon 4-Layer OOP Standard Library + Interfaces (Static & dyn) + @derive JSON/Schema verified!")
     0
 }

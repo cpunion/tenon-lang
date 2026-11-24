@@ -258,42 +258,53 @@ pub fn check_program_protocols(program: &Program) -> ModelCheckSuiteReport {
         }
     }
 
+    let mut fn_items: Vec<(String, &FnDecl)> = Vec::new();
     for item in &program.items {
-        if let Item::Fn(f) = item {
-            for attr in &f.attrs {
-                if attr.name == "acquires" {
-                    let locks: Vec<String> = attr
-                        .args
-                        .iter()
-                        .filter_map(|a| match &a.value.kind {
-                            ExprKind::Str(s) | ExprKind::Ident(s) => Some(s.clone()),
-                            _ => None,
-                        })
-                        .collect();
-                    let mut violation = None;
-                    for pair in locks.windows(2) {
-                        if let (Some((lat_a, ra)), Some((lat_b, rb))) =
-                            (lock_ranks.get(&pair[0]), lock_ranks.get(&pair[1]))
-                        {
-                            if lat_a == lat_b && ra >= rb {
-                                violation = Some(format!(
-                                    "fn `{}` acquires `{}` (rank {}) then `{}` (rank {}) violating `{}`",
-                                    f.name, pair[0], ra, pair[1], rb, lat_a
-                                ));
-                                break;
-                            }
+        match item {
+            Item::Fn(f) => fn_items.push((f.name.clone(), f)),
+            Item::Impl(imp) => {
+                let tname = imp.target_ty.display_name();
+                for m in &imp.methods {
+                    fn_items.push((format!("{}.{}", tname, m.name), m));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (fname, f) in fn_items {
+        for attr in &f.attrs {
+            if attr.name == "acquires" {
+                let locks: Vec<String> = attr
+                    .args
+                    .iter()
+                    .filter_map(|a| match &a.value.kind {
+                        ExprKind::Str(s) | ExprKind::Ident(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let mut violation = None;
+                for pair in locks.windows(2) {
+                    if let (Some((lat_a, ra)), Some((lat_b, rb))) =
+                        (lock_ranks.get(&pair[0]), lock_ranks.get(&pair[1]))
+                    {
+                        if lat_a == lat_b && ra >= rb {
+                            violation = Some(format!(
+                                "fn `{}` acquires `{}` (rank {}) then `{}` (rank {}) violating `{}`",
+                                fname, pair[0], ra, pair[1], rb, lat_a
+                            ));
+                            break;
                         }
                     }
-                    cases.push(ModelCheckCaseResult {
-                        protocol: format!("LockOrder::{}", f.name),
-                        case_name: format!("acquires({})", locks.join(" -> ")),
-                        expect_violation: false,
-                        passed: violation.is_none(),
-                        states_explored: locks.len(),
-                        violated_invariant: violation.as_ref().map(|_| "DeadlockFreeLockOrder".into()),
-                        counterexample_trace: violation.into_iter().collect(),
-                    });
                 }
+                cases.push(ModelCheckCaseResult {
+                    protocol: format!("LockOrder::{}", fname),
+                    case_name: format!("acquires({})", locks.join(" -> ")),
+                    expect_violation: false,
+                    passed: violation.is_none(),
+                    states_explored: locks.len(),
+                    violated_invariant: violation.as_ref().map(|_| "DeadlockFreeLockOrder".into()),
+                    counterexample_trace: violation.into_iter().collect(),
+                });
             }
         }
     }

@@ -550,6 +550,17 @@ impl L0Env {
                 }
             }
             ExprKind::Call { callee, args } => {
+                if let ExprKind::Field { field, .. } = &callee.kind {
+                    if matches!(field.as_str(), "len" | "byte_len" | "size") && args.is_empty() {
+                        return AbsInt::top().refine_interval(Interval {
+                            min: 0,
+                            max: i64::MAX as i128,
+                        });
+                    }
+                    if field == "byte_at" && args.len() == 1 {
+                        return AbsInt::top().refine_interval(Interval { min: -1, max: 255 });
+                    }
+                }
                 if let ExprKind::Ident(fname) = &callee.kind {
                     // Built-in core domain facts: `len(x) >= 0`, `byte_at(s, i) in [-1, 255]`
                     if fname == "len" && args.len() == 1 {

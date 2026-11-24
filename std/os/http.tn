@@ -1,19 +1,20 @@
 // Tenon Standard Library — Layer 3: std/os/http.tn
-// Generic vendor-neutral HTTP/SSE streaming client built on `sys_http_open`.
+// Generic vendor-neutral HTTP/SSE streaming client (`HttpStream.open` / `next_line` / `close`).
 
 import "std/core/types.tn"
+import "std/text/text.tn"
 
 pub record HttpStream {
     handle Int
 }
 
-pub fn http_open(method Text, url Text, headers Text, body Text) HttpStream {
-    HttpStream {
-        handle = sys_http_open(method, url, headers, body)
-    }
-}
-
 impl HttpStream {
+    pub fn open(method Text, url Text, headers Text, body Text) HttpStream {
+        HttpStream {
+            handle = sys_http_open(method, url, headers, body)
+        }
+    }
+
     pub fn next_line(self) Option[Text] {
         if sys_http_sse_eof(self.handle) {
             return None
@@ -28,7 +29,7 @@ impl HttpStream {
     pub fn close(self) Result[Int, Text] {
         let err = sys_http_sse_error(self.handle)
         let _ = sys_http_sse_close(self.handle)
-        if len(err) > 0 {
+        if !err.is_empty() {
             return Err(err)
         }
         Ok(0)

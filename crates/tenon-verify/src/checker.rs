@@ -981,11 +981,12 @@ impl CheckerCtx {
                 named_ty("Any")
             }
             ExprKind::Call { callee, args } => match &callee.kind {
-                ExprKind::Field { target, field } if field == "parse" => {
+                ExprKind::Field { target, field }
+                    if field == "parse"
+                        && matches!(&target.kind, ExprKind::Ident(rname) if self.records.contains_key(rname) && self.resolve_assoc_method_sig(rname, "parse").is_none()) =>
+                {
                     if let ExprKind::Ident(rname) = &target.kind {
-                        if self.records.contains_key(rname) {
-                            return generic_ty("Result", vec![named_ty(rname), named_ty("Int")]);
-                        }
+                        return generic_ty("Result", vec![named_ty(rname), named_ty("Int")]);
                     }
                     named_ty("Any")
                 }
@@ -2592,7 +2593,10 @@ impl CheckerCtx {
                     );
                 }
                 match &callee.kind {
-                    ExprKind::Field { target, field } if field == "parse" => {
+                    ExprKind::Field { target, field }
+                        if field == "parse"
+                            && matches!(&target.kind, ExprKind::Ident(rname) if self.records.contains_key(rname) && self.resolve_assoc_method_sig(rname, "parse").is_none()) =>
+                    {
                         if let ExprKind::Ident(rname) = &target.kind {
                             if let Some(rec) = self.records.get(rname) {
                                 if args.len() != rec.fields.len() {
@@ -3700,7 +3704,15 @@ impl CheckerCtx {
         if has_self {
             if let Some(r_expr) = recv {
                 if mdecl.params[0].is_inout {
-                    if let ExprKind::Ident(v) = &r_expr.kind {
+                    let root_var = match &r_expr.kind {
+                        ExprKind::Ident(v) => Some(v.as_str()),
+                        ExprKind::Field { target, .. } => match &target.kind {
+                            ExprKind::Ident(v) => Some(v.as_str()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(v) = root_var {
                         if !mutable_vars.contains(v) && var_types.contains_key(v) {
                             self.diagnostics.push(Diagnostic {
                                 code: "E0203".into(),
@@ -3709,7 +3721,7 @@ impl CheckerCtx {
                                     label, v
                                 ),
                                 span: r_expr.span,
-                                notes: vec![format!("declare `{}` with `var`", v)],
+                                notes: vec![format!("declare `{}` with `var` or `inout`", v)],
                                 counterexample: BTreeMap::new(),
                             });
                         }

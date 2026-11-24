@@ -1,7 +1,8 @@
 // Tenon Standard Library — Layer 3: std/os/fs.tn
-// Structured `FsError`, `FileSystem` interface (enabling both real `OsFs` and sandboxed `MemFs` via `dyn FileSystem`!).
+// Structured `FsError`, `FileSystem` interface, `OsFs` & pure in-memory `MemFs` (supports `dyn FileSystem`).
 
 import "std/core/types.tn"
+import "std/text/text.tn"
 import "std/collections/map.tn"
 
 pub enum FsError {
@@ -27,8 +28,19 @@ pub record OsFs {
     root Text
 }
 
-pub pure fn os_fs_new() OsFs {
-    OsFs { root = "" }
+impl OsFs {
+    pub pure fn new() OsFs {
+        OsFs { root = "" }
+    }
+
+    pub fn read(path Text) Result[Text, FsError] {
+        OsFs.new().read_text(path)
+    }
+
+    pub fn write(path Text, content Text) Result[NonNegative, FsError] {
+        var os = OsFs.new()
+        os.write_text(path, content)
+    }
 }
 
 impl FileSystem for OsFs {
@@ -44,7 +56,7 @@ impl FileSystem for OsFs {
         if !sys_write_file(path, content) {
             return Err(IoFailure("failed to write `" ++ path ++ "`"))
         }
-        Ok(len(content))
+        Ok(content.len())
     }
 }
 
@@ -53,8 +65,10 @@ pub record MemFs {
     files TextMap
 }
 
-pub pure fn mem_fs_new() MemFs {
-    MemFs { files = text_map_new() }
+impl MemFs {
+    pub pure fn new() MemFs {
+        MemFs { files = TextMap.new() }
+    }
 }
 
 impl FileSystem for MemFs {
@@ -66,16 +80,15 @@ impl FileSystem for MemFs {
     }
 
     fn write_text(inout self, path Text, content Text) Result[NonNegative, FsError] {
-        self.files = self.files.set(path, content)
-        Ok(len(content))
+        self.files.set(path, content)
+        Ok(content.len())
     }
 }
 
 pub fn fs_read(path Text) Result[Text, FsError] {
-    os_fs_new().read_text(path)
+    OsFs.read(path)
 }
 
 pub fn fs_write(path Text, content Text) Result[NonNegative, FsError] {
-    var os = os_fs_new()
-    os.write_text(path, content)
+    OsFs.write(path, content)
 }

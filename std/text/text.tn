@@ -1,163 +1,13 @@
 // Tenon Standard Library — Layer 1: std/text/text.tn
-// Idiomatic `Text` methods (`impl Text`) + verified slice contracts + integer formatting/parsing.
+// Idiomatic OOP methods on `Text` & `Int`, verified slice contracts, and `Display` impls.
 
 import "std/core/types.tn"
+import "std/core/ops.tn"
 
 pub pure fn str_slice_checked(s Text, start NonNegative, end NonNegative) Text
     requires start <= end
 {
     str_slice(s, start, end)
-}
-
-pub pure fn str_slice_range(s Text, r SliceRange) Text {
-    str_slice_checked(s, r.start, r.end)
-}
-
-pub pure fn str_starts_with(s Text, prefix Text) Bool {
-    let plen = len(prefix)
-    if plen > len(s) {
-        return false
-    }
-    if plen == 0 {
-        return true
-    }
-    str_slice_checked(s, 0, plen) == prefix
-}
-
-pub pure fn str_ends_with(s Text, suffix Text) Bool {
-    let slen = len(s)
-    let xlen = len(suffix)
-    if xlen > slen {
-        return false
-    }
-    if xlen == 0 {
-        return true
-    }
-    let start = slen - xlen
-    str_slice_checked(s, start, slen) == suffix
-}
-
-pub pure fn str_strip_prefix(s Text, prefix Text) Option[Text] {
-    if !str_starts_with(s, prefix) {
-        return None
-    }
-    let plen = len(prefix)
-    let slen = len(s)
-    if plen > slen {
-        return None
-    }
-    Some(str_slice_checked(s, plen, slen))
-}
-
-pub pure fn str_trim(s Text) Text {
-    let n = len(s)
-    var start = 0
-    while start < n && is_space_byte(byte_at(s, start)) {
-        start += 1
-    }
-    var end = n
-    while end > start && is_space_byte(byte_at(s, end - 1)) {
-        end -= 1
-    }
-    let s_ok = clamp_non_neg(start)
-    let e_ok = clamp_non_neg(end)
-    if s_ok > e_ok {
-        return ""
-    }
-    str_slice_checked(s, s_ok, e_ok)
-}
-
-pub pure fn str_index_of_from(s Text, needle Text, start NonNegative) Option[NonNegative] {
-    let slen = len(s)
-    let nlen = len(needle)
-    if nlen == 0 {
-        if start > slen {
-            return Some(slen)
-        }
-        return Some(start)
-    }
-    if nlen > slen {
-        return None
-    }
-    let first = byte_at(needle, 0)
-    var i = start
-    let limit = slen - nlen
-    while i <= limit {
-        if byte_at(s, i) == first {
-            var matched = true
-            var j = 1
-            while j < nlen {
-                if byte_at(s, i + j) != byte_at(needle, j) {
-                    matched = false
-                    break
-                }
-                j += 1
-            }
-            if matched {
-                return Some(clamp_non_neg(i))
-            }
-        }
-        i += 1
-    }
-    None
-}
-
-pub pure fn str_index_of(s Text, needle Text) Option[NonNegative] {
-    str_index_of_from(s, needle, 0)
-}
-
-pub pure fn str_contains(s Text, needle Text) Bool {
-    match str_index_of(s, needle) {
-        Some(_) => true
-        None => false
-    }
-}
-
-pub pure fn str_replace_first(s Text, target Text, replacement Text) Text {
-    let tlen = len(target)
-    if tlen == 0 {
-        return s
-    }
-    match str_index_of(s, target) {
-        None => s
-        Some(pos) => {
-            let left = str_slice(s, 0, pos)
-            let right = str_slice(s, pos + tlen, len(s))
-            left ++ replacement ++ right
-        }
-    }
-}
-
-pub pure fn str_replace_all(s Text, target Text, replacement Text) Text {
-    let tlen = len(target)
-    if tlen == 0 {
-        return s
-    }
-    let slen = len(s)
-    let b = buf_new()
-    var pos = 0
-    while pos <= slen {
-        let p_ok = clamp_non_neg(pos)
-        match str_index_of_from(s, target, p_ok) {
-            None => {
-                let _ = buf_push_str(b, str_slice(s, p_ok, slen))
-                break
-            }
-            Some(idx) => {
-                let _ = buf_push_str(b, str_slice(s, p_ok, idx))
-                let _ = buf_push_str(b, replacement)
-                pos = idx + tlen
-            }
-        }
-    }
-    buf_finish(b)
-}
-
-pub pure fn truncate_output(s Text, max_bytes MaxBytes) Text {
-    if len(s) <= max_bytes {
-        return s
-    }
-    str_slice_checked(s, 0, max_bytes) ++ "\n... (truncated, total " ++ int_to_text(len(s)) ++ " bytes)"
 }
 
 pub pure fn int_to_text(n Int) Text {
@@ -182,37 +32,39 @@ pub pure fn int_to_text(n Int) Text {
     rev
 }
 
-pub pure fn text_parse_int(s Text) Result[Int, Text] {
-    let trimmed = str_trim(s)
-    let n = len(trimmed)
-    if n == 0 {
-        return Err("empty integer string")
+impl Int {
+    pub pure fn to_text(self) Text {
+        int_to_text(self)
     }
-    var i = 0
-    var neg = false
-    if byte_at(trimmed, 0) == 45 {
-        neg = true
-        i = 1
+
+    pub pure fn parse(s Text) Result[Int, Text] {
+        s.parse_int()
     }
-    if i >= n {
-        return Err("missing digits after '-'")
+}
+
+impl Display for Int {
+    pub pure fn display(self) Text {
+        self.to_text()
     }
-    var acc = 0
-    while i < n {
-        let b = byte_at(trimmed, i)
-        if !is_digit_byte(b) {
-            return Err("invalid digit in integer `" ++ trimmed ++ "`")
-        }
-        acc = acc * 10 + (b - 48)
-        i += 1
+}
+
+impl Display for Bool {
+    pub pure fn display(self) Text {
+        if self { "true" } else { "false" }
     }
-    if neg {
-        return Ok(-acc)
+}
+
+impl Display for Text {
+    pub pure fn display(self) Text {
+        self
     }
-    Ok(acc)
 }
 
 impl Text {
+    pub pure fn len(self) NonNegative {
+        len(self)
+    }
+
     pub pure fn byte_len(self) NonNegative {
         len(self)
     }
@@ -221,47 +73,191 @@ impl Text {
         len(self) == 0
     }
 
-    pub pure fn trim(self) Text {
-        str_trim(self)
+    pub pure fn byte_at(self, idx NonNegative) Int {
+        byte_at(self, idx)
     }
 
-    pub pure fn starts_with(self, prefix Text) Bool {
-        str_starts_with(self, prefix)
-    }
-
-    pub pure fn ends_with(self, suffix Text) Bool {
-        str_ends_with(self, suffix)
-    }
-
-    pub pure fn strip_prefix(self, prefix Text) Option[Text] {
-        str_strip_prefix(self, prefix)
-    }
-
-    pub pure fn find(self, needle Text) Option[NonNegative] {
-        str_index_of(self, needle)
-    }
-
-    pub pure fn find_from(self, needle Text, start NonNegative) Option[NonNegative] {
-        str_index_of_from(self, needle, start)
-    }
-
-    pub pure fn contains(self, needle Text) Bool {
-        str_contains(self, needle)
-    }
-
-    pub pure fn replace_first(self, target Text, replacement Text) Text {
-        str_replace_first(self, target, replacement)
-    }
-
-    pub pure fn replace_all(self, target Text, replacement Text) Text {
-        str_replace_all(self, target, replacement)
+    pub pure fn slice(self, start NonNegative, end NonNegative) Text
+        requires start <= end
+    {
+        str_slice_checked(self, start, end)
     }
 
     pub pure fn slice_range(self, r SliceRange) Text {
-        str_slice_range(self, r)
+        str_slice_checked(self, r.start, r.end)
+    }
+
+    pub pure fn starts_with(self, prefix Text) Bool {
+        let plen = len(prefix)
+        if plen > len(self) {
+            return false
+        }
+        if plen == 0 {
+            return true
+        }
+        str_slice_checked(self, 0, plen) == prefix
+    }
+
+    pub pure fn ends_with(self, suffix Text) Bool {
+        let slen = len(self)
+        let xlen = len(suffix)
+        if xlen > slen {
+            return false
+        }
+        if xlen == 0 {
+            return true
+        }
+        let start = slen - xlen
+        str_slice_checked(self, start, slen) == suffix
+    }
+
+    pub pure fn strip_prefix(self, prefix Text) Option[Text] {
+        if !self.starts_with(prefix) {
+            return None
+        }
+        let plen = len(prefix)
+        let slen = len(self)
+        if plen > slen {
+            return None
+        }
+        Some(str_slice_checked(self, plen, slen))
+    }
+
+    pub pure fn trim(self) Text {
+        let n = len(self)
+        var start = 0
+        while start < n && is_space_byte(byte_at(self, start)) {
+            start += 1
+        }
+        var end = n
+        while end > start && is_space_byte(byte_at(self, end - 1)) {
+            end -= 1
+        }
+        let s_ok = clamp_non_neg(start)
+        let e_ok = clamp_non_neg(end)
+        if s_ok > e_ok {
+            return ""
+        }
+        str_slice_checked(self, s_ok, e_ok)
+    }
+
+    pub pure fn find_from(self, needle Text, start NonNegative) Option[NonNegative] {
+        let slen = len(self)
+        let nlen = len(needle)
+        if nlen == 0 {
+            if start > slen {
+                return Some(slen)
+            }
+            return Some(start)
+        }
+        if nlen > slen {
+            return None
+        }
+        let first = byte_at(needle, 0)
+        var i = start
+        let limit = slen - nlen
+        while i <= limit {
+            if byte_at(self, i) == first {
+                var matched = true
+                var j = 1
+                while j < nlen {
+                    if byte_at(self, i + j) != byte_at(needle, j) {
+                        matched = false
+                        break
+                    }
+                    j += 1
+                }
+                if matched {
+                    return Some(clamp_non_neg(i))
+                }
+            }
+            i += 1
+        }
+        None
+    }
+
+    pub pure fn find(self, needle Text) Option[NonNegative] {
+        self.find_from(needle, 0)
+    }
+
+    pub pure fn contains(self, needle Text) Bool {
+        self.find(needle).is_some()
+    }
+
+    pub pure fn replace_first(self, target Text, replacement Text) Text {
+        let tlen = len(target)
+        if tlen == 0 {
+            return self
+        }
+        match self.find(target) {
+            None => self
+            Some(pos) => {
+                let left = str_slice(self, 0, pos)
+                let right = str_slice(self, pos + tlen, len(self))
+                left ++ replacement ++ right
+            }
+        }
+    }
+
+    pub pure fn replace_all(self, target Text, replacement Text) Text {
+        let tlen = len(target)
+        if tlen == 0 {
+            return self
+        }
+        let slen = len(self)
+        let b = buf_new()
+        var pos = 0
+        while pos <= slen {
+            let p_ok = clamp_non_neg(pos)
+            match self.find_from(target, p_ok) {
+                None => {
+                    let _ = buf_push_str(b, str_slice(self, p_ok, slen))
+                    break
+                }
+                Some(idx) => {
+                    let _ = buf_push_str(b, str_slice(self, p_ok, idx))
+                    let _ = buf_push_str(b, replacement)
+                    pos = idx + tlen
+                }
+            }
+        }
+        buf_finish(b)
+    }
+
+    pub pure fn truncate(self, max_bytes MaxBytes) Text {
+        if len(self) <= max_bytes {
+            return self
+        }
+        str_slice_checked(self, 0, max_bytes) ++ "\n... (truncated, total " ++ len(self).to_text() ++ " bytes)"
     }
 
     pub pure fn parse_int(self) Result[Int, Text] {
-        text_parse_int(self)
+        let trimmed = self.trim()
+        let n = len(trimmed)
+        if n == 0 {
+            return Err("empty integer string")
+        }
+        var i = 0
+        var neg = false
+        if byte_at(trimmed, 0) == 45 {
+            neg = true
+            i = 1
+        }
+        if i >= n {
+            return Err("missing digits after '-'")
+        }
+        var acc = 0
+        while i < n {
+            let b = byte_at(trimmed, i)
+            if !is_digit_byte(b) {
+                return Err("invalid digit in integer `" ++ trimmed ++ "`")
+            }
+            acc = acc * 10 + (b - 48)
+            i += 1
+        }
+        if neg {
+            return Ok(-acc)
+        }
+        Ok(acc)
     }
 }

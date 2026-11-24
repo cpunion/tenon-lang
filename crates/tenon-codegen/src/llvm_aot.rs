@@ -1666,7 +1666,10 @@ impl<'a> LlvmFnGen<'a> {
                                 && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
                         );
                         let target_ty = self.var_types.get(name).cloned();
+                        let is_inout = self.inout_vars.contains(name);
                         let target_is_rc = self.owned_rc_vars.contains(name);
+                        let inout_is_rc = is_inout
+                            && target_ty.as_ref().is_some_and(|t| self.type_is_rc(t));
                         let rhs = if consuming_push {
                             let ExprKind::Call { args, .. } = &value.kind else {
                                 unreachable!()
@@ -1695,7 +1698,7 @@ impl<'a> LlvmFnGen<'a> {
                                 res, xs_val, val_v
                             ));
                             res
-                        } else if target_is_rc && *op == AssignOp::Set {
+                        } else if (target_is_rc || inout_is_rc) && *op == AssignOp::Set {
                             self.lower_expr_owned(value, target_ty.as_ref())?
                         } else {
                             let mut temps = Vec::new();
@@ -1708,7 +1711,6 @@ impl<'a> LlvmFnGen<'a> {
                             .get(name)
                             .cloned()
                             .ok_or_else(|| format!("undefined variable `{}` in LLVM assign", name))?;
-                        let is_inout = self.inout_vars.contains(name);
                         if target_is_rc && !consuming_push && !is_inout {
                             let old = self.fresh_tmp();
                             self.code.push_str(&format!(
@@ -1722,29 +1724,37 @@ impl<'a> LlvmFnGen<'a> {
                                 "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n",
                                 ai, slot, ap, ai
                             ));
-                            let new_v = match op {
-                                AssignOp::Set => rhs,
-                                AssignOp::AddSet => {
-                                    let cur = self.fresh_tmp();
-                                    let res = self.fresh_tmp();
-                                    self.code.push_str(&format!(
-                                        "  {} = load i64, ptr {}\n  {} = add i64 {}, {}\n",
-                                        cur, ap, res, cur, rhs
-                                    ));
-                                    res
-                                }
-                                AssignOp::SubSet => {
-                                    let cur = self.fresh_tmp();
-                                    let res = self.fresh_tmp();
-                                    self.code.push_str(&format!(
-                                        "  {} = load i64, ptr {}\n  {} = sub i64 {}, {}\n",
-                                        cur, ap, res, cur, rhs
-                                    ));
-                                    res
-                                }
-                            };
-                            self.code
-                                .push_str(&format!("  store i64 {}, ptr {}\n", new_v, ap));
+                            if inout_is_rc && !consuming_push && *op == AssignOp::Set {
+                                let old = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = load i64, ptr {}\n  store i64 {}, ptr {}\n  call void @tenon_rc_dec(i64 {})\n",
+                                    old, ap, rhs, ap, old
+                                ));
+                            } else {
+                                let new_v = match op {
+                                    AssignOp::Set => rhs,
+                                    AssignOp::AddSet => {
+                                        let cur = self.fresh_tmp();
+                                        let res = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = load i64, ptr {}\n  {} = add i64 {}, {}\n",
+                                            cur, ap, res, cur, rhs
+                                        ));
+                                        res
+                                    }
+                                    AssignOp::SubSet => {
+                                        let cur = self.fresh_tmp();
+                                        let res = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = load i64, ptr {}\n  {} = sub i64 {}, {}\n",
+                                            cur, ap, res, cur, rhs
+                                        ));
+                                        res
+                                    }
+                                };
+                                self.code
+                                    .push_str(&format!("  store i64 {}, ptr {}\n", new_v, ap));
+                            }
                         } else {
                             let new_v = match op {
                                 AssignOp::Set => rhs,
@@ -3041,6 +3051,7 @@ impl<'a> LlvmFnGen<'a> {
                     let mut temps = Vec::new();
                     let mut avals = Vec::new();
                     let mut writebacks: Vec<(String, String)> = Vec::new();
+                    let mut field_writebacks: Vec<(String, usize, String)> = Vec::new();
                     for (idx, a) in args.iter().enumerate() {
                         let is_inout = meta
                             .as_ref()
@@ -3048,21 +3059,68 @@ impl<'a> LlvmFnGen<'a> {
                             .unwrap_or(false);
                         let pty = meta.as_ref().and_then(|m| m.param_tys.get(idx));
                         if is_inout {
-                            if let ExprKind::Ident(vn) = &a.value.kind {
-                                let cur = self.load_ident_val(vn)?;
-                                self.slot_id += 1;
-                                let tmp_slot = format!("%io_{}_{}", self.slot_id, idx);
-                                self.entry_allocas
-                                    .push_str(&format!("  {} = alloca i64\n", tmp_slot));
-                                let addr_i = self.fresh_tmp();
-                                self.code.push_str(&format!(
-                                    "  store i64 {}, ptr {}\n  {} = ptrtoint ptr {} to i64\n",
-                                    cur, tmp_slot, addr_i, tmp_slot
-                                ));
-                                avals.push(format!("i64 {}", addr_i));
-                                writebacks.push((vn.clone(), tmp_slot));
-                            } else {
-                                return Err("inout arg must be variable".into());
+                            match &a.value.kind {
+                                ExprKind::Ident(vn) => {
+                                    let cur = self.load_ident_val(vn)?;
+                                    self.slot_id += 1;
+                                    let tmp_slot = format!("%io_{}_{}", self.slot_id, idx);
+                                    self.entry_allocas
+                                        .push_str(&format!("  {} = alloca i64\n", tmp_slot));
+                                    let addr_i = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  store i64 {}, ptr {}\n  {} = ptrtoint ptr {} to i64\n",
+                                        cur, tmp_slot, addr_i, tmp_slot
+                                    ));
+                                    avals.push(format!("i64 {}", addr_i));
+                                    writebacks.push((vn.clone(), tmp_slot));
+                                }
+                                ExprKind::Field { target: obj, field }
+                                    if matches!(&obj.kind, ExprKind::Ident(_)) =>
+                                {
+                                    let ExprKind::Ident(vn) = &obj.kind else {
+                                        unreachable!()
+                                    };
+                                    let (fidx, _) = self.resolve_field_layout(obj, field)?;
+                                    let cur_obj = self.load_ident_val(vn)?;
+                                    let uniq_obj = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n",
+                                        uniq_obj, cur_obj
+                                    ));
+                                    let vslot = self.var_ptrs[vn].clone();
+                                    if self.inout_vars.contains(vn) {
+                                        let ai = self.fresh_tmp();
+                                        let ap = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                            ai, vslot, ap, ai, uniq_obj, ap
+                                        ));
+                                    } else {
+                                        self.code.push_str(&format!(
+                                            "  store i64 {}, ptr {}\n",
+                                            uniq_obj, vslot
+                                        ));
+                                    }
+                                    let cur_fv = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
+                                        cur_fv, uniq_obj, fidx
+                                    ));
+                                    self.slot_id += 1;
+                                    let tmp_slot = format!("%iof_{}_{}", self.slot_id, idx);
+                                    self.entry_allocas
+                                        .push_str(&format!("  {} = alloca i64\n", tmp_slot));
+                                    let addr_i = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  store i64 {}, ptr {}\n  {} = ptrtoint ptr {} to i64\n",
+                                        cur_fv, tmp_slot, addr_i, tmp_slot
+                                    ));
+                                    avals.push(format!("i64 {}", addr_i));
+                                    field_writebacks.push((uniq_obj, fidx, tmp_slot));
+                                }
+                                _ => {
+                                    return Err("inout arg must be variable or record field".into());
+                                }
                             }
                         } else if matches!(&a.value.kind, ExprKind::List(es) if es.is_empty())
                             && pty.is_some()
@@ -3099,6 +3157,13 @@ impl<'a> LlvmFnGen<'a> {
                             self.code
                                 .push_str(&format!("  store i64 {}, ptr {}\n", updated, vslot));
                         }
+                    }
+                    for (uniq_obj, fidx, tmp_slot) in field_writebacks {
+                        let updated = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = load i64, ptr {}\n  call void @tenon_rc_set_field_raw(i64 {}, i64 {}, i64 {})\n",
+                            updated, tmp_slot, uniq_obj, fidx, updated
+                        ));
                     }
                     Ok(res)
                 }

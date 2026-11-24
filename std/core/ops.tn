@@ -1,5 +1,5 @@
 // Tenon Standard Library — Layer 0: std/core/ops.tn
-// Foundational static & dynamic interfaces (`Display`, `Writer`) and generic `Option`/`Result` helpers.
+// Foundational interfaces (`Display`, `Writer`) and OOP container methods (`List[T]`, `Option[T]`, `Result[T, E]`).
 
 import "std/core/types.tn"
 
@@ -16,6 +16,47 @@ pub interface Writer {
         let a = self.write_str(s)
         let b = self.write_byte(10)
         a + b
+    }
+}
+
+impl[T] List[T] {
+    pub pure fn len(self) NonNegative {
+        len(self)
+    }
+
+    pub pure fn is_empty(self) Bool {
+        len(self) == 0
+    }
+
+    pub pure fn get(self, idx NonNegative) Option[T] {
+        if idx >= len(self) {
+            return None
+        }
+        Some(self[idx])
+    }
+
+    pub pure fn first(self) Option[T] {
+        if len(self) == 0 {
+            return None
+        }
+        Some(self[0])
+    }
+
+    pub pure fn last(self) Option[T] {
+        let n = len(self)
+        if n == 0 {
+            return None
+        }
+        Some(self[n - 1])
+    }
+
+    pub pure fn push(inout self, item T) {
+        self = push(self, item)
+    }
+
+    pub pure fn clear(inout self) {
+        let empty List[T] = []
+        self = empty
     }
 }
 

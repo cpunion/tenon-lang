@@ -1638,7 +1638,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                 && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
                         );
                         let target_ty = self.var_types.get(name).cloned();
+                        let is_inout = self.inout_vars.contains(name);
                         let target_is_rc = self.owned_rc_vars.contains(name);
+                        let inout_is_rc = is_inout
+                            && target_ty.as_ref().is_some_and(|t| self.type_is_rc(t));
                         let rhs = if consuming_push {
                             let ExprKind::Call { args, .. } = &value.kind else {
                                 unreachable!()
@@ -1660,7 +1663,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                 v
                             };
                             self.call_rt_2_vals(self.rt.list_push, xs_val, val_v)
-                        } else if target_is_rc && *op == AssignOp::Set {
+                        } else if (target_is_rc || inout_is_rc) && *op == AssignOp::Set {
                             self.lower_expr_owned(value, target_ty.as_ref())?
                         } else {
                             let mut temps = Vec::new();
@@ -1673,25 +1676,30 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             .vars
                             .get(name)
                             .ok_or_else(|| format!("undefined variable `{}` in assignment", name))?;
-                        let is_inout = self.inout_vars.contains(name);
                         if target_is_rc && !consuming_push && !is_inout {
                             let old = self.builder.use_var(var);
                             self.builder.def_var(var, rhs);
                             self.call_rt_1_void(self.rt.rc_dec, old);
                         } else if is_inout {
                             let slot_ptr = self.builder.use_var(var);
-                            let new_v = match op {
-                                AssignOp::Set => rhs,
-                                AssignOp::AddSet => {
-                                    let cur = self.builder.ins().load(types::I64, MemFlags::new(), slot_ptr, 0);
-                                    self.builder.ins().iadd(cur, rhs)
-                                }
-                                AssignOp::SubSet => {
-                                    let cur = self.builder.ins().load(types::I64, MemFlags::new(), slot_ptr, 0);
-                                    self.builder.ins().isub(cur, rhs)
-                                }
-                            };
-                            self.builder.ins().store(MemFlags::new(), new_v, slot_ptr, 0);
+                            if inout_is_rc && !consuming_push && *op == AssignOp::Set {
+                                let old = self.builder.ins().load(types::I64, MemFlags::new(), slot_ptr, 0);
+                                self.builder.ins().store(MemFlags::new(), rhs, slot_ptr, 0);
+                                self.call_rt_1_void(self.rt.rc_dec, old);
+                            } else {
+                                let new_v = match op {
+                                    AssignOp::Set => rhs,
+                                    AssignOp::AddSet => {
+                                        let cur = self.builder.ins().load(types::I64, MemFlags::new(), slot_ptr, 0);
+                                        self.builder.ins().iadd(cur, rhs)
+                                    }
+                                    AssignOp::SubSet => {
+                                        let cur = self.builder.ins().load(types::I64, MemFlags::new(), slot_ptr, 0);
+                                        self.builder.ins().isub(cur, rhs)
+                                    }
+                                };
+                                self.builder.ins().store(MemFlags::new(), new_v, slot_ptr, 0);
+                            }
                         } else {
                             let new_v = match op {
                                 AssignOp::Set => rhs,
@@ -2778,6 +2786,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     let mut arg_vals = Vec::new();
                     let mut inout_writebacks: Vec<(String, cranelift_codegen::ir::StackSlot)> =
                         Vec::new();
+                    let mut inout_field_writebacks: Vec<(Value, usize, cranelift_codegen::ir::StackSlot)> =
+                        Vec::new();
 
                     for (idx, a) in args.iter().enumerate() {
                         let is_inout = meta
@@ -2786,22 +2796,53 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             .unwrap_or(false);
                         let pty = meta.as_ref().and_then(|m| m.param_tys.get(idx));
                         if is_inout {
-                            if let ExprKind::Ident(vname) = &a.value.kind {
-                                let cur_val = self.load_ident_val(vname)?;
-                                let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
-                                    StackSlotKind::ExplicitSlot,
-                                    8,
-                                    3,
-                                ));
-                                self.builder.ins().stack_store(cur_val, ss, 0);
-                                let addr = self.builder.ins().stack_addr(types::I64, ss, 0);
-                                arg_vals.push(addr);
-                                inout_writebacks.push((vname.clone(), ss));
-                            } else {
-                                return Err(format!(
-                                    "`inout` argument {} of `{}` must be a variable",
-                                    idx, fname
-                                ));
+                            match &a.value.kind {
+                                ExprKind::Ident(vname) => {
+                                    let cur_val = self.load_ident_val(vname)?;
+                                    let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
+                                        StackSlotKind::ExplicitSlot,
+                                        8,
+                                        3,
+                                    ));
+                                    self.builder.ins().stack_store(cur_val, ss, 0);
+                                    let addr = self.builder.ins().stack_addr(types::I64, ss, 0);
+                                    arg_vals.push(addr);
+                                    inout_writebacks.push((vname.clone(), ss));
+                                }
+                                ExprKind::Field { target: obj, field }
+                                    if matches!(&obj.kind, ExprKind::Ident(_)) =>
+                                {
+                                    let ExprKind::Ident(vname) = &obj.kind else {
+                                        unreachable!()
+                                    };
+                                    let (fidx, _) = self.resolve_field_layout(obj, field)?;
+                                    let cur_obj = self.load_ident_val(vname)?;
+                                    let uniq_obj = self.call_rt_1(self.rt.rc_ensure_unique, cur_obj);
+                                    let var = self.vars[vname];
+                                    if self.inout_vars.contains(vname) {
+                                        let slot_ptr = self.builder.use_var(var);
+                                        self.builder.ins().store(MemFlags::new(), uniq_obj, slot_ptr, 0);
+                                    } else {
+                                        self.builder.def_var(var, uniq_obj);
+                                    }
+                                    let idx_v = self.builder.ins().iconst(types::I64, fidx as i64);
+                                    let cur_fv = self.call_rt_2_vals(self.rt.rc_get_field, uniq_obj, idx_v);
+                                    let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
+                                        StackSlotKind::ExplicitSlot,
+                                        8,
+                                        3,
+                                    ));
+                                    self.builder.ins().stack_store(cur_fv, ss, 0);
+                                    let addr = self.builder.ins().stack_addr(types::I64, ss, 0);
+                                    arg_vals.push(addr);
+                                    inout_field_writebacks.push((uniq_obj, fidx, ss));
+                                }
+                                _ => {
+                                    return Err(format!(
+                                        "`inout` argument {} of `{}` must be a variable or record field",
+                                        idx, fname
+                                    ));
+                                }
                             }
                         } else if matches!(&a.value.kind, ExprKind::List(es) if es.is_empty())
                             && pty.is_some()
@@ -2829,6 +2870,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         } else {
                             self.builder.def_var(var, updated);
                         }
+                    }
+                    for (uniq_obj, fidx, ss) in inout_field_writebacks {
+                        let updated = self.builder.ins().stack_load(types::I64, ss, 0);
+                        self.call_rt_3_void(self.rt.rc_set_field_raw, uniq_obj, fidx as i64, updated);
                     }
                     Ok(ret)
                 }
@@ -3274,6 +3319,81 @@ pub fn main() Int {
         assert_eq!(
             st.live_objects, 0,
             "interfaces + default methods + static monomorph + dyn vtable + COW must leave 0 leaks, got {:?}",
+            st
+        );
+    }
+
+    #[test]
+    fn oop_list_push_clear_and_inout_field_projection_zero_leaks() {
+        let src = r#"
+pub interface Plugin {
+    pure fn label(self) Text
+}
+
+pub record Alpha { tag Text }
+pub record Beta  { tag Text }
+
+impl Plugin for Alpha {
+    pure fn label(self) Text { "A:" ++ self.tag }
+}
+
+impl Plugin for Beta {
+    pure fn label(self) Text { "B:" ++ self.tag }
+}
+
+impl[T] List[T] {
+    pub pure fn len(self) Int { len(self) }
+    pub pure fn push(inout self, item T) { self = push(self, item) }
+    pub pure fn clear(inout self) {
+        let empty List[T] = []
+        self = empty
+    }
+}
+
+pub record Registry {
+    plugins List[dyn Plugin]
+}
+
+impl Registry {
+    pub pure fn new() Registry {
+        let empty List[dyn Plugin] = []
+        Registry { plugins = empty }
+    }
+
+    pub pure fn register(inout self, p dyn Plugin) {
+        self.plugins.push(p)
+    }
+
+    pub pure fn reset(inout self) {
+        self.plugins.clear()
+    }
+}
+
+pub fn main() Int {
+    var reg = Registry.new()
+    reg.register(Alpha { tag = "one" })
+    let snapshot = reg
+    reg.register(Beta { tag = "two" })
+
+    assert snapshot.plugins.len() == 1
+    assert reg.plugins.len() == 2
+    assert reg.plugins[0].label() == "A:one"
+    assert reg.plugins[1].label() == "B:two"
+
+    reg.reset()
+    assert reg.plugins.len() == 0
+    assert snapshot.plugins.len() == 1
+    42
+}
+"#;
+        perceus::reset_stats();
+        let prog = parse(src).unwrap();
+        let jit = JitProgram::compile(&prog).unwrap();
+        assert_eq!(jit.call_0("main").unwrap(), 42);
+        let st = perceus::snapshot_stats();
+        assert_eq!(
+            st.live_objects, 0,
+            "OOP List.push/clear + COW inout field projection must leave 0 leaks, got {:?}",
             st
         );
     }
