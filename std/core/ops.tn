@@ -1,10 +1,14 @@
 // Tenon Standard Library — Layer 0: std/core/ops.tn
-// Foundational interfaces (`Display`, `Writer`) and OOP container methods (`List[T]`, `Option[T]`, `Result[T, E]`).
+// Foundational interfaces (`Display`, `Hash`, `Writer`) and O(1) OOP container methods (`List[T]`, `Option[T]`, `Result[T, E]`).
 
 import "std/core/types.tn"
 
 pub interface Display {
     pure fn display(self) Text
+}
+
+pub interface Hash {
+    pure fn hash(self) NonNegative
 }
 
 pub interface Writer {
@@ -20,6 +24,10 @@ pub interface Writer {
 }
 
 impl[T] List[T] {
+    pub pure fn filled(count NonNegative, init T) List[T] {
+        list_filled(count, init)
+    }
+
     pub pure fn len(self) NonNegative {
         len(self)
     }
@@ -33,6 +41,14 @@ impl[T] List[T] {
             return None
         }
         Some(self[idx])
+    }
+
+    pub pure fn set(inout self, idx NonNegative, item T) Bool {
+        if idx >= len(self) {
+            return false
+        }
+        self[idx] = item
+        true
     }
 
     pub pure fn first(self) Option[T] {
@@ -52,6 +68,16 @@ impl[T] List[T] {
 
     pub pure fn push(inout self, item T) {
         self = push(self, item)
+    }
+
+    pub pure fn pop(inout self) Option[T] {
+        let n = len(self)
+        if n == 0 {
+            return None
+        }
+        let item = self[n - 1]
+        self = list_pop_shrink(self)
+        Some(item)
     }
 
     pub pure fn clear(inout self) {

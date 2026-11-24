@@ -155,6 +155,8 @@ struct RtFuncs {
     text_eq: FuncId,
     str_concat: FuncId,
     list_push: FuncId,
+    list_filled: FuncId,
+    list_pop_shrink: FuncId,
     async_frame_alloc: FuncId,
     async_yield_create: FuncId,
     async_poll_frame: FuncId,
@@ -208,6 +210,8 @@ impl JitProgram {
         jit_builder.symbol("tenon_text_new", tenon_text_new as *const u8);
         jit_builder.symbol("tenon_text_eq", tenon_text_eq as *const u8);
         jit_builder.symbol("tenon_list_push", tenon_list_push as *const u8);
+        jit_builder.symbol("tenon_list_filled", tenon_list_filled as *const u8);
+        jit_builder.symbol("tenon_list_pop_shrink", tenon_list_pop_shrink as *const u8);
         jit_builder.symbol("tenon_async_frame_alloc", tenon_async_frame_alloc as *const u8);
         jit_builder.symbol("tenon_async_yield_create", tenon_async_yield_create as *const u8);
         jit_builder.symbol("tenon_async_poll_frame", tenon_async_poll_frame as *const u8);
@@ -993,6 +997,8 @@ fn declare_runtime_funcs(module: &mut JITModule) -> Result<RtFuncs, String> {
         text_eq: declare_sig(module, "tenon_text_eq", 2, true)?,
         str_concat: declare_sig(module, "tenon_str_concat", 2, true)?,
         list_push: declare_sig(module, "tenon_list_push", 2, true)?,
+        list_filled: declare_sig(module, "tenon_list_filled", 3, true)?,
+        list_pop_shrink: declare_sig(module, "tenon_list_pop_shrink", 1, true)?,
         async_frame_alloc: declare_sig(module, "tenon_async_frame_alloc", 2, true)?,
         async_yield_create: declare_sig(module, "tenon_async_yield_create", 1, true)?,
         async_poll_frame: declare_sig(module, "tenon_async_poll_frame", 1, true)?,
@@ -1386,6 +1392,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         }
                         return generic_ty("List", vec![self.infer_expr_type_with(&args[1].value, extra_vars)]);
                     }
+                    if f == "list_filled" && args.len() == 2 {
+                        return generic_ty("List", vec![self.infer_expr_type_with(&args[1].value, extra_vars)]);
+                    }
+                    if f == "list_pop_shrink" && args.len() == 1 {
+                        return self.infer_expr_type_with(&args[0].value, extra_vars);
+                    }
                     if let Some(meta) = self.fn_metas.get(f) {
                         if let Some(rt) = &meta.ret_ty {
                             return rt.clone();
@@ -1505,7 +1517,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             ExprKind::Call { callee, .. } => match &callee.kind {
                 ExprKind::Ident(f) => {
-                    matches!(f.as_str(), "Ok" | "Err" | "Some" | "push" | "yield_val" | "__box_dyn")
+                    matches!(
+                        f.as_str(),
+                        "Ok" | "Err" | "Some" | "push" | "list_filled" | "list_pop_shrink" | "yield_val" | "__box_dyn"
+                    )
                         || (self.enum_tags.contains_key(f) && !self.func_ids.contains_key(f))
                         || self.fn_metas.get(f).is_some_and(|m| m.returns_rc)
                 }
@@ -1637,6 +1652,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                 && args.len() == 2
                                 && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
                         );
+                        let consuming_pop = matches!(
+                            &value.kind,
+                            ExprKind::Call { callee, args }
+                            if matches!(&callee.kind, ExprKind::Ident(f) if f == "list_pop_shrink")
+                                && args.len() == 1
+                                && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
+                        );
+                        let consuming_in_place = consuming_push || consuming_pop;
                         let target_ty = self.var_types.get(name).cloned();
                         let is_inout = self.inout_vars.contains(name);
                         let target_is_rc = self.owned_rc_vars.contains(name);
@@ -1663,6 +1686,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                 v
                             };
                             self.call_rt_2_vals(self.rt.list_push, xs_val, val_v)
+                        } else if consuming_pop {
+                            let xs_val = self.load_ident_val(name)?;
+                            self.call_rt_1(self.rt.list_pop_shrink, xs_val)
                         } else if (target_is_rc || inout_is_rc) && *op == AssignOp::Set {
                             self.lower_expr_owned(value, target_ty.as_ref())?
                         } else {
@@ -1676,13 +1702,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             .vars
                             .get(name)
                             .ok_or_else(|| format!("undefined variable `{}` in assignment", name))?;
-                        if target_is_rc && !consuming_push && !is_inout {
+                        if target_is_rc && !consuming_in_place && !is_inout {
                             let old = self.builder.use_var(var);
                             self.builder.def_var(var, rhs);
                             self.call_rt_1_void(self.rt.rc_dec, old);
                         } else if is_inout {
                             let slot_ptr = self.builder.use_var(var);
-                            if inout_is_rc && !consuming_push && *op == AssignOp::Set {
+                            if inout_is_rc && !consuming_in_place && *op == AssignOp::Set {
                                 let old = self.builder.ins().load(types::I64, MemFlags::new(), slot_ptr, 0);
                                 self.builder.ins().store(MemFlags::new(), rhs, slot_ptr, 0);
                                 self.call_rt_1_void(self.rt.rc_dec, old);
@@ -1771,6 +1797,125 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                 fidx as i64,
                                 new_field_val,
                             );
+                        }
+                    }
+                    ExprKind::Index {
+                        target: list_expr,
+                        index,
+                    } => {
+                        let mut idx_temps = Vec::new();
+                        let idx_v = self.lower_expr_borrowed(index, &mut idx_temps)?;
+                        self.flush_temps(&idx_temps);
+                        match &list_expr.kind {
+                            ExprKind::Ident(vname) => {
+                                let elem_ty = self
+                                    .var_types
+                                    .get(vname)
+                                    .and_then(|t| self.list_elem_ty(t));
+                                let elem_is_rc = elem_ty
+                                    .as_ref()
+                                    .is_some_and(|et| self.type_is_rc(et))
+                                    || self.expr_produces_rc(value);
+                                let rhs = if elem_is_rc && *op == AssignOp::Set {
+                                    self.lower_expr_owned(value, elem_ty.as_ref())?
+                                } else {
+                                    let mut temps = Vec::new();
+                                    let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                    self.flush_temps(&temps);
+                                    v
+                                };
+                                let cur_list = self.load_ident_val(vname)?;
+                                let uniq_list = self.call_rt_1(self.rt.rc_ensure_unique, cur_list);
+                                let var = self.vars[vname];
+                                if self.inout_vars.contains(vname) {
+                                    let slot_ptr = self.builder.use_var(var);
+                                    self.builder
+                                        .ins()
+                                        .store(MemFlags::new(), uniq_list, slot_ptr, 0);
+                                } else {
+                                    self.builder.def_var(var, uniq_list);
+                                }
+                                if elem_is_rc {
+                                    let mv = self.builder.ins().iconst(types::I64, RC_MASK_ALL as i64);
+                                    self.call_rt_2_void(self.rt.rc_set_rc_mask, uniq_list, mv);
+                                }
+                                let new_val = match op {
+                                    AssignOp::Set => rhs,
+                                    AssignOp::AddSet => {
+                                        let cur_e = self.call_rt_2_vals(self.rt.rc_get_field, uniq_list, idx_v);
+                                        self.builder.ins().iadd(cur_e, rhs)
+                                    }
+                                    AssignOp::SubSet => {
+                                        let cur_e = self.call_rt_2_vals(self.rt.rc_get_field, uniq_list, idx_v);
+                                        self.builder.ins().isub(cur_e, rhs)
+                                    }
+                                };
+                                let fref = self
+                                    .module
+                                    .declare_func_in_func(self.rt.rc_set_field, self.builder.func);
+                                self.builder.ins().call(fref, &[uniq_list, idx_v, new_val]);
+                            }
+                            ExprKind::Field { target: obj, field }
+                                if matches!(&obj.kind, ExprKind::Ident(_)) =>
+                            {
+                                let ExprKind::Ident(vname) = &obj.kind else {
+                                    unreachable!()
+                                };
+                                let (fidx, fl) = self.resolve_field_layout(obj, field)?;
+                                let elem_ty = fl.as_ref().and_then(|f| self.list_elem_ty(&f.ty));
+                                let elem_is_rc = elem_ty
+                                    .as_ref()
+                                    .is_some_and(|et| self.type_is_rc(et))
+                                    || self.expr_produces_rc(value);
+                                let rhs = if elem_is_rc && *op == AssignOp::Set {
+                                    self.lower_expr_owned(value, elem_ty.as_ref())?
+                                } else {
+                                    let mut temps = Vec::new();
+                                    let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                    self.flush_temps(&temps);
+                                    v
+                                };
+                                let cur_obj = self.load_ident_val(vname)?;
+                                let uniq_obj = self.call_rt_1(self.rt.rc_ensure_unique, cur_obj);
+                                let var = self.vars[vname];
+                                if self.inout_vars.contains(vname) {
+                                    let slot_ptr = self.builder.use_var(var);
+                                    self.builder
+                                        .ins()
+                                        .store(MemFlags::new(), uniq_obj, slot_ptr, 0);
+                                } else {
+                                    self.builder.def_var(var, uniq_obj);
+                                }
+                                let fidx_v = self.builder.ins().iconst(types::I64, fidx as i64);
+                                let cur_list = self.call_rt_2_vals(self.rt.rc_get_field, uniq_obj, fidx_v);
+                                let uniq_list = self.call_rt_1(self.rt.rc_ensure_unique, cur_list);
+                                self.call_rt_3_void(
+                                    self.rt.rc_set_field_raw,
+                                    uniq_obj,
+                                    fidx as i64,
+                                    uniq_list,
+                                );
+                                if elem_is_rc {
+                                    let mv = self.builder.ins().iconst(types::I64, RC_MASK_ALL as i64);
+                                    self.call_rt_2_void(self.rt.rc_set_rc_mask, uniq_list, mv);
+                                }
+                                let new_val = match op {
+                                    AssignOp::Set => rhs,
+                                    AssignOp::AddSet => {
+                                        let cur_e = self.call_rt_2_vals(self.rt.rc_get_field, uniq_list, idx_v);
+                                        self.builder.ins().iadd(cur_e, rhs)
+                                    }
+                                    AssignOp::SubSet => {
+                                        let cur_e = self.call_rt_2_vals(self.rt.rc_get_field, uniq_list, idx_v);
+                                        self.builder.ins().isub(cur_e, rhs)
+                                    }
+                                };
+                                let fref = self
+                                    .module
+                                    .declare_func_in_func(self.rt.rc_set_field, self.builder.func);
+                                self.builder.ins().call(fref, &[uniq_list, idx_v, new_val]);
+                            }
+                            _ => {}
                         }
                     }
                     _ => {}
@@ -2542,6 +2687,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     BinOp::Mod => self.builder.ins().srem(l, r),
                     BinOp::BitAnd => self.builder.ins().band(l, r),
                     BinOp::BitOr => self.builder.ins().bor(l, r),
+                    BinOp::BitXor => self.builder.ins().bxor(l, r),
+                    BinOp::Shl => self.builder.ins().ishl(l, r),
+                    BinOp::Shr => self.builder.ins().ushr(l, r),
                     BinOp::Eq => {
                         let c = self.builder.ins().icmp(IntCC::Equal, l, r);
                         self.builder.ins().uextend(types::I64, c)
@@ -2741,6 +2889,31 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             v
                         };
                         return Ok(self.call_rt_2_vals(self.rt.list_push, xs, val));
+                    }
+                    if fname == "list_filled" && args.len() == 2 {
+                        let elem_is_rc = expected_ty
+                            .and_then(|t| self.list_elem_ty(t))
+                            .is_some_and(|et| self.type_is_rc(&et))
+                            || self.type_is_rc(&self.infer_expr_type(&args[1].value))
+                            || self.expr_produces_rc(&args[1].value);
+                        let mut temps = Vec::new();
+                        let count_v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let init_v = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        let rc_flag = self
+                            .builder
+                            .ins()
+                            .iconst(types::I64, if elem_is_rc { 1 } else { 0 });
+                        let fref = self
+                            .module
+                            .declare_func_in_func(self.rt.list_filled, self.builder.func);
+                        let call = self.builder.ins().call(fref, &[count_v, init_v, rc_flag]);
+                        let res = self.builder.inst_results(call)[0];
+                        self.flush_temps(&temps);
+                        return Ok(res);
+                    }
+                    if fname == "list_pop_shrink" && args.len() == 1 {
+                        let xs = self.lower_expr_owned(&args[0].value, expected_ty)?;
+                        return Ok(self.call_rt_1(self.rt.list_pop_shrink, xs));
                     }
                     if fname == "yield_val" && args.len() == 1 {
                         let mut temps = Vec::new();
@@ -3394,6 +3567,60 @@ pub fn main() Int {
         assert_eq!(
             st.live_objects, 0,
             "OOP List.push/clear + COW inout field projection must leave 0 leaks, got {:?}",
+            st
+        );
+    }
+
+    #[test]
+    fn list_index_assign_filled_pop_bitwise_and_cow_zero_leaks() {
+        let src = r#"
+pub record Table {
+    slots List[Int]
+    names List[Text]
+}
+
+impl Table {
+    pub pure fn set_slot(inout self, idx Int, v Int, name Text) {
+        self.slots[idx] = v
+        self.names[idx] = name
+    }
+}
+
+pub fn main() Int {
+    var xs = list_filled(4, -1)
+    assert len(xs) == 4
+    let snap = xs
+    xs[0] = (15 ^ 6) << 2
+    xs[1] = 128 >> 3
+    xs[2] = 7
+    xs[3] = 9
+    assert snap[0] == -1
+    assert xs[0] == 36
+    assert xs[1] == 16
+    xs = list_pop_shrink(xs)
+    assert len(xs) == 3
+
+    var tbl = Table {
+        slots = list_filled(2, 0),
+        names = list_filled(2, "init")
+    }
+    let tbl_snap = tbl
+    tbl.set_slot(1, 42, "updated")
+    assert tbl_snap.slots[1] == 0
+    assert tbl_snap.names[1] == "init"
+    assert tbl.slots[1] == 42
+    assert tbl.names[1] == "updated"
+    tbl.slots[1]
+}
+"#;
+        perceus::reset_stats();
+        let prog = parse(src).unwrap();
+        let jit = JitProgram::compile(&prog).unwrap();
+        assert_eq!(jit.call_0("main").unwrap(), 42);
+        let st = perceus::snapshot_stats();
+        assert_eq!(
+            st.live_objects, 0,
+            "list_filled + list_pop_shrink + index assign COW + bitwise ops must leave 0 leaks, got {:?}",
             st
         );
     }

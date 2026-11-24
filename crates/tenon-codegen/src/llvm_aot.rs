@@ -255,6 +255,39 @@ int64_t tenon_list_push(int64_t ptr, int64_t val) {
     return fp;
 }
 
+int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc) {
+    int64_t n = len < 0 ? 0 : len;
+    int64_t fp = tenon_rc_alloc(4, n);
+    TenonObj* fresh = (TenonObj*)(uintptr_t)fp;
+    fresh->len = n;
+    if (elem_is_rc != 0) {
+        fresh->rc_mask = UINT64_MAX;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        fresh->fields[i] = init_val;
+        if (elem_is_rc != 0 && init_val != 0) {
+            tenon_rc_inc(init_val);
+        }
+    }
+    return fp;
+}
+
+int64_t tenon_list_pop_shrink(int64_t ptr) {
+    if (ptr == 0) return 0;
+    int64_t uniq = tenon_rc_ensure_unique(ptr);
+    TenonObj* hdr = (TenonObj*)(uintptr_t)uniq;
+    if (hdr->len > 0) {
+        int64_t last_idx = hdr->len - 1;
+        int64_t old = hdr->fields[last_idx];
+        hdr->fields[last_idx] = 0;
+        hdr->len = last_idx;
+        if (hdr->rc_mask == UINT64_MAX && old != 0) {
+            tenon_rc_dec(old);
+        }
+    }
+    return uniq;
+}
+
 int64_t tenon_async_frame_alloc(int64_t total_slots, int64_t poll_fn_ptr) {
     int64_t slots = total_slots < 4 ? 4 : total_slots;
     int64_t f = tenon_rc_alloc(6, slots);
@@ -733,6 +766,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     ir.push_str("declare i64 @tenon_text_new(i64, i64)\n");
     ir.push_str("declare i64 @tenon_text_eq(i64, i64)\n");
     ir.push_str("declare i64 @tenon_list_push(i64, i64)\n");
+    ir.push_str("declare i64 @tenon_list_filled(i64, i64, i64)\n");
+    ir.push_str("declare i64 @tenon_list_pop_shrink(i64)\n");
     ir.push_str("declare i64 @tenon_async_frame_alloc(i64, i64)\n");
     ir.push_str("declare i64 @tenon_async_yield_create(i64)\n");
     ir.push_str("declare i64 @tenon_async_poll_frame(i64)\n");
@@ -1095,6 +1130,12 @@ impl<'a> LlvmFnGen<'a> {
                         }
                         return generic_ty("List", vec![self.infer_expr_type_with(&args[1].value, extra_vars)]);
                     }
+                    if f == "list_filled" && args.len() == 2 {
+                        return generic_ty("List", vec![self.infer_expr_type_with(&args[1].value, extra_vars)]);
+                    }
+                    if f == "list_pop_shrink" && args.len() == 1 {
+                        return self.infer_expr_type_with(&args[0].value, extra_vars);
+                    }
                     if let Some(meta) = self.fn_metas.get(f) {
                         if let Some(rt) = &meta.ret_ty {
                             return rt.clone();
@@ -1218,7 +1259,10 @@ impl<'a> LlvmFnGen<'a> {
             }
             ExprKind::Call { callee, .. } => match &callee.kind {
                 ExprKind::Ident(f) => {
-                    matches!(f.as_str(), "Ok" | "Err" | "Some" | "push" | "yield_val" | "__box_dyn")
+                    matches!(
+                        f.as_str(),
+                        "Ok" | "Err" | "Some" | "push" | "list_filled" | "list_pop_shrink" | "yield_val" | "__box_dyn"
+                    )
                         || (self.enum_tags.contains_key(f) && !self.fn_metas.contains_key(f))
                         || self.fn_metas.get(f).is_some_and(|m| m.returns_rc)
                 }
@@ -1665,6 +1709,14 @@ impl<'a> LlvmFnGen<'a> {
                                 && args.len() == 2
                                 && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
                         );
+                        let consuming_pop = matches!(
+                            &value.kind,
+                            ExprKind::Call { callee, args }
+                            if matches!(&callee.kind, ExprKind::Ident(f) if f == "list_pop_shrink")
+                                && args.len() == 1
+                                && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
+                        );
+                        let consuming_in_place = consuming_push || consuming_pop;
                         let target_ty = self.var_types.get(name).cloned();
                         let is_inout = self.inout_vars.contains(name);
                         let target_is_rc = self.owned_rc_vars.contains(name);
@@ -1698,6 +1750,14 @@ impl<'a> LlvmFnGen<'a> {
                                 res, xs_val, val_v
                             ));
                             res
+                        } else if consuming_pop {
+                            let xs_val = self.load_ident_val(name)?;
+                            let res = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = call i64 @tenon_list_pop_shrink(i64 {})\n",
+                                res, xs_val
+                            ));
+                            res
                         } else if (target_is_rc || inout_is_rc) && *op == AssignOp::Set {
                             self.lower_expr_owned(value, target_ty.as_ref())?
                         } else {
@@ -1711,7 +1771,7 @@ impl<'a> LlvmFnGen<'a> {
                             .get(name)
                             .cloned()
                             .ok_or_else(|| format!("undefined variable `{}` in LLVM assign", name))?;
-                        if target_is_rc && !consuming_push && !is_inout {
+                        if target_is_rc && !consuming_in_place && !is_inout {
                             let old = self.fresh_tmp();
                             self.code.push_str(&format!(
                                 "  {} = load i64, ptr {}\n  store i64 {}, ptr {}\n  call void @tenon_rc_dec(i64 {})\n",
@@ -1724,7 +1784,7 @@ impl<'a> LlvmFnGen<'a> {
                                 "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n",
                                 ai, slot, ap, ai
                             ));
-                            if inout_is_rc && !consuming_push && *op == AssignOp::Set {
+                            if inout_is_rc && !consuming_in_place && *op == AssignOp::Set {
                                 let old = self.fresh_tmp();
                                 self.code.push_str(&format!(
                                     "  {} = load i64, ptr {}\n  store i64 {}, ptr {}\n  call void @tenon_rc_dec(i64 {})\n",
@@ -1852,6 +1912,164 @@ impl<'a> LlvmFnGen<'a> {
                                 "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
                                 uniq, fidx, new_fv
                             ));
+                        }
+                    }
+                    ExprKind::Index {
+                        target: list_expr,
+                        index,
+                    } => {
+                        let mut idx_temps = Vec::new();
+                        let idx_v = self.lower_expr_borrowed(index, &mut idx_temps)?;
+                        self.flush_temps(&idx_temps);
+                        match &list_expr.kind {
+                            ExprKind::Ident(vname) => {
+                                let elem_ty = self
+                                    .var_types
+                                    .get(vname)
+                                    .and_then(|t| self.list_elem_ty(t));
+                                let elem_is_rc = elem_ty
+                                    .as_ref()
+                                    .is_some_and(|et| self.type_is_rc(et))
+                                    || self.expr_produces_rc(value);
+                                let rhs = if elem_is_rc && *op == AssignOp::Set {
+                                    self.lower_expr_owned(value, elem_ty.as_ref())?
+                                } else {
+                                    let mut temps = Vec::new();
+                                    let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                    self.flush_temps(&temps);
+                                    v
+                                };
+                                let cur_list = self.load_ident_val(vname)?;
+                                let uniq_list = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n",
+                                    uniq_list, cur_list
+                                ));
+                                let vslot = self.var_ptrs[vname].clone();
+                                if self.inout_vars.contains(vname) {
+                                    let ai = self.fresh_tmp();
+                                    let ap = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                        ai, vslot, ap, ai, uniq_list, ap
+                                    ));
+                                } else {
+                                    self.code.push_str(&format!(
+                                        "  store i64 {}, ptr {}\n",
+                                        uniq_list, vslot
+                                    ));
+                                }
+                                if elem_is_rc {
+                                    self.code.push_str(&format!(
+                                        "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                        uniq_list, RC_MASK_ALL as i64
+                                    ));
+                                }
+                                let new_val = match op {
+                                    AssignOp::Set => rhs,
+                                    AssignOp::AddSet => {
+                                        let ce = self.fresh_tmp();
+                                        let res = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
+                                            ce, uniq_list, idx_v, res, ce, rhs
+                                        ));
+                                        res
+                                    }
+                                    AssignOp::SubSet => {
+                                        let ce = self.fresh_tmp();
+                                        let res = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
+                                            ce, uniq_list, idx_v, res, ce, rhs
+                                        ));
+                                        res
+                                    }
+                                };
+                                self.code.push_str(&format!(
+                                    "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
+                                    uniq_list, idx_v, new_val
+                                ));
+                            }
+                            ExprKind::Field { target: obj, field }
+                                if matches!(&obj.kind, ExprKind::Ident(_)) =>
+                            {
+                                let ExprKind::Ident(vname) = &obj.kind else {
+                                    unreachable!()
+                                };
+                                let (fidx, fl) = self.resolve_field_layout(obj, field)?;
+                                let elem_ty = fl.as_ref().and_then(|f| self.list_elem_ty(&f.ty));
+                                let elem_is_rc = elem_ty
+                                    .as_ref()
+                                    .is_some_and(|et| self.type_is_rc(et))
+                                    || self.expr_produces_rc(value);
+                                let rhs = if elem_is_rc && *op == AssignOp::Set {
+                                    self.lower_expr_owned(value, elem_ty.as_ref())?
+                                } else {
+                                    let mut temps = Vec::new();
+                                    let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                    self.flush_temps(&temps);
+                                    v
+                                };
+                                let cur_obj = self.load_ident_val(vname)?;
+                                let uniq_obj = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n",
+                                    uniq_obj, cur_obj
+                                ));
+                                let vslot = self.var_ptrs[vname].clone();
+                                if self.inout_vars.contains(vname) {
+                                    let ai = self.fresh_tmp();
+                                    let ap = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                        ai, vslot, ap, ai, uniq_obj, ap
+                                    ));
+                                } else {
+                                    self.code.push_str(&format!(
+                                        "  store i64 {}, ptr {}\n",
+                                        uniq_obj, vslot
+                                    ));
+                                }
+                                let cur_list = self.fresh_tmp();
+                                let uniq_list = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n  call void @tenon_rc_set_field_raw(i64 {}, i64 {}, i64 {})\n",
+                                    cur_list, uniq_obj, fidx, uniq_list, cur_list, uniq_obj, fidx, uniq_list
+                                ));
+                                if elem_is_rc {
+                                    self.code.push_str(&format!(
+                                        "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                        uniq_list, RC_MASK_ALL as i64
+                                    ));
+                                }
+                                let new_val = match op {
+                                    AssignOp::Set => rhs,
+                                    AssignOp::AddSet => {
+                                        let ce = self.fresh_tmp();
+                                        let res = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
+                                            ce, uniq_list, idx_v, res, ce, rhs
+                                        ));
+                                        res
+                                    }
+                                    AssignOp::SubSet => {
+                                        let ce = self.fresh_tmp();
+                                        let res = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
+                                            ce, uniq_list, idx_v, res, ce, rhs
+                                        ));
+                                        res
+                                    }
+                                };
+                                self.code.push_str(&format!(
+                                    "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
+                                    uniq_list, idx_v, new_val
+                                ));
+                            }
+                            _ => {}
                         }
                     }
                     _ => {}
@@ -2746,6 +2964,9 @@ impl<'a> LlvmFnGen<'a> {
                     BinOp::Mod => self.code.push_str(&format!("  {} = srem i64 {}, {}\n", res, l, r)),
                     BinOp::BitAnd => self.code.push_str(&format!("  {} = and i64 {}, {}\n", res, l, r)),
                     BinOp::BitOr => self.code.push_str(&format!("  {} = or i64 {}, {}\n", res, l, r)),
+                    BinOp::BitXor => self.code.push_str(&format!("  {} = xor i64 {}, {}\n", res, l, r)),
+                    BinOp::Shl => self.code.push_str(&format!("  {} = shl i64 {}, {}\n", res, l, r)),
+                    BinOp::Shr => self.code.push_str(&format!("  {} = lshr i64 {}, {}\n", res, l, r)),
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         let pred = match op {
                             BinOp::Eq => "eq",
@@ -2980,6 +3201,35 @@ impl<'a> LlvmFnGen<'a> {
                         self.code.push_str(&format!(
                             "  {} = call i64 @tenon_list_push(i64 {}, i64 {})\n",
                             res, xs, val
+                        ));
+                        return Ok(res);
+                    }
+                    if fname == "list_filled" && args.len() == 2 {
+                        let elem_is_rc = expected_ty
+                            .and_then(|t| self.list_elem_ty(t))
+                            .is_some_and(|et| self.type_is_rc(&et))
+                            || self.type_is_rc(&self.infer_expr_type(&args[1].value))
+                            || self.expr_produces_rc(&args[1].value);
+                        let mut temps = Vec::new();
+                        let count_v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let init_v = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        let res = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_list_filled(i64 {}, i64 {}, i64 {})\n",
+                            res,
+                            count_v,
+                            init_v,
+                            if elem_is_rc { 1 } else { 0 }
+                        ));
+                        self.flush_temps(&temps);
+                        return Ok(res);
+                    }
+                    if fname == "list_pop_shrink" && args.len() == 1 {
+                        let xs = self.lower_expr_owned(&args[0].value, expected_ty)?;
+                        let res = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_list_pop_shrink(i64 {})\n",
+                            res, xs
                         ));
                         return Ok(res);
                     }

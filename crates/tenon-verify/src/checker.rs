@@ -50,6 +50,8 @@ const BUILTIN_SIGS: &[BuiltinSig] = &[
     BuiltinSig { name: "print_int", arity: 1, is_pure: false, allocates: false, param_types: &["Int"], ret_type: "Int" },
     BuiltinSig { name: "len", arity: 1, is_pure: true, allocates: false, param_types: &["Any"], ret_type: "Int" },
     BuiltinSig { name: "push", arity: 2, is_pure: true, allocates: true, param_types: &["Any", "Any"], ret_type: "List[Any]" },
+    BuiltinSig { name: "list_filled", arity: 2, is_pure: true, allocates: true, param_types: &["Int", "Any"], ret_type: "List[Any]" },
+    BuiltinSig { name: "list_pop_shrink", arity: 1, is_pure: true, allocates: true, param_types: &["Any"], ret_type: "List[Any]" },
     BuiltinSig { name: "yield_val", arity: 1, is_pure: false, allocates: true, param_types: &["Any"], ret_type: "Any" },
     BuiltinSig { name: "block_on", arity: 1, is_pure: false, allocates: true, param_types: &["Any"], ret_type: "Any" },
     // Polymorphic Option / Result constructors
@@ -610,6 +612,58 @@ impl CheckerCtx {
         None
     }
 
+    fn instantiate_assoc_method_from_args(
+        &self,
+        m: &FnDecl,
+        args: &[CallArg],
+        var_types: &BTreeMap<String, TypeExpr>,
+    ) -> FnDecl {
+        if m.type_params.is_empty() {
+            return m.clone();
+        }
+        fn unify(
+            pat: &TypeExpr,
+            actual: &TypeExpr,
+            tps: &[String],
+            subst: &mut BTreeMap<String, TypeExpr>,
+        ) {
+            match (pat, actual) {
+                (TypeExpr::Named { name, args, .. }, _)
+                    if args.is_empty() && tps.contains(name) =>
+                {
+                    if actual.display_name() != "Any" {
+                        subst.entry(name.clone()).or_insert_with(|| actual.clone());
+                    }
+                }
+                (
+                    TypeExpr::Named { name: pn, args: pa, .. },
+                    TypeExpr::Named { name: an, args: aa, .. },
+                ) if pn == an && pa.len() == aa.len() => {
+                    for (x, y) in pa.iter().zip(aa.iter()) {
+                        unify(x, y, tps, subst);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut subst = BTreeMap::new();
+        for (p, a) in m.params.iter().zip(args.iter()) {
+            let aty = self.infer_expr_type(&a.value, var_types);
+            unify(&p.ty, &aty, &m.type_params, &mut subst);
+        }
+        if subst.is_empty() {
+            return m.clone();
+        }
+        let mut out = m.clone();
+        for p in &mut out.params {
+            p.ty = subst_type_expr(&p.ty, &subst);
+        }
+        if let Some(rt) = &out.ret_ty {
+            out.ret_ty = Some(subst_type_expr(rt, &subst));
+        }
+        out
+    }
+
     fn is_known_type_name(&self, name: &str) -> bool {
         self.records.contains_key(name)
             || self.enums.contains_key(name)
@@ -856,8 +910,10 @@ impl CheckerCtx {
             ExprKind::Field { target, .. } => matches!(&target.kind, ExprKind::Ident(_)),
             ExprKind::Unary { expr: inner, .. } => self.expr_smt_encodable(inner),
             ExprKind::Binary { op, left, right } => {
-                !matches!(op, BinOp::Concat | BinOp::BitAnd | BinOp::BitOr)
-                    && self.expr_smt_encodable(left)
+                !matches!(
+                    op,
+                    BinOp::Concat | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+                ) && self.expr_smt_encodable(left)
                     && self.expr_smt_encodable(right)
             }
             ExprKind::Call { callee, args } => {
@@ -952,7 +1008,16 @@ impl CheckerCtx {
             },
             ExprKind::Binary { op, .. } => match op {
                 BinOp::Concat => named_ty("Text"),
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::BitAnd | BinOp::BitOr => named_ty("Int"),
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr => named_ty("Int"),
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or | BinOp::Implies => named_ty("Bool"),
             },
             ExprKind::Field { target, field } => {
@@ -997,7 +1062,8 @@ impl CheckerCtx {
                         }
                         if !var_types.contains_key(ename) && self.is_known_type_name(ename) {
                             if let Some(m) = self.resolve_assoc_method_sig(ename, field) {
-                                return m.ret_ty.unwrap_or_else(|| named_ty("Any"));
+                                let inst = self.instantiate_assoc_method_from_args(&m, args, var_types);
+                                return inst.ret_ty.unwrap_or_else(|| named_ty("Any"));
                             }
                         }
                     }
@@ -1046,6 +1112,12 @@ impl CheckerCtx {
                             return lt;
                         }
                         return generic_ty("List", vec![self.infer_expr_type(&args[1].value, var_types)]);
+                    }
+                    if fname == "list_filled" && args.len() == 2 {
+                        return generic_ty("List", vec![self.infer_expr_type(&args[1].value, var_types)]);
+                    }
+                    if fname == "list_pop_shrink" && args.len() == 1 {
+                        return self.infer_expr_type(&args[0].value, var_types);
                     }
                     if fname == "block_on" && args.len() == 1 {
                         return self.infer_expr_type(&args[0].value, var_types);
@@ -1988,6 +2060,79 @@ impl CheckerCtx {
                                 }
                             }
                         }
+                        ExprKind::Index {
+                            target: list_expr,
+                            index,
+                        } => {
+                            self.check_expr(
+                                index,
+                                cur_fn,
+                                env,
+                                smt_int_vars,
+                                smt_premises,
+                                var_types,
+                                mutable_vars,
+                                active_mutate,
+                                saw_return,
+                            );
+                            let root_var = match &list_expr.kind {
+                                ExprKind::Ident(v) => Some(v.as_str()),
+                                ExprKind::Field { target: obj, .. } => match &obj.kind {
+                                    ExprKind::Ident(v) => Some(v.as_str()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            if let Some(v) = root_var {
+                                if !mutable_vars.contains(v) && var_types.contains_key(v) {
+                                    self.diagnostics.push(Diagnostic {
+                                        code: "E0203".into(),
+                                        message: format!(
+                                            "cannot assign to index of immutable binding `{}`",
+                                            v
+                                        ),
+                                        span: *span,
+                                        notes: vec![format!("declare `{}` with `var` or `inout`", v)],
+                                        counterexample: BTreeMap::new(),
+                                    });
+                                }
+                            }
+                            let list_ty = self.resolve_base_type(&self.infer_expr_type(list_expr, var_types));
+                            if let TypeExpr::Named { name: ln, args: la, .. } = list_ty {
+                                if ln == "List" && la.len() == 1 {
+                                    let rhs_ty = self.infer_expr_type(value, var_types);
+                                    if let TypeExpr::Dyn { interface, .. } = &la[0] {
+                                        if !self.type_implements(&rhs_ty, interface) {
+                                            self.diagnostics.push(Diagnostic {
+                                                code: "E0505".into(),
+                                                message: format!(
+                                                    "cannot assign `{}` into `List[dyn {}]`: `{}` does not implement `{}`",
+                                                    rhs_ty.display_name(),
+                                                    interface,
+                                                    rhs_ty.display_name(),
+                                                    interface
+                                                ),
+                                                span: *span,
+                                                notes: vec![],
+                                                counterexample: BTreeMap::new(),
+                                            });
+                                        }
+                                    } else if !self.types_compatible(&la[0], &rhs_ty) {
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0205".into(),
+                                            message: format!(
+                                                "type mismatch assigning to list element: expected `{}`, found `{}`",
+                                                la[0].display_name(),
+                                                rhs_ty.display_name()
+                                            ),
+                                            span: *span,
+                                            notes: vec![],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -2247,7 +2392,13 @@ impl CheckerCtx {
                             q.declare_int(v.clone());
                         }
                         for (p, s) in smt_premises {
-                            let _ = q.add_premise_expr(p, s);
+                            if var == "self" && !s.contains_key("self") {
+                                let mut s2 = s.clone();
+                                s2.insert("self".into(), "self".into());
+                                let _ = q.add_premise_expr(p, &s2);
+                            } else {
+                                let _ = q.add_premise_expr(p, s);
+                            }
                         }
                         let mut fs = subst.clone();
                         fs.insert(
@@ -2306,7 +2457,13 @@ impl CheckerCtx {
                 q.declare_int(v.clone());
             }
             for (p, s) in smt_premises {
-                let _ = q.add_premise_expr(p, s);
+                if var == "self" && !s.contains_key("self") {
+                    let mut s2 = s.clone();
+                    s2.insert("self".into(), "self".into());
+                    let _ = q.add_premise_expr(p, &s2);
+                } else {
+                    let _ = q.add_premise_expr(p, s);
+                }
             }
             if q.set_goal_expr(wc, &subst).is_ok() {
                 match q.solve() {
@@ -2643,11 +2800,12 @@ impl CheckerCtx {
                             }
                         } else if let ExprKind::Ident(tname) = &target.kind {
                             if !var_types.contains_key(tname) && self.is_known_type_name(tname) {
-                                // Static associated call: `Type.method(args)` (e.g. `Order.from_json(v)`)
+                                // Static associated call: `Type.method(args)` (e.g. `Order.from_json(v)`, `List.filled(n, val)`)
                                 if let Some(mdecl) = self.resolve_assoc_method_sig(tname, field) {
+                                    let inst = self.instantiate_assoc_method_from_args(&mdecl, args, var_types);
                                     self.check_method_call_contract(
                                         &format!("{}.{}", tname, field),
-                                        &mdecl,
+                                        &inst,
                                         None,
                                         args,
                                         cur_fn,

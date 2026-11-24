@@ -511,7 +511,10 @@ pub enum BinOp {
     Mod,
     Concat,
     BitOr,
+    BitXor,
     BitAnd,
+    Shl,
+    Shr,
 }
 
 impl BinOp {
@@ -533,7 +536,10 @@ impl BinOp {
             BinOp::Mod => "%",
             BinOp::Concat => "++",
             BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
             BinOp::BitAnd => "&",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
         }
     }
 }

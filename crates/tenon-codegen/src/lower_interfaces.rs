@@ -469,6 +469,12 @@ impl LowerCtx {
                         }
                         return generic_ty("List", vec![self.infer_expr_ty(&args[1].value, var_types)]);
                     }
+                    if fname == "list_filled" && args.len() == 2 {
+                        return generic_ty("List", vec![self.infer_expr_ty(&args[1].value, var_types)]);
+                    }
+                    if fname == "list_pop_shrink" && args.len() == 1 {
+                        return self.infer_expr_ty(&args[0].value, var_types);
+                    }
                     if let Some(sig) = self.fn_sigs.get(fname) {
                         return sig.ret_ty.clone().unwrap_or_else(|| named_ty("Any"));
                     }
@@ -526,6 +532,12 @@ impl LowerCtx {
                             if let Some(mname) = self.lookup_concrete_method(ename, field) {
                                 if let Some(sig) = self.fn_sigs.get(&mname) {
                                     return sig.ret_ty.clone().unwrap_or_else(|| named_ty("Any"));
+                                }
+                                if let Some(tmpl) = self.generic_templates.get(&mname) {
+                                    if let Some(rt) = &tmpl.ret_ty {
+                                        let subst = self.infer_generic_subst(tmpl, &[], args, var_types);
+                                        return subst_type(rt, &subst);
+                                    }
                                 }
                             }
                         }
@@ -838,11 +850,23 @@ impl LowerCtx {
                 } => {
                     let lt = self.lower_expr(target, var_types, ret_ty);
                     let mut lv = self.lower_expr(value, var_types, ret_ty);
-                    if let ExprKind::Ident(vname) = &lt.kind {
-                        if let Some(tty) = var_types.get(vname).cloned() {
-                            let aty = self.infer_expr_ty(&lv, var_types);
-                            lv = self.maybe_box_dyn(lv, &tty, &aty);
+                    match &lt.kind {
+                        ExprKind::Ident(vname) => {
+                            if let Some(tty) = var_types.get(vname).cloned() {
+                                let aty = self.infer_expr_ty(&lv, var_types);
+                                lv = self.maybe_box_dyn(lv, &tty, &aty);
+                            }
                         }
+                        ExprKind::Index { target: list_expr, .. } => {
+                            let lty = self.resolve_alias(&self.infer_expr_ty(list_expr, var_types));
+                            if let TypeExpr::Named { name: ln, args: la, .. } = lty {
+                                if ln == "List" && la.len() == 1 {
+                                    let aty = self.infer_expr_ty(&lv, var_types);
+                                    lv = self.maybe_box_dyn(lv, &la[0], &aty);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                     stmts.push(Stmt::Assign {
                         target: lt,
@@ -1120,11 +1144,17 @@ impl LowerCtx {
                             }
                             if !var_types.contains_key(ename) && self.is_known_type(ename) {
                                 if let Some(mname) = self.lookup_concrete_method(ename, field) {
-                                    self.box_call_args(&mname, &mut lowered_args, var_types);
+                                    let final_fn = if let Some(tmpl) = self.generic_templates.get(&mname).cloned() {
+                                        let subst = self.infer_generic_subst(&tmpl, &[], &lowered_args, var_types);
+                                        self.ensure_monomorphized(&mname, &subst).unwrap_or(mname)
+                                    } else {
+                                        mname
+                                    };
+                                    self.box_call_args(&final_fn, &mut lowered_args, var_types);
                                     return Expr {
                                         kind: ExprKind::Call {
                                             callee: Box::new(Expr {
-                                                kind: ExprKind::Ident(mname),
+                                                kind: ExprKind::Ident(final_fn),
                                                 span: callee.span,
                                             }),
                                             args: lowered_args,

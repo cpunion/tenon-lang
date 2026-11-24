@@ -95,22 +95,16 @@ pub pure fn json_arr_push(arr JsonValue, item JsonValue) JsonValue {
 pub pure fn json_obj_set(obj JsonValue, key Text, val JsonValue) JsonValue {
     match obj {
         JObj(entries) => {
-            var next List[JsonEntry] = []
-            var replaced = false
+            var next List[JsonEntry] = entries
             var i = 0
-            while i < entries.len() {
-                let e = entries[i]
-                if e.key == key {
-                    next.push(JsonEntry { key = key, val = val })
-                    replaced = true
-                } else {
-                    next.push(e)
+            while i < next.len() {
+                if next[i].key == key {
+                    next[i] = JsonEntry { key = key, val = val }
+                    return JObj(next)
                 }
                 i += 1
             }
-            if !replaced {
-                next.push(JsonEntry { key = key, val = val })
-            }
+            next.push(JsonEntry { key = key, val = val })
             JObj(next)
         }
         JNull => {

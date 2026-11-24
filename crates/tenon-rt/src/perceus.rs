@@ -384,6 +384,48 @@ pub extern "C" fn tenon_list_push(ptr: i64, val: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn tenon_list_filled(len: i64, init_val: i64, elem_is_rc: i64) -> i64 {
+    let n = len.max(0) as usize;
+    let fresh = tenon_rc_alloc(TAG_LIST, n as i64) as *mut ObjHeader;
+    unsafe {
+        (*fresh).len = n;
+        if elem_is_rc != 0 {
+            (*fresh).rc_mask = RC_MASK_ALL;
+        }
+        let fp = fields_ptr(fresh);
+        for i in 0..n {
+            *fp.add(i) = init_val;
+            if elem_is_rc != 0 && init_val != 0 {
+                tenon_rc_inc(init_val);
+            }
+        }
+    }
+    fresh as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_list_pop_shrink(ptr: i64) -> i64 {
+    if ptr == 0 {
+        return 0;
+    }
+    let uniq = tenon_rc_ensure_unique(ptr);
+    unsafe {
+        let hdr = uniq as *mut ObjHeader;
+        if (*hdr).len > 0 {
+            let last_idx = (*hdr).len - 1;
+            let fp = fields_ptr(hdr);
+            let old = *fp.add(last_idx);
+            *fp.add(last_idx) = 0;
+            (*hdr).len = last_idx;
+            if (*hdr).rc_mask == RC_MASK_ALL && old != 0 {
+                tenon_rc_dec(old);
+            }
+        }
+    }
+    uniq
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_async_frame_alloc(total_slots: i64, poll_fn_ptr: i64) -> i64 {
     let slots = total_slots.max(4);
     let frame = tenon_rc_alloc(TAG_ASYNC_FRAME, slots);

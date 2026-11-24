@@ -546,6 +546,29 @@ impl L0Env {
                         }
                         AbsInt::top()
                     }
+                    BinOp::BitAnd => {
+                        if r.interval.min >= 0 && r.interval.max <= i64::MAX as i128 {
+                            return AbsInt {
+                                interval: Interval {
+                                    min: 0,
+                                    max: r.interval.max,
+                                },
+                                cong: Congruence::TOP,
+                                non_zero: false,
+                            };
+                        }
+                        if l.interval.min >= 0 && l.interval.max <= i64::MAX as i128 {
+                            return AbsInt {
+                                interval: Interval {
+                                    min: 0,
+                                    max: l.interval.max,
+                                },
+                                cong: Congruence::TOP,
+                                non_zero: false,
+                            };
+                        }
+                        AbsInt::top()
+                    }
                     _ => AbsInt::top(),
                 }
             }

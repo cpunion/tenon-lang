@@ -632,4 +632,38 @@ pub fn bad_uses() Int {
             rep.diagnostics
         );
     }
+
+    #[test]
+    fn enforces_index_assignment_mutability_and_type_checks() {
+        let src = r#"
+pub interface Item {
+    pure fn id(self) Int
+}
+pub record GoodItem { v Int }
+pub record BadItem  { v Int }
+
+impl Item for GoodItem {
+    pure fn id(self) Int { self.v }
+}
+
+pub fn bad_index_assign() Int {
+    let frozen List[Int] = [1, 2, 3]
+    frozen[0] = 99
+
+    var xs List[Int] = [1, 2]
+    xs[0] = "wrong_type"
+
+    var dyn_xs List[dyn Item] = []
+    dyn_xs[0] = BadItem { v = 7 }
+    0
+}
+"#;
+        let prog = parse(src).unwrap();
+        let rep = check_program(&prog);
+        assert!(!rep.ok);
+        let codes: Vec<&str> = rep.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0203"), "expected E0203 on immutable index assign, got {:?}", codes);
+        assert!(codes.contains(&"E0205"), "expected E0205 on mismatched element type, got {:?}", codes);
+        assert!(codes.contains(&"E0505"), "expected E0505 on non-Item into List[dyn Item], got {:?}", codes);
+    }
 }

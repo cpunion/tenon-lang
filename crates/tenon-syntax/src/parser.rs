@@ -1790,15 +1790,34 @@ impl Parser {
     }
 
     fn parse_bitor(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_bitand()?;
+        let mut left = self.parse_bitxor()?;
         while self.peek().kind == TokenKind::Pipe {
+            self.bump();
+            self.skip_newlines();
+            let right = self.parse_bitxor()?;
+            let span = left.span.merge(right.span);
+            left = Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::BitOr,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_bitxor(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_bitand()?;
+        while self.peek().kind == TokenKind::Caret {
             self.bump();
             self.skip_newlines();
             let right = self.parse_bitand()?;
             let span = left.span.merge(right.span);
             left = Expr {
                 kind: ExprKind::Binary {
-                    op: BinOp::BitOr,
+                    op: BinOp::BitXor,
                     left: Box::new(left),
                     right: Box::new(right),
                 },
@@ -1828,7 +1847,7 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_add()?;
+        let mut left = self.parse_shift()?;
         while let Some(op) = match self.peek().kind {
             TokenKind::EqEq => Some(BinOp::Eq),
             TokenKind::BangEq => Some(BinOp::Ne),
@@ -1836,6 +1855,29 @@ impl Parser {
             TokenKind::Le => Some(BinOp::Le),
             TokenKind::Gt => Some(BinOp::Gt),
             TokenKind::Ge => Some(BinOp::Ge),
+            _ => None,
+        } {
+            self.bump();
+            self.skip_newlines();
+            let right = self.parse_shift()?;
+            let span = left.span.merge(right.span);
+            left = Expr {
+                kind: ExprKind::Binary {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_add()?;
+        while let Some(op) = match self.peek().kind {
+            TokenKind::Shl => Some(BinOp::Shl),
+            TokenKind::Shr => Some(BinOp::Shr),
             _ => None,
         } {
             self.bump();

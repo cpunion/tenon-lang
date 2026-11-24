@@ -100,6 +100,9 @@ pub enum TokenKind {
     AmpAmp,
     Pipe,
     PipePipe,
+    Caret,
+    Shl,
+    Shr,
     FatArrow,
     Bidirectional, // <->
     Newline,
@@ -335,6 +338,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 let rem = &src[i..];
                 let (kind, len) = if rem.starts_with("<->") {
                     (TokenKind::Bidirectional, 3)
+                } else if rem.starts_with("<<") {
+                    (TokenKind::Shl, 2)
+                } else if rem.starts_with(">>") {
+                    (TokenKind::Shr, 2)
                 } else if rem.starts_with("==") {
                     (TokenKind::EqEq, 2)
                 } else if rem.starts_with("!=") {
@@ -379,6 +386,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                         '%' => (TokenKind::Percent, 1),
                         '&' => (TokenKind::Amp, 1),
                         '|' => (TokenKind::Pipe, 1),
+                        '^' => (TokenKind::Caret, 1),
                         other => {
                             return Err(ParseError {
                                 message: format!("unexpected character `{}`", other),

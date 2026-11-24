@@ -60,6 +60,38 @@ impl Display for Text {
     }
 }
 
+impl Hash for Text {
+    /// 63-bit FNV-1a + SplitMix avalanche finalizer (pure Tenon, zero heap allocation).
+    pub pure fn hash(self) NonNegative {
+        let n = len(self)
+        var h = 2166136261
+        var i = 0
+        while i < n {
+            h = (h ^ byte_at(self, i)) * 16777619
+            i += 1
+        }
+        h = (h ^ (h >> 33)) * 490278349
+        h = h ^ (h >> 29)
+        h & 9223372036854775807
+    }
+}
+
+impl Hash for Int {
+    pub pure fn hash(self) NonNegative {
+        var h = self
+        h = (h ^ (h >> 30)) * 490278349
+        h = (h ^ (h >> 27)) * 16777619
+        h = h ^ (h >> 31)
+        h & 9223372036854775807
+    }
+}
+
+impl Hash for Bool {
+    pub pure fn hash(self) NonNegative {
+        if self { 1 } else { 0 }
+    }
+}
+
 impl Text {
     pub pure fn len(self) NonNegative {
         len(self)

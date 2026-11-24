@@ -61,16 +61,18 @@ pub fn roundtrip_fs(inout storage dyn FileSystem, path Text, content Text) Resul
 }
 
 pub fn main() Int {
-    // 1. Layer 0: `List[T]` OOP methods (`push`, `len`, `get`, `first`, `last`, `clear`) — zero leaks!
-    var nums List[Int] = []
-    assert nums.is_empty()
-    nums.push(10)
-    nums.push(20)
-    nums.push(30)
+    // 1. Layer 0: `List[T]` OOP methods (`filled`, `push`, `set`, `pop`, `len`, `get`, `first`, `last`, `clear`) — zero leaks!
+    var nums = List.filled(3, 7)
     assert nums.len() == 3
-    assert nums.first().unwrap_or(0) == 10
+    assert nums[0] == 7 && nums[2] == 7
+    assert nums.set(1, 20)
+    nums[2] = 30
+    assert nums.first().unwrap_or(0) == 7
     assert nums.get(1).unwrap_or(0) == 20
-    assert nums.last().unwrap_or(0) == 30
+    assert nums.pop().unwrap_or(0) == 30
+    assert nums.len() == 2
+    nums.push(99)
+    assert nums.last().unwrap_or(0) == 99
     assert nums.get(9).is_none()
     nums.clear()
     assert nums.is_empty()
@@ -78,9 +80,11 @@ pub fn main() Int {
     var words List[Text] = []
     words.push("tenon")
     words.push("oop")
+    words[1] = "fast"
     assert words.len() == 2
     assert words.first().unwrap_or("") == "tenon"
-    assert words.last().unwrap_or("") == "oop"
+    assert words.pop().unwrap_or("") == "fast"
+    assert words.len() == 1
 
     // List[dyn Display] with `list.push(...)` auto-boxing concrete types!
     var items List[dyn Display] = []
@@ -114,14 +118,49 @@ pub fn main() Int {
     var m = TextMap.new()
     m.set("lang", "tenon")
     m.set("ver", "3")
+    m.set("ver", "3.1")
     assert m.len() == 2
     assert m.has("lang")
-    assert m.get("ver").unwrap_or("") == "3"
+    assert m.get("ver").unwrap_or("") == "3.1"
     let m2 = m.with("ver", "4")
-    assert m.get("ver").unwrap_or("") == "3"
+    assert m.get("ver").unwrap_or("") == "3.1"
     assert m2.get("ver").unwrap_or("") == "4"
+    assert m.remove("lang").unwrap_or("") == "tenon"
+    assert m.len() == 1
+    assert !m.has("lang")
+    assert m2.has("lang")
     m.clear()
     assert m.is_empty()
+
+    // High-scale O(1) HashMap stress test: 2000 inserts, updates, deletes, tombstone compaction & lookups!
+    var big = TextMap.with_capacity(16)
+    var k = 0
+    while k < 2000 {
+        let ks = "k_" ++ k.to_text()
+        big.set(ks, "v_" ++ k.to_text())
+        k += 1
+    }
+    assert big.len() == 2000
+    assert big.get("k_0").unwrap_or("") == "v_0"
+    assert big.get("k_1337").unwrap_or("") == "v_1337"
+    assert big.get("k_1999").unwrap_or("") == "v_1999"
+    assert big.get("missing_key").is_none()
+
+    // Overwrite & delete half to exercise in-place update + tombstone compaction
+    var d = 0
+    while d < 1000 {
+        assert big.remove("k_" ++ d.to_text()).is_some()
+        d += 1
+    }
+    assert big.len() == 1000
+    assert big.get("k_500").is_none()
+    assert big.get("k_1500").unwrap_or("") == "v_1500"
+    big.set("k_1500", "updated_1500")
+    assert big.get("k_1500").unwrap_or("") == "updated_1500"
+    let ks_live = big.keys()
+    assert ks_live.len() == 1000
+    assert ks_live[0] == "k_1000"
+    assert ks_live[999] == "k_1999"
 
     // Static `[W Writer]` + Dynamic `dyn Writer` (with default method `write_line`!)
     var tb = TextBuilder.new()
