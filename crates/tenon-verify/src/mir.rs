@@ -12,9 +12,11 @@ pub struct MirFnSummary {
     pub is_pure: bool,
     pub is_ghost: bool,
     pub is_fip: bool,
+    pub is_arena: bool,
     pub is_no_heap_alloc: bool,
     pub param_count: usize,
     pub non_escaping_locals: Vec<String>,
+    pub stack_promotable_locals: Vec<String>,
 }
 
 /// Unified Verified Middle-End IR facts shared across Cranelift, LLVM AOT, Wasm, and LSP.
@@ -35,9 +37,15 @@ pub struct VerifiedMir {
     /// Per-function local variables proved not to escape return, closures, channels, or outer structs.
     #[serde(default)]
     pub non_escaping_vars: BTreeMap<String, BTreeSet<String>>,
+    /// Per-function local immutable scalar-only records proved safe for zero-malloc LLVM stack `alloca` promotion.
+    #[serde(default)]
+    pub stack_promotable_vars: BTreeMap<String, BTreeSet<String>>,
     /// Functions verified to satisfy `@fip` (Functional-In-Place: zero net heap allocation).
     #[serde(default)]
     pub fip_verified_fns: BTreeSet<String>,
+    /// Functions verified to satisfy `@arena` (Tier-2 scoped 64 KiB Slab Arena, no escaping arena handles).
+    #[serde(default)]
+    pub arena_verified_fns: BTreeSet<String>,
     /// Compact per-function verification summaries.
     #[serde(default)]
     pub fn_summaries: BTreeMap<String, MirFnSummary>,
@@ -303,10 +311,10 @@ fn mark_escapes_block(
                 );
                 if is_self_push {
                     if let ExprKind::Call { args, .. } = &value.kind {
-                        mark_all_mentioned(&args[1].value, cands, escaped);
+                        mark_escapes_expr(&args[1].value, true, cands, escaped);
                     }
                 } else {
-                    mark_all_mentioned(value, cands, escaped);
+                    mark_escapes_expr(value, true, cands, escaped);
                 }
             }
             Stmt::Return { value: Some(e), .. } => {
@@ -637,6 +645,280 @@ fn check_fip_expr(
         }
         ExprKind::Block(b) | ExprKind::Unsafe(b) => {
             check_fip_block(b, fn_name, fip_fns, no_heap_fns, non_alloc_builtins, budget, used, diags);
+        }
+        _ => {}
+    }
+}
+
+/// Identifies local immutable `let x = Rec { ... }` bindings whose record type contains only
+/// scalar (non-RC) fields and whose ONLY uses in `f.body` are field reads `x.field`.
+/// Such locals are 100% sound to promote directly onto the LLVM stack (`alloca`), eliminating
+/// heap allocation, `rc_inc`/`rc_dec`, and enabling LLVM SROA into CPU registers.
+pub fn compute_stack_promotable_vars(
+    f: &FnDecl,
+    non_escaping: &BTreeSet<String>,
+    scalar_only_records: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut candidates = BTreeSet::new();
+    let mut disqualified = BTreeSet::new();
+    collect_stack_candidates(&f.body, non_escaping, scalar_only_records, &mut candidates, &mut disqualified);
+    check_stack_uses_block(&f.body, &candidates, &mut disqualified);
+    candidates.difference(&disqualified).cloned().collect()
+}
+
+fn collect_stack_candidates(
+    blk: &Block,
+    non_escaping: &BTreeSet<String>,
+    scalar_only_records: &BTreeSet<String>,
+    candidates: &mut BTreeSet<String>,
+    disqualified: &mut BTreeSet<String>,
+) {
+    for s in &blk.stmts {
+        match s {
+            Stmt::Let { name, is_mut, value, .. } => {
+                if !is_mut && non_escaping.contains(name) {
+                    if let ExprKind::RecordLit { name: rname, .. } = &value.kind {
+                        if scalar_only_records.contains(rname) {
+                            if !candidates.insert(name.clone()) {
+                                // Shadowed name -> disqualify conservatively
+                                disqualified.insert(name.clone());
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if candidates.contains(name) {
+                    disqualified.insert(name.clone());
+                }
+            }
+            Stmt::Assign { target, .. } => {
+                if let ExprKind::Ident(n) = &target.kind {
+                    disqualified.insert(n.clone());
+                } else if let ExprKind::Field { target: obj, .. } = &target.kind {
+                    if let ExprKind::Ident(n) = &obj.kind {
+                        disqualified.insert(n.clone());
+                    }
+                }
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+                collect_stack_candidates(body, non_escaping, scalar_only_records, candidates, disqualified);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_stack_uses_block(blk: &Block, candidates: &BTreeSet<String>, disqualified: &mut BTreeSet<String>) {
+    for s in &blk.stmts {
+        match s {
+            Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => {
+                check_stack_uses_expr(value, candidates, disqualified, false);
+            }
+            Stmt::Assign { target, value, .. } => {
+                check_stack_uses_expr(target, candidates, disqualified, false);
+                check_stack_uses_expr(value, candidates, disqualified, false);
+            }
+            Stmt::Return { value: Some(e), .. } | Stmt::Expr { expr: e, .. } | Stmt::Assert { cond: e, .. } => {
+                check_stack_uses_expr(e, candidates, disqualified, false);
+            }
+            Stmt::While { cond, body, .. } => {
+                check_stack_uses_expr(cond, candidates, disqualified, false);
+                check_stack_uses_block(body, candidates, disqualified);
+            }
+            Stmt::For { iter, body, .. } => {
+                check_stack_uses_expr(iter, candidates, disqualified, false);
+                check_stack_uses_block(body, candidates, disqualified);
+            }
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+                check_stack_uses_block(body, candidates, disqualified);
+            }
+            _ => {}
+        }
+    }
+    if let Some(t) = &blk.tail {
+        check_stack_uses_expr(t, candidates, disqualified, false);
+    }
+}
+
+fn check_stack_uses_expr(
+    expr: &Expr,
+    candidates: &BTreeSet<String>,
+    disqualified: &mut BTreeSet<String>,
+    in_field_read: bool,
+) {
+    match &expr.kind {
+        ExprKind::Ident(n) => {
+            if !in_field_read && candidates.contains(n) {
+                disqualified.insert(n.clone());
+            }
+        }
+        ExprKind::Field { target, .. } => {
+            check_stack_uses_expr(target, candidates, disqualified, true);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            check_stack_uses_expr(left, candidates, disqualified, false);
+            check_stack_uses_expr(right, candidates, disqualified, false);
+        }
+        ExprKind::Unary { expr: e, .. }
+        | ExprKind::TupleIndex { target: e, .. }
+        | ExprKind::Try(e)
+        | ExprKind::Cast { expr: e, .. }
+        | ExprKind::TryCast { expr: e, .. } => {
+            check_stack_uses_expr(e, candidates, disqualified, false);
+        }
+        ExprKind::Index { target, index } => {
+            check_stack_uses_expr(target, candidates, disqualified, false);
+            check_stack_uses_expr(index, candidates, disqualified, false);
+        }
+        ExprKind::Call { callee, args } => {
+            check_stack_uses_expr(callee, candidates, disqualified, false);
+            for a in args {
+                check_stack_uses_expr(&a.value, candidates, disqualified, false);
+            }
+        }
+        ExprKind::RecordLit { fields, .. } => {
+            for (_, v) in fields {
+                check_stack_uses_expr(v, candidates, disqualified, false);
+            }
+        }
+        ExprKind::List(es) | ExprKind::Tuple(es) => {
+            for e in es {
+                check_stack_uses_expr(e, candidates, disqualified, false);
+            }
+        }
+        ExprKind::If { cond, then_block, else_branch } => {
+            check_stack_uses_expr(cond, candidates, disqualified, false);
+            check_stack_uses_block(then_block, candidates, disqualified);
+            if let Some(eb) = else_branch {
+                check_stack_uses_expr(eb, candidates, disqualified, false);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            check_stack_uses_expr(scrutinee, candidates, disqualified, false);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    check_stack_uses_expr(g, candidates, disqualified, false);
+                }
+                check_stack_uses_expr(&a.body, candidates, disqualified, false);
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => check_stack_uses_block(b, candidates, disqualified),
+        ExprKind::Lambda { body, .. } => check_stack_uses_expr(body, candidates, disqualified, false),
+        _ => {}
+    }
+}
+
+/// Verifies that an `@arena` function safely uses a scoped Tier-2 64 KiB Slab Arena:
+/// 1. Cannot return a heap-allocated (RC) value (arena objects are bulk-freed on function exit).
+/// 2. Cannot accept `inout` RC parameters (mutating them could store arena pointers outside the arena).
+/// 3. Cannot spawn threads or send objects over channels inside the arena frame.
+pub fn verify_arena_function(
+    f: &FnDecl,
+    is_rc_type: &dyn Fn(&TypeExpr) -> bool,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    if let Some(rt) = &f.ret_ty {
+        if is_rc_type(rt) {
+            diags.push(Diagnostic {
+                code: "E0621".into(),
+                message: format!(
+                    "`@arena` contract violated in `{}`: cannot return heap type `{}` from a scoped slab arena",
+                    f.name,
+                    rt.display_name()
+                ),
+                span: f.span,
+                notes: vec![
+                    "Tier-2 `@arena` bulk-frees all allocations on function exit; return a scalar/primitive summary or remove `@arena`".into(),
+                ],
+                counterexample: BTreeMap::new(),
+            });
+        }
+    }
+    for p in &f.params {
+        if p.is_inout && is_rc_type(&p.ty) {
+            diags.push(Diagnostic {
+                code: "E0621".into(),
+                message: format!(
+                    "`@arena` contract violated in `{}`: `inout` heap parameter `{}` could escape arena pointers",
+                    f.name, p.name
+                ),
+                span: p.span,
+                notes: vec!["only read-only or scalar `inout` parameters are allowed in `@arena` functions".into()],
+                counterexample: BTreeMap::new(),
+            });
+        }
+    }
+    check_arena_escape_block(&f.body, &f.name, &mut diags);
+    diags
+}
+
+fn check_arena_escape_block(blk: &Block, fn_name: &str, diags: &mut Vec<Diagnostic>) {
+    for s in &blk.stmts {
+        match s {
+            Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => {
+                check_arena_escape_expr(value, fn_name, diags);
+            }
+            Stmt::Assign { target, value, .. } => {
+                check_arena_escape_expr(target, fn_name, diags);
+                check_arena_escape_expr(value, fn_name, diags);
+            }
+            Stmt::Return { value: Some(e), .. } | Stmt::Expr { expr: e, .. } | Stmt::Assert { cond: e, .. } => {
+                check_arena_escape_expr(e, fn_name, diags);
+            }
+            Stmt::While { cond, body, .. } => {
+                check_arena_escape_expr(cond, fn_name, diags);
+                check_arena_escape_block(body, fn_name, diags);
+            }
+            Stmt::For { iter, body, .. } => {
+                check_arena_escape_expr(iter, fn_name, diags);
+                check_arena_escape_block(body, fn_name, diags);
+            }
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+                check_arena_escape_block(body, fn_name, diags);
+            }
+            _ => {}
+        }
+    }
+    if let Some(t) = &blk.tail {
+        check_arena_escape_expr(t, fn_name, diags);
+    }
+}
+
+fn check_arena_escape_expr(expr: &Expr, fn_name: &str, diags: &mut Vec<Diagnostic>) {
+    match &expr.kind {
+        ExprKind::Call { callee, args } => {
+            if let ExprKind::Ident(c) = &callee.kind {
+                if matches!(c.as_str(), "thread_spawn" | "channel_send" | "channel_try_send") {
+                    diags.push(Diagnostic {
+                        code: "E0621".into(),
+                        message: format!(
+                            "`@arena` contract violated in `{}`: `{}` may escape arena-allocated values across threads",
+                            fn_name, c
+                        ),
+                        span: expr.span,
+                        notes: vec!["do not spawn threads or send values on channels inside an `@arena` scope".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+            }
+            for a in args {
+                check_arena_escape_expr(&a.value, fn_name, diags);
+            }
+        }
+        ExprKind::If { cond, then_block, else_branch } => {
+            check_arena_escape_expr(cond, fn_name, diags);
+            check_arena_escape_block(then_block, fn_name, diags);
+            if let Some(eb) = else_branch {
+                check_arena_escape_expr(eb, fn_name, diags);
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => check_arena_escape_block(b, fn_name, diags),
+        ExprKind::Binary { left, right, .. } => {
+            check_arena_escape_expr(left, fn_name, diags);
+            check_arena_escape_expr(right, fn_name, diags);
+        }
+        ExprKind::Unary { expr: e, .. } | ExprKind::Field { target: e, .. } | ExprKind::Try(e) => {
+            check_arena_escape_expr(e, fn_name, diags);
         }
         _ => {}
     }

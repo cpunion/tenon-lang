@@ -44,6 +44,8 @@ pub struct BuildOptions {
     pub proved_no_overflow: BTreeSet<usize>,
     /// Per-function local variables proved non-escaping (Tier-2 escape analysis -> eliminates COW uniqueness checks).
     pub non_escaping_vars: BTreeMap<String, BTreeSet<String>>,
+    /// Per-function local immutable scalar-only records proved safe for zero-malloc LLVM stack `alloca` promotion.
+    pub stack_promotable_vars: BTreeMap<String, BTreeSet<String>>,
     /// Emit checked signed integer overflow traps for arithmetic NOT statically proved overflow-free.
     pub checked_overflow: bool,
     /// Optional target triple override for cross-compilation (e.g. `x86_64-unknown-linux-gnu`).
@@ -64,6 +66,7 @@ impl Default for BuildOptions {
             proved_safe_indices: BTreeSet::new(),
             proved_no_overflow: BTreeSet::new(),
             non_escaping_vars: BTreeMap::new(),
+            stack_promotable_vars: BTreeMap::new(),
             checked_overflow: false,
             target_triple: None,
         }
@@ -76,6 +79,7 @@ impl BuildOptions {
         self.proved_safe_indices = mir.proved_safe_indices.clone();
         self.proved_no_overflow = mir.proved_no_overflow.clone();
         self.non_escaping_vars = mir.non_escaping_vars.clone();
+        self.stack_promotable_vars = mir.stack_promotable_vars.clone();
     }
 }
 
@@ -162,6 +166,85 @@ int64_t tenon_rt_print_int(int64_t v) {
 static TenonObj* g_freelist[TENON_FREELIST_MAX_CAP + 1] = {0};
 static int g_freelist_len[TENON_FREELIST_MAX_CAP + 1] = {0};
 
+/* Tier-2 Chunked 64 KiB Slab Arena (ADR-0001 D09: `@arena` zero-malloc bulk scope) */
+#define TENON_ARENA_SLAB_SIZE 65536
+typedef struct TenonSlab {
+    struct TenonSlab* prev;
+    size_t used;
+    size_t cap;
+    uint8_t data[];
+} TenonSlab;
+
+typedef struct {
+    TenonSlab* slab;
+    size_t used;
+} TenonArenaMark;
+
+static TenonSlab* g_arena_slab = NULL;
+static int g_arena_depth = 0;
+static TenonArenaMark g_arena_marks[64];
+
+static TenonSlab* tenon_slab_new(size_t min_bytes, TenonSlab* prev) {
+    size_t cap = min_bytes > TENON_ARENA_SLAB_SIZE ? min_bytes : TENON_ARENA_SLAB_SIZE;
+    TenonSlab* s = (TenonSlab*)malloc(sizeof(TenonSlab) + cap);
+    if (!s) abort();
+    s->prev = prev;
+    s->used = 0;
+    s->cap = cap;
+    return s;
+}
+
+int64_t tenon_arena_enter(void) {
+    int idx = g_arena_depth;
+    if (idx < 64) {
+        g_arena_marks[idx].slab = g_arena_slab;
+        g_arena_marks[idx].used = g_arena_slab ? g_arena_slab->used : 0;
+    }
+    g_arena_depth++;
+    return (int64_t)idx;
+}
+
+void tenon_arena_exit(int64_t mark) {
+    if (g_arena_depth <= 0) return;
+    g_arena_depth--;
+    int idx = (int)mark;
+    if (idx >= 0 && idx < 64) {
+        TenonSlab* target = g_arena_marks[idx].slab;
+        size_t saved_used = g_arena_marks[idx].used;
+        while (g_arena_slab && g_arena_slab != target) {
+            TenonSlab* prev = g_arena_slab->prev;
+            free(g_arena_slab);
+            g_arena_slab = prev;
+        }
+        if (g_arena_slab) {
+            g_arena_slab->used = saved_used;
+        }
+    }
+    if (g_arena_depth == 0 && g_arena_slab) {
+        while (g_arena_slab->prev) {
+            TenonSlab* prev = g_arena_slab->prev;
+            free(g_arena_slab);
+            g_arena_slab = prev;
+        }
+        g_arena_slab->used = 0;
+    }
+}
+
+static inline TenonObj* tenon_arena_alloc_obj(int64_t tag, int64_t lu, int64_t cap) {
+    size_t bytes = (sizeof(TenonObj) + (size_t)cap * sizeof(int64_t) + 7u) & ~7u;
+    if (!g_arena_slab || g_arena_slab->used + bytes > g_arena_slab->cap) {
+        g_arena_slab = tenon_slab_new(bytes, g_arena_slab);
+    }
+    TenonObj* obj = (TenonObj*)(g_arena_slab->data + g_arena_slab->used);
+    g_arena_slab->used += bytes;
+    obj->rc = -2; /* Immortal-in-arena sentinel: rc_inc/rc_dec skip in 1 branch, bulk-freed on arena_exit */
+    obj->tag = tag;
+    obj->len = lu;
+    obj->cap = cap;
+    obj->rc_mask = 0;
+    return obj;
+}
+
 #ifdef TENON_USE_SYNC
 void tenon_drop_mutex_handle(int64_t raw);
 void tenon_drop_channel_handle(int64_t raw, int is_rc);
@@ -181,6 +264,9 @@ static inline TenonObj* tenon_rc_alloc_raw(int64_t tag, int64_t lu, int64_t cap)
     __atomic_add_fetch(&g_allocs, 1, __ATOMIC_RELAXED);
     return obj;
 #else
+    if (__builtin_expect(g_arena_depth > 0, 0)) {
+        return tenon_arena_alloc_obj(tag, lu, cap);
+    }
     if (__builtin_expect(cap >= 1 && cap <= TENON_FREELIST_MAX_CAP && g_freelist[cap] != NULL, 1)) {
         obj = g_freelist[cap];
         g_freelist[cap] = *(TenonObj**)obj;
@@ -313,6 +399,16 @@ static int64_t tenon_rc_cow_clone_slow(TenonObj* obj) {
         TenonObj* fresh = tenon_rc_alloc_raw(obj->tag, obj->len, words);
         if (obj->len > 0) memcpy(fresh->fields, obj->fields, (size_t)obj->len);
         if (extra) ((uint8_t*)fresh->fields)[obj->len] = 0;
+        tenon_rc_dec((int64_t)(uintptr_t)obj);
+        return (int64_t)(uintptr_t)fresh;
+    }
+    if (obj->tag == 17 || obj->tag == 18) {
+        int64_t eb = (obj->tag == 17) ? 16 : 32;
+        int64_t total_bytes = obj->len * eb;
+        int64_t words = (total_bytes + 7) / 8;
+        if (words < 2) words = 2;
+        TenonObj* fresh = tenon_rc_alloc_raw(obj->tag, obj->len, words);
+        if (total_bytes > 0) memcpy(fresh->fields, obj->fields, (size_t)total_bytes);
         tenon_rc_dec((int64_t)(uintptr_t)obj);
         return (int64_t)(uintptr_t)fresh;
     }
@@ -646,6 +742,57 @@ int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc) {
             fresh->fields[i] = init_val;
         }
     }
+    return (int64_t)(uintptr_t)fresh;
+}
+
+int64_t tenon_flat_list_filled(int64_t len, int64_t elem_bytes, const void* init_ptr) {
+    int64_t n = len < 0 ? 0 : len;
+    int64_t tag = (elem_bytes == 16) ? 17 : 18;
+    int64_t total_bytes = n * elem_bytes;
+    int64_t words = (total_bytes + 7) / 8;
+    if (words < 4) words = 4;
+    TenonObj* fresh = tenon_rc_alloc_raw(tag, n, words);
+    uint8_t* dst = (uint8_t*)fresh->fields;
+    if (init_ptr == NULL) {
+        if (total_bytes > 0) memset(dst, 0, (size_t)total_bytes);
+    } else {
+        for (int64_t i = 0; i < n; i++) {
+            memcpy(dst + (size_t)(i * elem_bytes), init_ptr, (size_t)elem_bytes);
+        }
+    }
+    return (int64_t)(uintptr_t)fresh;
+}
+
+int64_t tenon_flat_list_push(int64_t ptr, int64_t elem_bytes, const void* val_ptr) {
+    int64_t tag = (elem_bytes == 16) ? 17 : 18;
+    if (ptr == 0) {
+        return tenon_flat_list_filled(1, elem_bytes, val_ptr);
+    }
+    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
+    int64_t old_len = obj->len;
+    int64_t cap_elems = (obj->cap * 8) / elem_bytes;
+#ifdef TENON_THREAD_SAFE
+    int shared = __atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE) > 1;
+#else
+    int shared = obj->rc > 1;
+#endif
+    if (!shared && old_len < cap_elems) {
+        g_reuse++;
+        memcpy((uint8_t*)obj->fields + (size_t)(old_len * elem_bytes), val_ptr, (size_t)elem_bytes);
+        obj->len = old_len + 1;
+        return ptr;
+    }
+    int64_t new_elems = cap_elems * 2;
+    if (new_elems < old_len + 1) new_elems = old_len + 1;
+    if (new_elems < 4) new_elems = 4;
+    int64_t new_words = (new_elems * elem_bytes + 7) / 8;
+    TenonObj* fresh = tenon_rc_alloc_raw(tag, old_len + 1, new_words);
+    if (old_len > 0) {
+        memcpy(fresh->fields, obj->fields, (size_t)(old_len * elem_bytes));
+    }
+    memcpy((uint8_t*)fresh->fields + (size_t)(old_len * elem_bytes), val_ptr, (size_t)elem_bytes);
+    if (shared) g_cow++; else g_reuse++;
+    tenon_rc_dec(ptr);
     return (int64_t)(uintptr_t)fresh;
 }
 
@@ -1910,6 +2057,7 @@ pub fn emit_llvm_ir_with_build_options(
     let proved_safe_indices = &opts.proved_safe_indices;
     let proved_no_overflow = &opts.proved_no_overflow;
     let non_escaping_vars = &opts.non_escaping_vars;
+    let stack_promotable_vars = &opts.stack_promotable_vars;
     let checked_overflow = opts.checked_overflow;
     let target_triple = opts.target_triple.as_deref();
     let prepared = prepare_program_for_codegen(program);
@@ -2202,6 +2350,7 @@ pub fn emit_llvm_ir_with_build_options(
             proved_safe_indices,
             proved_no_overflow,
             non_escaping_vars,
+            stack_promotable_vars,
             checked_overflow,
             &mut string_globals,
             &mut string_intern,
@@ -2239,6 +2388,7 @@ pub fn emit_llvm_ir_with_build_options(
             proved_safe_indices,
             proved_no_overflow,
             non_escaping_vars,
+            stack_promotable_vars,
             checked_overflow,
             &mut string_globals,
             &mut string_intern,
@@ -2269,6 +2419,7 @@ pub fn emit_llvm_ir_with_build_options(
             proved_safe_indices,
             proved_no_overflow,
             non_escaping_vars,
+            stack_promotable_vars,
             checked_overflow,
             &mut string_globals,
             &mut string_intern,
@@ -2356,6 +2507,10 @@ pub fn emit_llvm_ir_with_build_options(
     ir.push_str("declare i64 @tenon_text_eq(i64, i64)\n");
     ir.push_str("declare i64 @tenon_list_push(i64, i64)\n");
     ir.push_str("declare i64 @tenon_list_filled(i64, i64, i64)\n");
+    ir.push_str("declare i64 @tenon_flat_list_filled(i64, i64, ptr)\n");
+    ir.push_str("declare i64 @tenon_flat_list_push(i64, i64, ptr)\n");
+    ir.push_str("declare i64 @tenon_arena_enter()\n");
+    ir.push_str("declare void @tenon_arena_exit(i64)\n");
     ir.push_str("declare i64 @tenon_list_pop_shrink(i64)\n");
     ir.push_str("declare i64 @tenon_async_frame_alloc(i64, i64)\n");
     ir.push_str("declare i64 @tenon_async_yield_create(i64)\n");
@@ -2530,6 +2685,7 @@ struct LlvmFnGen<'a> {
     proved_safe_indices: &'a BTreeSet<usize>,
     proved_no_overflow: &'a BTreeSet<usize>,
     non_escaping_vars: &'a BTreeMap<String, BTreeSet<String>>,
+    stack_promotable_vars: &'a BTreeMap<String, BTreeSet<String>>,
     checked_overflow: bool,
     string_globals: &'a mut Vec<(String, String)>,
     string_intern: &'a mut BTreeMap<String, String>,
@@ -2548,6 +2704,8 @@ struct LlvmFnGen<'a> {
     owned_rc_vars: BTreeSet<String>,
     borrowed_rc_vars: BTreeSet<String>,
     always_unique_vars: BTreeSet<String>,
+    cur_stack_promotable: BTreeSet<String>,
+    active_arena_mark: Option<String>,
     rc_scopes: Vec<Vec<(String, String)>>,
     temp_rc_scopes: Vec<Vec<String>>,
     loop_stack: Vec<LlvmLoopCtx>,
@@ -2576,6 +2734,7 @@ impl<'a> LlvmFnGen<'a> {
         proved_safe_indices: &'a BTreeSet<usize>,
         proved_no_overflow: &'a BTreeSet<usize>,
         non_escaping_vars: &'a BTreeMap<String, BTreeSet<String>>,
+        stack_promotable_vars: &'a BTreeMap<String, BTreeSet<String>>,
         checked_overflow: bool,
         string_globals: &'a mut Vec<(String, String)>,
         string_intern: &'a mut BTreeMap<String, String>,
@@ -2601,6 +2760,7 @@ impl<'a> LlvmFnGen<'a> {
             proved_safe_indices,
             proved_no_overflow,
             non_escaping_vars,
+            stack_promotable_vars,
             checked_overflow,
             string_globals,
             string_intern,
@@ -2619,6 +2779,8 @@ impl<'a> LlvmFnGen<'a> {
             owned_rc_vars: BTreeSet::new(),
             borrowed_rc_vars: BTreeSet::new(),
             always_unique_vars: BTreeSet::new(),
+            cur_stack_promotable: BTreeSet::new(),
+            active_arena_mark: None,
             rc_scopes: Vec::new(),
             temp_rc_scopes: Vec::new(),
             loop_stack: Vec::new(),
@@ -3186,6 +3348,234 @@ impl<'a> LlvmFnGen<'a> {
         Ok(out)
     }
 
+    /// Returns `(llvm_vec_ty, elem_byte_size, flat_tag)` if `ty` is `List[SimdVec]`
+    /// eligible for contiguous unboxed value-type specialization (zero pointer chasing, zero child RC).
+    fn flat_simd_list_info(&self, ty: &TypeExpr) -> Option<(&'static str, usize, i64)> {
+        let elem = self.list_elem_ty(ty)?;
+        self.simd_elem_info(&elem)
+    }
+
+    fn simd_elem_info(&self, ty: &TypeExpr) -> Option<(&'static str, usize, i64)> {
+        match resolve_alias_ty(ty, self.alias_bases) {
+            TypeExpr::Named { name, .. } => match name.as_str() {
+                "Float64x4" => Some(("<4 x double>", 32, 18)),
+                "Int64x4" => Some(("<4 x i64>", 32, 18)),
+                "Float32x4" => Some(("<4 x float>", 16, 17)),
+                "Int32x4" => Some(("<4 x i32>", 16, 17)),
+                "UInt8x16" => Some(("<16 x i8>", 16, 17)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Evaluates a SIMD vector expression directly into an LLVM vector SSA register (`<4 x double>`, etc.)
+    /// without intermediate heap boxing:
+    /// - `a[j]` on a flat `List[SimdVec]` emits a direct contiguous vector `load` (`!tbaa !7`)!
+    /// - `simd_*_new(...)` / `simd_*_splat(...)` constructs the vector directly in registers!
+    fn lower_simd_vec_reg(
+        &mut self,
+        expr: &Expr,
+        vec_ty: &str,
+        elem_bytes: usize,
+        temps: &mut Vec<String>,
+    ) -> Result<String, String> {
+        // Fast path 1: contiguous unboxed vector load from flat `List[SimdVec]`
+        if let ExprKind::Index { target, index } = &expr.kind {
+            let tty = self.infer_expr_type(target);
+            if let Some((f_vty, f_bytes, _)) = self.flat_simd_list_info(&tty) {
+                if f_vty == vec_ty && f_bytes == elem_bytes {
+                    let t = self.lower_expr_borrowed(target, temps)?;
+                    let idx = self.lower_expr_borrowed(index, temps)?;
+                    let is_safe = self.proved_safe_indices.contains(&expr.span.start);
+                    if is_safe {
+                        let base = self.fresh_tmp();
+                        let data = self.fresh_tmp();
+                        let ep = self.fresh_tmp();
+                        let v = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds {}, ptr {}, i64 {}\n  {} = load {}, ptr {}, align 8, !tbaa !7\n",
+                            base, t, data, base, ep, vec_ty, data, idx, v, vec_ty, ep
+                        ));
+                        return Ok(v);
+                    } else {
+                        let res_slot = format!("%fsimd_{}", { self.slot_id += 1; self.slot_id });
+                        self.entry_allocas
+                            .push_str(&format!("  {} = alloca {}, align 8\n", res_slot, vec_ty));
+                        let ok_l = self.fresh_lbl("fsimd_ok");
+                        let oob_l = self.fresh_lbl("fsimd_oob");
+                        let end_l = self.fresh_lbl("fsimd_end");
+                        let nz = self.fresh_tmp();
+                        let base = self.fresh_tmp();
+                        let lp = self.fresh_tmp();
+                        let len_v = self.fresh_tmp();
+                        let in_b = self.fresh_tmp();
+                        let ok_all = self.fresh_tmp();
+                        let data = self.fresh_tmp();
+                        let ep = self.fresh_tmp();
+                        let lv = self.fresh_tmp();
+                        let out = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}_chk, label %{}\n{}_chk:\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 16\n  {} = load i64, ptr {}, align 8, !tbaa !8\n  {} = icmp ult i64 {}, {}\n  {} = and i1 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds {}, ptr {}, i64 {}\n  {} = load {}, ptr {}, align 8, !tbaa !7\n  store {} {}, ptr {}, align 8\n  br label %{}\n{}:\n  store {} zeroinitializer, ptr {}, align 8\n  br label %{}\n{}:\n  {} = load {}, ptr {}, align 8\n",
+                            nz, t, nz, ok_l, oob_l,
+                            ok_l, base, t, lp, base, len_v, lp, in_b, idx, len_v, ok_all, nz, in_b, ok_all, ok_l, oob_l,
+                            ok_l, data, base, ep, vec_ty, data, idx, lv, vec_ty, ep, vec_ty, lv, res_slot, end_l,
+                            oob_l, vec_ty, res_slot, end_l,
+                            end_l, out, vec_ty, res_slot
+                        ));
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        // Fast path 2: construct SIMD vector directly in registers (zero heap allocation!)
+        if let ExprKind::Call { callee, args } = &expr.kind {
+            if let ExprKind::Ident(fname) = &callee.kind {
+                match (fname.as_str(), vec_ty) {
+                    ("simd_f64x4_new", "<4 x double>") if args.len() == 4 => {
+                        let mut ds = Vec::new();
+                        for a in args {
+                            let raw = self.lower_expr_borrowed(&a.value, temps)?;
+                            let d = self.fresh_tmp();
+                            self.code.push_str(&format!("  {} = bitcast i64 {} to double\n", d, raw));
+                            ds.push(d);
+                        }
+                        let v0 = self.fresh_tmp();
+                        let v1 = self.fresh_tmp();
+                        let v2 = self.fresh_tmp();
+                        let v3 = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = insertelement <4 x double> undef, double {}, i32 0\n  {} = insertelement <4 x double> {}, double {}, i32 1\n  {} = insertelement <4 x double> {}, double {}, i32 2\n  {} = insertelement <4 x double> {}, double {}, i32 3\n",
+                            v0, ds[0], v1, v0, ds[1], v2, v1, ds[2], v3, v2, ds[3]
+                        ));
+                        return Ok(v3);
+                    }
+                    ("simd_f64x4_splat", "<4 x double>") if args.len() == 1 => {
+                        let raw = self.lower_expr_borrowed(&args[0].value, temps)?;
+                        let d = self.fresh_tmp();
+                        let v0 = self.fresh_tmp();
+                        let vs = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = bitcast i64 {} to double\n  {} = insertelement <4 x double> undef, double {}, i32 0\n  {} = shufflevector <4 x double> {}, <4 x double> undef, <4 x i32> zeroinitializer\n",
+                            d, raw, v0, d, vs, v0
+                        ));
+                        return Ok(vs);
+                    }
+                    ("simd_f32x4_new", "<4 x float>") if args.len() == 4 => {
+                        let mut fs = Vec::new();
+                        for a in args {
+                            let raw = self.lower_expr_borrowed(&a.value, temps)?;
+                            let t = self.fresh_tmp();
+                            let f = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n",
+                                t, raw, f, t
+                            ));
+                            fs.push(f);
+                        }
+                        let v0 = self.fresh_tmp();
+                        let v1 = self.fresh_tmp();
+                        let v2 = self.fresh_tmp();
+                        let v3 = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = insertelement <4 x float> undef, float {}, i32 0\n  {} = insertelement <4 x float> {}, float {}, i32 1\n  {} = insertelement <4 x float> {}, float {}, i32 2\n  {} = insertelement <4 x float> {}, float {}, i32 3\n",
+                            v0, fs[0], v1, v0, fs[1], v2, v1, fs[2], v3, v2, fs[3]
+                        ));
+                        return Ok(v3);
+                    }
+                    ("simd_f32x4_splat", "<4 x float>") if args.len() == 1 => {
+                        let raw = self.lower_expr_borrowed(&args[0].value, temps)?;
+                        let t = self.fresh_tmp();
+                        let f = self.fresh_tmp();
+                        let v0 = self.fresh_tmp();
+                        let vs = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n  {} = insertelement <4 x float> undef, float {}, i32 0\n  {} = shufflevector <4 x float> {}, <4 x float> undef, <4 x i32> zeroinitializer\n",
+                            t, raw, f, t, v0, f, vs, v0
+                        ));
+                        return Ok(vs);
+                    }
+                    ("simd_i64x4_new", "<4 x i64>") if args.len() == 4 => {
+                        let mut vs = Vec::new();
+                        for a in args {
+                            vs.push(self.lower_expr_borrowed(&a.value, temps)?);
+                        }
+                        let v0 = self.fresh_tmp();
+                        let v1 = self.fresh_tmp();
+                        let v2 = self.fresh_tmp();
+                        let v3 = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = insertelement <4 x i64> undef, i64 {}, i32 0\n  {} = insertelement <4 x i64> {}, i64 {}, i32 1\n  {} = insertelement <4 x i64> {}, i64 {}, i32 2\n  {} = insertelement <4 x i64> {}, i64 {}, i32 3\n",
+                            v0, vs[0], v1, v0, vs[1], v2, v1, vs[2], v3, v2, vs[3]
+                        ));
+                        return Ok(v3);
+                    }
+                    ("simd_i64x4_splat", "<4 x i64>") if args.len() == 1 => {
+                        let raw = self.lower_expr_borrowed(&args[0].value, temps)?;
+                        let v0 = self.fresh_tmp();
+                        let vs = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = insertelement <4 x i64> undef, i64 {}, i32 0\n  {} = shufflevector <4 x i64> {}, <4 x i64> undef, <4 x i32> zeroinitializer\n",
+                            v0, raw, vs, v0
+                        ));
+                        return Ok(vs);
+                    }
+                    ("simd_i32x4_new", "<4 x i32>") if args.len() == 4 => {
+                        let mut vs = Vec::new();
+                        for a in args {
+                            let raw = self.lower_expr_borrowed(&a.value, temps)?;
+                            let t = self.fresh_tmp();
+                            self.code.push_str(&format!("  {} = trunc i64 {} to i32\n", t, raw));
+                            vs.push(t);
+                        }
+                        let v0 = self.fresh_tmp();
+                        let v1 = self.fresh_tmp();
+                        let v2 = self.fresh_tmp();
+                        let v3 = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = insertelement <4 x i32> undef, i32 {}, i32 0\n  {} = insertelement <4 x i32> {}, i32 {}, i32 1\n  {} = insertelement <4 x i32> {}, i32 {}, i32 2\n  {} = insertelement <4 x i32> {}, i32 {}, i32 3\n",
+                            v0, vs[0], v1, v0, vs[1], v2, v1, vs[2], v3, v2, vs[3]
+                        ));
+                        return Ok(v3);
+                    }
+                    ("simd_i32x4_splat", "<4 x i32>") if args.len() == 1 => {
+                        let raw = self.lower_expr_borrowed(&args[0].value, temps)?;
+                        let t = self.fresh_tmp();
+                        let v0 = self.fresh_tmp();
+                        let vs = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = trunc i64 {} to i32\n  {} = insertelement <4 x i32> undef, i32 {}, i32 0\n  {} = shufflevector <4 x i32> {}, <4 x i32> undef, <4 x i32> zeroinitializer\n",
+                            t, raw, v0, t, vs, v0
+                        ));
+                        return Ok(vs);
+                    }
+                    ("simd_u8x16_splat", "<16 x i8>") if args.len() == 1 => {
+                        let raw = self.lower_expr_borrowed(&args[0].value, temps)?;
+                        let t = self.fresh_tmp();
+                        let v0 = self.fresh_tmp();
+                        let vs = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = trunc i64 {} to i8\n  {} = insertelement <16 x i8> undef, i8 {}, i32 0\n  {} = shufflevector <16 x i8> {}, <16 x i8> undef, <16 x i32> zeroinitializer\n",
+                            t, raw, v0, t, vs, v0
+                        ));
+                        return Ok(vs);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Fallback: load vector from boxed SIMD handle
+        let vh = self.lower_expr_borrowed(expr, temps)?;
+        let di = self.fresh_tmp();
+        let dp = self.fresh_tmp();
+        let v = self.fresh_tmp();
+        self.code.push_str(&format!(
+            "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  {} = load {}, ptr {}, align 8\n",
+            di, vh, dp, di, v, vec_ty, dp
+        ));
+        Ok(v)
+    }
+
     /// Native LLVM SIMD Vector IR emitter (`<4 x float>`, `<4 x double>`, `<4 x i32>`, `<4 x i64>`, `<16 x i8>`).
     fn try_emit_simd_builtin(
         &mut self,
@@ -3256,9 +3646,8 @@ impl<'a> LlvmFnGen<'a> {
                 obj
             }
             "simd_f32x4_lane" if args.len() == 2 => {
-                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let v = self.lower_simd_vec_reg(&args[0].value, "<4 x float>", 16, &mut temps)?;
                 let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let v = load_vec(self, &vh, "<4 x float>");
                 let i32x = self.fresh_tmp();
                 let f = self.fresh_tmp();
                 let b = self.fresh_tmp();
@@ -3270,10 +3659,8 @@ impl<'a> LlvmFnGen<'a> {
                 z
             }
             "simd_f32x4_binop" if args.len() == 3 => {
-                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let va = load_vec(self, &ah, "<4 x float>");
-                let vb = load_vec(self, &bh, "<4 x float>");
+                let va = self.lower_simd_vec_reg(&args[0].value, "<4 x float>", 16, &mut temps)?;
+                let vb = self.lower_simd_vec_reg(&args[1].value, "<4 x float>", 16, &mut temps)?;
                 let (obj, dp) = alloc_vec(self, 16);
                 let op_const = match &args[2].value.kind {
                     ExprKind::Int(n) => Some(*n),
@@ -3316,12 +3703,9 @@ impl<'a> LlvmFnGen<'a> {
                 obj
             }
             "simd_f32x4_fma" if args.len() == 3 => {
-                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let ch = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
-                let va = load_vec(self, &ah, "<4 x float>");
-                let vb = load_vec(self, &bh, "<4 x float>");
-                let vc = load_vec(self, &ch, "<4 x float>");
+                let va = self.lower_simd_vec_reg(&args[0].value, "<4 x float>", 16, &mut temps)?;
+                let vb = self.lower_simd_vec_reg(&args[1].value, "<4 x float>", 16, &mut temps)?;
+                let vc = self.lower_simd_vec_reg(&args[2].value, "<4 x float>", 16, &mut temps)?;
                 let (obj, dp) = alloc_vec(self, 16);
                 let res = self.fresh_tmp();
                 self.code.push_str(&format!(
@@ -3331,8 +3715,7 @@ impl<'a> LlvmFnGen<'a> {
                 obj
             }
             "simd_f32x4_reduce_sum" if args.len() == 1 => {
-                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let v = load_vec(self, &vh, "<4 x float>");
+                let v = self.lower_simd_vec_reg(&args[0].value, "<4 x float>", 16, &mut temps)?;
                 let sum = self.fresh_tmp();
                 let b = self.fresh_tmp();
                 let z = self.fresh_tmp();
@@ -3343,10 +3726,8 @@ impl<'a> LlvmFnGen<'a> {
                 z
             }
             "simd_f32x4_dot" if args.len() == 2 => {
-                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let va = load_vec(self, &ah, "<4 x float>");
-                let vb = load_vec(self, &bh, "<4 x float>");
+                let va = self.lower_simd_vec_reg(&args[0].value, "<4 x float>", 16, &mut temps)?;
+                let vb = self.lower_simd_vec_reg(&args[1].value, "<4 x float>", 16, &mut temps)?;
                 let prod = self.fresh_tmp();
                 let lo = self.fresh_tmp();
                 let hi = self.fresh_tmp();
@@ -3394,9 +3775,8 @@ impl<'a> LlvmFnGen<'a> {
                 obj
             }
             "simd_f64x4_lane" if args.len() == 2 => {
-                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let v = self.lower_simd_vec_reg(&args[0].value, "<4 x double>", 32, &mut temps)?;
                 let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let v = load_vec(self, &vh, "<4 x double>");
                 let i32x = self.fresh_tmp();
                 let d = self.fresh_tmp();
                 let b = self.fresh_tmp();
@@ -3407,10 +3787,8 @@ impl<'a> LlvmFnGen<'a> {
                 b
             }
             "simd_f64x4_binop" if args.len() == 3 => {
-                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let va = load_vec(self, &ah, "<4 x double>");
-                let vb = load_vec(self, &bh, "<4 x double>");
+                let va = self.lower_simd_vec_reg(&args[0].value, "<4 x double>", 32, &mut temps)?;
+                let vb = self.lower_simd_vec_reg(&args[1].value, "<4 x double>", 32, &mut temps)?;
                 let (obj, dp) = alloc_vec(self, 32);
                 let op_const = match &args[2].value.kind {
                     ExprKind::Int(n) => Some(*n),
@@ -3453,12 +3831,9 @@ impl<'a> LlvmFnGen<'a> {
                 obj
             }
             "simd_f64x4_fma" if args.len() == 3 => {
-                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let ch = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
-                let va = load_vec(self, &ah, "<4 x double>");
-                let vb = load_vec(self, &bh, "<4 x double>");
-                let vc = load_vec(self, &ch, "<4 x double>");
+                let va = self.lower_simd_vec_reg(&args[0].value, "<4 x double>", 32, &mut temps)?;
+                let vb = self.lower_simd_vec_reg(&args[1].value, "<4 x double>", 32, &mut temps)?;
+                let vc = self.lower_simd_vec_reg(&args[2].value, "<4 x double>", 32, &mut temps)?;
                 let (obj, dp) = alloc_vec(self, 32);
                 let res = self.fresh_tmp();
                 self.code.push_str(&format!(
@@ -3468,8 +3843,7 @@ impl<'a> LlvmFnGen<'a> {
                 obj
             }
             "simd_f64x4_reduce_sum" if args.len() == 1 => {
-                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let v = load_vec(self, &vh, "<4 x double>");
+                let v = self.lower_simd_vec_reg(&args[0].value, "<4 x double>", 32, &mut temps)?;
                 let sum = self.fresh_tmp();
                 let b = self.fresh_tmp();
                 self.code.push_str(&format!(
@@ -3479,10 +3853,8 @@ impl<'a> LlvmFnGen<'a> {
                 b
             }
             "simd_f64x4_dot" if args.len() == 2 => {
-                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let va = load_vec(self, &ah, "<4 x double>");
-                let vb = load_vec(self, &bh, "<4 x double>");
+                let va = self.lower_simd_vec_reg(&args[0].value, "<4 x double>", 32, &mut temps)?;
+                let vb = self.lower_simd_vec_reg(&args[1].value, "<4 x double>", 32, &mut temps)?;
                 let prod = self.fresh_tmp();
                 let lo = self.fresh_tmp();
                 let hi = self.fresh_tmp();
@@ -3529,9 +3901,8 @@ impl<'a> LlvmFnGen<'a> {
                 obj
             }
             "simd_i32x4_lane" if args.len() == 2 => {
-                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let v = self.lower_simd_vec_reg(&args[0].value, "<4 x i32>", 16, &mut temps)?;
                 let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let v = load_vec(self, &vh, "<4 x i32>");
                 let i32x = self.fresh_tmp();
                 let el = self.fresh_tmp();
                 let ex = self.fresh_tmp();
@@ -3542,10 +3913,8 @@ impl<'a> LlvmFnGen<'a> {
                 ex
             }
             "simd_i32x4_binop" if args.len() == 3 => {
-                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let va = load_vec(self, &ah, "<4 x i32>");
-                let vb = load_vec(self, &bh, "<4 x i32>");
+                let va = self.lower_simd_vec_reg(&args[0].value, "<4 x i32>", 16, &mut temps)?;
+                let vb = self.lower_simd_vec_reg(&args[1].value, "<4 x i32>", 16, &mut temps)?;
                 let (obj, dp) = alloc_vec(self, 16);
                 let op_const = match &args[2].value.kind {
                     ExprKind::Int(n) => Some(*n),
@@ -3574,8 +3943,7 @@ impl<'a> LlvmFnGen<'a> {
                 obj
             }
             "simd_i32x4_reduce_sum" if args.len() == 1 => {
-                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let v = load_vec(self, &vh, "<4 x i32>");
+                let v = self.lower_simd_vec_reg(&args[0].value, "<4 x i32>", 16, &mut temps)?;
                 let sum = self.fresh_tmp();
                 let ex = self.fresh_tmp();
                 self.code.push_str(&format!(
@@ -3612,9 +3980,8 @@ impl<'a> LlvmFnGen<'a> {
                 obj
             }
             "simd_i64x4_lane" if args.len() == 2 => {
-                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let v = self.lower_simd_vec_reg(&args[0].value, "<4 x i64>", 32, &mut temps)?;
                 let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let v = load_vec(self, &vh, "<4 x i64>");
                 let i32x = self.fresh_tmp();
                 let el = self.fresh_tmp();
                 self.code.push_str(&format!(
@@ -3624,10 +3991,8 @@ impl<'a> LlvmFnGen<'a> {
                 el
             }
             "simd_i64x4_binop" if args.len() == 3 => {
-                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
-                let va = load_vec(self, &ah, "<4 x i64>");
-                let vb = load_vec(self, &bh, "<4 x i64>");
+                let va = self.lower_simd_vec_reg(&args[0].value, "<4 x i64>", 32, &mut temps)?;
+                let vb = self.lower_simd_vec_reg(&args[1].value, "<4 x i64>", 32, &mut temps)?;
                 let (obj, dp) = alloc_vec(self, 32);
                 let op_const = match &args[2].value.kind {
                     ExprKind::Int(n) => Some(*n),
@@ -3656,8 +4021,7 @@ impl<'a> LlvmFnGen<'a> {
                 obj
             }
             "simd_i64x4_reduce_sum" if args.len() == 1 => {
-                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
-                let v = load_vec(self, &vh, "<4 x i64>");
+                let v = self.lower_simd_vec_reg(&args[0].value, "<4 x i64>", 32, &mut temps)?;
                 let sum = self.fresh_tmp();
                 self.code.push_str(&format!(
                     "  {} = call i64 @llvm.vector.reduce.add.v4i64(<4 x i64> {})\n",
@@ -4431,9 +4795,26 @@ impl<'a> LlvmFnGen<'a> {
         if let Some(ne) = self.non_escaping_vars.get(&f.name) {
             self.always_unique_vars.extend(ne.iter().cloned());
         }
+        self.cur_stack_promotable = self
+            .stack_promotable_vars
+            .get(&f.name)
+            .cloned()
+            .unwrap_or_default();
+        if f.attrs.iter().any(|a| a.name == "arena") {
+            let am = self.fresh_tmp();
+            self.code
+                .push_str(&format!("  {} = call i64 @tenon_arena_enter()\n", am));
+            self.active_arena_mark = Some(am);
+        } else {
+            self.active_arena_mark = None;
+        }
 
         let ret_val = self.lower_block(&f.body, self.fn_returns_rc, f.ret_ty.as_ref())?;
         if !self.terminated {
+            if let Some(am) = &self.active_arena_mark {
+                self.code
+                    .push_str(&format!("  call void @tenon_arena_exit(i64 {})\n", am));
+            }
             let dbg = self.dbg_suffix(f.body.span);
             self.code.push_str(&format!("  ret i64 {}{}\n", ret_val, dbg));
         }
@@ -4772,6 +5153,72 @@ impl<'a> LlvmFnGen<'a> {
                     name, ty, value, span, ..
                 } => {
                     let effective_ty = ty.clone().unwrap_or_else(|| self.infer_expr_type(value));
+                    // Tier-2 Stack Promotion: non-escaping immutable scalar-only RecordLit -> LLVM entry `alloca`!
+                    if self.cur_stack_promotable.contains(name) {
+                        if let ExprKind::RecordLit {
+                            name: rname,
+                            fields,
+                            ..
+                        } = &value.kind
+                        {
+                            if let Some(layout) = self.records.get(rname).cloned() {
+                                if layout.rc_mask == 0 && layout.c_layout.is_none() {
+                                    let nwords = 5 + layout.fields.len().max(1);
+                                    self.slot_id += 1;
+                                    let stk_arr = format!("%stkrec_{}", self.slot_id);
+                                    self.entry_allocas.push_str(&format!(
+                                        "  {} = alloca [{} x i64], align 8\n",
+                                        stk_arr, nwords
+                                    ));
+                                    let obj = self.fresh_tmp();
+                                    let p_rc = self.fresh_tmp();
+                                    let p_tag = self.fresh_tmp();
+                                    let p_len = self.fresh_tmp();
+                                    let p_cap = self.fresh_tmp();
+                                    let p_mask = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = getelementptr inbounds [{} x i64], ptr {}, i64 0, i64 0\n  store i64 -2, ptr {}, align 8\n  {} = getelementptr inbounds [{} x i64], ptr {}, i64 0, i64 1\n  store i64 {}, ptr {}, align 8\n  {} = getelementptr inbounds [{} x i64], ptr {}, i64 0, i64 2\n  store i64 {}, ptr {}, align 8\n  {} = getelementptr inbounds [{} x i64], ptr {}, i64 0, i64 3\n  store i64 {}, ptr {}, align 8\n  {} = getelementptr inbounds [{} x i64], ptr {}, i64 0, i64 4\n  store i64 0, ptr {}, align 8\n",
+                                        p_rc, nwords, stk_arr, p_rc,
+                                        p_tag, nwords, stk_arr, layout.tag, p_tag,
+                                        p_len, nwords, stk_arr, layout.fields.len(), p_len,
+                                        p_cap, nwords, stk_arr, layout.fields.len().max(1), p_cap,
+                                        p_mask, nwords, stk_arr, p_mask
+                                    ));
+                                    for (fname, fexpr) in fields {
+                                        if let Some((idx, _)) = layout
+                                            .fields
+                                            .iter()
+                                            .enumerate()
+                                            .find(|(_, f)| f.name == *fname)
+                                        {
+                                            let mut temps = Vec::new();
+                                            let fv = self.lower_expr_borrowed(fexpr, &mut temps)?;
+                                            self.flush_temps(&temps);
+                                            let fp = self.fresh_tmp();
+                                            self.code.push_str(&format!(
+                                                "  {} = getelementptr inbounds [{} x i64], ptr {}, i64 0, i64 {}\n  store i64 {}, ptr {}, align 8, !tbaa !7\n",
+                                                fp, nwords, stk_arr, 5 + idx, fv, fp
+                                            ));
+                                        }
+                                    }
+                                    self.code.push_str(&format!(
+                                        "  {} = ptrtoint ptr {} to i64\n",
+                                        obj, stk_arr
+                                    ));
+                                    let slot = self.fresh_var_slot(name);
+                                    let dbg = self.dbg_suffix(*span);
+                                    self.code.push_str(&format!(
+                                        "  store i64 {}, ptr {}{}\n",
+                                        obj, slot, dbg
+                                    ));
+                                    self.var_types.insert(name.clone(), effective_ty);
+                                    self.owned_rc_vars.remove(name);
+                                    self.borrowed_rc_vars.insert(name.clone());
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let produces_rc = self.type_is_rc(&effective_ty) || self.expr_produces_rc(value);
                     let mut v = if produces_rc {
                         self.lower_expr_owned(value, ty.as_ref())?
@@ -4834,6 +5281,26 @@ impl<'a> LlvmFnGen<'a> {
                             let ExprKind::Call { args, .. } = &value.kind else {
                                 unreachable!()
                             };
+                            if let Some((vec_ty, elem_bytes, _)) = target_ty
+                                .as_ref()
+                                .and_then(|t| self.flat_simd_list_info(t))
+                                .or_else(|| self.simd_elem_info(&self.infer_expr_type(&args[1].value)))
+                            {
+                                let xs_val = self.load_ident_val(name)?;
+                                let mut temps = Vec::new();
+                                let vv = self.lower_simd_vec_reg(&args[1].value, vec_ty, elem_bytes, &mut temps)?;
+                                self.slot_id += 1;
+                                let vslot = format!("%fpush_{}", self.slot_id);
+                                self.entry_allocas
+                                    .push_str(&format!("  {} = alloca {}, align 8\n", vslot, vec_ty));
+                                let res = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  store {} {}, ptr {}, align 8\n  {} = call i64 @tenon_flat_list_push(i64 {}, i64 {}, ptr {})\n",
+                                    vec_ty, vv, vslot, res, xs_val, elem_bytes, vslot
+                                ));
+                                self.flush_temps(&temps);
+                                res
+                            } else {
                             let elem_is_rc = target_ty
                                 .as_ref()
                                 .and_then(|t| self.list_elem_ty(t))
@@ -4858,6 +5325,7 @@ impl<'a> LlvmFnGen<'a> {
                                 res, xs_val, val_v
                             ));
                             res
+                            }
                         } else if consuming_pop {
                             let xs_val = self.load_ident_val(name)?;
                             let res = self.fresh_tmp();
@@ -5165,6 +5633,61 @@ impl<'a> LlvmFnGen<'a> {
                                     };
                                     self.emit_mem_store(&eptr, 0, &new_val, &elem_ty, false)?;
                                     self.flush_temps(&temps);
+                                } else if let Some((vec_ty, elem_bytes, _)) = self
+                                    .var_types
+                                    .get(vname)
+                                    .and_then(|t| self.flat_simd_list_info(t))
+                                {
+                                    // Unboxed contiguous flat `List[SimdVec]` element store (zero heap boxing!)
+                                    let mut temps = Vec::new();
+                                    let vv = self.lower_simd_vec_reg(value, vec_ty, elem_bytes, &mut temps)?;
+                                    let cur_list = self.load_ident_val(vname)?;
+                                    let is_always_uniq = self.always_unique_vars.contains(vname);
+                                    let uniq_list = if is_always_uniq {
+                                        cur_list
+                                    } else {
+                                        let u = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
+                                            u, cur_list
+                                        ));
+                                        let vslot = self.var_ptrs[vname].clone();
+                                        if self.inout_vars.contains(vname) {
+                                            let ai = self.fresh_tmp();
+                                            let ap = self.fresh_tmp();
+                                            self.code.push_str(&format!(
+                                                "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                                ai, vslot, ap, ai, u, ap
+                                            ));
+                                        } else {
+                                            self.code.push_str(&format!(
+                                                "  store i64 {}, ptr {}\n",
+                                                u, vslot
+                                            ));
+                                        }
+                                        u
+                                    };
+                                    let base = self.fresh_tmp();
+                                    let data = self.fresh_tmp();
+                                    let ep = self.fresh_tmp();
+                                    if self.proved_safe_indices.contains(&target.span.start) {
+                                        self.code.push_str(&format!(
+                                            "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds {}, ptr {}, i64 {}\n  store {} {}, ptr {}, align 8, !tbaa !7\n",
+                                            base, uniq_list, data, base, ep, vec_ty, data, idx_v, vec_ty, vv, ep
+                                        ));
+                                    } else {
+                                        let ok_l = self.fresh_lbl("fset_ok");
+                                        let end_l = self.fresh_lbl("fset_end");
+                                        let lp = self.fresh_tmp();
+                                        let len_v = self.fresh_tmp();
+                                        let in_b = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 16\n  {} = load i64, ptr {}, align 8, !tbaa !8\n  {} = icmp ult i64 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds {}, ptr {}, i64 {}\n  store {} {}, ptr {}, align 8, !tbaa !7\n  br label %{}\n{}:\n",
+                                            base, uniq_list, lp, base, len_v, lp, in_b, idx_v, len_v, in_b, ok_l, end_l,
+                                            ok_l, data, base, ep, vec_ty, data, idx_v, vec_ty, vv, ep, end_l, end_l
+                                        ));
+                                    }
+                                    self.flush_temps(&temps);
                                 } else {
                                     let elem_ty = self
                                         .var_types
@@ -5400,6 +5923,10 @@ impl<'a> LlvmFnGen<'a> {
                     };
                     self.emit_cleanup_temp_scopes_from(0);
                     self.emit_cleanup_scopes_from(0, move_skip_slot.as_deref());
+                    if let Some(am) = &self.active_arena_mark {
+                        self.code
+                            .push_str(&format!("  call void @tenon_arena_exit(i64 {})\n", am));
+                    }
                     self.code.push_str(&format!("  ret i64 {}\n", v));
                     self.terminated = true;
                     last = v;
@@ -5622,6 +6149,19 @@ impl<'a> LlvmFnGen<'a> {
                     self.flush_temps(&temps);
                     return Ok(res);
                 }
+                if let Some((vec_ty, elem_bytes, _)) = self.flat_simd_list_info(&target_ty) {
+                    let mut temps = Vec::new();
+                    let vv = self.lower_simd_vec_reg(expr, vec_ty, elem_bytes, &mut temps)?;
+                    let obj = self.fresh_tmp();
+                    let di = self.fresh_tmp();
+                    let dp = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  store {} {}, ptr {}, align 8\n",
+                        obj, elem_bytes, di, obj, dp, di, vec_ty, vv, dp
+                    ));
+                    self.flush_temps(&temps);
+                    return Ok(obj);
+                }
                 let elem_is_rc = self
                     .list_elem_ty(&target_ty)
                     .is_some_and(|et| self.type_is_rc(&et));
@@ -5793,6 +6333,18 @@ impl<'a> LlvmFnGen<'a> {
                         temps.push(val.clone());
                     }
                     return Ok(val);
+                }
+                if let Some((vec_ty, elem_bytes, _)) = self.flat_simd_list_info(&target_ty) {
+                    let vv = self.lower_simd_vec_reg(expr, vec_ty, elem_bytes, temps)?;
+                    let obj = self.fresh_tmp();
+                    let di = self.fresh_tmp();
+                    let dp = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  store {} {}, ptr {}, align 8\n",
+                        obj, elem_bytes, di, obj, dp, di, vec_ty, vv, dp
+                    ));
+                    temps.push(obj.clone());
+                    return Ok(obj);
                 }
                 let is_proved_safe = self.proved_safe_indices.contains(&expr.span.start);
                 let is_nonnull = matches!(&target.kind, ExprKind::Ident(n) if self.always_unique_vars.contains(n));
@@ -6393,6 +6945,35 @@ impl<'a> LlvmFnGen<'a> {
                         }
                         return Ok(obj);
                     }
+                }
+                if let Some((vec_ty, elem_bytes, _)) = expected_ty
+                    .and_then(|t| self.flat_simd_list_info(t))
+                    .or_else(|| elems.first().and_then(|e| self.simd_elem_info(&self.infer_expr_type(e))))
+                {
+                    let obj = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_flat_list_filled(i64 {}, i64 {}, ptr null)\n",
+                        obj,
+                        elems.len(),
+                        elem_bytes
+                    ));
+                    let base = self.fresh_tmp();
+                    let data = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n",
+                        base, obj, data, base
+                    ));
+                    for (idx, e) in elems.iter().enumerate() {
+                        let mut temps = Vec::new();
+                        let vv = self.lower_simd_vec_reg(e, vec_ty, elem_bytes, &mut temps)?;
+                        let ep = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = getelementptr inbounds {}, ptr {}, i64 {}\n  store {} {}, ptr {}, align 8, !tbaa !7\n",
+                            ep, vec_ty, data, idx, vec_ty, vv, ep
+                        ));
+                        self.flush_temps(&temps);
+                    }
+                    return Ok(obj);
                 }
                 let exp_elem_ty = expected_ty.and_then(|t| self.list_elem_ty(t));
                 let elem_is_rc = exp_elem_ty
@@ -7381,6 +7962,26 @@ impl<'a> LlvmFnGen<'a> {
                     }
                     if fname == "push" && args.len() == 2 {
                         let xs_ty = self.infer_expr_type(&args[0].value);
+                        if let Some((vec_ty, elem_bytes, _)) = self
+                            .flat_simd_list_info(&xs_ty)
+                            .or_else(|| expected_ty.and_then(|t| self.flat_simd_list_info(t)))
+                            .or_else(|| self.simd_elem_info(&self.infer_expr_type(&args[1].value)))
+                        {
+                            let xs = self.lower_expr_owned(&args[0].value, expected_ty)?;
+                            let mut temps = Vec::new();
+                            let vv = self.lower_simd_vec_reg(&args[1].value, vec_ty, elem_bytes, &mut temps)?;
+                            self.slot_id += 1;
+                            let vslot = format!("%fpush_{}", self.slot_id);
+                            self.entry_allocas
+                                .push_str(&format!("  {} = alloca {}, align 8\n", vslot, vec_ty));
+                            let res = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  store {} {}, ptr {}, align 8\n  {} = call i64 @tenon_flat_list_push(i64 {}, i64 {}, ptr {})\n",
+                                vec_ty, vv, vslot, res, xs, elem_bytes, vslot
+                            ));
+                            self.flush_temps(&temps);
+                            return Ok(res);
+                        }
                         let elem_is_rc = self
                             .list_elem_ty(&xs_ty)
                             .is_some_and(|et| self.type_is_rc(&et))
@@ -7406,6 +8007,44 @@ impl<'a> LlvmFnGen<'a> {
                         return Ok(res);
                     }
                     if fname == "list_filled" && args.len() == 2 {
+                        if let Some((vec_ty, elem_bytes, _)) = expected_ty
+                            .and_then(|t| self.flat_simd_list_info(t))
+                            .or_else(|| self.simd_elem_info(&self.infer_expr_type(&args[1].value)))
+                        {
+                            let mut temps = Vec::new();
+                            let count_v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                            let vv = self.lower_simd_vec_reg(&args[1].value, vec_ty, elem_bytes, &mut temps)?;
+                            self.slot_id += 1;
+                            let islot = format!("%ffill_{}", self.slot_id);
+                            self.entry_allocas
+                                .push_str(&format!("  {} = alloca {}, align 8\n", islot, vec_ty));
+                            let res = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  store {} {}, ptr {}, align 8\n  {} = call i64 @tenon_flat_list_filled(i64 {}, i64 {}, ptr {})\n",
+                                vec_ty, vv, islot, res, count_v, elem_bytes, islot
+                            ));
+                            let lf_pos = self.fresh_tmp();
+                            let lf_exp = self.fresh_tmp();
+                            let lf_nz = self.fresh_tmp();
+                            let lf_obj = self.fresh_tmp();
+                            let lf_lp = self.fresh_tmp();
+                            let lf_len = self.fresh_tmp();
+                            let lf_eq = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = icmp sgt i64 {}, 0\n  {} = select i1 {}, i64 {}, i64 0\n  {} = icmp ne i64 {}, 0\n  call void @llvm.assume(i1 {})\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 16\n  {} = load i64, ptr {}, align 8, !tbaa !8\n  {} = icmp eq i64 {}, {}\n  call void @llvm.assume(i1 {})\n",
+                                lf_pos, count_v,
+                                lf_exp, lf_pos, count_v,
+                                lf_nz, res,
+                                lf_nz,
+                                lf_obj, res,
+                                lf_lp, lf_obj,
+                                lf_len, lf_lp,
+                                lf_eq, lf_len, lf_exp,
+                                lf_eq
+                            ));
+                            self.flush_temps(&temps);
+                            return Ok(res);
+                        }
                         let elem_is_rc = expected_ty
                             .and_then(|t| self.list_elem_ty(t))
                             .is_some_and(|et| self.type_is_rc(&et))

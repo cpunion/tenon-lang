@@ -11,7 +11,7 @@ pub use checker::{
     CastVerdict, CheckReport, Diagnostic, ProofRecord, ProofTier, check_program,
     check_type_subsumption,
 };
-pub use db::{IncrementalDb, QueryStats};
+pub use db::{IncrementalDb, QueryStats, program_full_hash, program_signature_hash};
 pub use evolve::{
     CompatVerdict, EvolutionLockEntry, EvolutionReport, append_evolution_lock, check_evolution,
     emit_expand_contract_sql,
@@ -19,6 +19,7 @@ pub use evolve::{
 pub use mir::{MirFnSummary, VerifiedMir};
 pub use smt::{
     ExportedProofCert, begin_proof_recording, end_proof_recording, export_proof_certificates,
+    solve_batch_parallel,
 };
 pub use modelcheck::{
     ModelCheckSuiteReport, TraceEvent, TraceRefinementReport, check_program_protocols,
@@ -1609,5 +1610,91 @@ pub pure fn bad_hof(x Range[1, 10]) Range[2, 20] {
 
         let sql = emit_expand_contract_sql(&v1, &v2, &ev_rep);
         assert!(sql.contains("BEGIN TRANSACTION;") && sql.contains("COMMIT;"));
+    }
+
+    #[test]
+    fn verifies_tier2_stack_promotion_arena_safety_incremental_early_cutoff_and_parallel_smt() {
+        let src_ok = r#"
+pub record Pair {
+    x Int
+    y Int
+}
+
+@arena
+pub fn arena_sum(n Int where self >= 0 && self <= 100) Int {
+    var xs = list_filled(n, 3)
+    var i = 0
+    var acc = 0
+    while i < n invariant i >= 0 && i <= n {
+        let p = Pair { x = xs[i], y = i }
+        acc = acc + p.x + p.y
+        i += 1
+    }
+    acc
+}
+"#;
+        let prog = parse(src_ok).unwrap();
+        let rep = check_program(&prog);
+        assert!(rep.ok, "unexpected diags: {:?}", rep.diagnostics);
+        assert!(rep.mir.arena_verified_fns.contains("arena_sum"));
+        assert!(
+            rep.mir
+                .stack_promotable_vars
+                .get("arena_sum")
+                .is_some_and(|s| s.contains("p")),
+            "expected local immutable scalar record `p` to be stack-promotable, got {:?}",
+            rep.mir.stack_promotable_vars
+        );
+
+        // Negative test: `@arena` function returning heap type `Pair` must fail with E0621
+        let src_bad = r#"
+pub record Pair {
+    x Int
+    y Int
+}
+
+@arena
+pub fn bad_arena_escape() Pair {
+    Pair { x = 1, y = 2 }
+}
+"#;
+        let rep_bad = check_program(&parse(src_bad).unwrap());
+        assert!(!rep_bad.ok);
+        assert!(
+            rep_bad.diagnostics.iter().any(|d| d.code == "E0621"),
+            "expected E0621 for @arena returning heap type, got {:?}",
+            rep_bad.diagnostics
+        );
+
+        // Signature-level Early Cutoff in IncrementalDb: edit function body only, keep signature identical!
+        let db = IncrementalDb::new();
+        let v1 = "pub pure fn add1(x Int) Int { x + 1 }\npub pure fn add2(x Int) Int { x + 2 }\n";
+        let v2 = "pub pure fn add1(x Int) Int { x + 1 }\npub pure fn add2(x Int) Int { x + 1 + 1 }\n";
+        db.set_file("inc.tn", v1);
+        let r1 = db.check_file("inc.tn").unwrap();
+        assert!(r1.ok);
+        assert_eq!(program_signature_hash(&parse(v1).unwrap()), program_signature_hash(&parse(v2).unwrap()));
+        db.set_file("inc.tn", v2);
+        let r2 = db.check_file("inc.tn").unwrap();
+        assert!(r2.ok);
+        let st = db.stats();
+        assert!(
+            st.early_cutoffs >= 1 && st.fn_cache_hits >= 1,
+            "expected early cutoff and unchanged fn cache hit, got {:?}",
+            st
+        );
+
+        // Parallel Z3 VC batch solver
+        let mut qs = Vec::new();
+        for k in 1..=4 {
+            let mut q = smt::SmtQuery::new(std::collections::BTreeMap::new());
+            q.vars.insert("x".into(), smt::SmtSort::Int);
+            q.premises.push(format!("(> x {})", k));
+            q.goal = format!("(>= x {})", k + 1);
+            qs.push(q);
+        }
+        let outcomes = solve_batch_parallel(&qs);
+        assert_eq!(outcomes.len(), 4);
+        assert!(outcomes.iter().all(|o| *o == smt::SmtOutcome::Proved));
     }
 }

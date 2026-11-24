@@ -134,6 +134,31 @@ pub fn vc_cache_len() -> usize {
     cache().lock().unwrap().len()
 }
 
+/// Solves a batch of independent SMT queries in parallel across OS worker threads
+/// (sharing the thread-safe in-memory & disk VC cache).
+pub fn solve_batch_parallel(queries: &[SmtQuery]) -> Vec<SmtOutcome> {
+    if queries.len() <= 1 {
+        return queries.iter().map(|q| q.solve()).collect();
+    }
+    let max_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(8)
+        .min(queries.len());
+    let chunk_size = queries.len().div_ceil(max_workers);
+    let mut results: Vec<Vec<SmtOutcome>> = Vec::with_capacity(max_workers);
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for chunk in queries.chunks(chunk_size) {
+            handles.push(s.spawn(move || chunk.iter().map(|q| q.solve()).collect::<Vec<_>>()));
+        }
+        for h in handles {
+            results.push(h.join().unwrap_or_default());
+        }
+    });
+    results.into_iter().flatten().collect()
+}
+
 pub struct SmtQuery {
     pub pure_fns: BTreeMap<String, FnDecl>,
     pub vars: BTreeMap<String, SmtSort>,

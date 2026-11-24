@@ -1,5 +1,8 @@
 use crate::l0::{AbsInt, Interval, L0Env, L0Result};
-use crate::mir::{MirFnSummary, VerifiedMir, analyze_function_escapes, prove_binop_no_overflow, verify_fip_function};
+use crate::mir::{
+    MirFnSummary, VerifiedMir, analyze_function_escapes, compute_stack_promotable_vars,
+    prove_binop_no_overflow, verify_arena_function, verify_fip_function,
+};
 use crate::smt::{SmtOutcome, SmtQuery};
 use crate::sync_solver::{DistributedAppManifest, solve_distributed_manifest};
 use serde::{Deserialize, Serialize};
@@ -320,7 +323,9 @@ pub fn check_program(program: &Program) -> CheckReport {
         infallible_casts: ctx.infallible_casts.clone(),
         refine_cast_types: refine_cast_types.clone(),
         non_escaping_vars: ctx.non_escaping_vars,
+        stack_promotable_vars: ctx.stack_promotable_vars,
         fip_verified_fns: ctx.fip_verified_fns,
+        arena_verified_fns: ctx.arena_verified_fns,
         fn_summaries: ctx.fn_summaries,
     };
 
@@ -369,6 +374,7 @@ struct CheckerCtx {
     no_heap_fns: BTreeSet<String>,
     fip_fns: BTreeSet<String>,
     fip_verified_fns: BTreeSet<String>,
+    arena_verified_fns: BTreeSet<String>,
     all_fns: BTreeMap<String, FnDecl>,
     async_fns: BTreeSet<String>,
     cur_type_params: BTreeSet<String>,
@@ -385,6 +391,7 @@ struct CheckerCtx {
     infallible_casts: BTreeSet<usize>,
     refine_cast_types: BTreeMap<usize, TypeExpr>,
     non_escaping_vars: BTreeMap<String, BTreeSet<String>>,
+    stack_promotable_vars: BTreeMap<String, BTreeSet<String>>,
     fn_summaries: BTreeMap<String, MirFnSummary>,
     proofs: Vec<ProofRecord>,
     diagnostics: Vec<Diagnostic>,
@@ -707,6 +714,7 @@ impl CheckerCtx {
             no_heap_fns,
             fip_fns,
             fip_verified_fns: BTreeSet::new(),
+            arena_verified_fns: BTreeSet::new(),
             all_fns,
             async_fns,
             cur_type_params: BTreeSet::new(),
@@ -723,6 +731,7 @@ impl CheckerCtx {
             infallible_casts: BTreeSet::new(),
             refine_cast_types: BTreeMap::new(),
             non_escaping_vars: BTreeMap::new(),
+            stack_promotable_vars: BTreeMap::new(),
             fn_summaries: BTreeMap::new(),
             proofs: Vec::new(),
             diagnostics: Vec::new(),
@@ -2528,9 +2537,10 @@ impl CheckerCtx {
             smt_premises.push((req.clone(), BTreeMap::new()));
         }
 
-        // 3. Static Effect, Purity & Memory Contract Checks (`async`, `pure`, `@no_heap_alloc`, `@fip`, Tier-2 Escape Analysis)
+        // 3. Static Effect, Purity & Memory Contract Checks (`async`, `pure`, `@no_heap_alloc`, `@fip`, `@arena`, Tier-2 Escape & Stack Promotion)
         let no_heap = f.attrs.iter().any(|a| a.name == "no_heap_alloc");
         let is_fip = f.attrs.iter().any(|a| a.name == "fip");
+        let is_arena = f.attrs.iter().any(|a| a.name == "arena");
         let non_esc = if f.is_ghost {
             BTreeSet::new()
         } else {
@@ -2539,6 +2549,36 @@ impl CheckerCtx {
         if !non_esc.is_empty() {
             self.non_escaping_vars.insert(f.name.clone(), non_esc.clone());
         }
+        let scalar_only_records: BTreeSet<String> = self
+            .records
+            .iter()
+            .filter(|(_, r)| {
+                !r.attrs.iter().any(|a| a.name == "repr" || a.name == "packed")
+                    && r.fields.iter().all(|fl| {
+                        let base = self.resolve_base_type(&fl.ty);
+                        matches!(
+                            base,
+                            TypeExpr::Named { name, .. }
+                            if matches!(
+                                name.as_str(),
+                                "Int" | "Int8" | "Int16" | "Int32" | "Int64" | "ISize"
+                                | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "USize" | "Byte"
+                                | "CInt" | "CUInt" | "CSize" | "Float" | "Float32" | "Float64" | "Bool"
+                            )
+                        )
+                    })
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        let stack_promo = if f.is_ghost {
+            BTreeSet::new()
+        } else {
+            compute_stack_promotable_vars(f, &non_esc, &scalar_only_records)
+        };
+        if !stack_promo.is_empty() {
+            self.stack_promotable_vars
+                .insert(f.name.clone(), stack_promo.clone());
+        }
         self.fn_summaries.insert(
             f.name.clone(),
             MirFnSummary {
@@ -2546,9 +2586,11 @@ impl CheckerCtx {
                 is_pure: f.is_pure,
                 is_ghost: f.is_ghost,
                 is_fip,
+                is_arena,
                 is_no_heap_alloc: no_heap,
                 param_count: f.params.len(),
                 non_escaping_locals: non_esc.into_iter().collect(),
+                stack_promotable_locals: stack_promo.into_iter().collect(),
             },
         );
         if !f.is_ghost {
@@ -2569,6 +2611,32 @@ impl CheckerCtx {
                     });
                 } else {
                     self.diagnostics.extend(fip_diags);
+                }
+            }
+            if is_arena {
+                let is_rc_ty = |t: &TypeExpr| -> bool {
+                    let base = self.resolve_base_type(t);
+                    !matches!(
+                        base,
+                        TypeExpr::Named { name, .. }
+                            if matches!(
+                                name.as_str(),
+                                "Unit" | "Int" | "Int8" | "Int16" | "Int32" | "Int64" | "ISize"
+                                | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "USize" | "Byte"
+                                | "CInt" | "CUInt" | "CSize" | "Float" | "Float32" | "Float64" | "Bool"
+                            )
+                    )
+                };
+                let arena_diags = verify_arena_function(f, &is_rc_ty);
+                if arena_diags.is_empty() {
+                    self.arena_verified_fns.insert(f.name.clone());
+                    self.proofs.push(ProofRecord {
+                        obligation: format!("@arena Tier-2 slab scope safety proof for `{}`", f.name),
+                        tier: ProofTier::L0Fast,
+                        span: f.span,
+                    });
+                } else {
+                    self.diagnostics.extend(arena_diags);
                 }
             }
         }

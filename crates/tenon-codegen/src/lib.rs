@@ -5936,4 +5936,88 @@ pub fn main() Int {
             st
         );
     }
+
+    #[test]
+    fn llvm_aot_tier2_stack_promotion_slab_arena_and_flat_simd_list_zero_leaks() {
+        let src = r#"
+pub record Vec2 {
+    x Int
+    y Int
+}
+
+@arena
+pub fn compute_in_arena(n Int where self >= 1 && self <= 64) Int {
+    var xs = list_filled(n, 2)
+    var total = 0
+    var i = 0
+    while i < n invariant i >= 0 && i <= n {
+        let v = Vec2 { x = xs[i], y = i }
+        total = total + v.x + v.y
+        i += 1
+    }
+    total
+}
+
+pub fn simd_flat_dot() Int {
+    var a = list_filled(8, simd_f64x4_splat(1.0))
+    var b = list_filled(8, simd_f64x4_splat(2.0))
+    a[0] = simd_f64x4_new(1.0, 2.0, 3.0, 4.0)
+    b[0] = simd_f64x4_new(2.0, 3.0, 4.0, 5.0)
+    var s = 0.0
+    var i = 0
+    while i < 8 {
+        s = s + simd_f64x4_dot(a[i], b[i])
+        i += 1
+    }
+    s as Int
+}
+
+pub fn main() Int {
+    let a = compute_in_arena(10)
+    let b = simd_flat_dot()
+    a + b
+}
+"#;
+        let prog = parse(src).unwrap();
+        let rep = tenon_verify::check_program(&prog);
+        assert!(rep.ok, "verify failed: {:?}", rep.diagnostics);
+        assert!(rep.mir.arena_verified_fns.contains("compute_in_arena"));
+        assert!(
+            rep.mir
+                .stack_promotable_vars
+                .get("compute_in_arena")
+                .is_some_and(|s| s.contains("v"))
+        );
+
+        let ll_path = std::env::temp_dir().join(format!("tenon_tier2_{}.ll", std::process::id()));
+        let bin_path = std::env::temp_dir().join(format!("tenon_tier2_{}_bin", std::process::id()));
+        let mut opts = llvm_aot::BuildOptions::default();
+        opts.apply_verified_mir(&rep.mir);
+        opts.emit_ll_path = Some(ll_path.clone());
+        llvm_aot::compile_with_options(&prog, &bin_path, &opts).unwrap();
+
+        let ir = std::fs::read_to_string(&ll_path).unwrap();
+        assert!(ir.contains("@tenon_arena_enter"), "expected @arena enter in LLVM IR");
+        assert!(ir.contains("@tenon_arena_exit"), "expected @arena exit in LLVM IR");
+        assert!(ir.contains("%stkrec_"), "expected stack-promoted record alloca in LLVM IR");
+        assert!(ir.contains("@tenon_flat_list_filled"), "expected flat unboxed SIMD list in LLVM IR");
+
+        let out = std::process::Command::new(&bin_path).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // compute_in_arena(10) = 10*2 + (0..9)=45 = 65
+        // simd_flat_dot() = (1*2+2*3+3*4+4*5)=40 + 7*(4*2)=56 = 96
+        // total = 161
+        assert!(
+            out.status.success() && stdout.contains("main() => 161"),
+            "unexpected run output: status={:?} stdout={} stderr={}",
+            out.status,
+            stdout,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if stdout.contains("live_objects=") {
+            assert!(stdout.contains("live_objects=0"), "leaked objects: {}", stdout);
+        }
+        let _ = std::fs::remove_file(&ll_path);
+        let _ = std::fs::remove_file(&bin_path);
+    }
 }

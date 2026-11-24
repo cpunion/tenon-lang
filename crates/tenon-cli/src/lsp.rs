@@ -23,7 +23,7 @@ use tenon_syntax::{
     InterfaceMethodDecl, Item, LayoutEngine, LoadMode, MacroDecl, Program, RecordDecl, Span,
     TypeAliasDecl, UnionDecl, load_package_with_overlays, parse_with_file_id,
 };
-use tenon_verify::{CheckReport, ProofTier, check_program};
+use tenon_verify::{CheckReport, IncrementalDb, ProofTier};
 
 pub fn run_lsp_stdio() -> ExitCode {
     let stdin = io::stdin();
@@ -57,6 +57,7 @@ struct AnalyzedDoc {
 struct LspServer {
     docs: BTreeMap<String, OpenDoc>,
     analysis: BTreeMap<String, AnalyzedDoc>,
+    db: IncrementalDb,
     shutdown_requested: bool,
 }
 
@@ -65,6 +66,7 @@ impl LspServer {
         Self {
             docs: BTreeMap::new(),
             analysis: BTreeMap::new(),
+            db: IncrementalDb::new(),
             shutdown_requested: false,
         }
     }
@@ -400,7 +402,7 @@ impl LspServer {
                                 .map(|idx| idx as u32)
                         })
                         .unwrap_or(0);
-                    let rep = check_program(&full);
+                    let rep = self.db.check_program_incremental(uri, &full);
                     analyzed.active_file_id = active_fid;
                     analyzed.full_program = Some(full);
                     analyzed.report = Some(rep);
@@ -413,7 +415,7 @@ impl LspServer {
                             analyzed.parse_error = Some((1, 1, e));
                         } else {
                             tenon_syntax::expand_derives(&mut single);
-                            let rep = check_program(&single);
+                            let rep = self.db.check_program_incremental(uri, &single);
                             analyzed.active_file_id = 0;
                             analyzed.full_program = Some(single);
                             analyzed.report = Some(rep);
