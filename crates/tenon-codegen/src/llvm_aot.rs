@@ -1,5 +1,6 @@
+use crate::lower_interfaces::{DynInterfaceLayout, prepare_program_for_codegen};
 use crate::perceus::{
-    RC_MASK_ALL, TAG_ERR, TAG_LIST, TAG_NONE, TAG_OK, TAG_RECORD_BASE, TAG_SOME,
+    RC_MASK_ALL, TAG_DYN, TAG_ERR, TAG_LIST, TAG_NONE, TAG_OK, TAG_RECORD_BASE, TAG_SOME,
 };
 use crate::{
     CORE_SYSCALLS, generic_ty, is_rc_type_expr, is_text_type_expr, named_ty, resolve_alias_ty,
@@ -175,6 +176,14 @@ void tenon_rc_set_field(int64_t ptr, int64_t idx, int64_t val) {
     }
 }
 
+void tenon_rc_set_field_raw(int64_t ptr, int64_t idx, int64_t val) {
+    if (ptr == 0 || idx < 0) return;
+    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
+    if (idx < obj->len) {
+        obj->fields[idx] = val;
+    }
+}
+
 int64_t tenon_rc_get_tag(int64_t ptr) {
     if (ptr == 0) return -1;
     return ((TenonObj*)(uintptr_t)ptr)->tag;
@@ -320,6 +329,7 @@ int main(void) {
 fn ir_uses_tenon_rt_syscalls(ir: &str) -> bool {
     ir.contains("call i64 @tenon_byte_")
         || ir.contains("call i64 @tenon_str_")
+        || ir.contains("call i64 @tenon_buf_")
         || ir.contains("call i64 @tenon_sys_")
 }
 
@@ -466,6 +476,14 @@ pub fn compile_to_native_binary(
 }
 
 pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
+    let prepared = prepare_program_for_codegen(program);
+    let program = &prepared.program;
+    let vtable_ifaces: BTreeMap<String, String> = prepared
+        .vtables
+        .iter()
+        .map(|v| (v.sym_name.clone(), v.interface.clone()))
+        .collect();
+    let dyn_interfaces = &prepared.dyn_interfaces;
     let mut alias_preds: BTreeMap<String, Expr> = BTreeMap::new();
     let mut alias_bases: BTreeMap<String, TypeExpr> = BTreeMap::new();
     for item in &program.items {
@@ -649,6 +667,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             &enum_variants,
             &fn_metas,
             &syscall_map,
+            dyn_interfaces,
+            &vtable_ifaces,
             &mut string_globals,
         );
         fn_defs.push_str(&cg.emit_sync_fn(f)?);
@@ -669,6 +689,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             &enum_variants,
             &fn_metas,
             &syscall_map,
+            dyn_interfaces,
+            &vtable_ifaces,
             &mut string_globals,
         );
         fn_defs.push_str(&cg.emit_record_parser(rname, layout)?);
@@ -686,6 +708,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             &enum_variants,
             &fn_metas,
             &syscall_map,
+            dyn_interfaces,
+            &vtable_ifaces,
             &mut string_globals,
         );
         fn_defs.push_str(&cg.emit_async_fn(f)?);
@@ -703,6 +727,7 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     ir.push_str("declare i64 @tenon_rc_ensure_unique(i64)\n");
     ir.push_str("declare i64 @tenon_rc_get_field(i64, i64)\n");
     ir.push_str("declare void @tenon_rc_set_field(i64, i64, i64)\n");
+    ir.push_str("declare void @tenon_rc_set_field_raw(i64, i64, i64)\n");
     ir.push_str("declare i64 @tenon_rc_get_tag(i64)\n");
     ir.push_str("declare i64 @tenon_rc_get_len(i64)\n");
     ir.push_str("declare i64 @tenon_text_new(i64, i64)\n");
@@ -728,6 +753,23 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
         ));
     }
     if !string_globals.is_empty() {
+        ir.push('\n');
+    }
+
+    for vt in &prepared.vtables {
+        let entries: Vec<String> = vt
+            .fn_names
+            .iter()
+            .map(|fn_name| format!("ptr @tenon_fn_{}", sanitize(fn_name)))
+            .collect();
+        ir.push_str(&format!(
+            "@{} = private constant [{} x ptr] [{}]\n",
+            sanitize(&vt.sym_name),
+            entries.len(),
+            entries.join(", ")
+        ));
+    }
+    if !prepared.vtables.is_empty() {
         ir.push('\n');
     }
 
@@ -771,6 +813,8 @@ struct LlvmFnGen<'a> {
     enum_variants: &'a BTreeMap<String, LlvmEnumVariantLayout>,
     fn_metas: &'a BTreeMap<String, LlvmFnMeta>,
     syscall_map: &'a BTreeMap<String, &'static str>,
+    dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
+    vtable_ifaces: &'a BTreeMap<String, String>,
     string_globals: &'a mut Vec<(String, String)>,
     tmp: usize,
     lbl: usize,
@@ -803,6 +847,8 @@ impl<'a> LlvmFnGen<'a> {
         enum_variants: &'a BTreeMap<String, LlvmEnumVariantLayout>,
         fn_metas: &'a BTreeMap<String, LlvmFnMeta>,
         syscall_map: &'a BTreeMap<String, &'static str>,
+        dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
+        vtable_ifaces: &'a BTreeMap<String, String>,
         string_globals: &'a mut Vec<(String, String)>,
     ) -> Self {
         Self {
@@ -815,6 +861,8 @@ impl<'a> LlvmFnGen<'a> {
             enum_variants,
             fn_metas,
             syscall_map,
+            dyn_interfaces,
+            vtable_ifaces,
             string_globals,
             tmp: 0,
             lbl: 0,
@@ -1004,9 +1052,33 @@ impl<'a> LlvmFnGen<'a> {
                             return named_ty(&vl.enum_name);
                         }
                     }
+                    let recv_ty = resolve_alias_ty(
+                        &self.infer_expr_type_with(target, extra_vars),
+                        self.alias_bases,
+                    );
+                    if let TypeExpr::Dyn { interface, .. } = recv_ty {
+                        if let Some(layout) = self.dyn_interfaces.get(&interface) {
+                            if let Some(dm) = layout.methods.iter().find(|m| m.name == *field) {
+                                return dm.ret_ty.clone().unwrap_or_else(|| named_ty("Any"));
+                            }
+                        }
+                    }
                     named_ty("Any")
                 }
                 ExprKind::Ident(f) => {
+                    if f == "__box_dyn" {
+                        if let Some(a1) = args.get(1) {
+                            if let ExprKind::Str(vsym) = &a1.value.kind {
+                                if let Some(iface) = self.vtable_ifaces.get(vsym) {
+                                    return TypeExpr::Dyn {
+                                        interface: iface.clone(),
+                                        args: vec![],
+                                        span: expr.span,
+                                    };
+                                }
+                            }
+                        }
+                    }
                     if f == "Ok" && args.len() == 1 {
                         return generic_ty("Result", vec![self.infer_expr_type_with(&args[0].value, extra_vars), named_ty("Any")]);
                     }
@@ -1146,13 +1218,25 @@ impl<'a> LlvmFnGen<'a> {
             }
             ExprKind::Call { callee, .. } => match &callee.kind {
                 ExprKind::Ident(f) => {
-                    matches!(f.as_str(), "Ok" | "Err" | "Some" | "push" | "yield_val")
+                    matches!(f.as_str(), "Ok" | "Err" | "Some" | "push" | "yield_val" | "__box_dyn")
                         || (self.enum_tags.contains_key(f) && !self.fn_metas.contains_key(f))
                         || self.fn_metas.get(f).is_some_and(|m| m.returns_rc)
                 }
                 ExprKind::Field { target, field } => {
-                    field == "parse"
+                    if field == "parse"
                         || matches!(&target.kind, ExprKind::Ident(e) if self.enum_tags.contains_key(&format!("{}.{}", e, field)))
+                    {
+                        return true;
+                    }
+                    let recv_ty = resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases);
+                    if let TypeExpr::Dyn { interface, .. } = recv_ty {
+                        if let Some(layout) = self.dyn_interfaces.get(&interface) {
+                            if let Some(dm) = layout.methods.iter().find(|m| m.name == *field) {
+                                return dm.returns_rc;
+                            }
+                        }
+                    }
+                    false
                 }
                 _ => false,
             },
@@ -2707,9 +2791,140 @@ impl<'a> LlvmFnGen<'a> {
                             return self.lower_enum_ctor(tag, &ptys, args);
                         }
                     }
-                    Err("unsupported method call in LLVM codegen".into())
+                    // Dynamic interface method dispatch: `d.method(args)` where `d: dyn Interface`!
+                    let recv_ty = resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases);
+                    if let TypeExpr::Dyn { interface, .. } = recv_ty {
+                        let dm = self
+                            .dyn_interfaces
+                            .get(&interface)
+                            .and_then(|l| l.methods.iter().find(|m| m.name == *field))
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!("unknown method `{}` on `dyn {}` in LLVM codegen", field, interface)
+                            })?;
+                        let mut temps = Vec::new();
+                        let mut d_val = self.lower_expr_borrowed(target, &mut temps)?;
+                        let mut call_args = Vec::new();
+                        let mut inout_dyn_slot: Option<(String, String, Option<String>)> = None;
+
+                        if dm.is_inout_self {
+                            let d_uniq = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n",
+                                d_uniq, d_val
+                            ));
+                            if let ExprKind::Ident(vname) = &target.kind {
+                                if let Some(ptr) = self.var_ptrs.get(vname).cloned() {
+                                    if self.inout_vars.contains(vname) {
+                                        let slot_addr = self.fresh_tmp();
+                                        let p = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                            slot_addr, ptr, p, slot_addr, d_uniq, p
+                                        ));
+                                    } else {
+                                        self.code
+                                            .push_str(&format!("  store i64 {}, ptr {}\n", d_uniq, ptr));
+                                    }
+                                }
+                            }
+                            d_val = d_uniq.clone();
+                            let data_val = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 0)\n",
+                                data_val, d_val
+                            ));
+                            self.slot_id += 1;
+                            let slot = format!("%dyn_inout_{}", self.slot_id);
+                            self.entry_allocas.push_str(&format!(
+                                "  {} = alloca i64\n  store i64 0, ptr {}\n",
+                                slot, slot
+                            ));
+                            let slot_i64 = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  store i64 {}, ptr {}\n  {} = ptrtoint ptr {} to i64\n",
+                                data_val, slot, slot_i64, slot
+                            ));
+                            call_args.push(format!("i64 {}", slot_i64));
+                            inout_dyn_slot = Some((d_uniq, slot, None));
+                        } else {
+                            let data_val = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 0)\n",
+                                data_val, d_val
+                            ));
+                            call_args.push(format!("i64 {}", data_val));
+                        }
+
+                        for a in args {
+                            let av = self.lower_expr_borrowed(&a.value, &mut temps)?;
+                            call_args.push(format!("i64 {}", av));
+                        }
+
+                        let vt_i64 = self.fresh_tmp();
+                        let vt_ptr = self.fresh_tmp();
+                        let slot_ptr = self.fresh_tmp();
+                        let fn_ptr = self.fresh_tmp();
+                        let res = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 1)\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds ptr, ptr {}, i64 {}\n  {} = load ptr, ptr {}\n  {} = call i64 {}({})\n",
+                            vt_i64, d_val,
+                            vt_ptr, vt_i64,
+                            slot_ptr, vt_ptr, dm.slot_idx,
+                            fn_ptr, slot_ptr,
+                            res, fn_ptr, call_args.join(", ")
+                        ));
+                        if let Some((d_uniq, slot, _)) = inout_dyn_slot {
+                            let updated = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = load i64, ptr {}\n  call void @tenon_rc_set_field_raw(i64 {}, i64 0, i64 {})\n",
+                                updated, slot, d_uniq, updated
+                            ));
+                        }
+                        self.flush_temps(&temps);
+                        return Ok(res);
+                    }
+                    Err(format!(
+                        "unsupported method call `{}` on `{}` in LLVM codegen",
+                        field,
+                        recv_ty.display_name()
+                    ))
                 }
                 ExprKind::Ident(fname) => {
+                    if fname == "__box_dyn" && args.len() == 3 {
+                        let vsym = match &args[1].value.kind {
+                            ExprKind::Str(s) => s.clone(),
+                            _ => return Err("__box_dyn expects vtable symbol string".into()),
+                        };
+                        let data_is_rc = matches!(&args[2].value.kind, ExprKind::Int(n) if *n != 0);
+                        let data_val = if data_is_rc {
+                            self.lower_expr_owned(&args[0].value, None)?
+                        } else {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                            self.flush_temps(&temps);
+                            v
+                        };
+                        let obj = self.fresh_tmp();
+                        let vt_i64 = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 2)\n",
+                            obj, TAG_DYN
+                        ));
+                        if data_is_rc {
+                            self.code.push_str(&format!(
+                                "  call void @tenon_rc_set_rc_mask(i64 {}, i64 1)\n",
+                                obj
+                            ));
+                        }
+                        self.code.push_str(&format!(
+                            "  call void @tenon_rc_set_field(i64 {}, i64 0, i64 {})\n  {} = ptrtoint ptr @{} to i64\n  call void @tenon_rc_set_field(i64 {}, i64 1, i64 {})\n",
+                            obj, data_val,
+                            vt_i64, sanitize(&vsym),
+                            obj, vt_i64
+                        ));
+                        return Ok(obj);
+                    }
                     if fname == "print_int" && args.len() == 1 {
                         let mut temps = Vec::new();
                         let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
@@ -3083,5 +3298,89 @@ pub fn main() Int {
             String::from_utf8_lossy(&run.stderr)
         );
         assert_eq!(stdout.trim(), "[OK] hello");
+    }
+
+    #[test]
+    fn llvm_aot_interfaces_static_monomorph_and_dyn_vtable_zero_leaks() {
+        let src = r#"
+pub interface Greeter {
+    pure fn greet(self, who Text) Text
+}
+
+pub interface Accumulator {
+    fn add(inout self, delta Int) Int
+    pure fn current(self) Int
+}
+
+pub record EnGreeter { prefix Text }
+pub record ZhGreeter { prefix Text }
+
+impl Greeter for EnGreeter {
+    pure fn greet(self, who Text) Text { self.prefix ++ " " ++ who }
+}
+
+impl Greeter for ZhGreeter {
+    pure fn greet(self, who Text) Text { self.prefix ++ ", " ++ who }
+}
+
+pub record Counter { val Int }
+
+impl Accumulator for Counter {
+    fn add(inout self, delta Int) Int {
+        self.val += delta
+        self.val
+    }
+    pure fn current(self) Int { self.val }
+}
+
+pub pure fn run_static[T Greeter](g T, name Text) Text {
+    g.greet(name)
+}
+
+pub pure fn run_dyn(g dyn Greeter, name Text) Text {
+    g.greet(name)
+}
+
+pub fn main() Int {
+    let en = EnGreeter { prefix = "Hello" }
+    let zh = ZhGreeter { prefix = "NiHao" }
+    assert run_static(en, "Tenon") == "Hello Tenon"
+    assert run_static(zh, "Tenon") == "NiHao, Tenon"
+
+    var list List[dyn Greeter] = []
+    list = push(list, en)
+    list = push(list, zh)
+    let b = buf_new()
+    let _ = buf_push_str(b, run_dyn(list[0], "World"))
+    let _ = buf_push_byte(b, 124)
+    let _ = buf_push_str(b, list[1].greet("World"))
+    let joined = buf_finish(b)
+    assert joined == "Hello World|NiHao, World"
+
+    var c dyn Accumulator = Counter { val = 10 }
+    let c2 dyn Accumulator = c
+    let v1 = c.add(5)
+    assert v1 == 15
+    assert c.current() == 15
+    assert c2.current() == 10
+    let _ = sys_write_stdout(joined ++ "\n")
+    0
+}
+"#;
+        let prog = parse(src).unwrap();
+        let bin = std::env::temp_dir().join(format!("tenon_llvm_dyn_test_{}", std::process::id()));
+        let art = compile_to_native_binary(&prog, &bin, None, "O3").unwrap();
+        assert!(art.binary_bytes > 4096);
+
+        let run = Command::new(&bin).output().unwrap();
+        let _ = fs::remove_file(&bin);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "native LLVM dyn/static interface binary failed: stdout={} stderr={}",
+            stdout,
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(stdout.trim(), "Hello World|NiHao, World");
     }
 }

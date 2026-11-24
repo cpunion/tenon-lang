@@ -1,4 +1,5 @@
 pub mod llvm_aot;
+pub mod lower_interfaces;
 pub use tenon_rt::perceus;
 pub mod wasm_client;
 
@@ -10,7 +11,8 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
+use lower_interfaces::{DynInterfaceLayout, prepare_program_for_codegen};
 use perceus::*;
 use std::collections::{BTreeMap, BTreeSet};
 use tenon_rt::syscalls;
@@ -32,6 +34,11 @@ pub(crate) const CORE_SYSCALLS: &[CoreSyscallSpec] = &[
     CoreSyscallSpec { tenon_name: "str_slice", c_symbol: "tenon_str_slice", arity: 3, returns_rc: true, returns_text: true },
     CoreSyscallSpec { tenon_name: "byte_to_text", c_symbol: "tenon_byte_to_text", arity: 1, returns_rc: true, returns_text: true },
     CoreSyscallSpec { tenon_name: "str_concat", c_symbol: "tenon_str_concat", arity: 2, returns_rc: true, returns_text: true },
+    // 1b. O(n) Byte buffer primitives (4)
+    CoreSyscallSpec { tenon_name: "buf_new", c_symbol: "tenon_buf_new", arity: 0, returns_rc: false, returns_text: false },
+    CoreSyscallSpec { tenon_name: "buf_push_str", c_symbol: "tenon_buf_push_str", arity: 2, returns_rc: false, returns_text: false },
+    CoreSyscallSpec { tenon_name: "buf_push_byte", c_symbol: "tenon_buf_push_byte", arity: 2, returns_rc: false, returns_text: false },
+    CoreSyscallSpec { tenon_name: "buf_finish", c_symbol: "tenon_buf_finish", arity: 1, returns_rc: true, returns_text: true },
     // 2. Minimal OS / I/O / FS / Process syscalls (10)
     CoreSyscallSpec { tenon_name: "sys_write_stdout", c_symbol: "tenon_sys_write_stdout", arity: 1, returns_rc: false, returns_text: false },
     CoreSyscallSpec { tenon_name: "sys_read_line", c_symbol: "tenon_sys_read_line", arity: 0, returns_rc: true, returns_text: true },
@@ -43,7 +50,8 @@ pub(crate) const CORE_SYSCALLS: &[CoreSyscallSpec] = &[
     CoreSyscallSpec { tenon_name: "sys_write_file", c_symbol: "tenon_sys_write_file", arity: 2, returns_rc: false, returns_text: false },
     CoreSyscallSpec { tenon_name: "sys_exec", c_symbol: "tenon_sys_exec", arity: 1, returns_rc: true, returns_text: true },
     CoreSyscallSpec { tenon_name: "sys_exec_exit_code", c_symbol: "tenon_sys_exec_exit_code", arity: 0, returns_rc: false, returns_text: false },
-    // 3. Minimal Raw HTTPS SSE line-stream transport syscalls (5)
+    // 3. Minimal Raw HTTPS line-stream transport syscalls (6)
+    CoreSyscallSpec { tenon_name: "sys_http_open", c_symbol: "tenon_sys_http_open", arity: 4, returns_rc: false, returns_text: false },
     CoreSyscallSpec { tenon_name: "sys_http_sse_open", c_symbol: "tenon_sys_http_sse_open", arity: 3, returns_rc: false, returns_text: false },
     CoreSyscallSpec { tenon_name: "sys_http_sse_next_line", c_symbol: "tenon_sys_http_sse_next_line", arity: 1, returns_rc: true, returns_text: true },
     CoreSyscallSpec { tenon_name: "sys_http_sse_eof", c_symbol: "tenon_sys_http_sse_eof", arity: 1, returns_rc: false, returns_text: false },
@@ -86,6 +94,7 @@ pub(crate) fn is_rc_type_expr(
 ) -> bool {
     let resolved = resolve_alias_ty(ty, aliases);
     match resolved {
+        TypeExpr::Dyn { .. } => true,
         TypeExpr::Named { name, .. } => {
             record_names.contains(&name)
                 || enum_names.contains(&name)
@@ -139,6 +148,7 @@ struct RtFuncs {
     rc_ensure_unique: FuncId,
     rc_get_field: FuncId,
     rc_set_field: FuncId,
+    rc_set_field_raw: FuncId,
     rc_get_tag: FuncId,
     rc_get_len: FuncId,
     text_new: FuncId,
@@ -161,6 +171,15 @@ pub struct JitProgram {
 
 impl JitProgram {
     pub fn compile(program: &Program) -> Result<Self, String> {
+        let prepared = prepare_program_for_codegen(program);
+        let program = &prepared.program;
+        let dyn_interfaces = &prepared.dyn_interfaces;
+        let vtable_ifaces: BTreeMap<String, String> = prepared
+            .vtables
+            .iter()
+            .map(|v| (v.sym_name.clone(), v.interface.clone()))
+            .collect();
+
         let mut flag_builder = settings::builder();
         flag_builder
             .set("use_colocated_libcalls", "false")
@@ -183,6 +202,7 @@ impl JitProgram {
         jit_builder.symbol("tenon_rc_ensure_unique", tenon_rc_ensure_unique as *const u8);
         jit_builder.symbol("tenon_rc_get_field", tenon_rc_get_field as *const u8);
         jit_builder.symbol("tenon_rc_set_field", tenon_rc_set_field as *const u8);
+        jit_builder.symbol("tenon_rc_set_field_raw", tenon_rc_set_field_raw as *const u8);
         jit_builder.symbol("tenon_rc_get_tag", tenon_rc_get_tag as *const u8);
         jit_builder.symbol("tenon_rc_get_len", tenon_rc_get_len as *const u8);
         jit_builder.symbol("tenon_text_new", tenon_text_new as *const u8);
@@ -197,6 +217,10 @@ impl JitProgram {
         jit_builder.symbol("tenon_str_slice", syscalls::tenon_str_slice as *const u8);
         jit_builder.symbol("tenon_byte_to_text", syscalls::tenon_byte_to_text as *const u8);
         jit_builder.symbol("tenon_str_concat", syscalls::tenon_str_concat as *const u8);
+        jit_builder.symbol("tenon_buf_new", syscalls::tenon_buf_new as *const u8);
+        jit_builder.symbol("tenon_buf_push_str", syscalls::tenon_buf_push_str as *const u8);
+        jit_builder.symbol("tenon_buf_push_byte", syscalls::tenon_buf_push_byte as *const u8);
+        jit_builder.symbol("tenon_buf_finish", syscalls::tenon_buf_finish as *const u8);
         jit_builder.symbol("tenon_sys_write_stdout", syscalls::tenon_sys_write_stdout as *const u8);
         jit_builder.symbol("tenon_sys_read_line", syscalls::tenon_sys_read_line as *const u8);
         jit_builder.symbol("tenon_sys_is_eof", syscalls::tenon_sys_is_eof as *const u8);
@@ -207,6 +231,7 @@ impl JitProgram {
         jit_builder.symbol("tenon_sys_write_file", syscalls::tenon_sys_write_file as *const u8);
         jit_builder.symbol("tenon_sys_exec", syscalls::tenon_sys_exec as *const u8);
         jit_builder.symbol("tenon_sys_exec_exit_code", syscalls::tenon_sys_exec_exit_code as *const u8);
+        jit_builder.symbol("tenon_sys_http_open", syscalls::tenon_sys_http_open as *const u8);
         jit_builder.symbol("tenon_sys_http_sse_open", syscalls::tenon_sys_http_sse_open as *const u8);
         jit_builder.symbol("tenon_sys_http_sse_next_line", syscalls::tenon_sys_http_sse_next_line as *const u8);
         jit_builder.symbol("tenon_sys_http_sse_eof", syscalls::tenon_sys_http_sse_eof as *const u8);
@@ -420,6 +445,25 @@ impl JitProgram {
             derived_parsers.push(pname);
         }
 
+        // Build static read-only Cranelift data objects for every `dyn` vtable!
+        let mut vtable_data_ids: BTreeMap<String, DataId> = BTreeMap::new();
+        for vt in &prepared.vtables {
+            let did = module
+                .declare_data(&vt.sym_name, Linkage::Local, false, false)
+                .map_err(|e| e.to_string())?;
+            let mut dd = DataDescription::new();
+            dd.define_zeroinit(vt.fn_names.len() * 8);
+            for (slot, fn_name) in vt.fn_names.iter().enumerate() {
+                let fid = *func_ids
+                    .get(fn_name)
+                    .ok_or_else(|| format!("vtable `{}` missing function `{}`", vt.sym_name, fn_name))?;
+                let fref = module.declare_func_in_data(fid, &mut dd);
+                dd.write_function_addr((slot * 8) as u32, fref);
+            }
+            module.define_data(did, &dd).map_err(|e| e.to_string())?;
+            vtable_data_ids.insert(vt.sym_name.clone(), did);
+        }
+
         let mut interned_strings: Vec<Box<[u8]>> = Vec::new();
         let mut ctx = module.make_context();
         let mut fb_ctx = FunctionBuilderContext::new();
@@ -474,6 +518,9 @@ impl JitProgram {
                     field_to_idx: &field_to_idx,
                     enum_tags: &enum_tags,
                     enum_variants: &enum_variants,
+                    dyn_interfaces,
+                    vtable_data_ids: &vtable_data_ids,
+                    vtable_ifaces: &vtable_ifaces,
                     interned_strings: &mut interned_strings,
                     vars,
                     var_types,
@@ -549,6 +596,9 @@ impl JitProgram {
                     field_to_idx: &field_to_idx,
                     enum_tags: &enum_tags,
                     enum_variants: &enum_variants,
+                    dyn_interfaces,
+                    vtable_data_ids: &vtable_data_ids,
+                    vtable_ifaces: &vtable_ifaces,
                     interned_strings: &mut interned_strings,
                     vars,
                     var_types,
@@ -719,6 +769,9 @@ impl JitProgram {
                     field_to_idx: &field_to_idx,
                     enum_tags: &enum_tags,
                     enum_variants: &enum_variants,
+                    dyn_interfaces,
+                    vtable_data_ids: &vtable_data_ids,
+                    vtable_ifaces: &vtable_ifaces,
                     interned_strings: &mut interned_strings,
                     vars: BTreeMap::new(),
                     var_types: BTreeMap::new(),
@@ -933,6 +986,7 @@ fn declare_runtime_funcs(module: &mut JITModule) -> Result<RtFuncs, String> {
         rc_ensure_unique: declare_sig(module, "tenon_rc_ensure_unique", 1, true)?,
         rc_get_field: declare_sig(module, "tenon_rc_get_field", 2, true)?,
         rc_set_field: declare_sig(module, "tenon_rc_set_field", 3, false)?,
+        rc_set_field_raw: declare_sig(module, "tenon_rc_set_field_raw", 3, false)?,
         rc_get_tag: declare_sig(module, "tenon_rc_get_tag", 1, true)?,
         rc_get_len: declare_sig(module, "tenon_rc_get_len", 1, true)?,
         text_new: declare_sig(module, "tenon_text_new", 2, true)?,
@@ -1093,6 +1147,9 @@ struct FnLower<'a, 'b> {
     field_to_idx: &'a BTreeMap<String, usize>,
     enum_tags: &'a BTreeMap<String, i64>,
     enum_variants: &'a BTreeMap<String, EnumVariantLayout>,
+    dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
+    vtable_data_ids: &'a BTreeMap<String, DataId>,
+    vtable_ifaces: &'a BTreeMap<String, String>,
     interned_strings: &'a mut Vec<Box<[u8]>>,
     vars: BTreeMap<String, Variable>,
     var_types: BTreeMap<String, TypeExpr>,
@@ -1286,9 +1343,33 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             return named_ty(&vl.enum_name);
                         }
                     }
+                    let recv_ty = resolve_alias_ty(
+                        &self.infer_expr_type_with(target, extra_vars),
+                        self.alias_bases,
+                    );
+                    if let TypeExpr::Dyn { interface, .. } = recv_ty {
+                        if let Some(layout) = self.dyn_interfaces.get(&interface) {
+                            if let Some(dm) = layout.methods.iter().find(|m| m.name == *field) {
+                                return dm.ret_ty.clone().unwrap_or_else(|| named_ty("Any"));
+                            }
+                        }
+                    }
                     named_ty("Any")
                 }
                 ExprKind::Ident(f) => {
+                    if f == "__box_dyn" {
+                        if let Some(a1) = args.get(1) {
+                            if let ExprKind::Str(vsym) = &a1.value.kind {
+                                if let Some(iface) = self.vtable_ifaces.get(vsym) {
+                                    return TypeExpr::Dyn {
+                                        interface: iface.clone(),
+                                        args: vec![],
+                                        span: expr.span,
+                                    };
+                                }
+                            }
+                        }
+                    }
                     if f == "Ok" && args.len() == 1 {
                         return generic_ty("Result", vec![self.infer_expr_type_with(&args[0].value, extra_vars), named_ty("Any")]);
                     }
@@ -1424,13 +1505,25 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             ExprKind::Call { callee, .. } => match &callee.kind {
                 ExprKind::Ident(f) => {
-                    matches!(f.as_str(), "Ok" | "Err" | "Some" | "push" | "yield_val")
+                    matches!(f.as_str(), "Ok" | "Err" | "Some" | "push" | "yield_val" | "__box_dyn")
                         || (self.enum_tags.contains_key(f) && !self.func_ids.contains_key(f))
                         || self.fn_metas.get(f).is_some_and(|m| m.returns_rc)
                 }
                 ExprKind::Field { target, field } => {
-                    field == "parse"
+                    if field == "parse"
                         || matches!(&target.kind, ExprKind::Ident(e) if self.enum_tags.contains_key(&format!("{}.{}", e, field)))
+                    {
+                        return true;
+                    }
+                    let recv_ty = resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases);
+                    if let TypeExpr::Dyn { interface, .. } = recv_ty {
+                        if let Some(layout) = self.dyn_interfaces.get(&interface) {
+                            if let Some(dm) = layout.methods.iter().find(|m| m.name == *field) {
+                                return dm.returns_rc;
+                            }
+                        }
+                    }
+                    false
                 }
                 _ => false,
             },
@@ -2504,9 +2597,116 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             return self.lower_enum_ctor(tag, &ptys, args);
                         }
                     }
-                    Err("unsupported method call in codegen".into())
+                    // Dynamic interface method dispatch: `d.method(args)` where `d: dyn Interface`!
+                    let recv_ty = resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases);
+                    if let TypeExpr::Dyn { interface, .. } = recv_ty {
+                        let dm = self
+                            .dyn_interfaces
+                            .get(&interface)
+                            .and_then(|l| l.methods.iter().find(|m| m.name == *field))
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!("unknown method `{}` on `dyn {}` in Cranelift codegen", field, interface)
+                            })?;
+                        let mut temps = Vec::new();
+                        let mut d_val = self.lower_expr_borrowed(target, &mut temps)?;
+                        let mut call_args = Vec::new();
+                        let mut inout_dyn_slot: Option<(Value, cranelift_codegen::ir::StackSlot)> = None;
+
+                        if dm.is_inout_self {
+                            let d_uniq = self.call_rt_1(self.rt.rc_ensure_unique, d_val);
+                            if let ExprKind::Ident(vname) = &target.kind {
+                                if let Some(&var) = self.vars.get(vname) {
+                                    if self.inout_vars.contains(vname) {
+                                        let slot_ptr = self.builder.use_var(var);
+                                        self.builder.ins().store(MemFlags::new(), d_uniq, slot_ptr, 0);
+                                    } else {
+                                        self.builder.def_var(var, d_uniq);
+                                    }
+                                }
+                            }
+                            d_val = d_uniq;
+                            let z0 = self.builder.ins().iconst(types::I64, 0);
+                            let data_val = self.call_rt_2_vals(self.rt.rc_get_field, d_val, z0);
+                            let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
+                                StackSlotKind::ExplicitSlot,
+                                8,
+                                3,
+                            ));
+                            self.builder.ins().stack_store(data_val, ss, 0);
+                            let addr = self.builder.ins().stack_addr(types::I64, ss, 0);
+                            call_args.push(addr);
+                            inout_dyn_slot = Some((d_uniq, ss));
+                        } else {
+                            let z0 = self.builder.ins().iconst(types::I64, 0);
+                            let data_val = self.call_rt_2_vals(self.rt.rc_get_field, d_val, z0);
+                            call_args.push(data_val);
+                        }
+
+                        for a in args {
+                            call_args.push(self.lower_expr_borrowed(&a.value, &mut temps)?);
+                        }
+
+                        let one = self.builder.ins().iconst(types::I64, 1);
+                        let vt_ptr = self.call_rt_2_vals(self.rt.rc_get_field, d_val, one);
+                        let fn_ptr = self.builder.ins().load(
+                            types::I64,
+                            MemFlags::new(),
+                            vt_ptr,
+                            (dm.slot_idx * 8) as i32,
+                        );
+                        let mut sig = self.module.make_signature();
+                        for _ in 0..call_args.len() {
+                            sig.params.push(AbiParam::new(types::I64));
+                        }
+                        sig.returns.push(AbiParam::new(types::I64));
+                        let sig_ref = self.builder.import_signature(sig);
+                        let call = self.builder.ins().call_indirect(sig_ref, fn_ptr, &call_args);
+                        let ret = self.builder.inst_results(call)[0];
+
+                        if let Some((d_uniq, ss)) = inout_dyn_slot {
+                            let updated = self.builder.ins().stack_load(types::I64, ss, 0);
+                            self.call_rt_3_void(self.rt.rc_set_field_raw, d_uniq, 0, updated);
+                        }
+                        self.flush_temps(&temps);
+                        return Ok(ret);
+                    }
+                    Err(format!(
+                        "unsupported method call `{}` on `{}` in codegen",
+                        field,
+                        recv_ty.display_name()
+                    ))
                 }
                 ExprKind::Ident(fname) => {
+                    if fname == "__box_dyn" && args.len() == 3 {
+                        let vsym = match &args[1].value.kind {
+                            ExprKind::Str(s) => s.clone(),
+                            _ => return Err("__box_dyn expects vtable symbol string".into()),
+                        };
+                        let data_is_rc = matches!(&args[2].value.kind, ExprKind::Int(n) if *n != 0);
+                        let data_val = if data_is_rc {
+                            self.lower_expr_owned(&args[0].value, None)?
+                        } else {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                            self.flush_temps(&temps);
+                            v
+                        };
+                        let obj = self.call_rt_2(self.rt.rc_alloc, TAG_DYN, 2);
+                        if data_is_rc {
+                            let mv = self.builder.ins().iconst(types::I64, 1);
+                            self.call_rt_2_void(self.rt.rc_set_rc_mask, obj, mv);
+                        }
+                        self.call_rt_3_void(self.rt.rc_set_field, obj, 0, data_val);
+                        let did = *self
+                            .vtable_data_ids
+                            .get(&vsym)
+                            .ok_or_else(|| format!("missing vtable data `{}`", vsym))?;
+                        let gv = self.module.declare_data_in_func(did, self.builder.func);
+                        let vt_ptr = self.builder.ins().global_value(types::I64, gv);
+                        self.call_rt_3_void(self.rt.rc_set_field, obj, 1, vt_ptr);
+                        return Ok(obj);
+                    }
                     if fname == "len" && args.len() == 1 {
                         let mut temps = Vec::new();
                         let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
@@ -2986,6 +3186,94 @@ pub fn main() Int {
         assert_eq!(
             st.live_objects, 0,
             "recursive payload enums + Option/Result + RC Lists must leave 0 leaks, got {:?}",
+            st
+        );
+    }
+
+    #[test]
+    fn interfaces_methods_static_monomorph_and_dyn_vtable_zero_leaks() {
+        let src = r#"
+pub interface Greeter {
+    pure fn greet(self, who Text) Text
+    pure fn shout(self, who Text) Text {
+        self.greet(who) ++ "!"
+    }
+}
+
+pub interface Accumulator {
+    fn add(inout self, delta Int) Int
+    pure fn current(self) Int
+}
+
+pub record EnGreeter { prefix Text }
+pub record ZhGreeter { prefix Text }
+
+impl Greeter for EnGreeter {
+    pure fn greet(self, who Text) Text { self.prefix ++ " " ++ who }
+}
+
+impl Greeter for ZhGreeter {
+    pure fn greet(self, who Text) Text { self.prefix ++ ", " ++ who }
+}
+
+pub record Counter { val Int }
+
+impl Counter {
+    pure fn doubled(self) Int { self.val * 2 }
+}
+
+impl Accumulator for Counter {
+    fn add(inout self, delta Int) Int {
+        self.val += delta
+        self.val
+    }
+    pure fn current(self) Int { self.val }
+}
+
+pub pure fn run_static[T Greeter](g T, name Text) Text {
+    g.shout(name)
+}
+
+pub pure fn run_dyn(g dyn Greeter, name Text) Text {
+    g.shout(name)
+}
+
+pub fn main() Int {
+    let en = EnGreeter { prefix = "Hello" }
+    let zh = ZhGreeter { prefix = "NiHao" }
+    assert run_static(en, "Tenon") == "Hello Tenon!"
+    assert run_static(zh, "Tenon") == "NiHao, Tenon!"
+
+    var list List[dyn Greeter] = []
+    list = push(list, en)
+    list = push(list, zh)
+    let b = buf_new()
+    let _ = buf_push_str(b, run_dyn(list[0], "World"))
+    let _ = buf_push_byte(b, 124)
+    let _ = buf_push_str(b, list[1].greet("World"))
+    let joined = buf_finish(b)
+    assert joined == "Hello World!|NiHao, World"
+
+    let c0 = Counter { val = 7 }
+    assert c0.doubled() == 14
+
+    var c dyn Accumulator = Counter { val = 10 }
+    let c2 dyn Accumulator = c
+    let v1 = c.add(5)
+    assert v1 == 15
+    assert c.current() == 15
+    assert c2.current() == 10
+    v1
+}
+"#;
+        perceus::reset_stats();
+        let prog = parse(src).unwrap();
+        let jit = JitProgram::compile(&prog).unwrap();
+        assert_eq!(jit.call_0("main").unwrap(), 15);
+        let st = perceus::snapshot_stats();
+        assert_eq!(
+            st.live_objects, 0,
+            "interfaces + default methods + static monomorph + dyn vtable + COW must leave 0 leaks, got {:?}",
             st
         );
     }

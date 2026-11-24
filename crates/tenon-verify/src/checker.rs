@@ -61,6 +61,11 @@ const BUILTIN_SIGS: &[BuiltinSig] = &[
     BuiltinSig { name: "str_slice", arity: 3, is_pure: true, allocates: true, param_types: &["Text", "Int", "Int"], ret_type: "Text" },
     BuiltinSig { name: "byte_to_text", arity: 1, is_pure: true, allocates: true, param_types: &["Int"], ret_type: "Text" },
     BuiltinSig { name: "str_concat", arity: 2, is_pure: true, allocates: true, param_types: &["Text", "Text"], ret_type: "Text" },
+    // 4 O(n) Byte buffer primitives (pure)
+    BuiltinSig { name: "buf_new", arity: 0, is_pure: true, allocates: true, param_types: &[], ret_type: "Int" },
+    BuiltinSig { name: "buf_push_str", arity: 2, is_pure: true, allocates: true, param_types: &["Int", "Text"], ret_type: "Int" },
+    BuiltinSig { name: "buf_push_byte", arity: 2, is_pure: true, allocates: true, param_types: &["Int", "Int"], ret_type: "Int" },
+    BuiltinSig { name: "buf_finish", arity: 1, is_pure: true, allocates: true, param_types: &["Int"], ret_type: "Text" },
     // 10 Minimal OS / I/O / FS / Process syscalls (impure)
     BuiltinSig { name: "sys_write_stdout", arity: 1, is_pure: false, allocates: false, param_types: &["Text"], ret_type: "Int" },
     BuiltinSig { name: "sys_read_line", arity: 0, is_pure: false, allocates: true, param_types: &[], ret_type: "Text" },
@@ -72,7 +77,8 @@ const BUILTIN_SIGS: &[BuiltinSig] = &[
     BuiltinSig { name: "sys_write_file", arity: 2, is_pure: false, allocates: false, param_types: &["Text", "Text"], ret_type: "Bool" },
     BuiltinSig { name: "sys_exec", arity: 1, is_pure: false, allocates: true, param_types: &["Text"], ret_type: "Text" },
     BuiltinSig { name: "sys_exec_exit_code", arity: 0, is_pure: false, allocates: false, param_types: &[], ret_type: "Int" },
-    // 5 Minimal Raw HTTPS SSE transport syscalls (impure)
+    // 6 Minimal Raw HTTPS Line-Stream transport syscalls (impure)
+    BuiltinSig { name: "sys_http_open", arity: 4, is_pure: false, allocates: false, param_types: &["Text", "Text", "Text", "Text"], ret_type: "Int" },
     BuiltinSig { name: "sys_http_sse_open", arity: 3, is_pure: false, allocates: false, param_types: &["Text", "Text", "Text"], ret_type: "Int" },
     BuiltinSig { name: "sys_http_sse_next_line", arity: 1, is_pure: false, allocates: true, param_types: &["Int"], ret_type: "Text" },
     BuiltinSig { name: "sys_http_sse_eof", arity: 1, is_pure: false, allocates: false, param_types: &["Int"], ret_type: "Bool" },
@@ -140,13 +146,100 @@ struct CheckerCtx {
     records: BTreeMap<String, RecordDecl>,
     enums: BTreeMap<String, EnumDecl>,
     enum_variants: BTreeMap<String, VariantInfo>,
+    interfaces: BTreeMap<String, InterfaceDecl>,
+    inherent_methods: BTreeMap<(String, String), FnDecl>,
+    interface_impls: BTreeMap<(String, String), ImplDecl>,
+    impl_methods: BTreeMap<(String, String), Vec<(String, FnDecl)>>,
     pure_fns: BTreeMap<String, FnDecl>,
     smt_pure_fns: BTreeMap<String, FnDecl>,
     no_heap_fns: BTreeSet<String>,
     all_fns: BTreeMap<String, FnDecl>,
     async_fns: BTreeSet<String>,
+    cur_type_params: BTreeSet<String>,
+    cur_type_param_bounds: BTreeMap<String, Vec<String>>,
     proofs: Vec<ProofRecord>,
     diagnostics: Vec<Diagnostic>,
+}
+
+fn type_head_name(ty: &TypeExpr) -> String {
+    match ty {
+        TypeExpr::Named { name, .. } => name.clone(),
+        TypeExpr::Dyn { interface, .. } => format!("dyn {}", interface),
+        TypeExpr::Tuple(_, _) => "Tuple".into(),
+    }
+}
+
+fn subst_type_expr(ty: &TypeExpr, subst: &BTreeMap<String, TypeExpr>) -> TypeExpr {
+    match ty {
+        TypeExpr::Named {
+            name,
+            version,
+            args,
+            span,
+        } => {
+            if args.is_empty() {
+                if let Some(rep) = subst.get(name) {
+                    return rep.clone();
+                }
+            }
+            TypeExpr::Named {
+                name: name.clone(),
+                version: version.clone(),
+                args: args.iter().map(|a| subst_type_expr(a, subst)).collect(),
+                span: *span,
+            }
+        }
+        TypeExpr::Dyn {
+            interface,
+            args,
+            span,
+        } => TypeExpr::Dyn {
+            interface: interface.clone(),
+            args: args.iter().map(|a| subst_type_expr(a, subst)).collect(),
+            span: *span,
+        },
+        TypeExpr::Tuple(es, span) => TypeExpr::Tuple(
+            es.iter().map(|e| subst_type_expr(e, subst)).collect(),
+            *span,
+        ),
+    }
+}
+
+fn subst_fn_self(f: &FnDecl, self_ty: &TypeExpr) -> FnDecl {
+    let mut subst = BTreeMap::new();
+    subst.insert("Self".into(), self_ty.clone());
+    let mut out = f.clone();
+    for p in &mut out.params {
+        p.ty = subst_type_expr(&p.ty, &subst);
+    }
+    if let Some(rt) = &out.ret_ty {
+        out.ret_ty = Some(subst_type_expr(rt, &subst));
+    }
+    out
+}
+
+fn iface_method_to_fn_decl(m: &InterfaceMethodDecl, self_ty: &TypeExpr) -> FnDecl {
+    let f = FnDecl {
+        attrs: m.attrs.clone(),
+        is_pub: true,
+        is_pure: m.is_pure,
+        is_async: m.is_async,
+        is_test: false,
+        name: m.name.clone(),
+        type_params: m.type_params.clone(),
+        type_param_bounds: m.type_param_bounds.clone(),
+        params: m.params.clone(),
+        ret_ty: m.ret_ty.clone(),
+        requires: m.requires.clone(),
+        ensures: m.ensures.clone(),
+        body: m.default_body.clone().unwrap_or(Block {
+            stmts: vec![],
+            tail: None,
+            span: m.span,
+        }),
+        span: m.span,
+    };
+    subst_fn_self(&f, self_ty)
 }
 
 impl CheckerCtx {
@@ -155,6 +248,10 @@ impl CheckerCtx {
         let mut records = BTreeMap::new();
         let mut enums = BTreeMap::new();
         let mut enum_variants = BTreeMap::new();
+        let mut interfaces = BTreeMap::new();
+        let mut inherent_methods = BTreeMap::new();
+        let mut interface_impls = BTreeMap::new();
+        let mut impl_methods: BTreeMap<(String, String), Vec<(String, FnDecl)>> = BTreeMap::new();
         let mut pure_fns = BTreeMap::new();
         let mut no_heap_fns = BTreeSet::new();
         let mut all_fns = BTreeMap::new();
@@ -169,7 +266,9 @@ impl CheckerCtx {
                 Item::Record(r) => {
                     records.insert(r.name.clone(), r.clone());
                     for m in &r.methods {
-                        all_fns.insert(format!("{}.{}", r.name, m.name), m.clone());
+                        let sub = subst_fn_self(m, &named_ty(&r.name));
+                        inherent_methods.insert((r.name.clone(), m.name.clone()), sub.clone());
+                        all_fns.insert(format!("{}.{}", r.name, m.name), sub);
                     }
                 }
                 Item::Enum(e) => {
@@ -185,6 +284,10 @@ impl CheckerCtx {
                         enum_variants.insert(format!("{}.{}", e.name, v.name), info);
                     }
                 }
+                Item::Interface(iface) => {
+                    interfaces.insert(iface.name.clone(), iface.clone());
+                }
+                Item::Impl(_) => {}
                 Item::Fn(f) => {
                     if f.is_pure {
                         pure_fns.insert(f.name.clone(), f.clone());
@@ -198,6 +301,43 @@ impl CheckerCtx {
                     all_fns.insert(f.name.clone(), f.clone());
                 }
                 _ => {}
+            }
+        }
+
+        // Second pass: index all `impl` blocks (inherent and interface impls, including default methods)
+        for item in &program.items {
+            if let Item::Impl(imp) = item {
+                let tname = type_head_name(&imp.target_ty);
+                if let Some(iface_ty) = &imp.interface {
+                    let iname = type_head_name(iface_ty);
+                    interface_impls.insert((iname.clone(), tname.clone()), imp.clone());
+                    let mut provided = BTreeSet::new();
+                    for m in &imp.methods {
+                        provided.insert(m.name.clone());
+                        let sub = subst_fn_self(m, &imp.target_ty);
+                        impl_methods
+                            .entry((tname.clone(), m.name.clone()))
+                            .or_default()
+                            .push((iname.clone(), sub));
+                    }
+                    // Inherit any default methods from the interface not overridden by this impl
+                    if let Some(idecl) = interfaces.get(&iname) {
+                        for im in &idecl.methods {
+                            if !provided.contains(&im.name) && im.default_body.is_some() {
+                                let sub = iface_method_to_fn_decl(im, &imp.target_ty);
+                                impl_methods
+                                    .entry((tname.clone(), im.name.clone()))
+                                    .or_default()
+                                    .push((iname.clone(), sub));
+                            }
+                        }
+                    }
+                } else {
+                    for m in &imp.methods {
+                        let sub = subst_fn_self(m, &imp.target_ty);
+                        inherent_methods.insert((tname.clone(), m.name.clone()), sub);
+                    }
+                }
             }
         }
 
@@ -253,11 +393,17 @@ impl CheckerCtx {
             records,
             enums,
             enum_variants,
+            interfaces,
+            inherent_methods,
+            interface_impls,
+            impl_methods,
             pure_fns,
             smt_pure_fns,
             no_heap_fns,
             all_fns,
             async_fns,
+            cur_type_params: BTreeSet::new(),
+            cur_type_param_bounds: BTreeMap::new(),
             proofs: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -265,10 +411,417 @@ impl CheckerCtx {
 
     fn check_all(&mut self, program: &Program) {
         for item in &program.items {
-            if let Item::Fn(f) = item {
-                self.check_fn(f);
+            match item {
+                Item::Fn(f) => self.check_fn(f),
+                Item::Impl(imp) => self.check_impl(imp),
+                _ => {}
             }
         }
+    }
+
+    fn type_implements(&self, ty: &TypeExpr, iface_name: &str) -> bool {
+        let base = self.resolve_base_type(ty);
+        match &base {
+            TypeExpr::Dyn { interface, .. } => interface == iface_name,
+            TypeExpr::Named { name, .. } => {
+                if name == "Any" {
+                    return true;
+                }
+                if self.interface_impls.contains_key(&(iface_name.to_string(), name.clone())) {
+                    return true;
+                }
+                if let TypeExpr::Named { name: orig, .. } = ty {
+                    if self.interface_impls.contains_key(&(iface_name.to_string(), orig.clone())) {
+                        return true;
+                    }
+                }
+                if let Some(bounds) = self.cur_type_param_bounds.get(name) {
+                    if bounds.iter().any(|b| b == iface_name) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn is_object_safe(&self, iface_name: &str) -> Result<(), String> {
+        let Some(iface) = self.interfaces.get(iface_name) else {
+            return Err(format!("unknown interface `{}`", iface_name));
+        };
+        for m in &iface.methods {
+            if !m.params.first().is_some_and(|p| p.name == "self") {
+                return Err(format!(
+                    "interface `{}` is not object-safe: method `{}` has no `self` receiver",
+                    iface_name, m.name
+                ));
+            }
+            if !m.type_params.is_empty() {
+                return Err(format!(
+                    "interface `{}` is not object-safe: method `{}` has generic type parameters",
+                    iface_name, m.name
+                ));
+            }
+            for p in m.params.iter().skip(1) {
+                if p.ty.display_name().contains("Self") {
+                    return Err(format!(
+                        "interface `{}` is not object-safe: parameter `{}` of `{}` mentions `Self`",
+                        iface_name, p.name, m.name
+                    ));
+                }
+            }
+            if let Some(rt) = &m.ret_ty {
+                if rt.display_name().contains("Self") {
+                    return Err(format!(
+                        "interface `{}` is not object-safe: return type of `{}` mentions `Self`",
+                        iface_name, m.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_dyn_type_valid(&mut self, ty: &TypeExpr, span: Span) {
+        match ty {
+            TypeExpr::Dyn { interface, args, .. } => {
+                if !self.interfaces.contains_key(interface) {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0500".into(),
+                        message: format!("unknown interface `{}` in `dyn {}`", interface, interface),
+                        span,
+                        notes: vec![],
+                        counterexample: BTreeMap::new(),
+                    });
+                } else if let Err(reason) = self.is_object_safe(interface) {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0506".into(),
+                        message: reason,
+                        span,
+                        notes: vec!["use static generic constraint `[T Interface]` instead of `dyn Interface`".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+                for a in args {
+                    self.check_dyn_type_valid(a, span);
+                }
+            }
+            TypeExpr::Named { args, .. } => {
+                for a in args {
+                    self.check_dyn_type_valid(a, span);
+                }
+            }
+            TypeExpr::Tuple(es, _) => {
+                for e in es {
+                    self.check_dyn_type_valid(e, span);
+                }
+            }
+        }
+    }
+
+    fn resolve_method_sig(&self, recv_ty: &TypeExpr, method_name: &str) -> Option<FnDecl> {
+        let base = self.resolve_base_type(recv_ty);
+        match &base {
+            TypeExpr::Dyn { interface, .. } => {
+                let idecl = self.interfaces.get(interface)?;
+                let m = idecl.methods.iter().find(|m| m.name == method_name)?;
+                Some(iface_method_to_fn_decl(m, recv_ty))
+            }
+            TypeExpr::Named { name, args, .. } => {
+                // 1. Bounded generic type parameter `T` -> check bound interfaces
+                if let Some(bounds) = self.cur_type_param_bounds.get(name) {
+                    for b in bounds {
+                        if let Some(idecl) = self.interfaces.get(b) {
+                            if let Some(m) = idecl.methods.iter().find(|m| m.name == method_name) {
+                                return Some(iface_method_to_fn_decl(m, recv_ty));
+                            }
+                        }
+                    }
+                }
+                // 2. Inherent method on exact or base type name
+                let lookup_names: Vec<String> = match recv_ty {
+                    TypeExpr::Named { name: orig, .. } if orig != name => {
+                        vec![orig.clone(), name.clone()]
+                    }
+                    _ => vec![name.clone()],
+                };
+                for tn in &lookup_names {
+                    if let Some(m) = self.inherent_methods.get(&(tn.clone(), method_name.to_string())) {
+                        return Some(self.instantiate_container_method(m, tn, args));
+                    }
+                }
+                // 3. Interface impl method on concrete type
+                for tn in &lookup_names {
+                    if let Some(list) = self.impl_methods.get(&(tn.clone(), method_name.to_string())) {
+                        if let Some((_, m)) = list.first() {
+                            return Some(self.instantiate_container_method(m, tn, args));
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn instantiate_container_method(&self, m: &FnDecl, _tn: &str, type_args: &[TypeExpr]) -> FnDecl {
+        if type_args.is_empty() || m.type_params.is_empty() {
+            return m.clone();
+        }
+        let mut subst = BTreeMap::new();
+        for (tp, ta) in m.type_params.iter().zip(type_args.iter()) {
+            subst.insert(tp.clone(), ta.clone());
+        }
+        let mut out = m.clone();
+        for p in &mut out.params {
+            p.ty = subst_type_expr(&p.ty, &subst);
+        }
+        if let Some(rt) = &out.ret_ty {
+            out.ret_ty = Some(subst_type_expr(rt, &subst));
+        }
+        out
+    }
+
+    fn resolve_assoc_method_sig(&self, type_name: &str, method_name: &str) -> Option<FnDecl> {
+        // Check bounded generic type param `T.from_json(...)`
+        if let Some(bounds) = self.cur_type_param_bounds.get(type_name) {
+            for b in bounds {
+                if let Some(idecl) = self.interfaces.get(b) {
+                    if let Some(m) = idecl.methods.iter().find(|m| m.name == method_name) {
+                        return Some(iface_method_to_fn_decl(m, &named_ty(type_name)));
+                    }
+                }
+            }
+        }
+        if let Some(m) = self.inherent_methods.get(&(type_name.to_string(), method_name.to_string())) {
+            return Some(m.clone());
+        }
+        if let Some(list) = self.impl_methods.get(&(type_name.to_string(), method_name.to_string())) {
+            if let Some((_, m)) = list.first() {
+                return Some(m.clone());
+            }
+        }
+        None
+    }
+
+    fn is_known_type_name(&self, name: &str) -> bool {
+        self.records.contains_key(name)
+            || self.enums.contains_key(name)
+            || self.type_aliases.contains_key(name)
+            || self.cur_type_params.contains(name)
+            || matches!(
+                name,
+                "Int" | "Int64" | "Int32" | "UInt16" | "USize" | "Bool" | "Text" | "Option" | "Result" | "List"
+            )
+    }
+
+    fn check_impl(&mut self, imp: &ImplDecl) {
+        let tname = type_head_name(&imp.target_ty);
+        let prev_tp = self.cur_type_params.clone();
+        let prev_bounds = self.cur_type_param_bounds.clone();
+        for tp in &imp.type_params {
+            self.cur_type_params.insert(tp.clone());
+        }
+        for (k, v) in &imp.type_param_bounds {
+            self.cur_type_param_bounds.insert(k.clone(), v.clone());
+        }
+
+        if let Some(iface_ty) = &imp.interface {
+            let iname = type_head_name(iface_ty);
+            let Some(idecl) = self.interfaces.get(&iname).cloned() else {
+                self.diagnostics.push(Diagnostic {
+                    code: "E0500".into(),
+                    message: format!("unknown interface `{}` in `impl {} for {}`", iname, iname, tname),
+                    span: imp.span,
+                    notes: vec![],
+                    counterexample: BTreeMap::new(),
+                });
+                self.cur_type_params = prev_tp;
+                self.cur_type_param_bounds = prev_bounds;
+                return;
+            };
+
+            let provided_map: BTreeMap<String, FnDecl> = imp
+                .methods
+                .iter()
+                .map(|m| (m.name.clone(), m.clone()))
+                .collect();
+
+            // 1. Verify all required interface methods are implemented & conform to signature, effects, and Liskov contracts!
+            for im in &idecl.methods {
+                let expected = iface_method_to_fn_decl(im, &imp.target_ty);
+                let Some(impl_m) = provided_map.get(&im.name) else {
+                    if im.default_body.is_none() {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0501".into(),
+                            message: format!(
+                                "missing method `{}` in `impl {} for {}`",
+                                im.name, iname, tname
+                            ),
+                            span: imp.span,
+                            notes: vec![format!("interface `{}` requires method `{}`", iname, im.name)],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                    continue;
+                };
+                let mut concrete_m = subst_fn_self(impl_m, &imp.target_ty);
+
+                // Signature compatibility: arity, `inout`, parameter types, return type
+                if concrete_m.params.len() != expected.params.len() {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0502".into(),
+                        message: format!(
+                            "method `{}` in `impl {} for {}` expects {} parameter(s), found {}",
+                            im.name,
+                            iname,
+                            tname,
+                            expected.params.len(),
+                            concrete_m.params.len()
+                        ),
+                        span: impl_m.span,
+                        notes: vec![],
+                        counterexample: BTreeMap::new(),
+                    });
+                } else {
+                    for (ep, ap) in expected.params.iter().zip(concrete_m.params.iter()) {
+                        if ep.is_inout != ap.is_inout {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0502".into(),
+                                message: format!(
+                                    "method `{}` in `impl {} for {}`: parameter `{}` `inout` mismatch with interface `{}`",
+                                    im.name, iname, tname, ap.name, iname
+                                ),
+                                span: ap.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                        if !self.types_compatible(&ep.ty, &ap.ty) {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0502".into(),
+                                message: format!(
+                                    "method `{}` in `impl {} for {}`: parameter `{}` expects `{}`, found `{}`",
+                                    im.name,
+                                    iname,
+                                    tname,
+                                    ap.name,
+                                    ep.ty.display_name(),
+                                    ap.ty.display_name()
+                                ),
+                                span: ap.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                }
+                match (&expected.ret_ty, &concrete_m.ret_ty) {
+                    (Some(ert), Some(art)) if !self.types_compatible(ert, art) => {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0502".into(),
+                            message: format!(
+                                "method `{}` in `impl {} for {}`: return type expects `{}`, found `{}`",
+                                im.name,
+                                iname,
+                                tname,
+                                ert.display_name(),
+                                art.display_name()
+                            ),
+                            span: impl_m.span,
+                            notes: vec![],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                    (Some(ert), None) => {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0502".into(),
+                            message: format!(
+                                "method `{}` in `impl {} for {}` must return `{}`",
+                                im.name,
+                                iname,
+                                tname,
+                                ert.display_name()
+                            ),
+                            span: impl_m.span,
+                            notes: vec![],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                    _ => {}
+                }
+
+                // Effect discipline: interface `pure` / `@no_heap_alloc` / `async` MUST be honored!
+                if expected.is_pure && !concrete_m.is_pure {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0503".into(),
+                        message: format!(
+                            "effect mismatch in `impl {} for {}`: interface method `{}` requires `pure`",
+                            iname, tname, im.name
+                        ),
+                        span: impl_m.span,
+                        notes: vec!["mark the implementation `pure fn`".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+                let iface_no_heap = expected.attrs.iter().any(|a| a.name == "no_heap_alloc");
+                let impl_no_heap = concrete_m.attrs.iter().any(|a| a.name == "no_heap_alloc");
+                if iface_no_heap && !impl_no_heap {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0503".into(),
+                        message: format!(
+                            "effect mismatch in `impl {} for {}`: interface method `{}` requires `@no_heap_alloc`",
+                            iname, tname, im.name
+                        ),
+                        span: impl_m.span,
+                        notes: vec!["annotate the implementation with `@no_heap_alloc`".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+                if expected.is_async != concrete_m.is_async {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0503".into(),
+                        message: format!(
+                            "effect mismatch in `impl {} for {}`: `async` modifier of `{}` does not match interface `{}`",
+                            iname, tname, im.name, iname
+                        ),
+                        span: impl_m.span,
+                        notes: vec![],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+
+                // Liskov behavioural subtyping: merge interface `requires` (available to impl)
+                // and interface `ensures` (MUST be proved by impl body via L0/L1 Z3!)
+                for req in &expected.requires {
+                    concrete_m.requires.push(req.clone());
+                }
+                for ens in &expected.ensures {
+                    concrete_m.ensures.push(ens.clone());
+                }
+                concrete_m.name = format!("{}::{}::{}", tname, iname, im.name);
+                let diag_before = self.diagnostics.len();
+                self.check_fn(&concrete_m);
+                if self.diagnostics.len() == diag_before {
+                    self.proofs.push(ProofRecord {
+                        obligation: format!("impl `{}` for `{}` satisfies `{}` contract", iname, tname, im.name),
+                        tier: ProofTier::L0Fast,
+                        span: impl_m.span,
+                    });
+                }
+            }
+        } else {
+            // Inherent `impl Target { ... }`
+            for m in &imp.methods {
+                let mut concrete_m = subst_fn_self(m, &imp.target_ty);
+                concrete_m.name = format!("{}::{}", tname, m.name);
+                self.check_fn(&concrete_m);
+            }
+        }
+
+        self.cur_type_params = prev_tp;
+        self.cur_type_param_bounds = prev_bounds;
     }
 
     fn resolve_base_type(&self, ty: &TypeExpr) -> TypeExpr {
@@ -319,10 +872,15 @@ impl CheckerCtx {
         match (&exp, &act) {
             (TypeExpr::Named { name: en, .. }, _) if en == "Any" => true,
             (_, TypeExpr::Named { name: an, .. }) if an == "Any" => true,
+            (TypeExpr::Dyn { interface: ei, .. }, TypeExpr::Dyn { interface: ai, .. }) => ei == ai,
+            (TypeExpr::Dyn { interface: ei, .. }, _) => self.type_implements(actual, ei),
             (
                 TypeExpr::Named { name: en, args: ea, .. },
                 TypeExpr::Named { name: an, args: aa, .. },
             ) => {
+                if self.cur_type_params.contains(en) || self.cur_type_params.contains(an) {
+                    return true;
+                }
                 if self.is_int_type_name(en) && self.is_int_type_name(an) {
                     return true;
                 }
@@ -430,6 +988,29 @@ impl CheckerCtx {
                     if let ExprKind::Ident(ename) = &target.kind {
                         if let Some(vi) = self.enum_variants.get(&format!("{}.{}", ename, field)) {
                             return named_ty(&vi.enum_name);
+                        }
+                        if !var_types.contains_key(ename) && self.is_known_type_name(ename) {
+                            if let Some(m) = self.resolve_assoc_method_sig(ename, field) {
+                                return m.ret_ty.unwrap_or_else(|| named_ty("Any"));
+                            }
+                        }
+                    }
+                    let recv_ty = self.infer_expr_type(target, var_types);
+                    if let Some(m) = self.resolve_method_sig(&recv_ty, field) {
+                        return m.ret_ty.unwrap_or_else(|| named_ty("Any"));
+                    }
+                    named_ty("Any")
+                }
+                ExprKind::GenericInst { expr: inner, type_args } => {
+                    if let ExprKind::Ident(fname) = &inner.kind {
+                        if let Some(fdecl) = self.all_fns.get(fname) {
+                            if let Some(rt) = &fdecl.ret_ty {
+                                let mut subst = BTreeMap::new();
+                                for (tp, ta) in fdecl.type_params.iter().zip(type_args.iter()) {
+                                    subst.insert(tp.clone(), ta.clone());
+                                }
+                                return subst_type_expr(rt, &subst);
+                            }
                         }
                     }
                     named_ty("Any")
@@ -568,6 +1149,15 @@ impl CheckerCtx {
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
+        let prev_tp = self.cur_type_params.clone();
+        let prev_bounds = self.cur_type_param_bounds.clone();
+        for tp in &f.type_params {
+            self.cur_type_params.insert(tp.clone());
+        }
+        for (k, v) in &f.type_param_bounds {
+            self.cur_type_param_bounds.insert(k.clone(), v.clone());
+        }
+
         let mut env = L0Env {
             pure_fns: self.pure_fns.clone(),
             type_aliases: self.type_aliases.clone(),
@@ -578,8 +1168,9 @@ impl CheckerCtx {
         let mut var_types: BTreeMap<String, TypeExpr> = BTreeMap::new();
         let mut mutable_vars: BTreeSet<String> = BTreeSet::new();
 
-        // 1. Register parameters, mutability, refinements & record invariants
+        // 1. Register parameters, mutability, dyn object-safety, refinements & record invariants
         for p in &f.params {
+            self.check_dyn_type_valid(&p.ty, p.span);
             var_types.insert(p.name.clone(), p.ty.clone());
             if p.is_inout {
                 mutable_vars.insert(p.name.clone());
@@ -597,6 +1188,9 @@ impl CheckerCtx {
                 subst.insert("self".into(), p.name.clone());
                 smt_premises.push((pred.clone(), subst));
             }
+        }
+        if let Some(rt) = &f.ret_ty {
+            self.check_dyn_type_valid(rt, f.span);
         }
 
         // 2. Assume function `requires`
@@ -660,6 +1254,8 @@ impl CheckerCtx {
                 self.check_ensures(f, ens, None, &env, &smt_int_vars, &smt_premises);
             }
         }
+        self.cur_type_params = prev_tp;
+        self.cur_type_param_bounds = prev_bounds;
     }
 
     fn check_block_effects(
@@ -1031,7 +1627,38 @@ impl CheckerCtx {
                     );
                     let inferred = self.infer_expr_type(value, var_types);
                     let effective_ty = if let Some(t) = ty {
-                        if !self.types_compatible(t, &inferred) {
+                        self.check_dyn_type_valid(t, *span);
+                        if let TypeExpr::Dyn { interface, .. } = t {
+                            if !self.type_implements(&inferred, interface) {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0505".into(),
+                                    message: format!(
+                                        "type `{}` does not implement interface `{}` required by `{}`",
+                                        inferred.display_name(),
+                                        interface,
+                                        t.display_name()
+                                    ),
+                                    span: *span,
+                                    notes: vec![format!("add `impl {} for {} {{ ... }}`", interface, inferred.display_name())],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            } else if !matches!(inferred, TypeExpr::Dyn { .. })
+                                && cur_fn.attrs.iter().any(|a| a.name == "no_heap_alloc")
+                            {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0701".into(),
+                                    message: format!(
+                                        "`@no_heap_alloc` contract violated in `{}`: boxing `{}` into `dyn {}` allocates",
+                                        cur_fn.name,
+                                        inferred.display_name(),
+                                        interface
+                                    ),
+                                    span: *span,
+                                    notes: vec!["use static generic parameter `[T Interface]` on `@no_heap_alloc` paths".into()],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                        } else if !self.types_compatible(t, &inferred) {
                             self.diagnostics.push(Diagnostic {
                                 code: "E0205".into(),
                                 message: format!(
@@ -1981,19 +2608,96 @@ impl CheckerCtx {
                         }
                     }
                     ExprKind::Field { target, field } => {
-                        if let ExprKind::Ident(ename) = &target.kind {
-                            if let Some(vi) =
-                                self.enum_variants.get(&format!("{}.{}", ename, field)).cloned()
-                            {
-                                if args.len() != vi.payload_tys.len() {
+                        let is_enum_ctor = matches!(&target.kind, ExprKind::Ident(ename)
+                            if self.enum_variants.contains_key(&format!("{}.{}", ename, field)));
+                        if is_enum_ctor {
+                            if let ExprKind::Ident(ename) = &target.kind {
+                                if let Some(vi) =
+                                    self.enum_variants.get(&format!("{}.{}", ename, field)).cloned()
+                                {
+                                    if args.len() != vi.payload_tys.len() {
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0202".into(),
+                                            message: format!(
+                                                "variant `{}.{}` expects {} argument(s), found {}",
+                                                ename,
+                                                field,
+                                                vi.payload_tys.len(),
+                                                args.len()
+                                            ),
+                                            span: expr.span,
+                                            notes: vec![],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    }
+                                }
+                            }
+                        } else if let ExprKind::Ident(tname) = &target.kind {
+                            if !var_types.contains_key(tname) && self.is_known_type_name(tname) {
+                                // Static associated call: `Type.method(args)` (e.g. `Order.from_json(v)`)
+                                if let Some(mdecl) = self.resolve_assoc_method_sig(tname, field) {
+                                    self.check_method_call_contract(
+                                        &format!("{}.{}", tname, field),
+                                        &mdecl,
+                                        None,
+                                        args,
+                                        cur_fn,
+                                        env,
+                                        smt_int_vars,
+                                        smt_premises,
+                                        var_types,
+                                        mutable_vars,
+                                        active_mutate,
+                                        expr.span,
+                                    );
+                                } else {
                                     self.diagnostics.push(Diagnostic {
-                                        code: "E0202".into(),
+                                        code: "E0207".into(),
                                         message: format!(
-                                            "variant `{}.{}` expects {} argument(s), found {}",
-                                            ename,
+                                            "unknown associated method `{}` on type `{}`",
+                                            field, tname
+                                        ),
+                                        span: expr.span,
+                                        notes: vec![],
+                                        counterexample: BTreeMap::new(),
+                                    });
+                                }
+                            } else {
+                                // Receiver method call on variable `target.field(args)`
+                                self.check_expr(
+                                    target,
+                                    cur_fn,
+                                    env,
+                                    smt_int_vars,
+                                    smt_premises,
+                                    var_types,
+                                    mutable_vars,
+                                    active_mutate,
+                                    saw_return,
+                                );
+                                let recv_ty = self.infer_expr_type(target, var_types);
+                                if let Some(mdecl) = self.resolve_method_sig(&recv_ty, field) {
+                                    self.check_method_call_contract(
+                                        &format!("{}.{}", recv_ty.display_name(), field),
+                                        &mdecl,
+                                        Some(target),
+                                        args,
+                                        cur_fn,
+                                        env,
+                                        smt_int_vars,
+                                        smt_premises,
+                                        var_types,
+                                        mutable_vars,
+                                        active_mutate,
+                                        expr.span,
+                                    );
+                                } else if recv_ty.display_name() != "Any" {
+                                    self.diagnostics.push(Diagnostic {
+                                        code: "E0207".into(),
+                                        message: format!(
+                                            "unknown method `{}` on type `{}`",
                                             field,
-                                            vi.payload_tys.len(),
-                                            args.len()
+                                            recv_ty.display_name()
                                         ),
                                         span: expr.span,
                                         notes: vec![],
@@ -2001,10 +2705,134 @@ impl CheckerCtx {
                                     });
                                 }
                             }
+                        } else {
+                            // Receiver method call on arbitrary expression `(expr).field(args)`
+                            self.check_expr(
+                                target,
+                                cur_fn,
+                                env,
+                                smt_int_vars,
+                                smt_premises,
+                                var_types,
+                                mutable_vars,
+                                active_mutate,
+                                saw_return,
+                            );
+                            let recv_ty = self.infer_expr_type(target, var_types);
+                            if let Some(mdecl) = self.resolve_method_sig(&recv_ty, field) {
+                                self.check_method_call_contract(
+                                    &format!("{}.{}", recv_ty.display_name(), field),
+                                    &mdecl,
+                                    Some(target),
+                                    args,
+                                    cur_fn,
+                                    env,
+                                    smt_int_vars,
+                                    smt_premises,
+                                    var_types,
+                                    mutable_vars,
+                                    active_mutate,
+                                    expr.span,
+                                );
+                            } else if recv_ty.display_name() != "Any" {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0207".into(),
+                                    message: format!(
+                                        "unknown method `{}` on type `{}`",
+                                        field,
+                                        recv_ty.display_name()
+                                    ),
+                                    span: expr.span,
+                                    notes: vec![],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                        }
+                    }
+                    ExprKind::GenericInst { expr: inner, type_args } => {
+                        if let ExprKind::Ident(fname) = &inner.kind {
+                            if let Some(fdecl) = self.all_fns.get(fname).cloned() {
+                                let mut tsubst = BTreeMap::new();
+                                for (tp, ta) in fdecl.type_params.iter().zip(type_args.iter()) {
+                                    tsubst.insert(tp.clone(), ta.clone());
+                                    if let Some(bounds) = fdecl.type_param_bounds.get(tp) {
+                                        for b in bounds {
+                                            if !self.type_implements(ta, b) {
+                                                self.diagnostics.push(Diagnostic {
+                                                    code: "E0505".into(),
+                                                    message: format!(
+                                                        "type `{}` does not satisfy interface bound `{}` for type parameter `{}` of `{}`",
+                                                        ta.display_name(),
+                                                        b,
+                                                        tp,
+                                                        fname
+                                                    ),
+                                                    span: expr.span,
+                                                    notes: vec![format!("add `impl {} for {} {{ ... }}`", b, ta.display_name())],
+                                                    counterexample: BTreeMap::new(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut inst_fn = fdecl.clone();
+                                for p in &mut inst_fn.params {
+                                    p.ty = subst_type_expr(&p.ty, &tsubst);
+                                }
+                                if let Some(rt) = &inst_fn.ret_ty {
+                                    inst_fn.ret_ty = Some(subst_type_expr(rt, &tsubst));
+                                }
+                                self.check_method_call_contract(
+                                    fname,
+                                    &inst_fn,
+                                    None,
+                                    args,
+                                    cur_fn,
+                                    env,
+                                    smt_int_vars,
+                                    smt_premises,
+                                    var_types,
+                                    mutable_vars,
+                                    active_mutate,
+                                    expr.span,
+                                );
+                            }
                         }
                     }
                     ExprKind::Ident(fname) => {
                         if let Some(fdecl) = self.all_fns.get(fname).cloned() {
+                            // Infer generic type parameter bindings & verify interface bounds `[T Tool]`!
+                            let mut inferred_tp: BTreeMap<String, TypeExpr> = BTreeMap::new();
+                            if !fdecl.type_params.is_empty() {
+                                for (p, a) in fdecl.params.iter().zip(args.iter()) {
+                                    if let TypeExpr::Named { name: pname, args: pargs, .. } = &p.ty {
+                                        if pargs.is_empty() && fdecl.type_params.contains(pname) {
+                                            let aty = self.infer_expr_type(&a.value, var_types);
+                                            inferred_tp.entry(pname.clone()).or_insert(aty);
+                                        }
+                                    }
+                                }
+                                for (tp, concrete_ty) in &inferred_tp {
+                                    if let Some(bounds) = fdecl.type_param_bounds.get(tp) {
+                                        for b in bounds {
+                                            if !self.type_implements(concrete_ty, b) {
+                                                self.diagnostics.push(Diagnostic {
+                                                    code: "E0505".into(),
+                                                    message: format!(
+                                                        "type `{}` does not implement interface `{}` required by `{}`",
+                                                        concrete_ty.display_name(),
+                                                        b,
+                                                        fname
+                                                    ),
+                                                    span: expr.span,
+                                                    notes: vec![format!("add `impl {} for {} {{ ... }}`", b, concrete_ty.display_name())],
+                                                    counterexample: BTreeMap::new(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if args.len() != fdecl.params.len() {
                                 self.diagnostics.push(Diagnostic {
                                     code: "E0202".into(),
@@ -2024,15 +2852,51 @@ impl CheckerCtx {
                             let mut mutated_inout_targets: Vec<(String, TypeExpr)> = Vec::new();
                             for (p, a) in fdecl.params.iter().zip(args.iter()) {
                                 param_arg_map.insert(p.name.clone(), a.value.clone());
+                                let expected_pty = if inferred_tp.is_empty() {
+                                    p.ty.clone()
+                                } else {
+                                    subst_type_expr(&p.ty, &inferred_tp)
+                                };
                                 let actual_ty = self.infer_expr_type(&a.value, var_types);
-                                if !self.types_compatible(&p.ty, &actual_ty) {
+                                if let TypeExpr::Dyn { interface, .. } = &expected_pty {
+                                    if !self.type_implements(&actual_ty, interface) {
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0505".into(),
+                                            message: format!(
+                                                "argument `{}` of `{}`: type `{}` does not implement interface `{}`",
+                                                p.name,
+                                                fname,
+                                                actual_ty.display_name(),
+                                                interface
+                                            ),
+                                            span: a.value.span,
+                                            notes: vec![format!("add `impl {} for {} {{ ... }}`", interface, actual_ty.display_name())],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    } else if !matches!(actual_ty, TypeExpr::Dyn { .. })
+                                        && cur_fn.attrs.iter().any(|at| at.name == "no_heap_alloc")
+                                    {
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0701".into(),
+                                            message: format!(
+                                                "`@no_heap_alloc` contract violated in `{}`: boxing `{}` into `dyn {}` allocates",
+                                                cur_fn.name,
+                                                actual_ty.display_name(),
+                                                interface
+                                            ),
+                                            span: a.value.span,
+                                            notes: vec![],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    }
+                                } else if !self.types_compatible(&expected_pty, &actual_ty) {
                                     self.diagnostics.push(Diagnostic {
                                         code: "E0205".into(),
                                         message: format!(
                                             "type mismatch for argument `{}` of `{}`: expected `{}`, found `{}`",
                                             p.name,
                                             fname,
-                                            p.ty.display_name(),
+                                            expected_pty.display_name(),
                                             actual_ty.display_name()
                                         ),
                                         span: a.value.span,
@@ -2162,6 +3026,31 @@ impl CheckerCtx {
                                 }
                             }
                         } else if let Some(b) = lookup_builtin(fname) {
+                            if fname == "push" && args.len() == 2 {
+                                let list_ty = self.resolve_base_type(&self.infer_expr_type(&args[0].value, var_types));
+                                if let TypeExpr::Named { name: ln, args: la, .. } = list_ty {
+                                    if ln == "List" && la.len() == 1 {
+                                        let item_ty = self.infer_expr_type(&args[1].value, var_types);
+                                        if let TypeExpr::Dyn { interface, .. } = &la[0] {
+                                            if !self.type_implements(&item_ty, interface) {
+                                                self.diagnostics.push(Diagnostic {
+                                                    code: "E0505".into(),
+                                                    message: format!(
+                                                        "cannot push `{}` into `List[dyn {}]`: `{}` does not implement `{}`",
+                                                        item_ty.display_name(),
+                                                        interface,
+                                                        item_ty.display_name(),
+                                                        interface
+                                                    ),
+                                                    span: args[1].value.span,
+                                                    notes: vec![format!("add `impl {} for {} {{ ... }}`", interface, item_ty.display_name())],
+                                                    counterexample: BTreeMap::new(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if args.len() != b.arity {
                                 self.diagnostics.push(Diagnostic {
                                     code: "E0202".into(),
@@ -2733,6 +3622,197 @@ impl CheckerCtx {
                     }
                 }
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_method_call_contract(
+        &mut self,
+        label: &str,
+        mdecl: &FnDecl,
+        recv: Option<&Expr>,
+        args: &[CallArg],
+        cur_fn: &FnDecl,
+        env: &mut L0Env,
+        smt_int_vars: &mut BTreeSet<String>,
+        smt_premises: &mut Vec<(Expr, BTreeMap<String, String>)>,
+        var_types: &BTreeMap<String, TypeExpr>,
+        mutable_vars: &BTreeSet<String>,
+        active_mutate: &Option<String>,
+        span: Span,
+    ) {
+        if cur_fn.is_pure && !mdecl.is_pure {
+            self.diagnostics.push(Diagnostic {
+                code: "E0610".into(),
+                message: format!(
+                    "purity violation: `pure fn {}` cannot call non-pure method `{}`",
+                    cur_fn.name, label
+                ),
+                span,
+                notes: vec![],
+                counterexample: BTreeMap::new(),
+            });
+        }
+        if cur_fn.attrs.iter().any(|a| a.name == "no_heap_alloc")
+            && !mdecl.attrs.iter().any(|a| a.name == "no_heap_alloc")
+        {
+            self.diagnostics.push(Diagnostic {
+                code: "E0701".into(),
+                message: format!(
+                    "`@no_heap_alloc` contract violated in `{}`: method `{}` is not `@no_heap_alloc`",
+                    cur_fn.name, label
+                ),
+                span,
+                notes: vec![],
+                counterexample: BTreeMap::new(),
+            });
+        }
+
+        let has_self = recv.is_some() && mdecl.params.first().is_some_and(|p| p.name == "self");
+        let explicit_params = if has_self {
+            &mdecl.params[1..]
+        } else {
+            &mdecl.params[..]
+        };
+
+        if has_self {
+            if let Some(r_expr) = recv {
+                if mdecl.params[0].is_inout {
+                    if let ExprKind::Ident(v) = &r_expr.kind {
+                        if !mutable_vars.contains(v) && var_types.contains_key(v) {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0203".into(),
+                                message: format!(
+                                    "cannot call `inout self` method `{}` on immutable binding `{}`",
+                                    label, v
+                                ),
+                                span: r_expr.span,
+                                notes: vec![format!("declare `{}` with `var`", v)],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if args.len() != explicit_params.len() {
+            self.diagnostics.push(Diagnostic {
+                code: "E0202".into(),
+                message: format!(
+                    "method `{}` expects {} argument(s), found {}",
+                    label,
+                    explicit_params.len(),
+                    args.len()
+                ),
+                span,
+                notes: vec![],
+                counterexample: BTreeMap::new(),
+            });
+        }
+
+        let mut param_arg_map: BTreeMap<String, Expr> = BTreeMap::new();
+        if let Some(r_expr) = recv {
+            param_arg_map.insert("self".into(), r_expr.clone());
+        }
+        for (p, a) in explicit_params.iter().zip(args.iter()) {
+            param_arg_map.insert(p.name.clone(), a.value.clone());
+            let actual_ty = self.infer_expr_type(&a.value, var_types);
+            if let TypeExpr::Dyn { interface, .. } = &p.ty {
+                if !self.type_implements(&actual_ty, interface) {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0505".into(),
+                        message: format!(
+                            "argument `{}` of `{}`: type `{}` does not implement interface `{}`",
+                            p.name,
+                            label,
+                            actual_ty.display_name(),
+                            interface
+                        ),
+                        span: a.value.span,
+                        notes: vec![],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+            } else if !self.types_compatible(&p.ty, &actual_ty) {
+                self.diagnostics.push(Diagnostic {
+                    code: "E0205".into(),
+                    message: format!(
+                        "type mismatch for argument `{}` of `{}`: expected `{}`, found `{}`",
+                        p.name,
+                        label,
+                        p.ty.display_name(),
+                        actual_ty.display_name()
+                    ),
+                    span: a.value.span,
+                    notes: vec![],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+            if p.is_inout {
+                if let ExprKind::Ident(v) = &a.value.kind {
+                    if active_mutate.as_deref() == Some(v.as_str()) {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0502".into(),
+                            message: format!(
+                                "cannot pass `{}` (currently unsealed inside `mutate {}`) to `{}`",
+                                v, v, label
+                            ),
+                            span: a.value.span,
+                            notes: vec![],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                    if !mutable_vars.contains(v) && var_types.contains_key(v) {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0203".into(),
+                            message: format!(
+                                "cannot pass immutable binding `{}` to `inout` parameter `{}` of `{}`",
+                                v, p.name, label
+                            ),
+                            span: a.value.span,
+                            notes: vec![format!("declare `{}` with `var`", v)],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                }
+            }
+            self.check_expr_satisfies_type(
+                &a.value,
+                &p.ty,
+                env,
+                smt_int_vars,
+                smt_premises,
+                &format!("argument `{}` of `{}`", p.name, label),
+                a.value.span,
+            );
+            if let Some(pred) = &p.predicate {
+                self.check_predicate_obligation(
+                    pred,
+                    Some(&a.value),
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    &format!("parameter `{}` predicate of `{}`", p.name, label),
+                    "E0440",
+                    "E0441",
+                    a.value.span,
+                );
+            }
+        }
+        for req in &mdecl.requires {
+            let instantiated = substitute_expr_idents(req, &param_arg_map);
+            self.check_predicate_obligation(
+                &instantiated,
+                None,
+                env,
+                smt_int_vars,
+                smt_premises,
+                &format!("precondition `requires` of `{}`", label),
+                "E0440",
+                "E0441",
+                span,
+            );
         }
     }
 

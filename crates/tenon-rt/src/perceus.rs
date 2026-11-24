@@ -8,6 +8,7 @@ pub const TAG_SOME: i64 = 3;
 pub const TAG_LIST: i64 = 4;
 pub const TAG_TEXT: i64 = 5;
 pub const TAG_ASYNC_FRAME: i64 = 6;
+pub const TAG_DYN: i64 = 7;
 pub const TAG_RECORD_BASE: i64 = 100;
 /// Sentinel `rc_mask` meaning EVERY element in `0..len` is an RC pointer (used for `List[T]` of RC `T`).
 pub const RC_MASK_ALL: u64 = u64::MAX;
@@ -268,6 +269,20 @@ pub extern "C" fn tenon_rc_set_field(ptr: i64, idx: i64, val: i64) {
             if is_rc && old != 0 {
                 tenon_rc_dec(old);
             }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_rc_set_field_raw(ptr: i64, idx: i64, val: i64) {
+    if ptr == 0 || idx < 0 {
+        return;
+    }
+    unsafe {
+        let hdr = ptr as *mut ObjHeader;
+        let i = idx as usize;
+        if i < (*hdr).len {
+            *fields_ptr(hdr).add(i) = val;
         }
     }
 }

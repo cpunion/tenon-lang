@@ -9,11 +9,16 @@ pub enum TokenKind {
 
     // Keywords
     Import,
+    As,
     Pub,
     Type,
     Distinct,
     Record,
     Enum,
+    Interface,
+    Impl,
+    For,
+    Dyn,
     Fn,
     Pure,
     Async,
@@ -259,11 +264,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 let word = &src[start..i];
                 let kind = match word {
                     "import" => TokenKind::Import,
+                    "as" => TokenKind::As,
                     "pub" => TokenKind::Pub,
                     "type" => TokenKind::Type,
                     "distinct" => TokenKind::Distinct,
                     "record" => TokenKind::Record,
                     "enum" => TokenKind::Enum,
+                    "interface" => TokenKind::Interface,
+                    "impl" => TokenKind::Impl,
+                    "for" => TokenKind::For,
+                    "dyn" => TokenKind::Dyn,
                     "fn" => TokenKind::Fn,
                     "pure" => TokenKind::Pure,
                     "async" => TokenKind::Async,

@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::lexer::{Token, TokenKind, lex};
 use crate::span::{ParseError, Span};
+use std::collections::BTreeMap;
 
 pub fn parse(src: &str) -> Result<Program, ParseError> {
     let tokens = lex(src)?;
@@ -214,9 +215,19 @@ impl Parser {
             let tok = self.peek().clone();
             if let TokenKind::Str(path) = tok.kind {
                 self.bump();
+                let mut end = tok.span;
+                let alias = if self.peek().kind == TokenKind::As {
+                    self.bump();
+                    let (a, aspan) = self.expect_ident()?;
+                    end = aspan;
+                    Some(a)
+                } else {
+                    None
+                };
                 return Ok(Item::Import {
                     path,
-                    span: start.merge(tok.span),
+                    alias,
+                    span: start.merge(end),
                 });
             }
             return Err(ParseError {
@@ -232,6 +243,8 @@ impl Parser {
             }
             TokenKind::Record => Ok(Item::Record(self.parse_record(attrs, is_pub)?)),
             TokenKind::Enum => Ok(Item::Enum(self.parse_enum(attrs, is_pub)?)),
+            TokenKind::Interface => Ok(Item::Interface(self.parse_interface(attrs, is_pub)?)),
+            TokenKind::Impl => Ok(Item::Impl(self.parse_impl(attrs)?)),
             TokenKind::Pure | TokenKind::Async | TokenKind::Test | TokenKind::Fn => {
                 Ok(Item::Fn(self.parse_fn(attrs, is_pub)?))
             }
@@ -251,7 +264,14 @@ impl Parser {
     }
 
     fn parse_type_params(&mut self) -> Result<Vec<String>, ParseError> {
+        Ok(self.parse_type_params_with_bounds()?.0)
+    }
+
+    fn parse_type_params_with_bounds(
+        &mut self,
+    ) -> Result<(Vec<String>, BTreeMap<String, Vec<String>>), ParseError> {
         let mut params = Vec::new();
+        let mut bounds: BTreeMap<String, Vec<String>> = BTreeMap::new();
         if self.peek().kind == TokenKind::LBracket {
             self.bump();
             loop {
@@ -260,14 +280,22 @@ impl Parser {
                     self.bump();
                     break;
                 }
-                let _ = self.eat(&TokenKind::Comptime);
+                let is_comptime = self.eat(&TokenKind::Comptime);
                 let (name, _) = self.expect_ident()?;
-                // Optional bound or type annotation (e.g. `T IntLike` or `comptime N USize where ...`)
+                // Optional bound(s) e.g. `T Tool` or `K Hash + Eq` or `comptime N USize where ...`
                 if !matches!(
                     self.peek_non_nl().kind,
                     TokenKind::Comma | TokenKind::RBracket
                 ) {
-                    let _ = self.parse_type_expr()?;
+                    let first_bound = self.parse_type_expr()?;
+                    if !is_comptime {
+                        let mut bvec = vec![first_bound.display_name()];
+                        while self.eat(&TokenKind::Plus) {
+                            let next_b = self.parse_type_expr()?;
+                            bvec.push(next_b.display_name());
+                        }
+                        bounds.insert(name.clone(), bvec);
+                    }
                     if self.eat(&TokenKind::Where) {
                         let _ = self.parse_expr()?;
                     }
@@ -279,7 +307,169 @@ impl Parser {
                 }
             }
         }
-        Ok(params)
+        Ok((params, bounds))
+    }
+
+    fn parse_interface(
+        &mut self,
+        attrs: Vec<Attr>,
+        is_pub: bool,
+    ) -> Result<InterfaceDecl, ParseError> {
+        let start = self.expect(TokenKind::Interface)?.span;
+        let (name, _) = self.expect_ident()?;
+        let (type_params, type_param_bounds) = self.parse_type_params_with_bounds()?;
+        self.expect(TokenKind::LBrace)?;
+        let mut assoc_types = Vec::new();
+        let mut methods = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.peek().kind == TokenKind::RBrace {
+                let end = self.bump().span;
+                return Ok(InterfaceDecl {
+                    attrs,
+                    is_pub,
+                    name,
+                    type_params,
+                    type_param_bounds,
+                    assoc_types,
+                    methods,
+                    span: start.merge(end),
+                });
+            }
+            let mattrs = self.parse_attrs()?;
+            self.skip_newlines();
+            if self.peek().kind == TokenKind::Type {
+                self.bump();
+                let (aname, _) = self.expect_ident()?;
+                assoc_types.push(aname);
+                self.eat_sep();
+                continue;
+            }
+            let _mpub = self.eat(&TokenKind::Pub);
+            let mstart = self.peek().span;
+            let mut is_pure = false;
+            let mut is_async = false;
+            loop {
+                self.skip_newlines();
+                match self.peek().kind {
+                    TokenKind::Pure => {
+                        self.bump();
+                        is_pure = true;
+                    }
+                    TokenKind::Async => {
+                        self.bump();
+                        is_async = true;
+                    }
+                    _ => break,
+                }
+            }
+            self.expect(TokenKind::Fn)?;
+            let (mname, mname_span) = self.expect_ident()?;
+            let (mtype_params, mtype_param_bounds) = self.parse_type_params_with_bounds()?;
+            let params = self.parse_params()?;
+            // Return type on the same line before newline/brace/requires/ensures
+            let ret_ty = if !matches!(
+                self.peek().kind,
+                TokenKind::Newline
+                    | TokenKind::Semi
+                    | TokenKind::LBrace
+                    | TokenKind::RBrace
+                    | TokenKind::Requires
+                    | TokenKind::Ensures
+            ) {
+                Some(self.parse_type_expr()?)
+            } else {
+                None
+            };
+            let mut requires = Vec::new();
+            let mut ensures = Vec::new();
+            loop {
+                let saved = self.pos;
+                self.skip_newlines();
+                if self.peek().kind == TokenKind::Requires {
+                    self.bump();
+                    requires.push(self.parse_expr()?);
+                } else if self.peek().kind == TokenKind::Ensures {
+                    self.bump();
+                    ensures.push(self.parse_expr()?);
+                } else {
+                    self.pos = saved;
+                    break;
+                }
+            }
+            let saved_b = self.pos;
+            self.skip_newlines();
+            let default_body = if self.peek().kind == TokenKind::LBrace {
+                Some(self.parse_block()?)
+            } else {
+                self.pos = saved_b;
+                None
+            };
+            let mend = default_body
+                .as_ref()
+                .map(|b| b.span)
+                .unwrap_or(mname_span);
+            methods.push(InterfaceMethodDecl {
+                attrs: mattrs,
+                is_pure,
+                is_async,
+                name: mname,
+                type_params: mtype_params,
+                type_param_bounds: mtype_param_bounds,
+                params,
+                ret_ty,
+                requires,
+                ensures,
+                default_body,
+                span: mstart.merge(mend),
+            });
+            self.eat_sep();
+        }
+    }
+
+    fn parse_impl(&mut self, attrs: Vec<Attr>) -> Result<ImplDecl, ParseError> {
+        let start = self.expect(TokenKind::Impl)?.span;
+        let (type_params, type_param_bounds) = self.parse_type_params_with_bounds()?;
+        let first_ty = self.parse_type_expr()?;
+        let (interface, target_ty) = if self.eat(&TokenKind::For) {
+            let target = self.parse_type_expr()?;
+            (Some(first_ty), target)
+        } else {
+            (None, first_ty)
+        };
+        self.expect(TokenKind::LBrace)?;
+        let mut assoc_bindings = Vec::new();
+        let mut methods = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.peek().kind == TokenKind::RBrace {
+                let end = self.bump().span;
+                return Ok(ImplDecl {
+                    attrs,
+                    type_params,
+                    type_param_bounds,
+                    interface,
+                    target_ty,
+                    assoc_bindings,
+                    methods,
+                    span: start.merge(end),
+                });
+            }
+            let mattrs = self.parse_attrs()?;
+            self.skip_newlines();
+            if self.peek().kind == TokenKind::Type {
+                self.bump();
+                let (aname, _) = self.expect_ident()?;
+                self.expect(TokenKind::Eq)?;
+                let aty = self.parse_type_expr()?;
+                assoc_bindings.push((aname, aty));
+                self.eat_sep();
+                continue;
+            }
+            let mpub = self.eat(&TokenKind::Pub);
+            methods.push(self.parse_fn(mattrs, mpub)?);
+            self.eat_sep();
+        }
     }
 
     fn parse_type_alias(
@@ -552,7 +742,7 @@ impl Parser {
         }
         self.expect(TokenKind::Fn)?;
         let (name, _) = self.expect_ident()?;
-        let type_params = self.parse_type_params()?;
+        let (type_params, type_param_bounds) = self.parse_type_params_with_bounds()?;
         let params = self.parse_params()?;
         // Optional return type before `{`, `requires`, `ensures`, `retain`, `allow_loss`
         let ret_ty = if !matches!(
@@ -591,6 +781,7 @@ impl Parser {
             is_test,
             name,
             type_params,
+            type_param_bounds,
             params,
             ret_ty,
             requires,
@@ -765,6 +956,7 @@ impl Parser {
                 is_test: false,
                 name: mname.clone(),
                 type_params: Vec::new(),
+                type_param_bounds: BTreeMap::new(),
                 params,
                 ret_ty,
                 requires: Vec::new(),
@@ -1291,6 +1483,32 @@ impl Parser {
 
     fn parse_type_expr(&mut self) -> Result<TypeExpr, ParseError> {
         self.skip_newlines();
+        if self.peek().kind == TokenKind::Dyn {
+            let start = self.bump().span;
+            let (interface, ispan) = self.expect_ident()?;
+            let mut end = ispan;
+            let mut args = Vec::new();
+            if self.peek().kind == TokenKind::LBracket {
+                self.bump();
+                loop {
+                    self.skip_newlines();
+                    if self.peek().kind == TokenKind::RBracket {
+                        end = self.bump().span;
+                        break;
+                    }
+                    args.push(self.parse_type_expr()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        end = self.expect(TokenKind::RBracket)?.span;
+                        break;
+                    }
+                }
+            }
+            return Ok(TypeExpr::Dyn {
+                interface,
+                args,
+                span: start.merge(end),
+            });
+        }
         if self.peek().kind == TokenKind::LParen {
             let start = self.bump().span;
             let mut elems = Vec::new();
@@ -1794,17 +2012,59 @@ impl Parser {
                     };
                 }
                 TokenKind::LBracket => {
+                    // Disambiguate generic call instantiation `decode[Order](raw)` vs indexing `arr[i]`
+                    // by speculatively parsing `[TypeExpr, ...]` ONLY when immediately followed by `(`.
+                    let saved = self.pos;
                     self.bump();
-                    let idx = self.parse_expr()?;
-                    let end = self.expect(TokenKind::RBracket)?.span;
-                    let span = expr.span.merge(end);
-                    expr = Expr {
-                        kind: ExprKind::Index {
-                            target: Box::new(expr),
-                            index: Box::new(idx),
-                        },
-                        span,
-                    };
+                    let mut parsed_type_args = Vec::new();
+                    let mut ok_generic = false;
+                    let mut generic_end = expr.span;
+                    if self.peek().kind != TokenKind::RBracket {
+                        let mut valid = true;
+                        loop {
+                            match self.parse_type_expr() {
+                                Ok(t) => parsed_type_args.push(t),
+                                Err(_) => {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            if !self.eat(&TokenKind::Comma) {
+                                if self.peek().kind == TokenKind::RBracket {
+                                    generic_end = self.bump().span;
+                                } else {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                        }
+                        if valid && self.peek().kind == TokenKind::LParen {
+                            ok_generic = true;
+                        }
+                    }
+                    if ok_generic {
+                        let span = expr.span.merge(generic_end);
+                        expr = Expr {
+                            kind: ExprKind::GenericInst {
+                                expr: Box::new(expr),
+                                type_args: parsed_type_args,
+                            },
+                            span,
+                        };
+                    } else {
+                        self.pos = saved;
+                        self.bump();
+                        let idx = self.parse_expr()?;
+                        let end = self.expect(TokenKind::RBracket)?.span;
+                        let span = expr.span.merge(end);
+                        expr = Expr {
+                            kind: ExprKind::Index {
+                                target: Box::new(expr),
+                                index: Box::new(idx),
+                            },
+                            span,
+                        };
+                    }
                 }
                 _ => break,
             }

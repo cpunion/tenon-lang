@@ -1,5 +1,6 @@
 use crate::span::Span;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Program {
@@ -21,10 +22,17 @@ pub struct AttrArg {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Item {
-    Import { path: String, span: Span },
+    Import {
+        path: String,
+        #[serde(default)]
+        alias: Option<String>,
+        span: Span,
+    },
     TypeAlias(TypeAliasDecl),
     Record(RecordDecl),
     Enum(EnumDecl),
+    Interface(InterfaceDecl),
+    Impl(ImplDecl),
     Fn(FnDecl),
     Evolution(EvolutionDecl),
     LockLattice(LockLatticeDecl),
@@ -32,6 +40,50 @@ pub enum Item {
     Stream(StreamDecl),
     View(ViewDecl),
     Subscriber(SubscriberDecl),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InterfaceDecl {
+    pub attrs: Vec<Attr>,
+    pub is_pub: bool,
+    pub name: String,
+    pub type_params: Vec<String>,
+    #[serde(default)]
+    pub type_param_bounds: BTreeMap<String, Vec<String>>,
+    pub assoc_types: Vec<String>,
+    pub methods: Vec<InterfaceMethodDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InterfaceMethodDecl {
+    pub attrs: Vec<Attr>,
+    pub is_pure: bool,
+    pub is_async: bool,
+    pub name: String,
+    pub type_params: Vec<String>,
+    #[serde(default)]
+    pub type_param_bounds: BTreeMap<String, Vec<String>>,
+    pub params: Vec<ParamDecl>,
+    pub ret_ty: Option<TypeExpr>,
+    pub requires: Vec<Expr>,
+    pub ensures: Vec<Expr>,
+    pub default_body: Option<Block>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImplDecl {
+    pub attrs: Vec<Attr>,
+    pub type_params: Vec<String>,
+    #[serde(default)]
+    pub type_param_bounds: BTreeMap<String, Vec<String>>,
+    /// `None` for inherent `impl Target { ... }`, `Some(Iface)` for `impl Iface for Target { ... }`.
+    pub interface: Option<TypeExpr>,
+    pub target_ty: TypeExpr,
+    pub assoc_bindings: Vec<(String, TypeExpr)>,
+    pub methods: Vec<FnDecl>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,6 +149,8 @@ pub struct FnDecl {
     pub is_test: bool,
     pub name: String,
     pub type_params: Vec<String>,
+    #[serde(default)]
+    pub type_param_bounds: BTreeMap<String, Vec<String>>,
     pub params: Vec<ParamDecl>,
     pub ret_ty: Option<TypeExpr>,
     pub requires: Vec<Expr>,
@@ -225,6 +279,11 @@ pub enum TypeExpr {
         args: Vec<TypeExpr>,
         span: Span,
     },
+    Dyn {
+        interface: String,
+        args: Vec<TypeExpr>,
+        span: Span,
+    },
     Tuple(Vec<TypeExpr>, Span),
 }
 
@@ -242,6 +301,22 @@ impl TypeExpr {
                     out.push('@');
                     out.push_str(v);
                 }
+                if !args.is_empty() {
+                    out.push('[');
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push_str(&a.display_name());
+                    }
+                    out.push(']');
+                }
+                out
+            }
+            TypeExpr::Dyn {
+                interface, args, ..
+            } => {
+                let mut out = format!("dyn {}", interface);
                 if !args.is_empty() {
                     out.push('[');
                     for (i, a) in args.iter().enumerate() {
@@ -347,6 +422,10 @@ pub enum ExprKind {
     Call {
         callee: Box<Expr>,
         args: Vec<CallArg>,
+    },
+    GenericInst {
+        expr: Box<Expr>,
+        type_args: Vec<TypeExpr>,
     },
     Field {
         target: Box<Expr>,

@@ -164,6 +164,7 @@ fn compare_record_versions(
     }
 
     let mut added_optional = Vec::new();
+    let mut breaking_schema_changes = Vec::new();
     let mut notes = Vec::new();
 
     for (slot, f2) in &f2_map {
@@ -171,14 +172,49 @@ fn compare_record_versions(
             if f2.default.is_some() || f2.ty.display_name().starts_with("Option[") {
                 added_optional.push(f2.name.clone());
                 notes.push(format!(
-                    "field `{}` (id `{}`) added with default/Option: backward-compatible, mark `retain_on_downgrade`",
-                    f2.name, slot
+                    "field `{}` added with default/Option: backward-compatible, mark `retain_on_downgrade`",
+                    f2.name
                 ));
             } else {
-                notes.push(format!(
-                    "field `{}` (id `{}`) added as required without default: breaking upgrade",
-                    f2.name, slot
+                breaking_schema_changes.push(format!(
+                    "field `{}` added as required without default",
+                    f2.name
                 ));
+                notes.push(format!(
+                    "field `{}` added as required without default: breaking upgrade (requires evolution lens)",
+                    f2.name
+                ));
+            }
+        }
+    }
+
+    // Check removed fields and cross-version field base-type changes (e.g., Text -> Int64)
+    for (slot, f1) in &f1_map {
+        match f2_map.get(slot) {
+            None => {
+                breaking_schema_changes.push(format!("field `{}` removed in v2", f1.name));
+                notes.push(format!(
+                    "field `{}` removed in v2: breaking schema change (requires evolution lens)",
+                    f1.name
+                ));
+            }
+            Some(f2) => {
+                let t1 = normalize_base_type_name(&f1.ty.display_name(), v1_aliases);
+                let t2 = normalize_base_type_name(&f2.ty.display_name(), v2_aliases);
+                if t1 != t2 {
+                    breaking_schema_changes.push(format!(
+                        "field `{}` changed type from `{}` to `{}`",
+                        f1.name,
+                        f1.ty.display_name(),
+                        f2.ty.display_name()
+                    ));
+                    notes.push(format!(
+                        "field `{}` changed type from `{}` to `{}` between versions: requires verified `evolution` lens",
+                        f1.name,
+                        f1.ty.display_name(),
+                        f2.ty.display_name()
+                    ));
+                }
             }
         }
     }
@@ -244,39 +280,46 @@ fn compare_record_versions(
     q_down.goal = p1.clone();
     let down_res = q_down.solve();
 
-    let upgrade_safe = matches!(up_res, SmtOutcome::Proved);
-    let downgrade_safe = matches!(down_res, SmtOutcome::Proved) && added_optional.is_empty();
+    let upgrade_safe = matches!(up_res, SmtOutcome::Proved) && breaking_schema_changes.is_empty();
+    let downgrade_safe = matches!(down_res, SmtOutcome::Proved)
+        && added_optional.is_empty()
+        && breaking_schema_changes.is_empty();
 
     let mut counterexample = BTreeMap::new();
     let mut residual_domain = None;
 
-    let verdict = match (&up_res, &down_res) {
-        (SmtOutcome::Proved, SmtOutcome::Proved) if added_optional.is_empty() => {
-            notes.push("SMT proved P_v1 <=> P_v2: zero-downtime HotfixCompatible".into());
-            CompatVerdict::HotfixCompatible
-        }
-        (SmtOutcome::Proved, _) => {
-            if let SmtOutcome::Counterexample(ce) = down_res {
-                counterexample = ce;
-                notes.push("upgrade is safe (P_v1 => P_v2), but downgrade/rolling old-reads-new has counterexample".into());
+    let verdict = if !breaking_schema_changes.is_empty() {
+        residual_domain = Some(breaking_schema_changes.join("; "));
+        CompatVerdict::DivergentBreaking
+    } else {
+        match (&up_res, &down_res) {
+            (SmtOutcome::Proved, SmtOutcome::Proved) if added_optional.is_empty() => {
+                notes.push("SMT proved P_v1 <=> P_v2: zero-downtime HotfixCompatible".into());
+                CompatVerdict::HotfixCompatible
             }
-            CompatVerdict::WideningBackwardSafe
-        }
-        (SmtOutcome::Counterexample(ce), SmtOutcome::Proved) => {
-            counterexample = ce.clone();
-            residual_domain = Some(format!("(and {} (not {}))", p1, p2));
-            notes.push("BREAKING narrowing: P_v1 ⇏ P_v2; requires verified evolution lens covering residual domain Δ".into());
-            CompatVerdict::NarrowingBreaking
-        }
-        (SmtOutcome::Counterexample(ce), _) => {
-            counterexample = ce.clone();
-            residual_domain = Some(format!("(and {} (not {}))", p1, p2));
-            notes.push("BREAKING divergent predicate change".into());
-            CompatVerdict::DivergentBreaking
-        }
-        (SmtOutcome::Unknown(msg), _) => {
-            notes.push(format!("SMT unknown (Fail-Closed): {}", msg));
-            CompatVerdict::DivergentBreaking
+            (SmtOutcome::Proved, _) => {
+                if let SmtOutcome::Counterexample(ce) = down_res {
+                    counterexample = ce;
+                    notes.push("upgrade is safe (P_v1 => P_v2), but downgrade/rolling old-reads-new has counterexample".into());
+                }
+                CompatVerdict::WideningBackwardSafe
+            }
+            (SmtOutcome::Counterexample(ce), SmtOutcome::Proved) => {
+                counterexample = ce.clone();
+                residual_domain = Some(format!("(and {} (not {}))", p1, p2));
+                notes.push("BREAKING narrowing: P_v1 ⇏ P_v2; requires verified evolution lens covering residual domain Δ".into());
+                CompatVerdict::NarrowingBreaking
+            }
+            (SmtOutcome::Counterexample(ce), _) => {
+                counterexample = ce.clone();
+                residual_domain = Some(format!("(and {} (not {}))", p1, p2));
+                notes.push("BREAKING divergent predicate change".into());
+                CompatVerdict::DivergentBreaking
+            }
+            (SmtOutcome::Unknown(msg), _) => {
+                notes.push(format!("SMT unknown (Fail-Closed): {}", msg));
+                CompatVerdict::DivergentBreaking
+            }
         }
     };
 
@@ -511,6 +554,15 @@ fn check_capabilities(v1: &Program, v2: &Program) -> Vec<CapabilityCheckResult> 
         });
     }
     out
+}
+
+fn normalize_base_type_name(ty_name: &str, aliases: &BTreeMap<String, Expr>) -> String {
+    if aliases.contains_key(ty_name)
+        || matches!(ty_name, "Int" | "Int64" | "Int32" | "UInt16" | "USize")
+    {
+        return "Int".into();
+    }
+    ty_name.to_string()
 }
 
 fn index_fields_by_identity(rec: &RecordDecl) -> BTreeMap<String, FieldDecl> {

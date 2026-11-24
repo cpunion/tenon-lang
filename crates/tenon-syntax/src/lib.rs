@@ -1,23 +1,28 @@
 pub mod ast;
+pub mod derive;
 pub mod lexer;
 pub mod parser;
 pub mod span;
 
 pub use ast::*;
+pub use derive::expand_derives;
 pub use parser::parse;
 pub use span::{ParseError, Span};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Load a `.tn` source file and recursively resolve all `import "path.tn"` declarations
-/// in topological order with cycle-safe deduplication.
+/// Load a `.tn` source file and recursively resolve all `import "path.tn" [as alias]` declarations
+/// in topological order with cycle-safe deduplication, then expand `@derive(...)` macros.
 pub fn load_program_with_imports(entry: &Path) -> Result<Program, String> {
     let mut visited = BTreeSet::new();
+    let mut module_exports: BTreeMap<PathBuf, (String, BTreeSet<String>)> = BTreeMap::new();
     let mut items = Vec::new();
-    load_module_recursive(entry, &mut visited, &mut items)?;
-    Ok(Program { items })
+    load_module_recursive(entry, &mut visited, &mut module_exports, &mut items)?;
+    let mut prog = Program { items };
+    expand_derives(&mut prog);
+    Ok(prog)
 }
 
 fn resolve_import_path(current_file: &Path, import_rel: &str) -> Result<PathBuf, String> {
@@ -57,6 +62,7 @@ fn resolve_import_path(current_file: &Path, import_rel: &str) -> Result<PathBuf,
 fn load_module_recursive(
     file: &Path,
     visited: &mut BTreeSet<PathBuf>,
+    module_exports: &mut BTreeMap<PathBuf, (String, BTreeSet<String>)>,
     out_items: &mut Vec<Item>,
 ) -> Result<(), String> {
     let canon = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
@@ -66,16 +72,176 @@ fn load_module_recursive(
     let src = fs::read_to_string(&canon)
         .map_err(|e| format!("failed to read `{}`: {}", file.display(), e))?;
     let prog = parse(&src).map_err(|e| format!("{}: {}", file.display(), e))?;
+
+    let mut local_aliases: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
+    let mut local_items = Vec::new();
+    let mut exported_fns = BTreeSet::new();
+
     for item in prog.items {
         match item {
-            Item::Import { path, .. } => {
+            Item::Import { path, alias, .. } => {
                 let target = resolve_import_path(&canon, &path)?;
-                load_module_recursive(&target, visited, out_items)?;
+                let target_canon = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+                load_module_recursive(&target, visited, module_exports, out_items)?;
+                if let Some(a) = alias {
+                    if let Some(exp) = module_exports.get(&target_canon) {
+                        local_aliases.insert(a, exp.clone());
+                    }
+                }
             }
-            other => out_items.push(other),
+            other => {
+                if let Item::Fn(f) = &other {
+                    exported_fns.insert(f.name.clone());
+                }
+                local_items.push(other);
+            }
         }
     }
+
+    let stem = canon
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    module_exports.insert(canon, (stem, exported_fns));
+
+    if !local_aliases.is_empty() {
+        for item in &mut local_items {
+            rewrite_item_aliases(item, &local_aliases);
+        }
+    }
+    out_items.extend(local_items);
     Ok(())
+}
+
+fn rewrite_item_aliases(item: &mut Item, aliases: &BTreeMap<String, (String, BTreeSet<String>)>) {
+    match item {
+        Item::Fn(f) => rewrite_fn_aliases(f, aliases),
+        Item::Impl(imp) => {
+            for m in &mut imp.methods {
+                rewrite_fn_aliases(m, aliases);
+            }
+        }
+        Item::Interface(iface) => {
+            for m in &mut iface.methods {
+                if let Some(b) = &mut m.default_body {
+                    rewrite_block_aliases(b, aliases);
+                }
+            }
+        }
+        Item::Record(r) => {
+            for m in &mut r.methods {
+                rewrite_fn_aliases(m, aliases);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_fn_aliases(f: &mut FnDecl, aliases: &BTreeMap<String, (String, BTreeSet<String>)>) {
+    for r in &mut f.requires {
+        rewrite_expr_aliases(r, aliases);
+    }
+    for e in &mut f.ensures {
+        rewrite_expr_aliases(e, aliases);
+    }
+    rewrite_block_aliases(&mut f.body, aliases);
+}
+
+fn rewrite_block_aliases(blk: &mut Block, aliases: &BTreeMap<String, (String, BTreeSet<String>)>) {
+    for s in &mut blk.stmts {
+        match s {
+            Stmt::Let { value, .. } => rewrite_expr_aliases(value, aliases),
+            Stmt::Assign { target, value, .. } => {
+                rewrite_expr_aliases(target, aliases);
+                rewrite_expr_aliases(value, aliases);
+            }
+            Stmt::Return { value: Some(e), .. }
+            | Stmt::Assert { cond: e, .. }
+            | Stmt::Expr { expr: e, .. } => rewrite_expr_aliases(e, aliases),
+            Stmt::Mutate { body, .. } => rewrite_block_aliases(body, aliases),
+            Stmt::While { cond, body, .. } => {
+                rewrite_expr_aliases(cond, aliases);
+                rewrite_block_aliases(body, aliases);
+            }
+            _ => {}
+        }
+    }
+    if let Some(t) = &mut blk.tail {
+        rewrite_expr_aliases(t, aliases);
+    }
+}
+
+fn rewrite_expr_aliases(expr: &mut Expr, aliases: &BTreeMap<String, (String, BTreeSet<String>)>) {
+    match &mut expr.kind {
+        ExprKind::Field { target, field } => {
+            if let ExprKind::Ident(m) = &target.kind {
+                if let Some((stem, exports)) = aliases.get(m) {
+                    if exports.contains(field.as_str()) {
+                        let resolved = field.clone();
+                        expr.kind = ExprKind::Ident(resolved);
+                        return;
+                    }
+                    let prefixed = format!("{}_{}", stem, field);
+                    if exports.contains(&prefixed) {
+                        expr.kind = ExprKind::Ident(prefixed);
+                        return;
+                    }
+                }
+            }
+            rewrite_expr_aliases(target, aliases);
+        }
+        ExprKind::GenericInst { expr: inner, .. } => rewrite_expr_aliases(inner, aliases),
+        ExprKind::Call { callee, args } => {
+            rewrite_expr_aliases(callee, aliases);
+            for a in args {
+                rewrite_expr_aliases(&mut a.value, aliases);
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            rewrite_expr_aliases(left, aliases);
+            rewrite_expr_aliases(right, aliases);
+        }
+        ExprKind::Unary { expr: inner, .. } | ExprKind::Await(inner) | ExprKind::Old(inner) => {
+            rewrite_expr_aliases(inner, aliases);
+        }
+        ExprKind::Index { target, index } => {
+            rewrite_expr_aliases(target, aliases);
+            rewrite_expr_aliases(index, aliases);
+        }
+        ExprKind::RecordLit { fields, .. } => {
+            for (_, v) in fields {
+                rewrite_expr_aliases(v, aliases);
+            }
+        }
+        ExprKind::Tuple(es) | ExprKind::List(es) => {
+            for e in es {
+                rewrite_expr_aliases(e, aliases);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_branch,
+        } => {
+            rewrite_expr_aliases(cond, aliases);
+            rewrite_block_aliases(then_block, aliases);
+            if let Some(eb) = else_branch {
+                rewrite_expr_aliases(eb, aliases);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            rewrite_expr_aliases(scrutinee, aliases);
+            for a in arms {
+                if let Some(g) = &mut a.guard {
+                    rewrite_expr_aliases(g, aliases);
+                }
+                rewrite_expr_aliases(&mut a.body, aliases);
+            }
+        }
+        ExprKind::Block(b) => rewrite_block_aliases(b, aliases),
+        _ => {}
+    }
 }
 
 #[cfg(test)]

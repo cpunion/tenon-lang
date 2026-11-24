@@ -466,5 +466,114 @@ pub record Order {
         assert!(!rep_narrow.safe_to_release, "narrowing renamed field must be caught by Z3");
         assert_eq!(rep_narrow.entities[0].verdict, CompatVerdict::NarrowingBreaking);
         assert_eq!(rep_narrow.entities[0].counterexample.get("amount").map(|s| s.as_str()), Some("0"));
+
+        // Version-first field base type change (`Int64 -> Text`) caught automatically!
+        let v2_type_change = parse(r#"
+@evolve
+pub record Order {
+    id     Int64
+    amount Text
+}
+"#).unwrap();
+        let rep_tc = check_evolution(&v1, &v2_type_change);
+        assert!(!rep_tc.safe_to_release, "field type change across versions must be flagged");
+        assert_eq!(rep_tc.entities[0].verdict, CompatVerdict::DivergentBreaking);
+    }
+
+    #[test]
+    fn verifies_interfaces_impls_liskov_contracts_static_bounds_and_dyn_object_safety() {
+        // 1. Positive: interface with `ensures`, `pure`, static `[T Scorer]` AND `dyn Scorer`!
+        let good = parse(r#"
+pub type NonNegative = Int where self >= 0
+
+pub interface Scorer {
+    pure fn score(self, bonus NonNegative) Int
+        ensures result >= 0
+}
+
+pub record FlatScorer {
+    base NonNegative
+}
+
+impl Scorer for FlatScorer {
+    pure fn score(self, bonus NonNegative) Int {
+        self.base + bonus
+    }
+}
+
+pub pure fn run_static[T Scorer](s T, b NonNegative) Int {
+    s.score(b)
+}
+
+pub pure fn run_dynamic(s dyn Scorer, b NonNegative) Int {
+    s.score(b)
+}
+
+pub fn demo() Int {
+    let f = FlatScorer { base = 10 }
+    let a = run_static(f, 5)
+    let d dyn Scorer = f
+    let b = run_dynamic(d, 3)
+    var list List[dyn Scorer] = []
+    list = push(list, f)
+    a + b
+}
+"#).unwrap();
+        let good_rep = check_program(&good);
+        assert!(
+            good_rep.ok,
+            "valid interface + static bound + dyn dispatch should pass: {:?}",
+            good_rep.diagnostics
+        );
+        assert!(good_rep
+            .proofs
+            .iter()
+            .any(|p| p.obligation.contains("impl `Scorer` for `FlatScorer`")));
+
+        // 2. Negative controls: missing method (E0501), purity mismatch (E0503),
+        //    Liskov ensures violation (V1004), unsatisfied bound / dyn coercion (E0505),
+        //    non-object-safe dyn (E0506)!
+        let bad = parse(r#"
+pub interface Scorer {
+    pure fn score(self, x Int) Int
+        ensures result >= 0
+}
+
+pub interface Factory {
+    pure fn make() Self
+}
+
+pub record MissingImpl { v Int }
+pub record ImpureImpl { v Int }
+pub record BadContractImpl { v Int }
+pub record NoImpl { v Int }
+
+impl Scorer for MissingImpl {}
+
+impl Scorer for ImpureImpl {
+    fn score(self, x Int) Int { 1 }
+}
+
+impl Scorer for BadContractImpl {
+    pure fn score(self, x Int) Int { -1 }
+}
+
+pub fn run_static[T Scorer](s T) Int { s.score(1) }
+
+pub fn bad_uses(f dyn Factory) Int {
+    let n = NoImpl { v = 1 }
+    let _ = run_static(n)
+    let _ dyn Scorer = n
+    0
+}
+"#).unwrap();
+        let bad_rep = check_program(&bad);
+        assert!(!bad_rep.ok);
+        let codes: Vec<&str> = bad_rep.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0501"), "expected E0501 missing method, got {:?}", codes);
+        assert!(codes.contains(&"E0503"), "expected E0503 purity mismatch, got {:?}", codes);
+        assert!(codes.contains(&"V1004"), "expected V1004 Liskov ensures violation, got {:?}", codes);
+        assert!(codes.contains(&"E0505"), "expected E0505 unsatisfied interface bound/dyn, got {:?}", codes);
+        assert!(codes.contains(&"E0506"), "expected E0506 non-object-safe dyn, got {:?}", codes);
     }
 }

@@ -28,10 +28,54 @@ struct SseStreamHandle {
 }
 
 static NEXT_SSE_HANDLE: AtomicI64 = AtomicI64::new(1);
+static NEXT_BUF_HANDLE: AtomicI64 = AtomicI64::new(1);
 
 fn sse_table() -> &'static Mutex<BTreeMap<i64, SseStreamHandle>> {
     static TABLE: OnceLock<Mutex<BTreeMap<i64, SseStreamHandle>>> = OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn buf_table() -> &'static Mutex<BTreeMap<i64, Vec<u8>>> {
+    static TABLE: OnceLock<Mutex<BTreeMap<i64, Vec<u8>>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+// =========================================================================
+// 1b. O(n) Byte Buffer Primitives (4 — used by std/text/builder & std/encoding/json)
+// =========================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_buf_new() -> i64 {
+    let id = NEXT_BUF_HANDLE.fetch_add(1, Ordering::SeqCst);
+    buf_table().lock().unwrap().insert(id, Vec::with_capacity(64));
+    id
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_buf_push_str(handle: i64, s: i64) -> i64 {
+    let bytes = read_text_bytes(s);
+    if let Some(buf) = buf_table().lock().unwrap().get_mut(&handle) {
+        buf.extend_from_slice(bytes);
+        buf.len() as i64
+    } else {
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_buf_push_byte(handle: i64, b: i64) -> i64 {
+    if let Some(buf) = buf_table().lock().unwrap().get_mut(&handle) {
+        buf.push((b & 0xFF) as u8);
+        buf.len() as i64
+    } else {
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_buf_finish(handle: i64) -> i64 {
+    let bytes = buf_table().lock().unwrap().remove(&handle).unwrap_or_default();
+    make_text_bytes(&bytes)
 }
 
 // =========================================================================
@@ -213,19 +257,30 @@ pub extern "C" fn tenon_sys_exec_exit_code() -> i64 {
 }
 
 // =========================================================================
-// 3. Minimal Raw HTTPS SSE Line-Stream Transport Syscalls (5)
+// 3. Minimal Raw HTTPS Line-Stream Transport Syscalls (6)
 //    Pure transport ONLY — zero JSON, zero OpenAI protocol logic!
 // =========================================================================
 
+/// Generic HTTP/SSE stream opener: accepts HTTP method, URL, newline-separated `Key: Value` headers,
+/// and raw body bytes. Zero vendor/OpenAI specifics inside `tenon-rt`.
 #[unsafe(no_mangle)]
-pub extern "C" fn tenon_sys_http_sse_open(url: i64, bearer: i64, body: i64) -> i64 {
+pub extern "C" fn tenon_sys_http_open(method: i64, url: i64, headers: i64, body: i64) -> i64 {
+    let method_s = read_text(method).trim().to_uppercase();
     let url_s = read_text(url);
-    let bearer_s = read_text(bearer);
+    let headers_s = read_text(headers);
     let body_bytes = read_text_bytes(body).to_vec();
+    spawn_http_line_stream(method_s, url_s, headers_s, body_bytes)
+}
 
+fn spawn_http_line_stream(
+    method_s: String,
+    url_s: String,
+    headers_s: String,
+    body_bytes: Vec<u8>,
+) -> i64 {
     let (tx, rx) = mpsc::channel::<String>();
     let err_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let err_bg = Arc::clone(&err_slot);
+    let err_bg = err_slot.clone();
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -249,13 +304,20 @@ pub extern "C" fn tenon_sys_http_sse_open(url: i64, bearer: i64, body: i64) -> i
                     return;
                 }
             };
-            let mut req = client
-                .post(&url_s)
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream")
-                .body(body_bytes);
-            if !bearer_s.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", bearer_s));
+            let http_method = reqwest::Method::from_bytes(method_s.as_bytes())
+                .unwrap_or(reqwest::Method::POST);
+            let mut req = client.request(http_method, &url_s);
+            for line in headers_s.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    let key = k.trim();
+                    let val = v.trim();
+                    if !key.is_empty() {
+                        req = req.header(key, val);
+                    }
+                }
+            }
+            if !body_bytes.is_empty() {
+                req = req.body(body_bytes);
             }
             let resp = match req.send().await {
                 Ok(r) => r,
@@ -315,6 +377,18 @@ pub extern "C" fn tenon_sys_http_sse_open(url: i64, bearer: i64, body: i64) -> i
         },
     );
     id
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_sys_http_sse_open(url: i64, bearer: i64, body: i64) -> i64 {
+    let url_s = read_text(url);
+    let bearer_s = read_text(bearer);
+    let body_bytes = read_text_bytes(body).to_vec();
+    let mut headers = String::from("Content-Type: application/json\nAccept: text/event-stream\n");
+    if !bearer_s.is_empty() {
+        headers.push_str(&format!("Authorization: Bearer {}\n", bearer_s));
+    }
+    spawn_http_line_stream("POST".to_string(), url_s, headers, body_bytes)
 }
 
 #[unsafe(no_mangle)]
