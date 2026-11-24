@@ -1,20 +1,59 @@
+use crate::llvm_runtime::{
+    TENON_AOT_NET_C, TENON_AOT_SYNC_C, TENON_AOT_SYSTEMS_CORE_C, TENON_ATOMIC_RC_IR_HELPERS,
+};
+pub use crate::llvm_runtime::emit_c_header;
 use crate::lower_interfaces::{DynInterfaceLayout, prepare_program_for_codegen};
 use crate::perceus::{
-    RC_MASK_ALL, TAG_CLOSURE, TAG_DYN, TAG_ERR, TAG_LIST, TAG_NONE, TAG_OK, TAG_RECORD_BASE,
-    TAG_SOME, TAG_TUPLE,
+    RC_MASK_ALL, TAG_CLOSURE, TAG_CSTRUCT, TAG_DYN, TAG_ENUM_BASE, TAG_ERR, TAG_LIST, TAG_NONE,
+    TAG_OK, TAG_RECORD_BASE, TAG_SOME, TAG_TUPLE,
 };
 use crate::{
-    CORE_SYSCALLS, generic_ty, is_float_type_expr, is_rc_type_expr, is_text_type_expr, named_ty,
-    resolve_alias_ty, split_async_segments,
+    CORE_SYSCALLS, generic_ty, is_consuming_cow_builtin, is_f32_type_expr, is_float_type_expr,
+    is_rc_type_expr, is_text_type_expr, named_ty, parse_syscall_ret_ty, resolve_alias_ty,
+    scalar_kind_of_ty, split_async_segments,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tenon_syntax::*;
 
 static AOT_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputKind {
+    Executable,
+    StaticLib,
+    SharedLib,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildOptions {
+    pub opt_level: String,
+    pub output_kind: OutputKind,
+    pub emit_ll_path: Option<PathBuf>,
+    pub emit_header_path: Option<PathBuf>,
+    pub debug_info: bool,
+    pub link_libs: Vec<String>,
+    pub link_dirs: Vec<String>,
+    pub extra_c_sources: Vec<PathBuf>,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        Self {
+            opt_level: "O3".into(),
+            output_kind: OutputKind::Executable,
+            emit_ll_path: None,
+            emit_header_path: None,
+            debug_info: false,
+            link_libs: Vec::new(),
+            link_dirs: Vec::new(),
+            extra_c_sources: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct BuildArtifact {
@@ -38,6 +77,7 @@ struct LlvmRecordLayout {
     fields: Vec<LlvmFieldLayout>,
     rc_mask: i64,
     where_clauses: Vec<Expr>,
+    c_layout: Option<StructByteLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,8 +133,25 @@ int64_t tenon_rt_print_int(int64_t v) {
 static TenonObj* g_freelist[TENON_FREELIST_MAX_CAP + 1] = {0};
 static int g_freelist_len[TENON_FREELIST_MAX_CAP + 1] = {0};
 
+#ifdef TENON_USE_SYNC
+void tenon_drop_mutex_handle(int64_t raw);
+void tenon_drop_channel_handle(int64_t raw, int is_rc);
+#endif
+
 static inline TenonObj* tenon_rc_alloc_raw(int64_t tag, int64_t lu, int64_t cap) {
     TenonObj* obj;
+#ifdef TENON_THREAD_SAFE
+    obj = (TenonObj*)malloc(sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
+    if (!obj) abort();
+    obj->rc = 1;
+    obj->tag = tag;
+    obj->len = lu;
+    obj->cap = cap;
+    obj->rc_mask = 0;
+    __atomic_add_fetch(&g_live, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_allocs, 1, __ATOMIC_RELAXED);
+    return obj;
+#else
     if (__builtin_expect(cap >= 1 && cap <= TENON_FREELIST_MAX_CAP && g_freelist[cap] != NULL, 1)) {
         obj = g_freelist[cap];
         g_freelist[cap] = *(TenonObj**)obj;
@@ -111,6 +168,7 @@ static inline TenonObj* tenon_rc_alloc_raw(int64_t tag, int64_t lu, int64_t cap)
     g_live++;
     g_allocs++;
     return obj;
+#endif
 }
 
 int64_t tenon_rc_alloc(int64_t tag, int64_t len) {
@@ -136,9 +194,15 @@ void tenon_rc_set_rc_mask(int64_t ptr, int64_t mask) {
 int64_t tenon_rc_inc(int64_t ptr) {
     if (__builtin_expect(ptr == 0, 0)) return 0;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
+#ifdef TENON_THREAD_SAFE
+    if (__builtin_expect(__atomic_load_n(&obj->rc, __ATOMIC_RELAXED) > 0, 1)) {
+        __atomic_add_fetch(&obj->rc, 1, __ATOMIC_RELAXED);
+    }
+#else
     if (__builtin_expect(obj->rc > 0, 1)) {
         obj->rc++;
     }
+#endif
     return ptr;
 }
 
@@ -159,6 +223,17 @@ static void tenon_rc_free_slow(TenonObj* obj) {
             }
         }
     }
+#ifdef TENON_USE_SYNC
+    if (obj->tag == 14) {
+        tenon_drop_mutex_handle(obj->fields[0]);
+    } else if (obj->tag == 15) {
+        tenon_drop_channel_handle(obj->fields[0], obj->fields[1] != 0);
+    }
+#endif
+#ifdef TENON_THREAD_SAFE
+    __atomic_sub_fetch(&g_live, 1, __ATOMIC_RELAXED);
+    free(obj);
+#else
     g_live--;
     int64_t cap = obj->cap;
     if (__builtin_expect(cap >= 1 && cap <= TENON_FREELIST_MAX_CAP && g_freelist_len[cap] < TENON_FREELIST_LIMIT, 1)) {
@@ -168,6 +243,7 @@ static void tenon_rc_free_slow(TenonObj* obj) {
         return;
     }
     free(obj);
+#endif
 }
 
 void tenon_rc_free_obj(int64_t ptr) {
@@ -178,16 +254,39 @@ void tenon_rc_free_obj(int64_t ptr) {
 void tenon_rc_dec(int64_t ptr) {
     if (__builtin_expect(ptr == 0, 0)) return;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
+#ifdef TENON_THREAD_SAFE
+    if (__builtin_expect(__atomic_load_n(&obj->rc, __ATOMIC_RELAXED) > 0, 1)) {
+        if (__builtin_expect(__atomic_sub_fetch(&obj->rc, 1, __ATOMIC_ACQ_REL) <= 0, 0)) {
+            tenon_rc_free_slow(obj);
+        }
+    }
+#else
     if (__builtin_expect(obj->rc > 0, 1)) {
         if (__builtin_expect(--obj->rc <= 0, 0)) {
             tenon_rc_free_slow(obj);
         }
     }
+#endif
 }
 
 __attribute__((noinline))
 static int64_t tenon_rc_cow_clone_slow(TenonObj* obj) {
+#ifdef TENON_THREAD_SAFE
+    __atomic_add_fetch(&g_cow, 1, __ATOMIC_RELAXED);
+#else
     g_cow++;
+#endif
+    int is_byte_payload = (obj->tag == 5 || obj->tag == 10 || obj->tag == 12 || obj->tag == 16);
+    if (is_byte_payload) {
+        int64_t extra = obj->tag == 5 ? 1 : 0;
+        int64_t words = (obj->len + extra + 7) / 8;
+        if (words < 1) words = 1;
+        TenonObj* fresh = tenon_rc_alloc_raw(obj->tag, obj->len, words);
+        if (obj->len > 0) memcpy(fresh->fields, obj->fields, (size_t)obj->len);
+        if (extra) ((uint8_t*)fresh->fields)[obj->len] = 0;
+        tenon_rc_dec((int64_t)(uintptr_t)obj);
+        return (int64_t)(uintptr_t)fresh;
+    }
     int64_t cap = obj->len < 1 ? 1 : obj->len;
     TenonObj* fresh = tenon_rc_alloc_raw(obj->tag, obj->len, cap);
     uint64_t mask = obj->rc_mask;
@@ -212,9 +311,15 @@ static int64_t tenon_rc_cow_clone_slow(TenonObj* obj) {
 int64_t tenon_rc_ensure_unique(int64_t ptr) {
     if (__builtin_expect(ptr == 0, 0)) return 0;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
+#ifdef TENON_THREAD_SAFE
+    if (__builtin_expect(__atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE) == 1, 1)) {
+        return ptr;
+    }
+#else
     if (__builtin_expect(obj->rc == 1, 1)) {
         return ptr;
     }
+#endif
     return tenon_rc_cow_clone_slow(obj);
 }
 
@@ -262,12 +367,13 @@ int64_t tenon_rc_get_len(int64_t ptr) {
 
 int64_t tenon_text_new(int64_t data_ptr, int64_t byte_len) {
     int64_t blen = byte_len < 0 ? 0 : byte_len;
-    int64_t words = (blen + 7) / 8;
+    int64_t words = (blen + 8) / 8;
     if (words < 1) words = 1;
     TenonObj* obj = tenon_rc_alloc_raw(5, blen, words);
     if (blen > 0 && data_ptr != 0) {
         memcpy((void*)obj->fields, (const void*)(uintptr_t)data_ptr, (size_t)blen);
     }
+    ((uint8_t*)obj->fields)[blen] = 0;
     return (int64_t)(uintptr_t)obj;
 }
 
@@ -307,12 +413,13 @@ int64_t tenon_str_concat(int64_t a, int64_t b) {
     int64_t la = a ? ((TenonObj*)(uintptr_t)a)->len : 0;
     int64_t lb = b ? ((TenonObj*)(uintptr_t)b)->len : 0;
     int64_t total = la + lb;
-    int64_t words = (total + 7) / 8;
+    int64_t words = (total + 8) / 8;
     if (words < 1) words = 1;
     TenonObj* obj = tenon_rc_alloc_raw(5, total, words);
     uint8_t* dst = (uint8_t*)obj->fields;
     if (la > 0) memcpy(dst, (const void*)((TenonObj*)(uintptr_t)a)->fields, (size_t)la);
     if (lb > 0) memcpy(dst + la, (const void*)((TenonObj*)(uintptr_t)b)->fields, (size_t)lb);
+    dst[total] = 0;
     return (int64_t)(uintptr_t)obj;
 }
 
@@ -377,7 +484,11 @@ typedef struct {
     uint8_t inline_buf[128];
 } TenonBuf;
 
+#ifdef TENON_THREAD_SAFE
+static _Thread_local TenonBuf* g_buf_cache = NULL;
+#else
 static TenonBuf* g_buf_cache = NULL;
+#endif
 
 int64_t tenon_buf_new(void) {
     TenonBuf* b;
@@ -450,7 +561,11 @@ int64_t tenon_list_push(int64_t ptr, int64_t val) {
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
     int64_t old_len = obj->len;
     uint64_t mask = obj->rc_mask;
+#ifdef TENON_THREAD_SAFE
+    int shared = __atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE) > 1;
+#else
     int shared = obj->rc > 1;
+#endif
     if (!shared && old_len < obj->cap) {
         g_reuse++;
         obj->fields[old_len] = val;
@@ -488,7 +603,11 @@ int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc) {
         fresh->rc_mask = UINT64_MAX;
         if (init_val != 0 && n > 0) {
             TenonObj* iv = (TenonObj*)(uintptr_t)init_val;
+#ifdef TENON_THREAD_SAFE
+            if (__atomic_load_n(&iv->rc, __ATOMIC_RELAXED) > 0) __atomic_add_fetch(&iv->rc, n, __ATOMIC_RELAXED);
+#else
             if (iv->rc > 0) iv->rc += n;
+#endif
         }
     }
     if (init_val == 0) {
@@ -1012,13 +1131,64 @@ fn ir_uses_http_syscalls(ir: &str) -> bool {
     ir.contains("call i64 @tenon_sys_http_")
 }
 
+fn ir_uses_sync_runtime(ir: &str) -> bool {
+    ir.contains("call i64 @tenon_thread_")
+        || ir.contains("call i64 @tenon_atomic_")
+        || ir.contains("call i64 @tenon_mutex_")
+        || ir.contains("call i64 @tenon_chan_")
+}
+
+fn ir_uses_net_runtime(ir: &str) -> bool {
+    ir.contains("call i64 @tenon_net_")
+}
+
+fn ir_uses_systems_core(ir: &str) -> bool {
+    ir.contains("call i64 @tenon_bytes_")
+        || ir.contains("call i64 @tenon_slice_")
+        || ir.contains("call i64 @tenon_cstruct_")
+        || ir.contains("call i64 @tenon_raw_")
+        || ir.contains("call i64 @tenon_f32_")
+        || ir.contains("call i64 @tenon_parse_f32")
+        || ir.contains("call i64 @tenon_text_cstr_")
+        || ir.contains("call i64 @tenon_cstr_")
+        || ir.contains("call i64 @tenon_text_to_bytes")
+        || ir.contains("call i64 @tenon_clz")
+        || ir.contains("call i64 @tenon_ctz")
+        || ir.contains("call i64 @tenon_popcnt")
+        || ir.contains("call i64 @tenon_bswap")
+        || ir.contains("call i64 @tenon_rot")
+        || ir_uses_net_runtime(ir)
+}
+
 pub fn compile_to_native_binary(
     program: &Program,
     output_path: &Path,
     emit_ll_path: Option<&Path>,
     opt_level: &str,
 ) -> Result<BuildArtifact, String> {
-    let ir = emit_llvm_ir(program)?;
+    let opts = BuildOptions {
+        opt_level: opt_level.to_string(),
+        output_kind: OutputKind::Executable,
+        emit_ll_path: emit_ll_path.map(PathBuf::from),
+        ..BuildOptions::default()
+    };
+    compile_with_options(program, output_path, &opts)
+}
+
+pub fn compile_with_options(
+    program: &Program,
+    output_path: &Path,
+    opts: &BuildOptions,
+) -> Result<BuildArtifact, String> {
+    if let Some(hpath) = &opts.emit_header_path {
+        if let Some(parent) = hpath.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let header = emit_c_header(program);
+        fs::write(hpath, header).map_err(|e| e.to_string())?;
+    }
+
+    let ir = emit_llvm_ir_with_options(program, opts.debug_info)?;
     let pid = std::process::id();
     let seq = AOT_TMP_SEQ.fetch_add(1, Ordering::SeqCst);
     let tmp_ll = std::env::temp_dir().join(format!("tenon_aot_{}_{}.ll", pid, seq));
@@ -1027,21 +1197,40 @@ pub fn compile_to_native_binary(
     fs::write(&tmp_ll, &ir).map_err(|e| e.to_string())?;
     let uses_os = ir_uses_os_syscalls(&ir);
     let uses_http = ir_uses_http_syscalls(&ir);
-    let mut rt_c = String::with_capacity(TENON_AOT_RUNTIME_C.len() + 8192);
+    let uses_sync = ir_uses_sync_runtime(&ir);
+    let uses_net = ir_uses_net_runtime(&ir);
+    let uses_sys_core = ir_uses_systems_core(&ir);
+
+    let mut rt_c = String::with_capacity(TENON_AOT_RUNTIME_C.len() + 16384);
+    if uses_sync {
+        rt_c.push_str("#define TENON_THREAD_SAFE 1\n#define TENON_USE_SYNC 1\n");
+    }
     rt_c.push_str(TENON_AOT_RUNTIME_C);
+    if uses_sys_core {
+        rt_c.push_str(TENON_AOT_SYSTEMS_CORE_C);
+    }
+    if uses_sync {
+        rt_c.push_str(TENON_AOT_SYNC_C);
+    }
+    if uses_net {
+        rt_c.push_str(TENON_AOT_NET_C);
+    }
     if uses_os {
         rt_c.push_str(TENON_AOT_OS_C);
     }
     if uses_http {
         rt_c.push_str(TENON_AOT_HTTP_C);
     }
-    if uses_os {
-        rt_c.push_str(TENON_AOT_MAIN_CLI_C);
-    } else {
-        rt_c.push_str(TENON_AOT_MAIN_STATS_C);
+    if opts.output_kind == OutputKind::Executable {
+        if uses_os {
+            rt_c.push_str(TENON_AOT_MAIN_CLI_C);
+        } else {
+            rt_c.push_str(TENON_AOT_MAIN_STATS_C);
+        }
     }
     fs::write(&tmp_rt, &rt_c).map_err(|e| e.to_string())?;
-    if let Some(p) = emit_ll_path {
+
+    if let Some(p) = &opts.emit_ll_path {
         if let Some(parent) = p.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -1051,41 +1240,159 @@ pub fn compile_to_native_binary(
         let _ = fs::create_dir_all(parent);
     }
 
-    let opt_flag = match opt_level {
+    let opt_flag = match opts.opt_level.as_str() {
         "O0" | "-O0" => "-O0",
         "O2" | "-O2" => "-O2",
         _ => "-O3",
     };
 
-    let mut cmd = Command::new("clang");
-    cmd.arg(opt_flag);
-    if opt_flag == "-O3" {
-        cmd.arg("-flto=thin");
+    // Collect `@link("lib")` attributes from `extern "C"` declarations
+    let mut all_link_libs: Vec<String> = Vec::new();
+    for item in &program.items {
+        if let Item::ExternFn(ef) = item {
+            for lib in extract_link_libs(&ef.attrs) {
+                if !all_link_libs.contains(&lib) {
+                    all_link_libs.push(lib);
+                }
+            }
+        }
     }
-    cmd.args([
-        "-Wno-override-module",
-        tmp_ll.to_str().unwrap(),
-        tmp_rt.to_str().unwrap(),
-    ]);
-    if uses_http {
-        cmd.args(["-lcurl", "-lpthread"]);
+    for lib in &opts.link_libs {
+        if !all_link_libs.contains(lib) {
+            all_link_libs.push(lib.clone());
+        }
     }
-    cmd.args(["-o", output_path.to_str().unwrap()]);
 
-    let out = cmd
-        .output()
-        .map_err(|e| format!("failed to invoke LLVM clang: {}", e))?;
+    let res = match opts.output_kind {
+        OutputKind::StaticLib => {
+            let tmp_obj_ll = std::env::temp_dir().join(format!("tenon_ll_{}_{}.o", pid, seq));
+            let tmp_obj_rt = std::env::temp_dir().join(format!("tenon_rt_{}_{}.o", pid, seq));
+            let mut extra_objs: Vec<PathBuf> = Vec::new();
+
+            let mut c1 = Command::new("clang");
+            c1.arg(opt_flag).arg("-c").arg("-Wno-override-module");
+            if opts.debug_info {
+                c1.arg("-g");
+            }
+            c1.args([tmp_ll.to_str().unwrap(), "-o", tmp_obj_ll.to_str().unwrap()]);
+            let o1 = c1.output().map_err(|e| format!("clang failed: {}", e))?;
+            if !o1.status.success() {
+                let _ = fs::remove_file(&tmp_ll);
+                let _ = fs::remove_file(&tmp_rt);
+                return Err(format!(
+                    "LLVM clang -c (IR) failed:\n{}",
+                    String::from_utf8_lossy(&o1.stderr)
+                ));
+            }
+
+            let mut c2 = Command::new("clang");
+            c2.arg(opt_flag).arg("-c");
+            if opts.debug_info {
+                c2.arg("-g");
+            }
+            c2.args([tmp_rt.to_str().unwrap(), "-o", tmp_obj_rt.to_str().unwrap()]);
+            let o2 = c2.output().map_err(|e| format!("clang failed: {}", e))?;
+            if !o2.status.success() {
+                let _ = fs::remove_file(&tmp_ll);
+                let _ = fs::remove_file(&tmp_rt);
+                let _ = fs::remove_file(&tmp_obj_ll);
+                return Err(format!(
+                    "LLVM clang -c (RT) failed:\n{}",
+                    String::from_utf8_lossy(&o2.stderr)
+                ));
+            }
+
+            for (idx, csrc) in opts.extra_c_sources.iter().enumerate() {
+                let eo = std::env::temp_dir().join(format!("tenon_ex_{}_{}_{}.o", pid, seq, idx));
+                let mut ce = Command::new("clang");
+                ce.arg(opt_flag).arg("-c");
+                if opts.debug_info {
+                    ce.arg("-g");
+                }
+                ce.args([csrc.to_str().unwrap(), "-o", eo.to_str().unwrap()]);
+                let oe = ce.output().map_err(|e| format!("clang failed: {}", e))?;
+                if !oe.status.success() {
+                    return Err(format!(
+                        "LLVM clang -c ({}) failed:\n{}",
+                        csrc.display(),
+                        String::from_utf8_lossy(&oe.stderr)
+                    ));
+                }
+                extra_objs.push(eo);
+            }
+
+            let _ = fs::remove_file(output_path);
+            let mut ar = Command::new("ar");
+            ar.args([
+                "rcs",
+                output_path.to_str().unwrap(),
+                tmp_obj_ll.to_str().unwrap(),
+                tmp_obj_rt.to_str().unwrap(),
+            ]);
+            for eo in &extra_objs {
+                ar.arg(eo.to_str().unwrap());
+            }
+            let oar = ar.output().map_err(|e| format!("ar rcs failed: {}", e))?;
+            let _ = fs::remove_file(&tmp_obj_ll);
+            let _ = fs::remove_file(&tmp_obj_rt);
+            for eo in &extra_objs {
+                let _ = fs::remove_file(eo);
+            }
+            if !oar.status.success() {
+                Err(format!("ar rcs failed:\n{}", String::from_utf8_lossy(&oar.stderr)))
+            } else {
+                Ok(())
+            }
+        }
+        OutputKind::SharedLib | OutputKind::Executable => {
+            let mut cmd = Command::new("clang");
+            cmd.arg(opt_flag);
+            if opts.debug_info {
+                cmd.arg("-g");
+            }
+            if opts.output_kind == OutputKind::SharedLib {
+                cmd.args(["-shared", "-fPIC"]);
+            } else if opt_flag == "-O3" && !opts.debug_info {
+                cmd.arg("-flto=thin");
+            }
+            cmd.args([
+                "-Wno-override-module",
+                tmp_ll.to_str().unwrap(),
+                tmp_rt.to_str().unwrap(),
+            ]);
+            for csrc in &opts.extra_c_sources {
+                cmd.arg(csrc.to_str().unwrap());
+            }
+            for dir in &opts.link_dirs {
+                cmd.arg(format!("-L{}", dir));
+            }
+            if uses_http {
+                cmd.args(["-lcurl", "-lpthread"]);
+            } else if uses_sync {
+                cmd.arg("-lpthread");
+            }
+            for lib in &all_link_libs {
+                cmd.arg(format!("-l{}", lib));
+            }
+            cmd.args(["-o", output_path.to_str().unwrap()]);
+            let out = cmd
+                .output()
+                .map_err(|e| format!("failed to invoke LLVM clang: {}", e))?;
+            if !out.status.success() {
+                Err(format!(
+                    "LLVM clang compilation failed:\nstdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    };
 
     let _ = fs::remove_file(&tmp_ll);
     let _ = fs::remove_file(&tmp_rt);
-
-    if !out.status.success() {
-        return Err(format!(
-            "LLVM clang compilation failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
+    res?;
 
     let binary_bytes = fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
     Ok(BuildArtifact {
@@ -1096,7 +1403,7 @@ pub fn compile_to_native_binary(
     })
 }
 
-const TENON_INLINE_IR_HELPERS: &str = r#"
+const TENON_NONATOMIC_RC_IR_HELPERS: &str = r#"
 define internal i64 @__tn_rc_inc(i64 %p) alwaysinline {
 entry:
   %nz = icmp ne i64 %p, 0
@@ -1152,7 +1459,9 @@ retp:
 ret0:
   ret i64 0
 }
+"#;
 
+const TENON_INLINE_IR_HELPERS: &str = r#"
 define internal void @__tn_rc_set_rc_mask(i64 %p, i64 %mask) alwaysinline {
 entry:
   %nz = icmp ne i64 %p, 0
@@ -1405,9 +1714,121 @@ const TENON_TBAA_METADATA: &str = r#"
 !10 = !{!5, !5, i64 0}
 "#;
 
+fn llvm_c_abi_type(ty: &TypeExpr, aliases: &BTreeMap<String, TypeExpr>) -> &'static str {
+    match resolve_alias_ty(ty, aliases) {
+        TypeExpr::Named { name, .. } => match ScalarKind::from_name(&name) {
+            Some(ScalarKind::I8 | ScalarKind::U8) => "i8",
+            Some(ScalarKind::I16 | ScalarKind::U16) => "i16",
+            Some(ScalarKind::I32 | ScalarKind::U32) => "i32",
+            Some(ScalarKind::I64 | ScalarKind::U64) => "i64",
+            Some(ScalarKind::F32) => "float",
+            Some(ScalarKind::F64) => "double",
+            None => match name.as_str() {
+                "Bool" => "i1",
+                "CVoid" => "void",
+                "Ptr" | "MutPtr" | "CStr" => "ptr",
+                _ => "i64",
+            },
+        },
+        _ => "i64",
+    }
+}
+
+fn emit_export_wrapper(
+    f: &FnDecl,
+    cname: &str,
+    aliases: &BTreeMap<String, TypeExpr>,
+) -> String {
+    let ret_llvm = match &f.ret_ty {
+        Some(rt) => llvm_c_abi_type(rt, aliases),
+        None => "void",
+    };
+    let mut sig_params = Vec::new();
+    let mut conv_lines = String::new();
+    let mut call_args = Vec::new();
+    for (i, p) in f.params.iter().enumerate() {
+        let cty = llvm_c_abi_type(&p.ty, aliases);
+        let arg = format!("%c_arg_{}", i);
+        sig_params.push(format!("{} {}", cty, arg));
+        let sk = scalar_kind_of_ty(&p.ty, aliases);
+        let tn_val = format!("%tn_arg_{}", i);
+        match cty {
+            "i8" | "i16" | "i32" => {
+                let ext = if sk.is_some_and(|k| k.is_unsigned()) { "zext" } else { "sext" };
+                conv_lines.push_str(&format!("  {} = {} {} {} to i64\n", tn_val, ext, cty, arg));
+            }
+            "i1" => {
+                conv_lines.push_str(&format!("  {} = zext i1 {} to i64\n", tn_val, arg));
+            }
+            "float" => {
+                let b32 = format!("%fb32_{}", i);
+                conv_lines.push_str(&format!(
+                    "  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                    b32, arg, tn_val, b32
+                ));
+            }
+            "double" => {
+                conv_lines.push_str(&format!("  {} = bitcast double {} to i64\n", tn_val, arg));
+            }
+            "ptr" => {
+                conv_lines.push_str(&format!("  {} = ptrtoint ptr {} to i64\n", tn_val, arg));
+            }
+            _ => {
+                call_args.push(format!("i64 {}", arg));
+                continue;
+            }
+        }
+        call_args.push(format!("i64 {}", tn_val));
+    }
+    let mut body = conv_lines;
+    body.push_str(&format!(
+        "  %raw_ret = call i64 @tenon_fn_{}({})\n",
+        sanitize(&f.name),
+        call_args.join(", ")
+    ));
+    match ret_llvm {
+        "void" => body.push_str("  ret void\n"),
+        "i8" | "i16" | "i32" => {
+            body.push_str(&format!(
+                "  %out = trunc i64 %raw_ret to {}\n  ret {} %out\n",
+                ret_llvm, ret_llvm
+            ));
+        }
+        "i1" => {
+            body.push_str("  %out = icmp ne i64 %raw_ret, 0\n  ret i1 %out\n");
+        }
+        "float" => {
+            body.push_str(
+                "  %r32 = trunc i64 %raw_ret to i32\n  %out = bitcast i32 %r32 to float\n  ret float %out\n",
+            );
+        }
+        "double" => {
+            body.push_str("  %out = bitcast i64 %raw_ret to double\n  ret double %out\n");
+        }
+        "ptr" => {
+            body.push_str("  %out = inttoptr i64 %raw_ret to ptr\n  ret ptr %out\n");
+        }
+        _ => {
+            body.push_str("  ret i64 %raw_ret\n");
+        }
+    }
+    format!(
+        "define {} @{}({}) {{\nentry:\n{}}}\n",
+        ret_llvm,
+        cname,
+        sig_params.join(", "),
+        body
+    )
+}
+
 pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
+    emit_llvm_ir_with_options(program, false)
+}
+
+pub fn emit_llvm_ir_with_options(program: &Program, debug_info: bool) -> Result<String, String> {
     let prepared = prepare_program_for_codegen(program);
     let program = &prepared.program;
+    let layout_engine = LayoutEngine::from_program(program);
     let vtable_ifaces: BTreeMap<String, String> = prepared
         .vtables
         .iter()
@@ -1430,6 +1851,7 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
         .iter()
         .filter_map(|i| match i {
             Item::Record(r) if r.type_params.is_empty() => Some(r.name.clone()),
+            Item::Union(u) => Some(u.name.clone()),
             _ => None,
         })
         .collect();
@@ -1446,16 +1868,22 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     let mut field_to_idx: BTreeMap<String, usize> = BTreeMap::new();
     let mut enum_tags: BTreeMap<String, i64> = BTreeMap::new();
     let mut enum_variants: BTreeMap<String, LlvmEnumVariantLayout> = BTreeMap::new();
+    let mut extern_fns: BTreeMap<String, ExternFnDecl> = BTreeMap::new();
     enum_tags.insert("Err".into(), TAG_ERR);
     enum_tags.insert("Ok".into(), TAG_OK);
     enum_tags.insert("None".into(), TAG_NONE);
     enum_tags.insert("Some".into(), TAG_SOME);
 
     let mut next_rec_tag = TAG_RECORD_BASE;
-    let mut next_enum_tag = 10i64;
+    let mut next_enum_tag = TAG_ENUM_BASE;
     for item in &program.items {
         match item {
             Item::Record(r) if r.type_params.is_empty() => {
+                let c_layout = if is_c_layout_attrs(&r.attrs) {
+                    layout_engine.struct_layout(&r.name)
+                } else {
+                    None
+                };
                 let mut fields = Vec::new();
                 let mut rc_mask = 0u64;
                 for (idx, f) in r.fields.iter().enumerate() {
@@ -1467,8 +1895,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
                     if let Some(fp) = &f.predicate {
                         preds.push(fp.clone());
                     }
-                    let is_rc =
-                        is_rc_type_expr(&f.ty, &alias_bases, &record_names, &enum_names);
+                    let is_rc = c_layout.is_none()
+                        && is_rc_type_expr(&f.ty, &alias_bases, &record_names, &enum_names);
                     if is_rc && idx < 64 {
                         rc_mask |= 1u64 << idx;
                     }
@@ -1487,9 +1915,36 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
                         fields,
                         rc_mask: rc_mask as i64,
                         where_clauses: r.where_clauses.clone(),
+                        c_layout,
                     },
                 );
                 next_rec_tag += 1;
+            }
+            Item::Union(u) => {
+                let c_layout = layout_engine.union_layout(&u.name);
+                let mut fields = Vec::new();
+                for (idx, f) in u.fields.iter().enumerate() {
+                    fields.push(LlvmFieldLayout {
+                        name: f.name.clone(),
+                        ty: f.ty.clone(),
+                        preds: Vec::new(),
+                        is_rc: false,
+                    });
+                    field_to_idx.entry(f.name.clone()).or_insert(idx);
+                }
+                records.insert(
+                    u.name.clone(),
+                    LlvmRecordLayout {
+                        tag: TAG_CSTRUCT,
+                        fields,
+                        rc_mask: 0,
+                        where_clauses: Vec::new(),
+                        c_layout,
+                    },
+                );
+            }
+            Item::ExternFn(ef) => {
+                extern_fns.insert(ef.name.clone(), ef.clone());
             }
             Item::Enum(e) => {
                 for v in &e.variants {
@@ -1536,14 +1991,19 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             LlvmFnMeta {
                 params_inout: vec![false; spec.arity],
                 param_tys: vec![named_ty("Any"); spec.arity],
-                ret_ty: Some(if spec.returns_text {
-                    named_ty("Text")
-                } else if spec.returns_float {
-                    named_ty("Float")
-                } else {
-                    named_ty("Int")
-                }),
+                ret_ty: Some(parse_syscall_ret_ty(spec.ret_ty)),
                 returns_rc: spec.returns_rc,
+            },
+        );
+    }
+    for (ename, ef) in &extern_fns {
+        fn_metas.insert(
+            ename.clone(),
+            LlvmFnMeta {
+                params_inout: vec![false; ef.params.len()],
+                param_tys: ef.params.iter().map(|p| p.ty.clone()).collect(),
+                ret_ty: ef.ret_ty.clone(),
+                returns_rc: false,
             },
         );
     }
@@ -1572,7 +2032,7 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
         );
     }
     for (rname, layout) in &records {
-        if !layout.fields.is_empty() {
+        if !layout.fields.is_empty() && layout.c_layout.is_none() {
             fn_metas.insert(
                 format!("{}__parse", rname),
                 LlvmFnMeta {
@@ -1590,7 +2050,55 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     let mut unit_enum_tags: BTreeSet<i64> = BTreeSet::new();
     let mut fn_defs = String::new();
 
+    // DWARF debug info metadata builder (allocated IDs >= 100 so TBAA !0..!10 stay untouched!)
+    let mut next_md_id: u32 = 110;
+    let mut dbg_files: Vec<(u32, String, String)> = Vec::new();
+    let mut dbg_subprograms: Vec<(u32, String, String, u32, u32)> = Vec::new();
+    let mut dbg_locs: Vec<(u32, u32, u32, u32)> = Vec::new();
+    if debug_info {
+        let files = if program.source_files.is_empty() {
+            vec!["main.tn".to_string()]
+        } else {
+            program.source_files.clone()
+        };
+        for fpath in files {
+            let p = Path::new(&fpath);
+            let fname = p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| fpath.clone());
+            let dir = p
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ".".to_string());
+            let fid = next_md_id;
+            next_md_id += 1;
+            dbg_files.push((fid, fname, dir));
+        }
+    }
+
     for f in &sync_fns {
+        let sp_id = if debug_info {
+            let id = next_md_id;
+            next_md_id += 1;
+            let file_md = dbg_files
+                .get(f.span.file_id as usize)
+                .or_else(|| dbg_files.first())
+                .map(|(id, _, _)| *id)
+                .unwrap_or(110);
+            let line = f.span.line.max(1) as u32;
+            dbg_subprograms.push((
+                id,
+                f.name.clone(),
+                format!("tenon_fn_{}", sanitize(&f.name)),
+                file_md,
+                line,
+            ));
+            Some(id)
+        } else {
+            None
+        };
         let mut cg = LlvmFnGen::new(
             &alias_bases,
             &records,
@@ -1601,18 +2109,27 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             &enum_variants,
             &fn_metas,
             &syscall_map,
+            &layout_engine,
+            &extern_fns,
             dyn_interfaces,
             &vtable_ifaces,
             &mut string_globals,
             &mut string_intern,
             &mut unit_enum_tags,
+            sp_id,
+            &mut dbg_locs,
+            &mut next_md_id,
         );
         fn_defs.push_str(&cg.emit_sync_fn(f)?);
         fn_defs.push('\n');
+        if let Some(cname) = extract_export_name(&f.attrs, &f.name) {
+            fn_defs.push_str(&emit_export_wrapper(f, &cname, &alias_bases));
+            fn_defs.push('\n');
+        }
     }
 
     for (rname, layout) in &records {
-        if layout.fields.is_empty() {
+        if layout.fields.is_empty() || layout.c_layout.is_some() {
             continue;
         }
         let mut cg = LlvmFnGen::new(
@@ -1625,11 +2142,16 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             &enum_variants,
             &fn_metas,
             &syscall_map,
+            &layout_engine,
+            &extern_fns,
             dyn_interfaces,
             &vtable_ifaces,
             &mut string_globals,
             &mut string_intern,
             &mut unit_enum_tags,
+            None,
+            &mut dbg_locs,
+            &mut next_md_id,
         );
         fn_defs.push_str(&cg.emit_record_parser(rname, layout)?);
         fn_defs.push('\n');
@@ -1646,20 +2168,71 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             &enum_variants,
             &fn_metas,
             &syscall_map,
+            &layout_engine,
+            &extern_fns,
             dyn_interfaces,
             &vtable_ifaces,
             &mut string_globals,
             &mut string_intern,
             &mut unit_enum_tags,
+            None,
+            &mut dbg_locs,
+            &mut next_md_id,
         );
         fn_defs.push_str(&cg.emit_async_fn(f)?);
         fn_defs.push('\n');
     }
 
+    let uses_sync = ir_uses_sync_runtime(&fn_defs);
+
     let mut ir = String::new();
     ir.push_str("; Generated by Tenon LLVM 22 AOT Release Backend\n\n");
     ir.push_str("declare void @llvm.assume(i1)\n");
+    ir.push_str("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
     ir.push_str("declare i32 @memcmp(ptr, ptr, i64)\n");
+    // Emit only the LLVM bit/saturating/SIMD intrinsics actually referenced in `fn_defs`
+    let optional_intrinsics: &[(&str, &str)] = &[
+        ("@llvm.ctlz.i64", "declare i64 @llvm.ctlz.i64(i64, i1)\n"),
+        ("@llvm.cttz.i64", "declare i64 @llvm.cttz.i64(i64, i1)\n"),
+        ("@llvm.ctpop.i64", "declare i64 @llvm.ctpop.i64(i64)\n"),
+        ("@llvm.bswap.i16", "declare i16 @llvm.bswap.i16(i16)\n"),
+        ("@llvm.bswap.i32", "declare i32 @llvm.bswap.i32(i32)\n"),
+        ("@llvm.bswap.i64", "declare i64 @llvm.bswap.i64(i64)\n"),
+        ("@llvm.fshl.i64", "declare i64 @llvm.fshl.i64(i64, i64, i64)\n"),
+        ("@llvm.fshr.i64", "declare i64 @llvm.fshr.i64(i64, i64, i64)\n"),
+        ("@llvm.sadd.sat.i8", "declare i8 @llvm.sadd.sat.i8(i8, i8)\n"),
+        ("@llvm.uadd.sat.i8", "declare i8 @llvm.uadd.sat.i8(i8, i8)\n"),
+        ("@llvm.ssub.sat.i8", "declare i8 @llvm.ssub.sat.i8(i8, i8)\n"),
+        ("@llvm.usub.sat.i8", "declare i8 @llvm.usub.sat.i8(i8, i8)\n"),
+        ("@llvm.sadd.sat.i16", "declare i16 @llvm.sadd.sat.i16(i16, i16)\n"),
+        ("@llvm.uadd.sat.i16", "declare i16 @llvm.uadd.sat.i16(i16, i16)\n"),
+        ("@llvm.ssub.sat.i16", "declare i16 @llvm.ssub.sat.i16(i16, i16)\n"),
+        ("@llvm.usub.sat.i16", "declare i16 @llvm.usub.sat.i16(i16, i16)\n"),
+        ("@llvm.sadd.sat.i32", "declare i32 @llvm.sadd.sat.i32(i32, i32)\n"),
+        ("@llvm.uadd.sat.i32", "declare i32 @llvm.uadd.sat.i32(i32, i32)\n"),
+        ("@llvm.ssub.sat.i32", "declare i32 @llvm.ssub.sat.i32(i32, i32)\n"),
+        ("@llvm.usub.sat.i32", "declare i32 @llvm.usub.sat.i32(i32, i32)\n"),
+        ("@llvm.sadd.sat.i64", "declare i64 @llvm.sadd.sat.i64(i64, i64)\n"),
+        ("@llvm.uadd.sat.i64", "declare i64 @llvm.uadd.sat.i64(i64, i64)\n"),
+        ("@llvm.ssub.sat.i64", "declare i64 @llvm.ssub.sat.i64(i64, i64)\n"),
+        ("@llvm.usub.sat.i64", "declare i64 @llvm.usub.sat.i64(i64, i64)\n"),
+        ("@llvm.fma.v4f32", "declare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>)\n"),
+        ("@llvm.fma.v4f64", "declare <4 x double> @llvm.fma.v4f64(<4 x double>, <4 x double>, <4 x double>)\n"),
+        ("@llvm.minnum.v4f32", "declare <4 x float> @llvm.minnum.v4f32(<4 x float>, <4 x float>)\n"),
+        ("@llvm.maxnum.v4f32", "declare <4 x float> @llvm.maxnum.v4f32(<4 x float>, <4 x float>)\n"),
+        ("@llvm.minnum.v4f64", "declare <4 x double> @llvm.minnum.v4f64(<4 x double>, <4 x double>)\n"),
+        ("@llvm.maxnum.v4f64", "declare <4 x double> @llvm.maxnum.v4f64(<4 x double>, <4 x double>)\n"),
+        ("@llvm.vector.reduce.fadd.v4f32", "declare float @llvm.vector.reduce.fadd.v4f32(float, <4 x float>)\n"),
+        ("@llvm.vector.reduce.fadd.v4f64", "declare double @llvm.vector.reduce.fadd.v4f64(double, <4 x double>)\n"),
+        ("@llvm.vector.reduce.add.v4i32", "declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)\n"),
+        ("@llvm.vector.reduce.add.v4i64", "declare i64 @llvm.vector.reduce.add.v4i64(<4 x i64>)\n"),
+        ("@llvm.vector.reduce.add.v16i8", "declare i8 @llvm.vector.reduce.add.v16i8(<16 x i8>)\n"),
+    ];
+    for (needle, decl) in optional_intrinsics {
+        if fn_defs.contains(needle) {
+            ir.push_str(decl);
+        }
+    }
     ir.push_str("declare void @tenon_rt_assert_fail(i64) cold\n");
     ir.push_str("declare i64 @tenon_rt_print_int(i64)\n");
     ir.push_str("declare i64 @tenon_rc_alloc(i64, i64)\n");
@@ -1682,16 +2255,43 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     ir.push_str("declare i64 @tenon_async_yield_create(i64)\n");
     ir.push_str("declare i64 @tenon_async_poll_frame(i64)\n");
     ir.push_str("declare i64 @tenon_async_block_on(i64)\n");
+    ir.push_str("declare i64 @tenon_cstruct_alloc(i64)\n");
+    ir.push_str("declare i64 @tenon_cstruct_data_ptr(i64)\n");
     for spec in CORE_SYSCALLS {
         let params = vec!["i64"; spec.arity].join(", ");
         ir.push_str(&format!("declare i64 @{}({})\n", spec.c_symbol, params));
+    }
+    for ef in extern_fns.values() {
+        let ret_llvm = match &ef.ret_ty {
+            Some(rt) => llvm_c_abi_type(rt, &alias_bases),
+            None => "void",
+        };
+        let mut ptypes: Vec<&str> = ef
+            .params
+            .iter()
+            .map(|p| llvm_c_abi_type(&p.ty, &alias_bases))
+            .collect();
+        if ef.is_variadic {
+            ptypes.push("...");
+        }
+        ir.push_str(&format!(
+            "declare {} @{}({})\n",
+            ret_llvm,
+            ef.name,
+            ptypes.join(", ")
+        ));
+    }
+    if uses_sync {
+        ir.push_str(TENON_ATOMIC_RC_IR_HELPERS);
+    } else {
+        ir.push_str(TENON_NONATOMIC_RC_IR_HELPERS);
     }
     ir.push_str(TENON_INLINE_IR_HELPERS);
     ir.push('\n');
 
     for (gname, text) in &string_globals {
         let blen = text.len();
-        let words = ((blen + 7) / 8).max(1);
+        let words = ((blen + 8) / 8).max(1);
         if blen == 0 {
             ir.push_str(&format!(
                 "@{} = private unnamed_addr constant {{ i64, i64, i64, i64, i64, [1 x i8] }} {{ i64 -1, i64 5, i64 0, i64 1, i64 0, [1 x i8] zeroinitializer }}, align 8\n",
@@ -1700,8 +2300,13 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
         } else {
             let escaped = escape_llvm_bytes(text.as_bytes());
             ir.push_str(&format!(
-                "@{} = private unnamed_addr constant {{ i64, i64, i64, i64, i64, [{} x i8] }} {{ i64 -1, i64 5, i64 {}, i64 {}, i64 0, [{} x i8] c\"{}\" }}, align 8\n",
-                gname, blen, blen, words, blen, escaped
+                "@{} = private unnamed_addr constant {{ i64, i64, i64, i64, i64, [{} x i8] }} {{ i64 -1, i64 5, i64 {}, i64 {}, i64 0, [{} x i8] c\"{}\\00\" }}, align 8\n",
+                gname,
+                blen + 1,
+                blen,
+                words,
+                blen + 1,
+                escaped
             ));
         }
     }
@@ -1738,6 +2343,41 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
 
     ir.push_str(&fn_defs);
     ir.push_str(TENON_TBAA_METADATA);
+
+    if debug_info {
+        let primary_file_id = dbg_files.first().map(|(id, _, _)| *id).unwrap_or(110);
+        ir.push_str("\n!llvm.dbg.cu = !{!100}\n");
+        ir.push_str("!llvm.module.flags = !{!101, !102}\n");
+        ir.push_str(&format!(
+            "!100 = distinct !DICompileUnit(language: DW_LANG_C99, file: !{}, producer: \"Tenon LLVM 22 AOT\", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)\n",
+            primary_file_id
+        ));
+        ir.push_str("!101 = !{i32 7, !\"Dwarf Version\", i32 4}\n");
+        ir.push_str("!102 = !{i32 2, !\"Debug Info Version\", i32 3}\n");
+        ir.push_str("!103 = !DISubroutineType(types: !104)\n");
+        ir.push_str("!104 = !{null}\n");
+        for (fid, fname, dir) in &dbg_files {
+            ir.push_str(&format!(
+                "!{} = !DIFile(filename: \"{}\", directory: \"{}\")\n",
+                fid,
+                fname.replace('\\', "\\\\").replace('"', "\\\""),
+                dir.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
+        }
+        for (sp_id, name, linkage, file_id, line) in &dbg_subprograms {
+            ir.push_str(&format!(
+                "!{} = distinct !DISubprogram(name: \"{}\", linkageName: \"{}\", scope: !{}, file: !{}, line: {}, type: !103, scopeLine: {}, spFlags: DISPFlagDefinition, unit: !100)\n",
+                sp_id, name, linkage, file_id, file_id, line, line
+            ));
+        }
+        for (loc_id, line, col, scope_id) in &dbg_locs {
+            ir.push_str(&format!(
+                "!{} = !DILocation(line: {}, column: {}, scope: !{})\n",
+                loc_id, line, col, scope_id
+            ));
+        }
+    }
+
     Ok(ir)
 }
 
@@ -1777,11 +2417,16 @@ struct LlvmFnGen<'a> {
     enum_variants: &'a BTreeMap<String, LlvmEnumVariantLayout>,
     fn_metas: &'a BTreeMap<String, LlvmFnMeta>,
     syscall_map: &'a BTreeMap<String, &'static str>,
+    layout_engine: &'a LayoutEngine,
+    extern_fns: &'a BTreeMap<String, ExternFnDecl>,
     dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
     vtable_ifaces: &'a BTreeMap<String, String>,
     string_globals: &'a mut Vec<(String, String)>,
     string_intern: &'a mut BTreeMap<String, String>,
     unit_enum_tags: &'a mut BTreeSet<i64>,
+    debug_sp_id: Option<u32>,
+    dbg_locs: &'a mut Vec<(u32, u32, u32, u32)>,
+    next_md_id: &'a mut u32,
     tmp: usize,
     lbl: usize,
     slot_id: usize,
@@ -1814,11 +2459,16 @@ impl<'a> LlvmFnGen<'a> {
         enum_variants: &'a BTreeMap<String, LlvmEnumVariantLayout>,
         fn_metas: &'a BTreeMap<String, LlvmFnMeta>,
         syscall_map: &'a BTreeMap<String, &'static str>,
+        layout_engine: &'a LayoutEngine,
+        extern_fns: &'a BTreeMap<String, ExternFnDecl>,
         dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
         vtable_ifaces: &'a BTreeMap<String, String>,
         string_globals: &'a mut Vec<(String, String)>,
         string_intern: &'a mut BTreeMap<String, String>,
         unit_enum_tags: &'a mut BTreeSet<i64>,
+        debug_sp_id: Option<u32>,
+        dbg_locs: &'a mut Vec<(u32, u32, u32, u32)>,
+        next_md_id: &'a mut u32,
     ) -> Self {
         Self {
             alias_bases,
@@ -1830,11 +2480,16 @@ impl<'a> LlvmFnGen<'a> {
             enum_variants,
             fn_metas,
             syscall_map,
+            layout_engine,
+            extern_fns,
             dyn_interfaces,
             vtable_ifaces,
             string_globals,
             string_intern,
             unit_enum_tags,
+            debug_sp_id,
+            dbg_locs,
+            next_md_id,
             tmp: 0,
             lbl: 0,
             slot_id: 0,
@@ -1961,14 +2616,1026 @@ impl<'a> LlvmFnGen<'a> {
         is_rc_type_expr(ty, self.alias_bases, self.record_names, self.enum_names)
     }
 
+    fn dbg_suffix(&mut self, span: Span) -> String {
+        if let Some(sp_id) = self.debug_sp_id {
+            let line = span.line.max(1) as u32;
+            let col = span.col.max(1) as u32;
+            let loc_id = *self.next_md_id;
+            *self.next_md_id += 1;
+            self.dbg_locs.push((loc_id, line, col, sp_id));
+            format!(", !dbg !{}", loc_id)
+        } else {
+            String::new()
+        }
+    }
+
     fn list_elem_ty(&self, ty: &TypeExpr) -> Option<TypeExpr> {
         let resolved = resolve_alias_ty(ty, self.alias_bases);
-        if let TypeExpr::Named { name, args, .. } = resolved {
-            if name == "List" && !args.is_empty() {
+        match resolved {
+            TypeExpr::Array { elem, .. } => Some(*elem),
+            TypeExpr::Named { name, args, .. } if name == "List" && !args.is_empty() => {
+                Some(args[0].clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn array_layout(&self, ty: &TypeExpr) -> Option<(TypeExpr, usize, usize, bool)> {
+        if let TypeExpr::Array { elem, len, .. } = resolve_alias_ty(ty, self.alias_bases) {
+            let is_rc = self.type_is_rc(&elem) && !self.is_c_value_type(&elem);
+            let stride = if is_rc {
+                8
+            } else {
+                self.layout_engine.size_and_align(&elem).0.max(1)
+            };
+            return Some((*elem, len, stride, is_rc));
+        }
+        None
+    }
+
+    fn is_c_value_type(&self, ty: &TypeExpr) -> bool {
+        match resolve_alias_ty(ty, self.alias_bases) {
+            TypeExpr::Named { name, .. } => self
+                .records
+                .get(&name)
+                .is_some_and(|r| r.c_layout.is_some()),
+            TypeExpr::Array { elem, .. } => !self.type_is_rc(&elem) || self.is_c_value_type(&elem),
+            _ => false,
+        }
+    }
+
+    fn ptr_pointee_ty(&self, ty: &TypeExpr) -> Option<TypeExpr> {
+        if let TypeExpr::Named { name, args, .. } = resolve_alias_ty(ty, self.alias_bases) {
+            if (name == "Ptr" || name == "MutPtr") && !args.is_empty() {
                 return Some(args[0].clone());
+            }
+            if name == "CStr" {
+                return Some(named_ty("UInt8"));
             }
         }
         None
+    }
+
+    fn scalar_kind_of_expr(&self, expr: &Expr) -> Option<ScalarKind> {
+        let ty = self.infer_expr_type(expr);
+        if let Some(sk) = scalar_kind_of_ty(&ty, self.alias_bases) {
+            return Some(sk);
+        }
+        match &expr.kind {
+            ExprKind::Float(_) => Some(ScalarKind::F64),
+            ExprKind::Cast { ty, .. } => scalar_kind_of_ty(ty, self.alias_bases),
+            ExprKind::Unary { op: UnOp::Neg | UnOp::BitNot, expr: inner } => {
+                self.scalar_kind_of_expr(inner)
+            }
+            ExprKind::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Mod
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr
+                ) =>
+            {
+                let lk = self.scalar_kind_of_expr(left);
+                let rk = self.scalar_kind_of_expr(right);
+                match (lk, rk) {
+                    (Some(ScalarKind::I64), Some(k)) if k != ScalarKind::I64 && matches!(left.kind, ExprKind::Int(_)) => Some(k),
+                    (Some(k), _) => Some(k),
+                    (None, k) => k,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn normalize_scalar(&mut self, val: &str, kind: ScalarKind) -> String {
+        match kind {
+            ScalarKind::I8 | ScalarKind::U8 | ScalarKind::I16 | ScalarKind::U16 | ScalarKind::I32 | ScalarKind::U32 => {
+                let ity = match kind {
+                    ScalarKind::I8 | ScalarKind::U8 => "i8",
+                    ScalarKind::I16 | ScalarKind::U16 => "i16",
+                    _ => "i32",
+                };
+                let ext = if kind.is_unsigned() { "zext" } else { "sext" };
+                let tr = self.fresh_tmp();
+                let ex = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to {}\n  {} = {} {} {} to i64\n",
+                    tr, val, ity, ex, ext, ity, tr
+                ));
+                ex
+            }
+            ScalarKind::I64 | ScalarKind::U64 | ScalarKind::F32 | ScalarKind::F64 => val.to_string(),
+        }
+    }
+
+    fn emit_mem_load(
+        &mut self,
+        base_ptr_i64: &str,
+        byte_off: i64,
+        ty: &TypeExpr,
+        volatile: bool,
+    ) -> Result<String, String> {
+        let resolved = resolve_alias_ty(ty, self.alias_bases);
+        let bp = self.fresh_tmp();
+        self.code
+            .push_str(&format!("  {} = inttoptr i64 {} to ptr\n", bp, base_ptr_i64));
+        let ptr = if byte_off == 0 {
+            bp
+        } else {
+            let gp = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = getelementptr inbounds i8, ptr {}, i64 {}\n",
+                gp, bp, byte_off
+            ));
+            gp
+        };
+        if self.is_c_value_type(&resolved) {
+            let (sz, _) = self.layout_engine.size_and_align(&resolved);
+            let obj = self.fresh_tmp();
+            let dst_i = self.fresh_tmp();
+            let dst_p = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  call void @llvm.memcpy.p0.p0.i64(ptr {}, ptr {}, i64 {}, i1 false)\n",
+                obj, sz, dst_i, obj, dst_p, dst_i, dst_p, ptr, sz
+            ));
+            return Ok(obj);
+        }
+        let vol = if volatile { "volatile " } else { "" };
+        let sk = scalar_kind_of_ty(&resolved, self.alias_bases);
+        let (ity, ext) = match sk {
+            Some(ScalarKind::I8) => ("i8", Some("sext")),
+            Some(ScalarKind::U8) => ("i8", Some("zext")),
+            Some(ScalarKind::I16) => ("i16", Some("sext")),
+            Some(ScalarKind::U16) => ("i16", Some("zext")),
+            Some(ScalarKind::I32) => ("i32", Some("sext")),
+            Some(ScalarKind::U32 | ScalarKind::F32) => ("i32", Some("zext")),
+            None if matches!(&resolved, TypeExpr::Named { name, .. } if name == "Bool") => {
+                ("i8", Some("zext"))
+            }
+            _ => ("i64", None),
+        };
+        let ld = self.fresh_tmp();
+        self.code.push_str(&format!(
+            "  {} = load {}{}, ptr {}, align 1\n",
+            ld, vol, ity, ptr
+        ));
+        if let Some(ex_op) = ext {
+            let out = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = {} {} {} to i64\n",
+                out, ex_op, ity, ld
+            ));
+            Ok(out)
+        } else {
+            Ok(ld)
+        }
+    }
+
+    fn emit_mem_store(
+        &mut self,
+        base_ptr_i64: &str,
+        byte_off: i64,
+        val_i64: &str,
+        ty: &TypeExpr,
+        volatile: bool,
+    ) -> Result<(), String> {
+        let resolved = resolve_alias_ty(ty, self.alias_bases);
+        let bp = self.fresh_tmp();
+        self.code
+            .push_str(&format!("  {} = inttoptr i64 {} to ptr\n", bp, base_ptr_i64));
+        let ptr = if byte_off == 0 {
+            bp
+        } else {
+            let gp = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = getelementptr inbounds i8, ptr {}, i64 {}\n",
+                gp, bp, byte_off
+            ));
+            gp
+        };
+        if self.is_c_value_type(&resolved) {
+            let (sz, _) = self.layout_engine.size_and_align(&resolved);
+            let src_i = self.fresh_tmp();
+            let src_p = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  call void @llvm.memcpy.p0.p0.i64(ptr {}, ptr {}, i64 {}, i1 false)\n",
+                src_i, val_i64, src_p, src_i, ptr, src_p, sz
+            ));
+            return Ok(());
+        }
+        let vol = if volatile { "volatile " } else { "" };
+        let sk = scalar_kind_of_ty(&resolved, self.alias_bases);
+        let ity = match sk {
+            Some(ScalarKind::I8 | ScalarKind::U8) => "i8",
+            Some(ScalarKind::I16 | ScalarKind::U16) => "i16",
+            Some(ScalarKind::I32 | ScalarKind::U32 | ScalarKind::F32) => "i32",
+            None if matches!(&resolved, TypeExpr::Named { name, .. } if name == "Bool") => "i8",
+            _ => "i64",
+        };
+        if ity == "i64" {
+            self.code.push_str(&format!(
+                "  store {}i64 {}, ptr {}, align 1\n",
+                vol, val_i64, ptr
+            ));
+        } else {
+            let tr = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = trunc i64 {} to {}\n  store {}{} {}, ptr {}, align 1\n",
+                tr, val_i64, ity, vol, ity, tr, ptr
+            ));
+        }
+        Ok(())
+    }
+
+    fn emit_cast(&mut self, val: &str, src_ty: &TypeExpr, dst_ty: &TypeExpr) -> String {
+        let src_base = resolve_alias_ty(src_ty, self.alias_bases);
+        let dst_base = resolve_alias_ty(dst_ty, self.alias_bases);
+        let src_sk = scalar_kind_of_ty(&src_base, self.alias_bases);
+        let dst_sk = scalar_kind_of_ty(&dst_base, self.alias_bases);
+
+        if matches!(&dst_base, TypeExpr::Named { name, .. } if name == "Bool") {
+            let c = self.fresh_tmp();
+            let z = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = icmp ne i64 {}, 0\n  {} = zext i1 {} to i64\n",
+                c, val, z, c
+            ));
+            return z;
+        }
+        match (src_sk, dst_sk) {
+            (Some(ScalarKind::F64), Some(ScalarKind::F32)) => {
+                let d = self.fresh_tmp();
+                let f = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                let z = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = bitcast i64 {} to double\n  {} = fptrunc double {} to float\n  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                    d, val, f, d, b, f, z, b
+                ));
+                z
+            }
+            (Some(ScalarKind::F32), Some(ScalarKind::F64)) => {
+                let t = self.fresh_tmp();
+                let f = self.fresh_tmp();
+                let d = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n  {} = fpext float {} to double\n  {} = bitcast double {} to i64\n",
+                    t, val, f, t, d, f, b, d
+                ));
+                b
+            }
+            (Some(ScalarKind::F64), Some(dk)) if dk.is_int() => {
+                let d = self.fresh_tmp();
+                let i = self.fresh_tmp();
+                let op = if dk.is_unsigned() { "fptoui" } else { "fptosi" };
+                self.code.push_str(&format!(
+                    "  {} = bitcast i64 {} to double\n  {} = {} double {} to i64\n",
+                    d, val, i, op, d
+                ));
+                self.normalize_scalar(&i, dk)
+            }
+            (Some(ScalarKind::F32), Some(dk)) if dk.is_int() => {
+                let t = self.fresh_tmp();
+                let f = self.fresh_tmp();
+                let i = self.fresh_tmp();
+                let op = if dk.is_unsigned() { "fptoui" } else { "fptosi" };
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n  {} = {} float {} to i64\n",
+                    t, val, f, t, i, op, f
+                ));
+                self.normalize_scalar(&i, dk)
+            }
+            (sk, Some(ScalarKind::F64)) if sk != Some(ScalarKind::F64) => {
+                let d = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                let op = if sk.is_some_and(|k| k.is_unsigned()) { "uitofp" } else { "sitofp" };
+                self.code.push_str(&format!(
+                    "  {} = {} i64 {} to double\n  {} = bitcast double {} to i64\n",
+                    d, op, val, b, d
+                ));
+                b
+            }
+            (sk, Some(ScalarKind::F32)) if sk != Some(ScalarKind::F32) => {
+                let f = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                let z = self.fresh_tmp();
+                let op = if sk.is_some_and(|k| k.is_unsigned()) { "uitofp" } else { "sitofp" };
+                self.code.push_str(&format!(
+                    "  {} = {} i64 {} to float\n  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                    f, op, val, b, f, z, b
+                ));
+                z
+            }
+            (_, Some(dk)) => self.normalize_scalar(val, dk),
+            _ => val.to_string(),
+        }
+    }
+
+    fn emit_extern_c_call(
+        &mut self,
+        ef: &ExternFnDecl,
+        args: &[CallArg],
+    ) -> Result<String, String> {
+        let mut temps = Vec::new();
+        let mut c_args = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let raw = self.lower_expr_borrowed(&a.value, &mut temps)?;
+            let cty = if let Some(p) = ef.params.get(i) {
+                llvm_c_abi_type(&p.ty, self.alias_bases)
+            } else {
+                // Variadic extra argument: promote C default promotions
+                let aty = self.infer_expr_type(&a.value);
+                match llvm_c_abi_type(&aty, self.alias_bases) {
+                    "float" => "double",
+                    "i8" | "i16" | "i1" => "i32",
+                    other => other,
+                }
+            };
+            let cv = match cty {
+                "i8" | "i16" | "i32" => {
+                    let t = self.fresh_tmp();
+                    self.code.push_str(&format!("  {} = trunc i64 {} to {}\n", t, raw, cty));
+                    t
+                }
+                "i1" => {
+                    let t = self.fresh_tmp();
+                    self.code.push_str(&format!("  {} = icmp ne i64 {}, 0\n", t, raw));
+                    t
+                }
+                "float" => {
+                    let t = self.fresh_tmp();
+                    let f = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n",
+                        t, raw, f, t
+                    ));
+                    f
+                }
+                "double" => {
+                    let d = self.fresh_tmp();
+                    self.code.push_str(&format!("  {} = bitcast i64 {} to double\n", d, raw));
+                    d
+                }
+                "ptr" => {
+                    let p = self.fresh_tmp();
+                    self.code.push_str(&format!("  {} = inttoptr i64 {} to ptr\n", p, raw));
+                    p
+                }
+                _ => raw,
+            };
+            c_args.push(format!("{} {}", cty, cv));
+        }
+        let ret_llvm = match &ef.ret_ty {
+            Some(rt) => llvm_c_abi_type(rt, self.alias_bases),
+            None => "void",
+        };
+        let sig_str = if ef.is_variadic {
+            let mut ps: Vec<&str> = ef
+                .params
+                .iter()
+                .map(|p| llvm_c_abi_type(&p.ty, self.alias_bases))
+                .collect();
+            ps.push("...");
+            format!("{} ({})", ret_llvm, ps.join(", "))
+        } else {
+            ret_llvm.to_string()
+        };
+        let out = if ret_llvm == "void" {
+            self.code.push_str(&format!(
+                "  call {} @{}({})\n",
+                sig_str,
+                ef.name,
+                c_args.join(", ")
+            ));
+            "0".to_string()
+        } else {
+            let rv = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = call {} @{}({})\n",
+                rv,
+                sig_str,
+                ef.name,
+                c_args.join(", ")
+            ));
+            let sk = ef
+                .ret_ty
+                .as_ref()
+                .and_then(|t| scalar_kind_of_ty(t, self.alias_bases));
+            match ret_llvm {
+                "i8" | "i16" | "i32" => {
+                    let ext = if sk.is_some_and(|k| k.is_unsigned()) { "zext" } else { "sext" };
+                    let o = self.fresh_tmp();
+                    self.code.push_str(&format!("  {} = {} {} {} to i64\n", o, ext, ret_llvm, rv));
+                    o
+                }
+                "i1" => {
+                    let o = self.fresh_tmp();
+                    self.code.push_str(&format!("  {} = zext i1 {} to i64\n", o, rv));
+                    o
+                }
+                "float" => {
+                    let b = self.fresh_tmp();
+                    let o = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                        b, rv, o, b
+                    ));
+                    o
+                }
+                "double" => {
+                    let o = self.fresh_tmp();
+                    self.code.push_str(&format!("  {} = bitcast double {} to i64\n", o, rv));
+                    o
+                }
+                "ptr" => {
+                    let o = self.fresh_tmp();
+                    self.code.push_str(&format!("  {} = ptrtoint ptr {} to i64\n", o, rv));
+                    o
+                }
+                _ => rv,
+            }
+        };
+        self.flush_temps(&temps);
+        Ok(out)
+    }
+
+    /// Native LLVM SIMD Vector IR emitter (`<4 x float>`, `<4 x double>`, `<4 x i32>`, `<4 x i64>`, `<16 x i8>`).
+    fn try_emit_simd_builtin(
+        &mut self,
+        fname: &str,
+        args: &[CallArg],
+        expected_ty: Option<&TypeExpr>,
+    ) -> Result<Option<String>, String> {
+        if !fname.starts_with("simd_") {
+            return Ok(None);
+        }
+        let mut temps = Vec::new();
+        let alloc_vec = |cg: &mut Self, bytes: usize| -> (String, String) {
+            let obj = cg.fresh_tmp();
+            let di = cg.fresh_tmp();
+            let dp = cg.fresh_tmp();
+            cg.code.push_str(&format!(
+                "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n",
+                obj, bytes, di, obj, dp, di
+            ));
+            (obj, dp)
+        };
+        let load_vec = |cg: &mut Self, h: &str, vty: &str| -> String {
+            let di = cg.fresh_tmp();
+            let dp = cg.fresh_tmp();
+            let v = cg.fresh_tmp();
+            cg.code.push_str(&format!(
+                "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  {} = load {}, ptr {}, align 8\n",
+                di, h, dp, di, v, vty, dp
+            ));
+            v
+        };
+
+        let out = match fname {
+            "simd_f32x4_new" if args.len() == 4 => {
+                let mut fs = Vec::new();
+                for a in args {
+                    let raw = self.lower_expr_borrowed(&a.value, &mut temps)?;
+                    let t = self.fresh_tmp();
+                    let f = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n",
+                        t, raw, f, t
+                    ));
+                    fs.push(f);
+                }
+                let (obj, dp) = alloc_vec(self, 16);
+                let v0 = self.fresh_tmp();
+                let v1 = self.fresh_tmp();
+                let v2 = self.fresh_tmp();
+                let v3 = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = insertelement <4 x float> undef, float {}, i32 0\n  {} = insertelement <4 x float> {}, float {}, i32 1\n  {} = insertelement <4 x float> {}, float {}, i32 2\n  {} = insertelement <4 x float> {}, float {}, i32 3\n  store <4 x float> {}, ptr {}, align 8\n",
+                    v0, fs[0], v1, v0, fs[1], v2, v1, fs[2], v3, v2, fs[3], v3, dp
+                ));
+                obj
+            }
+            "simd_f32x4_splat" if args.len() == 1 => {
+                let raw = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let t = self.fresh_tmp();
+                let f = self.fresh_tmp();
+                let v0 = self.fresh_tmp();
+                let vs = self.fresh_tmp();
+                let (obj, dp) = alloc_vec(self, 16);
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n  {} = insertelement <4 x float> undef, float {}, i32 0\n  {} = shufflevector <4 x float> {}, <4 x float> undef, <4 x i32> zeroinitializer\n  store <4 x float> {}, ptr {}, align 8\n",
+                    t, raw, f, t, v0, f, vs, v0, vs, dp
+                ));
+                obj
+            }
+            "simd_f32x4_lane" if args.len() == 2 => {
+                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let v = load_vec(self, &vh, "<4 x float>");
+                let i32x = self.fresh_tmp();
+                let f = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                let z = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = extractelement <4 x float> {}, i32 {}\n  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                    i32x, idx, f, v, i32x, b, f, z, b
+                ));
+                z
+            }
+            "simd_f32x4_binop" if args.len() == 3 => {
+                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let va = load_vec(self, &ah, "<4 x float>");
+                let vb = load_vec(self, &bh, "<4 x float>");
+                let (obj, dp) = alloc_vec(self, 16);
+                let op_const = match &args[2].value.kind {
+                    ExprKind::Int(n) => Some(*n),
+                    _ => None,
+                };
+                let res = self.fresh_tmp();
+                match op_const {
+                    Some(0) => self.code.push_str(&format!("  {} = fadd <4 x float> {}, {}\n", res, va, vb)),
+                    Some(1) => self.code.push_str(&format!("  {} = fsub <4 x float> {}, {}\n", res, va, vb)),
+                    Some(2) => self.code.push_str(&format!("  {} = fmul <4 x float> {}, {}\n", res, va, vb)),
+                    Some(3) => self.code.push_str(&format!("  {} = fdiv <4 x float> {}, {}\n", res, va, vb)),
+                    Some(4) => self.code.push_str(&format!("  {} = call <4 x float> @llvm.minnum.v4f32(<4 x float> {}, <4 x float> {})\n", res, va, vb)),
+                    Some(_) => self.code.push_str(&format!("  {} = call <4 x float> @llvm.maxnum.v4f32(<4 x float> {}, <4 x float> {})\n", res, va, vb)),
+                    None => {
+                        let opv = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                        let r0 = self.fresh_tmp();
+                        let r1 = self.fresh_tmp();
+                        let r2 = self.fresh_tmp();
+                        let r3 = self.fresh_tmp();
+                        let r4 = self.fresh_tmp();
+                        let r5 = self.fresh_tmp();
+                        let c0 = self.fresh_tmp();
+                        let c1 = self.fresh_tmp();
+                        let c2 = self.fresh_tmp();
+                        let c3 = self.fresh_tmp();
+                        let c4 = self.fresh_tmp();
+                        let s1 = self.fresh_tmp();
+                        let s2 = self.fresh_tmp();
+                        let s3 = self.fresh_tmp();
+                        let s4 = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = fadd <4 x float> {}, {}\n  {} = fsub <4 x float> {}, {}\n  {} = fmul <4 x float> {}, {}\n  {} = fdiv <4 x float> {}, {}\n  {} = call <4 x float> @llvm.minnum.v4f32(<4 x float> {}, <4 x float> {})\n  {} = call <4 x float> @llvm.maxnum.v4f32(<4 x float> {}, <4 x float> {})\n  {} = icmp eq i64 {}, 0\n  {} = icmp eq i64 {}, 1\n  {} = icmp eq i64 {}, 2\n  {} = icmp eq i64 {}, 3\n  {} = icmp eq i64 {}, 4\n  {} = select i1 {}, <4 x float> {}, <4 x float> {}\n  {} = select i1 {}, <4 x float> {}, <4 x float> {}\n  {} = select i1 {}, <4 x float> {}, <4 x float> {}\n  {} = select i1 {}, <4 x float> {}, <4 x float> {}\n  {} = select i1 {}, <4 x float> {}, <4 x float> {}\n",
+                            r0, va, vb, r1, va, vb, r2, va, vb, r3, va, vb, r4, va, vb, r5, va, vb,
+                            c0, opv, c1, opv, c2, opv, c3, opv, c4, opv,
+                            s1, c4, r4, r5, s2, c3, r3, s1, s3, c2, r2, s2, s4, c1, r1, s3, res, c0, r0, s4
+                        ));
+                    }
+                }
+                self.code.push_str(&format!("  store <4 x float> {}, ptr {}, align 8\n", res, dp));
+                obj
+            }
+            "simd_f32x4_fma" if args.len() == 3 => {
+                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let ch = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                let va = load_vec(self, &ah, "<4 x float>");
+                let vb = load_vec(self, &bh, "<4 x float>");
+                let vc = load_vec(self, &ch, "<4 x float>");
+                let (obj, dp) = alloc_vec(self, 16);
+                let res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call <4 x float> @llvm.fma.v4f32(<4 x float> {}, <4 x float> {}, <4 x float> {})\n  store <4 x float> {}, ptr {}, align 8\n",
+                    res, va, vb, vc, res, dp
+                ));
+                obj
+            }
+            "simd_f32x4_reduce_sum" if args.len() == 1 => {
+                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let v = load_vec(self, &vh, "<4 x float>");
+                let sum = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                let z = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call float @llvm.vector.reduce.fadd.v4f32(float -0.0, <4 x float> {})\n  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                    sum, v, b, sum, z, b
+                ));
+                z
+            }
+            "simd_f32x4_dot" if args.len() == 2 => {
+                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let va = load_vec(self, &ah, "<4 x float>");
+                let vb = load_vec(self, &bh, "<4 x float>");
+                let prod = self.fresh_tmp();
+                let sum = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                let z = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = fmul <4 x float> {}, {}\n  {} = call float @llvm.vector.reduce.fadd.v4f32(float -0.0, <4 x float> {})\n  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                    prod, va, vb, sum, prod, b, sum, z, b
+                ));
+                z
+            }
+            "simd_f64x4_new" if args.len() == 4 => {
+                let mut ds = Vec::new();
+                for a in args {
+                    let raw = self.lower_expr_borrowed(&a.value, &mut temps)?;
+                    let d = self.fresh_tmp();
+                    self.code.push_str(&format!("  {} = bitcast i64 {} to double\n", d, raw));
+                    ds.push(d);
+                }
+                let (obj, dp) = alloc_vec(self, 32);
+                let v0 = self.fresh_tmp();
+                let v1 = self.fresh_tmp();
+                let v2 = self.fresh_tmp();
+                let v3 = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = insertelement <4 x double> undef, double {}, i32 0\n  {} = insertelement <4 x double> {}, double {}, i32 1\n  {} = insertelement <4 x double> {}, double {}, i32 2\n  {} = insertelement <4 x double> {}, double {}, i32 3\n  store <4 x double> {}, ptr {}, align 8\n",
+                    v0, ds[0], v1, v0, ds[1], v2, v1, ds[2], v3, v2, ds[3], v3, dp
+                ));
+                obj
+            }
+            "simd_f64x4_splat" if args.len() == 1 => {
+                let raw = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let d = self.fresh_tmp();
+                let v0 = self.fresh_tmp();
+                let vs = self.fresh_tmp();
+                let (obj, dp) = alloc_vec(self, 32);
+                self.code.push_str(&format!(
+                    "  {} = bitcast i64 {} to double\n  {} = insertelement <4 x double> undef, double {}, i32 0\n  {} = shufflevector <4 x double> {}, <4 x double> undef, <4 x i32> zeroinitializer\n  store <4 x double> {}, ptr {}, align 8\n",
+                    d, raw, v0, d, vs, v0, vs, dp
+                ));
+                obj
+            }
+            "simd_f64x4_lane" if args.len() == 2 => {
+                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let v = load_vec(self, &vh, "<4 x double>");
+                let i32x = self.fresh_tmp();
+                let d = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = extractelement <4 x double> {}, i32 {}\n  {} = bitcast double {} to i64\n",
+                    i32x, idx, d, v, i32x, b, d
+                ));
+                b
+            }
+            "simd_f64x4_binop" if args.len() == 3 => {
+                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let va = load_vec(self, &ah, "<4 x double>");
+                let vb = load_vec(self, &bh, "<4 x double>");
+                let (obj, dp) = alloc_vec(self, 32);
+                let op_const = match &args[2].value.kind {
+                    ExprKind::Int(n) => Some(*n),
+                    _ => None,
+                };
+                let res = self.fresh_tmp();
+                match op_const {
+                    Some(0) => self.code.push_str(&format!("  {} = fadd <4 x double> {}, {}\n", res, va, vb)),
+                    Some(1) => self.code.push_str(&format!("  {} = fsub <4 x double> {}, {}\n", res, va, vb)),
+                    Some(2) => self.code.push_str(&format!("  {} = fmul <4 x double> {}, {}\n", res, va, vb)),
+                    Some(3) => self.code.push_str(&format!("  {} = fdiv <4 x double> {}, {}\n", res, va, vb)),
+                    Some(4) => self.code.push_str(&format!("  {} = call <4 x double> @llvm.minnum.v4f64(<4 x double> {}, <4 x double> {})\n", res, va, vb)),
+                    Some(_) => self.code.push_str(&format!("  {} = call <4 x double> @llvm.maxnum.v4f64(<4 x double> {}, <4 x double> {})\n", res, va, vb)),
+                    None => {
+                        let opv = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                        let r0 = self.fresh_tmp();
+                        let r1 = self.fresh_tmp();
+                        let r2 = self.fresh_tmp();
+                        let r3 = self.fresh_tmp();
+                        let r4 = self.fresh_tmp();
+                        let r5 = self.fresh_tmp();
+                        let c0 = self.fresh_tmp();
+                        let c1 = self.fresh_tmp();
+                        let c2 = self.fresh_tmp();
+                        let c3 = self.fresh_tmp();
+                        let c4 = self.fresh_tmp();
+                        let s1 = self.fresh_tmp();
+                        let s2 = self.fresh_tmp();
+                        let s3 = self.fresh_tmp();
+                        let s4 = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = fadd <4 x double> {}, {}\n  {} = fsub <4 x double> {}, {}\n  {} = fmul <4 x double> {}, {}\n  {} = fdiv <4 x double> {}, {}\n  {} = call <4 x double> @llvm.minnum.v4f64(<4 x double> {}, <4 x double> {})\n  {} = call <4 x double> @llvm.maxnum.v4f64(<4 x double> {}, <4 x double> {})\n  {} = icmp eq i64 {}, 0\n  {} = icmp eq i64 {}, 1\n  {} = icmp eq i64 {}, 2\n  {} = icmp eq i64 {}, 3\n  {} = icmp eq i64 {}, 4\n  {} = select i1 {}, <4 x double> {}, <4 x double> {}\n  {} = select i1 {}, <4 x double> {}, <4 x double> {}\n  {} = select i1 {}, <4 x double> {}, <4 x double> {}\n  {} = select i1 {}, <4 x double> {}, <4 x double> {}\n  {} = select i1 {}, <4 x double> {}, <4 x double> {}\n",
+                            r0, va, vb, r1, va, vb, r2, va, vb, r3, va, vb, r4, va, vb, r5, va, vb,
+                            c0, opv, c1, opv, c2, opv, c3, opv, c4, opv,
+                            s1, c4, r4, r5, s2, c3, r3, s1, s3, c2, r2, s2, s4, c1, r1, s3, res, c0, r0, s4
+                        ));
+                    }
+                }
+                self.code.push_str(&format!("  store <4 x double> {}, ptr {}, align 8\n", res, dp));
+                obj
+            }
+            "simd_f64x4_fma" if args.len() == 3 => {
+                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let ch = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                let va = load_vec(self, &ah, "<4 x double>");
+                let vb = load_vec(self, &bh, "<4 x double>");
+                let vc = load_vec(self, &ch, "<4 x double>");
+                let (obj, dp) = alloc_vec(self, 32);
+                let res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call <4 x double> @llvm.fma.v4f64(<4 x double> {}, <4 x double> {}, <4 x double> {})\n  store <4 x double> {}, ptr {}, align 8\n",
+                    res, va, vb, vc, res, dp
+                ));
+                obj
+            }
+            "simd_f64x4_reduce_sum" if args.len() == 1 => {
+                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let v = load_vec(self, &vh, "<4 x double>");
+                let sum = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call double @llvm.vector.reduce.fadd.v4f64(double -0.0, <4 x double> {})\n  {} = bitcast double {} to i64\n",
+                    sum, v, b, sum
+                ));
+                b
+            }
+            "simd_f64x4_dot" if args.len() == 2 => {
+                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let va = load_vec(self, &ah, "<4 x double>");
+                let vb = load_vec(self, &bh, "<4 x double>");
+                let prod = self.fresh_tmp();
+                let sum = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = fmul <4 x double> {}, {}\n  {} = call double @llvm.vector.reduce.fadd.v4f64(double -0.0, <4 x double> {})\n  {} = bitcast double {} to i64\n",
+                    prod, va, vb, sum, prod, b, sum
+                ));
+                b
+            }
+            "simd_i32x4_new" if args.len() == 4 => {
+                let mut vs = Vec::new();
+                for a in args {
+                    let raw = self.lower_expr_borrowed(&a.value, &mut temps)?;
+                    let t = self.fresh_tmp();
+                    self.code.push_str(&format!("  {} = trunc i64 {} to i32\n", t, raw));
+                    vs.push(t);
+                }
+                let (obj, dp) = alloc_vec(self, 16);
+                let v0 = self.fresh_tmp();
+                let v1 = self.fresh_tmp();
+                let v2 = self.fresh_tmp();
+                let v3 = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = insertelement <4 x i32> undef, i32 {}, i32 0\n  {} = insertelement <4 x i32> {}, i32 {}, i32 1\n  {} = insertelement <4 x i32> {}, i32 {}, i32 2\n  {} = insertelement <4 x i32> {}, i32 {}, i32 3\n  store <4 x i32> {}, ptr {}, align 8\n",
+                    v0, vs[0], v1, v0, vs[1], v2, v1, vs[2], v3, v2, vs[3], v3, dp
+                ));
+                obj
+            }
+            "simd_i32x4_splat" if args.len() == 1 => {
+                let raw = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let t = self.fresh_tmp();
+                let v0 = self.fresh_tmp();
+                let vs = self.fresh_tmp();
+                let (obj, dp) = alloc_vec(self, 16);
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = insertelement <4 x i32> undef, i32 {}, i32 0\n  {} = shufflevector <4 x i32> {}, <4 x i32> undef, <4 x i32> zeroinitializer\n  store <4 x i32> {}, ptr {}, align 8\n",
+                    t, raw, v0, t, vs, v0, vs, dp
+                ));
+                obj
+            }
+            "simd_i32x4_lane" if args.len() == 2 => {
+                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let v = load_vec(self, &vh, "<4 x i32>");
+                let i32x = self.fresh_tmp();
+                let el = self.fresh_tmp();
+                let ex = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = extractelement <4 x i32> {}, i32 {}\n  {} = sext i32 {} to i64\n",
+                    i32x, idx, el, v, i32x, ex, el
+                ));
+                ex
+            }
+            "simd_i32x4_binop" if args.len() == 3 => {
+                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let va = load_vec(self, &ah, "<4 x i32>");
+                let vb = load_vec(self, &bh, "<4 x i32>");
+                let (obj, dp) = alloc_vec(self, 16);
+                let op_const = match &args[2].value.kind {
+                    ExprKind::Int(n) => Some(*n),
+                    _ => None,
+                };
+                let res = self.fresh_tmp();
+                match op_const {
+                    Some(0) => self.code.push_str(&format!("  {} = add <4 x i32> {}, {}\n", res, va, vb)),
+                    Some(1) => self.code.push_str(&format!("  {} = sub <4 x i32> {}, {}\n", res, va, vb)),
+                    Some(_) => self.code.push_str(&format!("  {} = mul <4 x i32> {}, {}\n", res, va, vb)),
+                    None => {
+                        let opv = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                        let r0 = self.fresh_tmp();
+                        let r1 = self.fresh_tmp();
+                        let r2 = self.fresh_tmp();
+                        let c0 = self.fresh_tmp();
+                        let c1 = self.fresh_tmp();
+                        let s1 = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = add <4 x i32> {}, {}\n  {} = sub <4 x i32> {}, {}\n  {} = mul <4 x i32> {}, {}\n  {} = icmp eq i64 {}, 0\n  {} = icmp eq i64 {}, 1\n  {} = select i1 {}, <4 x i32> {}, <4 x i32> {}\n  {} = select i1 {}, <4 x i32> {}, <4 x i32> {}\n",
+                            r0, va, vb, r1, va, vb, r2, va, vb, c0, opv, c1, opv, s1, c1, r1, r2, res, c0, r0, s1
+                        ));
+                    }
+                }
+                self.code.push_str(&format!("  store <4 x i32> {}, ptr {}, align 8\n", res, dp));
+                obj
+            }
+            "simd_i32x4_reduce_sum" if args.len() == 1 => {
+                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let v = load_vec(self, &vh, "<4 x i32>");
+                let sum = self.fresh_tmp();
+                let ex = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> {})\n  {} = sext i32 {} to i64\n",
+                    sum, v, ex, sum
+                ));
+                ex
+            }
+            "simd_i64x4_new" if args.len() == 4 => {
+                let mut vs = Vec::new();
+                for a in args {
+                    vs.push(self.lower_expr_borrowed(&a.value, &mut temps)?);
+                }
+                let (obj, dp) = alloc_vec(self, 32);
+                let v0 = self.fresh_tmp();
+                let v1 = self.fresh_tmp();
+                let v2 = self.fresh_tmp();
+                let v3 = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = insertelement <4 x i64> undef, i64 {}, i32 0\n  {} = insertelement <4 x i64> {}, i64 {}, i32 1\n  {} = insertelement <4 x i64> {}, i64 {}, i32 2\n  {} = insertelement <4 x i64> {}, i64 {}, i32 3\n  store <4 x i64> {}, ptr {}, align 8\n",
+                    v0, vs[0], v1, v0, vs[1], v2, v1, vs[2], v3, v2, vs[3], v3, dp
+                ));
+                obj
+            }
+            "simd_i64x4_splat" if args.len() == 1 => {
+                let raw = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let v0 = self.fresh_tmp();
+                let vs = self.fresh_tmp();
+                let (obj, dp) = alloc_vec(self, 32);
+                self.code.push_str(&format!(
+                    "  {} = insertelement <4 x i64> undef, i64 {}, i32 0\n  {} = shufflevector <4 x i64> {}, <4 x i64> undef, <4 x i32> zeroinitializer\n  store <4 x i64> {}, ptr {}, align 8\n",
+                    v0, raw, vs, v0, vs, dp
+                ));
+                obj
+            }
+            "simd_i64x4_lane" if args.len() == 2 => {
+                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let v = load_vec(self, &vh, "<4 x i64>");
+                let i32x = self.fresh_tmp();
+                let el = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = extractelement <4 x i64> {}, i32 {}\n",
+                    i32x, idx, el, v, i32x
+                ));
+                el
+            }
+            "simd_i64x4_binop" if args.len() == 3 => {
+                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let va = load_vec(self, &ah, "<4 x i64>");
+                let vb = load_vec(self, &bh, "<4 x i64>");
+                let (obj, dp) = alloc_vec(self, 32);
+                let op_const = match &args[2].value.kind {
+                    ExprKind::Int(n) => Some(*n),
+                    _ => None,
+                };
+                let res = self.fresh_tmp();
+                match op_const {
+                    Some(0) => self.code.push_str(&format!("  {} = add <4 x i64> {}, {}\n", res, va, vb)),
+                    Some(1) => self.code.push_str(&format!("  {} = sub <4 x i64> {}, {}\n", res, va, vb)),
+                    Some(_) => self.code.push_str(&format!("  {} = mul <4 x i64> {}, {}\n", res, va, vb)),
+                    None => {
+                        let opv = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                        let r0 = self.fresh_tmp();
+                        let r1 = self.fresh_tmp();
+                        let r2 = self.fresh_tmp();
+                        let c0 = self.fresh_tmp();
+                        let c1 = self.fresh_tmp();
+                        let s1 = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = add <4 x i64> {}, {}\n  {} = sub <4 x i64> {}, {}\n  {} = mul <4 x i64> {}, {}\n  {} = icmp eq i64 {}, 0\n  {} = icmp eq i64 {}, 1\n  {} = select i1 {}, <4 x i64> {}, <4 x i64> {}\n  {} = select i1 {}, <4 x i64> {}, <4 x i64> {}\n",
+                            r0, va, vb, r1, va, vb, r2, va, vb, c0, opv, c1, opv, s1, c1, r1, r2, res, c0, r0, s1
+                        ));
+                    }
+                }
+                self.code.push_str(&format!("  store <4 x i64> {}, ptr {}, align 8\n", res, dp));
+                obj
+            }
+            "simd_i64x4_reduce_sum" if args.len() == 1 => {
+                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let v = load_vec(self, &vh, "<4 x i64>");
+                let sum = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @llvm.vector.reduce.add.v4i64(<4 x i64> {})\n",
+                    sum, v
+                ));
+                sum
+            }
+            "simd_u8x16_splat" if args.len() == 1 => {
+                let raw = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let t = self.fresh_tmp();
+                let v0 = self.fresh_tmp();
+                let vs = self.fresh_tmp();
+                let (obj, dp) = alloc_vec(self, 16);
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i8\n  {} = insertelement <16 x i8> undef, i8 {}, i32 0\n  {} = shufflevector <16 x i8> {}, <16 x i8> undef, <16 x i32> zeroinitializer\n  store <16 x i8> {}, ptr {}, align 8\n",
+                    t, raw, v0, t, vs, v0, vs, dp
+                ));
+                obj
+            }
+            "simd_u8x16_lane" if args.len() == 2 => {
+                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let v = load_vec(self, &vh, "<16 x i8>");
+                let i32x = self.fresh_tmp();
+                let el = self.fresh_tmp();
+                let ex = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = extractelement <16 x i8> {}, i32 {}\n  {} = zext i8 {} to i64\n",
+                    i32x, idx, el, v, i32x, ex, el
+                ));
+                ex
+            }
+            "simd_u8x16_set_lane" if args.len() == 3 => {
+                let vh = self.lower_expr_owned(&args[0].value, expected_ty)?;
+                let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let val = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                let uniq = self.fresh_tmp();
+                let di = self.fresh_tmp();
+                let dp = self.fresh_tmp();
+                let ep = self.fresh_tmp();
+                let b8 = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 {}\n  {} = trunc i64 {} to i8\n  store i8 {}, ptr {}, align 1\n",
+                    uniq, vh, di, uniq, dp, di, ep, dp, idx, b8, val, b8, ep
+                ));
+                uniq
+            }
+            "simd_u8x16_binop" if args.len() == 3 => {
+                let ah = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let bh = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                let va = load_vec(self, &ah, "<16 x i8>");
+                let vb = load_vec(self, &bh, "<16 x i8>");
+                let (obj, dp) = alloc_vec(self, 16);
+                let op_const = match &args[2].value.kind {
+                    ExprKind::Int(n) => Some(*n),
+                    _ => None,
+                };
+                let res = self.fresh_tmp();
+                match op_const {
+                    Some(0) => self.code.push_str(&format!("  {} = add <16 x i8> {}, {}\n", res, va, vb)),
+                    Some(1) => self.code.push_str(&format!("  {} = sub <16 x i8> {}, {}\n", res, va, vb)),
+                    Some(_) => self.code.push_str(&format!("  {} = xor <16 x i8> {}, {}\n", res, va, vb)),
+                    None => {
+                        let opv = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                        let r0 = self.fresh_tmp();
+                        let r1 = self.fresh_tmp();
+                        let r2 = self.fresh_tmp();
+                        let c0 = self.fresh_tmp();
+                        let c1 = self.fresh_tmp();
+                        let s1 = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = add <16 x i8> {}, {}\n  {} = sub <16 x i8> {}, {}\n  {} = xor <16 x i8> {}, {}\n  {} = icmp eq i64 {}, 0\n  {} = icmp eq i64 {}, 1\n  {} = select i1 {}, <16 x i8> {}, <16 x i8> {}\n  {} = select i1 {}, <16 x i8> {}, <16 x i8> {}\n",
+                            r0, va, vb, r1, va, vb, r2, va, vb, c0, opv, c1, opv, s1, c1, r1, r2, res, c0, r0, s1
+                        ));
+                    }
+                }
+                self.code.push_str(&format!("  store <16 x i8> {}, ptr {}, align 8\n", res, dp));
+                obj
+            }
+            "simd_u8x16_reduce_sum" if args.len() == 1 => {
+                let vh = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                let v = load_vec(self, &vh, "<16 x i8>");
+                let ext = self.fresh_tmp();
+                // Zero-extend <16 x i8> -> <16 x i32> so sum doesn't wrap at 255!
+                let sum32 = self.fresh_tmp();
+                let sum64 = self.fresh_tmp();
+                let mut acc = "0".to_string();
+                self.code.push_str(&format!("  {} = zext <16 x i8> {} to <16 x i32>\n", ext, v));
+                for lane in 0..16 {
+                    let el = self.fresh_tmp();
+                    let nxt = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = extractelement <16 x i32> {}, i32 {}\n  {} = add i32 {}, {}\n",
+                        el, ext, lane, nxt, acc, el
+                    ));
+                    acc = nxt;
+                }
+                self.code.push_str(&format!(
+                    "  {} = add i32 {}, 0\n  {} = zext i32 {} to i64\n",
+                    sum32, acc, sum64, sum32
+                ));
+                sum64
+            }
+            _ => return Ok(None),
+        };
+        self.flush_temps(&temps);
+        Ok(Some(out))
     }
 
     fn infer_expr_type(&self, expr: &Expr) -> TypeExpr {
@@ -2017,15 +3684,32 @@ impl<'a> LlvmFnGen<'a> {
                 }
                 named_ty("Any")
             }
+            ExprKind::Cast { ty, .. } => ty.clone(),
+            ExprKind::ArrayRepeat { value, len } => TypeExpr::Array {
+                elem: Box::new(self.infer_expr_type_with(value, extra_vars)),
+                len: *len,
+                span: expr.span,
+            },
+            ExprKind::Unsafe(b) => self.infer_block_type_with(b, extra_vars),
             ExprKind::Binary { op: BinOp::Concat, .. } => named_ty("Text"),
             ExprKind::Binary {
                 op: BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or,
                 ..
             } => named_ty("Bool"),
             ExprKind::Binary { op, left, right } => {
-                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
-                    && (is_float_type_expr(&self.infer_expr_type_with(left, extra_vars), self.alias_bases)
-                        || is_float_type_expr(&self.infer_expr_type_with(right, extra_vars), self.alias_bases))
+                let lt = self.infer_expr_type_with(left, extra_vars);
+                let rt = self.infer_expr_type_with(right, extra_vars);
+                if matches!(left.kind, ExprKind::Int(_) | ExprKind::Float(_))
+                    && scalar_kind_of_ty(&rt, self.alias_bases).is_some()
+                {
+                    rt
+                } else if scalar_kind_of_ty(&lt, self.alias_bases).is_some() {
+                    lt
+                } else if scalar_kind_of_ty(&rt, self.alias_bases).is_some() {
+                    rt
+                } else if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
+                    && (is_float_type_expr(&lt, self.alias_bases)
+                        || is_float_type_expr(&rt, self.alias_bases))
                 {
                     named_ty("Float")
                 } else {
@@ -2033,8 +3717,11 @@ impl<'a> LlvmFnGen<'a> {
                 }
             }
             ExprKind::Unary { op: UnOp::Not, .. } => named_ty("Bool"),
-            ExprKind::Unary { op: UnOp::Neg, expr: inner } => {
-                if is_float_type_expr(&self.infer_expr_type_with(inner, extra_vars), self.alias_bases) {
+            ExprKind::Unary { op: op @ (UnOp::Neg | UnOp::BitNot), expr: inner } => {
+                let it = self.infer_expr_type_with(inner, extra_vars);
+                if scalar_kind_of_ty(&it, self.alias_bases).is_some() {
+                    it
+                } else if matches!(op, UnOp::Neg) && is_float_type_expr(&it, self.alias_bases) {
                     named_ty("Float")
                 } else {
                     named_ty("Int")
@@ -2144,6 +3831,50 @@ impl<'a> LlvmFnGen<'a> {
                         return generic_ty("List", vec![self.infer_expr_type_with(&args[1].value, extra_vars)]);
                     }
                     if f == "list_pop_shrink" && args.len() == 1 {
+                        return self.infer_expr_type_with(&args[0].value, extra_vars);
+                    }
+                    if f == "mutex_get" && args.len() == 1 {
+                        if let TypeExpr::Named { name, args: ma, .. } =
+                            resolve_alias_ty(&self.infer_expr_type_with(&args[0].value, extra_vars), self.alias_bases)
+                        {
+                            if name == "Mutex" && !ma.is_empty() {
+                                return ma[0].clone();
+                            }
+                        }
+                    }
+                    if (f == "chan_recv" || f == "chan_try_recv") && args.len() == 1 {
+                        if let TypeExpr::Named { name, args: ca, .. } =
+                            resolve_alias_ty(&self.infer_expr_type_with(&args[0].value, extra_vars), self.alias_bases)
+                        {
+                            if name == "Channel" && !ca.is_empty() {
+                                return generic_ty("Option", vec![ca[0].clone()]);
+                            }
+                        }
+                        return generic_ty("Option", vec![named_ty("Any")]);
+                    }
+                    if (f == "ptr_read" || f == "volatile_read") && args.len() == 1 {
+                        let pty = self.infer_expr_type_with(&args[0].value, extra_vars);
+                        if let Some(elem) = self.ptr_pointee_ty(&pty) {
+                            return elem;
+                        }
+                    }
+                    if (f == "__ptr_add" || f == "ptr_add") && !args.is_empty() {
+                        return self.infer_expr_type_with(&args[0].value, extra_vars);
+                    }
+                    if (f == "ptr_of" || f == "mut_ptr_of") && args.len() == 1 {
+                        let raw_inner = self.infer_expr_type_with(&args[0].value, extra_vars);
+                        let inner = match resolve_alias_ty(&raw_inner, self.alias_bases) {
+                            TypeExpr::Array { elem, .. } => *elem,
+                            _ => raw_inner,
+                        };
+                        let pname = if f == "mut_ptr_of" { "MutPtr" } else { "Ptr" };
+                        return generic_ty(pname, vec![inner]);
+                    }
+                    if matches!(
+                        f.as_str(),
+                        "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "saturating_add" | "saturating_sub"
+                    ) && !args.is_empty()
+                    {
                         return self.infer_expr_type_with(&args[0].value, extra_vars);
                     }
                     if let Some(meta) = self.fn_metas.get(f) {
@@ -2269,7 +4000,11 @@ impl<'a> LlvmFnGen<'a> {
             return true;
         }
         match &expr.kind {
-            ExprKind::RecordLit { .. } | ExprKind::List(_) | ExprKind::Tuple(_) | ExprKind::Str(_) => true,
+            ExprKind::RecordLit { .. }
+            | ExprKind::List(_)
+            | ExprKind::ArrayRepeat { .. }
+            | ExprKind::Tuple(_)
+            | ExprKind::Str(_) => true,
             ExprKind::Binary { op: BinOp::Concat, .. } => true,
             ExprKind::Ident(s) => {
                 s == "None"
@@ -2290,6 +4025,18 @@ impl<'a> LlvmFnGen<'a> {
                         return true;
                     }
                 }
+                if let TypeExpr::Named { name: rname, .. } =
+                    resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases)
+                {
+                    if let Some(cfl) = self
+                        .records
+                        .get(&rname)
+                        .and_then(|rl| rl.c_layout.as_ref())
+                        .and_then(|cl| cl.fields.iter().find(|f| f.name == *field))
+                    {
+                        return self.is_c_value_type(&cfl.ty);
+                    }
+                }
                 if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
                     return fl.is_rc;
                 }
@@ -2299,8 +4046,29 @@ impl<'a> LlvmFnGen<'a> {
                 let tt = self.infer_expr_type(target);
                 self.list_elem_ty(&tt).is_some_and(|et| self.type_is_rc(&et))
             }
-            ExprKind::Call { callee, .. } => match &callee.kind {
+            ExprKind::Call { callee, args } => match &callee.kind {
                 ExprKind::Ident(f) => {
+                    if f == "mutex_get" {
+                        if let Some(a0) = args.first() {
+                            if let TypeExpr::Named { name, args: ma, .. } =
+                                resolve_alias_ty(&self.infer_expr_type(&a0.value), self.alias_bases)
+                            {
+                                if name == "Mutex" && !ma.is_empty() {
+                                    return self.type_is_rc(&ma[0]);
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                    if f == "ptr_read" || f == "volatile_read" {
+                        if let Some(a0) = args.first() {
+                            let pty = self.infer_expr_type(&a0.value);
+                            if let Some(pt) = self.ptr_pointee_ty(&pty) {
+                                return self.is_c_value_type(&pt);
+                            }
+                        }
+                        return false;
+                    }
                     matches!(
                         f.as_str(),
                         "Ok" | "Err" | "Some" | "push" | "list_filled" | "list_pop_shrink" | "yield_val" | "__box_dyn" | "__make_closure"
@@ -2408,7 +4176,35 @@ impl<'a> LlvmFnGen<'a> {
         Vec::new()
     }
 
-    fn emit_compound_op(&mut self, cur: &str, rhs: &str, op: AssignOp, is_float: bool) -> String {
+    fn emit_compound_op(
+        &mut self,
+        cur: &str,
+        rhs: &str,
+        op: AssignOp,
+        is_float: bool,
+        sk: Option<ScalarKind>,
+    ) -> String {
+        if sk == Some(ScalarKind::F32) {
+            let fop = match op {
+                AssignOp::AddSet => "fadd",
+                AssignOp::SubSet => "fsub",
+                AssignOp::MulSet => "fmul",
+                AssignOp::DivSet => "fdiv",
+                _ => return rhs.to_string(),
+            };
+            let c32 = self.fresh_tmp();
+            let r32 = self.fresh_tmp();
+            let cf = self.fresh_tmp();
+            let rf = self.fresh_tmp();
+            let fres = self.fresh_tmp();
+            let b32 = self.fresh_tmp();
+            let res = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = trunc i64 {} to i32\n  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n  {} = bitcast i32 {} to float\n  {} = {} float {}, {}\n  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                c32, cur, r32, rhs, cf, c32, rf, r32, fres, fop, cf, rf, b32, fres, res, b32
+            ));
+            return res;
+        }
         if is_float {
             let cf = self.fresh_tmp();
             let rf = self.fresh_tmp();
@@ -2427,22 +4223,28 @@ impl<'a> LlvmFnGen<'a> {
             ));
             return res;
         }
+        let is_unsigned = sk.is_some_and(|k| k.is_unsigned());
+        let is_signed_narrow = matches!(sk, Some(ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I32));
         let iop = match op {
             AssignOp::Set => return rhs.to_string(),
             AssignOp::AddSet => "add",
             AssignOp::SubSet => "sub",
             AssignOp::MulSet => "mul",
-            AssignOp::DivSet => "sdiv",
+            AssignOp::DivSet => if is_unsigned { "udiv" } else { "sdiv" },
             AssignOp::BitAndSet => "and",
             AssignOp::BitOrSet => "or",
             AssignOp::BitXorSet => "xor",
             AssignOp::ShlSet => "shl",
-            AssignOp::ShrSet => "lshr",
+            AssignOp::ShrSet => if is_signed_narrow { "ashr" } else { "lshr" },
         };
         let res = self.fresh_tmp();
         self.code
             .push_str(&format!("  {} = {} i64 {}, {}\n", res, iop, cur, rhs));
-        res
+        if let Some(k) = sk {
+            self.normalize_scalar(&res, k)
+        } else {
+            res
+        }
     }
 
     fn infer_match_binding_type(&self, scrutinee_ty: &TypeExpr, variant_name: &str) -> TypeExpr {
@@ -2499,15 +4301,39 @@ impl<'a> LlvmFnGen<'a> {
 
         let ret_val = self.lower_block(&f.body, self.fn_returns_rc, f.ret_ty.as_ref())?;
         if !self.terminated {
-            self.code.push_str(&format!("  ret i64 {}\n", ret_val));
+            let dbg = self.dbg_suffix(f.body.span);
+            self.code.push_str(&format!("  ret i64 {}{}\n", ret_val, dbg));
         }
 
         let linkage = if f.name == "main" { "" } else { "internal " };
+        let mut fn_attrs = String::new();
+        for attr in &f.attrs {
+            if attr.name == "inline" {
+                match attr.args.first().map(|a| &a.value.kind) {
+                    Some(ExprKind::Ident(s) | ExprKind::Str(s)) if s == "always" => {
+                        fn_attrs.push_str(" alwaysinline");
+                    }
+                    Some(ExprKind::Ident(s) | ExprKind::Str(s)) if s == "never" => {
+                        fn_attrs.push_str(" noinline");
+                    }
+                    None => fn_attrs.push_str(" alwaysinline"),
+                    _ => {}
+                }
+            } else if attr.name == "cold" {
+                fn_attrs.push_str(" cold");
+            }
+        }
+        let sp_dbg = self
+            .debug_sp_id
+            .map(|id| format!(" !dbg !{}", id))
+            .unwrap_or_default();
         Ok(format!(
-            "define {}i64 @tenon_fn_{}({}) {{\nentry:\n{}{}}}\n",
+            "define {}i64 @tenon_fn_{}({}){}{} {{\nentry:\n{}{}}}\n",
             linkage,
             sanitize(&f.name),
             param_list.join(", "),
+            fn_attrs,
+            sp_dbg,
             self.entry_allocas,
             self.code
         ))
@@ -2810,11 +4636,11 @@ impl<'a> LlvmFnGen<'a> {
             }
             match stmt {
                 Stmt::Let {
-                    name, ty, value, ..
+                    name, ty, value, span, ..
                 } => {
                     let effective_ty = ty.clone().unwrap_or_else(|| self.infer_expr_type(value));
                     let produces_rc = self.type_is_rc(&effective_ty) || self.expr_produces_rc(value);
-                    let v = if produces_rc {
+                    let mut v = if produces_rc {
                         self.lower_expr_owned(value, ty.as_ref())?
                     } else {
                         let mut temps = Vec::new();
@@ -2822,9 +4648,15 @@ impl<'a> LlvmFnGen<'a> {
                         self.flush_temps(&temps);
                         val
                     };
+                    if let Some(sk) = scalar_kind_of_ty(&effective_ty, self.alias_bases) {
+                        if sk.is_int() {
+                            v = self.normalize_scalar(&v, sk);
+                        }
+                    }
                     let slot = self.fresh_var_slot(name);
+                    let dbg = self.dbg_suffix(*span);
                     self.code
-                        .push_str(&format!("  store i64 {}, ptr {}\n", v, slot));
+                        .push_str(&format!("  store i64 {}, ptr {}{}\n", v, slot, dbg));
 
                     self.var_types.insert(name.clone(), effective_ty);
                     self.owned_rc_vars.remove(name);
@@ -2852,7 +4684,14 @@ impl<'a> LlvmFnGen<'a> {
                                 && args.len() == 1
                                 && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
                         );
-                        let consuming_in_place = consuming_push || consuming_pop;
+                        let consuming_cow = matches!(
+                            &value.kind,
+                            ExprKind::Call { callee, args }
+                            if matches!(&callee.kind, ExprKind::Ident(f) if is_consuming_cow_builtin(f))
+                                && !args.is_empty()
+                                && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
+                        );
+                        let consuming_in_place = consuming_push || consuming_pop || consuming_cow;
                         let target_ty = self.var_types.get(name).cloned();
                         let is_inout = self.inout_vars.contains(name);
                         let target_is_rc = self.owned_rc_vars.contains(name);
@@ -2894,6 +4733,53 @@ impl<'a> LlvmFnGen<'a> {
                                 res, xs_val
                             ));
                             res
+                        } else if consuming_cow {
+                            let ExprKind::Call { callee, args } = &value.kind else {
+                                unreachable!()
+                            };
+                            let ExprKind::Ident(fname) = &callee.kind else {
+                                unreachable!()
+                            };
+                            if fname == "simd_u8x16_set_lane" && args.len() == 3 {
+                                let vh = self.load_ident_val(name)?;
+                                let mut temps = Vec::new();
+                                let idx = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                                let val = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                                let uniq = self.fresh_tmp();
+                                let di = self.fresh_tmp();
+                                let dp = self.fresh_tmp();
+                                let ep = self.fresh_tmp();
+                                let b8 = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 {}\n  {} = trunc i64 {} to i8\n  store i8 {}, ptr {}, align 1\n",
+                                    uniq, vh, di, uniq, dp, di, ep, dp, idx, b8, val, b8, ep
+                                ));
+                                self.flush_temps(&temps);
+                                uniq
+                            } else {
+                                let csym = *self
+                                    .syscall_map
+                                    .get(fname)
+                                    .ok_or_else(|| format!("unknown cow builtin `{}`", fname))?;
+                                let mut temps = Vec::new();
+                                let mut avals = Vec::with_capacity(args.len());
+                                avals.push(format!("i64 {}", self.load_ident_val(name)?));
+                                for a in &args[1..] {
+                                    avals.push(format!(
+                                        "i64 {}",
+                                        self.lower_expr_borrowed(&a.value, &mut temps)?
+                                    ));
+                                }
+                                let res = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = call i64 @{}({})\n",
+                                    res,
+                                    csym,
+                                    avals.join(", ")
+                                ));
+                                self.flush_temps(&temps);
+                                res
+                            }
                         } else if (target_is_rc || inout_is_rc) && *op == AssignOp::Set {
                             self.lower_expr_owned(value, target_ty.as_ref())?
                         } else {
@@ -2907,6 +4793,10 @@ impl<'a> LlvmFnGen<'a> {
                             .get(name)
                             .cloned()
                             .ok_or_else(|| format!("undefined variable `{}` in LLVM assign", name))?;
+                        let sk = target_ty
+                            .as_ref()
+                            .and_then(|t| scalar_kind_of_ty(t, self.alias_bases))
+                            .or_else(|| self.scalar_kind_of_expr(value));
                         if target_is_rc && !consuming_in_place && !is_inout {
                             let old = self.fresh_tmp();
                             self.code.push_str(&format!(
@@ -2932,11 +4822,15 @@ impl<'a> LlvmFnGen<'a> {
                                     .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
                                     || self.is_float_expr(value);
                                 let new_v = if *op == AssignOp::Set {
-                                    rhs
+                                    if let Some(k) = sk {
+                                        if k.is_int() { self.normalize_scalar(&rhs, k) } else { rhs }
+                                    } else {
+                                        rhs
+                                    }
                                 } else {
                                     let cur = self.fresh_tmp();
                                     self.code.push_str(&format!("  {} = load i64, ptr {}\n", cur, ap));
-                                    self.emit_compound_op(&cur, &rhs, *op, is_flt)
+                                    self.emit_compound_op(&cur, &rhs, *op, is_flt, sk)
                                 };
                                 self.code
                                     .push_str(&format!("  store i64 {}, ptr {}\n", new_v, ap));
@@ -2947,11 +4841,15 @@ impl<'a> LlvmFnGen<'a> {
                                 .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
                                 || self.is_float_expr(value);
                             let new_v = if *op == AssignOp::Set {
-                                rhs
+                                if let Some(k) = sk {
+                                    if k.is_int() { self.normalize_scalar(&rhs, k) } else { rhs }
+                                } else {
+                                    rhs
+                                }
                             } else {
                                 let cur = self.fresh_tmp();
                                 self.code.push_str(&format!("  {} = load i64, ptr {}\n", cur, slot));
-                                self.emit_compound_op(&cur, &rhs, *op, is_flt)
+                                self.emit_compound_op(&cur, &rhs, *op, is_flt, sk)
                             };
                             self.code
                                 .push_str(&format!("  store i64 {}, ptr {}\n", new_v, slot));
@@ -2959,78 +4857,125 @@ impl<'a> LlvmFnGen<'a> {
                     }
                     ExprKind::Field { target: obj, field } => {
                         if let ExprKind::Ident(vname) = &obj.kind {
-                            let (fidx, fl) = self.resolve_field_layout(obj, field)?;
-                            let field_is_rc = fl.as_ref().is_some_and(|f| f.is_rc);
-                            let field_ty = fl.as_ref().map(|f| &f.ty);
-                            let rhs = if field_is_rc && *op == AssignOp::Set {
-                                self.lower_expr_owned(value, field_ty)?
-                            } else {
+                            let c_field_info = match resolve_alias_ty(&self.infer_expr_type(obj), self.alias_bases) {
+                                TypeExpr::Named { name: rname, .. } => self
+                                    .records
+                                    .get(&rname)
+                                    .and_then(|rl| rl.c_layout.as_ref())
+                                    .and_then(|cl| cl.fields.iter().find(|f| f.name == *field))
+                                    .cloned(),
+                                _ => None,
+                            };
+                            if let Some(cfl) = c_field_info {
                                 let mut temps = Vec::new();
-                                let v = self.lower_expr_borrowed(value, &mut temps)?;
-                                self.flush_temps(&temps);
-                                v
-                            };
-                            let slot = self.var_ptrs[vname].clone();
-                            let is_inout = self.inout_vars.contains(vname);
-                            let cur_h = if is_inout {
-                                let addr_i = self.fresh_tmp();
-                                let addr_p = self.fresh_tmp();
-                                let val = self.fresh_tmp();
+                                let rhs = self.lower_expr_borrowed(value, &mut temps)?;
+                                let cur_h = self.load_ident_val(vname)?;
+                                let uniq = self.fresh_tmp();
                                 self.code.push_str(&format!(
-                                    "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  {} = load i64, ptr {}\n",
-                                    addr_i, slot, addr_p, addr_i, val, addr_p
+                                    "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
+                                    uniq, cur_h
                                 ));
-                                val
-                            } else {
-                                let val = self.fresh_tmp();
-                                self.code
-                                    .push_str(&format!("  {} = load i64, ptr {}\n", val, slot));
-                                val
-                            };
-                            let uniq = self.fresh_tmp();
-                            self.code.push_str(&format!(
-                                "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
-                                uniq, cur_h
-                            ));
-                            if is_inout {
-                                let addr_i = self.fresh_tmp();
-                                let addr_p = self.fresh_tmp();
-                                self.code.push_str(&format!(
-                                    "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
-                                    addr_i, slot, addr_p, addr_i, uniq, addr_p
-                                ));
-                            } else {
-                                self.code
-                                    .push_str(&format!("  store i64 {}, ptr {}\n", uniq, slot));
-                            }
-                            let is_flt = field_ty
-                                .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
-                                || self.is_float_expr(value);
-                            let new_fv = if *op == AssignOp::Set {
-                                rhs
-                            } else {
-                                let cf = self.fresh_tmp();
-                                self.code.push_str(&format!(
-                                    "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
-                                    cf, uniq, fidx
-                                ));
-                                self.emit_compound_op(&cf, &rhs, *op, is_flt)
-                            };
-                            let setter = if *op != AssignOp::Set {
-                                "@__tn_slot_set_prim"
-                            } else if let Some(ref f) = fl {
-                                if f.is_rc {
-                                    "@__tn_slot_set_rc"
+                                let slot = self.var_ptrs[vname].clone();
+                                if self.inout_vars.contains(vname) {
+                                    let addr_i = self.fresh_tmp();
+                                    let addr_p = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                        addr_i, slot, addr_p, addr_i, uniq, addr_p
+                                    ));
                                 } else {
-                                    "@__tn_slot_set_prim"
+                                    self.code.push_str(&format!("  store i64 {}, ptr {}\n", uniq, slot));
                                 }
+                                let base = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                                    base, uniq
+                                ));
+                                let sk = scalar_kind_of_ty(&cfl.ty, self.alias_bases);
+                                let is_flt = is_float_type_expr(&cfl.ty, self.alias_bases) || self.is_float_expr(value);
+                                let new_fv = if *op == AssignOp::Set {
+                                    rhs
+                                } else {
+                                    let cf = self.emit_mem_load(&base, cfl.byte_offset as i64, &cfl.ty, false)?;
+                                    self.emit_compound_op(&cf, &rhs, *op, is_flt, sk)
+                                };
+                                self.emit_mem_store(&base, cfl.byte_offset as i64, &new_fv, &cfl.ty, false)?;
+                                self.flush_temps(&temps);
                             } else {
-                                "@tenon_rc_set_field"
-                            };
-                            self.code.push_str(&format!(
-                                "  call void {}(i64 {}, i64 {}, i64 {})\n",
-                                setter, uniq, fidx, new_fv
-                            ));
+                                let (fidx, fl) = self.resolve_field_layout(obj, field)?;
+                                let field_is_rc = fl.as_ref().is_some_and(|f| f.is_rc);
+                                let field_ty = fl.as_ref().map(|f| &f.ty);
+                                let rhs = if field_is_rc && *op == AssignOp::Set {
+                                    self.lower_expr_owned(value, field_ty)?
+                                } else {
+                                    let mut temps = Vec::new();
+                                    let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                    self.flush_temps(&temps);
+                                    v
+                                };
+                                let slot = self.var_ptrs[vname].clone();
+                                let is_inout = self.inout_vars.contains(vname);
+                                let cur_h = if is_inout {
+                                    let addr_i = self.fresh_tmp();
+                                    let addr_p = self.fresh_tmp();
+                                    let val = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  {} = load i64, ptr {}\n",
+                                        addr_i, slot, addr_p, addr_i, val, addr_p
+                                    ));
+                                    val
+                                } else {
+                                    let val = self.fresh_tmp();
+                                    self.code
+                                        .push_str(&format!("  {} = load i64, ptr {}\n", val, slot));
+                                    val
+                                };
+                                let uniq = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
+                                    uniq, cur_h
+                                ));
+                                if is_inout {
+                                    let addr_i = self.fresh_tmp();
+                                    let addr_p = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                        addr_i, slot, addr_p, addr_i, uniq, addr_p
+                                    ));
+                                } else {
+                                    self.code
+                                        .push_str(&format!("  store i64 {}, ptr {}\n", uniq, slot));
+                                }
+                                let sk = field_ty.and_then(|t| scalar_kind_of_ty(t, self.alias_bases));
+                                let is_flt = field_ty
+                                    .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
+                                    || self.is_float_expr(value);
+                                let new_fv = if *op == AssignOp::Set {
+                                    rhs
+                                } else {
+                                    let cf = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
+                                        cf, uniq, fidx
+                                    ));
+                                    self.emit_compound_op(&cf, &rhs, *op, is_flt, sk)
+                                };
+                                let setter = if *op != AssignOp::Set {
+                                    "@__tn_slot_set_prim"
+                                } else if let Some(ref f) = fl {
+                                    if f.is_rc {
+                                        "@__tn_slot_set_rc"
+                                    } else {
+                                        "@__tn_slot_set_prim"
+                                    }
+                                } else {
+                                    "@tenon_rc_set_field"
+                                };
+                                self.code.push_str(&format!(
+                                    "  call void {}(i64 {}, i64 {}, i64 {})\n",
+                                    setter, uniq, fidx, new_fv
+                                ));
+                            }
                         }
                     }
                     ExprKind::Index {
@@ -3042,31 +4987,19 @@ impl<'a> LlvmFnGen<'a> {
                         self.flush_temps(&idx_temps);
                         match &list_expr.kind {
                             ExprKind::Ident(vname) => {
-                                let elem_ty = self
+                                let arr_info = self
                                     .var_types
                                     .get(vname)
-                                    .and_then(|t| self.list_elem_ty(t));
-                                let elem_is_rc = elem_ty
-                                    .as_ref()
-                                    .is_some_and(|et| self.type_is_rc(et))
-                                    || self.expr_produces_rc(value);
-                                let rhs = if elem_is_rc && *op == AssignOp::Set {
-                                    self.lower_expr_owned(value, elem_ty.as_ref())?
-                                } else {
+                                    .cloned()
+                                    .and_then(|t| self.array_layout(&t));
+                                if let Some((elem_ty, _len, stride, false)) = arr_info {
                                     let mut temps = Vec::new();
-                                    let v = self.lower_expr_borrowed(value, &mut temps)?;
-                                    self.flush_temps(&temps);
-                                    v
-                                };
-                                let cur_list = self.load_ident_val(vname)?;
-                                let is_always_uniq = self.always_unique_vars.contains(vname);
-                                let uniq_list = if is_always_uniq {
-                                    cur_list
-                                } else {
-                                    let u = self.fresh_tmp();
+                                    let rhs = self.lower_expr_borrowed(value, &mut temps)?;
+                                    let cur_arr = self.load_ident_val(vname)?;
+                                    let uniq_arr = self.fresh_tmp();
                                     self.code.push_str(&format!(
                                         "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
-                                        u, cur_list
+                                        uniq_arr, cur_arr
                                     ));
                                     let vslot = self.var_ptrs[vname].clone();
                                     if self.inout_vars.contains(vname) {
@@ -3074,57 +5007,117 @@ impl<'a> LlvmFnGen<'a> {
                                         let ap = self.fresh_tmp();
                                         self.code.push_str(&format!(
                                             "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
-                                            ai, vslot, ap, ai, u, ap
+                                            ai, vslot, ap, ai, uniq_arr, ap
                                         ));
                                     } else {
                                         self.code.push_str(&format!(
                                             "  store i64 {}, ptr {}\n",
-                                            u, vslot
+                                            uniq_arr, vslot
                                         ));
                                     }
-                                    u
-                                };
-                                if elem_is_rc {
+                                    let base = self.fresh_tmp();
+                                    let boff = self.fresh_tmp();
+                                    let eptr = self.fresh_tmp();
                                     self.code.push_str(&format!(
-                                        "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
-                                        uniq_list, RC_MASK_ALL as i64
+                                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
+                                        base, uniq_arr, boff, idx_v, stride, eptr, base, boff
+                                    ));
+                                    let sk = scalar_kind_of_ty(&elem_ty, self.alias_bases);
+                                    let is_flt = is_float_type_expr(&elem_ty, self.alias_bases) || self.is_float_expr(value);
+                                    let new_val = if *op == AssignOp::Set {
+                                        rhs
+                                    } else {
+                                        let ce = self.emit_mem_load(&eptr, 0, &elem_ty, false)?;
+                                        self.emit_compound_op(&ce, &rhs, *op, is_flt, sk)
+                                    };
+                                    self.emit_mem_store(&eptr, 0, &new_val, &elem_ty, false)?;
+                                    self.flush_temps(&temps);
+                                } else {
+                                    let elem_ty = self
+                                        .var_types
+                                        .get(vname)
+                                        .and_then(|t| self.list_elem_ty(t));
+                                    let elem_is_rc = elem_ty
+                                        .as_ref()
+                                        .is_some_and(|et| self.type_is_rc(et))
+                                        || self.expr_produces_rc(value);
+                                    let rhs = if elem_is_rc && *op == AssignOp::Set {
+                                        self.lower_expr_owned(value, elem_ty.as_ref())?
+                                    } else {
+                                        let mut temps = Vec::new();
+                                        let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                        self.flush_temps(&temps);
+                                        v
+                                    };
+                                    let cur_list = self.load_ident_val(vname)?;
+                                    let is_always_uniq = self.always_unique_vars.contains(vname);
+                                    let uniq_list = if is_always_uniq {
+                                        cur_list
+                                    } else {
+                                        let u = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
+                                            u, cur_list
+                                        ));
+                                        let vslot = self.var_ptrs[vname].clone();
+                                        if self.inout_vars.contains(vname) {
+                                            let ai = self.fresh_tmp();
+                                            let ap = self.fresh_tmp();
+                                            self.code.push_str(&format!(
+                                                "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                                ai, vslot, ap, ai, u, ap
+                                            ));
+                                        } else {
+                                            self.code.push_str(&format!(
+                                                "  store i64 {}, ptr {}\n",
+                                                u, vslot
+                                            ));
+                                        }
+                                        u
+                                    };
+                                    if elem_is_rc {
+                                        self.code.push_str(&format!(
+                                            "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                            uniq_list, RC_MASK_ALL as i64
+                                        ));
+                                    }
+                                    let getter = if is_always_uniq {
+                                        "@__tn_list_get_nonnull"
+                                    } else {
+                                        "@__tn_list_get"
+                                    };
+                                    let sk = elem_ty.as_ref().and_then(|t| scalar_kind_of_ty(t, self.alias_bases));
+                                    let is_flt = elem_ty
+                                        .as_ref()
+                                        .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
+                                        || self.is_float_expr(value);
+                                    let new_val = if *op == AssignOp::Set {
+                                        rhs
+                                    } else {
+                                        let ce = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = call i64 {}(i64 {}, i64 {})\n",
+                                            ce, getter, uniq_list, idx_v
+                                        ));
+                                        self.emit_compound_op(&ce, &rhs, *op, is_flt, sk)
+                                    };
+                                    let setter = if *op != AssignOp::Set {
+                                        if is_always_uniq { "@__tn_list_set_prim_nonnull" } else { "@__tn_list_set_prim" }
+                                    } else if elem_is_rc {
+                                        "@__tn_list_set_rc"
+                                    } else if elem_ty
+                                        .as_ref()
+                                        .is_some_and(|et| et.display_name() != "Any")
+                                    {
+                                        if is_always_uniq { "@__tn_list_set_prim_nonnull" } else { "@__tn_list_set_prim" }
+                                    } else {
+                                        "@tenon_rc_set_field"
+                                    };
+                                    self.code.push_str(&format!(
+                                        "  call void {}(i64 {}, i64 {}, i64 {})\n",
+                                        setter, uniq_list, idx_v, new_val
                                     ));
                                 }
-                                let getter = if is_always_uniq {
-                                    "@__tn_list_get_nonnull"
-                                } else {
-                                    "@__tn_list_get"
-                                };
-                                let is_flt = elem_ty
-                                    .as_ref()
-                                    .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
-                                    || self.is_float_expr(value);
-                                let new_val = if *op == AssignOp::Set {
-                                    rhs
-                                } else {
-                                    let ce = self.fresh_tmp();
-                                    self.code.push_str(&format!(
-                                        "  {} = call i64 {}(i64 {}, i64 {})\n",
-                                        ce, getter, uniq_list, idx_v
-                                    ));
-                                    self.emit_compound_op(&ce, &rhs, *op, is_flt)
-                                };
-                                let setter = if *op != AssignOp::Set {
-                                    if is_always_uniq { "@__tn_list_set_prim_nonnull" } else { "@__tn_list_set_prim" }
-                                } else if elem_is_rc {
-                                    "@__tn_list_set_rc"
-                                } else if elem_ty
-                                    .as_ref()
-                                    .is_some_and(|et| et.display_name() != "Any")
-                                {
-                                    if is_always_uniq { "@__tn_list_set_prim_nonnull" } else { "@__tn_list_set_prim" }
-                                } else {
-                                    "@tenon_rc_set_field"
-                                };
-                                self.code.push_str(&format!(
-                                    "  call void {}(i64 {}, i64 {}, i64 {})\n",
-                                    setter, uniq_list, idx_v, new_val
-                                ));
                             }
                             ExprKind::Field { target: obj, field }
                                 if matches!(&obj.kind, ExprKind::Ident(_)) =>
@@ -3178,6 +5171,7 @@ impl<'a> LlvmFnGen<'a> {
                                         uniq_list, RC_MASK_ALL as i64
                                     ));
                                 }
+                                let sk = elem_ty.as_ref().and_then(|t| scalar_kind_of_ty(t, self.alias_bases));
                                 let is_flt = elem_ty
                                     .as_ref()
                                     .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
@@ -3190,7 +5184,7 @@ impl<'a> LlvmFnGen<'a> {
                                         "  {} = call i64 @__tn_list_get(i64 {}, i64 {})\n",
                                         ce, uniq_list, idx_v
                                     ));
-                                    self.emit_compound_op(&ce, &rhs, *op, is_flt)
+                                    self.emit_compound_op(&ce, &rhs, *op, is_flt, sk)
                                 };
                                 let setter = if *op != AssignOp::Set {
                                     "@__tn_list_set_prim"
@@ -3332,7 +5326,7 @@ impl<'a> LlvmFnGen<'a> {
                         self.flush_temps(&temps);
                     }
                 }
-                Stmt::LetTuple { .. } | Stmt::For { .. } => {}
+                Stmt::LetTuple { .. } | Stmt::For { .. } | Stmt::Defer { .. } => {}
             }
         }
 
@@ -3422,6 +5416,27 @@ impl<'a> LlvmFnGen<'a> {
                         return Ok(self.emit_unit_enum_const(tag));
                     }
                 }
+                let c_field_info = match resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases) {
+                    TypeExpr::Named { name: rname, .. } => self
+                        .records
+                        .get(&rname)
+                        .and_then(|rl| rl.c_layout.as_ref())
+                        .and_then(|cl| cl.fields.iter().find(|f| f.name == *field))
+                        .cloned(),
+                    _ => None,
+                };
+                if let Some(cfl) = c_field_info {
+                    let mut temps = Vec::new();
+                    let obj = self.lower_expr_borrowed(target, &mut temps)?;
+                    let base = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                        base, obj
+                    ));
+                    let val = self.emit_mem_load(&base, cfl.byte_offset as i64, &cfl.ty, false)?;
+                    self.flush_temps(&temps);
+                    return Ok(val);
+                }
                 let (idx, fl) = self.resolve_field_layout(target, field)?;
                 let mut temps = Vec::new();
                 let obj = self.lower_expr_borrowed(target, &mut temps)?;
@@ -3442,8 +5457,24 @@ impl<'a> LlvmFnGen<'a> {
                 Ok(res)
             }
             ExprKind::Index { target, index } => {
+                let target_ty = self.infer_expr_type(target);
+                if let Some((elem_ty, _len, stride, false)) = self.array_layout(&target_ty) {
+                    let mut temps = Vec::new();
+                    let t = self.lower_expr_borrowed(target, &mut temps)?;
+                    let i = self.lower_expr_borrowed(index, &mut temps)?;
+                    let base = self.fresh_tmp();
+                    let boff = self.fresh_tmp();
+                    let eptr = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
+                        base, t, boff, i, stride, eptr, base, boff
+                    ));
+                    let res = self.emit_mem_load(&eptr, 0, &elem_ty, false)?;
+                    self.flush_temps(&temps);
+                    return Ok(res);
+                }
                 let elem_is_rc = self
-                    .list_elem_ty(&self.infer_expr_type(target))
+                    .list_elem_ty(&target_ty)
                     .is_some_and(|et| self.type_is_rc(&et));
                 let mut temps = Vec::new();
                 let t = self.lower_expr_borrowed(target, &mut temps)?;
@@ -3517,7 +5548,7 @@ impl<'a> LlvmFnGen<'a> {
             ExprKind::Match { scrutinee, arms } => {
                 self.lower_match(scrutinee, arms, true, expected_ty)
             }
-            ExprKind::Block(blk) => self.lower_block(blk, true, expected_ty),
+            ExprKind::Block(blk) | ExprKind::Unsafe(blk) => self.lower_block(blk, true, expected_ty),
             _ => self.lower_expr_fresh(expr, expected_ty),
         }
     }
@@ -3565,6 +5596,28 @@ impl<'a> LlvmFnGen<'a> {
                         return Ok(self.emit_unit_enum_const(tag));
                     }
                 }
+                let c_field_info = match resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases) {
+                    TypeExpr::Named { name: rname, .. } => self
+                        .records
+                        .get(&rname)
+                        .and_then(|rl| rl.c_layout.as_ref())
+                        .and_then(|cl| cl.fields.iter().find(|f| f.name == *field))
+                        .cloned(),
+                    _ => None,
+                };
+                if let Some(cfl) = c_field_info {
+                    let obj = self.lower_expr_borrowed(target, temps)?;
+                    let base = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                        base, obj
+                    ));
+                    let val = self.emit_mem_load(&base, cfl.byte_offset as i64, &cfl.ty, false)?;
+                    if self.is_c_value_type(&cfl.ty) {
+                        temps.push(val.clone());
+                    }
+                    return Ok(val);
+                }
                 let (idx, _) = self.resolve_field_layout(target, field)?;
                 let obj = self.lower_expr_borrowed(target, temps)?;
                 let res = self.fresh_tmp();
@@ -3575,6 +5628,23 @@ impl<'a> LlvmFnGen<'a> {
                 Ok(res)
             }
             ExprKind::Index { target, index } => {
+                let target_ty = self.infer_expr_type(target);
+                if let Some((elem_ty, _len, stride, false)) = self.array_layout(&target_ty) {
+                    let t = self.lower_expr_borrowed(target, temps)?;
+                    let i = self.lower_expr_borrowed(index, temps)?;
+                    let base = self.fresh_tmp();
+                    let boff = self.fresh_tmp();
+                    let eptr = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
+                        base, t, boff, i, stride, eptr, base, boff
+                    ));
+                    let val = self.emit_mem_load(&eptr, 0, &elem_ty, false)?;
+                    if self.is_c_value_type(&elem_ty) {
+                        temps.push(val.clone());
+                    }
+                    return Ok(val);
+                }
                 let is_nonnull = matches!(&target.kind, ExprKind::Ident(n) if self.always_unique_vars.contains(n));
                 let t = self.lower_expr_borrowed(target, temps)?;
                 let i = self.lower_expr_borrowed(index, temps)?;
@@ -3615,13 +5685,38 @@ impl<'a> LlvmFnGen<'a> {
                 }
                 Ok(v)
             }
-            ExprKind::Block(blk) => {
+            ExprKind::Block(blk) | ExprKind::Unsafe(blk) => {
                 let want_owned = self.expr_produces_rc(expr);
                 let v = self.lower_block(blk, want_owned, None)?;
                 if want_owned && !self.terminated {
                     temps.push(v.clone());
                 }
                 Ok(v)
+            }
+            ExprKind::Call { callee, args }
+                if args.len() == 1
+                    && matches!(
+                        &callee.kind,
+                        ExprKind::Ident(f) if f == "text_cstr_ptr" || f == "bytes_ptr"
+                    ) =>
+            {
+                let ExprKind::Ident(fname) = &callee.kind else {
+                    unreachable!()
+                };
+                // Keep the backing Text/Bytes temporary alive in caller's `temps`
+                // until the enclosing call completes (prevents UAF on dynamic strings)!
+                let arg_v = self.lower_expr_borrowed(&args[0].value, temps)?;
+                let csym = if fname == "text_cstr_ptr" {
+                    "tenon_text_cstr_ptr"
+                } else {
+                    "tenon_bytes_ptr"
+                };
+                let res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @{}(i64 {})\n",
+                    res, csym, arg_v
+                ));
+                Ok(res)
             }
             _ => {
                 let v = self.lower_expr_fresh(expr, None)?;
@@ -3992,6 +6087,23 @@ impl<'a> LlvmFnGen<'a> {
                     .get(name)
                     .cloned()
                     .ok_or_else(|| format!("unknown record `{}`", name))?;
+                if let Some(c_lay) = &layout.c_layout {
+                    let obj = self.fresh_tmp();
+                    let base = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                        obj, c_lay.size, base, obj
+                    ));
+                    for (fname, fexpr) in fields {
+                        if let Some(cfl) = c_lay.fields.iter().find(|f| f.name == *fname) {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(fexpr, &mut temps)?;
+                            self.emit_mem_store(&base, cfl.byte_offset as i64, &v, &cfl.ty, false)?;
+                            self.flush_temps(&temps);
+                        }
+                    }
+                    return Ok(obj);
+                }
                 let obj = self.fresh_tmp();
                 self.code.push_str(&format!(
                     "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 {})\n",
@@ -4028,7 +6140,104 @@ impl<'a> LlvmFnGen<'a> {
                 }
                 Ok(obj)
             }
+            ExprKind::ArrayRepeat { value, len } => {
+                let arr_ty = expected_ty
+                    .cloned()
+                    .filter(|t| matches!(resolve_alias_ty(t, self.alias_bases), TypeExpr::Array { .. }))
+                    .unwrap_or_else(|| TypeExpr::Array {
+                        elem: Box::new(self.infer_expr_type(value)),
+                        len: *len,
+                        span: expr.span,
+                    });
+                let (elem_ty, alen, stride, elem_is_rc) = self.array_layout(&arr_ty).unwrap();
+                if !elem_is_rc {
+                    let total_bytes = alen * stride;
+                    let obj = self.fresh_tmp();
+                    let base = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                        obj, total_bytes, base, obj
+                    ));
+                    let mut temps = Vec::new();
+                    let val = self.lower_expr_borrowed(value, &mut temps)?;
+                    if alen <= 16 {
+                        for idx in 0..alen {
+                            self.emit_mem_store(&base, (idx * stride) as i64, &val, &elem_ty, false)?;
+                        }
+                    } else {
+                        self.slot_id += 1;
+                        let islot = format!("%arrep_{}", self.slot_id);
+                        self.entry_allocas.push_str(&format!("  {} = alloca i64\n", islot));
+                        let hdr = self.fresh_lbl("arr_hdr");
+                        let bdy = self.fresh_lbl("arr_bdy");
+                        let end = self.fresh_lbl("arr_end");
+                        self.code.push_str(&format!(
+                            "  store i64 0, ptr {}\n  br label %{}\n{}:\n",
+                            islot, hdr, hdr
+                        ));
+                        let cur = self.fresh_tmp();
+                        let cmp = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = load i64, ptr {}\n  {} = icmp slt i64 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n",
+                            cur, islot, cmp, cur, alen, cmp, bdy, end, bdy
+                        ));
+                        let boff = self.fresh_tmp();
+                        let eptr = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
+                            boff, cur, stride, eptr, base, boff
+                        ));
+                        self.emit_mem_store(&eptr, 0, &val, &elem_ty, false)?;
+                        let nxt = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = add i64 {}, 1\n  store i64 {}, ptr {}\n  br label %{}\n{}:\n",
+                            nxt, cur, nxt, islot, hdr, end
+                        ));
+                    }
+                    self.flush_temps(&temps);
+                    return Ok(obj);
+                }
+                let mut temps = Vec::new();
+                let init_v = self.lower_expr_borrowed(value, &mut temps)?;
+                let res = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = call i64 @tenon_list_filled(i64 {}, i64 {}, i64 1)\n",
+                    res, alen, init_v
+                ));
+                self.flush_temps(&temps);
+                Ok(res)
+            }
+            ExprKind::Cast { expr: inner, ty } => {
+                if let ExprKind::Float(x) = &inner.kind {
+                    if is_f32_type_expr(ty, self.alias_bases) {
+                        return Ok(((*x as f32).to_bits() as i64).to_string());
+                    }
+                }
+                let src_ty = self.infer_expr_type(inner);
+                let mut temps = Vec::new();
+                let v = self.lower_expr_borrowed(inner, &mut temps)?;
+                self.flush_temps(&temps);
+                Ok(self.emit_cast(&v, &src_ty, ty))
+            }
             ExprKind::List(elems) => {
+                if let Some(exp) = expected_ty {
+                    if let Some((elem_ty, alen, stride, false)) = self.array_layout(exp) {
+                        let total_bytes = alen * stride;
+                        let obj = self.fresh_tmp();
+                        let base = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                            obj, total_bytes, base, obj
+                        ));
+                        for (idx, e) in elems.iter().enumerate() {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(e, &mut temps)?;
+                            self.emit_mem_store(&base, (idx * stride) as i64, &v, &elem_ty, false)?;
+                            self.flush_temps(&temps);
+                        }
+                        return Ok(obj);
+                    }
+                }
                 let exp_elem_ty = expected_ty.and_then(|t| self.list_elem_ty(t));
                 let elem_is_rc = exp_elem_ty
                     .as_ref()
@@ -4104,6 +6313,7 @@ impl<'a> LlvmFnGen<'a> {
                 Ok(obj)
             }
             ExprKind::Unary { op, expr } => {
+                let sk = self.scalar_kind_of_expr(expr);
                 let is_flt = self.is_float_expr(expr);
                 let mut temps = Vec::new();
                 let v = self.lower_expr_borrowed(expr, &mut temps)?;
@@ -4111,7 +6321,16 @@ impl<'a> LlvmFnGen<'a> {
                 let r = self.fresh_tmp();
                 match op {
                     UnOp::Neg => {
-                        if is_flt {
+                        if sk == Some(ScalarKind::F32) {
+                            let t32 = self.fresh_tmp();
+                            let fv = self.fresh_tmp();
+                            let nf = self.fresh_tmp();
+                            let b32 = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n  {} = fneg float {}\n  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                                t32, v, fv, t32, nf, fv, b32, nf, r, b32
+                            ));
+                        } else if is_flt {
                             let fv = self.fresh_tmp();
                             let nf = self.fresh_tmp();
                             self.code.push_str(&format!(
@@ -4120,6 +6339,15 @@ impl<'a> LlvmFnGen<'a> {
                             ));
                         } else {
                             self.code.push_str(&format!("  {} = sub i64 0, {}\n", r, v));
+                            if let Some(k) = sk {
+                                return Ok(self.normalize_scalar(&r, k));
+                            }
+                        }
+                    }
+                    UnOp::BitNot => {
+                        self.code.push_str(&format!("  {} = xor i64 {}, -1\n", r, v));
+                        if let Some(k) = sk {
+                            return Ok(self.normalize_scalar(&r, k));
                         }
                     }
                     UnOp::Not => {
@@ -4204,6 +6432,14 @@ impl<'a> LlvmFnGen<'a> {
             }
             ExprKind::Binary { op, left, right } => {
                 let tcmp = self.is_text_expr(left) || self.is_text_expr(right);
+                let lk = self.scalar_kind_of_expr(left);
+                let rk = self.scalar_kind_of_expr(right);
+                let eff_sk = match (lk, rk) {
+                    (Some(ScalarKind::I64), Some(k)) if k != ScalarKind::I64 && matches!(left.kind, ExprKind::Int(_)) => Some(k),
+                    (Some(ScalarKind::F32), _) | (_, Some(ScalarKind::F32)) => Some(ScalarKind::F32),
+                    (Some(k), _) => Some(k),
+                    (None, k) => k,
+                };
                 let float_op = self.is_float_expr(left) || self.is_float_expr(right);
                 let mut temps = Vec::new();
                 let l = self.lower_expr_borrowed(left, &mut temps)?;
@@ -4236,6 +6472,52 @@ impl<'a> LlvmFnGen<'a> {
                     return Ok(res);
                 }
                 self.flush_temps(&temps);
+                if eff_sk == Some(ScalarKind::F32) {
+                    let l32 = self.fresh_tmp();
+                    let r32 = self.fresh_tmp();
+                    let lf = self.fresh_tmp();
+                    let rf = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = trunc i64 {} to i32\n  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n  {} = bitcast i32 {} to float\n",
+                        l32, l, r32, r, lf, l32, rf, r32
+                    ));
+                    let res = self.fresh_tmp();
+                    match op {
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                            let fop = match op {
+                                BinOp::Add => "fadd",
+                                BinOp::Sub => "fsub",
+                                BinOp::Mul => "fmul",
+                                BinOp::Div => "fdiv",
+                                _ => unreachable!(),
+                            };
+                            let fres = self.fresh_tmp();
+                            let b32 = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = {} float {}, {}\n  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                                fres, fop, lf, rf, b32, fres, res, b32
+                            ));
+                        }
+                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                            let pred = match op {
+                                BinOp::Eq => "oeq",
+                                BinOp::Ne => "une",
+                                BinOp::Lt => "olt",
+                                BinOp::Le => "ole",
+                                BinOp::Gt => "ogt",
+                                BinOp::Ge => "oge",
+                                _ => unreachable!(),
+                            };
+                            let c = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = fcmp {} float {}, {}\n  {} = zext i1 {} to i64\n",
+                                c, pred, lf, rf, res, c
+                            ));
+                        }
+                        other => return Err(format!("unsupported float32 op {:?} in LLVM codegen", other)),
+                    }
+                    return Ok(res);
+                }
                 if float_op {
                     let lf = self.fresh_tmp();
                     let rf = self.fresh_tmp();
@@ -4279,26 +6561,41 @@ impl<'a> LlvmFnGen<'a> {
                     }
                     return Ok(res);
                 }
+                let is_unsigned = eff_sk.is_some_and(|k| k.is_unsigned());
+                let is_signed_narrow = matches!(eff_sk, Some(ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I32));
+                let is_cmp = matches!(
+                    op,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                );
                 let res = self.fresh_tmp();
                 match op {
                     BinOp::Add => self.code.push_str(&format!("  {} = add i64 {}, {}\n", res, l, r)),
                     BinOp::Sub => self.code.push_str(&format!("  {} = sub i64 {}, {}\n", res, l, r)),
                     BinOp::Mul => self.code.push_str(&format!("  {} = mul i64 {}, {}\n", res, l, r)),
-                    BinOp::Div => self.code.push_str(&format!("  {} = sdiv i64 {}, {}\n", res, l, r)),
-                    BinOp::Mod => self.code.push_str(&format!("  {} = srem i64 {}, {}\n", res, l, r)),
+                    BinOp::Div => {
+                        let iop = if is_unsigned { "udiv" } else { "sdiv" };
+                        self.code.push_str(&format!("  {} = {} i64 {}, {}\n", res, iop, l, r));
+                    }
+                    BinOp::Mod => {
+                        let iop = if is_unsigned { "urem" } else { "srem" };
+                        self.code.push_str(&format!("  {} = {} i64 {}, {}\n", res, iop, l, r));
+                    }
                     BinOp::BitAnd => self.code.push_str(&format!("  {} = and i64 {}, {}\n", res, l, r)),
                     BinOp::BitOr => self.code.push_str(&format!("  {} = or i64 {}, {}\n", res, l, r)),
                     BinOp::BitXor => self.code.push_str(&format!("  {} = xor i64 {}, {}\n", res, l, r)),
                     BinOp::Shl => self.code.push_str(&format!("  {} = shl i64 {}, {}\n", res, l, r)),
-                    BinOp::Shr => self.code.push_str(&format!("  {} = lshr i64 {}, {}\n", res, l, r)),
+                    BinOp::Shr => {
+                        let iop = if is_signed_narrow { "ashr" } else { "lshr" };
+                        self.code.push_str(&format!("  {} = {} i64 {}, {}\n", res, iop, l, r));
+                    }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         let pred = match op {
                             BinOp::Eq => "eq",
                             BinOp::Ne => "ne",
-                            BinOp::Lt => "slt",
-                            BinOp::Le => "sle",
-                            BinOp::Gt => "sgt",
-                            BinOp::Ge => "sge",
+                            BinOp::Lt => if is_unsigned { "ult" } else { "slt" },
+                            BinOp::Le => if is_unsigned { "ule" } else { "sle" },
+                            BinOp::Gt => if is_unsigned { "ugt" } else { "sgt" },
+                            BinOp::Ge => if is_unsigned { "uge" } else { "sge" },
                             _ => unreachable!(),
                         };
                         let c = self.fresh_tmp();
@@ -4308,6 +6605,11 @@ impl<'a> LlvmFnGen<'a> {
                         ));
                     }
                     other => return Err(format!("unsupported op {:?} in LLVM codegen", other)),
+                }
+                if !is_cmp {
+                    if let Some(k) = eff_sk {
+                        return Ok(self.normalize_scalar(&res, k));
+                    }
                 }
                 Ok(res)
             }
@@ -4580,6 +6882,24 @@ impl<'a> LlvmFnGen<'a> {
                         return Ok(res);
                     }
                     if fname == "len" && args.len() == 1 {
+                        let arg_ty = self.infer_expr_type(&args[0].value);
+                        if let Some((_, alen, _, _)) = self.array_layout(&arg_ty) {
+                            let mut temps = Vec::new();
+                            let _ = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                            self.flush_temps(&temps);
+                            return Ok(alen.to_string());
+                        }
+                        if matches!(resolve_alias_ty(&arg_ty, self.alias_bases), TypeExpr::Named { ref name, .. } if name == "BytesSlice") {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                            let res = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = call i64 @tenon_slice_len(i64 {})\n",
+                                res, v
+                            ));
+                            self.flush_temps(&temps);
+                            return Ok(res);
+                        }
                         let mut temps = Vec::new();
                         let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
                         let res = self.fresh_tmp();
@@ -4589,6 +6909,271 @@ impl<'a> LlvmFnGen<'a> {
                         ));
                         self.flush_temps(&temps);
                         return Ok(res);
+                    }
+                    // Native LLVM SIMD vector IR (takes priority over scalar syscall fallback!)
+                    if let Some(simd_res) = self.try_emit_simd_builtin(fname, args, expected_ty)? {
+                        return Ok(simd_res);
+                    }
+                    // Native LLVM hardware bit intrinsics
+                    if matches!(
+                        fname.as_str(),
+                        "clz" | "ctz" | "popcnt" | "bswap16" | "bswap32" | "bswap64"
+                    ) && args.len() == 1
+                    {
+                        let mut temps = Vec::new();
+                        let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        self.flush_temps(&temps);
+                        let res = self.fresh_tmp();
+                        match fname.as_str() {
+                            "clz" => self.code.push_str(&format!(
+                                "  {} = call i64 @llvm.ctlz.i64(i64 {}, i1 false)\n",
+                                res, v
+                            )),
+                            "ctz" => self.code.push_str(&format!(
+                                "  {} = call i64 @llvm.cttz.i64(i64 {}, i1 false)\n",
+                                res, v
+                            )),
+                            "popcnt" => self.code.push_str(&format!(
+                                "  {} = call i64 @llvm.ctpop.i64(i64 {})\n",
+                                res, v
+                            )),
+                            "bswap16" => {
+                                let t = self.fresh_tmp();
+                                let b = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = trunc i64 {} to i16\n  {} = call i16 @llvm.bswap.i16(i16 {})\n  {} = zext i16 {} to i64\n",
+                                    t, v, b, t, res, b
+                                ));
+                            }
+                            "bswap32" => {
+                                let t = self.fresh_tmp();
+                                let b = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = trunc i64 {} to i32\n  {} = call i32 @llvm.bswap.i32(i32 {})\n  {} = zext i32 {} to i64\n",
+                                    t, v, b, t, res, b
+                                ));
+                            }
+                            _ => self.code.push_str(&format!(
+                                "  {} = call i64 @llvm.bswap.i64(i64 {})\n",
+                                res, v
+                            )),
+                        }
+                        return Ok(res);
+                    }
+                    if (fname == "rotl64" || fname == "rotr64") && args.len() == 2 {
+                        let mut temps = Vec::new();
+                        let x = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let n = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        self.flush_temps(&temps);
+                        let res = self.fresh_tmp();
+                        let intr = if fname == "rotl64" { "@llvm.fshl.i64" } else { "@llvm.fshr.i64" };
+                        self.code.push_str(&format!(
+                            "  {} = call i64 {}(i64 {}, i64 {}, i64 {})\n",
+                            res, intr, x, x, n
+                        ));
+                        return Ok(res);
+                    }
+                    if matches!(
+                        fname.as_str(),
+                        "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "saturating_add" | "saturating_sub"
+                    ) && args.len() == 2
+                    {
+                        let sk = self
+                            .scalar_kind_of_expr(&args[0].value)
+                            .or_else(|| self.scalar_kind_of_expr(&args[1].value))
+                            .unwrap_or(ScalarKind::I64);
+                        let mut temps = Vec::new();
+                        let a = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let b = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        self.flush_temps(&temps);
+                        if matches!(fname.as_str(), "wrapping_add" | "wrapping_sub" | "wrapping_mul") {
+                            let iop = match fname.as_str() {
+                                "wrapping_add" => "add",
+                                "wrapping_sub" => "sub",
+                                _ => "mul",
+                            };
+                            let r = self.fresh_tmp();
+                            self.code.push_str(&format!("  {} = {} i64 {}, {}\n", r, iop, a, b));
+                            return Ok(self.normalize_scalar(&r, sk));
+                        }
+                        let (ity, bits) = match sk {
+                            ScalarKind::I8 | ScalarKind::U8 => ("i8", 8),
+                            ScalarKind::I16 | ScalarKind::U16 => ("i16", 16),
+                            ScalarKind::I32 | ScalarKind::U32 => ("i32", 32),
+                            _ => ("i64", 64),
+                        };
+                        let prefix = match (fname.as_str(), sk.is_unsigned()) {
+                            ("saturating_add", false) => "sadd",
+                            ("saturating_add", true) => "uadd",
+                            (_, false) => "ssub",
+                            (_, true) => "usub",
+                        };
+                        let res = self.fresh_tmp();
+                        if bits == 64 {
+                            self.code.push_str(&format!(
+                                "  {} = call i64 @llvm.{}.sat.i64(i64 {}, i64 {})\n",
+                                res, prefix, a, b
+                            ));
+                        } else {
+                            let ta = self.fresh_tmp();
+                            let tb = self.fresh_tmp();
+                            let sv = self.fresh_tmp();
+                            let ext = if sk.is_unsigned() { "zext" } else { "sext" };
+                            self.code.push_str(&format!(
+                                "  {} = trunc i64 {} to {}\n  {} = trunc i64 {} to {}\n  {} = call {} @llvm.{}.sat.{}({} {}, {} {})\n  {} = {} {} {} to i64\n",
+                                ta, a, ity, tb, b, ity, sv, ity, prefix, ity, ity, ta, ity, tb, res, ext, ity, sv
+                            ));
+                        }
+                        return Ok(res);
+                    }
+                    if is_consuming_cow_builtin(fname) && !args.is_empty() {
+                        let csym = *self
+                            .syscall_map
+                            .get(fname)
+                            .ok_or_else(|| format!("unknown cow builtin `{}`", fname))?;
+                        let mut temps = Vec::new();
+                        let mut avals = Vec::with_capacity(args.len());
+                        avals.push(format!(
+                            "i64 {}",
+                            self.lower_expr_owned(&args[0].value, expected_ty)?
+                        ));
+                        for a in &args[1..] {
+                            avals.push(format!(
+                                "i64 {}",
+                                self.lower_expr_borrowed(&a.value, &mut temps)?
+                            ));
+                        }
+                        let res = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @{}({})\n",
+                            res,
+                            csym,
+                            avals.join(", ")
+                        ));
+                        self.flush_temps(&temps);
+                        return Ok(res);
+                    }
+                    if fname == "ptr_is_null" && args.len() == 1 {
+                        let mut temps = Vec::new();
+                        let p = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        self.flush_temps(&temps);
+                        let c = self.fresh_tmp();
+                        let r = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = icmp eq i64 {}, 0\n  {} = zext i1 {} to i64\n",
+                            c, p, r, c
+                        ));
+                        return Ok(r);
+                    }
+                    if (fname == "ptr_of" || fname == "mut_ptr_of") && args.len() == 1 {
+                        let arg = &args[0].value;
+                        let aty = self.infer_expr_type(arg);
+                        let abase = resolve_alias_ty(&aty, self.alias_bases);
+                        let is_buf = self.is_c_value_type(&abase)
+                            || matches!(&abase, TypeExpr::Named { name, .. } if name == "Bytes" || name == "Text");
+                        if is_buf {
+                            if fname == "mut_ptr_of" {
+                                if let ExprKind::Ident(vname) = &arg.kind {
+                                    let cur = self.load_ident_val(vname)?;
+                                    let uniq = self.fresh_tmp();
+                                    let dp = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
+                                        uniq, cur
+                                    ));
+                                    let vslot = self.var_ptrs[vname].clone();
+                                    if self.inout_vars.contains(vname) {
+                                        let ai = self.fresh_tmp();
+                                        let ap = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                            ai, vslot, ap, ai, uniq, ap
+                                        ));
+                                    } else {
+                                        self.code.push_str(&format!(
+                                            "  store i64 {}, ptr {}\n",
+                                            uniq, vslot
+                                        ));
+                                    }
+                                    self.code.push_str(&format!(
+                                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                                        dp, uniq
+                                    ));
+                                    return Ok(dp);
+                                }
+                            }
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(arg, &mut temps)?;
+                            let dp = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                                dp, v
+                            ));
+                            self.flush_temps(&temps);
+                            return Ok(dp);
+                        }
+                        if let ExprKind::Ident(vname) = &arg.kind {
+                            if let Some(slot) = self.var_ptrs.get(vname).cloned() {
+                                if self.inout_vars.contains(vname) {
+                                    let p = self.fresh_tmp();
+                                    self.code.push_str(&format!("  {} = load i64, ptr {}\n", p, slot));
+                                    return Ok(p);
+                                }
+                                let p = self.fresh_tmp();
+                                self.code.push_str(&format!("  {} = ptrtoint ptr {} to i64\n", p, slot));
+                                return Ok(p);
+                            }
+                        }
+                        let mut temps = Vec::new();
+                        let v = self.lower_expr_borrowed(arg, &mut temps)?;
+                        self.slot_id += 1;
+                        let s = format!("%ptrof_{}", self.slot_id);
+                        self.entry_allocas.push_str(&format!("  {} = alloca i64\n", s));
+                        let p = self.fresh_tmp();
+                        self.code.push_str(&format!("  {} = ptrtoint ptr {} to i64\n", p, s));
+                        self.emit_mem_store(&p, 0, &v, &abase, false)?;
+                        self.flush_temps(&temps);
+                        return Ok(p);
+                    }
+                    if fname == "__ptr_add" && args.len() == 3 {
+                        let mut temps = Vec::new();
+                        let p = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let n = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        let sz = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                        self.flush_temps(&temps);
+                        let off = self.fresh_tmp();
+                        let res = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
+                            off, n, sz, res, p, off
+                        ));
+                        return Ok(res);
+                    }
+                    if (fname == "ptr_read" || fname == "volatile_read") && args.len() == 1 {
+                        let pty = self.infer_expr_type(&args[0].value);
+                        let elem_ty = self
+                            .ptr_pointee_ty(&pty)
+                            .unwrap_or_else(|| named_ty("Int64"));
+                        let mut temps = Vec::new();
+                        let p = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let v = self.emit_mem_load(&p, 0, &elem_ty, fname == "volatile_read")?;
+                        self.flush_temps(&temps);
+                        return Ok(v);
+                    }
+                    if (fname == "ptr_write" || fname == "volatile_write") && args.len() == 2 {
+                        let pty = self.infer_expr_type(&args[0].value);
+                        let elem_ty = self
+                            .ptr_pointee_ty(&pty)
+                            .unwrap_or_else(|| self.infer_expr_type(&args[1].value));
+                        let mut temps = Vec::new();
+                        let p = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let v = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        self.emit_mem_store(&p, 0, &v, &elem_ty, fname == "volatile_write")?;
+                        self.flush_temps(&temps);
+                        return Ok("0".into());
+                    }
+                    if let Some(ef) = self.extern_fns.get(fname).cloned() {
+                        return self.emit_extern_c_call(&ef, args);
                     }
                     if fname == "push" && args.len() == 2 {
                         let xs_ty = self.infer_expr_type(&args[0].value);
@@ -4997,6 +7582,7 @@ fn stmt_keeps_unique(stmt: &Stmt, name: &str) -> bool {
         }
         Stmt::Expr { expr, .. } => expr_keeps_unique(expr, name),
         Stmt::Break { .. } | Stmt::Continue { .. } => true,
+        Stmt::Defer { body, .. } => block_keeps_unique(body, name),
         Stmt::LetTuple { .. } | Stmt::For { .. } => false,
     }
 }
@@ -5065,8 +7651,10 @@ fn expr_keeps_unique(expr: &Expr, name: &str) -> bool {
                     && expr_keeps_unique(&a.body, name)
             })
         }
-        ExprKind::Block(blk) => block_keeps_unique(blk, name),
-        ExprKind::Await(e) => expr_keeps_unique(e, name),
+        ExprKind::Block(blk) | ExprKind::Unsafe(blk) => block_keeps_unique(blk, name),
+        ExprKind::Cast { expr: e, .. }
+        | ExprKind::ArrayRepeat { value: e, .. }
+        | ExprKind::Await(e) => expr_keeps_unique(e, name),
         _ => false,
     }
 }
@@ -5476,5 +8064,274 @@ pub fn main() Int {
         );
         assert!(stdout.contains("main() => 42"), "unexpected stdout: {}", stdout);
         assert!(stdout.contains("live_objects=0"), "leaked objects in LLVM AOT: {}", stdout);
+    }
+
+    #[test]
+    fn llvm_aot_systems_suite_simd_threads_tcp_zero_leaks() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let entry = repo_root.join("examples/systems_test.tn");
+        let prog = load_program_with_imports(&entry).unwrap();
+
+        let pid = std::process::id();
+        let bin = std::env::temp_dir().join(format!("tenon_llvm_systems_suite_{}", pid));
+        let ir_path = std::env::temp_dir().join(format!("tenon_llvm_systems_suite_{}.ll", pid));
+        let opts = BuildOptions {
+            opt_level: "O3".into(),
+            emit_ll_path: Some(ir_path.clone()),
+            ..Default::default()
+        };
+        let art = compile_with_options(&prog, &bin, &opts).unwrap();
+        assert!(art.binary_bytes > 4096);
+
+        let ir = fs::read_to_string(&ir_path).unwrap();
+        let _ = fs::remove_file(&ir_path);
+        assert!(
+            ir.contains("<4 x float>")
+                && ir.contains("@llvm.fma.v4f32")
+                && ir.contains("@llvm.vector.reduce.fadd.v4f32"),
+            "LLVM AOT must emit native SIMD vector IR for Float32x4"
+        );
+        assert!(ir.contains("<4 x double>"), "LLVM AOT must emit native SIMD vector IR for Float64x4");
+        assert!(ir.contains("<16 x i8>"), "LLVM AOT must emit native SIMD vector IR for UInt8x16");
+
+        let run = Command::new(&bin).output().unwrap();
+        let _ = fs::remove_file(&bin);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "native LLVM systems suite binary failed: stdout={} stderr={}",
+            stdout,
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(stdout.contains("main() => 1110"), "unexpected stdout: {}", stdout);
+        assert!(stdout.contains("live_objects=0"), "leaked objects in LLVM AOT: {}", stdout);
+    }
+
+    #[test]
+    fn llvm_aot_bidirectional_c_ffi_and_header_gen() {
+        let pid = std::process::id();
+        let tmp = std::env::temp_dir();
+
+        // Direction 1: Tenon calls real C code (`--c-src`) passing `@packed` and `@repr(C)` struct pointers!
+        let c_helper = tmp.join(format!("tenon_ffi_helper_{}.c", pid));
+        fs::write(
+            &c_helper,
+            r#"
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct __attribute__((packed)) PackedHdr {
+    uint8_t ver;
+    uint16_t port;
+    uint32_t seq;
+} PackedHdr;
+
+typedef struct CPoint {
+    uint8_t tag;
+    int32_t x;
+    float y;
+} CPoint;
+
+int64_t c_mutate_and_verify(const PackedHdr* h, CPoint* p) {
+    if (sizeof(PackedHdr) != 7 || offsetof(PackedHdr, seq) != 3) return -1;
+    if (sizeof(CPoint) != 12 || offsetof(CPoint, x) != 4 || offsetof(CPoint, y) != 8) return -2;
+    p->x += (int32_t)h->seq;
+    return (int64_t)h->ver * 10000 + (int64_t)h->port + (int64_t)p->tag;
+}
+"#,
+        )
+        .unwrap();
+
+        let tenon_caller = parse(
+            r#"
+@packed
+pub record PackedHdr {
+    ver  UInt8
+    port UInt16
+    seq  UInt32
+}
+
+@repr(C)
+pub record CPoint {
+    tag UInt8
+    x   Int32
+    y   Float32
+}
+
+extern "C" {
+    fn c_mutate_and_verify(h Ptr[PackedHdr], p MutPtr[CPoint]) Int64
+}
+
+pub fn main() Int {
+    let hdr = PackedHdr { ver = 4, port = 8080, seq = 100 }
+    var pt = CPoint { tag = 7, x = 23, y = 1.5 }
+    let res = unsafe {
+        c_mutate_and_verify(ptr_of(hdr), mut_ptr_of(pt))
+    }
+    assert res == 48087
+    assert pt.x == 123
+    (res as Int) + (pt.x as Int)
+}
+"#,
+        )
+        .unwrap();
+
+        let bin1 = tmp.join(format!("tenon_ffi_caller_{}", pid));
+        let opts1 = BuildOptions {
+            opt_level: "O2".into(),
+            extra_c_sources: vec![c_helper.clone()],
+            ..Default::default()
+        };
+        compile_with_options(&tenon_caller, &bin1, &opts1).unwrap();
+        let run1 = Command::new(&bin1).output().unwrap();
+        let _ = fs::remove_file(&bin1);
+        let _ = fs::remove_file(&c_helper);
+        let out1 = String::from_utf8_lossy(&run1.stdout);
+        assert!(
+            run1.status.success(),
+            "Tenon -> C FFI binary failed: stdout={} stderr={}",
+            out1,
+            String::from_utf8_lossy(&run1.stderr)
+        );
+        assert!(out1.contains("main() => 48210"), "unexpected Tenon->C output: {}", out1);
+        assert!(out1.contains("live_objects=0"), "Tenon->C leaked objects: {}", out1);
+
+        // Direction 2: C calls Tenon static library (`--lib static` + `--emit-header`) via `@export`!
+        let tenon_lib = parse(
+            r#"
+@repr(C)
+pub record CPoint {
+    tag UInt8
+    x   Int32
+    y   Float32
+}
+
+@export("tn_compute_point")
+pub fn compute_point(p Ptr[CPoint], scale Int32) Int32 {
+    unsafe {
+        let pt = ptr_read(p)
+        pt.x * scale + (pt.tag as Int32)
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let lib_path = tmp.join(format!("libtenon_export_{}.a", pid));
+        let hdr_path = tmp.join(format!("tenon_export_{}.h", pid));
+        let opts2 = BuildOptions {
+            opt_level: "O2".into(),
+            output_kind: OutputKind::StaticLib,
+            emit_header_path: Some(hdr_path.clone()),
+            ..Default::default()
+        };
+        compile_with_options(&tenon_lib, &lib_path, &opts2).unwrap();
+
+        let hdr_text = fs::read_to_string(&hdr_path).unwrap();
+        assert!(
+            hdr_text.contains("typedef struct CPoint")
+                && hdr_text.contains("extern int32_t tn_compute_point(const CPoint* p, int32_t scale);"),
+            "unexpected generated C header:\n{}",
+            hdr_text
+        );
+
+        let c_main = tmp.join(format!("tenon_c_driver_{}.c", pid));
+        let c_bin = tmp.join(format!("tenon_c_driver_{}", pid));
+        fs::write(
+            &c_main,
+            format!(
+                r#"
+#include <stdio.h>
+#include "{}"
+
+int main(void) {{
+    CPoint pt = {{ 5, 14, 2.5f }};
+    int32_t r = tn_compute_point(&pt, 3);
+    printf("c_to_tenon=%d\n", r);
+    return r == 47 ? 0 : 1;
+}}
+"#,
+                hdr_path.display()
+            ),
+        )
+        .unwrap();
+
+        let cc = Command::new("clang")
+            .args([
+                "-O2",
+                c_main.to_str().unwrap(),
+                lib_path.to_str().unwrap(),
+                "-o",
+                c_bin.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            cc.status.success(),
+            "clang linking libtenon_export.a failed: {}",
+            String::from_utf8_lossy(&cc.stderr)
+        );
+        let run2 = Command::new(&c_bin).output().unwrap();
+        let _ = fs::remove_file(&c_main);
+        let _ = fs::remove_file(&c_bin);
+        let _ = fs::remove_file(&lib_path);
+        let _ = fs::remove_file(&hdr_path);
+        let out2 = String::from_utf8_lossy(&run2.stdout);
+        assert!(
+            run2.status.success() && out2.contains("c_to_tenon=47"),
+            "C -> Tenon static library execution failed: status={:?} stdout={} stderr={}",
+            run2.status,
+            out2,
+            String::from_utf8_lossy(&run2.stderr)
+        );
+    }
+
+    #[test]
+    fn llvm_aot_dwarf_debug_info_emits_valid_metadata() {
+        let mut prog = parse(
+            r#"
+pub fn add_pair(a Int, b Int) Int {
+    let s = a + b
+    s * 2
+}
+
+pub fn main() Int {
+    add_pair(10, 11)
+}
+"#,
+        )
+        .unwrap();
+        prog.source_files.push("debug_demo.tn".into());
+
+        let pid = std::process::id();
+        let bin = std::env::temp_dir().join(format!("tenon_llvm_dbg_{}", pid));
+        let ir_path = std::env::temp_dir().join(format!("tenon_llvm_dbg_{}.ll", pid));
+        let opts = BuildOptions {
+            opt_level: "O0".into(),
+            debug_info: true,
+            emit_ll_path: Some(ir_path.clone()),
+            ..Default::default()
+        };
+        compile_with_options(&prog, &bin, &opts).unwrap();
+        let ir = fs::read_to_string(&ir_path).unwrap();
+        let _ = fs::remove_file(&ir_path);
+        assert!(ir.contains("!DICompileUnit"), "missing !DICompileUnit in DWARF IR");
+        assert!(ir.contains("!DIFile"), "missing !DIFile in DWARF IR");
+        assert!(ir.contains("!DISubprogram"), "missing !DISubprogram in DWARF IR");
+        assert!(ir.contains("!DILocation"), "missing !DILocation in DWARF IR");
+
+        let run = Command::new(&bin).output().unwrap();
+        let _ = fs::remove_file(&bin);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success() && stdout.contains("main() => 42"),
+            "DWARF -g binary failed: stdout={} stderr={}",
+            stdout,
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
 }

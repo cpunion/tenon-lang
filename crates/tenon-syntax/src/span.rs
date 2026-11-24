@@ -7,6 +7,8 @@ pub struct Span {
     pub end: usize,
     pub line: usize,
     pub col: usize,
+    #[serde(default)]
+    pub file_id: u32,
 }
 
 impl Span {
@@ -16,6 +18,17 @@ impl Span {
             end,
             line,
             col,
+            file_id: 0,
+        }
+    }
+
+    pub fn new_in_file(start: usize, end: usize, line: usize, col: usize, file_id: u32) -> Self {
+        Self {
+            start,
+            end,
+            line,
+            col,
+            file_id,
         }
     }
 
@@ -25,6 +38,11 @@ impl Span {
             end: self.end.max(other.end),
             line: self.line,
             col: self.col,
+            file_id: if self.file_id != 0 {
+                self.file_id
+            } else {
+                other.file_id
+            },
         }
     }
 }

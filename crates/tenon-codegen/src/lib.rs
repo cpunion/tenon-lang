@@ -1,4 +1,5 @@
 pub mod llvm_aot;
+pub mod llvm_runtime;
 pub mod lower_interfaces;
 pub use tenon_rt::perceus;
 pub mod wasm_client;
@@ -15,56 +16,179 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use lower_interfaces::{DynInterfaceLayout, prepare_program_for_codegen};
 use perceus::*;
 use std::collections::{BTreeMap, BTreeSet};
-use tenon_rt::syscalls;
+use tenon_rt::{syscalls, systems};
 use tenon_syntax::*;
 
-/// Minimal Tenon Core Byte & OS/Network Syscall Table (19 primitives).
+/// Minimal Tenon Core Byte, OS/Network & Systems Syscall Table.
 /// Shared between Cranelift JIT (`lib.rs`) and LLVM 22 AOT (`llvm_aot.rs`).
 pub(crate) struct CoreSyscallSpec {
     pub tenon_name: &'static str,
     pub c_symbol: &'static str,
     pub arity: usize,
     pub returns_rc: bool,
+    #[allow(dead_code)]
     pub returns_text: bool,
+    #[allow(dead_code)]
     pub returns_float: bool,
+    pub ret_ty: &'static str,
+}
+
+pub(crate) fn is_consuming_cow_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "bytes_set"
+            | "bytes_push"
+            | "bytes_write_u16_le"
+            | "bytes_write_u16_be"
+            | "bytes_write_u32_le"
+            | "bytes_write_u32_be"
+            | "bytes_write_u64_le"
+            | "bytes_write_u64_be"
+            | "simd_u8x16_set_lane"
+    )
 }
 
 pub(crate) const CORE_SYSCALLS: &[CoreSyscallSpec] = &[
     // 1. Core byte / text primitives (4)
-    CoreSyscallSpec { tenon_name: "byte_at", c_symbol: "tenon_byte_at", arity: 2, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "str_slice", c_symbol: "tenon_str_slice", arity: 3, returns_rc: true, returns_text: true, returns_float: false },
-    CoreSyscallSpec { tenon_name: "byte_to_text", c_symbol: "tenon_byte_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false },
-    CoreSyscallSpec { tenon_name: "str_concat", c_symbol: "tenon_str_concat", arity: 2, returns_rc: true, returns_text: true, returns_float: false },
+    CoreSyscallSpec { tenon_name: "byte_at", c_symbol: "tenon_byte_at", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "str_slice", c_symbol: "tenon_str_slice", arity: 3, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "byte_to_text", c_symbol: "tenon_byte_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "str_concat", c_symbol: "tenon_str_concat", arity: 2, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
     // 1b. O(n) Byte buffer primitives (4)
-    CoreSyscallSpec { tenon_name: "buf_new", c_symbol: "tenon_buf_new", arity: 0, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "buf_push_str", c_symbol: "tenon_buf_push_str", arity: 2, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "buf_push_byte", c_symbol: "tenon_buf_push_byte", arity: 2, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "buf_finish", c_symbol: "tenon_buf_finish", arity: 1, returns_rc: true, returns_text: true, returns_float: false },
+    CoreSyscallSpec { tenon_name: "buf_new", c_symbol: "tenon_buf_new", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "buf_push_str", c_symbol: "tenon_buf_push_str", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "buf_push_byte", c_symbol: "tenon_buf_push_byte", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "buf_finish", c_symbol: "tenon_buf_finish", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
     // 1c. Minimal IEEE-754 Float64 primitives (6)
-    CoreSyscallSpec { tenon_name: "int_to_float", c_symbol: "tenon_int_to_float", arity: 1, returns_rc: false, returns_text: false, returns_float: true },
-    CoreSyscallSpec { tenon_name: "float_to_int", c_symbol: "tenon_float_to_int", arity: 1, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "float_to_text", c_symbol: "tenon_float_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false },
-    CoreSyscallSpec { tenon_name: "parse_float", c_symbol: "tenon_parse_float", arity: 1, returns_rc: false, returns_text: false, returns_float: true },
-    CoreSyscallSpec { tenon_name: "float_is_nan", c_symbol: "tenon_float_is_nan", arity: 1, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "float_bits", c_symbol: "tenon_float_bits", arity: 1, returns_rc: false, returns_text: false, returns_float: false },
+    CoreSyscallSpec { tenon_name: "int_to_float", c_symbol: "tenon_int_to_float", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float" },
+    CoreSyscallSpec { tenon_name: "float_to_int", c_symbol: "tenon_float_to_int", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "float_to_text", c_symbol: "tenon_float_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "parse_float", c_symbol: "tenon_parse_float", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float" },
+    CoreSyscallSpec { tenon_name: "float_is_nan", c_symbol: "tenon_float_is_nan", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "float_bits", c_symbol: "tenon_float_bits", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     // 2. Minimal OS / I/O / FS / Process syscalls (10)
-    CoreSyscallSpec { tenon_name: "sys_write_stdout", c_symbol: "tenon_sys_write_stdout", arity: 1, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_read_line", c_symbol: "tenon_sys_read_line", arity: 0, returns_rc: true, returns_text: true, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_is_eof", c_symbol: "tenon_sys_is_eof", arity: 0, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_env", c_symbol: "tenon_sys_env", arity: 1, returns_rc: true, returns_text: true, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_cwd", c_symbol: "tenon_sys_cwd", arity: 0, returns_rc: true, returns_text: true, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_read_file", c_symbol: "tenon_sys_read_file", arity: 1, returns_rc: true, returns_text: true, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_file_ok", c_symbol: "tenon_sys_file_ok", arity: 0, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_write_file", c_symbol: "tenon_sys_write_file", arity: 2, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_exec", c_symbol: "tenon_sys_exec", arity: 1, returns_rc: true, returns_text: true, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_exec_exit_code", c_symbol: "tenon_sys_exec_exit_code", arity: 0, returns_rc: false, returns_text: false, returns_float: false },
+    CoreSyscallSpec { tenon_name: "sys_write_stdout", c_symbol: "tenon_sys_write_stdout", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "sys_read_line", c_symbol: "tenon_sys_read_line", arity: 0, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "sys_is_eof", c_symbol: "tenon_sys_is_eof", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "sys_env", c_symbol: "tenon_sys_env", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "sys_cwd", c_symbol: "tenon_sys_cwd", arity: 0, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "sys_read_file", c_symbol: "tenon_sys_read_file", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "sys_file_ok", c_symbol: "tenon_sys_file_ok", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "sys_write_file", c_symbol: "tenon_sys_write_file", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "sys_exec", c_symbol: "tenon_sys_exec", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "sys_exec_exit_code", c_symbol: "tenon_sys_exec_exit_code", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     // 3. Minimal Raw HTTPS line-stream transport syscalls (6)
-    CoreSyscallSpec { tenon_name: "sys_http_open", c_symbol: "tenon_sys_http_open", arity: 4, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_http_sse_open", c_symbol: "tenon_sys_http_sse_open", arity: 3, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_http_sse_next_line", c_symbol: "tenon_sys_http_sse_next_line", arity: 1, returns_rc: true, returns_text: true, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_http_sse_eof", c_symbol: "tenon_sys_http_sse_eof", arity: 1, returns_rc: false, returns_text: false, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_http_sse_error", c_symbol: "tenon_sys_http_sse_error", arity: 1, returns_rc: true, returns_text: true, returns_float: false },
-    CoreSyscallSpec { tenon_name: "sys_http_sse_close", c_symbol: "tenon_sys_http_sse_close", arity: 1, returns_rc: false, returns_text: false, returns_float: false },
+    CoreSyscallSpec { tenon_name: "sys_http_open", c_symbol: "tenon_sys_http_open", arity: 4, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "sys_http_sse_open", c_symbol: "tenon_sys_http_sse_open", arity: 3, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "sys_http_sse_next_line", c_symbol: "tenon_sys_http_sse_next_line", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "sys_http_sse_eof", c_symbol: "tenon_sys_http_sse_eof", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "sys_http_sse_error", c_symbol: "tenon_sys_http_sse_error", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "sys_http_sse_close", c_symbol: "tenon_sys_http_sse_close", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    // 4. S1 Bit intrinsics & Float32 text ops
+    CoreSyscallSpec { tenon_name: "clz", c_symbol: "tenon_clz", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "ctz", c_symbol: "tenon_ctz", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "popcnt", c_symbol: "tenon_popcnt", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "bswap16", c_symbol: "tenon_bswap16", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt16" },
+    CoreSyscallSpec { tenon_name: "bswap32", c_symbol: "tenon_bswap32", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt32" },
+    CoreSyscallSpec { tenon_name: "bswap64", c_symbol: "tenon_bswap64", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt64" },
+    CoreSyscallSpec { tenon_name: "rotl64", c_symbol: "tenon_rotl64", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt64" },
+    CoreSyscallSpec { tenon_name: "rotr64", c_symbol: "tenon_rotr64", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt64" },
+    CoreSyscallSpec { tenon_name: "f32_to_text", c_symbol: "tenon_f32_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "parse_f32", c_symbol: "tenon_parse_f32", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
+    // 5. S1 Compact Bytes & zero-copy BytesSlice
+    CoreSyscallSpec { tenon_name: "bytes_new", c_symbol: "tenon_bytes_new", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_filled", c_symbol: "tenon_bytes_filled", arity: 2, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_len", c_symbol: "tenon_bytes_len", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "bytes_get", c_symbol: "tenon_bytes_get", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt8" },
+    CoreSyscallSpec { tenon_name: "bytes_set", c_symbol: "tenon_bytes_set", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_push", c_symbol: "tenon_bytes_push", arity: 2, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_read_u16_le", c_symbol: "tenon_bytes_read_u16_le", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt16" },
+    CoreSyscallSpec { tenon_name: "bytes_read_u16_be", c_symbol: "tenon_bytes_read_u16_be", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt16" },
+    CoreSyscallSpec { tenon_name: "bytes_read_u32_le", c_symbol: "tenon_bytes_read_u32_le", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt32" },
+    CoreSyscallSpec { tenon_name: "bytes_read_u32_be", c_symbol: "tenon_bytes_read_u32_be", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt32" },
+    CoreSyscallSpec { tenon_name: "bytes_read_u64_le", c_symbol: "tenon_bytes_read_u64_le", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt64" },
+    CoreSyscallSpec { tenon_name: "bytes_read_u64_be", c_symbol: "tenon_bytes_read_u64_be", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt64" },
+    CoreSyscallSpec { tenon_name: "bytes_write_u16_le", c_symbol: "tenon_bytes_write_u16_le", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_write_u16_be", c_symbol: "tenon_bytes_write_u16_be", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_write_u32_le", c_symbol: "tenon_bytes_write_u32_le", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_write_u32_be", c_symbol: "tenon_bytes_write_u32_be", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_write_u64_le", c_symbol: "tenon_bytes_write_u64_le", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_write_u64_be", c_symbol: "tenon_bytes_write_u64_be", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_slice", c_symbol: "tenon_bytes_slice", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "BytesSlice" },
+    CoreSyscallSpec { tenon_name: "slice_len", c_symbol: "tenon_slice_len", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "slice_get", c_symbol: "tenon_slice_get", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt8" },
+    CoreSyscallSpec { tenon_name: "bytes_to_text", c_symbol: "tenon_bytes_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    CoreSyscallSpec { tenon_name: "text_to_bytes", c_symbol: "tenon_text_to_bytes", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "bytes_ptr", c_symbol: "tenon_bytes_ptr", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Ptr[UInt8]" },
+    CoreSyscallSpec { tenon_name: "text_cstr_ptr", c_symbol: "tenon_text_cstr_ptr", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "CStr" },
+    CoreSyscallSpec { tenon_name: "cstr_to_text", c_symbol: "tenon_cstr_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
+    // 6. S2 Raw memory ops
+    CoreSyscallSpec { tenon_name: "raw_alloc", c_symbol: "tenon_raw_alloc", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "MutPtr[UInt8]" },
+    CoreSyscallSpec { tenon_name: "raw_free", c_symbol: "tenon_raw_free", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "raw_memcpy", c_symbol: "tenon_raw_memcpy", arity: 3, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "MutPtr[UInt8]" },
+    CoreSyscallSpec { tenon_name: "raw_memset", c_symbol: "tenon_raw_memset", arity: 3, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "MutPtr[UInt8]" },
+    CoreSyscallSpec { tenon_name: "raw_memcmp", c_symbol: "tenon_raw_memcmp", arity: 3, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    // 7. S3 Threads, Atomics, Mutex, Channel
+    CoreSyscallSpec { tenon_name: "thread_spawn", c_symbol: "tenon_thread_spawn", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "thread_join", c_symbol: "tenon_thread_join", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "thread_sleep_ms", c_symbol: "tenon_thread_sleep_ms", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "thread_hw_concurrency", c_symbol: "tenon_thread_hw_concurrency", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "atomic_new", c_symbol: "tenon_atomic_new", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "AtomicInt" },
+    CoreSyscallSpec { tenon_name: "atomic_load", c_symbol: "tenon_atomic_load", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "atomic_store", c_symbol: "tenon_atomic_store", arity: 3, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "atomic_fetch_add", c_symbol: "tenon_atomic_fetch_add", arity: 3, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "atomic_fetch_sub", c_symbol: "tenon_atomic_fetch_sub", arity: 3, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "atomic_cas", c_symbol: "tenon_atomic_cas", arity: 4, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "atomic_swap", c_symbol: "tenon_atomic_swap", arity: 3, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "mutex_new", c_symbol: "tenon_mutex_new", arity: 2, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Mutex" },
+    CoreSyscallSpec { tenon_name: "mutex_lock", c_symbol: "tenon_mutex_lock", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "mutex_unlock", c_symbol: "tenon_mutex_unlock", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "mutex_get", c_symbol: "tenon_mutex_get", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Any" },
+    CoreSyscallSpec { tenon_name: "mutex_set", c_symbol: "tenon_mutex_set", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "chan_new", c_symbol: "tenon_chan_new", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Channel" },
+    CoreSyscallSpec { tenon_name: "chan_send", c_symbol: "tenon_chan_send", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "chan_recv", c_symbol: "tenon_chan_recv", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Option" },
+    CoreSyscallSpec { tenon_name: "chan_try_recv", c_symbol: "tenon_chan_try_recv", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Option" },
+    CoreSyscallSpec { tenon_name: "chan_close", c_symbol: "tenon_chan_close", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    // 8. S3 Non-blocking TCP sockets
+    CoreSyscallSpec { tenon_name: "net_tcp_listen", c_symbol: "tenon_net_tcp_listen", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "net_tcp_local_port", c_symbol: "tenon_net_tcp_local_port", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "net_tcp_accept", c_symbol: "tenon_net_tcp_accept", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "net_tcp_connect", c_symbol: "tenon_net_tcp_connect", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "net_set_nonblocking", c_symbol: "tenon_net_set_nonblocking", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "net_read", c_symbol: "tenon_net_read", arity: 2, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "net_write", c_symbol: "tenon_net_write", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "net_close", c_symbol: "tenon_net_close", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    // 9. S3 SIMD vector operations
+    CoreSyscallSpec { tenon_name: "simd_f32x4_new", c_symbol: "tenon_simd_f32x4_new", arity: 4, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Float32x4" },
+    CoreSyscallSpec { tenon_name: "simd_f32x4_splat", c_symbol: "tenon_simd_f32x4_splat", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Float32x4" },
+    CoreSyscallSpec { tenon_name: "simd_f32x4_lane", c_symbol: "tenon_simd_f32x4_lane", arity: 2, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
+    CoreSyscallSpec { tenon_name: "simd_f32x4_binop", c_symbol: "tenon_simd_f32x4_binop", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Float32x4" },
+    CoreSyscallSpec { tenon_name: "simd_f32x4_fma", c_symbol: "tenon_simd_f32x4_fma", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Float32x4" },
+    CoreSyscallSpec { tenon_name: "simd_f32x4_reduce_sum", c_symbol: "tenon_simd_f32x4_reduce_sum", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
+    CoreSyscallSpec { tenon_name: "simd_f32x4_dot", c_symbol: "tenon_simd_f32x4_dot", arity: 2, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
+    CoreSyscallSpec { tenon_name: "simd_f64x4_new", c_symbol: "tenon_simd_f64x4_new", arity: 4, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Float64x4" },
+    CoreSyscallSpec { tenon_name: "simd_f64x4_splat", c_symbol: "tenon_simd_f64x4_splat", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Float64x4" },
+    CoreSyscallSpec { tenon_name: "simd_f64x4_lane", c_symbol: "tenon_simd_f64x4_lane", arity: 2, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float" },
+    CoreSyscallSpec { tenon_name: "simd_f64x4_binop", c_symbol: "tenon_simd_f64x4_binop", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Float64x4" },
+    CoreSyscallSpec { tenon_name: "simd_f64x4_fma", c_symbol: "tenon_simd_f64x4_fma", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Float64x4" },
+    CoreSyscallSpec { tenon_name: "simd_f64x4_reduce_sum", c_symbol: "tenon_simd_f64x4_reduce_sum", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float" },
+    CoreSyscallSpec { tenon_name: "simd_f64x4_dot", c_symbol: "tenon_simd_f64x4_dot", arity: 2, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float" },
+    CoreSyscallSpec { tenon_name: "simd_i32x4_new", c_symbol: "tenon_simd_i32x4_new", arity: 4, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Int32x4" },
+    CoreSyscallSpec { tenon_name: "simd_i32x4_splat", c_symbol: "tenon_simd_i32x4_splat", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Int32x4" },
+    CoreSyscallSpec { tenon_name: "simd_i32x4_lane", c_symbol: "tenon_simd_i32x4_lane", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int32" },
+    CoreSyscallSpec { tenon_name: "simd_i32x4_binop", c_symbol: "tenon_simd_i32x4_binop", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Int32x4" },
+    CoreSyscallSpec { tenon_name: "simd_i32x4_reduce_sum", c_symbol: "tenon_simd_i32x4_reduce_sum", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int32" },
+    CoreSyscallSpec { tenon_name: "simd_i64x4_new", c_symbol: "tenon_simd_i64x4_new", arity: 4, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Int64x4" },
+    CoreSyscallSpec { tenon_name: "simd_i64x4_splat", c_symbol: "tenon_simd_i64x4_splat", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Int64x4" },
+    CoreSyscallSpec { tenon_name: "simd_i64x4_lane", c_symbol: "tenon_simd_i64x4_lane", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "simd_i64x4_binop", c_symbol: "tenon_simd_i64x4_binop", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Int64x4" },
+    CoreSyscallSpec { tenon_name: "simd_i64x4_reduce_sum", c_symbol: "tenon_simd_i64x4_reduce_sum", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "simd_u8x16_splat", c_symbol: "tenon_simd_u8x16_splat", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "UInt8x16" },
+    CoreSyscallSpec { tenon_name: "simd_u8x16_lane", c_symbol: "tenon_simd_u8x16_lane", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "UInt8" },
+    CoreSyscallSpec { tenon_name: "simd_u8x16_set_lane", c_symbol: "tenon_simd_u8x16_set_lane", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "UInt8x16" },
+    CoreSyscallSpec { tenon_name: "simd_u8x16_binop", c_symbol: "tenon_simd_u8x16_binop", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "UInt8x16" },
+    CoreSyscallSpec { tenon_name: "simd_u8x16_reduce_sum", c_symbol: "tenon_simd_u8x16_reduce_sum", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
 ];
 
 pub(crate) fn named_ty(name: &str) -> TypeExpr {
@@ -102,11 +226,27 @@ pub(crate) fn is_rc_type_expr(
 ) -> bool {
     let resolved = resolve_alias_ty(ty, aliases);
     match resolved {
-        TypeExpr::Dyn { .. } | TypeExpr::Tuple(_, _) | TypeExpr::Fn { .. } => true,
+        TypeExpr::Dyn { .. }
+        | TypeExpr::Tuple(_, _)
+        | TypeExpr::Fn { .. }
+        | TypeExpr::Array { .. } => true,
         TypeExpr::Named { name, .. } => {
             record_names.contains(&name)
                 || enum_names.contains(&name)
-                || matches!(name.as_str(), "Text" | "List" | "Option" | "Result" | "Range")
+                || SimdKind::from_name(&name).is_some()
+                || matches!(
+                    name.as_str(),
+                    "Text"
+                        | "List"
+                        | "Option"
+                        | "Result"
+                        | "Range"
+                        | "Bytes"
+                        | "BytesSlice"
+                        | "AtomicInt"
+                        | "Mutex"
+                        | "Channel"
+                )
         }
     }
 }
@@ -120,6 +260,20 @@ pub(crate) fn is_float_type_expr(ty: &TypeExpr, aliases: &BTreeMap<String, TypeE
         resolve_alias_ty(ty, aliases),
         TypeExpr::Named { name, .. } if matches!(name.as_str(), "Float" | "Float64" | "Float32")
     )
+}
+
+pub(crate) fn is_f32_type_expr(ty: &TypeExpr, aliases: &BTreeMap<String, TypeExpr>) -> bool {
+    matches!(resolve_alias_ty(ty, aliases), TypeExpr::Named { name, .. } if name == "Float32")
+}
+
+pub(crate) fn scalar_kind_of_ty(
+    ty: &TypeExpr,
+    aliases: &BTreeMap<String, TypeExpr>,
+) -> Option<ScalarKind> {
+    match resolve_alias_ty(ty, aliases) {
+        TypeExpr::Named { name, .. } => ScalarKind::from_name(&name),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +290,7 @@ struct RecordLayout {
     fields: Vec<FieldLayout>,
     rc_mask: i64,
     where_clauses: Vec<Expr>,
+    c_layout: Option<StructByteLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +330,11 @@ struct RtFuncs {
     async_yield_create: FuncId,
     async_poll_frame: FuncId,
     async_block_on: FuncId,
+    cstruct_alloc: FuncId,
+    cstruct_data_ptr: FuncId,
+    raw_memcpy: FuncId,
+    volatile_read: FuncId,
+    volatile_write: FuncId,
 }
 
 pub struct JitProgram {
@@ -262,6 +422,124 @@ impl JitProgram {
         jit_builder.symbol("tenon_sys_http_sse_error", syscalls::tenon_sys_http_sse_error as *const u8);
         jit_builder.symbol("tenon_sys_http_sse_close", syscalls::tenon_sys_http_sse_close as *const u8);
 
+        // Systems programming runtime symbols (S1 + S2 + S3)
+        jit_builder.symbol("tenon_clz", systems::tenon_clz as *const u8);
+        jit_builder.symbol("tenon_ctz", systems::tenon_ctz as *const u8);
+        jit_builder.symbol("tenon_popcnt", systems::tenon_popcnt as *const u8);
+        jit_builder.symbol("tenon_bswap16", systems::tenon_bswap16 as *const u8);
+        jit_builder.symbol("tenon_bswap32", systems::tenon_bswap32 as *const u8);
+        jit_builder.symbol("tenon_bswap64", systems::tenon_bswap64 as *const u8);
+        jit_builder.symbol("tenon_rotl64", systems::tenon_rotl64 as *const u8);
+        jit_builder.symbol("tenon_rotr64", systems::tenon_rotr64 as *const u8);
+        jit_builder.symbol("tenon_f32_to_text", systems::tenon_f32_to_text as *const u8);
+        jit_builder.symbol("tenon_parse_f32", systems::tenon_parse_f32 as *const u8);
+        jit_builder.symbol("tenon_bytes_new", systems::tenon_bytes_new as *const u8);
+        jit_builder.symbol("tenon_bytes_filled", systems::tenon_bytes_filled as *const u8);
+        jit_builder.symbol("tenon_bytes_len", systems::tenon_bytes_len as *const u8);
+        jit_builder.symbol("tenon_bytes_get", systems::tenon_bytes_get as *const u8);
+        jit_builder.symbol("tenon_bytes_set", systems::tenon_bytes_set as *const u8);
+        jit_builder.symbol("tenon_bytes_push", systems::tenon_bytes_push as *const u8);
+        jit_builder.symbol("tenon_bytes_read_u16_le", systems::tenon_bytes_read_u16_le as *const u8);
+        jit_builder.symbol("tenon_bytes_read_u16_be", systems::tenon_bytes_read_u16_be as *const u8);
+        jit_builder.symbol("tenon_bytes_read_u32_le", systems::tenon_bytes_read_u32_le as *const u8);
+        jit_builder.symbol("tenon_bytes_read_u32_be", systems::tenon_bytes_read_u32_be as *const u8);
+        jit_builder.symbol("tenon_bytes_read_u64_le", systems::tenon_bytes_read_u64_le as *const u8);
+        jit_builder.symbol("tenon_bytes_read_u64_be", systems::tenon_bytes_read_u64_be as *const u8);
+        jit_builder.symbol("tenon_bytes_write_u16_le", systems::tenon_bytes_write_u16_le as *const u8);
+        jit_builder.symbol("tenon_bytes_write_u16_be", systems::tenon_bytes_write_u16_be as *const u8);
+        jit_builder.symbol("tenon_bytes_write_u32_le", systems::tenon_bytes_write_u32_le as *const u8);
+        jit_builder.symbol("tenon_bytes_write_u32_be", systems::tenon_bytes_write_u32_be as *const u8);
+        jit_builder.symbol("tenon_bytes_write_u64_le", systems::tenon_bytes_write_u64_le as *const u8);
+        jit_builder.symbol("tenon_bytes_write_u64_be", systems::tenon_bytes_write_u64_be as *const u8);
+        jit_builder.symbol("tenon_bytes_slice", systems::tenon_bytes_slice as *const u8);
+        jit_builder.symbol("tenon_slice_len", systems::tenon_slice_len as *const u8);
+        jit_builder.symbol("tenon_slice_get", systems::tenon_slice_get as *const u8);
+        jit_builder.symbol("tenon_bytes_to_text", systems::tenon_bytes_to_text as *const u8);
+        jit_builder.symbol("tenon_text_to_bytes", systems::tenon_text_to_bytes as *const u8);
+        jit_builder.symbol("tenon_bytes_ptr", systems::tenon_bytes_ptr as *const u8);
+        jit_builder.symbol("tenon_text_cstr_ptr", systems::tenon_text_cstr_ptr as *const u8);
+        jit_builder.symbol("tenon_cstr_to_text", systems::tenon_cstr_to_text as *const u8);
+        jit_builder.symbol("tenon_cstruct_alloc", systems::tenon_cstruct_alloc as *const u8);
+        jit_builder.symbol("tenon_cstruct_data_ptr", systems::tenon_cstruct_data_ptr as *const u8);
+        jit_builder.symbol("tenon_raw_alloc", systems::tenon_raw_alloc as *const u8);
+        jit_builder.symbol("tenon_raw_free", systems::tenon_raw_free as *const u8);
+        jit_builder.symbol("tenon_raw_memcpy", systems::tenon_raw_memcpy as *const u8);
+        jit_builder.symbol("tenon_raw_memset", systems::tenon_raw_memset as *const u8);
+        jit_builder.symbol("tenon_raw_memcmp", systems::tenon_raw_memcmp as *const u8);
+        jit_builder.symbol("tenon_volatile_read", systems::tenon_volatile_read as *const u8);
+        jit_builder.symbol("tenon_volatile_write", systems::tenon_volatile_write as *const u8);
+        jit_builder.symbol("tenon_thread_spawn", systems::tenon_thread_spawn as *const u8);
+        jit_builder.symbol("tenon_thread_join", systems::tenon_thread_join as *const u8);
+        jit_builder.symbol("tenon_thread_sleep_ms", systems::tenon_thread_sleep_ms as *const u8);
+        jit_builder.symbol("tenon_thread_hw_concurrency", systems::tenon_thread_hw_concurrency as *const u8);
+        jit_builder.symbol("tenon_atomic_new", systems::tenon_atomic_new as *const u8);
+        jit_builder.symbol("tenon_atomic_load", systems::tenon_atomic_load as *const u8);
+        jit_builder.symbol("tenon_atomic_store", systems::tenon_atomic_store as *const u8);
+        jit_builder.symbol("tenon_atomic_fetch_add", systems::tenon_atomic_fetch_add as *const u8);
+        jit_builder.symbol("tenon_atomic_fetch_sub", systems::tenon_atomic_fetch_sub as *const u8);
+        jit_builder.symbol("tenon_atomic_cas", systems::tenon_atomic_cas as *const u8);
+        jit_builder.symbol("tenon_atomic_swap", systems::tenon_atomic_swap as *const u8);
+        jit_builder.symbol("tenon_mutex_new", systems::tenon_mutex_new as *const u8);
+        jit_builder.symbol("tenon_mutex_lock", systems::tenon_mutex_lock as *const u8);
+        jit_builder.symbol("tenon_mutex_unlock", systems::tenon_mutex_unlock as *const u8);
+        jit_builder.symbol("tenon_mutex_get", systems::tenon_mutex_get as *const u8);
+        jit_builder.symbol("tenon_mutex_set", systems::tenon_mutex_set as *const u8);
+        jit_builder.symbol("tenon_chan_new", systems::tenon_chan_new as *const u8);
+        jit_builder.symbol("tenon_chan_send", systems::tenon_chan_send as *const u8);
+        jit_builder.symbol("tenon_chan_recv", systems::tenon_chan_recv as *const u8);
+        jit_builder.symbol("tenon_chan_try_recv", systems::tenon_chan_try_recv as *const u8);
+        jit_builder.symbol("tenon_chan_close", systems::tenon_chan_close as *const u8);
+        jit_builder.symbol("tenon_net_tcp_listen", systems::tenon_net_tcp_listen as *const u8);
+        jit_builder.symbol("tenon_net_tcp_local_port", systems::tenon_net_tcp_local_port as *const u8);
+        jit_builder.symbol("tenon_net_tcp_accept", systems::tenon_net_tcp_accept as *const u8);
+        jit_builder.symbol("tenon_net_tcp_connect", systems::tenon_net_tcp_connect as *const u8);
+        jit_builder.symbol("tenon_net_set_nonblocking", systems::tenon_net_set_nonblocking as *const u8);
+        jit_builder.symbol("tenon_net_read", systems::tenon_net_read as *const u8);
+        jit_builder.symbol("tenon_net_write", systems::tenon_net_write as *const u8);
+        jit_builder.symbol("tenon_net_close", systems::tenon_net_close as *const u8);
+        jit_builder.symbol("tenon_simd_f32x4_new", systems::tenon_simd_f32x4_new as *const u8);
+        jit_builder.symbol("tenon_simd_f32x4_splat", systems::tenon_simd_f32x4_splat as *const u8);
+        jit_builder.symbol("tenon_simd_f32x4_lane", systems::tenon_simd_f32x4_lane as *const u8);
+        jit_builder.symbol("tenon_simd_f32x4_binop", systems::tenon_simd_f32x4_binop as *const u8);
+        jit_builder.symbol("tenon_simd_f32x4_fma", systems::tenon_simd_f32x4_fma as *const u8);
+        jit_builder.symbol("tenon_simd_f32x4_reduce_sum", systems::tenon_simd_f32x4_reduce_sum as *const u8);
+        jit_builder.symbol("tenon_simd_f32x4_dot", systems::tenon_simd_f32x4_dot as *const u8);
+        jit_builder.symbol("tenon_simd_f64x4_new", systems::tenon_simd_f64x4_new as *const u8);
+        jit_builder.symbol("tenon_simd_f64x4_splat", systems::tenon_simd_f64x4_splat as *const u8);
+        jit_builder.symbol("tenon_simd_f64x4_lane", systems::tenon_simd_f64x4_lane as *const u8);
+        jit_builder.symbol("tenon_simd_f64x4_binop", systems::tenon_simd_f64x4_binop as *const u8);
+        jit_builder.symbol("tenon_simd_f64x4_fma", systems::tenon_simd_f64x4_fma as *const u8);
+        jit_builder.symbol("tenon_simd_f64x4_reduce_sum", systems::tenon_simd_f64x4_reduce_sum as *const u8);
+        jit_builder.symbol("tenon_simd_f64x4_dot", systems::tenon_simd_f64x4_dot as *const u8);
+        jit_builder.symbol("tenon_simd_i32x4_new", systems::tenon_simd_i32x4_new as *const u8);
+        jit_builder.symbol("tenon_simd_i32x4_splat", systems::tenon_simd_i32x4_splat as *const u8);
+        jit_builder.symbol("tenon_simd_i32x4_lane", systems::tenon_simd_i32x4_lane as *const u8);
+        jit_builder.symbol("tenon_simd_i32x4_binop", systems::tenon_simd_i32x4_binop as *const u8);
+        jit_builder.symbol("tenon_simd_i32x4_reduce_sum", systems::tenon_simd_i32x4_reduce_sum as *const u8);
+        jit_builder.symbol("tenon_simd_i64x4_new", systems::tenon_simd_i64x4_new as *const u8);
+        jit_builder.symbol("tenon_simd_i64x4_splat", systems::tenon_simd_i64x4_splat as *const u8);
+        jit_builder.symbol("tenon_simd_i64x4_lane", systems::tenon_simd_i64x4_lane as *const u8);
+        jit_builder.symbol("tenon_simd_i64x4_binop", systems::tenon_simd_i64x4_binop as *const u8);
+        jit_builder.symbol("tenon_simd_i64x4_reduce_sum", systems::tenon_simd_i64x4_reduce_sum as *const u8);
+        jit_builder.symbol("tenon_simd_u8x16_splat", systems::tenon_simd_u8x16_splat as *const u8);
+        jit_builder.symbol("tenon_simd_u8x16_lane", systems::tenon_simd_u8x16_lane as *const u8);
+        jit_builder.symbol("tenon_simd_u8x16_set_lane", systems::tenon_simd_u8x16_set_lane as *const u8);
+        jit_builder.symbol("tenon_simd_u8x16_binop", systems::tenon_simd_u8x16_binop as *const u8);
+        jit_builder.symbol("tenon_simd_u8x16_reduce_sum", systems::tenon_simd_u8x16_reduce_sum as *const u8);
+
+        // Register dynamic C `extern "C"` symbols via dlsym!
+        let mut extern_fns: BTreeMap<String, ExternFnDecl> = BTreeMap::new();
+        let mut resolved_externs: BTreeSet<String> = BTreeSet::new();
+        for item in &program.items {
+            if let Item::ExternFn(ef) = item {
+                extern_fns.insert(ef.name.clone(), ef.clone());
+                if let Some(addr) = systems::lookup_c_symbol(&ef.name) {
+                    jit_builder.symbol(&ef.name, addr);
+                    resolved_externs.insert(ef.name.clone());
+                }
+            }
+        }
+
         let mut module = JITModule::new(jit_builder);
 
         let rt = declare_runtime_funcs(&mut module)?;
@@ -279,11 +557,13 @@ impl JitProgram {
             }
         }
 
+        let layout_engine = LayoutEngine::from_program(program);
         let record_names: BTreeSet<String> = program
             .items
             .iter()
             .filter_map(|i| match i {
                 Item::Record(r) if r.type_params.is_empty() => Some(r.name.clone()),
+                Item::Union(u) => Some(u.name.clone()),
                 _ => None,
             })
             .collect();
@@ -296,7 +576,7 @@ impl JitProgram {
             })
             .collect();
 
-        // Collect Records & Enums (with full variant payload types!)
+        // Collect Records, Unions & Enums (with full C byte layouts + variant payload types!)
         let mut records: BTreeMap<String, RecordLayout> = BTreeMap::new();
         let mut field_to_idx: BTreeMap<String, usize> = BTreeMap::new();
         let mut enum_tags: BTreeMap<String, i64> = BTreeMap::new();
@@ -307,10 +587,15 @@ impl JitProgram {
         enum_tags.insert("Some".into(), TAG_SOME);
 
         let mut next_rec_tag = TAG_RECORD_BASE;
-        let mut next_enum_tag = 10i64;
+        let mut next_enum_tag = TAG_ENUM_BASE;
         for item in &program.items {
             match item {
                 Item::Record(r) if r.type_params.is_empty() => {
+                    let c_layout = if is_c_layout_attrs(&r.attrs) {
+                        layout_engine.struct_layout(&r.name)
+                    } else {
+                        None
+                    };
                     let mut fields = Vec::new();
                     let mut rc_mask = 0u64;
                     for (idx, f) in r.fields.iter().enumerate() {
@@ -322,8 +607,8 @@ impl JitProgram {
                         if let Some(fp) = &f.predicate {
                             preds.push(fp.clone());
                         }
-                        let is_rc =
-                            is_rc_type_expr(&f.ty, &alias_bases, &record_names, &enum_names);
+                        let is_rc = c_layout.is_none()
+                            && is_rc_type_expr(&f.ty, &alias_bases, &record_names, &enum_names);
                         if is_rc && idx < 64 {
                             rc_mask |= 1u64 << idx;
                         }
@@ -342,9 +627,33 @@ impl JitProgram {
                             fields,
                             rc_mask: rc_mask as i64,
                             where_clauses: r.where_clauses.clone(),
+                            c_layout,
                         },
                     );
                     next_rec_tag += 1;
+                }
+                Item::Union(u) => {
+                    let c_layout = layout_engine.union_layout(&u.name);
+                    let mut fields = Vec::new();
+                    for (idx, f) in u.fields.iter().enumerate() {
+                        fields.push(FieldLayout {
+                            name: f.name.clone(),
+                            ty: f.ty.clone(),
+                            preds: Vec::new(),
+                            is_rc: false,
+                        });
+                        field_to_idx.entry(f.name.clone()).or_insert(idx);
+                    }
+                    records.insert(
+                        u.name.clone(),
+                        RecordLayout {
+                            tag: TAG_CSTRUCT,
+                            fields,
+                            rc_mask: 0,
+                            where_clauses: Vec::new(),
+                            c_layout,
+                        },
+                    );
                 }
                 Item::Enum(e) => {
                     for v in &e.variants {
@@ -385,7 +694,37 @@ impl JitProgram {
         let mut func_ids = BTreeMap::new();
         let mut fn_metas: BTreeMap<String, FnMeta> = BTreeMap::new();
         func_ids.insert("print_int".into(), print_int_id);
-        declare_core_syscalls(&mut module, rt.str_concat, &mut func_ids, &mut fn_metas)?;
+        declare_core_syscalls(&mut module, rt.str_concat, rt.raw_memcpy, &mut func_ids, &mut fn_metas)?;
+
+        // Declare resolved `extern "C"` functions with exact C ABI Cranelift signatures!
+        let mut extern_func_ids: BTreeMap<String, FuncId> = BTreeMap::new();
+        for (ename, ef) in &extern_fns {
+            if resolved_externs.contains(ename) {
+                let mut sig = module.make_signature();
+                for p in &ef.params {
+                    sig.params.push(AbiParam::new(c_abi_clif_type(&p.ty, &alias_bases)));
+                }
+                if let Some(rt_ty) = &ef.ret_ty {
+                    let rb = resolve_alias_ty(rt_ty, &alias_bases);
+                    if !matches!(&rb, TypeExpr::Named { name, .. } if name == "CVoid") {
+                        sig.returns.push(AbiParam::new(c_abi_clif_type(&rb, &alias_bases)));
+                    }
+                }
+                let fid = module
+                    .declare_function(ename, Linkage::Import, &sig)
+                    .map_err(|e| e.to_string())?;
+                extern_func_ids.insert(ename.clone(), fid);
+            }
+            fn_metas.insert(
+                ename.clone(),
+                FnMeta {
+                    params_inout: vec![false; ef.params.len()],
+                    param_tys: ef.params.iter().map(|p| p.ty.clone()).collect(),
+                    ret_ty: ef.ret_ty.clone(),
+                    returns_rc: false,
+                },
+            );
+        }
 
         for f in &async_fns {
             let mut create_sig = module.make_signature();
@@ -444,7 +783,7 @@ impl JitProgram {
 
         let mut derived_parsers = Vec::new();
         for (rname, layout) in &records {
-            if layout.fields.is_empty() {
+            if layout.fields.is_empty() || layout.c_layout.is_some() {
                 continue;
             }
             let pname = format!("{}__parse", rname);
@@ -545,6 +884,9 @@ impl JitProgram {
                     dyn_interfaces,
                     vtable_data_ids: &vtable_data_ids,
                     vtable_ifaces: &vtable_ifaces,
+                    layout_engine: &layout_engine,
+                    extern_fns: &extern_fns,
+                    extern_func_ids: &extern_func_ids,
                     interned_strings: &mut interned_strings,
                     vars,
                     var_types,
@@ -575,7 +917,7 @@ impl JitProgram {
 
         // Auto-derived `<Record>__parse`
         for (rname, layout) in &records {
-            if layout.fields.is_empty() {
+            if layout.fields.is_empty() || layout.c_layout.is_some() {
                 continue;
             }
             let pname = format!("{}__parse", rname);
@@ -623,6 +965,9 @@ impl JitProgram {
                     dyn_interfaces,
                     vtable_data_ids: &vtable_data_ids,
                     vtable_ifaces: &vtable_ifaces,
+                    layout_engine: &layout_engine,
+                    extern_fns: &extern_fns,
+                    extern_func_ids: &extern_func_ids,
                     interned_strings: &mut interned_strings,
                     vars,
                     var_types,
@@ -796,6 +1141,9 @@ impl JitProgram {
                     dyn_interfaces,
                     vtable_data_ids: &vtable_data_ids,
                     vtable_ifaces: &vtable_ifaces,
+                    layout_engine: &layout_engine,
+                    extern_fns: &extern_fns,
+                    extern_func_ids: &extern_func_ids,
                     interned_strings: &mut interned_strings,
                     vars: BTreeMap::new(),
                     var_types: BTreeMap::new(),
@@ -1023,18 +1371,54 @@ fn declare_runtime_funcs(module: &mut JITModule) -> Result<RtFuncs, String> {
         async_yield_create: declare_sig(module, "tenon_async_yield_create", 1, true)?,
         async_poll_frame: declare_sig(module, "tenon_async_poll_frame", 1, true)?,
         async_block_on: declare_sig(module, "tenon_async_block_on", 1, true)?,
+        cstruct_alloc: declare_sig(module, "tenon_cstruct_alloc", 1, true)?,
+        cstruct_data_ptr: declare_sig(module, "tenon_cstruct_data_ptr", 1, true)?,
+        raw_memcpy: declare_sig(module, "tenon_raw_memcpy", 3, true)?,
+        volatile_read: declare_sig(module, "tenon_volatile_read", 2, true)?,
+        volatile_write: declare_sig(module, "tenon_volatile_write", 3, true)?,
     })
+}
+
+fn c_abi_clif_type(ty: &TypeExpr, aliases: &BTreeMap<String, TypeExpr>) -> Type {
+    match resolve_alias_ty(ty, aliases) {
+        TypeExpr::Named { name, .. } => match ScalarKind::from_name(&name) {
+            Some(ScalarKind::I8 | ScalarKind::U8) => types::I8,
+            Some(ScalarKind::I16 | ScalarKind::U16) => types::I16,
+            Some(ScalarKind::I32 | ScalarKind::U32) => types::I32,
+            Some(ScalarKind::F32) => types::F32,
+            Some(ScalarKind::F64) => types::F64,
+            _ if name == "Bool" => types::I8,
+            _ => types::I64,
+        },
+        _ => types::I64,
+    }
+}
+
+pub(crate) fn parse_syscall_ret_ty(spec: &str) -> TypeExpr {
+    if let Some((head, rest)) = spec.split_once('[') {
+        if let Some(inner) = rest.strip_suffix(']') {
+            let args = inner
+                .split(',')
+                .map(|a| parse_syscall_ret_ty(a.trim()))
+                .collect();
+            return generic_ty(head.trim(), args);
+        }
+    }
+    named_ty(spec)
 }
 
 fn declare_core_syscalls(
     module: &mut JITModule,
     str_concat_id: FuncId,
+    raw_memcpy_id: FuncId,
     func_ids: &mut BTreeMap<String, FuncId>,
     fn_metas: &mut BTreeMap<String, FnMeta>,
 ) -> Result<(), String> {
     for spec in CORE_SYSCALLS {
         let fid = if spec.c_symbol == "tenon_str_concat" {
             str_concat_id
+        } else if spec.c_symbol == "tenon_raw_memcpy" {
+            raw_memcpy_id
         } else {
             declare_sig(module, spec.c_symbol, spec.arity, true)?
         };
@@ -1044,13 +1428,7 @@ fn declare_core_syscalls(
             FnMeta {
                 params_inout: vec![false; spec.arity],
                 param_tys: vec![named_ty("Any"); spec.arity],
-                ret_ty: Some(if spec.returns_text {
-                    named_ty("Text")
-                } else if spec.returns_float {
-                    named_ty("Float")
-                } else {
-                    named_ty("Int")
-                }),
+                ret_ty: Some(parse_syscall_ret_ty(spec.ret_ty)),
                 returns_rc: spec.returns_rc,
             },
         );
@@ -1178,6 +1556,9 @@ struct FnLower<'a, 'b> {
     dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
     vtable_data_ids: &'a BTreeMap<String, DataId>,
     vtable_ifaces: &'a BTreeMap<String, String>,
+    layout_engine: &'a LayoutEngine,
+    extern_fns: &'a BTreeMap<String, ExternFnDecl>,
+    extern_func_ids: &'a BTreeMap<String, FuncId>,
     interned_strings: &'a mut Vec<Box<[u8]>>,
     vars: BTreeMap<String, Variable>,
     var_types: BTreeMap<String, TypeExpr>,
@@ -1290,12 +1671,393 @@ impl<'a, 'b> FnLower<'a, 'b> {
 
     fn list_elem_ty(&self, ty: &TypeExpr) -> Option<TypeExpr> {
         let resolved = resolve_alias_ty(ty, self.alias_bases);
-        if let TypeExpr::Named { name, args, .. } = resolved {
-            if name == "List" && !args.is_empty() {
+        match resolved {
+            TypeExpr::Array { elem, .. } => Some(*elem),
+            TypeExpr::Named { name, args, .. } if name == "List" && !args.is_empty() => {
+                Some(args[0].clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// If `ty` is a fixed-size array `[T; N]`, returns `(elem_ty, len, elem_byte_stride, elem_is_rc)`.
+    fn array_layout(&self, ty: &TypeExpr) -> Option<(TypeExpr, usize, usize, bool)> {
+        if let TypeExpr::Array { elem, len, .. } = resolve_alias_ty(ty, self.alias_bases) {
+            let is_rc = self.type_is_rc(&elem) && !self.is_c_value_type(&elem);
+            let stride = if is_rc {
+                8
+            } else {
+                self.layout_engine.size_and_align(&elem).0.max(1)
+            };
+            return Some((*elem, len, stride, is_rc));
+        }
+        None
+    }
+
+    /// True if `ty` is a C-layout struct, union, or non-RC fixed array stored inline as raw bytes.
+    fn is_c_value_type(&self, ty: &TypeExpr) -> bool {
+        match resolve_alias_ty(ty, self.alias_bases) {
+            TypeExpr::Named { name, .. } => self
+                .records
+                .get(&name)
+                .is_some_and(|r| r.c_layout.is_some()),
+            TypeExpr::Array { elem, .. } => !self.type_is_rc(&elem) || self.is_c_value_type(&elem),
+            _ => false,
+        }
+    }
+
+    fn ptr_pointee_ty(&self, ty: &TypeExpr) -> Option<TypeExpr> {
+        if let TypeExpr::Named { name, args, .. } = resolve_alias_ty(ty, self.alias_bases) {
+            if (name == "Ptr" || name == "MutPtr") && !args.is_empty() {
                 return Some(args[0].clone());
+            }
+            if name == "CStr" {
+                return Some(named_ty("UInt8"));
             }
         }
         None
+    }
+
+    fn scalar_kind_of_expr(&self, expr: &Expr) -> Option<ScalarKind> {
+        let ty = self.infer_expr_type(expr);
+        if let Some(sk) = scalar_kind_of_ty(&ty, self.alias_bases) {
+            return Some(sk);
+        }
+        match &expr.kind {
+            ExprKind::Float(_) => Some(ScalarKind::F64),
+            ExprKind::Cast { ty, .. } => scalar_kind_of_ty(ty, self.alias_bases),
+            ExprKind::Unary { op: UnOp::Neg | UnOp::BitNot, expr: inner } => {
+                self.scalar_kind_of_expr(inner)
+            }
+            ExprKind::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Mod
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr
+                ) =>
+            {
+                let lk = self.scalar_kind_of_expr(left);
+                let rk = self.scalar_kind_of_expr(right);
+                match (lk, rk) {
+                    (Some(ScalarKind::I64), Some(k)) if k != ScalarKind::I64 && matches!(left.kind, ExprKind::Int(_)) => Some(k),
+                    (Some(k), _) => Some(k),
+                    (None, k) => k,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn normalize_scalar(&mut self, val: Value, kind: ScalarKind) -> Value {
+        match kind {
+            ScalarKind::I8 => {
+                let t = self.builder.ins().ireduce(types::I8, val);
+                self.builder.ins().sextend(types::I64, t)
+            }
+            ScalarKind::U8 => {
+                let t = self.builder.ins().ireduce(types::I8, val);
+                self.builder.ins().uextend(types::I64, t)
+            }
+            ScalarKind::I16 => {
+                let t = self.builder.ins().ireduce(types::I16, val);
+                self.builder.ins().sextend(types::I64, t)
+            }
+            ScalarKind::U16 => {
+                let t = self.builder.ins().ireduce(types::I16, val);
+                self.builder.ins().uextend(types::I64, t)
+            }
+            ScalarKind::I32 => {
+                let t = self.builder.ins().ireduce(types::I32, val);
+                self.builder.ins().sextend(types::I64, t)
+            }
+            ScalarKind::U32 => {
+                let t = self.builder.ins().ireduce(types::I32, val);
+                self.builder.ins().uextend(types::I64, t)
+            }
+            ScalarKind::I64 | ScalarKind::U64 | ScalarKind::F32 | ScalarKind::F64 => val,
+        }
+    }
+
+    fn emit_mem_load(
+        &mut self,
+        base_ptr: Value,
+        byte_off: i32,
+        ty: &TypeExpr,
+        volatile: bool,
+    ) -> Result<Value, String> {
+        let resolved = resolve_alias_ty(ty, self.alias_bases);
+        if self.is_c_value_type(&resolved) {
+            let (sz, _) = self.layout_engine.size_and_align(&resolved);
+            let sz_v = self.builder.ins().iconst(types::I64, sz as i64);
+            let obj = self.call_rt_1(self.rt.cstruct_alloc, sz_v);
+            let dst = self.call_rt_1(self.rt.cstruct_data_ptr, obj);
+            let src = if byte_off == 0 {
+                base_ptr
+            } else {
+                let ov = self.builder.ins().iconst(types::I64, byte_off as i64);
+                self.builder.ins().iadd(base_ptr, ov)
+            };
+            let fref = self.module.declare_func_in_func(self.rt.raw_memcpy, self.builder.func);
+            self.builder.ins().call(fref, &[dst, src, sz_v]);
+            return Ok(obj);
+        }
+        let sk = scalar_kind_of_ty(&resolved, self.alias_bases);
+        if volatile {
+            let ptr = if byte_off == 0 {
+                base_ptr
+            } else {
+                let ov = self.builder.ins().iconst(types::I64, byte_off as i64);
+                self.builder.ins().iadd(base_ptr, ov)
+            };
+            let ws: i64 = match sk {
+                Some(ScalarKind::I8) => -1,
+                Some(ScalarKind::U8) => 1,
+                Some(ScalarKind::I16) => -2,
+                Some(ScalarKind::U16) => 2,
+                Some(ScalarKind::I32) => -4,
+                Some(ScalarKind::U32 | ScalarKind::F32) => 4,
+                None if matches!(&resolved, TypeExpr::Named { name, .. } if name == "Bool") => 1,
+                _ => 8,
+            };
+            let wv = self.builder.ins().iconst(types::I64, ws);
+            return Ok(self.call_rt_2_vals(self.rt.volatile_read, ptr, wv));
+        }
+        let flags = MemFlags::new();
+        let val = match sk {
+            Some(ScalarKind::I8) => {
+                let v = self.builder.ins().load(types::I8, flags, base_ptr, byte_off);
+                self.builder.ins().sextend(types::I64, v)
+            }
+            Some(ScalarKind::U8) => {
+                let v = self.builder.ins().load(types::I8, flags, base_ptr, byte_off);
+                self.builder.ins().uextend(types::I64, v)
+            }
+            Some(ScalarKind::I16) => {
+                let v = self.builder.ins().load(types::I16, flags, base_ptr, byte_off);
+                self.builder.ins().sextend(types::I64, v)
+            }
+            Some(ScalarKind::U16) => {
+                let v = self.builder.ins().load(types::I16, flags, base_ptr, byte_off);
+                self.builder.ins().uextend(types::I64, v)
+            }
+            Some(ScalarKind::I32) => {
+                let v = self.builder.ins().load(types::I32, flags, base_ptr, byte_off);
+                self.builder.ins().sextend(types::I64, v)
+            }
+            Some(ScalarKind::U32 | ScalarKind::F32) => {
+                let v = self.builder.ins().load(types::I32, flags, base_ptr, byte_off);
+                self.builder.ins().uextend(types::I64, v)
+            }
+            None if matches!(&resolved, TypeExpr::Named { name, .. } if name == "Bool") => {
+                let v = self.builder.ins().load(types::I8, flags, base_ptr, byte_off);
+                self.builder.ins().uextend(types::I64, v)
+            }
+            _ => self.builder.ins().load(types::I64, flags, base_ptr, byte_off),
+        };
+        Ok(val)
+    }
+
+    fn emit_mem_store(
+        &mut self,
+        base_ptr: Value,
+        byte_off: i32,
+        val: Value,
+        ty: &TypeExpr,
+        volatile: bool,
+    ) -> Result<(), String> {
+        let resolved = resolve_alias_ty(ty, self.alias_bases);
+        if self.is_c_value_type(&resolved) {
+            let (sz, _) = self.layout_engine.size_and_align(&resolved);
+            let sz_v = self.builder.ins().iconst(types::I64, sz as i64);
+            let src = self.call_rt_1(self.rt.cstruct_data_ptr, val);
+            let dst = if byte_off == 0 {
+                base_ptr
+            } else {
+                let ov = self.builder.ins().iconst(types::I64, byte_off as i64);
+                self.builder.ins().iadd(base_ptr, ov)
+            };
+            let fref = self.module.declare_func_in_func(self.rt.raw_memcpy, self.builder.func);
+            self.builder.ins().call(fref, &[dst, src, sz_v]);
+            return Ok(());
+        }
+        let sk = scalar_kind_of_ty(&resolved, self.alias_bases);
+        if volatile {
+            let ptr = if byte_off == 0 {
+                base_ptr
+            } else {
+                let ov = self.builder.ins().iconst(types::I64, byte_off as i64);
+                self.builder.ins().iadd(base_ptr, ov)
+            };
+            let w: i64 = match sk {
+                Some(ScalarKind::I8 | ScalarKind::U8) => 1,
+                Some(ScalarKind::I16 | ScalarKind::U16) => 2,
+                Some(ScalarKind::I32 | ScalarKind::U32 | ScalarKind::F32) => 4,
+                None if matches!(&resolved, TypeExpr::Named { name, .. } if name == "Bool") => 1,
+                _ => 8,
+            };
+            let wv = self.builder.ins().iconst(types::I64, w);
+            let fref = self.module.declare_func_in_func(self.rt.volatile_write, self.builder.func);
+            self.builder.ins().call(fref, &[ptr, val, wv]);
+            return Ok(());
+        }
+        let flags = MemFlags::new();
+        match sk {
+            Some(ScalarKind::I8 | ScalarKind::U8) => {
+                let t = self.builder.ins().ireduce(types::I8, val);
+                self.builder.ins().store(flags, t, base_ptr, byte_off);
+            }
+            Some(ScalarKind::I16 | ScalarKind::U16) => {
+                let t = self.builder.ins().ireduce(types::I16, val);
+                self.builder.ins().store(flags, t, base_ptr, byte_off);
+            }
+            Some(ScalarKind::I32 | ScalarKind::U32 | ScalarKind::F32) => {
+                let t = self.builder.ins().ireduce(types::I32, val);
+                self.builder.ins().store(flags, t, base_ptr, byte_off);
+            }
+            None if matches!(&resolved, TypeExpr::Named { name, .. } if name == "Bool") => {
+                let t = self.builder.ins().ireduce(types::I8, val);
+                self.builder.ins().store(flags, t, base_ptr, byte_off);
+            }
+            _ => {
+                self.builder.ins().store(flags, val, base_ptr, byte_off);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_cast(&mut self, val: Value, src_ty: &TypeExpr, dst_ty: &TypeExpr) -> Value {
+        let src_base = resolve_alias_ty(src_ty, self.alias_bases);
+        let dst_base = resolve_alias_ty(dst_ty, self.alias_bases);
+        let src_sk = scalar_kind_of_ty(&src_base, self.alias_bases);
+        let dst_sk = scalar_kind_of_ty(&dst_base, self.alias_bases);
+
+        if matches!(&dst_base, TypeExpr::Named { name, .. } if name == "Bool") {
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            let ne = self.builder.ins().icmp(IntCC::NotEqual, val, zero);
+            return self.builder.ins().uextend(types::I64, ne);
+        }
+
+        match (src_sk, dst_sk) {
+            (Some(ScalarKind::F64), Some(ScalarKind::F32)) => {
+                let f64v = self.builder.ins().bitcast(types::F64, MemFlags::new(), val);
+                let f32v = self.builder.ins().fdemote(types::F32, f64v);
+                let i32v = self.builder.ins().bitcast(types::I32, MemFlags::new(), f32v);
+                self.builder.ins().uextend(types::I64, i32v)
+            }
+            (Some(ScalarKind::F32), Some(ScalarKind::F64)) => {
+                let i32v = self.builder.ins().ireduce(types::I32, val);
+                let f32v = self.builder.ins().bitcast(types::F32, MemFlags::new(), i32v);
+                let f64v = self.builder.ins().fpromote(types::F64, f32v);
+                self.builder.ins().bitcast(types::I64, MemFlags::new(), f64v)
+            }
+            (Some(ScalarKind::F64), Some(dk)) if dk.is_int() => {
+                let f64v = self.builder.ins().bitcast(types::F64, MemFlags::new(), val);
+                let iv = if dk.is_unsigned() {
+                    self.builder.ins().fcvt_to_uint_sat(types::I64, f64v)
+                } else {
+                    self.builder.ins().fcvt_to_sint_sat(types::I64, f64v)
+                };
+                self.normalize_scalar(iv, dk)
+            }
+            (Some(ScalarKind::F32), Some(dk)) if dk.is_int() => {
+                let i32v = self.builder.ins().ireduce(types::I32, val);
+                let f32v = self.builder.ins().bitcast(types::F32, MemFlags::new(), i32v);
+                let iv = if dk.is_unsigned() {
+                    self.builder.ins().fcvt_to_uint_sat(types::I64, f32v)
+                } else {
+                    self.builder.ins().fcvt_to_sint_sat(types::I64, f32v)
+                };
+                self.normalize_scalar(iv, dk)
+            }
+            (sk, Some(ScalarKind::F64)) if sk != Some(ScalarKind::F64) => {
+                let f64v = if sk.is_some_and(|k| k.is_unsigned()) {
+                    self.builder.ins().fcvt_from_uint(types::F64, val)
+                } else {
+                    self.builder.ins().fcvt_from_sint(types::F64, val)
+                };
+                self.builder.ins().bitcast(types::I64, MemFlags::new(), f64v)
+            }
+            (sk, Some(ScalarKind::F32)) if sk != Some(ScalarKind::F32) => {
+                let f32v = if sk.is_some_and(|k| k.is_unsigned()) {
+                    self.builder.ins().fcvt_from_uint(types::F32, val)
+                } else {
+                    self.builder.ins().fcvt_from_sint(types::F32, val)
+                };
+                let i32v = self.builder.ins().bitcast(types::I32, MemFlags::new(), f32v);
+                self.builder.ins().uextend(types::I64, i32v)
+            }
+            (_, Some(dk)) => self.normalize_scalar(val, dk),
+            _ => val,
+        }
+    }
+
+    fn emit_extern_c_call(
+        &mut self,
+        ef: &ExternFnDecl,
+        fid: FuncId,
+        args: &[CallArg],
+    ) -> Result<Value, String> {
+        let mut temps = Vec::new();
+        let mut c_args = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let raw = self.lower_expr_borrowed(&a.value, &mut temps)?;
+            let pty = ef.params.get(i).map(|p| &p.ty);
+            let cval = if let Some(pt) = pty {
+                let pb = resolve_alias_ty(pt, self.alias_bases);
+                match scalar_kind_of_ty(&pb, self.alias_bases) {
+                    Some(ScalarKind::I8 | ScalarKind::U8) => self.builder.ins().ireduce(types::I8, raw),
+                    Some(ScalarKind::I16 | ScalarKind::U16) => self.builder.ins().ireduce(types::I16, raw),
+                    Some(ScalarKind::I32 | ScalarKind::U32) => self.builder.ins().ireduce(types::I32, raw),
+                    Some(ScalarKind::F32) => {
+                        let i32v = self.builder.ins().ireduce(types::I32, raw);
+                        self.builder.ins().bitcast(types::F32, MemFlags::new(), i32v)
+                    }
+                    Some(ScalarKind::F64) => self.builder.ins().bitcast(types::F64, MemFlags::new(), raw),
+                    _ if matches!(&pb, TypeExpr::Named { name, .. } if name == "Bool") => {
+                        self.builder.ins().ireduce(types::I8, raw)
+                    }
+                    _ => raw,
+                }
+            } else {
+                raw
+            };
+            c_args.push(cval);
+        }
+        let callee = self.module.declare_func_in_func(fid, self.builder.func);
+        let call = self.builder.ins().call(callee, &c_args);
+        let results = self.builder.inst_results(call).to_vec();
+        self.flush_temps(&temps);
+        if let (Some(&rval), Some(rt)) = (results.first(), &ef.ret_ty) {
+            let rb = resolve_alias_ty(rt, self.alias_bases);
+            let out = match scalar_kind_of_ty(&rb, self.alias_bases) {
+                Some(ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I32) => {
+                    self.builder.ins().sextend(types::I64, rval)
+                }
+                Some(ScalarKind::U8 | ScalarKind::U16 | ScalarKind::U32) => {
+                    self.builder.ins().uextend(types::I64, rval)
+                }
+                Some(ScalarKind::F32) => {
+                    let i32v = self.builder.ins().bitcast(types::I32, MemFlags::new(), rval);
+                    self.builder.ins().uextend(types::I64, i32v)
+                }
+                Some(ScalarKind::F64) => self.builder.ins().bitcast(types::I64, MemFlags::new(), rval),
+                _ if matches!(&rb, TypeExpr::Named { name, .. } if name == "Bool") => {
+                    self.builder.ins().uextend(types::I64, rval)
+                }
+                _ => rval,
+            };
+            Ok(out)
+        } else {
+            Ok(self.builder.ins().iconst(types::I64, 0))
+        }
     }
 
     fn infer_expr_type(&self, expr: &Expr) -> TypeExpr {
@@ -1344,15 +2106,32 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
                 named_ty("Any")
             }
+            ExprKind::Cast { ty, .. } => ty.clone(),
+            ExprKind::ArrayRepeat { value, len } => TypeExpr::Array {
+                elem: Box::new(self.infer_expr_type_with(value, extra_vars)),
+                len: *len,
+                span: expr.span,
+            },
+            ExprKind::Unsafe(b) => self.infer_block_type_with(b, extra_vars),
             ExprKind::Binary { op: BinOp::Concat, .. } => named_ty("Text"),
             ExprKind::Binary {
                 op: BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or,
                 ..
             } => named_ty("Bool"),
             ExprKind::Binary { op, left, right } => {
-                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
-                    && (is_float_type_expr(&self.infer_expr_type_with(left, extra_vars), self.alias_bases)
-                        || is_float_type_expr(&self.infer_expr_type_with(right, extra_vars), self.alias_bases))
+                let lt = self.infer_expr_type_with(left, extra_vars);
+                let rt = self.infer_expr_type_with(right, extra_vars);
+                if matches!(left.kind, ExprKind::Int(_) | ExprKind::Float(_))
+                    && scalar_kind_of_ty(&rt, self.alias_bases).is_some()
+                {
+                    rt
+                } else if scalar_kind_of_ty(&lt, self.alias_bases).is_some() {
+                    lt
+                } else if scalar_kind_of_ty(&rt, self.alias_bases).is_some() {
+                    rt
+                } else if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
+                    && (is_float_type_expr(&lt, self.alias_bases)
+                        || is_float_type_expr(&rt, self.alias_bases))
                 {
                     named_ty("Float")
                 } else {
@@ -1360,8 +2139,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
             }
             ExprKind::Unary { op: UnOp::Not, .. } => named_ty("Bool"),
-            ExprKind::Unary { op: UnOp::Neg, expr: inner } => {
-                if is_float_type_expr(&self.infer_expr_type_with(inner, extra_vars), self.alias_bases) {
+            ExprKind::Unary { op: op @ (UnOp::Neg | UnOp::BitNot), expr: inner } => {
+                let it = self.infer_expr_type_with(inner, extra_vars);
+                if scalar_kind_of_ty(&it, self.alias_bases).is_some() {
+                    it
+                } else if matches!(op, UnOp::Neg) && is_float_type_expr(&it, self.alias_bases) {
                     named_ty("Float")
                 } else {
                     named_ty("Int")
@@ -1471,6 +2253,50 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         return generic_ty("List", vec![self.infer_expr_type_with(&args[1].value, extra_vars)]);
                     }
                     if f == "list_pop_shrink" && args.len() == 1 {
+                        return self.infer_expr_type_with(&args[0].value, extra_vars);
+                    }
+                    if f == "mutex_get" && args.len() == 1 {
+                        if let TypeExpr::Named { name, args: ma, .. } =
+                            resolve_alias_ty(&self.infer_expr_type_with(&args[0].value, extra_vars), self.alias_bases)
+                        {
+                            if name == "Mutex" && !ma.is_empty() {
+                                return ma[0].clone();
+                            }
+                        }
+                    }
+                    if (f == "chan_recv" || f == "chan_try_recv") && args.len() == 1 {
+                        if let TypeExpr::Named { name, args: ca, .. } =
+                            resolve_alias_ty(&self.infer_expr_type_with(&args[0].value, extra_vars), self.alias_bases)
+                        {
+                            if name == "Channel" && !ca.is_empty() {
+                                return generic_ty("Option", vec![ca[0].clone()]);
+                            }
+                        }
+                        return generic_ty("Option", vec![named_ty("Any")]);
+                    }
+                    if (f == "ptr_read" || f == "volatile_read") && args.len() == 1 {
+                        let pty = self.infer_expr_type_with(&args[0].value, extra_vars);
+                        if let Some(elem) = self.ptr_pointee_ty(&pty) {
+                            return elem;
+                        }
+                    }
+                    if (f == "__ptr_add" || f == "ptr_add") && !args.is_empty() {
+                        return self.infer_expr_type_with(&args[0].value, extra_vars);
+                    }
+                    if (f == "ptr_of" || f == "mut_ptr_of") && args.len() == 1 {
+                        let raw_inner = self.infer_expr_type_with(&args[0].value, extra_vars);
+                        let inner = match resolve_alias_ty(&raw_inner, self.alias_bases) {
+                            TypeExpr::Array { elem, .. } => *elem,
+                            _ => raw_inner,
+                        };
+                        let pname = if f == "mut_ptr_of" { "MutPtr" } else { "Ptr" };
+                        return generic_ty(pname, vec![inner]);
+                    }
+                    if matches!(
+                        f.as_str(),
+                        "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "saturating_add" | "saturating_sub"
+                    ) && !args.is_empty()
+                    {
                         return self.infer_expr_type_with(&args[0].value, extra_vars);
                     }
                     if let Some(meta) = self.fn_metas.get(f) {
@@ -1592,7 +2418,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
             return true;
         }
         match &expr.kind {
-            ExprKind::RecordLit { .. } | ExprKind::List(_) | ExprKind::Tuple(_) | ExprKind::Str(_) => true,
+            ExprKind::RecordLit { .. }
+            | ExprKind::List(_)
+            | ExprKind::ArrayRepeat { .. }
+            | ExprKind::Tuple(_)
+            | ExprKind::Str(_) => true,
             ExprKind::Binary { op: BinOp::Concat, .. } => true,
             ExprKind::Ident(s) => {
                 s == "None"
@@ -1613,6 +2443,18 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         return true;
                     }
                 }
+                if let TypeExpr::Named { name: rname, .. } =
+                    resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases)
+                {
+                    if let Some(cfl) = self
+                        .records
+                        .get(&rname)
+                        .and_then(|rl| rl.c_layout.as_ref())
+                        .and_then(|cl| cl.fields.iter().find(|f| f.name == *field))
+                    {
+                        return self.is_c_value_type(&cfl.ty);
+                    }
+                }
                 if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
                     return fl.is_rc;
                 }
@@ -1622,8 +2464,29 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let tt = self.infer_expr_type(target);
                 self.list_elem_ty(&tt).is_some_and(|et| self.type_is_rc(&et))
             }
-            ExprKind::Call { callee, .. } => match &callee.kind {
+            ExprKind::Call { callee, args } => match &callee.kind {
                 ExprKind::Ident(f) => {
+                    if f == "mutex_get" {
+                        if let Some(a0) = args.first() {
+                            if let TypeExpr::Named { name, args: ma, .. } =
+                                resolve_alias_ty(&self.infer_expr_type(&a0.value), self.alias_bases)
+                            {
+                                if name == "Mutex" && !ma.is_empty() {
+                                    return self.type_is_rc(&ma[0]);
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                    if f == "ptr_read" || f == "volatile_read" {
+                        if let Some(a0) = args.first() {
+                            let pty = self.infer_expr_type(&a0.value);
+                            if let Some(pt) = self.ptr_pointee_ty(&pty) {
+                                return self.is_c_value_type(&pt);
+                            }
+                        }
+                        return false;
+                    }
                     matches!(
                         f.as_str(),
                         "Ok" | "Err" | "Some" | "push" | "list_filled" | "list_pop_shrink" | "yield_val" | "__box_dyn" | "__make_closure"
@@ -1731,7 +2594,29 @@ impl<'a, 'b> FnLower<'a, 'b> {
         Vec::new()
     }
 
-    fn emit_compound_op(&mut self, cur: Value, rhs: Value, op: AssignOp, is_float: bool) -> Value {
+    fn emit_compound_op(
+        &mut self,
+        cur: Value,
+        rhs: Value,
+        op: AssignOp,
+        is_float: bool,
+        sk: Option<ScalarKind>,
+    ) -> Value {
+        if sk == Some(ScalarKind::F32) {
+            let c32 = self.builder.ins().ireduce(types::I32, cur);
+            let r32 = self.builder.ins().ireduce(types::I32, rhs);
+            let cf = self.builder.ins().bitcast(types::F32, MemFlags::new(), c32);
+            let rf = self.builder.ins().bitcast(types::F32, MemFlags::new(), r32);
+            let res = match op {
+                AssignOp::AddSet => self.builder.ins().fadd(cf, rf),
+                AssignOp::SubSet => self.builder.ins().fsub(cf, rf),
+                AssignOp::MulSet => self.builder.ins().fmul(cf, rf),
+                AssignOp::DivSet => self.builder.ins().fdiv(cf, rf),
+                _ => rf,
+            };
+            let o32 = self.builder.ins().bitcast(types::I32, MemFlags::new(), res);
+            return self.builder.ins().uextend(types::I64, o32);
+        }
         if is_float {
             let cf = self.builder.ins().bitcast(types::F64, MemFlags::new(), cur);
             let rf = self.builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
@@ -1744,17 +2629,36 @@ impl<'a, 'b> FnLower<'a, 'b> {
             };
             return self.builder.ins().bitcast(types::I64, MemFlags::new(), res);
         }
-        match op {
+        let is_unsigned = sk.is_some_and(|k| k.is_unsigned());
+        let is_signed_narrow = matches!(sk, Some(ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I32));
+        let out = match op {
             AssignOp::Set => rhs,
             AssignOp::AddSet => self.builder.ins().iadd(cur, rhs),
             AssignOp::SubSet => self.builder.ins().isub(cur, rhs),
             AssignOp::MulSet => self.builder.ins().imul(cur, rhs),
-            AssignOp::DivSet => self.builder.ins().sdiv(cur, rhs),
+            AssignOp::DivSet => {
+                if is_unsigned {
+                    self.builder.ins().udiv(cur, rhs)
+                } else {
+                    self.builder.ins().sdiv(cur, rhs)
+                }
+            }
             AssignOp::BitAndSet => self.builder.ins().band(cur, rhs),
             AssignOp::BitOrSet => self.builder.ins().bor(cur, rhs),
             AssignOp::BitXorSet => self.builder.ins().bxor(cur, rhs),
             AssignOp::ShlSet => self.builder.ins().ishl(cur, rhs),
-            AssignOp::ShrSet => self.builder.ins().ushr(cur, rhs),
+            AssignOp::ShrSet => {
+                if is_signed_narrow {
+                    self.builder.ins().sshr(cur, rhs)
+                } else {
+                    self.builder.ins().ushr(cur, rhs)
+                }
+            }
+        };
+        if let Some(k) = sk {
+            self.normalize_scalar(out, k)
+        } else {
+            out
         }
     }
 
@@ -1810,7 +2714,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 } => {
                     let effective_ty = ty.clone().unwrap_or_else(|| self.infer_expr_type(value));
                     let produces_rc = self.type_is_rc(&effective_ty) || self.expr_produces_rc(value);
-                    let v = if produces_rc {
+                    let mut v = if produces_rc {
                         self.lower_expr_owned(value, ty.as_ref())?
                     } else {
                         let mut temps = Vec::new();
@@ -1818,6 +2722,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         self.flush_temps(&temps);
                         val
                     };
+                    if let Some(sk) = scalar_kind_of_ty(&effective_ty, self.alias_bases) {
+                        if sk.is_int() {
+                            v = self.normalize_scalar(v, sk);
+                        }
+                    }
                     let var = self.declare_fresh_var(name, types::I64);
                     self.builder.def_var(var, v);
 
@@ -1847,7 +2756,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                 && args.len() == 1
                                 && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
                         );
-                        let consuming_in_place = consuming_push || consuming_pop;
+                        let consuming_cow = matches!(
+                            &value.kind,
+                            ExprKind::Call { callee, args }
+                            if matches!(&callee.kind, ExprKind::Ident(f) if is_consuming_cow_builtin(f))
+                                && !args.is_empty()
+                                && args.first().is_some_and(|a| matches!(&a.value.kind, ExprKind::Ident(s) if s == name))
+                        );
+                        let consuming_in_place = consuming_push || consuming_pop || consuming_cow;
                         let target_ty = self.var_types.get(name).cloned();
                         let is_inout = self.inout_vars.contains(name);
                         let target_is_rc = self.owned_rc_vars.contains(name);
@@ -1877,6 +2793,28 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         } else if consuming_pop {
                             let xs_val = self.load_ident_val(name)?;
                             self.call_rt_1(self.rt.list_pop_shrink, xs_val)
+                        } else if consuming_cow {
+                            let ExprKind::Call { callee, args } = &value.kind else {
+                                unreachable!()
+                            };
+                            let ExprKind::Ident(fname) = &callee.kind else {
+                                unreachable!()
+                            };
+                            let fid = *self
+                                .func_ids
+                                .get(fname)
+                                .ok_or_else(|| format!("unknown cow builtin `{}`", fname))?;
+                            let mut temps = Vec::new();
+                            let mut call_args = Vec::with_capacity(args.len());
+                            call_args.push(self.load_ident_val(name)?);
+                            for a in &args[1..] {
+                                call_args.push(self.lower_expr_borrowed(&a.value, &mut temps)?);
+                            }
+                            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                            let call = self.builder.ins().call(fref, &call_args);
+                            let ret = self.builder.inst_results(call)[0];
+                            self.flush_temps(&temps);
+                            ret
                         } else if (target_is_rc || inout_is_rc) && *op == AssignOp::Set {
                             self.lower_expr_owned(value, target_ty.as_ref())?
                         } else {
@@ -1890,6 +2828,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             .vars
                             .get(name)
                             .ok_or_else(|| format!("undefined variable `{}` in assignment", name))?;
+                        let sk = target_ty
+                            .as_ref()
+                            .and_then(|t| scalar_kind_of_ty(t, self.alias_bases))
+                            .or_else(|| self.scalar_kind_of_expr(value));
                         if target_is_rc && !consuming_in_place && !is_inout {
                             let old = self.builder.use_var(var);
                             self.builder.def_var(var, rhs);
@@ -1906,10 +2848,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                     .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
                                     || self.is_float_expr(value);
                                 let new_v = if *op == AssignOp::Set {
-                                    rhs
+                                    if let Some(k) = sk {
+                                        if k.is_int() { self.normalize_scalar(rhs, k) } else { rhs }
+                                    } else {
+                                        rhs
+                                    }
                                 } else {
                                     let cur = self.builder.ins().load(types::I64, MemFlags::new(), slot_ptr, 0);
-                                    self.emit_compound_op(cur, rhs, *op, is_flt)
+                                    self.emit_compound_op(cur, rhs, *op, is_flt, sk)
                                 };
                                 self.builder.ins().store(MemFlags::new(), new_v, slot_ptr, 0);
                             }
@@ -1919,66 +2865,114 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                 .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
                                 || self.is_float_expr(value);
                             let new_v = if *op == AssignOp::Set {
-                                rhs
+                                if let Some(k) = sk {
+                                    if k.is_int() { self.normalize_scalar(rhs, k) } else { rhs }
+                                } else {
+                                    rhs
+                                }
                             } else {
                                 let cur = self.builder.use_var(var);
-                                self.emit_compound_op(cur, rhs, *op, is_flt)
+                                self.emit_compound_op(cur, rhs, *op, is_flt, sk)
                             };
                             self.builder.def_var(var, new_v);
                         }
                     }
                     ExprKind::Field { target: obj, field } => {
                         if let ExprKind::Ident(vname) = &obj.kind {
-                            let (fidx, fl) = self.resolve_field_layout(obj, field)?;
-                            let field_is_rc = fl.as_ref().is_some_and(|f| f.is_rc);
-                            let field_ty = fl.as_ref().map(|f| &f.ty);
-                            let rhs = if field_is_rc && *op == AssignOp::Set {
-                                self.lower_expr_owned(value, field_ty)?
-                            } else {
+                            let c_field_info = match resolve_alias_ty(&self.infer_expr_type(obj), self.alias_bases) {
+                                TypeExpr::Named { name: rname, .. } => self
+                                    .records
+                                    .get(&rname)
+                                    .and_then(|rl| rl.c_layout.as_ref())
+                                    .and_then(|cl| cl.fields.iter().find(|f| f.name == *field))
+                                    .cloned(),
+                                _ => None,
+                            };
+                            if let Some(cfl) = c_field_info {
                                 let mut temps = Vec::new();
-                                let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                let rhs = self.lower_expr_borrowed(value, &mut temps)?;
+                                let is_inout = self.inout_vars.contains(vname);
+                                let var = *self
+                                    .vars
+                                    .get(vname)
+                                    .ok_or_else(|| format!("undefined variable `{}`", vname))?;
+                                let cur_handle = if is_inout {
+                                    let slot_ptr = self.builder.use_var(var);
+                                    self.builder.ins().load(types::I64, MemFlags::new(), slot_ptr, 0)
+                                } else {
+                                    self.builder.use_var(var)
+                                };
+                                let uniq_handle = self.call_rt_1(self.rt.rc_ensure_unique, cur_handle);
+                                if is_inout {
+                                    let slot_ptr = self.builder.use_var(var);
+                                    self.builder.ins().store(MemFlags::new(), uniq_handle, slot_ptr, 0);
+                                } else {
+                                    self.builder.def_var(var, uniq_handle);
+                                }
+                                let base = self.call_rt_1(self.rt.cstruct_data_ptr, uniq_handle);
+                                let sk = scalar_kind_of_ty(&cfl.ty, self.alias_bases);
+                                let is_flt = is_float_type_expr(&cfl.ty, self.alias_bases) || self.is_float_expr(value);
+                                let new_val = if *op == AssignOp::Set {
+                                    rhs
+                                } else {
+                                    let cur_f = self.emit_mem_load(base, cfl.byte_offset as i32, &cfl.ty, false)?;
+                                    self.emit_compound_op(cur_f, rhs, *op, is_flt, sk)
+                                };
+                                self.emit_mem_store(base, cfl.byte_offset as i32, new_val, &cfl.ty, false)?;
                                 self.flush_temps(&temps);
-                                v
-                            };
-                            let is_inout = self.inout_vars.contains(vname);
-                            let var = *self
-                                .vars
-                                .get(vname)
-                                .ok_or_else(|| format!("undefined variable `{}`", vname))?;
-                            let cur_handle = if is_inout {
-                                let slot_ptr = self.builder.use_var(var);
-                                self.builder
-                                    .ins()
-                                    .load(types::I64, MemFlags::new(), slot_ptr, 0)
                             } else {
-                                self.builder.use_var(var)
-                            };
-                            let uniq_handle = self.call_rt_1(self.rt.rc_ensure_unique, cur_handle);
-                            if is_inout {
-                                let slot_ptr = self.builder.use_var(var);
-                                self.builder
-                                    .ins()
-                                    .store(MemFlags::new(), uniq_handle, slot_ptr, 0);
-                            } else {
-                                self.builder.def_var(var, uniq_handle);
+                                let (fidx, fl) = self.resolve_field_layout(obj, field)?;
+                                let field_is_rc = fl.as_ref().is_some_and(|f| f.is_rc);
+                                let field_ty = fl.as_ref().map(|f| &f.ty);
+                                let rhs = if field_is_rc && *op == AssignOp::Set {
+                                    self.lower_expr_owned(value, field_ty)?
+                                } else {
+                                    let mut temps = Vec::new();
+                                    let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                    self.flush_temps(&temps);
+                                    v
+                                };
+                                let is_inout = self.inout_vars.contains(vname);
+                                let var = *self
+                                    .vars
+                                    .get(vname)
+                                    .ok_or_else(|| format!("undefined variable `{}`", vname))?;
+                                let cur_handle = if is_inout {
+                                    let slot_ptr = self.builder.use_var(var);
+                                    self.builder
+                                        .ins()
+                                        .load(types::I64, MemFlags::new(), slot_ptr, 0)
+                                } else {
+                                    self.builder.use_var(var)
+                                };
+                                let uniq_handle = self.call_rt_1(self.rt.rc_ensure_unique, cur_handle);
+                                if is_inout {
+                                    let slot_ptr = self.builder.use_var(var);
+                                    self.builder
+                                        .ins()
+                                        .store(MemFlags::new(), uniq_handle, slot_ptr, 0);
+                                } else {
+                                    self.builder.def_var(var, uniq_handle);
+                                }
+                                let sk = field_ty.and_then(|t| scalar_kind_of_ty(t, self.alias_bases));
+                                let is_flt = field_ty
+                                    .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
+                                    || self.is_float_expr(value);
+                                let new_field_val = if *op == AssignOp::Set {
+                                    rhs
+                                } else {
+                                    let idx_v = self.builder.ins().iconst(types::I64, fidx as i64);
+                                    let cur_f =
+                                        self.call_rt_2_vals(self.rt.rc_get_field, uniq_handle, idx_v);
+                                    self.emit_compound_op(cur_f, rhs, *op, is_flt, sk)
+                                };
+                                self.call_rt_3_void(
+                                    self.rt.rc_set_field,
+                                    uniq_handle,
+                                    fidx as i64,
+                                    new_field_val,
+                                );
                             }
-                            let is_flt = field_ty
-                                .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
-                                || self.is_float_expr(value);
-                            let new_field_val = if *op == AssignOp::Set {
-                                rhs
-                            } else {
-                                let idx_v = self.builder.ins().iconst(types::I64, fidx as i64);
-                                let cur_f =
-                                    self.call_rt_2_vals(self.rt.rc_get_field, uniq_handle, idx_v);
-                                self.emit_compound_op(cur_f, rhs, *op, is_flt)
-                            };
-                            self.call_rt_3_void(
-                                self.rt.rc_set_field,
-                                uniq_handle,
-                                fidx as i64,
-                                new_field_val,
-                            );
                         }
                     }
                     ExprKind::Index {
@@ -1990,51 +2984,85 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         self.flush_temps(&idx_temps);
                         match &list_expr.kind {
                             ExprKind::Ident(vname) => {
-                                let elem_ty = self
+                                let arr_info = self
                                     .var_types
                                     .get(vname)
-                                    .and_then(|t| self.list_elem_ty(t));
-                                let elem_is_rc = elem_ty
-                                    .as_ref()
-                                    .is_some_and(|et| self.type_is_rc(et))
-                                    || self.expr_produces_rc(value);
-                                let rhs = if elem_is_rc && *op == AssignOp::Set {
-                                    self.lower_expr_owned(value, elem_ty.as_ref())?
-                                } else {
+                                    .cloned()
+                                    .and_then(|t| self.array_layout(&t));
+                                if let Some((elem_ty, _len, stride, false)) = arr_info {
                                     let mut temps = Vec::new();
-                                    let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                    let rhs = self.lower_expr_borrowed(value, &mut temps)?;
+                                    let cur_arr = self.load_ident_val(vname)?;
+                                    let uniq_arr = self.call_rt_1(self.rt.rc_ensure_unique, cur_arr);
+                                    let var = self.vars[vname];
+                                    if self.inout_vars.contains(vname) {
+                                        let slot_ptr = self.builder.use_var(var);
+                                        self.builder.ins().store(MemFlags::new(), uniq_arr, slot_ptr, 0);
+                                    } else {
+                                        self.builder.def_var(var, uniq_arr);
+                                    }
+                                    let base = self.call_rt_1(self.rt.cstruct_data_ptr, uniq_arr);
+                                    let sv = self.builder.ins().iconst(types::I64, stride as i64);
+                                    let boff = self.builder.ins().imul(idx_v, sv);
+                                    let eptr = self.builder.ins().iadd(base, boff);
+                                    let sk = scalar_kind_of_ty(&elem_ty, self.alias_bases);
+                                    let is_flt = is_float_type_expr(&elem_ty, self.alias_bases) || self.is_float_expr(value);
+                                    let new_val = if *op == AssignOp::Set {
+                                        rhs
+                                    } else {
+                                        let cur_e = self.emit_mem_load(eptr, 0, &elem_ty, false)?;
+                                        self.emit_compound_op(cur_e, rhs, *op, is_flt, sk)
+                                    };
+                                    self.emit_mem_store(eptr, 0, new_val, &elem_ty, false)?;
                                     self.flush_temps(&temps);
-                                    v
-                                };
-                                let cur_list = self.load_ident_val(vname)?;
-                                let uniq_list = self.call_rt_1(self.rt.rc_ensure_unique, cur_list);
-                                let var = self.vars[vname];
-                                if self.inout_vars.contains(vname) {
-                                    let slot_ptr = self.builder.use_var(var);
-                                    self.builder
-                                        .ins()
-                                        .store(MemFlags::new(), uniq_list, slot_ptr, 0);
                                 } else {
-                                    self.builder.def_var(var, uniq_list);
+                                    let elem_ty = self
+                                        .var_types
+                                        .get(vname)
+                                        .and_then(|t| self.list_elem_ty(t));
+                                    let elem_is_rc = elem_ty
+                                        .as_ref()
+                                        .is_some_and(|et| self.type_is_rc(et))
+                                        || self.expr_produces_rc(value);
+                                    let rhs = if elem_is_rc && *op == AssignOp::Set {
+                                        self.lower_expr_owned(value, elem_ty.as_ref())?
+                                    } else {
+                                        let mut temps = Vec::new();
+                                        let v = self.lower_expr_borrowed(value, &mut temps)?;
+                                        self.flush_temps(&temps);
+                                        v
+                                    };
+                                    let cur_list = self.load_ident_val(vname)?;
+                                    let uniq_list = self.call_rt_1(self.rt.rc_ensure_unique, cur_list);
+                                    let var = self.vars[vname];
+                                    if self.inout_vars.contains(vname) {
+                                        let slot_ptr = self.builder.use_var(var);
+                                        self.builder
+                                            .ins()
+                                            .store(MemFlags::new(), uniq_list, slot_ptr, 0);
+                                    } else {
+                                        self.builder.def_var(var, uniq_list);
+                                    }
+                                    if elem_is_rc {
+                                        let mv = self.builder.ins().iconst(types::I64, RC_MASK_ALL as i64);
+                                        self.call_rt_2_void(self.rt.rc_set_rc_mask, uniq_list, mv);
+                                    }
+                                    let sk = elem_ty.as_ref().and_then(|t| scalar_kind_of_ty(t, self.alias_bases));
+                                    let is_flt = elem_ty
+                                        .as_ref()
+                                        .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
+                                        || self.is_float_expr(value);
+                                    let new_val = if *op == AssignOp::Set {
+                                        rhs
+                                    } else {
+                                        let cur_e = self.call_rt_2_vals(self.rt.rc_get_field, uniq_list, idx_v);
+                                        self.emit_compound_op(cur_e, rhs, *op, is_flt, sk)
+                                    };
+                                    let fref = self
+                                        .module
+                                        .declare_func_in_func(self.rt.rc_set_field, self.builder.func);
+                                    self.builder.ins().call(fref, &[uniq_list, idx_v, new_val]);
                                 }
-                                if elem_is_rc {
-                                    let mv = self.builder.ins().iconst(types::I64, RC_MASK_ALL as i64);
-                                    self.call_rt_2_void(self.rt.rc_set_rc_mask, uniq_list, mv);
-                                }
-                                let is_flt = elem_ty
-                                    .as_ref()
-                                    .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
-                                    || self.is_float_expr(value);
-                                let new_val = if *op == AssignOp::Set {
-                                    rhs
-                                } else {
-                                    let cur_e = self.call_rt_2_vals(self.rt.rc_get_field, uniq_list, idx_v);
-                                    self.emit_compound_op(cur_e, rhs, *op, is_flt)
-                                };
-                                let fref = self
-                                    .module
-                                    .declare_func_in_func(self.rt.rc_set_field, self.builder.func);
-                                self.builder.ins().call(fref, &[uniq_list, idx_v, new_val]);
                             }
                             ExprKind::Field { target: obj, field }
                                 if matches!(&obj.kind, ExprKind::Ident(_)) =>
@@ -2080,6 +3108,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                     let mv = self.builder.ins().iconst(types::I64, RC_MASK_ALL as i64);
                                     self.call_rt_2_void(self.rt.rc_set_rc_mask, uniq_list, mv);
                                 }
+                                let sk = elem_ty.as_ref().and_then(|t| scalar_kind_of_ty(t, self.alias_bases));
                                 let is_flt = elem_ty
                                     .as_ref()
                                     .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
@@ -2088,7 +3117,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                     rhs
                                 } else {
                                     let cur_e = self.call_rt_2_vals(self.rt.rc_get_field, uniq_list, idx_v);
-                                    self.emit_compound_op(cur_e, rhs, *op, is_flt)
+                                    self.emit_compound_op(cur_e, rhs, *op, is_flt, sk)
                                 };
                                 let fref = self
                                     .module
@@ -2227,7 +3256,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         self.flush_temps(&temps);
                     }
                 }
-                Stmt::LetTuple { .. } | Stmt::For { .. } => {}
+                Stmt::LetTuple { .. } | Stmt::For { .. } | Stmt::Defer { .. } => {}
             }
         }
 
@@ -2306,6 +3335,23 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         return Ok(self.call_rt_2(self.rt.rc_alloc, tag, 0));
                     }
                 }
+                let c_field_info = match resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases) {
+                    TypeExpr::Named { name: rname, .. } => self
+                        .records
+                        .get(&rname)
+                        .and_then(|rl| rl.c_layout.as_ref())
+                        .and_then(|cl| cl.fields.iter().find(|f| f.name == *field))
+                        .cloned(),
+                    _ => None,
+                };
+                if let Some(cfl) = c_field_info {
+                    let mut temps = Vec::new();
+                    let obj = self.lower_expr_borrowed(target, &mut temps)?;
+                    let base = self.call_rt_1(self.rt.cstruct_data_ptr, obj);
+                    let val = self.emit_mem_load(base, cfl.byte_offset as i32, &cfl.ty, false)?;
+                    self.flush_temps(&temps);
+                    return Ok(val);
+                }
                 let (idx, fl) = self.resolve_field_layout(target, field)?;
                 let mut temps = Vec::new();
                 let obj = self.lower_expr_borrowed(target, &mut temps)?;
@@ -2318,8 +3364,21 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 Ok(val)
             }
             ExprKind::Index { target, index } => {
+                let target_ty = self.infer_expr_type(target);
+                if let Some((elem_ty, _len, stride, false)) = self.array_layout(&target_ty) {
+                    let mut temps = Vec::new();
+                    let t = self.lower_expr_borrowed(target, &mut temps)?;
+                    let i = self.lower_expr_borrowed(index, &mut temps)?;
+                    let base = self.call_rt_1(self.rt.cstruct_data_ptr, t);
+                    let sv = self.builder.ins().iconst(types::I64, stride as i64);
+                    let boff = self.builder.ins().imul(i, sv);
+                    let eptr = self.builder.ins().iadd(base, boff);
+                    let res = self.emit_mem_load(eptr, 0, &elem_ty, false)?;
+                    self.flush_temps(&temps);
+                    return Ok(res);
+                }
                 let elem_is_rc = self
-                    .list_elem_ty(&self.infer_expr_type(target))
+                    .list_elem_ty(&target_ty)
                     .is_some_and(|et| self.type_is_rc(&et));
                 let mut temps = Vec::new();
                 let t = self.lower_expr_borrowed(target, &mut temps)?;
@@ -2367,7 +3426,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             ExprKind::Match { scrutinee, arms } => {
                 self.lower_match(scrutinee, arms, true, expected_ty)
             }
-            ExprKind::Block(blk) => self.lower_block(blk, true, expected_ty),
+            ExprKind::Block(blk) | ExprKind::Unsafe(blk) => self.lower_block(blk, true, expected_ty),
             _ => self.lower_expr_fresh(expr, expected_ty),
         }
     }
@@ -2410,12 +3469,44 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         return Ok(v);
                     }
                 }
+                let c_field_info = match resolve_alias_ty(&self.infer_expr_type(target), self.alias_bases) {
+                    TypeExpr::Named { name: rname, .. } => self
+                        .records
+                        .get(&rname)
+                        .and_then(|rl| rl.c_layout.as_ref())
+                        .and_then(|cl| cl.fields.iter().find(|f| f.name == *field))
+                        .cloned(),
+                    _ => None,
+                };
+                if let Some(cfl) = c_field_info {
+                    let obj = self.lower_expr_borrowed(target, temps)?;
+                    let base = self.call_rt_1(self.rt.cstruct_data_ptr, obj);
+                    let val = self.emit_mem_load(base, cfl.byte_offset as i32, &cfl.ty, false)?;
+                    if self.is_c_value_type(&cfl.ty) {
+                        temps.push(val);
+                    }
+                    return Ok(val);
+                }
                 let (idx, _) = self.resolve_field_layout(target, field)?;
                 let obj = self.lower_expr_borrowed(target, temps)?;
                 let idx_v = self.builder.ins().iconst(types::I64, idx as i64);
                 Ok(self.call_rt_2_vals(self.rt.rc_get_field, obj, idx_v))
             }
             ExprKind::Index { target, index } => {
+                let target_ty = self.infer_expr_type(target);
+                if let Some((elem_ty, _len, stride, false)) = self.array_layout(&target_ty) {
+                    let t = self.lower_expr_borrowed(target, temps)?;
+                    let i = self.lower_expr_borrowed(index, temps)?;
+                    let base = self.call_rt_1(self.rt.cstruct_data_ptr, t);
+                    let sv = self.builder.ins().iconst(types::I64, stride as i64);
+                    let boff = self.builder.ins().imul(i, sv);
+                    let eptr = self.builder.ins().iadd(base, boff);
+                    let val = self.emit_mem_load(eptr, 0, &elem_ty, false)?;
+                    if self.is_c_value_type(&elem_ty) {
+                        temps.push(val);
+                    }
+                    return Ok(val);
+                }
                 let t = self.lower_expr_borrowed(target, temps)?;
                 let i = self.lower_expr_borrowed(index, temps)?;
                 Ok(self.call_rt_2_vals(self.rt.rc_get_field, t, i))
@@ -2445,13 +3536,32 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
                 Ok(v)
             }
-            ExprKind::Block(blk) => {
+            ExprKind::Block(blk) | ExprKind::Unsafe(blk) => {
                 let want_owned = self.expr_produces_rc(expr);
                 let v = self.lower_block(blk, want_owned, None)?;
                 if want_owned && !self.terminated {
                     temps.push(v);
                 }
                 Ok(v)
+            }
+            ExprKind::Call { callee, args }
+                if args.len() == 1
+                    && matches!(
+                        &callee.kind,
+                        ExprKind::Ident(f) if f == "text_cstr_ptr" || f == "bytes_ptr"
+                    ) =>
+            {
+                let ExprKind::Ident(fname) = &callee.kind else {
+                    unreachable!()
+                };
+                // Keep the backing Text/Bytes temporary alive in caller's `temps`
+                // until the enclosing call (e.g. `strlen(text_cstr_ptr(...))`) finishes!
+                let arg_v = self.lower_expr_borrowed(&args[0].value, temps)?;
+                let fid = *self
+                    .func_ids
+                    .get(fname)
+                    .ok_or_else(|| format!("missing core syscall `{}`", fname))?;
+                Ok(self.call_rt_1(fid, arg_v))
             }
             _ => {
                 let v = self.lower_expr_fresh(expr, None)?;
@@ -2812,6 +3922,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .get(name)
                     .cloned()
                     .ok_or_else(|| format!("unknown record `{}` in codegen", name))?;
+                if let Some(c_lay) = &layout.c_layout {
+                    let sz_v = self.builder.ins().iconst(types::I64, c_lay.size as i64);
+                    let obj = self.call_rt_1(self.rt.cstruct_alloc, sz_v);
+                    let base = self.call_rt_1(self.rt.cstruct_data_ptr, obj);
+                    for (fname, fexpr) in fields {
+                        if let Some(cfl) = c_lay.fields.iter().find(|f| f.name == *fname) {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(fexpr, &mut temps)?;
+                            self.emit_mem_store(base, cfl.byte_offset as i32, v, &cfl.ty, false)?;
+                            self.flush_temps(&temps);
+                        }
+                    }
+                    return Ok(obj);
+                }
                 let obj = self.call_rt_2(self.rt.rc_alloc, layout.tag, layout.fields.len() as i64);
                 if layout.rc_mask != 0 {
                     let mv = self.builder.ins().iconst(types::I64, layout.rc_mask);
@@ -2837,7 +3961,95 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
                 Ok(obj)
             }
+            ExprKind::ArrayRepeat { value, len } => {
+                let arr_ty = expected_ty
+                    .cloned()
+                    .filter(|t| matches!(resolve_alias_ty(t, self.alias_bases), TypeExpr::Array { .. }))
+                    .unwrap_or_else(|| TypeExpr::Array {
+                        elem: Box::new(self.infer_expr_type(value)),
+                        len: *len,
+                        span: expr.span,
+                    });
+                let (elem_ty, alen, stride, elem_is_rc) = self.array_layout(&arr_ty).unwrap();
+                if !elem_is_rc {
+                    let total_bytes = (alen * stride) as i64;
+                    let sz_v = self.builder.ins().iconst(types::I64, total_bytes);
+                    let obj = self.call_rt_1(self.rt.cstruct_alloc, sz_v);
+                    let base = self.call_rt_1(self.rt.cstruct_data_ptr, obj);
+                    let mut temps = Vec::new();
+                    let val = self.lower_expr_borrowed(value, &mut temps)?;
+                    if alen <= 16 {
+                        for idx in 0..alen {
+                            self.emit_mem_store(base, (idx * stride) as i32, val, &elem_ty, false)?;
+                        }
+                    } else {
+                        let ivar = self.builder.declare_var(types::I64);
+                        let z0 = self.builder.ins().iconst(types::I64, 0);
+                        self.builder.def_var(ivar, z0);
+                        let hdr = self.builder.create_block();
+                        let body = self.builder.create_block();
+                        let done = self.builder.create_block();
+                        self.builder.ins().jump(hdr, &[]);
+                        self.builder.switch_to_block(hdr);
+                        let cur = self.builder.use_var(ivar);
+                        let lim = self.builder.ins().iconst(types::I64, alen as i64);
+                        let cond = self.builder.ins().icmp(IntCC::SignedLessThan, cur, lim);
+                        self.builder.ins().brif(cond, body, &[], done, &[]);
+                        self.builder.switch_to_block(body);
+                        self.builder.seal_block(body);
+                        let sv = self.builder.ins().iconst(types::I64, stride as i64);
+                        let boff = self.builder.ins().imul(cur, sv);
+                        let eptr = self.builder.ins().iadd(base, boff);
+                        self.emit_mem_store(eptr, 0, val, &elem_ty, false)?;
+                        let one = self.builder.ins().iconst(types::I64, 1);
+                        let nxt = self.builder.ins().iadd(cur, one);
+                        self.builder.def_var(ivar, nxt);
+                        self.builder.ins().jump(hdr, &[]);
+                        self.builder.seal_block(hdr);
+                        self.builder.switch_to_block(done);
+                        self.builder.seal_block(done);
+                    }
+                    self.flush_temps(&temps);
+                    return Ok(obj);
+                }
+                let mut temps = Vec::new();
+                let init_v = self.lower_expr_borrowed(value, &mut temps)?;
+                let cnt_v = self.builder.ins().iconst(types::I64, alen as i64);
+                let rc_flag = self.builder.ins().iconst(types::I64, 1);
+                let fref = self.module.declare_func_in_func(self.rt.list_filled, self.builder.func);
+                let call = self.builder.ins().call(fref, &[cnt_v, init_v, rc_flag]);
+                let res = self.builder.inst_results(call)[0];
+                self.flush_temps(&temps);
+                Ok(res)
+            }
+            ExprKind::Cast { expr: inner, ty } => {
+                if let ExprKind::Float(x) = &inner.kind {
+                    if is_f32_type_expr(ty, self.alias_bases) {
+                        return Ok(self.builder.ins().iconst(types::I64, (*x as f32).to_bits() as i64));
+                    }
+                }
+                let src_ty = self.infer_expr_type(inner);
+                let mut temps = Vec::new();
+                let v = self.lower_expr_borrowed(inner, &mut temps)?;
+                self.flush_temps(&temps);
+                Ok(self.emit_cast(v, &src_ty, ty))
+            }
             ExprKind::List(elems) => {
+                if let Some(exp) = expected_ty {
+                    if let Some((elem_ty, alen, stride, false)) = self.array_layout(exp) {
+                        let total_bytes = (alen * stride) as i64;
+                        let sz_v = self.builder.ins().iconst(types::I64, total_bytes);
+                        let obj = self.call_rt_1(self.rt.cstruct_alloc, sz_v);
+                        let base = self.call_rt_1(self.rt.cstruct_data_ptr, obj);
+                        for (idx, e) in elems.iter().enumerate() {
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(e, &mut temps)?;
+                            self.emit_mem_store(base, (idx * stride) as i32, v, &elem_ty, false)?;
+                            self.flush_temps(&temps);
+                        }
+                        return Ok(obj);
+                    }
+                }
                 let exp_elem_ty = expected_ty.and_then(|t| self.list_elem_ty(t));
                 let elem_is_rc = exp_elem_ty
                     .as_ref()
@@ -2891,19 +4103,31 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 Ok(obj)
             }
             ExprKind::Unary { op, expr } => {
+                let sk = self.scalar_kind_of_expr(expr);
                 let is_flt = self.is_float_expr(expr);
                 let mut temps = Vec::new();
                 let v = self.lower_expr_borrowed(expr, &mut temps)?;
                 self.flush_temps(&temps);
                 match op {
                     UnOp::Neg => {
-                        if is_flt {
+                        if sk == Some(ScalarKind::F32) {
+                            let i32v = self.builder.ins().ireduce(types::I32, v);
+                            let fv = self.builder.ins().bitcast(types::F32, MemFlags::new(), i32v);
+                            let neg = self.builder.ins().fneg(fv);
+                            let o32 = self.builder.ins().bitcast(types::I32, MemFlags::new(), neg);
+                            Ok(self.builder.ins().uextend(types::I64, o32))
+                        } else if is_flt {
                             let fv = self.builder.ins().bitcast(types::F64, MemFlags::new(), v);
                             let neg = self.builder.ins().fneg(fv);
                             Ok(self.builder.ins().bitcast(types::I64, MemFlags::new(), neg))
                         } else {
-                            Ok(self.builder.ins().ineg(v))
+                            let neg = self.builder.ins().ineg(v);
+                            Ok(if let Some(k) = sk { self.normalize_scalar(neg, k) } else { neg })
                         }
+                    }
+                    UnOp::BitNot => {
+                        let inv = self.builder.ins().bnot(v);
+                        Ok(if let Some(k) = sk { self.normalize_scalar(inv, k) } else { inv })
                     }
                     UnOp::Not => {
                         let zero = self.builder.ins().iconst(types::I64, 0);
@@ -2984,6 +4208,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             ExprKind::Binary { op, left, right } => {
                 let text_cmp = self.is_text_expr(left) || self.is_text_expr(right);
+                let lk = self.scalar_kind_of_expr(left);
+                let rk = self.scalar_kind_of_expr(right);
+                let eff_sk = match (lk, rk) {
+                    (Some(ScalarKind::I64), Some(k)) if k != ScalarKind::I64 && matches!(left.kind, ExprKind::Int(_)) => Some(k),
+                    (Some(ScalarKind::F32), _) | (_, Some(ScalarKind::F32)) => Some(ScalarKind::F32),
+                    (Some(k), _) => Some(k),
+                    (None, k) => k,
+                };
                 let float_op = self.is_float_expr(left) || self.is_float_expr(right);
                 let mut temps = Vec::new();
                 let l = self.lower_expr_borrowed(left, &mut temps)?;
@@ -3004,6 +4236,60 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     return Ok(self.builder.ins().uextend(types::I64, ne));
                 }
                 self.flush_temps(&temps);
+                if eff_sk == Some(ScalarKind::F32) {
+                    let l32 = self.builder.ins().ireduce(types::I32, l);
+                    let r32 = self.builder.ins().ireduce(types::I32, r);
+                    let lf = self.builder.ins().bitcast(types::F32, MemFlags::new(), l32);
+                    let rf = self.builder.ins().bitcast(types::F32, MemFlags::new(), r32);
+                    let v = match op {
+                        BinOp::Add => {
+                            let fv = self.builder.ins().fadd(lf, rf);
+                            let i32v = self.builder.ins().bitcast(types::I32, MemFlags::new(), fv);
+                            self.builder.ins().uextend(types::I64, i32v)
+                        }
+                        BinOp::Sub => {
+                            let fv = self.builder.ins().fsub(lf, rf);
+                            let i32v = self.builder.ins().bitcast(types::I32, MemFlags::new(), fv);
+                            self.builder.ins().uextend(types::I64, i32v)
+                        }
+                        BinOp::Mul => {
+                            let fv = self.builder.ins().fmul(lf, rf);
+                            let i32v = self.builder.ins().bitcast(types::I32, MemFlags::new(), fv);
+                            self.builder.ins().uextend(types::I64, i32v)
+                        }
+                        BinOp::Div => {
+                            let fv = self.builder.ins().fdiv(lf, rf);
+                            let i32v = self.builder.ins().bitcast(types::I32, MemFlags::new(), fv);
+                            self.builder.ins().uextend(types::I64, i32v)
+                        }
+                        BinOp::Eq => {
+                            let c = self.builder.ins().fcmp(FloatCC::Equal, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        BinOp::Ne => {
+                            let c = self.builder.ins().fcmp(FloatCC::NotEqual, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        BinOp::Lt => {
+                            let c = self.builder.ins().fcmp(FloatCC::LessThan, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        BinOp::Le => {
+                            let c = self.builder.ins().fcmp(FloatCC::LessThanOrEqual, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        BinOp::Gt => {
+                            let c = self.builder.ins().fcmp(FloatCC::GreaterThan, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        BinOp::Ge => {
+                            let c = self.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        other => return Err(format!("unsupported float32 op {:?} in codegen", other)),
+                    };
+                    return Ok(v);
+                }
                 if float_op {
                     let lf = self.builder.ins().bitcast(types::F64, MemFlags::new(), l);
                     let rf = self.builder.ins().bitcast(types::F64, MemFlags::new(), r);
@@ -3052,17 +4338,41 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     };
                     return Ok(v);
                 }
+                let is_unsigned = eff_sk.is_some_and(|k| k.is_unsigned());
+                let is_signed_narrow = matches!(eff_sk, Some(ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I32));
+                let is_cmp = matches!(
+                    op,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                );
                 let v = match op {
                     BinOp::Add => self.builder.ins().iadd(l, r),
                     BinOp::Sub => self.builder.ins().isub(l, r),
                     BinOp::Mul => self.builder.ins().imul(l, r),
-                    BinOp::Div => self.builder.ins().sdiv(l, r),
-                    BinOp::Mod => self.builder.ins().srem(l, r),
+                    BinOp::Div => {
+                        if is_unsigned {
+                            self.builder.ins().udiv(l, r)
+                        } else {
+                            self.builder.ins().sdiv(l, r)
+                        }
+                    }
+                    BinOp::Mod => {
+                        if is_unsigned {
+                            self.builder.ins().urem(l, r)
+                        } else {
+                            self.builder.ins().srem(l, r)
+                        }
+                    }
                     BinOp::BitAnd => self.builder.ins().band(l, r),
                     BinOp::BitOr => self.builder.ins().bor(l, r),
                     BinOp::BitXor => self.builder.ins().bxor(l, r),
                     BinOp::Shl => self.builder.ins().ishl(l, r),
-                    BinOp::Shr => self.builder.ins().ushr(l, r),
+                    BinOp::Shr => {
+                        if is_signed_narrow {
+                            self.builder.ins().sshr(l, r)
+                        } else {
+                            self.builder.ins().ushr(l, r)
+                        }
+                    }
                     BinOp::Eq => {
                         let c = self.builder.ins().icmp(IntCC::Equal, l, r);
                         self.builder.ins().uextend(types::I64, c)
@@ -3072,26 +4382,32 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         self.builder.ins().uextend(types::I64, c)
                     }
                     BinOp::Lt => {
-                        let c = self.builder.ins().icmp(IntCC::SignedLessThan, l, r);
+                        let cc = if is_unsigned { IntCC::UnsignedLessThan } else { IntCC::SignedLessThan };
+                        let c = self.builder.ins().icmp(cc, l, r);
                         self.builder.ins().uextend(types::I64, c)
                     }
                     BinOp::Le => {
-                        let c = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, l, r);
+                        let cc = if is_unsigned { IntCC::UnsignedLessThanOrEqual } else { IntCC::SignedLessThanOrEqual };
+                        let c = self.builder.ins().icmp(cc, l, r);
                         self.builder.ins().uextend(types::I64, c)
                     }
                     BinOp::Gt => {
-                        let c = self.builder.ins().icmp(IntCC::SignedGreaterThan, l, r);
+                        let cc = if is_unsigned { IntCC::UnsignedGreaterThan } else { IntCC::SignedGreaterThan };
+                        let c = self.builder.ins().icmp(cc, l, r);
                         self.builder.ins().uextend(types::I64, c)
                     }
                     BinOp::Ge => {
-                        let c = self
-                            .builder
-                            .ins()
-                            .icmp(IntCC::SignedGreaterThanOrEqual, l, r);
+                        let cc = if is_unsigned { IntCC::UnsignedGreaterThanOrEqual } else { IntCC::SignedGreaterThanOrEqual };
+                        let c = self.builder.ins().icmp(cc, l, r);
                         self.builder.ins().uextend(types::I64, c)
                     }
                     other => return Err(format!("unsupported binary op {:?} in codegen", other)),
                 };
+                if !is_cmp {
+                    if let Some(k) = eff_sk {
+                        return Ok(self.normalize_scalar(v, k));
+                    }
+                }
                 Ok(v)
             }
             ExprKind::Call { callee, args } => match &callee.kind {
@@ -3303,11 +4619,232 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         return Ok(obj);
                     }
                     if fname == "len" && args.len() == 1 {
+                        let arg_ty = self.infer_expr_type(&args[0].value);
+                        if let Some((_, alen, _, _)) = self.array_layout(&arg_ty) {
+                            let mut temps = Vec::new();
+                            let _ = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                            self.flush_temps(&temps);
+                            return Ok(self.builder.ins().iconst(types::I64, alen as i64));
+                        }
+                        if matches!(resolve_alias_ty(&arg_ty, self.alias_bases), TypeExpr::Named { ref name, .. } if name == "BytesSlice") {
+                            let fid = self.func_ids["slice_len"];
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                            let res = self.call_rt_1(fid, v);
+                            self.flush_temps(&temps);
+                            return Ok(res);
+                        }
                         let mut temps = Vec::new();
                         let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
                         let res = self.call_rt_1(self.rt.rc_get_len, v);
                         self.flush_temps(&temps);
                         return Ok(res);
+                    }
+                    if is_consuming_cow_builtin(fname) && !args.is_empty() {
+                        let fid = *self
+                            .func_ids
+                            .get(fname)
+                            .ok_or_else(|| format!("unknown cow builtin `{}`", fname))?;
+                        let mut temps = Vec::new();
+                        let mut call_args = Vec::with_capacity(args.len());
+                        call_args.push(self.lower_expr_owned(&args[0].value, expected_ty)?);
+                        for a in &args[1..] {
+                            call_args.push(self.lower_expr_borrowed(&a.value, &mut temps)?);
+                        }
+                        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                        let call = self.builder.ins().call(fref, &call_args);
+                        let ret = self.builder.inst_results(call)[0];
+                        self.flush_temps(&temps);
+                        return Ok(ret);
+                    }
+                    if matches!(
+                        fname.as_str(),
+                        "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "saturating_add" | "saturating_sub"
+                    ) && args.len() == 2
+                    {
+                        let sk = self
+                            .scalar_kind_of_expr(&args[0].value)
+                            .or_else(|| self.scalar_kind_of_expr(&args[1].value))
+                            .unwrap_or(ScalarKind::I64);
+                        let mut temps = Vec::new();
+                        let a = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let b = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        self.flush_temps(&temps);
+                        let out = match fname.as_str() {
+                            "wrapping_add" => {
+                                let r = self.builder.ins().iadd(a, b);
+                                self.normalize_scalar(r, sk)
+                            }
+                            "wrapping_sub" => {
+                                let r = self.builder.ins().isub(a, b);
+                                self.normalize_scalar(r, sk)
+                            }
+                            "wrapping_mul" => {
+                                let r = self.builder.ins().imul(a, b);
+                                self.normalize_scalar(r, sk)
+                            }
+                            "saturating_add" => {
+                                if sk.is_unsigned() {
+                                    let max_u = self.builder.ins().iconst(types::I64, sk.max_i128().unwrap_or(u64::MAX as i128) as u64 as i64);
+                                    let sum = self.builder.ins().iadd(a, b);
+                                    if matches!(sk, ScalarKind::U64) {
+                                        let ovf = self.builder.ins().icmp(IntCC::UnsignedLessThan, sum, a);
+                                        self.builder.ins().select(ovf, max_u, sum)
+                                    } else {
+                                        let ovf = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, sum, max_u);
+                                        self.builder.ins().select(ovf, max_u, sum)
+                                    }
+                                } else {
+                                    let lo = sk.min_i128().unwrap_or(i64::MIN as i128) as i64;
+                                    let hi = sk.max_i128().unwrap_or(i64::MAX as i128) as i64;
+                                    let min_v = self.builder.ins().iconst(types::I64, lo);
+                                    let max_v = self.builder.ins().iconst(types::I64, hi);
+                                    let sum = self.builder.ins().iadd(a, b);
+                                    if matches!(sk, ScalarKind::I64) {
+                                        let z = self.builder.ins().iconst(types::I64, 0);
+                                        let b_pos = self.builder.ins().icmp(IntCC::SignedGreaterThan, b, z);
+                                        let b_neg = self.builder.ins().icmp(IntCC::SignedLessThan, b, z);
+                                        let pos_ovf = self.builder.ins().icmp(IntCC::SignedLessThan, sum, a);
+                                        let neg_ovf = self.builder.ins().icmp(IntCC::SignedGreaterThan, sum, a);
+                                        let is_hi = self.builder.ins().band(b_pos, pos_ovf);
+                                        let is_lo = self.builder.ins().band(b_neg, neg_ovf);
+                                        let s1 = self.builder.ins().select(is_hi, max_v, sum);
+                                        self.builder.ins().select(is_lo, min_v, s1)
+                                    } else {
+                                        let too_hi = self.builder.ins().icmp(IntCC::SignedGreaterThan, sum, max_v);
+                                        let too_lo = self.builder.ins().icmp(IntCC::SignedLessThan, sum, min_v);
+                                        let s1 = self.builder.ins().select(too_hi, max_v, sum);
+                                        self.builder.ins().select(too_lo, min_v, s1)
+                                    }
+                                }
+                            }
+                            _ => {
+                                // saturating_sub
+                                if sk.is_unsigned() {
+                                    let z = self.builder.ins().iconst(types::I64, 0);
+                                    let under = self.builder.ins().icmp(IntCC::UnsignedLessThan, a, b);
+                                    let diff = self.builder.ins().isub(a, b);
+                                    self.builder.ins().select(under, z, diff)
+                                } else {
+                                    let lo = sk.min_i128().unwrap_or(i64::MIN as i128) as i64;
+                                    let hi = sk.max_i128().unwrap_or(i64::MAX as i128) as i64;
+                                    let min_v = self.builder.ins().iconst(types::I64, lo);
+                                    let max_v = self.builder.ins().iconst(types::I64, hi);
+                                    let diff = self.builder.ins().isub(a, b);
+                                    if matches!(sk, ScalarKind::I64) {
+                                        let z = self.builder.ins().iconst(types::I64, 0);
+                                        let b_neg = self.builder.ins().icmp(IntCC::SignedLessThan, b, z);
+                                        let b_pos = self.builder.ins().icmp(IntCC::SignedGreaterThan, b, z);
+                                        let pos_ovf = self.builder.ins().icmp(IntCC::SignedLessThan, diff, a);
+                                        let neg_ovf = self.builder.ins().icmp(IntCC::SignedGreaterThan, diff, a);
+                                        let is_hi = self.builder.ins().band(b_neg, pos_ovf);
+                                        let is_lo = self.builder.ins().band(b_pos, neg_ovf);
+                                        let s1 = self.builder.ins().select(is_hi, max_v, diff);
+                                        self.builder.ins().select(is_lo, min_v, s1)
+                                    } else {
+                                        let too_hi = self.builder.ins().icmp(IntCC::SignedGreaterThan, diff, max_v);
+                                        let too_lo = self.builder.ins().icmp(IntCC::SignedLessThan, diff, min_v);
+                                        let s1 = self.builder.ins().select(too_hi, max_v, diff);
+                                        self.builder.ins().select(too_lo, min_v, s1)
+                                    }
+                                }
+                            }
+                        };
+                        return Ok(out);
+                    }
+                    if fname == "ptr_is_null" && args.len() == 1 {
+                        let mut temps = Vec::new();
+                        let p = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        self.flush_temps(&temps);
+                        let z = self.builder.ins().iconst(types::I64, 0);
+                        let eq = self.builder.ins().icmp(IntCC::Equal, p, z);
+                        return Ok(self.builder.ins().uextend(types::I64, eq));
+                    }
+                    if (fname == "ptr_of" || fname == "mut_ptr_of") && args.len() == 1 {
+                        let arg = &args[0].value;
+                        let aty = self.infer_expr_type(arg);
+                        let abase = resolve_alias_ty(&aty, self.alias_bases);
+                        let is_buf = self.is_c_value_type(&abase)
+                            || matches!(&abase, TypeExpr::Named { name, .. } if name == "Bytes" || name == "Text");
+                        if is_buf {
+                            if fname == "mut_ptr_of" {
+                                if let ExprKind::Ident(vname) = &arg.kind {
+                                    let cur = self.load_ident_val(vname)?;
+                                    let uniq = self.call_rt_1(self.rt.rc_ensure_unique, cur);
+                                    let var = self.vars[vname];
+                                    if self.inout_vars.contains(vname) {
+                                        let slot_ptr = self.builder.use_var(var);
+                                        self.builder.ins().store(MemFlags::new(), uniq, slot_ptr, 0);
+                                    } else {
+                                        self.builder.def_var(var, uniq);
+                                    }
+                                    return Ok(self.call_rt_1(self.rt.cstruct_data_ptr, uniq));
+                                }
+                            }
+                            let mut temps = Vec::new();
+                            let v = self.lower_expr_borrowed(arg, &mut temps)?;
+                            let p = self.call_rt_1(self.rt.cstruct_data_ptr, v);
+                            self.flush_temps(&temps);
+                            return Ok(p);
+                        }
+                        if let ExprKind::Ident(vname) = &arg.kind {
+                            if self.inout_vars.contains(vname) {
+                                let var = self.vars[vname];
+                                return Ok(self.builder.use_var(var));
+                            }
+                        }
+                        let mut temps = Vec::new();
+                        let v = self.lower_expr_borrowed(arg, &mut temps)?;
+                        let ss = self.builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            8,
+                            3,
+                        ));
+                        let addr = self.builder.ins().stack_addr(types::I64, ss, 0);
+                        self.emit_mem_store(addr, 0, v, &abase, false)?;
+                        self.flush_temps(&temps);
+                        return Ok(addr);
+                    }
+                    if fname == "__ptr_add" && args.len() == 3 {
+                        let mut temps = Vec::new();
+                        let p = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let n = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        let sz = self.lower_expr_borrowed(&args[2].value, &mut temps)?;
+                        self.flush_temps(&temps);
+                        let off = self.builder.ins().imul(n, sz);
+                        return Ok(self.builder.ins().iadd(p, off));
+                    }
+                    if (fname == "ptr_read" || fname == "volatile_read") && args.len() == 1 {
+                        let pty = self.infer_expr_type(&args[0].value);
+                        let elem_ty = self
+                            .ptr_pointee_ty(&pty)
+                            .unwrap_or_else(|| named_ty("Int64"));
+                        let mut temps = Vec::new();
+                        let p = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let v = self.emit_mem_load(p, 0, &elem_ty, fname == "volatile_read")?;
+                        self.flush_temps(&temps);
+                        return Ok(v);
+                    }
+                    if (fname == "ptr_write" || fname == "volatile_write") && args.len() == 2 {
+                        let pty = self.infer_expr_type(&args[0].value);
+                        let elem_ty = self
+                            .ptr_pointee_ty(&pty)
+                            .unwrap_or_else(|| self.infer_expr_type(&args[1].value));
+                        let mut temps = Vec::new();
+                        let p = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                        let v = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                        self.emit_mem_store(p, 0, v, &elem_ty, fname == "volatile_write")?;
+                        self.flush_temps(&temps);
+                        return Ok(self.builder.ins().iconst(types::I64, 0));
+                    }
+                    if let Some(ef) = self.extern_fns.get(fname).cloned() {
+                        let fid = *self.extern_func_ids.get(fname).ok_or_else(|| {
+                            format!(
+                                "unresolved extern \"C\" symbol `{}` in JIT (use `tenon build --c-src ...` or `-l ...` to link external C code)",
+                                fname
+                            )
+                        })?;
+                        return self.emit_extern_c_call(&ef, fid, args);
                     }
                     if fname == "push" && args.len() == 2 {
                         let xs_ty = self.infer_expr_type(&args[0].value);
@@ -4347,6 +5884,28 @@ pub fn main() Int {
         assert_eq!(
             st.live_objects, 0,
             "P0 expressiveness features in Cranelift JIT must leave 0 leaks, got {:?}",
+            st
+        );
+    }
+
+    #[test]
+    fn systems_suite_jit_zero_leaks() {
+        let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let entry = repo_root.join("examples/systems_test.tn");
+        let prog = load_program_with_imports(&entry).unwrap();
+
+        perceus::reset_stats();
+        let jit = JitProgram::compile(&prog).unwrap();
+        assert_eq!(jit.call_0("main").unwrap(), 1110);
+        let st = perceus::snapshot_stats();
+        assert_eq!(
+            st.live_objects, 0,
+            "full systems programming suite (S1+S2+S3) in Cranelift JIT must leave 0 leaks, got {:?}",
             st
         );
     }

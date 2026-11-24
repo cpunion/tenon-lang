@@ -422,6 +422,7 @@ fn eval_proto_expr(expr: &Expr, state: &BTreeMap<String, i64>) -> Option<i64> {
             match op {
                 UnOp::Neg => Some(-v),
                 UnOp::Not => Some(if v == 0 { 1 } else { 0 }),
+                UnOp::BitNot => Some(!v),
             }
         }
         ExprKind::Binary { op, left, right } => {
@@ -540,6 +541,7 @@ fn expr_to_tla(expr: &Expr) -> String {
         ExprKind::Unary { op, expr } => match op {
             UnOp::Neg => format!("(-{})", expr_to_tla(expr)),
             UnOp::Not => format!("(~{})", expr_to_tla(expr)),
+            UnOp::BitNot => format!("(~{})", expr_to_tla(expr)),
         },
         ExprKind::Binary { op, left, right } => {
             let l = expr_to_tla(left);

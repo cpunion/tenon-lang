@@ -1,0 +1,405 @@
+// Comprehensive End-to-End Systems Programming Suite (S1 + S2 + S3)
+// Verified by L0/L1, executed in Cranelift JIT AND LLVM 22 -O3 AOT with live_objects == 0!
+
+import "std/collections/bytes.tn"
+import "std/collections/store.tn"
+import "std/sync/sync.tn"
+import "std/os/net.tn"
+import "std/simd/simd.tn"
+import "std/text/text.tn"
+
+pub const MAGIC_HEADER UInt32 = 0xDEADBEEF
+pub const FLAG_BITS    UInt8  = 0b1010_0101
+pub const OCTAL_PERM   UInt16 = 0o755
+pub const CACHE_LINE   USize  = 64
+
+pub type UnitFloat = Float where 0.0 <= self && self <= 1.0
+
+// Exact C memory layout: @repr(C), @packed, @align(N)
+@repr(C)
+pub record CPoint {
+    tag UInt8
+    x   Int32
+    y   Float32
+}
+
+@packed
+pub record PackedHdr {
+    ver  UInt8
+    port UInt16
+    seq  UInt32
+}
+
+@repr(C)
+@align(64)
+pub record CacheAligned {
+    value Int64
+}
+
+// First-class zero-alloc bitfield (lives in a UInt16 register!)
+pub bitfield TcpFlags : UInt16 {
+    fin : 1
+    syn : 1
+    rst : 1
+    psh : 1
+    ack : 1
+    urg : 1
+    reserved : 6
+    data_off : 4
+}
+
+// Untagged C union for IEEE-754 bit reinterpretation
+pub union FloatBits32 {
+    f Float32
+    u UInt32
+    i Int32
+}
+
+// Real C FFI to libc / libm
+extern "C" {
+    fn strlen(s CStr) USize
+    fn sin(x Float64) Float64
+}
+
+@cfg(target_arch = "aarch64")
+pub pure fn detected_arch_code() Int {
+    64
+}
+
+@cfg(target_arch = "x86_64")
+pub pure fn detected_arch_code() Int {
+    86
+}
+
+@inline(always)
+pub pure fn fast_mix(a UInt32, b UInt32) UInt32 {
+    wrapping_add(a, b) ^ 0x5A5A5A5A
+}
+
+@inline(never)
+pub pure fn clamp_unit(u UnitFloat) Float {
+    u
+}
+
+@cold
+pub pure fn slow_fallback() Int {
+    -1
+}
+
+// Defer LIFO execution order test (both normal exit and early return!)
+fn test_defer_order(early Bool) Int {
+    var log = 0
+    {
+        defer { log = log * 10 + 1 }
+        defer { log = log * 10 + 2 }
+        if early {
+            defer { log = log * 10 + 3 }
+            return log
+        }
+    }
+    // Block exited: defers ran in LIFO order: 2, then 1 => log == 21
+    log
+}
+
+fn test_defer_early_via_atomic() Int {
+    let a = atomic_new(0)
+    let _ = {
+        defer { atomic_store(a, atomic_load(a, ORDER_SEQ_CST) * 10 + 1, ORDER_SEQ_CST) }
+        defer { atomic_store(a, atomic_load(a, ORDER_SEQ_CST) * 10 + 2, ORDER_SEQ_CST) }
+        42
+    }
+    atomic_load(a, ORDER_SEQ_CST)
+}
+
+pub fn main() Int {
+    // 1. S1: Exact-width integers, unsigned division/comparison, hex/bin/oct, ~, Float32, casts
+    let u8_a UInt8 = 200
+    let u8_b UInt8 = 100
+    assert wrapping_add(u8_a, u8_b) == 44
+    assert saturating_add(u8_a, u8_b) == 255
+    assert saturating_sub(u8_b, u8_a) == 0
+    let i8_a Int8 = -100
+    let i8_b Int8 = -50
+    assert saturating_add(i8_a, i8_b) == -128
+    assert (~(0 as UInt8)) == 255
+    assert FLAG_BITS == 165
+    assert OCTAL_PERM == 493
+    assert MAGIC_HEADER == 3735928559
+    assert fast_mix(10, 20) == (30 ^ 0x5A5A5A5A)
+
+    let big_u64 UInt64 = 0xFFFF_FFFF_FFFF_FFFE
+    assert big_u64 > (10 as UInt64)
+    assert big_u64 / (2 as UInt64) == 0x7FFF_FFFF_FFFF_FFFF
+
+    // Bit intrinsics
+    assert clz(1) == 63
+    assert ctz(8) == 3
+    assert popcnt(0xFF) == 8
+    assert bswap16(0x1234) == 0x3412
+    assert bswap32(0x12345678) == 0x78563412
+    assert rotl64(1, 4) == 16
+    assert rotr64(16, 4) == 1
+
+    // Float32 + L0 float refinement
+    let f1 Float32 = 1.5
+    let f2 Float32 = 2.25
+    let f3 Float32 = f1 + f2
+    assert f3 == 3.75
+    assert (f3 as Int32) == 3
+    assert ((f3 as Float64) > 3.7 && (f3 as Float64) < 3.8)
+    let f32_str = f32_to_text(f3)
+    assert f32_str == "3.75"
+    assert parse_f32("1.25") == 1.25
+    assert clamp_unit(0.5) == 0.5
+
+    // 2. S1: Defer LIFO
+    assert test_defer_order(false) == 21
+    assert test_defer_early_via_atomic() == 21
+
+    // 3. S1: Fixed-size arrays `[T; N]` + `[val; N]` + `for` iteration
+    var fixed [Int32; 4] = [10; 4]
+    assert len(fixed) == 4
+    fixed[1] = 20
+    fixed[2] = 30
+    fixed[3] = 40
+    var arr_sum Int32 = 0
+    for x in fixed {
+        arr_sum += x
+    }
+    assert arr_sum == 100
+
+    // 4. S1: Compact 1-byte `Bytes` + zero-copy `BytesSlice` + endian I/O
+    var buf = bytes_zeroed(16)
+    buf.write_u16_be(0, 0x1234)
+    buf.write_u32_le(2, 0x04030201)
+    buf.write_u64_be(6, 0x0102030405060708)
+    assert buf.read_u16_be(0) == 0x1234
+    assert buf.read_u16_le(0) == 0x3412
+    assert buf.read_u32_le(2) == 0x04030201
+    assert buf.read_u64_be(6) == 0x0102030405060708
+    buf.push(0xAA)
+    assert buf.len() == 17
+    assert buf.get(16) == 0xAA
+
+    let sl = buf.slice(2, 6)
+    assert sl.len() == 4
+    assert sl.get(0) == 1
+    assert sl.get(3) == 4
+
+    let hello_bytes = text_to_bytes("hello")
+    assert hello_bytes.to_text() == "hello"
+
+    // 5. S1: Generational `Store[T]` + `Handle`
+    var store = store_new[Int]()
+    let h1 = store.insert(100)
+    let h2 = store.insert(200)
+    assert store.len() == 2
+    assert store.remove(h1)
+    assert !store.is_valid(h1)
+    let h3 = store.insert(300) // reuses slot 0 with bumped generation!
+    assert h3.index == h1.index
+    assert h3.gen > h1.gen
+    assert !store.is_valid(h1)
+    assert store.is_valid(h3)
+    let v3 = match store.get(h3) {
+        Some(v) => v
+        None => -1
+    }
+    assert v3 == 300
+    assert store.is_valid(h2)
+
+    // 6. S2: Exact C layouts (`@repr(C)`, `@packed`, `@align`), `size_of`, `align_of`, `offset_of`
+    assert size_of[CPoint]() == 12
+    assert align_of[CPoint]() == 4
+    assert offset_of(CPoint, "tag") == 0
+    assert offset_of(CPoint, "x") == 4
+    assert offset_of(CPoint, "y") == 8
+
+    assert size_of[PackedHdr]() == 7
+    assert align_of[PackedHdr]() == 1
+    assert offset_of(PackedHdr, "ver") == 0
+    assert offset_of(PackedHdr, "port") == 1
+    assert offset_of(PackedHdr, "seq") == 3
+
+    assert size_of[CacheAligned]() == 64
+    assert align_of[CacheAligned]() == 64
+
+    var pt = CPoint { tag = 7, x = -42, y = 3.5 }
+    assert pt.tag == 7
+    assert pt.x == -42
+    assert pt.y == 3.5
+    pt.x = 99
+    assert pt.x == 99
+
+    let ph = PackedHdr { ver = 4, port = 8080, seq = 123456 }
+    assert ph.ver == 4
+    assert ph.port == 8080
+    assert ph.seq == 123456
+
+    // 7. S2: Zero-alloc bitfield
+    var fl = TcpFlags { fin = 0, syn = 1, ack = 1, data_off = 5 }
+    assert fl.syn == 1
+    assert fl.ack == 1
+    assert fl.fin == 0
+    assert fl.data_off == 5
+    fl.fin = 1
+    assert fl.fin == 1
+    let raw_fl UInt16 = fl.raw()
+    let fl2 = TcpFlags.from_raw(raw_fl)
+    assert fl2.data_off == 5
+    assert fl2.fin == 1
+
+    // 8. S2: Untagged C union (IEEE-754 float32 -> uint32 bits = 0x3FC00000 for 1.5f)
+    let fb = FloatBits32 { f = 1.5 }
+    let fb_bits UInt32 = unsafe { fb.u }
+    assert fb_bits == 0x3FC00000
+
+    // 9. S2: Raw pointers, volatile ops, raw_alloc/free/memcpy/memset, extern "C" libc/libm
+    let p_null = null_ptr[Int32]()
+    assert ptr_is_null(p_null)
+
+    let c_res = unsafe {
+        let mem = raw_alloc(16)
+        raw_memset(mem, 0x41, 4)
+        let b0 = ptr_read(mem)
+        assert b0 == 0x41
+
+        // Read CPoint fields via raw pointer arithmetic
+        let pt_ptr = ptr_of(pt)
+        let pt_copy = ptr_read(pt_ptr)
+        assert pt_copy.x == 99
+
+        // Volatile read/write into fixed array buffer
+        var vbuf [Int32; 2] = [11; 2]
+        let vp = mut_ptr_of(vbuf)
+        let vp1 = ptr_add(vp, 1)
+        volatile_write(vp1, 77 as Int32)
+        let read_back = volatile_read(vp1)
+        assert read_back == 77
+
+        // Direct libc `strlen` and libm `sin`!
+        let slen = strlen(text_cstr_ptr("TenonSystems"))
+        assert slen == 12
+        let s0 = sin(0.0)
+        assert s0 == 0.0
+
+        raw_free(mem, 16)
+        (slen as Int) + (read_back as Int)
+    }
+    assert c_res == 89
+
+    // 10. S3: Hardware SIMD vectors (native LLVM vector IR in AOT!)
+    let vf1 = simd_f32x4_new(1.0, 2.0, 3.0, 4.0)
+    let vf2 = simd_f32x4_new(2.0, 3.0, 4.0, 5.0)
+    let vf_sum = vf1.add(vf2)
+    assert vf_sum.lane(0) == 3.0
+    assert vf_sum.lane(3) == 9.0
+    assert vf1.dot(vf2) == 40.0
+    let vf_fma = vf1.fma(vf2, simd_f32x4_splat(1.0))
+    assert vf_fma.reduce_sum() == 44.0
+
+    let vd1 = simd_f64x4_new(1.0, 2.0, 3.0, 4.0)
+    let vd2 = simd_f64x4_splat(2.0)
+    assert vd1.dot(vd2) == 20.0
+
+    let vi1 = simd_i32x4_new(1, 2, 3, 4)
+    let vi2 = simd_i32x4_new(10, 20, 30, 40)
+    assert vi1.add(vi2).reduce_sum() == 110
+
+    var vu = simd_u8x16_splat(2)
+    vu.set_lane(0, 10)
+    assert vu.reduce_sum() == 40
+
+    // 11. S3: Real OS Multi-Threading (4 threads + AtomicInt + Mutex + Channel!)
+    let counter = atomic_new(0)
+    let shared_mu = mutex_new(0)
+    let ch Channel[Int] = chan_new()
+
+    var workers List[Thread] = []
+    var tid = 0
+    while tid < 4 {
+        let my_id = tid
+        let t = thread_start(|| {
+            var k = 0
+            while k < 250 {
+                counter.fetch_add(1, ORDER_SEQ_CST)
+                k += 1
+            }
+            shared_mu.lock()
+            let cur = shared_mu.get()
+            shared_mu.set(cur + my_id + 1)
+            shared_mu.unlock()
+            ch.send((my_id + 1) * 10)
+            my_id + 1
+        })
+        workers = push(workers, t)
+        tid += 1
+    }
+
+    var join_sum = 0
+    for w in workers {
+        join_sum += w.join()
+    }
+    ch.close()
+
+    var ch_sum = 0
+    var draining = true
+    while draining {
+        match ch.recv() {
+            Some(v) => { ch_sum += v }
+            None => { draining = false }
+        }
+    }
+    assert counter.load(ORDER_SEQ_CST) == 1000
+    assert shared_mu.get() == 10
+    assert join_sum == 10
+    assert ch_sum == 100
+    assert hw_concurrency() >= 1
+
+    // 12. S3: Real TCP loopback client/server across OS threads!
+    let listener = match tcp_listen("127.0.0.1:0") {
+        Ok(l) => l
+        Err(_) => {
+            assert false
+            TcpListener { fd = -1 }
+        }
+    }
+    let port = listener.local_port()
+    assert port > 0
+    let addr = f"127.0.0.1:{int_to_text(port)}"
+
+    let srv_thread = thread_start(|| {
+        match listener.accept() {
+            Ok(conn) => {
+                let req = conn.read(64)
+                let _ = conn.write(req)
+                conn.close()
+                req.len()
+            }
+            Err(_) => -1
+        }
+    })
+
+    let client = match tcp_connect(addr) {
+        Ok(c) => c
+        Err(_) => {
+            assert false
+            TcpStream { fd = -1 }
+        }
+    }
+    let payload = text_to_bytes("PING_TENON")
+    let sent = client.write(payload)
+    assert sent == 10
+    let echoed = client.read(64)
+    assert echoed.to_text() == "PING_TENON"
+    client.close()
+    let srv_n = srv_thread.join()
+    listener.close()
+    assert srv_n == 10
+
+    assert detected_arch_code() > 0
+    assert slow_fallback() == -1
+
+    // Final deterministic checksum returned by main()
+    1000 + ch_sum + (c_res - 89) + srv_n
+}

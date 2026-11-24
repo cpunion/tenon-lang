@@ -11,7 +11,16 @@ pub const TAG_ASYNC_FRAME: i64 = 6;
 pub const TAG_DYN: i64 = 7;
 pub const TAG_CLOSURE: i64 = 8;
 pub const TAG_TUPLE: i64 = 9;
-pub const TAG_RECORD_BASE: i64 = 100;
+pub const TAG_BYTES: i64 = 10;
+pub const TAG_SLICE: i64 = 11;
+pub const TAG_CSTRUCT: i64 = 12;
+pub const TAG_ATOMIC: i64 = 13;
+pub const TAG_MUTEX: i64 = 14;
+pub const TAG_CHANNEL: i64 = 15;
+pub const TAG_SIMD: i64 = 16;
+pub const TAG_ARRAY: i64 = 17;
+pub const TAG_ENUM_BASE: i64 = 100;
+pub const TAG_RECORD_BASE: i64 = 10_000;
 /// Sentinel `rc_mask` meaning EVERY element in `0..len` is an RC pointer (used for `List[T]` of RC `T`).
 pub const RC_MASK_ALL: u64 = u64::MAX;
 
@@ -79,22 +88,26 @@ pub extern "C" fn tenon_rt_print_int(val: i64) -> i64 {
 }
 
 #[repr(C)]
-struct ObjHeader {
-    rc: AtomicUsize,
-    tag: i64,
-    len: usize,
-    cap: usize,
-    rc_mask: u64,
+pub(crate) struct ObjHeader {
+    pub(crate) rc: AtomicUsize,
+    pub(crate) tag: i64,
+    pub(crate) len: usize,
+    pub(crate) cap: usize,
+    pub(crate) rc_mask: u64,
 }
 
-fn obj_layout(cap: usize) -> Layout {
+pub(crate) fn obj_layout(cap: usize) -> Layout {
     let header_size = std::mem::size_of::<ObjHeader>();
     let fields_size = cap * std::mem::size_of::<i64>();
     Layout::from_size_align(header_size + fields_size, std::mem::align_of::<ObjHeader>()).unwrap()
 }
 
-unsafe fn fields_ptr(hdr: *mut ObjHeader) -> *mut i64 {
+pub(crate) unsafe fn fields_ptr(hdr: *mut ObjHeader) -> *mut i64 {
     unsafe { (hdr as *mut u8).add(std::mem::size_of::<ObjHeader>()) as *mut i64 }
+}
+
+pub(crate) fn is_byte_payload_tag(tag: i64) -> bool {
+    matches!(tag, TAG_TEXT | TAG_BYTES | TAG_CSTRUCT | TAG_SIMD)
 }
 
 pub fn read_text_bytes<'a>(ptr: i64) -> &'a [u8] {
@@ -200,6 +213,15 @@ pub extern "C" fn tenon_rc_dec(ptr: i64) {
                     }
                 }
             }
+            let tag = (*hdr).tag;
+            if tag == TAG_MUTEX {
+                let raw_mu = *fields_ptr(hdr);
+                crate::systems::drop_mutex_handle(raw_mu);
+            } else if tag == TAG_CHANNEL {
+                let raw_ch = *fields_ptr(hdr);
+                let is_rc = *fields_ptr(hdr).add(1) != 0;
+                crate::systems::drop_channel_handle(raw_ch, is_rc);
+            }
             let cap = (*hdr).cap;
             LIVE_OBJECTS.fetch_sub(1, Ordering::SeqCst);
             dealloc(hdr as *mut u8, obj_layout(cap));
@@ -222,6 +244,23 @@ pub extern "C" fn tenon_rc_ensure_unique(ptr: i64) -> i64 {
         let tag = (*hdr).tag;
         let len = (*hdr).len;
         let rc_mask = (*hdr).rc_mask;
+        if is_byte_payload_tag(tag) {
+            let extra = if tag == TAG_TEXT { 1 } else { 0 };
+            let words = (len + extra).div_ceil(8).max(1);
+            let fresh = tenon_rc_alloc(tag, words as i64) as *mut ObjHeader;
+            (*fresh).len = len;
+            (*fresh).rc_mask = 0;
+            let src_b = fields_ptr(hdr) as *const u8;
+            let dst_b = fields_ptr(fresh) as *mut u8;
+            if len > 0 {
+                std::ptr::copy_nonoverlapping(src_b, dst_b, len);
+            }
+            if tag == TAG_TEXT {
+                *dst_b.add(len) = 0;
+            }
+            tenon_rc_dec(ptr);
+            return fresh as i64;
+        }
         let fresh = tenon_rc_alloc(tag, len as i64) as *mut ObjHeader;
         (*fresh).rc_mask = rc_mask;
         let src_f = fields_ptr(hdr);
@@ -308,15 +347,16 @@ pub extern "C" fn tenon_rc_get_len(ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tenon_text_new(data_ptr: i64, byte_len: i64) -> i64 {
     let blen = byte_len.max(0) as usize;
-    let words = blen.div_ceil(8).max(1);
+    let words = (blen + 1).div_ceil(8).max(1);
     let obj = tenon_rc_alloc(TAG_TEXT, words as i64) as *mut ObjHeader;
     unsafe {
         (*obj).len = blen;
+        let dst = fields_ptr(obj) as *mut u8;
         if blen > 0 && data_ptr != 0 {
             let src = data_ptr as *const u8;
-            let dst = fields_ptr(obj) as *mut u8;
             std::ptr::copy_nonoverlapping(src, dst, blen);
         }
+        *dst.add(blen) = 0;
     }
     obj as i64
 }

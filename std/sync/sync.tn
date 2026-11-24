@@ -1,0 +1,91 @@
+// Tenon Standard Library — OS Multi-Threading, Explicit-Ordering Atomics, Mutex & Channel
+
+pub const ORDER_RELAXED Int = 0
+pub const ORDER_ACQUIRE Int = 1
+pub const ORDER_RELEASE Int = 2
+pub const ORDER_ACQ_REL Int = 3
+pub const ORDER_SEQ_CST Int = 4
+
+pub record Thread {
+    handle Int
+}
+
+pub fn thread_start(f fn() Int) Thread {
+    Thread { handle = thread_spawn(f) }
+}
+
+impl Thread {
+    pub fn join(self) Int {
+        thread_join(self.handle)
+    }
+}
+
+pub fn sleep_ms(ms Int) {
+    thread_sleep_ms(ms)
+}
+
+pub fn hw_concurrency() Int {
+    thread_hw_concurrency()
+}
+
+impl AtomicInt {
+    pub fn load(self, ord Int) Int {
+        atomic_load(self, ord)
+    }
+
+    pub fn store(self, val Int, ord Int) {
+        atomic_store(self, val, ord)
+    }
+
+    pub fn fetch_add(self, delta Int, ord Int) Int {
+        atomic_fetch_add(self, delta, ord)
+    }
+
+    pub fn fetch_sub(self, delta Int, ord Int) Int {
+        atomic_fetch_sub(self, delta, ord)
+    }
+
+    pub fn cas(self, expected Int, desired Int, ord Int) Bool {
+        atomic_cas(self, expected, desired, ord)
+    }
+
+    pub fn swap(self, val Int, ord Int) Int {
+        atomic_swap(self, val, ord)
+    }
+}
+
+impl[T] Mutex[T] {
+    pub fn lock(self) {
+        mutex_lock(self)
+    }
+
+    pub fn unlock(self) {
+        mutex_unlock(self)
+    }
+
+    pub fn get(self) T {
+        mutex_get(self)
+    }
+
+    pub fn set(self, val T) {
+        mutex_set(self, val)
+    }
+}
+
+impl[T] Channel[T] {
+    pub fn send(self, val T) Bool {
+        chan_send(self, val)
+    }
+
+    pub fn recv(self) Option[T] {
+        chan_recv(self)
+    }
+
+    pub fn try_recv(self) Option[T] {
+        chan_try_recv(self)
+    }
+
+    pub fn close(self) {
+        chan_close(self)
+    }
+}

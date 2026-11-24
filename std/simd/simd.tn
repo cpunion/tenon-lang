@@ -1,0 +1,156 @@
+// Tenon Standard Library — Hardware SIMD Vectors
+// Compiles to native LLVM `<4 x float>`, `<4 x double>`, `<4 x i32>`, `<4 x i64>`, `<16 x i8>` IR in AOT.
+
+impl Float32x4 {
+    pub pure fn lane(self, idx Int) Float32 {
+        simd_f32x4_lane(self, idx)
+    }
+
+    pub pure fn add(self, other Float32x4) Float32x4 {
+        simd_f32x4_binop(self, other, 0)
+    }
+
+    pub pure fn sub(self, other Float32x4) Float32x4 {
+        simd_f32x4_binop(self, other, 1)
+    }
+
+    pub pure fn mul(self, other Float32x4) Float32x4 {
+        simd_f32x4_binop(self, other, 2)
+    }
+
+    pub pure fn div(self, other Float32x4) Float32x4 {
+        simd_f32x4_binop(self, other, 3)
+    }
+
+    pub pure fn min(self, other Float32x4) Float32x4 {
+        simd_f32x4_binop(self, other, 4)
+    }
+
+    pub pure fn max(self, other Float32x4) Float32x4 {
+        simd_f32x4_binop(self, other, 5)
+    }
+
+    pub pure fn fma(self, b Float32x4, c Float32x4) Float32x4 {
+        simd_f32x4_fma(self, b, c)
+    }
+
+    pub pure fn reduce_sum(self) Float32 {
+        simd_f32x4_reduce_sum(self)
+    }
+
+    pub pure fn dot(self, other Float32x4) Float32 {
+        simd_f32x4_dot(self, other)
+    }
+}
+
+impl Float64x4 {
+    pub pure fn lane(self, idx Int) Float {
+        simd_f64x4_lane(self, idx)
+    }
+
+    pub pure fn add(self, other Float64x4) Float64x4 {
+        simd_f64x4_binop(self, other, 0)
+    }
+
+    pub pure fn sub(self, other Float64x4) Float64x4 {
+        simd_f64x4_binop(self, other, 1)
+    }
+
+    pub pure fn mul(self, other Float64x4) Float64x4 {
+        simd_f64x4_binop(self, other, 2)
+    }
+
+    pub pure fn div(self, other Float64x4) Float64x4 {
+        simd_f64x4_binop(self, other, 3)
+    }
+
+    pub pure fn min(self, other Float64x4) Float64x4 {
+        simd_f64x4_binop(self, other, 4)
+    }
+
+    pub pure fn max(self, other Float64x4) Float64x4 {
+        simd_f64x4_binop(self, other, 5)
+    }
+
+    pub pure fn fma(self, b Float64x4, c Float64x4) Float64x4 {
+        simd_f64x4_fma(self, b, c)
+    }
+
+    pub pure fn reduce_sum(self) Float {
+        simd_f64x4_reduce_sum(self)
+    }
+
+    pub pure fn dot(self, other Float64x4) Float {
+        simd_f64x4_dot(self, other)
+    }
+}
+
+impl Int32x4 {
+    pub pure fn lane(self, idx Int) Int32 {
+        simd_i32x4_lane(self, idx)
+    }
+
+    pub pure fn add(self, other Int32x4) Int32x4 {
+        simd_i32x4_binop(self, other, 0)
+    }
+
+    pub pure fn sub(self, other Int32x4) Int32x4 {
+        simd_i32x4_binop(self, other, 1)
+    }
+
+    pub pure fn mul(self, other Int32x4) Int32x4 {
+        simd_i32x4_binop(self, other, 2)
+    }
+
+    pub pure fn reduce_sum(self) Int32 {
+        simd_i32x4_reduce_sum(self)
+    }
+}
+
+impl Int64x4 {
+    pub pure fn lane(self, idx Int) Int {
+        simd_i64x4_lane(self, idx)
+    }
+
+    pub pure fn add(self, other Int64x4) Int64x4 {
+        simd_i64x4_binop(self, other, 0)
+    }
+
+    pub pure fn sub(self, other Int64x4) Int64x4 {
+        simd_i64x4_binop(self, other, 1)
+    }
+
+    pub pure fn mul(self, other Int64x4) Int64x4 {
+        simd_i64x4_binop(self, other, 2)
+    }
+
+    pub pure fn reduce_sum(self) Int {
+        simd_i64x4_reduce_sum(self)
+    }
+}
+
+impl UInt8x16 {
+    pub pure fn lane(self, idx Int) UInt8 {
+        simd_u8x16_lane(self, idx)
+    }
+
+    pub fn set_lane(inout self, idx Int, val UInt8) {
+        self = simd_u8x16_set_lane(self, idx, val)
+    }
+
+    pub pure fn add(self, other UInt8x16) UInt8x16 {
+        simd_u8x16_binop(self, other, 0)
+    }
+
+    pub pure fn sub(self, other UInt8x16) UInt8x16 {
+        simd_u8x16_binop(self, other, 1)
+    }
+
+    pub pure fn xor(self, other UInt8x16) UInt8x16 {
+        simd_u8x16_binop(self, other, 2)
+    }
+
+    pub pure fn reduce_sum(self) Int {
+        simd_u8x16_reduce_sum(self)
+    }
+}

@@ -186,11 +186,11 @@ fn resolve_base<'a>(
 }
 
 fn is_int_name(name: &str) -> bool {
-    matches!(name, "Int" | "Int64" | "Int32" | "UInt16" | "USize")
+    crate::layout::ScalarKind::from_name(name).is_some_and(|k| k.is_int())
 }
 
 fn is_float_name(name: &str) -> bool {
-    matches!(name, "Float" | "Float64" | "Float32")
+    crate::layout::ScalarKind::from_name(name).is_some_and(|k| k.is_float())
 }
 
 /// Expand `@derive(ToJson, FromJson, JsonSchema, Eq, Hash)` on records and enums into standard `impl` items.
@@ -452,6 +452,7 @@ fn derive_record_to_json(
         is_pure: true,
         is_async: false,
         is_test: false,
+        is_unsafe: false,
         name: "to_json".into(),
         type_params: vec![],
         type_param_bounds: BTreeMap::new(),
@@ -1118,6 +1119,7 @@ fn derive_record_from_json(
         is_pure: true,
         is_async: false,
         is_test: false,
+        is_unsafe: false,
         name: "from_json".into(),
         type_params: vec![],
         type_param_bounds: BTreeMap::new(),
@@ -1409,6 +1411,7 @@ fn derive_record_json_schema(
         is_pure: true,
         is_async: false,
         is_test: false,
+        is_unsafe: false,
         name: "json_schema".into(),
         type_params: vec![],
         type_param_bounds: BTreeMap::new(),
@@ -1510,6 +1513,7 @@ fn derive_enum_to_json(en: &EnumDecl, aliases: &BTreeMap<String, TypeAliasDecl>)
         is_pure: true,
         is_async: false,
         is_test: false,
+        is_unsafe: false,
         name: "to_json".into(),
         type_params: vec![],
         type_param_bounds: BTreeMap::new(),
@@ -1689,6 +1693,7 @@ fn derive_enum_from_json(en: &EnumDecl, aliases: &BTreeMap<String, TypeAliasDecl
         is_pure: true,
         is_async: false,
         is_test: false,
+        is_unsafe: false,
         name: "from_json".into(),
         type_params: vec![],
         type_param_bounds: BTreeMap::new(),
@@ -1760,6 +1765,7 @@ fn derive_record_eq(rec: &RecordDecl) -> ImplDecl {
         is_pure: true,
         is_async: false,
         is_test: false,
+        is_unsafe: false,
         name: "eq".into(),
         type_params: vec![],
         type_param_bounds: BTreeMap::new(),
@@ -1840,6 +1846,7 @@ fn derive_record_hash(rec: &RecordDecl) -> ImplDecl {
         is_pure: true,
         is_async: false,
         is_test: false,
+        is_unsafe: false,
         name: "hash".into(),
         type_params: vec![],
         type_param_bounds: BTreeMap::new(),

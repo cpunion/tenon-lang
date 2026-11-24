@@ -926,4 +926,177 @@ pub fn bad_eq_and_tuple() Int {
         assert!(codes.contains(&"E0505"), "expected E0505 on `==` without Eq, got {:?}", codes);
         assert!(codes.contains(&"E0206"), "expected E0206 on tuple index out of bounds, got {:?}", codes);
     }
+
+    #[test]
+    fn verifies_systems_suite_positive_and_negative_controls() {
+        // 1. Positive control: full S1 + S2 + S3 systems syntax verifies cleanly
+        let good = parse(r#"
+pub const MAX_N USize = 4
+pub type UnitFloat = Float where 0.0 <= self && self <= 1.0
+
+@repr(C)
+pub record CPoint {
+    tag UInt8
+    x   Int32
+    y   Float32
+}
+
+@packed
+pub record PackedHdr {
+    ver  UInt8
+    port UInt16
+    seq  UInt32
+}
+
+pub bitfield Flags : UInt8 {
+    read  : 1
+    write : 1
+    exec  : 1
+    pad   : 5
+}
+
+pub union FloatBits {
+    f Float32
+    u UInt32
+}
+
+extern "C" {
+    fn strlen(s CStr) USize
+}
+
+pub fn ok_systems() Int {
+    let a UInt8 = 200
+    let b UInt8 = 55
+    let _w = wrapping_add(a, b)
+    let _u UnitFloat = 0.75
+    let f1 Float32 = 1.5
+    let f2 Float32 = 2.5
+    let _f3 Float32 = f1 + f2
+
+    var arr [Int32; 4] = [1; 4]
+    arr[3] = 9
+    let _e = arr[3]
+
+    let _sz = size_of[CPoint]() + align_of[PackedHdr]() + offset_of(CPoint, "x")
+    let fl = Flags { read = 1, write = 1 }
+    let _r = fl.read
+
+    let fb = FloatBits { f = 1.5 }
+    let _bits = unsafe {
+        let p = mut_ptr_of(arr)
+        let p1 = ptr_add(p, 1)
+        volatile_write(p1, 42 as Int32)
+        let _v = volatile_read(p1)
+        let _n = strlen(text_cstr_ptr("ok"))
+        fb.u
+    }
+    var acc = 0
+    defer { acc += 1 }
+    acc
+}
+"#)
+        .unwrap();
+        let good_rep = check_program(&good);
+        assert!(
+            good_rep.ok,
+            "valid systems programming suite should verify cleanly, got: {:?}",
+            good_rep.diagnostics
+        );
+
+        // 2. Negative controls:
+        //    - UInt8 overflow (E0410)
+        //    - Mixed int widths UInt8 + Int32 (E0205)
+        //    - Mixed float widths Float32 + Float64 (E0205)
+        //    - Float refinement violation UnitFloat = 1.5 (E0410)
+        //    - Bitfield width overflow > 8 bits (E0610)
+        //    - Fixed array constant OOB arr[4] on [Int32; 4] (E0410)
+        //    - Unsafe operations outside `unsafe`: union read, ptr_read, extern call (E0800)
+        //    - Unknown field in `offset_of` (E0206)
+        let bad = parse(r#"
+pub type UnitFloat = Float where 0.0 <= self && self <= 1.0
+
+@repr(C)
+pub record CPoint {
+    x Int32
+}
+
+pub bitfield TooWide : UInt8 {
+    lo : 5
+    hi : 4
+}
+
+pub union RawU {
+    a Int32
+    b UInt32
+}
+
+extern "C" {
+    fn strlen(s CStr) USize
+}
+
+pub fn bad_systems() Int {
+    let over UInt8 = 256
+    let u8_v UInt8 = 1
+    let i32_v Int32 = 2
+    let _mix_i = u8_v + i32_v
+    let f32_v Float32 = 1.0
+    let f64_v Float64 = 2.0
+    let _mix_f = f32_v + f64_v
+    let _bad_uf UnitFloat = 1.5
+    let arr [Int32; 4] = [0; 4]
+    let _oob = arr[4]
+    let u = RawU { a = 1 }
+    let _ur = u.b
+    let p = null_ptr[Int32]()
+    let _pr = ptr_read(p)
+    let _sl = strlen(text_cstr_ptr("hi"))
+    let _bad_off = offset_of(CPoint, "missing")
+    over as Int
+}
+"#)
+        .unwrap();
+        let bad_rep = check_program(&bad);
+        assert!(!bad_rep.ok);
+        let codes: Vec<&str> = bad_rep.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            codes.iter().filter(|&&c| c == "E0410").count() >= 3,
+            "expected >=3 E0410 (UInt8 overflow, UnitFloat, fixed array OOB), got {:?}",
+            bad_rep.diagnostics
+        );
+        assert!(
+            codes.iter().filter(|&&c| c == "E0205").count() >= 2,
+            "expected >=2 E0205 (mixed int widths & mixed float widths), got {:?}",
+            bad_rep.diagnostics
+        );
+        assert!(codes.contains(&"E0610"), "expected E0610 on bitfield overflow, got {:?}", codes);
+        assert!(
+            codes.iter().filter(|&&c| c == "E0800").count() >= 3,
+            "expected >=3 E0800 (union read, ptr_read, extern call outside unsafe), got {:?}",
+            bad_rep.diagnostics
+        );
+        assert!(codes.contains(&"E0206"), "expected E0206 on unknown offset_of field, got {:?}", codes);
+
+        // 3. Cross-module `pub` visibility check (E0105)
+        let mut mod_a = parse("fn secret_helper() Int { 7 }\npub fn pub_helper() Int { 1 }").unwrap();
+        for it in &mut mod_a.items {
+            if let tenon_syntax::Item::Fn(f) = it {
+                f.span.file_id = 1;
+            }
+        }
+        let mut mod_b = parse("pub fn main() Int { secret_helper() + pub_helper() }").unwrap();
+        for it in &mut mod_b.items {
+            if let tenon_syntax::Item::Fn(f) = it {
+                f.span.file_id = 2;
+            }
+        }
+        mod_a.items.extend(mod_b.items);
+        let vis_rep = check_program(&mod_a);
+        assert!(!vis_rep.ok);
+        let vis_codes: Vec<&str> = vis_rep.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            vis_codes.contains(&"E0105"),
+            "expected E0105 on cross-module private call, got {:?}",
+            vis_rep.diagnostics
+        );
+    }
 }

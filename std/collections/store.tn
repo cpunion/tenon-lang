@@ -1,0 +1,88 @@
+// Tenon Standard Library — Generational SlotMap `Store[T]` & `Handle`
+// Enables safe, cyclic graphs, doubly-linked lists, and order books in value semantics
+// with zero dangling handles and O(1) lookup/insert/remove.
+
+@derive(Eq, Hash)
+pub record Handle {
+    index Int
+    gen   Int
+}
+
+pub record Store[T] {
+    items     List[T]
+    gens      List[Int]
+    alive     List[Bool]
+    free_list List[Int]
+    count     Int
+}
+
+pub fn store_new[T]() Store[T] {
+    Store {
+        items = [],
+        gens = [],
+        alive = [],
+        free_list = [],
+        count = 0
+    }
+}
+
+impl[T] Store[T] {
+    pub pure fn len(self) Int {
+        self.count
+    }
+
+    pub pure fn is_empty(self) Bool {
+        self.count == 0
+    }
+
+    pub pure fn is_valid(self, h Handle) Bool {
+        if h.index < 0 || h.index >= len(self.alive) {
+            return false
+        }
+        self.alive[h.index] && self.gens[h.index] == h.gen
+    }
+
+    pub fn insert(inout self, val T) Handle {
+        let fl_len = len(self.free_list)
+        if fl_len > 0 {
+            let slot = self.free_list[fl_len - 1]
+            self.free_list = list_pop_shrink(self.free_list)
+            self.items[slot] = val
+            self.alive[slot] = true
+            self.count += 1
+            return Handle { index = slot, gen = self.gens[slot] }
+        }
+        let idx = len(self.items)
+        self.items = push(self.items, val)
+        self.gens = push(self.gens, 1)
+        self.alive = push(self.alive, true)
+        self.count += 1
+        Handle { index = idx, gen = 1 }
+    }
+
+    pub pure fn get(self, h Handle) Option[T] {
+        if !self.is_valid(h) {
+            return None
+        }
+        Some(self.items[h.index])
+    }
+
+    pub fn set(inout self, h Handle, val T) Bool {
+        if !self.is_valid(h) {
+            return false
+        }
+        self.items[h.index] = val
+        true
+    }
+
+    pub fn remove(inout self, h Handle) Bool {
+        if !self.is_valid(h) {
+            return false
+        }
+        self.alive[h.index] = false
+        self.gens[h.index] = self.gens[h.index] + 1
+        self.free_list = push(self.free_list, h.index)
+        self.count -= 1
+        true
+    }
+}

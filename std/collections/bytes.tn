@@ -1,0 +1,105 @@
+// Tenon Standard Library — Compact 1-Byte `Bytes` & Zero-Copy RC `BytesSlice`
+
+pub fn bytes_with_capacity(cap Int) Bytes {
+    bytes_new(cap)
+}
+
+pub fn bytes_zeroed(n Int) Bytes {
+    bytes_filled(n, 0)
+}
+
+impl Bytes {
+    pub pure fn len(self) Int {
+        bytes_len(self)
+    }
+
+    pub pure fn is_empty(self) Bool {
+        bytes_len(self) == 0
+    }
+
+    pub pure fn get(self, idx Int) UInt8 {
+        bytes_get(self, idx)
+    }
+
+    pub fn set(inout self, idx Int, val UInt8) {
+        self = bytes_set(self, idx, val)
+    }
+
+    pub fn push(inout self, val UInt8) {
+        self = bytes_push(self, val)
+    }
+
+    pub pure fn read_u16_le(self, off Int) UInt16 {
+        bytes_read_u16_le(self, off)
+    }
+
+    pub pure fn read_u16_be(self, off Int) UInt16 {
+        bytes_read_u16_be(self, off)
+    }
+
+    pub pure fn read_u32_le(self, off Int) UInt32 {
+        bytes_read_u32_le(self, off)
+    }
+
+    pub pure fn read_u32_be(self, off Int) UInt32 {
+        bytes_read_u32_be(self, off)
+    }
+
+    pub pure fn read_u64_le(self, off Int) UInt64 {
+        bytes_read_u64_le(self, off)
+    }
+
+    pub pure fn read_u64_be(self, off Int) UInt64 {
+        bytes_read_u64_be(self, off)
+    }
+
+    pub fn write_u16_le(inout self, off Int, val UInt16) {
+        self = bytes_write_u16_le(self, off, val)
+    }
+
+    pub fn write_u16_be(inout self, off Int, val UInt16) {
+        self = bytes_write_u16_be(self, off, val)
+    }
+
+    pub fn write_u32_le(inout self, off Int, val UInt32) {
+        self = bytes_write_u32_le(self, off, val)
+    }
+
+    pub fn write_u32_be(inout self, off Int, val UInt32) {
+        self = bytes_write_u32_be(self, off, val)
+    }
+
+    pub fn write_u64_le(inout self, off Int, val UInt64) {
+        self = bytes_write_u64_le(self, off, val)
+    }
+
+    pub fn write_u64_be(inout self, off Int, val UInt64) {
+        self = bytes_write_u64_be(self, off, val)
+    }
+
+    pub pure fn slice(self, start Int, end Int) BytesSlice {
+        bytes_slice(self, start, end)
+    }
+
+    pub pure fn to_text(self) Text {
+        bytes_to_text(self)
+    }
+
+    pub pure fn as_ptr(self) Ptr[UInt8] {
+        bytes_ptr(self)
+    }
+}
+
+impl BytesSlice {
+    pub pure fn len(self) Int {
+        slice_len(self)
+    }
+
+    pub pure fn is_empty(self) Bool {
+        slice_len(self) == 0
+    }
+
+    pub pure fn get(self, idx Int) UInt8 {
+        slice_get(self, idx)
+    }
+}

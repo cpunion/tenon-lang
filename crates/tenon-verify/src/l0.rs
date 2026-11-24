@@ -434,6 +434,31 @@ impl L0Env {
     pub fn eval_abs_int(&self, expr: &Expr, self_var: Option<&str>) -> AbsInt {
         match &expr.kind {
             ExprKind::Int(n) => AbsInt::exact(*n as i128),
+            ExprKind::Cast { expr: inner, ty } => {
+                let a = self.eval_abs_int(inner, self_var);
+                if let TypeExpr::Named { name, .. } = ty {
+                    if let Some(sk) = tenon_syntax::ScalarKind::from_name(name) {
+                        if sk.is_int() {
+                            if let (Some(lo), Some(hi)) = (sk.min_i128(), sk.max_i128()) {
+                                if a.interval.min >= lo && a.interval.max <= hi {
+                                    return a;
+                                }
+                                if sk == tenon_syntax::ScalarKind::U64 {
+                                    if let ExprKind::Int(n) = &inner.kind {
+                                        return AbsInt::exact((*n as u64) as i128);
+                                    }
+                                }
+                                return AbsInt {
+                                    interval: Interval { min: lo, max: hi },
+                                    cong: Congruence::TOP,
+                                    non_zero: false,
+                                };
+                            }
+                        }
+                    }
+                }
+                a
+            }
             ExprKind::Ident(s) => {
                 let key = resolve_self(s, self_var);
                 self.get_int(&key)
@@ -1007,6 +1032,7 @@ impl L0Env {
             ExprKind::Unary { op, expr } => match (op, self.ctfe_expr(expr, locals, budget - 1)?) {
                 (UnOp::Neg, CtfeVal::Int(n)) => Some(CtfeVal::Int(-n)),
                 (UnOp::Not, CtfeVal::Bool(b)) => Some(CtfeVal::Bool(!b)),
+                (UnOp::BitNot, CtfeVal::Int(n)) => Some(CtfeVal::Int(!n)),
                 _ => None,
             },
             ExprKind::Binary { op, left, right } => {

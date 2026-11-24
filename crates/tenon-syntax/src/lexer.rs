@@ -41,6 +41,12 @@ pub enum TokenKind {
     While,
     Break,
     Continue,
+    Defer,
+    Unsafe,
+    Extern,
+    Bitfield,
+    Union,
+    Const,
     Match,
     Return,
     Assert,
@@ -83,6 +89,8 @@ pub enum TokenKind {
     Colon,
     Dot,
     DotDot,
+    DotDotDot,
+    Tilde,
     Question,
     At,
     Eq,
@@ -128,6 +136,11 @@ pub struct Token {
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
+    lex_with_file_id(src, 0)
+}
+
+pub fn lex_with_file_id(src: &str, file_id: u32) -> Result<Vec<Token>, ParseError> {
+    let mk_span = |s: usize, e: usize, l: usize, c: usize| Span::new_in_file(s, e, l, c, file_id);
     let bytes = src.as_bytes();
     let mut i = 0;
     let mut line = 1;
@@ -142,7 +155,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 col += 1;
             }
             '\n' => {
-                let span = Span::new(i, i + 1, line, col);
+                let span = mk_span(i, i + 1, line, col);
                 tokens.push(Token {
                     kind: TokenKind::Newline,
                     span,
@@ -182,7 +195,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 if !closed {
                     return Err(ParseError {
                         message: "unterminated block comment".into(),
-                        span: Span::new(start, i, sline, scol),
+                        span: mk_span(start, i, sline, scol),
                     });
                 }
             }
@@ -209,8 +222,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                             b'n' => raw.push(b'\n'),
                             b't' => raw.push(b'\t'),
                             b'r' => raw.push(b'\r'),
+                            b'0' => raw.push(0),
                             b'\\' => raw.push(b'\\'),
                             b'"' => raw.push(b'"'),
+                            b'x' if i + 2 < bytes.len() => {
+                                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                                    raw.push(v);
+                                    i += 2;
+                                    col += 2;
+                                } else {
+                                    raw.push(b'x');
+                                }
+                            }
                             other => raw.push(other),
                         }
                         i += 1;
@@ -229,13 +253,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 if !closed {
                     return Err(ParseError {
                         message: "unterminated string literal".into(),
-                        span: Span::new(start, i, sline, scol),
+                        span: mk_span(start, i, sline, scol),
                     });
                 }
                 let s = String::from_utf8_lossy(&raw).into_owned();
                 tokens.push(Token {
                     kind: TokenKind::Str(s),
-                    span: Span::new(start, i, sline, scol),
+                    span: mk_span(start, i, sline, scol),
                 });
             }
             'f' if i + 1 < bytes.len() && bytes[i + 1] == b'"' => {
@@ -261,6 +285,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                             b'n' => raw.push(b'\n'),
                             b't' => raw.push(b'\t'),
                             b'r' => raw.push(b'\r'),
+                            b'0' => raw.push(0),
                             b'\\' => raw.push(b'\\'),
                             b'"' => raw.push(b'"'),
                             other => raw.push(other),
@@ -281,18 +306,51 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 if !closed {
                     return Err(ParseError {
                         message: "unterminated interpolated string literal".into(),
-                        span: Span::new(start, i, sline, scol),
+                        span: mk_span(start, i, sline, scol),
                     });
                 }
                 let s = String::from_utf8_lossy(&raw).into_owned();
                 tokens.push(Token {
                     kind: TokenKind::FStr(s),
-                    span: Span::new(start, i, sline, scol),
+                    span: mk_span(start, i, sline, scol),
                 });
             }
             '0'..='9' => {
                 let start = i;
                 let scol = col;
+                // Support 0x (hex), 0b (binary), 0o (octal) integer literals
+                if bytes[i] == b'0' && i + 1 < bytes.len() && matches!(bytes[i + 1], b'x' | b'X' | b'b' | b'B' | b'o' | b'O') {
+                    let radix = match bytes[i + 1] {
+                        b'x' | b'X' => 16u32,
+                        b'b' | b'B' => 2u32,
+                        _ => 8u32,
+                    };
+                    i += 2;
+                    col += 2;
+                    let mut digits = String::new();
+                    while i < bytes.len() {
+                        let c = bytes[i] as char;
+                        if c == '_' {
+                            i += 1;
+                            col += 1;
+                        } else if c.is_digit(radix) {
+                            digits.push(c);
+                            i += 1;
+                            col += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let val = u64::from_str_radix(&digits, radix).map_err(|_| ParseError {
+                        message: format!("invalid radix-{} integer literal `{}`", radix, digits),
+                        span: mk_span(start, i, line, scol),
+                    })?;
+                    tokens.push(Token {
+                        kind: TokenKind::Int(val as i64),
+                        span: mk_span(start, i, line, scol),
+                    });
+                    continue;
+                }
                 let mut num_str = String::new();
                 let mut is_float = false;
                 while i < bytes.len() {
@@ -360,20 +418,23 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 if is_float {
                     let val: f64 = num_str.parse().map_err(|_| ParseError {
                         message: format!("invalid float literal `{}`", num_str),
-                        span: Span::new(start, i, line, scol),
+                        span: mk_span(start, i, line, scol),
                     })?;
                     tokens.push(Token {
                         kind: TokenKind::Float(val.to_bits()),
-                        span: Span::new(start, i, line, scol),
+                        span: mk_span(start, i, line, scol),
                     });
                 } else {
-                    let val: i64 = num_str.parse().map_err(|_| ParseError {
-                        message: format!("invalid integer literal `{}`", num_str),
-                        span: Span::new(start, i, line, scol),
-                    })?;
+                    let val: i64 = num_str
+                        .parse::<i64>()
+                        .or_else(|_| num_str.parse::<u64>().map(|u| u as i64))
+                        .map_err(|_| ParseError {
+                            message: format!("invalid integer literal `{}`", num_str),
+                            span: mk_span(start, i, line, scol),
+                        })?;
                     tokens.push(Token {
                         kind: TokenKind::Int(val),
-                        span: Span::new(start, i, line, scol),
+                        span: mk_span(start, i, line, scol),
                     });
                 }
             }
@@ -422,6 +483,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                     "while" => TokenKind::While,
                     "break" => TokenKind::Break,
                     "continue" => TokenKind::Continue,
+                    "defer" => TokenKind::Defer,
+                    "unsafe" => TokenKind::Unsafe,
+                    "extern" => TokenKind::Extern,
+                    "bitfield" => TokenKind::Bitfield,
+                    "union" => TokenKind::Union,
+                    "const" => TokenKind::Const,
                     "match" => TokenKind::Match,
                     "return" => TokenKind::Return,
                     "assert" => TokenKind::Assert,
@@ -455,7 +522,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 };
                 tokens.push(Token {
                     kind,
-                    span: Span::new(start, i, line, scol),
+                    span: mk_span(start, i, line, scol),
                 });
             }
             _ => {
@@ -464,6 +531,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 let rem = &src[i..];
                 let (kind, len) = if rem.starts_with("<->") {
                     (TokenKind::Bidirectional, 3)
+                } else if rem.starts_with("...") {
+                    (TokenKind::DotDotDot, 3)
                 } else if rem.starts_with("<<=") {
                     (TokenKind::ShlEq, 3)
                 } else if rem.starts_with(">>=") {
@@ -516,6 +585,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                         ';' => (TokenKind::Semi, 1),
                         ':' => (TokenKind::Colon, 1),
                         '.' => (TokenKind::Dot, 1),
+                        '~' => (TokenKind::Tilde, 1),
                         '?' => (TokenKind::Question, 1),
                         '@' => (TokenKind::At, 1),
                         '=' => (TokenKind::Eq, 1),
@@ -533,7 +603,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                         other => {
                             return Err(ParseError {
                                 message: format!("unexpected character `{}`", other),
-                                span: Span::new(start, start + 1, line, scol),
+                                span: mk_span(start, start + 1, line, scol),
                             });
                         }
                     }
@@ -542,7 +612,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
                 col += len;
                 tokens.push(Token {
                     kind,
-                    span: Span::new(start, i, line, scol),
+                    span: mk_span(start, i, line, scol),
                 });
             }
         }
@@ -550,7 +620,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
 
     tokens.push(Token {
         kind: TokenKind::Eof,
-        span: Span::new(i, i, line, col),
+        span: mk_span(i, i, line, col),
     });
     Ok(tokens)
 }

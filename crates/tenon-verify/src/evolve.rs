@@ -558,7 +558,7 @@ fn check_capabilities(v1: &Program, v2: &Program) -> Vec<CapabilityCheckResult> 
 
 fn normalize_base_type_name(ty_name: &str, aliases: &BTreeMap<String, Expr>) -> String {
     if aliases.contains_key(ty_name)
-        || matches!(ty_name, "Int" | "Int64" | "Int32" | "UInt16" | "USize")
+        || ScalarKind::from_name(ty_name).is_some_and(|k| k.is_int())
     {
         return "Int".into();
     }

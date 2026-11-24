@@ -93,7 +93,146 @@ const BUILTIN_SIGS: &[BuiltinSig] = &[
     BuiltinSig { name: "sys_http_sse_eof", arity: 1, is_pure: false, allocates: false, param_types: &["Int"], ret_type: "Bool" },
     BuiltinSig { name: "sys_http_sse_error", arity: 1, is_pure: false, allocates: true, param_types: &["Int"], ret_type: "Text" },
     BuiltinSig { name: "sys_http_sse_close", arity: 1, is_pure: false, allocates: false, param_types: &["Int"], ret_type: "Int" },
+    // S1: Hardware bit intrinsics, wrapping/saturating arithmetic, Float32 text ops
+    BuiltinSig { name: "clz", arity: 1, is_pure: true, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "ctz", arity: 1, is_pure: true, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "popcnt", arity: 1, is_pure: true, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "bswap16", arity: 1, is_pure: true, allocates: false, param_types: &["AnyInt"], ret_type: "UInt16" },
+    BuiltinSig { name: "bswap32", arity: 1, is_pure: true, allocates: false, param_types: &["AnyInt"], ret_type: "UInt32" },
+    BuiltinSig { name: "bswap64", arity: 1, is_pure: true, allocates: false, param_types: &["AnyInt"], ret_type: "UInt64" },
+    BuiltinSig { name: "rotl64", arity: 2, is_pure: true, allocates: false, param_types: &["AnyInt", "AnyInt"], ret_type: "UInt64" },
+    BuiltinSig { name: "rotr64", arity: 2, is_pure: true, allocates: false, param_types: &["AnyInt", "AnyInt"], ret_type: "UInt64" },
+    BuiltinSig { name: "wrapping_add", arity: 2, is_pure: true, allocates: false, param_types: &["AnyInt", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "wrapping_sub", arity: 2, is_pure: true, allocates: false, param_types: &["AnyInt", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "wrapping_mul", arity: 2, is_pure: true, allocates: false, param_types: &["AnyInt", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "saturating_add", arity: 2, is_pure: true, allocates: false, param_types: &["AnyInt", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "saturating_sub", arity: 2, is_pure: true, allocates: false, param_types: &["AnyInt", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "f32_to_text", arity: 1, is_pure: true, allocates: true, param_types: &["Float32"], ret_type: "Text" },
+    BuiltinSig { name: "parse_f32", arity: 1, is_pure: true, allocates: false, param_types: &["Text"], ret_type: "Float32" },
+    // S1: Compact 1-byte `Bytes` + zero-copy `BytesSlice` + endian I/O
+    BuiltinSig { name: "bytes_new", arity: 1, is_pure: true, allocates: true, param_types: &["AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_filled", arity: 2, is_pure: true, allocates: true, param_types: &["AnyInt", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_len", arity: 1, is_pure: true, allocates: false, param_types: &["Bytes"], ret_type: "Int" },
+    BuiltinSig { name: "bytes_get", arity: 2, is_pure: true, allocates: false, param_types: &["Bytes", "AnyInt"], ret_type: "UInt8" },
+    BuiltinSig { name: "bytes_set", arity: 3, is_pure: true, allocates: true, param_types: &["Bytes", "AnyInt", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_push", arity: 2, is_pure: true, allocates: true, param_types: &["Bytes", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_read_u16_le", arity: 2, is_pure: true, allocates: false, param_types: &["Bytes", "AnyInt"], ret_type: "UInt16" },
+    BuiltinSig { name: "bytes_read_u16_be", arity: 2, is_pure: true, allocates: false, param_types: &["Bytes", "AnyInt"], ret_type: "UInt16" },
+    BuiltinSig { name: "bytes_read_u32_le", arity: 2, is_pure: true, allocates: false, param_types: &["Bytes", "AnyInt"], ret_type: "UInt32" },
+    BuiltinSig { name: "bytes_read_u32_be", arity: 2, is_pure: true, allocates: false, param_types: &["Bytes", "AnyInt"], ret_type: "UInt32" },
+    BuiltinSig { name: "bytes_read_u64_le", arity: 2, is_pure: true, allocates: false, param_types: &["Bytes", "AnyInt"], ret_type: "UInt64" },
+    BuiltinSig { name: "bytes_read_u64_be", arity: 2, is_pure: true, allocates: false, param_types: &["Bytes", "AnyInt"], ret_type: "UInt64" },
+    BuiltinSig { name: "bytes_write_u16_le", arity: 3, is_pure: true, allocates: true, param_types: &["Bytes", "AnyInt", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_write_u16_be", arity: 3, is_pure: true, allocates: true, param_types: &["Bytes", "AnyInt", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_write_u32_le", arity: 3, is_pure: true, allocates: true, param_types: &["Bytes", "AnyInt", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_write_u32_be", arity: 3, is_pure: true, allocates: true, param_types: &["Bytes", "AnyInt", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_write_u64_le", arity: 3, is_pure: true, allocates: true, param_types: &["Bytes", "AnyInt", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_write_u64_be", arity: 3, is_pure: true, allocates: true, param_types: &["Bytes", "AnyInt", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_slice", arity: 3, is_pure: true, allocates: true, param_types: &["Any", "AnyInt", "AnyInt"], ret_type: "BytesSlice" },
+    BuiltinSig { name: "slice_len", arity: 1, is_pure: true, allocates: false, param_types: &["BytesSlice"], ret_type: "Int" },
+    BuiltinSig { name: "slice_get", arity: 2, is_pure: true, allocates: false, param_types: &["BytesSlice", "AnyInt"], ret_type: "UInt8" },
+    BuiltinSig { name: "bytes_to_text", arity: 1, is_pure: true, allocates: true, param_types: &["Bytes"], ret_type: "Text" },
+    BuiltinSig { name: "text_to_bytes", arity: 1, is_pure: true, allocates: true, param_types: &["Text"], ret_type: "Bytes" },
+    BuiltinSig { name: "bytes_ptr", arity: 1, is_pure: true, allocates: false, param_types: &["Bytes"], ret_type: "Ptr[UInt8]" },
+    BuiltinSig { name: "text_cstr_ptr", arity: 1, is_pure: true, allocates: false, param_types: &["Text"], ret_type: "Ptr[UInt8]" },
+    BuiltinSig { name: "cstr_to_text", arity: 1, is_pure: false, allocates: true, param_types: &["Any"], ret_type: "Text" },
+    // S2: Layout intrinsics, raw pointers & unsafe memory ops
+    BuiltinSig { name: "size_of", arity: 0, is_pure: true, allocates: false, param_types: &[], ret_type: "USize" },
+    BuiltinSig { name: "align_of", arity: 0, is_pure: true, allocates: false, param_types: &[], ret_type: "USize" },
+    BuiltinSig { name: "offset_of", arity: 2, is_pure: true, allocates: false, param_types: &["Any", "Text"], ret_type: "USize" },
+    BuiltinSig { name: "null_ptr", arity: 0, is_pure: true, allocates: false, param_types: &[], ret_type: "MutPtr[Any]" },
+    BuiltinSig { name: "ptr_is_null", arity: 1, is_pure: true, allocates: false, param_types: &["Any"], ret_type: "Bool" },
+    BuiltinSig { name: "ptr_of", arity: 1, is_pure: true, allocates: false, param_types: &["Any"], ret_type: "Ptr[Any]" },
+    BuiltinSig { name: "mut_ptr_of", arity: 1, is_pure: true, allocates: false, param_types: &["Any"], ret_type: "MutPtr[Any]" },
+    BuiltinSig { name: "ptr_add", arity: 2, is_pure: false, allocates: false, param_types: &["Any", "AnyInt"], ret_type: "Any" },
+    BuiltinSig { name: "ptr_read", arity: 1, is_pure: false, allocates: false, param_types: &["Any"], ret_type: "Any" },
+    BuiltinSig { name: "ptr_write", arity: 2, is_pure: false, allocates: false, param_types: &["Any", "Any"], ret_type: "Int" },
+    BuiltinSig { name: "volatile_read", arity: 1, is_pure: false, allocates: false, param_types: &["Any"], ret_type: "Any" },
+    BuiltinSig { name: "volatile_write", arity: 2, is_pure: false, allocates: false, param_types: &["Any", "Any"], ret_type: "Int" },
+    BuiltinSig { name: "raw_alloc", arity: 1, is_pure: false, allocates: true, param_types: &["AnyInt"], ret_type: "MutPtr[UInt8]" },
+    BuiltinSig { name: "raw_free", arity: 2, is_pure: false, allocates: false, param_types: &["Any", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "raw_memcpy", arity: 3, is_pure: false, allocates: false, param_types: &["Any", "Any", "AnyInt"], ret_type: "MutPtr[UInt8]" },
+    BuiltinSig { name: "raw_memset", arity: 3, is_pure: false, allocates: false, param_types: &["Any", "AnyInt", "AnyInt"], ret_type: "MutPtr[UInt8]" },
+    BuiltinSig { name: "raw_memcmp", arity: 3, is_pure: false, allocates: false, param_types: &["Any", "Any", "AnyInt"], ret_type: "Int" },
+    // S3: OS Threads, Atomics, Mutex, Channel
+    BuiltinSig { name: "thread_spawn", arity: 1, is_pure: false, allocates: true, param_types: &["Any"], ret_type: "Int" },
+    BuiltinSig { name: "thread_join", arity: 1, is_pure: false, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "thread_sleep_ms", arity: 1, is_pure: false, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "thread_hw_concurrency", arity: 0, is_pure: false, allocates: false, param_types: &[], ret_type: "Int" },
+    BuiltinSig { name: "atomic_new", arity: 1, is_pure: false, allocates: true, param_types: &["AnyInt"], ret_type: "AtomicInt" },
+    BuiltinSig { name: "atomic_load", arity: 2, is_pure: false, allocates: false, param_types: &["AtomicInt", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "atomic_store", arity: 3, is_pure: false, allocates: false, param_types: &["AtomicInt", "AnyInt", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "atomic_fetch_add", arity: 3, is_pure: false, allocates: false, param_types: &["AtomicInt", "AnyInt", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "atomic_fetch_sub", arity: 3, is_pure: false, allocates: false, param_types: &["AtomicInt", "AnyInt", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "atomic_cas", arity: 4, is_pure: false, allocates: false, param_types: &["AtomicInt", "AnyInt", "AnyInt", "AnyInt"], ret_type: "Bool" },
+    BuiltinSig { name: "atomic_swap", arity: 3, is_pure: false, allocates: false, param_types: &["AtomicInt", "AnyInt", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "mutex_new", arity: 1, is_pure: false, allocates: true, param_types: &["Any"], ret_type: "Mutex[Any]" },
+    BuiltinSig { name: "mutex_lock", arity: 1, is_pure: false, allocates: false, param_types: &["Any"], ret_type: "Int" },
+    BuiltinSig { name: "mutex_unlock", arity: 1, is_pure: false, allocates: false, param_types: &["Any"], ret_type: "Int" },
+    BuiltinSig { name: "mutex_get", arity: 1, is_pure: false, allocates: false, param_types: &["Any"], ret_type: "Any" },
+    BuiltinSig { name: "mutex_set", arity: 2, is_pure: false, allocates: false, param_types: &["Any", "Any"], ret_type: "Int" },
+    BuiltinSig { name: "chan_new", arity: 0, is_pure: false, allocates: true, param_types: &[], ret_type: "Channel[Any]" },
+    BuiltinSig { name: "chan_send", arity: 2, is_pure: false, allocates: false, param_types: &["Any", "Any"], ret_type: "Bool" },
+    BuiltinSig { name: "chan_recv", arity: 1, is_pure: false, allocates: true, param_types: &["Any"], ret_type: "Option[Any]" },
+    BuiltinSig { name: "chan_try_recv", arity: 1, is_pure: false, allocates: true, param_types: &["Any"], ret_type: "Option[Any]" },
+    BuiltinSig { name: "chan_close", arity: 1, is_pure: false, allocates: false, param_types: &["Any"], ret_type: "Int" },
+    // S3: Non-blocking TCP networking
+    BuiltinSig { name: "net_tcp_listen", arity: 1, is_pure: false, allocates: false, param_types: &["Text"], ret_type: "Int" },
+    BuiltinSig { name: "net_tcp_local_port", arity: 1, is_pure: false, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "net_tcp_accept", arity: 1, is_pure: false, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "net_tcp_connect", arity: 1, is_pure: false, allocates: false, param_types: &["Text"], ret_type: "Int" },
+    BuiltinSig { name: "net_set_nonblocking", arity: 2, is_pure: false, allocates: false, param_types: &["AnyInt", "Bool"], ret_type: "Bool" },
+    BuiltinSig { name: "net_read", arity: 2, is_pure: false, allocates: true, param_types: &["AnyInt", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "net_write", arity: 2, is_pure: false, allocates: false, param_types: &["AnyInt", "Any"], ret_type: "Int" },
+    BuiltinSig { name: "net_close", arity: 1, is_pure: false, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
+    // S3: SIMD vector primitives
+    BuiltinSig { name: "simd_f32x4_new", arity: 4, is_pure: true, allocates: false, param_types: &["Float32", "Float32", "Float32", "Float32"], ret_type: "Float32x4" },
+    BuiltinSig { name: "simd_f32x4_splat", arity: 1, is_pure: true, allocates: false, param_types: &["Float32"], ret_type: "Float32x4" },
+    BuiltinSig { name: "simd_f32x4_lane", arity: 2, is_pure: true, allocates: false, param_types: &["Float32x4", "AnyInt"], ret_type: "Float32" },
+    BuiltinSig { name: "simd_f32x4_binop", arity: 3, is_pure: true, allocates: false, param_types: &["Float32x4", "Float32x4", "AnyInt"], ret_type: "Float32x4" },
+    BuiltinSig { name: "simd_f32x4_fma", arity: 3, is_pure: true, allocates: false, param_types: &["Float32x4", "Float32x4", "Float32x4"], ret_type: "Float32x4" },
+    BuiltinSig { name: "simd_f32x4_reduce_sum", arity: 1, is_pure: true, allocates: false, param_types: &["Float32x4"], ret_type: "Float32" },
+    BuiltinSig { name: "simd_f32x4_dot", arity: 2, is_pure: true, allocates: false, param_types: &["Float32x4", "Float32x4"], ret_type: "Float32" },
+    BuiltinSig { name: "simd_f64x4_new", arity: 4, is_pure: true, allocates: false, param_types: &["Float", "Float", "Float", "Float"], ret_type: "Float64x4" },
+    BuiltinSig { name: "simd_f64x4_splat", arity: 1, is_pure: true, allocates: false, param_types: &["Float"], ret_type: "Float64x4" },
+    BuiltinSig { name: "simd_f64x4_lane", arity: 2, is_pure: true, allocates: false, param_types: &["Float64x4", "AnyInt"], ret_type: "Float" },
+    BuiltinSig { name: "simd_f64x4_binop", arity: 3, is_pure: true, allocates: false, param_types: &["Float64x4", "Float64x4", "AnyInt"], ret_type: "Float64x4" },
+    BuiltinSig { name: "simd_f64x4_fma", arity: 3, is_pure: true, allocates: false, param_types: &["Float64x4", "Float64x4", "Float64x4"], ret_type: "Float64x4" },
+    BuiltinSig { name: "simd_f64x4_reduce_sum", arity: 1, is_pure: true, allocates: false, param_types: &["Float64x4"], ret_type: "Float" },
+    BuiltinSig { name: "simd_f64x4_dot", arity: 2, is_pure: true, allocates: false, param_types: &["Float64x4", "Float64x4"], ret_type: "Float" },
+    BuiltinSig { name: "simd_i32x4_new", arity: 4, is_pure: true, allocates: false, param_types: &["Int32", "Int32", "Int32", "Int32"], ret_type: "Int32x4" },
+    BuiltinSig { name: "simd_i32x4_splat", arity: 1, is_pure: true, allocates: false, param_types: &["Int32"], ret_type: "Int32x4" },
+    BuiltinSig { name: "simd_i32x4_lane", arity: 2, is_pure: true, allocates: false, param_types: &["Int32x4", "AnyInt"], ret_type: "Int32" },
+    BuiltinSig { name: "simd_i32x4_binop", arity: 3, is_pure: true, allocates: false, param_types: &["Int32x4", "Int32x4", "AnyInt"], ret_type: "Int32x4" },
+    BuiltinSig { name: "simd_i32x4_reduce_sum", arity: 1, is_pure: true, allocates: false, param_types: &["Int32x4"], ret_type: "Int32" },
+    BuiltinSig { name: "simd_i64x4_new", arity: 4, is_pure: true, allocates: false, param_types: &["Int", "Int", "Int", "Int"], ret_type: "Int64x4" },
+    BuiltinSig { name: "simd_i64x4_splat", arity: 1, is_pure: true, allocates: false, param_types: &["Int"], ret_type: "Int64x4" },
+    BuiltinSig { name: "simd_i64x4_lane", arity: 2, is_pure: true, allocates: false, param_types: &["Int64x4", "AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "simd_i64x4_binop", arity: 3, is_pure: true, allocates: false, param_types: &["Int64x4", "Int64x4", "AnyInt"], ret_type: "Int64x4" },
+    BuiltinSig { name: "simd_i64x4_reduce_sum", arity: 1, is_pure: true, allocates: false, param_types: &["Int64x4"], ret_type: "Int" },
+    BuiltinSig { name: "simd_u8x16_splat", arity: 1, is_pure: true, allocates: false, param_types: &["UInt8"], ret_type: "UInt8x16" },
+    BuiltinSig { name: "simd_u8x16_lane", arity: 2, is_pure: true, allocates: false, param_types: &["UInt8x16", "AnyInt"], ret_type: "UInt8" },
+    BuiltinSig { name: "simd_u8x16_set_lane", arity: 3, is_pure: true, allocates: false, param_types: &["UInt8x16", "AnyInt", "UInt8"], ret_type: "UInt8x16" },
+    BuiltinSig { name: "simd_u8x16_binop", arity: 3, is_pure: true, allocates: false, param_types: &["UInt8x16", "UInt8x16", "AnyInt"], ret_type: "UInt8x16" },
+    BuiltinSig { name: "simd_u8x16_reduce_sum", arity: 1, is_pure: true, allocates: false, param_types: &["UInt8x16"], ret_type: "Int" },
 ];
+
+fn is_unsafe_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "ptr_read"
+            | "ptr_write"
+            | "ptr_add"
+            | "volatile_read"
+            | "volatile_write"
+            | "raw_alloc"
+            | "raw_free"
+            | "raw_memcpy"
+            | "raw_memset"
+            | "raw_memcmp"
+            | "cstr_to_text"
+    )
+}
 
 fn lookup_builtin(name: &str) -> Option<&'static BuiltinSig> {
     BUILTIN_SIGS.iter().find(|b| b.name == name)
@@ -155,6 +294,11 @@ struct CheckerCtx {
     records: BTreeMap<String, RecordDecl>,
     enums: BTreeMap<String, EnumDecl>,
     enum_variants: BTreeMap<String, VariantInfo>,
+    bitfields: BTreeMap<String, BitfieldDecl>,
+    unions: BTreeMap<String, UnionDecl>,
+    extern_fns: BTreeMap<String, ExternFnDecl>,
+    consts: BTreeMap<String, (ConstDecl, Option<i64>, Option<f64>)>,
+    layout: LayoutEngine,
     interfaces: BTreeMap<String, InterfaceDecl>,
     inherent_methods: BTreeMap<(String, String), FnDecl>,
     interface_impls: BTreeMap<(String, String), ImplDecl>,
@@ -166,6 +310,8 @@ struct CheckerCtx {
     async_fns: BTreeSet<String>,
     cur_type_params: BTreeSet<String>,
     cur_type_param_bounds: BTreeMap<String, Vec<String>>,
+    in_unsafe: bool,
+    cur_file_id: u32,
     proofs: Vec<ProofRecord>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -176,6 +322,7 @@ fn type_head_name(ty: &TypeExpr) -> String {
         TypeExpr::Dyn { interface, .. } => format!("dyn {}", interface),
         TypeExpr::Tuple(_, _) => "Tuple".into(),
         TypeExpr::Fn { .. } => "Fn".into(),
+        TypeExpr::Array { .. } => "Array".into(),
     }
 }
 
@@ -217,6 +364,11 @@ fn subst_type_expr(ty: &TypeExpr, subst: &BTreeMap<String, TypeExpr>) -> TypeExp
             ret: ret.as_ref().map(|r| Box::new(subst_type_expr(r, subst))),
             span: *span,
         },
+        TypeExpr::Array { elem, len, span } => TypeExpr::Array {
+            elem: Box::new(subst_type_expr(elem, subst)),
+            len: *len,
+            span: *span,
+        },
     }
 }
 
@@ -240,6 +392,7 @@ fn iface_method_to_fn_decl(m: &InterfaceMethodDecl, self_ty: &TypeExpr) -> FnDec
         is_pure: m.is_pure,
         is_async: m.is_async,
         is_test: false,
+        is_unsafe: false,
         name: m.name.clone(),
         type_params: m.type_params.clone(),
         type_param_bounds: m.type_param_bounds.clone(),
@@ -263,6 +416,11 @@ impl CheckerCtx {
         let mut records = BTreeMap::new();
         let mut enums = BTreeMap::new();
         let mut enum_variants = BTreeMap::new();
+        let mut bitfields = BTreeMap::new();
+        let mut unions = BTreeMap::new();
+        let mut extern_fns = BTreeMap::new();
+        let mut raw_consts = Vec::new();
+        let layout = LayoutEngine::from_program(program);
         let mut interfaces = BTreeMap::new();
         let mut inherent_methods = BTreeMap::new();
         let mut interface_impls = BTreeMap::new();
@@ -298,6 +456,18 @@ impl CheckerCtx {
                         enum_variants.insert(v.name.clone(), info.clone());
                         enum_variants.insert(format!("{}.{}", e.name, v.name), info);
                     }
+                }
+                Item::Bitfield(bf) => {
+                    bitfields.insert(bf.name.clone(), bf.clone());
+                }
+                Item::Union(u) => {
+                    unions.insert(u.name.clone(), u.clone());
+                }
+                Item::ExternFn(ef) => {
+                    extern_fns.insert(ef.name.clone(), ef.clone());
+                }
+                Item::Const(c) => {
+                    raw_consts.push(c.clone());
                 }
                 Item::Interface(iface) => {
                     interfaces.insert(iface.name.clone(), iface.clone());
@@ -383,10 +553,7 @@ impl CheckerCtx {
                     if !args.is_empty() {
                         return false;
                     }
-                    if matches!(
-                        name.as_str(),
-                        "Int" | "Int64" | "Int32" | "UInt16" | "USize" | "Bool"
-                    ) {
+                    if ScalarKind::from_name(name).is_some_and(|k| k.is_int()) || name == "Bool" {
                         return true;
                     }
                     if let Some(alias) = type_aliases.get(name) {
@@ -422,11 +589,23 @@ impl CheckerCtx {
             }
         }
 
+        let mut consts: BTreeMap<String, (ConstDecl, Option<i64>, Option<f64>)> = BTreeMap::new();
+        for c in raw_consts {
+            let iv = eval_const_int(&c.value, &consts, &layout);
+            let fv = eval_const_float(&c.value, &consts);
+            consts.insert(c.name.clone(), (c, iv, fv));
+        }
+
         Self {
             type_aliases,
             records,
             enums,
             enum_variants,
+            bitfields,
+            unions,
+            extern_fns,
+            consts,
+            layout,
             interfaces,
             inherent_methods,
             interface_impls,
@@ -438,6 +617,8 @@ impl CheckerCtx {
             async_fns,
             cur_type_params: BTreeSet::new(),
             cur_type_param_bounds: BTreeMap::new(),
+            in_unsafe: false,
+            cur_file_id: 0,
             proofs: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -446,10 +627,81 @@ impl CheckerCtx {
     fn check_all(&mut self, program: &Program) {
         for item in &program.items {
             match item {
+                Item::Bitfield(bf) => self.check_bitfield_decl(bf),
+                Item::Const(c) => self.check_const_decl(c),
                 Item::Fn(f) => self.check_fn(f),
                 Item::Impl(imp) => self.check_impl(imp),
                 _ => {}
             }
+        }
+    }
+
+    fn check_bitfield_decl(&mut self, bf: &BitfieldDecl) {
+        let backing = self.resolve_base_type(&bf.backing_ty);
+        let sk = match &backing {
+            TypeExpr::Named { name, .. } => ScalarKind::from_name(name),
+            _ => None,
+        };
+        let Some(sk) = sk.filter(|k| k.is_unsigned()) else {
+            self.diagnostics.push(Diagnostic {
+                code: "E0610".into(),
+                message: format!(
+                    "bitfield `{}` backing type `{}` must be an unsigned integer (UInt8/UInt16/UInt32/UInt64)",
+                    bf.name,
+                    bf.backing_ty.display_name()
+                ),
+                span: bf.span,
+                notes: vec![],
+                counterexample: BTreeMap::new(),
+            });
+            return;
+        };
+        let total_bits: u32 = bf.fields.iter().map(|f| f.bits).sum();
+        if total_bits > sk.bit_width() {
+            self.diagnostics.push(Diagnostic {
+                code: "E0610".into(),
+                message: format!(
+                    "bitfield `{}` uses {} bits, exceeding backing `{}` ({} bits)",
+                    bf.name,
+                    total_bits,
+                    bf.backing_ty.display_name(),
+                    sk.bit_width()
+                ),
+                span: bf.span,
+                notes: vec![],
+                counterexample: BTreeMap::new(),
+            });
+        } else {
+            self.proofs.push(ProofRecord {
+                obligation: format!(
+                    "bitfield `{}` ({} / {} bits) fits in `{}`",
+                    bf.name,
+                    total_bits,
+                    sk.bit_width(),
+                    bf.backing_ty.display_name()
+                ),
+                tier: ProofTier::L0Fast,
+                span: bf.span,
+            });
+        }
+    }
+
+    fn check_const_decl(&mut self, c: &ConstDecl) {
+        let vt = BTreeMap::new();
+        let actual = self.infer_expr_type_expected(&c.value, Some(&c.ty), &vt);
+        if !self.types_compatible(&c.ty, &actual) {
+            self.diagnostics.push(Diagnostic {
+                code: "E0205".into(),
+                message: format!(
+                    "const `{}` expects `{}`, found `{}`",
+                    c.name,
+                    c.ty.display_name(),
+                    actual.display_name()
+                ),
+                span: c.span,
+                notes: vec![],
+                counterexample: BTreeMap::new(),
+            });
         }
     }
 
@@ -558,6 +810,9 @@ impl CheckerCtx {
                 if let Some(r) = ret {
                     self.check_dyn_type_valid(r, span);
                 }
+            }
+            TypeExpr::Array { elem, .. } => {
+                self.check_dyn_type_valid(elem, span);
             }
         }
     }
@@ -820,30 +1075,40 @@ impl CheckerCtx {
                     self.check_type_bounds(a, span);
                 }
             }
+            TypeExpr::Array { elem, .. } => {
+                self.check_type_bounds(elem, span);
+            }
         }
     }
 
     fn is_known_type_name(&self, name: &str) -> bool {
         self.records.contains_key(name)
             || self.enums.contains_key(name)
+            || self.bitfields.contains_key(name)
+            || self.unions.contains_key(name)
             || self.type_aliases.contains_key(name)
             || self.cur_type_params.contains(name)
+            || ScalarKind::from_name(name).is_some()
+            || SimdKind::from_name(name).is_some()
             || matches!(
                 name,
-                "Int"
-                    | "Int64"
-                    | "Int32"
-                    | "UInt16"
-                    | "USize"
-                    | "Float"
-                    | "Float64"
-                    | "Float32"
-                    | "Bool"
+                "Bool"
                     | "Text"
+                    | "Bytes"
+                    | "BytesSlice"
                     | "Option"
                     | "Result"
                     | "List"
                     | "Range"
+                    | "Array"
+                    | "Ptr"
+                    | "MutPtr"
+                    | "CStr"
+                    | "CVoid"
+                    | "AtomicInt"
+                    | "Mutex"
+                    | "Channel"
+                    | "Simd"
             )
     }
 
@@ -1064,28 +1329,31 @@ impl CheckerCtx {
         ty.clone()
     }
 
-    fn is_int_type_name(&self, name: &str) -> bool {
-        if matches!(name, "Int" | "Int64" | "Int32" | "UInt16" | "USize") {
-            return true;
+    fn scalar_kind_of_name(&self, name: &str) -> Option<ScalarKind> {
+        if let Some(sk) = ScalarKind::from_name(name) {
+            return Some(sk);
         }
         if let Some(alias) = self.type_aliases.get(name) {
             if let TypeExpr::Named { name: base, .. } = self.resolve_base_type(&alias.base) {
-                return matches!(base.as_str(), "Int" | "Int64" | "Int32" | "UInt16" | "USize");
+                return ScalarKind::from_name(&base);
             }
         }
-        false
+        None
+    }
+
+    fn scalar_kind_of_ty(&self, ty: &TypeExpr) -> Option<ScalarKind> {
+        match self.resolve_base_type(ty) {
+            TypeExpr::Named { ref name, .. } => ScalarKind::from_name(name),
+            _ => None,
+        }
+    }
+
+    fn is_int_type_name(&self, name: &str) -> bool {
+        self.scalar_kind_of_name(name).is_some_and(|k| k.is_int())
     }
 
     fn is_float_type_name(&self, name: &str) -> bool {
-        if matches!(name, "Float" | "Float64" | "Float32") {
-            return true;
-        }
-        if let Some(alias) = self.type_aliases.get(name) {
-            if let TypeExpr::Named { name: base, .. } = self.resolve_base_type(&alias.base) {
-                return matches!(base.as_str(), "Float" | "Float64" | "Float32");
-            }
-        }
-        false
+        self.scalar_kind_of_name(name).is_some_and(|k| k.is_float())
     }
 
     fn is_float_ty(&self, ty: &TypeExpr) -> bool {
@@ -1131,8 +1399,13 @@ impl CheckerCtx {
         match (&exp, &act) {
             (TypeExpr::Named { name: en, .. }, _) if en == "Any" => true,
             (_, TypeExpr::Named { name: an, .. }) if an == "Any" => true,
+            (TypeExpr::Named { name: en, .. }, _) if en == "AnyInt" => self.is_int_ty(&act),
             (TypeExpr::Dyn { interface: ei, .. }, TypeExpr::Dyn { interface: ai, .. }) => ei == ai,
             (TypeExpr::Dyn { interface: ei, .. }, _) => self.type_implements(actual, ei),
+            (
+                TypeExpr::Array { elem: ee, len: el, .. },
+                TypeExpr::Array { elem: ae, len: al, .. },
+            ) => el == al && self.types_compatible(ee, ae),
             (
                 TypeExpr::Named { name: en, args: ea, .. },
                 TypeExpr::Named { name: an, args: aa, .. },
@@ -1140,11 +1413,36 @@ impl CheckerCtx {
                 if self.cur_type_params.contains(en) || self.cur_type_params.contains(an) {
                     return true;
                 }
-                if self.is_int_type_name(en) && self.is_int_type_name(an) {
+                if let (Some(ek), Some(ak)) = (self.scalar_kind_of_name(en), self.scalar_kind_of_name(an)) {
+                    return ek == ak;
+                }
+                if let (Some(es), Some(as_)) = (SimdKind::from_type_expr(&exp), SimdKind::from_type_expr(&act)) {
+                    return es == as_;
+                }
+                // C pointer interop: `MutPtr[T]` coerces to `Ptr[T]`; `CStr` <-> `Ptr[UInt8]`; `CVoid` ptr wildcard
+                if en == "CStr" && (an == "Ptr" || an == "MutPtr") {
                     return true;
                 }
-                if self.is_float_type_name(en) && self.is_float_type_name(an) {
+                if (en == "Ptr" || en == "MutPtr") && an == "CStr" {
                     return true;
+                }
+                if en == "Ptr" && an == "MutPtr" {
+                    if ea.is_empty() || aa.is_empty() {
+                        return true;
+                    }
+                    if ea[0].display_name() == "CVoid" || aa[0].display_name() == "CVoid" {
+                        return true;
+                    }
+                    return self.types_compatible(&ea[0], &aa[0]);
+                }
+                if (en == "Ptr" || en == "MutPtr") && en == an {
+                    if ea.is_empty() || aa.is_empty() {
+                        return true;
+                    }
+                    if ea[0].display_name() == "CVoid" || aa[0].display_name() == "CVoid" {
+                        return true;
+                    }
+                    return self.types_compatible(&ea[0], &aa[0]);
                 }
                 if en != an {
                     return false;
@@ -1200,8 +1498,22 @@ impl CheckerCtx {
         var_types: &BTreeMap<String, TypeExpr>,
     ) -> TypeExpr {
         match &expr.kind {
-            ExprKind::Int(_) => named_ty("Int"),
-            ExprKind::Float(_) => named_ty("Float"),
+            ExprKind::Int(_) => {
+                if let Some(exp) = expected {
+                    if self.scalar_kind_of_ty(exp).is_some_and(|k| k.is_int()) {
+                        return exp.clone();
+                    }
+                }
+                named_ty("Int")
+            }
+            ExprKind::Float(_) => {
+                if let Some(exp) = expected {
+                    if self.scalar_kind_of_ty(exp).is_some_and(|k| k.is_float()) {
+                        return exp.clone();
+                    }
+                }
+                named_ty("Float")
+            }
             ExprKind::Bool(_) => named_ty("Bool"),
             ExprKind::Str(_) => named_ty("Text"),
             ExprKind::Ident(s) => {
@@ -1210,6 +1522,9 @@ impl CheckerCtx {
                 }
                 if let Some(ty) = var_types.get(s) {
                     return ty.clone();
+                }
+                if let Some((c, _, _)) = self.consts.get(s) {
+                    return c.ty.clone();
                 }
                 if let Some(vi) = self.enum_variants.get(s) {
                     if let Some(ed) = self.enums.get(&vi.enum_name) {
@@ -1245,10 +1560,41 @@ impl CheckerCtx {
                 named_ty(name)
             }
             ExprKind::List(elems) => {
+                if let Some(TypeExpr::Array { elem, len, .. }) =
+                    expected.map(|t| self.resolve_base_type(t))
+                {
+                    if elems.len() == len {
+                        return TypeExpr::Array {
+                            elem,
+                            len,
+                            span: expr.span,
+                        };
+                    }
+                }
                 if let Some(first) = elems.first() {
                     generic_ty("List", vec![self.infer_expr_type(first, var_types)])
                 } else {
                     generic_ty("List", vec![named_ty("Any")])
+                }
+            }
+            ExprKind::ArrayRepeat { value, len } => {
+                let exp_elem = match expected.map(|t| self.resolve_base_type(t)) {
+                    Some(TypeExpr::Array { elem, .. }) => Some(*elem),
+                    _ => None,
+                };
+                let ety = self.infer_expr_type_expected(value, exp_elem.as_ref(), var_types);
+                TypeExpr::Array {
+                    elem: Box::new(ety),
+                    len: *len,
+                    span: expr.span,
+                }
+            }
+            ExprKind::Cast { ty, .. } => ty.clone(),
+            ExprKind::Unsafe(b) => {
+                if let Some(t) = &b.tail {
+                    self.infer_expr_type_expected(t, expected, var_types)
+                } else {
+                    named_ty("Any")
                 }
             }
             ExprKind::Tuple(elems) => TypeExpr::Tuple(
@@ -1314,8 +1660,11 @@ impl CheckerCtx {
                 }
             }
             ExprKind::Unary { op, expr: inner } => match op {
-                UnOp::Neg => {
-                    if self.is_float_ty(&self.infer_expr_type(inner, var_types)) {
+                UnOp::Neg | UnOp::BitNot => {
+                    let it = self.infer_expr_type_expected(inner, expected, var_types);
+                    if self.scalar_kind_of_ty(&it).is_some() {
+                        it
+                    } else if matches!(op, UnOp::Neg) && self.is_float_ty(&it) {
                         named_ty("Float")
                     } else {
                         named_ty("Int")
@@ -1325,20 +1674,30 @@ impl CheckerCtx {
             },
             ExprKind::Binary { op, left, right } => match op {
                 BinOp::Concat => named_ty("Text"),
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-                    if self.is_float_ty(&self.infer_expr_type(left, var_types))
-                        || self.is_float_ty(&self.infer_expr_type(right, var_types))
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr => {
+                    let lt = self.infer_expr_type_expected(left, expected, var_types);
+                    let rt = self.infer_expr_type_expected(right, Some(&lt), var_types);
+                    if matches!(left.kind, ExprKind::Int(_) | ExprKind::Float(_))
+                        && self.scalar_kind_of_ty(&rt).is_some()
                     {
-                        named_ty("Float")
+                        rt
+                    } else if self.scalar_kind_of_ty(&lt).is_some() {
+                        lt
+                    } else if self.scalar_kind_of_ty(&rt).is_some() {
+                        rt
                     } else {
                         named_ty("Int")
                     }
                 }
-                BinOp::BitAnd
-                | BinOp::BitOr
-                | BinOp::BitXor
-                | BinOp::Shl
-                | BinOp::Shr => named_ty("Int"),
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or | BinOp::Implies => named_ty("Bool"),
             },
             ExprKind::Field { target, field } => {
@@ -1369,17 +1728,28 @@ impl CheckerCtx {
                             return f.ty.clone();
                         }
                     }
+                    if let Some(bf) = self.bitfields.get(&rname) {
+                        if bf.fields.iter().any(|f| f.name == *field) {
+                            return bf.backing_ty.clone();
+                        }
+                    }
+                    if let Some(u) = self.unions.get(&rname) {
+                        if let Some(f) = u.fields.iter().find(|f| f.name == *field) {
+                            return f.ty.clone();
+                        }
+                    }
                 }
                 named_ty("Any")
             }
             ExprKind::Index { target, .. } => {
                 let t = self.resolve_base_type(&self.infer_expr_type(target, var_types));
-                if let TypeExpr::Named { name, args, .. } = t {
-                    if name == "List" && !args.is_empty() {
-                        return args[0].clone();
+                match t {
+                    TypeExpr::Array { elem, .. } => *elem,
+                    TypeExpr::Named { name, args, .. } if name == "List" && !args.is_empty() => {
+                        args[0].clone()
                     }
+                    _ => named_ty("Any"),
                 }
-                named_ty("Any")
             }
             ExprKind::Call { callee, args } => match &callee.kind {
                 ExprKind::Field { target, field }
@@ -1408,6 +1778,9 @@ impl CheckerCtx {
                             return self.infer_variant_ctor_type(vi, args, var_types);
                         }
                         if !var_types.contains_key(ename) && self.is_known_type_name(ename) {
+                            if field == "from_raw" && self.bitfields.contains_key(ename) {
+                                return named_ty(ename);
+                            }
                             if let Some(m) = self.resolve_assoc_method_sig(ename, field) {
                                 let inst = self.instantiate_assoc_method_from_args(&m, args, var_types);
                                 return inst.ret_ty.unwrap_or_else(|| named_ty("Any"));
@@ -1415,6 +1788,13 @@ impl CheckerCtx {
                         }
                     }
                     let recv_ty = self.infer_expr_type(target, var_types);
+                    if field == "raw" {
+                        if let TypeExpr::Named { name: bn, .. } = self.resolve_base_type(&recv_ty) {
+                            if let Some(bf) = self.bitfields.get(&bn) {
+                                return bf.backing_ty.clone();
+                            }
+                        }
+                    }
                     if let Some(m) = self.resolve_method_sig(&recv_ty, field) {
                         let inst = self.instantiate_method_from_args(&m, true, args, var_types);
                         return inst.ret_ty.unwrap_or_else(|| named_ty("Any"));
@@ -1428,6 +1808,21 @@ impl CheckerCtx {
                 }
                 ExprKind::GenericInst { expr: inner, type_args } => {
                     if let ExprKind::Ident(fname) = &inner.kind {
+                        if fname == "size_of" || fname == "align_of" {
+                            return named_ty("USize");
+                        }
+                        if fname == "null_ptr" {
+                            return generic_ty(
+                                "MutPtr",
+                                vec![type_args.first().cloned().unwrap_or_else(|| named_ty("CVoid"))],
+                            );
+                        }
+                        if fname == "chan_new" {
+                            return generic_ty(
+                                "Channel",
+                                vec![type_args.first().cloned().unwrap_or_else(|| named_ty("Any"))],
+                            );
+                        }
                         if let Some(fdecl) = self.all_fns.get(fname) {
                             if let Some(rt) = &fdecl.ret_ty {
                                 let mut subst = BTreeMap::new();
@@ -1445,6 +1840,62 @@ impl CheckerCtx {
                         if let TypeExpr::Fn { ret, .. } = self.resolve_base_type(vty) {
                             return ret.map(|r| *r).unwrap_or_else(|| named_ty("Any"));
                         }
+                    }
+                    if (fname == "ptr_of" || fname == "mut_ptr_of") && args.len() == 1 {
+                        let raw_inner = self.infer_expr_type(&args[0].value, var_types);
+                        let inner = match self.resolve_base_type(&raw_inner) {
+                            TypeExpr::Array { elem, .. } => *elem,
+                            _ => raw_inner,
+                        };
+                        let pname = if fname == "mut_ptr_of" { "MutPtr" } else { "Ptr" };
+                        return generic_ty(pname, vec![inner]);
+                    }
+                    if matches!(
+                        fname.as_str(),
+                        "wrapping_add"
+                            | "wrapping_sub"
+                            | "wrapping_mul"
+                            | "saturating_add"
+                            | "saturating_sub"
+                    ) && !args.is_empty()
+                    {
+                        return self.infer_expr_type(&args[0].value, var_types);
+                    }
+                    if fname == "ptr_add" && args.len() == 2 {
+                        return self.infer_expr_type(&args[0].value, var_types);
+                    }
+                    if (fname == "ptr_read" || fname == "volatile_read") && args.len() == 1 {
+                        let pt = self.resolve_base_type(&self.infer_expr_type(&args[0].value, var_types));
+                        if let TypeExpr::Named { name, args: pa, .. } = pt {
+                            if (name == "Ptr" || name == "MutPtr") && !pa.is_empty() {
+                                return pa[0].clone();
+                            }
+                        }
+                        return named_ty("Any");
+                    }
+                    if fname == "mutex_new" && args.len() == 1 {
+                        return generic_ty("Mutex", vec![self.infer_expr_type(&args[0].value, var_types)]);
+                    }
+                    if fname == "mutex_get" && args.len() == 1 {
+                        let mt = self.resolve_base_type(&self.infer_expr_type(&args[0].value, var_types));
+                        if let TypeExpr::Named { name, args: ma, .. } = mt {
+                            if name == "Mutex" && !ma.is_empty() {
+                                return ma[0].clone();
+                            }
+                        }
+                        return named_ty("Any");
+                    }
+                    if (fname == "chan_recv" || fname == "chan_try_recv") && args.len() == 1 {
+                        let ct = self.resolve_base_type(&self.infer_expr_type(&args[0].value, var_types));
+                        if let TypeExpr::Named { name, args: ca, .. } = ct {
+                            if name == "Channel" && !ca.is_empty() {
+                                return generic_ty("Option", vec![ca[0].clone()]);
+                            }
+                        }
+                        return generic_ty("Option", vec![named_ty("Any")]);
+                    }
+                    if let Some(ef) = self.extern_fns.get(fname) {
+                        return ef.ret_ty.clone().unwrap_or_else(|| named_ty("Any"));
                     }
                     if fname == "Ok" && args.len() == 1 {
                         return generic_ty(
@@ -1494,6 +1945,18 @@ impl CheckerCtx {
                             generic_ty("Option", vec![named_ty("Any")])
                         } else if b.ret_type == "Result[Any, Any]" {
                             generic_ty("Result", vec![named_ty("Any"), named_ty("Any")])
+                        } else if b.ret_type == "Ptr[UInt8]" {
+                            generic_ty("Ptr", vec![named_ty("UInt8")])
+                        } else if b.ret_type == "MutPtr[UInt8]" {
+                            generic_ty("MutPtr", vec![named_ty("UInt8")])
+                        } else if b.ret_type == "Ptr[Any]" {
+                            generic_ty("Ptr", vec![named_ty("Any")])
+                        } else if b.ret_type == "MutPtr[Any]" {
+                            generic_ty("MutPtr", vec![named_ty("Any")])
+                        } else if b.ret_type == "Mutex[Any]" {
+                            generic_ty("Mutex", vec![named_ty("Any")])
+                        } else if b.ret_type == "Channel[Any]" {
+                            generic_ty("Channel", vec![named_ty("Any")])
                         } else {
                             named_ty(b.ret_type)
                         };
@@ -1675,6 +2138,12 @@ impl CheckerCtx {
     fn check_fn(&mut self, f: &FnDecl) {
         let prev_tp = self.cur_type_params.clone();
         let prev_bounds = self.cur_type_param_bounds.clone();
+        let prev_unsafe = self.in_unsafe;
+        let prev_file_id = self.cur_file_id;
+        self.in_unsafe = f.is_unsafe;
+        if f.span.file_id != 0 {
+            self.cur_file_id = f.span.file_id;
+        }
         for tp in &f.type_params {
             self.cur_type_params.insert(tp.clone());
         }
@@ -1691,6 +2160,13 @@ impl CheckerCtx {
         let mut smt_int_vars: BTreeSet<String> = BTreeSet::new();
         let mut var_types: BTreeMap<String, TypeExpr> = BTreeMap::new();
         let mut mutable_vars: BTreeSet<String> = BTreeSet::new();
+        for (cname, (cdecl, iv, _)) in &self.consts {
+            var_types.insert(cname.clone(), cdecl.ty.clone());
+            if let Some(n) = iv {
+                env.set_int(cname, AbsInt::exact(*n as i128));
+                smt_int_vars.insert(cname.clone());
+            }
+        }
 
         // 1. Register parameters, mutability, dyn object-safety, refinements & record invariants
         for p in &f.params {
@@ -1780,6 +2256,8 @@ impl CheckerCtx {
         }
         self.cur_type_params = prev_tp;
         self.cur_type_param_bounds = prev_bounds;
+        self.in_unsafe = prev_unsafe;
+        self.cur_file_id = prev_file_id;
     }
 
     fn check_block_effects(
@@ -1805,7 +2283,7 @@ impl CheckerCtx {
                 Stmt::Assert { cond, .. } => {
                     self.check_expr_effects(cond, in_async, in_pure, no_heap, fn_name, inside_block_on);
                 }
-                Stmt::Mutate { body, .. } => {
+                Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
                     self.check_block_effects(body, in_async, in_pure, no_heap, fn_name, inside_block_on);
                 }
                 Stmt::While { cond, body, .. } => {
@@ -2108,24 +2586,17 @@ impl CheckerCtx {
         smt_premises: &mut Vec<(Expr, BTreeMap<String, String>)>,
     ) {
         if let TypeExpr::Named { name, .. } = ty {
-            if matches!(
-                name.as_str(),
-                "Int" | "Int64" | "Int32" | "UInt16" | "USize"
-            ) {
-                smt_int_vars.insert(var_name.to_string());
-                match name.as_str() {
-                    "UInt16" => env.set_int(
-                        var_name,
-                        AbsInt::top().refine_interval(Interval { min: 0, max: 65535 }),
-                    ),
-                    "USize" => env.set_int(
-                        var_name,
-                        AbsInt::top().refine_interval(Interval {
-                            min: 0,
-                            max: i64::MAX as i128,
-                        }),
-                    ),
-                    _ => {}
+            if let Some(sk) = ScalarKind::from_name(name) {
+                if sk.is_int() {
+                    smt_int_vars.insert(var_name.to_string());
+                    if let (Some(lo), Some(hi)) = (sk.min_i128(), sk.max_i128()) {
+                        if sk != ScalarKind::I64 {
+                            env.set_int(
+                                var_name,
+                                AbsInt::top().refine_interval(Interval { min: lo, max: hi }),
+                            );
+                        }
+                    }
                 }
             } else if let Some(alias) = self.type_aliases.get(name).cloned() {
                 self.assume_type_facts(var_name, &alias.base, env, smt_int_vars, smt_premises);
@@ -2441,7 +2912,11 @@ impl CheckerCtx {
                                 });
                             }
                             if let Some(expected_ty) = var_types.get(vname).cloned() {
-                                let rhs_ty = self.infer_expr_type(value, var_types);
+                                let rhs_ty = self.infer_expr_type_expected(
+                                    value,
+                                    Some(&expected_ty),
+                                    var_types,
+                                );
                                 if !self.types_compatible(&expected_ty, &rhs_ty) {
                                     self.diagnostics.push(Diagnostic {
                                         code: "E0205".into(),
@@ -2989,6 +3464,31 @@ impl CheckerCtx {
                                 });
                             }
                         },
+                        TypeExpr::Array { elem, .. } => match binding {
+                            ForBinding::Ident(v) => {
+                                if v != "_" {
+                                    let ety: TypeExpr = (**elem).clone();
+                                    body_types.insert(v.clone(), ety.clone());
+                                    body_mut.remove(v);
+                                    self.assume_type_facts(
+                                        v,
+                                        &ety,
+                                        &mut body_env,
+                                        &mut body_vars,
+                                        &mut body_premises,
+                                    );
+                                }
+                            }
+                            ForBinding::Tuple(_) => {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0205".into(),
+                                    message: "tuple destructuring in `for` over fixed array requires tuple elements".into(),
+                                    span: *span,
+                                    notes: vec![],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                        },
                         TypeExpr::Named { name, args, .. } if name == "List" => {
                             let elem_ty = args.first().cloned().unwrap_or_else(|| named_ty("Any"));
                             match binding {
@@ -3152,6 +3652,25 @@ impl CheckerCtx {
                         &mut body_mut,
                         active_mutate,
                         saw_return,
+                    );
+                }
+                Stmt::Defer { body, .. } => {
+                    let mut d_env = env.clone();
+                    let mut d_vars = smt_int_vars.clone();
+                    let mut d_prem = smt_premises.clone();
+                    let mut d_types = var_types.clone();
+                    let mut d_mut = mutable_vars.clone();
+                    let mut d_sr = false;
+                    let _ = self.check_block(
+                        body,
+                        cur_fn,
+                        &mut d_env,
+                        &mut d_vars,
+                        &mut d_prem,
+                        &mut d_types,
+                        &mut d_mut,
+                        active_mutate,
+                        &mut d_sr,
                     );
                 }
                 Stmt::Break { .. } | Stmt::Continue { .. } => {}
@@ -3406,15 +3925,29 @@ impl CheckerCtx {
                     active_mutate,
                     saw_return,
                 );
-                let lt = self.resolve_base_type(&self.infer_expr_type(left, var_types));
-                let rt = self.resolve_base_type(&self.infer_expr_type(right, var_types));
+                let mut lt = self.resolve_base_type(&self.infer_expr_type(left, var_types));
+                let mut rt = self.resolve_base_type(&self.infer_expr_type(right, var_types));
+                if is_untyped_int_expr(left) && self.is_int_ty(&rt) {
+                    lt = rt.clone();
+                } else if is_untyped_int_expr(right) && self.is_int_ty(&lt) {
+                    rt = lt.clone();
+                } else if is_untyped_float_expr(left) && self.is_float_ty(&rt) {
+                    lt = rt.clone();
+                } else if is_untyped_float_expr(right) && self.is_float_ty(&lt) {
+                    rt = lt.clone();
+                }
                 let l_float = self.is_float_ty(&lt);
                 let r_float = self.is_float_ty(&rt);
                 let l_int = self.is_int_ty(&lt);
                 let r_int = self.is_int_ty(&rt);
+                let l_sk = self.scalar_kind_of_ty(&lt);
+                let r_sk = self.scalar_kind_of_ty(&rt);
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-                        if (l_float && r_int) || (l_int && r_float) {
+                        if (l_float && r_int)
+                            || (l_int && r_float)
+                            || matches!((l_sk, r_sk), (Some(a), Some(b)) if a != b)
+                        {
                             self.diagnostics.push(Diagnostic {
                                 code: "E0205".into(),
                                 message: format!(
@@ -3423,7 +3956,7 @@ impl CheckerCtx {
                                     rt.display_name()
                                 ),
                                 span: expr.span,
-                                notes: vec!["convert explicitly with `.to_float()` or `.to_int()`".into()],
+                                notes: vec!["convert explicitly with `as` cast (e.g. `x as Int64`)".into()],
                                 counterexample: BTreeMap::new(),
                             });
                         }
@@ -3437,10 +3970,27 @@ impl CheckerCtx {
                                 notes: vec![],
                                 counterexample: BTreeMap::new(),
                             });
+                        } else if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)
+                            && matches!((l_sk, r_sk), (Some(a), Some(b)) if a != b)
+                        {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0205".into(),
+                                message: format!(
+                                    "cannot mix `{}` and `{}` in bitwise expression",
+                                    lt.display_name(),
+                                    rt.display_name()
+                                ),
+                                span: expr.span,
+                                notes: vec!["convert explicitly with `as` cast".into()],
+                                counterexample: BTreeMap::new(),
+                            });
                         }
                     }
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        if (l_float && r_int) || (l_int && r_float) {
+                        if (l_float && r_int)
+                            || (l_int && r_float)
+                            || matches!((l_sk, r_sk), (Some(a), Some(b)) if a != b)
+                        {
                             self.diagnostics.push(Diagnostic {
                                 code: "E0205".into(),
                                 message: format!(
@@ -3449,7 +3999,7 @@ impl CheckerCtx {
                                     rt.display_name()
                                 ),
                                 span: expr.span,
-                                notes: vec!["convert explicitly with `.to_float()` or `.to_int()`".into()],
+                                notes: vec!["convert explicitly with `as` cast".into()],
                                 counterexample: BTreeMap::new(),
                             });
                         }
@@ -3740,6 +4290,71 @@ impl CheckerCtx {
                     );
                 }
             }
+            ExprKind::ArrayRepeat { value, .. } => {
+                self.check_expr(
+                    value,
+                    cur_fn,
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    var_types,
+                    mutable_vars,
+                    active_mutate,
+                    saw_return,
+                );
+            }
+            ExprKind::Cast { expr: inner, ty } => {
+                self.check_expr(
+                    inner,
+                    cur_fn,
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    var_types,
+                    mutable_vars,
+                    active_mutate,
+                    saw_return,
+                );
+                let src_ty = self.resolve_base_type(&self.infer_expr_type(inner, var_types));
+                let dst_ty = self.resolve_base_type(ty);
+                let src_ok = self.scalar_kind_of_ty(&src_ty).is_some()
+                    || matches!(&src_ty, TypeExpr::Named { name, .. } if matches!(name.as_str(), "Bool" | "Ptr" | "MutPtr" | "CStr" | "Any") || self.bitfields.contains_key(name));
+                let dst_ok = self.scalar_kind_of_ty(&dst_ty).is_some()
+                    || matches!(&dst_ty, TypeExpr::Named { name, .. } if matches!(name.as_str(), "Bool" | "Ptr" | "MutPtr" | "CStr" | "Any") || self.bitfields.contains_key(name));
+                if !src_ok || !dst_ok {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0205".into(),
+                        message: format!(
+                            "invalid cast from `{}` to `{}`",
+                            src_ty.display_name(),
+                            dst_ty.display_name()
+                        ),
+                        span: expr.span,
+                        notes: vec!["`as` supports scalar, pointer, bool, and bitfield casts".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+            }
+            ExprKind::Unsafe(blk) => {
+                let prev = self.in_unsafe;
+                self.in_unsafe = true;
+                let mut u_env = env.clone();
+                let mut u_vars = var_types.clone();
+                let mut u_mut = mutable_vars.clone();
+                let mut m = active_mutate.clone();
+                let _ = self.check_block(
+                    blk,
+                    cur_fn,
+                    &mut u_env,
+                    &mut smt_int_vars.clone(),
+                    &mut smt_premises.clone(),
+                    &mut u_vars,
+                    &mut u_mut,
+                    &mut m,
+                    saw_return,
+                );
+                self.in_unsafe = prev;
+            }
             ExprKind::Index { target, index } => {
                 self.check_expr(
                     target,
@@ -3763,6 +4378,28 @@ impl CheckerCtx {
                     active_mutate,
                     saw_return,
                 );
+                let tty = self.resolve_base_type(&self.infer_expr_type(target, var_types));
+                if let TypeExpr::Array { len, .. } = tty {
+                    let idx_abs = env.eval_abs_int(index, None);
+                    if idx_abs.interval.max < 0 || idx_abs.interval.min >= len as i128 {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0410".into(),
+                            message: format!(
+                                "fixed array index out of bounds for length {}",
+                                len
+                            ),
+                            span: index.span,
+                            notes: vec![format!("index interval [{}, {}] outside 0..{}", idx_abs.interval.min, idx_abs.interval.max, len)],
+                            counterexample: BTreeMap::new(),
+                        });
+                    } else if idx_abs.interval.min >= 0 && idx_abs.interval.max < len as i128 {
+                        self.proofs.push(ProofRecord {
+                            obligation: format!("array index in bounds 0..{} (elided)", len),
+                            tier: ProofTier::L0Fast,
+                            span: index.span,
+                        });
+                    }
+                }
             }
             ExprKind::Field { target, field } => {
                 if let ExprKind::Ident(ename) = &target.kind {
@@ -3790,6 +4427,37 @@ impl CheckerCtx {
                                 message: format!("unknown field `{}` on record `{}`", field, rname),
                                 span: expr.span,
                                 notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    } else if let Some(bf) = self.bitfields.get(&rname) {
+                        if !bf.fields.iter().any(|f| f.name == *field) {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0206".into(),
+                                message: format!("unknown field `{}` on bitfield `{}`", field, rname),
+                                span: expr.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    } else if let Some(u) = self.unions.get(&rname) {
+                        if !u.fields.iter().any(|f| f.name == *field) {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0206".into(),
+                                message: format!("unknown field `{}` on union `{}`", field, rname),
+                                span: expr.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        } else if !self.in_unsafe {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0800".into(),
+                                message: format!(
+                                    "reading field `{}` of untagged union `{}` requires an `unsafe` block",
+                                    field, rname
+                                ),
+                                span: expr.span,
+                                notes: vec!["wrap union field access in `unsafe { ... }`".into()],
                                 counterexample: BTreeMap::new(),
                             });
                         }
@@ -3855,7 +4523,8 @@ impl CheckerCtx {
                             } else {
                                 subst_type_expr(&fdecl.ty, &rsubst)
                             };
-                            let actual_ty = self.infer_expr_type(fval, var_types);
+                            let actual_ty =
+                                self.infer_expr_type_expected(fval, Some(&expected_fty), var_types);
                             if !self.types_compatible(&expected_fty, &actual_ty) {
                                 self.diagnostics.push(Diagnostic {
                                     code: "E0205".into(),
@@ -3906,6 +4575,86 @@ impl CheckerCtx {
                         smt_premises,
                         expr.span,
                     );
+                } else if let Some(bf) = self.bitfields.get(name).cloned() {
+                    for (fname, fval) in fields {
+                        if let Some(bfd) = bf.fields.iter().find(|f| f.name == *fname) {
+                            let max_v = if bfd.bits >= 64 {
+                                u64::MAX as i128
+                            } else {
+                                ((1u64 << bfd.bits) - 1) as i128
+                            };
+                            let abs = env.eval_abs_int(fval, None);
+                            if abs.interval.max < 0 || abs.interval.min > max_v {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0410".into(),
+                                    message: format!(
+                                        "bitfield `{}.{}` ({}-bit) value out of range 0..={}",
+                                        bf.name, fname, bfd.bits, max_v
+                                    ),
+                                    span: fval.span,
+                                    notes: vec![],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                        } else {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0204".into(),
+                                message: format!(
+                                    "unknown field `{}` in bitfield `{}` literal",
+                                    fname, bf.name
+                                ),
+                                span: fval.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                } else if let Some(u) = self.unions.get(name).cloned() {
+                    if fields.len() != 1 {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0204".into(),
+                            message: format!(
+                                "union `{}` literal must initialize exactly 1 field, found {}",
+                                u.name,
+                                fields.len()
+                            ),
+                            span: expr.span,
+                            notes: vec![],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                    for (fname, fval) in fields {
+                        if let Some(uf) = u.fields.iter().find(|f| f.name == *fname) {
+                            let actual =
+                                self.infer_expr_type_expected(fval, Some(&uf.ty), var_types);
+                            if !self.types_compatible(&uf.ty, &actual) {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0205".into(),
+                                    message: format!(
+                                        "union field `{}.{}` expects `{}`, found `{}`",
+                                        u.name,
+                                        fname,
+                                        uf.ty.display_name(),
+                                        actual.display_name()
+                                    ),
+                                    span: fval.span,
+                                    notes: vec![],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                        } else {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0204".into(),
+                                message: format!(
+                                    "unknown field `{}` in union `{}` literal",
+                                    fname, u.name
+                                ),
+                                span: fval.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
                 }
             }
             ExprKind::Call { callee, args } => {
@@ -4024,8 +4773,23 @@ impl CheckerCtx {
                             }
                         } else if let ExprKind::Ident(tname) = &target.kind {
                             if !var_types.contains_key(tname) && self.is_known_type_name(tname) {
-                                // Static associated call: `Type.method(args)` (e.g. `Order.from_json(v)`, `List.filled(n, val)`)
-                                if let Some(mdecl) = self.resolve_assoc_method_sig(tname, field) {
+                                // Bitfield `from_raw(val)` constructor
+                                if field == "from_raw" && self.bitfields.contains_key(tname) {
+                                    if args.len() != 1 {
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0202".into(),
+                                            message: format!(
+                                                "`{}.from_raw` expects 1 argument, found {}",
+                                                tname,
+                                                args.len()
+                                            ),
+                                            span: expr.span,
+                                            notes: vec![],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    }
+                                    lambdas_checked = true;
+                                } else if let Some(mdecl) = self.resolve_assoc_method_sig(tname, field) {
                                     let inst = self.instantiate_assoc_method_from_args(&mdecl, args, var_types);
                                     self.check_method_call_contract(
                                         &format!("{}.{}", tname, field),
@@ -4068,7 +4832,20 @@ impl CheckerCtx {
                                     saw_return,
                                 );
                                 let recv_ty = self.infer_expr_type(target, var_types);
-                                if let Some(mdecl) = self.resolve_method_sig(&recv_ty, field) {
+                                if field == "raw"
+                                    && matches!(self.resolve_base_type(&recv_ty), TypeExpr::Named { ref name, .. } if self.bitfields.contains_key(name))
+                                {
+                                    if !args.is_empty() {
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0202".into(),
+                                            message: "bitfield `.raw()` expects 0 arguments".into(),
+                                            span: expr.span,
+                                            notes: vec![],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    }
+                                    lambdas_checked = true;
+                                } else if let Some(mdecl) = self.resolve_method_sig(&recv_ty, field) {
                                     let inst = self.instantiate_method_from_args(&mdecl, true, args, var_types);
                                     self.check_method_call_contract(
                                         &format!("{}.{}", recv_ty.display_name(), field),
@@ -4252,6 +5029,35 @@ impl CheckerCtx {
                                 });
                             }
                         } else if let Some(fdecl) = self.all_fns.get(fname).cloned() {
+                            if fdecl.is_unsafe && !self.in_unsafe {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0800".into(),
+                                    message: format!(
+                                        "calling `unsafe fn {}` requires an `unsafe` block or `unsafe fn`",
+                                        fname
+                                    ),
+                                    span: expr.span,
+                                    notes: vec!["wrap the call in `unsafe { ... }`".into()],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                            if self.cur_file_id != 0
+                                && fdecl.span.file_id != 0
+                                && self.cur_file_id != fdecl.span.file_id
+                                && !fdecl.is_pub
+                                && !fdecl.name.starts_with("__")
+                            {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0105".into(),
+                                    message: format!(
+                                        "private function `{}` cannot be accessed outside its defining module",
+                                        fname
+                                    ),
+                                    span: expr.span,
+                                    notes: vec![format!("mark `pub fn {}` to export it", fname)],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
                             self.check_direct_fn_call(
                                 fname,
                                 &fdecl,
@@ -4266,9 +5072,99 @@ impl CheckerCtx {
                                 expr.span,
                             );
                             lambdas_checked = true;
+                        } else if let Some(ef) = self.extern_fns.get(fname).cloned() {
+                            if !self.in_unsafe {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0800".into(),
+                                    message: format!(
+                                        "calling `extern \"{}\"` function `{}` requires an `unsafe` block",
+                                        ef.abi, fname
+                                    ),
+                                    span: expr.span,
+                                    notes: vec!["wrap C FFI calls in `unsafe { ... }`".into()],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                            let arity_ok = if ef.is_variadic {
+                                args.len() >= ef.params.len()
+                            } else {
+                                args.len() == ef.params.len()
+                            };
+                            if !arity_ok {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0202".into(),
+                                    message: format!(
+                                        "extern function `{}` expects {} argument(s), found {}",
+                                        fname,
+                                        ef.params.len(),
+                                        args.len()
+                                    ),
+                                    span: expr.span,
+                                    notes: vec![],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                            for (p, a) in ef.params.iter().zip(args.iter()) {
+                                let actual = self.infer_expr_type_expected(&a.value, Some(&p.ty), var_types);
+                                if !self.types_compatible(&p.ty, &actual) {
+                                    self.diagnostics.push(Diagnostic {
+                                        code: "E0205".into(),
+                                        message: format!(
+                                            "extern `{}` argument `{}` expects `{}`, found `{}`",
+                                            fname,
+                                            p.name,
+                                            p.ty.display_name(),
+                                            actual.display_name()
+                                        ),
+                                        span: a.value.span,
+                                        notes: vec![],
+                                        counterexample: BTreeMap::new(),
+                                    });
+                                }
+                            }
+                            lambdas_checked = true;
                         } else if let Some(vi) = self.enum_variants.get(fname).cloned() {
                             self.check_variant_ctor_args(fname, &vi, args, var_types, expr.span);
                         } else if let Some(b) = lookup_builtin(fname) {
+                            if is_unsafe_builtin(fname) && !self.in_unsafe {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0800".into(),
+                                    message: format!(
+                                        "calling unsafe memory/pointer builtin `{}` requires an `unsafe` block",
+                                        fname
+                                    ),
+                                    span: expr.span,
+                                    notes: vec!["wrap raw pointer/memory calls in `unsafe { ... }`".into()],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                            if fname == "offset_of" && args.len() == 2 {
+                                match (&args[0].value.kind, &args[1].value.kind) {
+                                    (ExprKind::Ident(tname), ExprKind::Str(field_name)) => {
+                                        if self.layout.offset_of(tname, field_name).is_none() {
+                                            self.diagnostics.push(Diagnostic {
+                                                code: "E0206".into(),
+                                                message: format!(
+                                                    "unknown field `{}` on type `{}` in `offset_of`",
+                                                    field_name, tname
+                                                ),
+                                                span: expr.span,
+                                                notes: vec![],
+                                                counterexample: BTreeMap::new(),
+                                            });
+                                        }
+                                    }
+                                    _ => {
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0205".into(),
+                                            message: "`offset_of` expects `(TypeName, \"field_name\")`".into(),
+                                            span: expr.span,
+                                            notes: vec![],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    }
+                                }
+                            }
                             if fname == "push" && args.len() == 2 {
                                 let list_ty = self.resolve_base_type(&self.infer_expr_type(&args[0].value, var_types));
                                 if let TypeExpr::Named { name: ln, args: la, .. } = list_ty {
@@ -4310,7 +5206,8 @@ impl CheckerCtx {
                             }
                             for (pt, a) in b.param_types.iter().zip(args.iter()) {
                                 let expected = named_ty(pt);
-                                let actual = self.infer_expr_type(&a.value, var_types);
+                                let actual =
+                                    self.infer_expr_type_expected(&a.value, Some(&expected), var_types);
                                 if !self.types_compatible(&expected, &actual) {
                                     self.diagnostics.push(Diagnostic {
                                         code: "E0205".into(),
@@ -5610,6 +6507,7 @@ impl CheckerCtx {
             is_pure: false,
             is_async: false,
             is_test: false,
+            is_unsafe: false,
             name: "<lambda>".into(),
             type_params: vec![],
             type_param_bounds: BTreeMap::new(),
@@ -5666,12 +6564,85 @@ impl CheckerCtx {
         let TypeExpr::Named { name, .. } = ty else {
             return;
         };
+        // Check exact-width scalar range bounds (e.g. `let x UInt8 = 256` rejected at L0!)
+        if let Some(sk) = ScalarKind::from_name(name) {
+            if sk.is_int() && sk != ScalarKind::I64 {
+                if let (Some(lo), Some(hi)) = (sk.min_i128(), sk.max_i128()) {
+                    let abs = if sk == ScalarKind::U64 {
+                        if let ExprKind::Int(n) = &expr.kind {
+                            AbsInt::exact((*n as u64) as i128)
+                        } else {
+                            env.eval_abs_int(expr, None)
+                        }
+                    } else {
+                        env.eval_abs_int(expr, None)
+                    };
+                    if abs.interval.max < lo || abs.interval.min > hi {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0410".into(),
+                            message: format!(
+                                "{} violates range of `{}` ({}..={})",
+                                context, name, lo, hi
+                            ),
+                            span,
+                            notes: vec![format!(
+                                "value interval [{}, {}] is outside {}..={}",
+                                abs.interval.min, abs.interval.max, lo, hi
+                            )],
+                            counterexample: BTreeMap::new(),
+                        });
+                    } else if abs.interval.min >= lo && abs.interval.max <= hi {
+                        self.proofs.push(ProofRecord {
+                            obligation: format!("{} fits in `{}` ({}..={})", context, name, lo, hi),
+                            tier: ProofTier::L0Fast,
+                            span,
+                        });
+                    }
+                }
+            }
+            return;
+        }
         let Some(alias) = self.type_aliases.get(name).cloned() else {
             return;
         };
         let Some(pred) = &alias.predicate else {
             return;
         };
+
+        // Float refinement verification (L0 float constant / bound checker for e.g. `UnitFloat = Float where 0.0 <= self && self <= 1.0`)
+        if self.is_float_ty(&alias.base) {
+            if let Some(fval) = eval_const_float(expr, &self.consts) {
+                match check_float_refinement_l0(pred, fval) {
+                    Some(true) => {
+                        self.proofs.push(ProofRecord {
+                            obligation: format!("{} satisfies float refinement `{}`", context, name),
+                            tier: ProofTier::L0Fast,
+                            span,
+                        });
+                        return;
+                    }
+                    Some(false) => {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0410".into(),
+                            message: format!(
+                                "{} ({}) violates float refinement `{}`",
+                                context, fval, name
+                            ),
+                            span,
+                            notes: vec![],
+                            counterexample: BTreeMap::new(),
+                        });
+                        return;
+                    }
+                    None => {}
+                }
+            }
+            // If dynamic variable already has exact alias type, accept
+            if let ExprKind::Ident(_) = &expr.kind {
+                return;
+            }
+            return;
+        }
 
         let mut check_env = env.clone();
         let abs = env.eval_abs_int(expr, None);
@@ -6168,6 +7139,7 @@ fn expr_to_sql(expr: &Expr, self_col: Option<&str>) -> Option<String> {
             match op {
                 UnOp::Neg => Some(format!("(-{})", inner)),
                 UnOp::Not => Some(format!("(NOT {})", inner)),
+                UnOp::BitNot => None,
             }
         }
         ExprKind::Binary { op, left, right } => {
@@ -6288,5 +7260,192 @@ fn apply_mutate_expr_symbolic(
         }
         ExprKind::Block(b) => apply_mutate_block_symbolic(var, b, sym_fields, mutated_any),
         _ => {}
+    }
+}
+
+fn eval_const_int(
+    expr: &Expr,
+    consts: &BTreeMap<String, (ConstDecl, Option<i64>, Option<f64>)>,
+    layout: &LayoutEngine,
+) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Int(n) => Some(*n),
+        ExprKind::Ident(s) => consts.get(s).and_then(|(_, iv, _)| *iv),
+        ExprKind::Cast { expr: inner, ty } => {
+            let v = eval_const_int(inner, consts, layout)?;
+            if let TypeExpr::Named { name, .. } = layout.resolve_alias(ty) {
+                if let Some(sk) = ScalarKind::from_name(&name) {
+                    return Some(match sk {
+                        ScalarKind::I8 => (v as i8) as i64,
+                        ScalarKind::I16 => (v as i16) as i64,
+                        ScalarKind::I32 => (v as i32) as i64,
+                        ScalarKind::U8 => (v as u8) as i64,
+                        ScalarKind::U16 => (v as u16) as i64,
+                        ScalarKind::U32 => (v as u32) as i64,
+                        _ => v,
+                    });
+                }
+            }
+            Some(v)
+        }
+        ExprKind::Unary { op, expr: inner } => {
+            let v = eval_const_int(inner, consts, layout)?;
+            match op {
+                UnOp::Neg => Some(v.wrapping_neg()),
+                UnOp::BitNot => Some(!v),
+                UnOp::Not => None,
+            }
+        }
+        ExprKind::Binary { op, left, right } => {
+            let l = eval_const_int(left, consts, layout)?;
+            let r = eval_const_int(right, consts, layout)?;
+            match op {
+                BinOp::Add => Some(l.wrapping_add(r)),
+                BinOp::Sub => Some(l.wrapping_sub(r)),
+                BinOp::Mul => Some(l.wrapping_mul(r)),
+                BinOp::Div if r != 0 => Some(l.wrapping_div(r)),
+                BinOp::Mod if r != 0 => Some(l.wrapping_rem(r)),
+                BinOp::BitAnd => Some(l & r),
+                BinOp::BitOr => Some(l | r),
+                BinOp::BitXor => Some(l ^ r),
+                BinOp::Shl => Some(l.wrapping_shl(r as u32)),
+                BinOp::Shr => Some(l.wrapping_shr(r as u32)),
+                _ => None,
+            }
+        }
+        ExprKind::Call { callee, args } => match &callee.kind {
+            ExprKind::GenericInst { expr: inner, type_args } if args.is_empty() => {
+                if let ExprKind::Ident(fn_name) = &inner.kind {
+                    if let Some(ta) = type_args.first() {
+                        if fn_name == "size_of" {
+                            return Some(layout.size_and_align(ta).0 as i64);
+                        }
+                        if fn_name == "align_of" {
+                            return Some(layout.size_and_align(ta).1 as i64);
+                        }
+                    }
+                }
+                None
+            }
+            ExprKind::Ident(fn_name) if fn_name == "offset_of" && args.len() == 2 => {
+                if let (ExprKind::Ident(tname), ExprKind::Str(fname)) =
+                    (&args[0].value.kind, &args[1].value.kind)
+                {
+                    return layout.offset_of(tname, fname).map(|o| o as i64);
+                }
+                None
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn eval_const_float(
+    expr: &Expr,
+    consts: &BTreeMap<String, (ConstDecl, Option<i64>, Option<f64>)>,
+) -> Option<f64> {
+    match &expr.kind {
+        ExprKind::Float(f) => Some(*f),
+        ExprKind::Ident(s) => consts.get(s).and_then(|(_, _, fv)| *fv),
+        ExprKind::Unary { op: UnOp::Neg, expr: inner } => eval_const_float(inner, consts).map(|v| -v),
+        ExprKind::Binary { op, left, right } => {
+            let l = eval_const_float(left, consts)?;
+            let r = eval_const_float(right, consts)?;
+            match op {
+                BinOp::Add => Some(l + r),
+                BinOp::Sub => Some(l - r),
+                BinOp::Mul => Some(l * r),
+                BinOp::Div => Some(l / r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn eval_float_term(expr: &Expr, self_val: f64) -> Option<f64> {
+    match &expr.kind {
+        ExprKind::Float(f) => Some(*f),
+        ExprKind::Int(n) => Some(*n as f64),
+        ExprKind::Ident(s) if s == "self" => Some(self_val),
+        ExprKind::Unary { op: UnOp::Neg, expr: inner } => eval_float_term(inner, self_val).map(|v| -v),
+        ExprKind::Binary { op, left, right } => {
+            let l = eval_float_term(left, self_val)?;
+            let r = eval_float_term(right, self_val)?;
+            match op {
+                BinOp::Add => Some(l + r),
+                BinOp::Sub => Some(l - r),
+                BinOp::Mul => Some(l * r),
+                BinOp::Div => Some(l / r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn check_float_refinement_l0(pred: &Expr, self_val: f64) -> Option<bool> {
+    match &pred.kind {
+        ExprKind::Binary { op, left, right } => match op {
+            BinOp::And => Some(
+                check_float_refinement_l0(left, self_val)?
+                    && check_float_refinement_l0(right, self_val)?,
+            ),
+            BinOp::Or => Some(
+                check_float_refinement_l0(left, self_val)?
+                    || check_float_refinement_l0(right, self_val)?,
+            ),
+            BinOp::Lt => Some(eval_float_term(left, self_val)? < eval_float_term(right, self_val)?),
+            BinOp::Le => Some(eval_float_term(left, self_val)? <= eval_float_term(right, self_val)?),
+            BinOp::Gt => Some(eval_float_term(left, self_val)? > eval_float_term(right, self_val)?),
+            BinOp::Ge => Some(eval_float_term(left, self_val)? >= eval_float_term(right, self_val)?),
+            BinOp::Eq => Some(eval_float_term(left, self_val)? == eval_float_term(right, self_val)?),
+            BinOp::Ne => Some(eval_float_term(left, self_val)? != eval_float_term(right, self_val)?),
+            _ => None,
+        },
+        ExprKind::Unary { op: UnOp::Not, expr: inner } => {
+            check_float_refinement_l0(inner, self_val).map(|b| !b)
+        }
+        _ => None,
+    }
+}
+
+fn is_untyped_int_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Int(_) => true,
+        ExprKind::Unary {
+            op: UnOp::Neg | UnOp::BitNot,
+            expr: inner,
+        } => is_untyped_int_expr(inner),
+        ExprKind::Binary { op, left, right }
+            if matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr
+            ) =>
+        {
+            is_untyped_int_expr(left) && is_untyped_int_expr(right)
+        }
+        _ => false,
+    }
+}
+
+fn is_untyped_float_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Float(_) => true,
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            expr: inner,
+        } => is_untyped_float_expr(inner),
+        _ => false,
     }
 }

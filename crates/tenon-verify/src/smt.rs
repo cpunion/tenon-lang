@@ -422,6 +422,7 @@ pub fn encode_expr(expr: &Expr, subst: &BTreeMap<String, String>) -> Result<Stri
             match op {
                 UnOp::Neg => Ok(format!("(- {})", inner)),
                 UnOp::Not => Ok(format!("(not {})", inner)),
+                UnOp::BitNot => Err("bitwise not outside integer SMT fragment".into()),
             }
         }
         ExprKind::Binary { op, left, right } => {

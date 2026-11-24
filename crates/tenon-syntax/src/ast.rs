@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Program {
     pub items: Vec<Item>,
+    #[serde(default)]
+    pub source_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,6 +36,10 @@ pub enum Item {
     Interface(InterfaceDecl),
     Impl(ImplDecl),
     Fn(FnDecl),
+    ExternFn(ExternFnDecl),
+    Bitfield(BitfieldDecl),
+    Union(UnionDecl),
+    Const(ConstDecl),
     Evolution(EvolutionDecl),
     LockLattice(LockLatticeDecl),
     Protocol(ProtocolDecl),
@@ -151,6 +157,8 @@ pub struct FnDecl {
     pub is_pure: bool,
     pub is_async: bool,
     pub is_test: bool,
+    #[serde(default)]
+    pub is_unsafe: bool,
     pub name: String,
     pub type_params: Vec<String>,
     #[serde(default)]
@@ -160,6 +168,56 @@ pub struct FnDecl {
     pub requires: Vec<Expr>,
     pub ensures: Vec<Expr>,
     pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternFnDecl {
+    pub attrs: Vec<Attr>,
+    pub is_pub: bool,
+    pub abi: String,
+    pub name: String,
+    pub params: Vec<ParamDecl>,
+    pub ret_ty: Option<TypeExpr>,
+    #[serde(default)]
+    pub is_variadic: bool,
+    pub link_lib: Option<String>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BitfieldFieldDecl {
+    pub name: String,
+    pub bits: u32,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BitfieldDecl {
+    pub attrs: Vec<Attr>,
+    pub is_pub: bool,
+    pub name: String,
+    pub backing_ty: TypeExpr,
+    pub fields: Vec<BitfieldFieldDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnionDecl {
+    pub attrs: Vec<Attr>,
+    pub is_pub: bool,
+    pub name: String,
+    pub fields: Vec<FieldDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConstDecl {
+    pub attrs: Vec<Attr>,
+    pub is_pub: bool,
+    pub name: String,
+    pub ty: TypeExpr,
+    pub value: Expr,
     pub span: Span,
 }
 
@@ -294,6 +352,11 @@ pub enum TypeExpr {
         ret: Option<Box<TypeExpr>>,
         span: Span,
     },
+    Array {
+        elem: Box<TypeExpr>,
+        len: usize,
+        span: Span,
+    },
 }
 
 impl TypeExpr {
@@ -348,6 +411,9 @@ impl TypeExpr {
                     Some(r) => format!("fn({}) {}", parts.join(", "), r.display_name()),
                     None => format!("fn({})", parts.join(", ")),
                 }
+            }
+            TypeExpr::Array { elem, len, .. } => {
+                format!("Array[{}, {}]", elem.display_name(), len)
             }
         }
     }
@@ -425,6 +491,10 @@ pub enum Stmt {
         span: Span,
     },
     Continue {
+        span: Span,
+    },
+    Defer {
+        body: Block,
         span: Span,
     },
     Expr {
@@ -506,6 +576,15 @@ pub enum ExprKind {
     },
     Tuple(Vec<Expr>),
     List(Vec<Expr>),
+    ArrayRepeat {
+        value: Box<Expr>,
+        len: usize,
+    },
+    Cast {
+        expr: Box<Expr>,
+        ty: TypeExpr,
+    },
+    Unsafe(Block),
     If {
         cond: Box<Expr>,
         then_block: Block,
@@ -618,4 +697,5 @@ impl BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    BitNot,
 }

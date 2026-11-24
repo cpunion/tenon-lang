@@ -1,26 +1,154 @@
 pub mod ast;
 pub mod derive;
+pub mod layout;
 pub mod lexer;
 pub mod parser;
 pub mod span;
 
 pub use ast::*;
 pub use derive::expand_derives;
-pub use parser::parse;
+pub use layout::*;
+pub use parser::{parse, parse_with_file_id};
 pub use span::{ParseError, Span};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Evaluate `@cfg(...)` conditional compilation attributes and drop disabled items.
+pub fn eval_cfg_attrs(program: &mut Program) {
+    program.items.retain(|item| {
+        let attrs: &[Attr] = match item {
+            Item::TypeAlias(d) => &d.attrs,
+            Item::Record(d) => &d.attrs,
+            Item::Enum(d) => &d.attrs,
+            Item::Interface(d) => &d.attrs,
+            Item::Impl(d) => &d.attrs,
+            Item::Fn(d) => &d.attrs,
+            Item::ExternFn(d) => &d.attrs,
+            Item::Bitfield(d) => &d.attrs,
+            Item::Union(d) => &d.attrs,
+            Item::Const(d) => &d.attrs,
+            Item::Evolution(d) => &d.attrs,
+            Item::Protocol(d) => &d.attrs,
+            Item::Stream(d) => &d.attrs,
+            Item::View(d) => &d.attrs,
+            Item::Subscriber(d) => &d.attrs,
+            Item::Import { .. } | Item::LockLattice(_) => return true,
+        };
+        attrs.iter().filter(|a| a.name == "cfg").all(eval_cfg_attr)
+    });
+}
+
+fn eval_cfg_attr(attr: &Attr) -> bool {
+    for arg in &attr.args {
+        if let Some(k) = &arg.key {
+            let val = match &arg.value.kind {
+                ExprKind::Str(s) | ExprKind::Ident(s) => s.as_str(),
+                ExprKind::Int(n) => {
+                    if k == "target_pointer_width" {
+                        if (*n as usize) != std::mem::size_of::<usize>() * 8 {
+                            return false;
+                        }
+                        continue;
+                    }
+                    ""
+                }
+                _ => "",
+            };
+            match k.as_str() {
+                "os" | "target_os" => {
+                    if val != std::env::consts::OS {
+                        return false;
+                    }
+                }
+                "arch" | "target_arch" => {
+                    if val != std::env::consts::ARCH {
+                        return false;
+                    }
+                }
+                "family" | "target_family" => {
+                    if val != std::env::consts::FAMILY {
+                        return false;
+                    }
+                }
+                "target_pointer_width" => {
+                    let expected = (std::mem::size_of::<usize>() * 8).to_string();
+                    if val != expected {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        } else if let ExprKind::Call { callee, args } = &arg.value.kind {
+            if let ExprKind::Ident(fname) = &callee.kind {
+                if fname == "not" && args.len() == 1 {
+                    let inner_attr = Attr {
+                        name: "cfg".into(),
+                        args: vec![AttrArg {
+                            key: args[0].name.clone(),
+                            value: args[0].value.clone(),
+                        }],
+                        span: attr.span,
+                    };
+                    if eval_cfg_attr(&inner_attr) {
+                        return false;
+                    }
+                }
+            }
+        } else if let ExprKind::Ident(flag) = &arg.value.kind {
+            match flag.as_str() {
+                "unix" => {
+                    if std::env::consts::FAMILY != "unix" {
+                        return false;
+                    }
+                }
+                "windows" => {
+                    if std::env::consts::OS != "windows" {
+                        return false;
+                    }
+                }
+                "macos" => {
+                    if std::env::consts::OS != "macos" {
+                        return false;
+                    }
+                }
+                "linux" => {
+                    if std::env::consts::OS != "linux" {
+                        return false;
+                    }
+                }
+                "debug" => {
+                    if !cfg!(debug_assertions) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
 /// Load a `.tn` source file and recursively resolve all `import "path.tn" [as alias]` declarations
-/// in topological order with cycle-safe deduplication, then expand `@derive(...)` macros.
+/// in topological order with cycle-safe deduplication, then evaluate `@cfg` and expand `@derive(...)` macros.
 pub fn load_program_with_imports(entry: &Path) -> Result<Program, String> {
     let mut visited = BTreeSet::new();
     let mut module_exports: BTreeMap<PathBuf, (String, BTreeSet<String>)> = BTreeMap::new();
+    let mut source_files = vec!["<inline>".to_string()];
     let mut items = Vec::new();
-    load_module_recursive(entry, &mut visited, &mut module_exports, &mut items)?;
-    let mut prog = Program { items };
+    load_module_recursive(
+        entry,
+        &mut visited,
+        &mut module_exports,
+        &mut source_files,
+        &mut items,
+    )?;
+    let mut prog = Program {
+        items,
+        source_files,
+    };
+    eval_cfg_attrs(&mut prog);
     expand_derives(&mut prog);
     Ok(prog)
 }
@@ -63,15 +191,18 @@ fn load_module_recursive(
     file: &Path,
     visited: &mut BTreeSet<PathBuf>,
     module_exports: &mut BTreeMap<PathBuf, (String, BTreeSet<String>)>,
+    source_files: &mut Vec<String>,
     out_items: &mut Vec<Item>,
 ) -> Result<(), String> {
     let canon = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
     if !visited.insert(canon.clone()) {
         return Ok(());
     }
+    let file_id = source_files.len() as u32;
+    source_files.push(canon.to_string_lossy().into_owned());
     let src = fs::read_to_string(&canon)
         .map_err(|e| format!("failed to read `{}`: {}", file.display(), e))?;
-    let prog = parse(&src).map_err(|e| format!("{}: {}", file.display(), e))?;
+    let prog = parse_with_file_id(&src, file_id).map_err(|e| format!("{}: {}", file.display(), e))?;
 
     let mut local_aliases: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
     let mut local_items = Vec::new();
@@ -82,7 +213,7 @@ fn load_module_recursive(
             Item::Import { path, alias, .. } => {
                 let target = resolve_import_path(&canon, &path)?;
                 let target_canon = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
-                load_module_recursive(&target, visited, module_exports, out_items)?;
+                load_module_recursive(&target, visited, module_exports, source_files, out_items)?;
                 if let Some(a) = alias {
                     if let Some(exp) = module_exports.get(&target_canon) {
                         local_aliases.insert(a, exp.clone());
@@ -90,8 +221,17 @@ fn load_module_recursive(
                 }
             }
             other => {
-                if let Item::Fn(f) = &other {
-                    exported_fns.insert(f.name.clone());
+                match &other {
+                    Item::Fn(f) => {
+                        exported_fns.insert(f.name.clone());
+                    }
+                    Item::ExternFn(ef) => {
+                        exported_fns.insert(ef.name.clone());
+                    }
+                    Item::Const(c) => {
+                        exported_fns.insert(c.name.clone());
+                    }
+                    _ => {}
                 }
                 local_items.push(other);
             }
@@ -134,6 +274,7 @@ fn rewrite_item_aliases(item: &mut Item, aliases: &BTreeMap<String, (String, BTr
                 rewrite_fn_aliases(m, aliases);
             }
         }
+        Item::Const(c) => rewrite_expr_aliases(&mut c.value, aliases),
         _ => {}
     }
 }
@@ -161,7 +302,9 @@ fn rewrite_block_aliases(blk: &mut Block, aliases: &BTreeMap<String, (String, BT
             Stmt::Return { value: Some(e), .. }
             | Stmt::Assert { cond: e, .. }
             | Stmt::Expr { expr: e, .. } => rewrite_expr_aliases(e, aliases),
-            Stmt::Mutate { body, .. } => rewrite_block_aliases(body, aliases),
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+                rewrite_block_aliases(body, aliases)
+            }
             Stmt::While { cond, body, .. } => {
                 rewrite_expr_aliases(cond, aliases);
                 rewrite_block_aliases(body, aliases);
@@ -212,6 +355,8 @@ fn rewrite_expr_aliases(expr: &mut Expr, aliases: &BTreeMap<String, (String, BTr
         | ExprKind::Await(inner)
         | ExprKind::Old(inner)
         | ExprKind::Try(inner)
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::ArrayRepeat { value: inner, .. }
         | ExprKind::TupleIndex { target: inner, .. } => {
             rewrite_expr_aliases(inner, aliases);
         }
@@ -254,7 +399,7 @@ fn rewrite_expr_aliases(expr: &mut Expr, aliases: &BTreeMap<String, (String, BTr
                 rewrite_expr_aliases(&mut a.body, aliases);
             }
         }
-        ExprKind::Block(b) => rewrite_block_aliases(b, aliases),
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => rewrite_block_aliases(b, aliases),
         _ => {}
     }
 }
@@ -374,5 +519,91 @@ view TasksListView from TaskAuthority {
         } else {
             panic!("expected greet first");
         }
+    }
+
+    #[test]
+    fn parses_systems_syntax_and_computes_exact_c_layouts() {
+        let src = r#"
+pub const MAGIC UInt32 = 0xDEAD_BEEF
+
+@repr(C)
+pub record PacketHdr {
+    ver  UInt8
+    len  UInt32
+    tag  UInt16
+}
+
+@packed
+pub record PackedHdr {
+    ver  UInt8
+    len  UInt32
+    tag  UInt16
+}
+
+@align(64)
+pub record CacheAligned {
+    val Int64
+}
+
+@repr(C)
+pub union FloatBits {
+    f Float32
+    u UInt32
+}
+
+pub bitfield TcpFlags : UInt16 {
+    data_offset : 4
+    reserved    : 3
+    syn         : 1
+    ack         : 1
+}
+
+@link("m")
+extern "C" {
+    fn sin(x Float64) Float64
+    fn printf(fmt Ptr[UInt8], ...) Int32
+}
+
+@cfg(os = "nonexistent_os")
+pub fn dropped_by_cfg() Int { 1 }
+
+pub unsafe fn demo(p Ptr[UInt8]) Int {
+    let arr [UInt8; 16] = [0; 16]
+    defer { let _ = arr[0] }
+    let x = (~0b1010) as UInt32
+    let y = unsafe { sin(1.0) }
+    0
+}
+"#;
+        let prog = parse(src).expect("systems syntax should parse cleanly");
+        assert!(!prog.items.iter().any(|i| matches!(i, Item::Fn(f) if f.name == "dropped_by_cfg")));
+        let eng = LayoutEngine::from_program(&prog);
+        let c_hdr = eng.struct_layout("PacketHdr").unwrap();
+        assert_eq!(c_hdr.size, 12);
+        assert_eq!(c_hdr.align, 4);
+        assert_eq!(eng.offset_of("PacketHdr", "ver"), Some(0));
+        assert_eq!(eng.offset_of("PacketHdr", "len"), Some(4));
+        assert_eq!(eng.offset_of("PacketHdr", "tag"), Some(8));
+
+        let p_hdr = eng.struct_layout("PackedHdr").unwrap();
+        assert_eq!(p_hdr.size, 7);
+        assert_eq!(p_hdr.align, 1);
+        assert_eq!(eng.offset_of("PackedHdr", "len"), Some(1));
+        assert_eq!(eng.offset_of("PackedHdr", "tag"), Some(5));
+
+        let ca = eng.struct_layout("CacheAligned").unwrap();
+        assert_eq!(ca.size, 64);
+        assert_eq!(ca.align, 64);
+
+        let ul = eng.union_layout("FloatBits").unwrap();
+        assert_eq!(ul.size, 4);
+        assert_eq!(ul.align, 4);
+
+        let bf = eng.bitfield_layout("TcpFlags").unwrap();
+        assert_eq!(bf.backing, ScalarKind::U16);
+        assert_eq!(bf.total_bits, 9);
+        assert_eq!(bf.fields[2].name, "syn");
+        assert_eq!(bf.fields[2].bit_offset, 7);
+        assert_eq!(bf.fields[2].mask, 1);
     }
 }

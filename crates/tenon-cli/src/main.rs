@@ -42,6 +42,7 @@ async fn main() -> ExitCode {
         "agent" => cmd_agent(&args[2..]).await,
         "build" => cmd_build_aot(&args[2..]),
         "build-wasm" => cmd_build_wasm(&args[2..]),
+        "fmt" => cmd_fmt(&args[2..]),
         "-h" | "--help" | "help" => {
             print_usage();
             ExitCode::SUCCESS
@@ -74,9 +75,10 @@ USAGE:
   tenon cluster-demo <app.tn>                     Spawn real multi-process cluster (Authority + 2 Workers + SIGKILL failover + 410 reset)
   tenon agent [--model luna|sol|terra|astra|<id>] [--workspace <dir>] [--spec <app.tn>] [--db <sqlite>] [--env-file <path>] [-p "<prompt>"]
                                                   Interactive CLI Agent powered by real OpenAI Responses API (dast-os models) + shell & file tools
-  tenon build <file.tn> -o <bin> [--emit-llvm <file.ll>] [--opt O0|O2|O3]
-                                                  Verify (Fail-Closed) & AOT-compile to standalone native binary via LLVM
-  tenon build-wasm <app.tn> [-o <out.wasm>]       Compile declarative .tn view/pacing directly to binary WebAssembly client store"#
+  tenon build <file.tn> -o <out> [--opt O0|O2|O3] [--lib static|shared] [--emit-header <h>] [--emit-llvm <ll>] [-g|--debug] [-l <lib>] [-L <dir>] [--c-src <file.c>]
+                                                  Verify (Fail-Closed) & AOT-compile to native binary / C static or shared library via LLVM
+  tenon build-wasm <app.tn> [-o <out.wasm>]       Compile declarative .tn view/pacing directly to binary WebAssembly client store
+  tenon fmt <file.tn> [--check]                   Format Tenon source file with canonical indentation & spacing"#
     );
 }
 
@@ -1132,42 +1134,82 @@ fn cmd_build_wasm(args: &[String]) -> ExitCode {
 }
 
 fn cmd_build_aot(args: &[String]) -> ExitCode {
-    let mut file_arg: Option<&str> = None;
-    let mut skip = false;
-    for a in args {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if a == "-o" || a == "--emit-llvm" || a == "--opt" {
-            skip = true;
-            continue;
-        }
-        if !a.starts_with('-') {
-            file_arg = Some(a.as_str());
-            break;
+    let mut file_arg: Option<String> = None;
+    let mut out_bin = "target/tenon_out".to_string();
+    let mut opts = tenon_codegen::llvm_aot::BuildOptions::default();
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" if i + 1 < args.len() => {
+                out_bin = args[i + 1].clone();
+                i += 2;
+            }
+            "--emit-llvm" if i + 1 < args.len() => {
+                opts.emit_ll_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-header" if i + 1 < args.len() => {
+                opts.emit_header_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--opt" if i + 1 < args.len() => {
+                opts.opt_level = args[i + 1].clone();
+                i += 2;
+            }
+            "--lib" if i + 1 < args.len() => {
+                opts.output_kind = match args[i + 1].as_str() {
+                    "static" => tenon_codegen::llvm_aot::OutputKind::StaticLib,
+                    "shared" | "dylib" | "so" => tenon_codegen::llvm_aot::OutputKind::SharedLib,
+                    other => {
+                        eprintln!("unknown --lib kind `{}` (expected `static` or `shared`)", other);
+                        return ExitCode::from(2);
+                    }
+                };
+                i += 2;
+            }
+            "-g" | "--debug" => {
+                opts.debug_info = true;
+                i += 1;
+            }
+            "-l" if i + 1 < args.len() => {
+                opts.link_libs.push(args[i + 1].clone());
+                i += 2;
+            }
+            "-L" if i + 1 < args.len() => {
+                opts.link_dirs.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--c-src" if i + 1 < args.len() => {
+                opts.extra_c_sources.push(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            s if s.starts_with("-l") && s.len() > 2 => {
+                opts.link_libs.push(s[2..].to_string());
+                i += 1;
+            }
+            s if s.starts_with("-L") && s.len() > 2 => {
+                opts.link_dirs.push(s[2..].to_string());
+                i += 1;
+            }
+            s if !s.starts_with('-') && file_arg.is_none() => {
+                file_arg = Some(s.to_string());
+                i += 1;
+            }
+            other => {
+                eprintln!("unknown build argument `{}`", other);
+                return ExitCode::from(2);
+            }
         }
     }
     let Some(file) = file_arg else {
-        eprintln!("usage: tenon build <file.tn> [-o <bin>] [--emit-llvm <file.ll>] [--opt O3]");
+        eprintln!(
+            "usage: tenon build <file.tn> [-o <out>] [--opt O3] [--lib static|shared] [--emit-header <h>] [--emit-llvm <ll>] [-g] [-l <lib>] [-L <dir>] [--c-src <c>]"
+        );
         return ExitCode::from(2);
     };
-    let out_bin = args
-        .windows(2)
-        .find(|w| w[0] == "-o")
-        .map(|w| w[1].as_str())
-        .unwrap_or("target/tenon_out");
-    let emit_ll = args
-        .windows(2)
-        .find(|w| w[0] == "--emit-llvm")
-        .map(|w| Path::new(w[1].as_str()));
-    let opt = args
-        .windows(2)
-        .find(|w| w[0] == "--opt")
-        .map(|w| w[1].as_str())
-        .unwrap_or("O3");
 
-    let prog = match load_and_parse(file) {
+    let prog = match load_and_parse(&file) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -1186,16 +1228,22 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    match tenon_codegen::llvm_aot::compile_to_native_binary(&prog, Path::new(out_bin), emit_ll, opt)
-    {
+    match tenon_codegen::llvm_aot::compile_with_options(&prog, Path::new(&out_bin), &opts) {
         Ok(art) => {
+            let kind_str = match opts.output_kind {
+                tenon_codegen::llvm_aot::OutputKind::Executable => "native binary",
+                tenon_codegen::llvm_aot::OutputKind::StaticLib => "static library",
+                tenon_codegen::llvm_aot::OutputKind::SharedLib => "shared library",
+            };
             println!(
-                "LLVM AOT Built `{}` -> `{}` ({} bytes native binary, {} bytes LLVM IR, opt={}, {} proofs verified)",
+                "LLVM AOT Built `{}` -> `{}` ({} bytes {}, {} bytes LLVM IR, opt={}, debug={}, {} proofs verified)",
                 file,
                 art.output_path,
                 art.binary_bytes,
+                kind_str,
                 art.llvm_ir_bytes,
                 art.opt_level,
+                opts.debug_info,
                 report.proofs.len()
             );
             ExitCode::SUCCESS
@@ -1204,6 +1252,117 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             eprintln!("LLVM AOT build failed: {}", e);
             ExitCode::from(1)
         }
+    }
+}
+
+fn format_tenon_source(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut indent: usize = 0;
+    let mut prev_blank = false;
+
+    for raw_line in src.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            if !out.is_empty() && !prev_blank {
+                out.push('\n');
+                prev_blank = true;
+            }
+            continue;
+        }
+        prev_blank = false;
+
+        // Count leading closing braces on this line to dedent before printing
+        let mut leading_closes = 0usize;
+        for ch in trimmed.chars() {
+            if ch == '}' {
+                leading_closes += 1;
+            } else {
+                break;
+            }
+        }
+        let line_indent = indent.saturating_sub(leading_closes);
+        for _ in 0..line_indent {
+            out.push_str("    ");
+        }
+        out.push_str(trimmed);
+        out.push('\n');
+
+        // Scan net `{` / `}` delta outside string literals and `//` comments
+        let mut opens = 0usize;
+        let mut closes = 0usize;
+        let bytes = trimmed.as_bytes();
+        let mut idx = 0usize;
+        let mut in_str = false;
+        while idx < bytes.len() {
+            let b = bytes[idx];
+            if in_str {
+                if b == b'\\' && idx + 1 < bytes.len() {
+                    idx += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_str = false;
+                }
+            } else {
+                if b == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'/' {
+                    break;
+                }
+                if b == b'"' {
+                    in_str = true;
+                } else if b == b'{' {
+                    opens += 1;
+                } else if b == b'}' {
+                    closes += 1;
+                }
+            }
+            idx += 1;
+        }
+        indent = indent.saturating_add(opens).saturating_sub(closes);
+    }
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+    out
+}
+
+fn cmd_fmt(args: &[String]) -> ExitCode {
+    let check_only = args.iter().any(|a| a == "--check");
+    let files: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if files.is_empty() {
+        eprintln!("usage: tenon fmt <file.tn> [--check]");
+        return ExitCode::from(2);
+    }
+    let mut dirty = false;
+    for file in files {
+        let src = match fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error reading `{}`: {}", file, e);
+                return ExitCode::from(1);
+            }
+        };
+        if let Err(e) = tenon_syntax::parse(&src) {
+            eprintln!("syntax error in `{}`: {}", file, e);
+            return ExitCode::from(1);
+        }
+        let formatted = format_tenon_source(&src);
+        if formatted != src {
+            if check_only {
+                eprintln!("would reformat `{}`", file);
+                dirty = true;
+            } else {
+                if let Err(e) = fs::write(file, &formatted) {
+                    eprintln!("error writing `{}`: {}", file, e);
+                    return ExitCode::from(1);
+                }
+                println!("Formatted `{}`", file);
+            }
+        }
+    }
+    if dirty {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

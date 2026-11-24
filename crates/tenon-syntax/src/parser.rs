@@ -1,10 +1,16 @@
 use crate::ast::*;
-use crate::lexer::{Token, TokenKind, lex};
+use crate::lexer::{Token, TokenKind, lex_with_file_id};
 use crate::span::{ParseError, Span};
 use std::collections::BTreeMap;
 
 pub fn parse(src: &str) -> Result<Program, ParseError> {
-    let tokens = lex(src)?;
+    let mut prog = parse_with_file_id(src, 0)?;
+    crate::eval_cfg_attrs(&mut prog);
+    Ok(prog)
+}
+
+pub fn parse_with_file_id(src: &str, file_id: u32) -> Result<Program, ParseError> {
+    let tokens = lex_with_file_id(src, file_id)?;
     let mut parser = Parser { tokens, pos: 0 };
     parser.parse_program()
 }
@@ -149,9 +155,12 @@ impl Parser {
             if self.peek().kind == TokenKind::Eof {
                 break;
             }
-            items.push(self.parse_item()?);
+            items.extend(self.parse_items()?);
         }
-        Ok(Program { items })
+        Ok(Program {
+            items,
+            source_files: Vec::new(),
+        })
     }
 
     fn parse_attrs(&mut self) -> Result<Vec<Attr>, ParseError> {
@@ -206,7 +215,7 @@ impl Parser {
         Ok(attrs)
     }
 
-    fn parse_item(&mut self) -> Result<Item, ParseError> {
+    fn parse_items(&mut self) -> Result<Vec<Item>, ParseError> {
         let attrs = self.parse_attrs()?;
         self.skip_newlines();
         if self.peek().kind == TokenKind::Import {
@@ -224,11 +233,11 @@ impl Parser {
                 } else {
                     None
                 };
-                return Ok(Item::Import {
+                return Ok(vec![Item::Import {
                     path,
                     alias,
                     span: start.merge(end),
-                });
+                }]);
             }
             return Err(ParseError {
                 message: format!("expected string path after `import`, found {:?}", tok.kind),
@@ -239,28 +248,233 @@ impl Parser {
         self.skip_newlines();
         match self.peek().kind {
             TokenKind::Distinct | TokenKind::Type => {
-                Ok(Item::TypeAlias(self.parse_type_alias(attrs, is_pub)?))
+                Ok(vec![Item::TypeAlias(self.parse_type_alias(attrs, is_pub)?)])
             }
-            TokenKind::Record => Ok(Item::Record(self.parse_record(attrs, is_pub)?)),
-            TokenKind::Enum => Ok(Item::Enum(self.parse_enum(attrs, is_pub)?)),
-            TokenKind::Interface => Ok(Item::Interface(self.parse_interface(attrs, is_pub)?)),
-            TokenKind::Impl => Ok(Item::Impl(self.parse_impl(attrs)?)),
-            TokenKind::Pure | TokenKind::Async | TokenKind::Test | TokenKind::Fn => {
-                Ok(Item::Fn(self.parse_fn(attrs, is_pub)?))
-            }
-            TokenKind::Evolution => Ok(Item::Evolution(self.parse_evolution(attrs)?)),
-            TokenKind::LockLattice => Ok(Item::LockLattice(self.parse_lock_lattice(is_pub)?)),
-            TokenKind::Protocol => Ok(Item::Protocol(self.parse_protocol(attrs, is_pub)?)),
-            TokenKind::Stream => Ok(Item::Stream(self.parse_stream(attrs, is_pub)?)),
+            TokenKind::Record => Ok(vec![Item::Record(self.parse_record(attrs, is_pub)?)]),
+            TokenKind::Enum => Ok(vec![Item::Enum(self.parse_enum(attrs, is_pub)?)]),
+            TokenKind::Bitfield => Ok(vec![Item::Bitfield(self.parse_bitfield(attrs, is_pub)?)]),
+            TokenKind::Union => Ok(vec![Item::Union(self.parse_union(attrs, is_pub)?)]),
+            TokenKind::Const => Ok(vec![Item::Const(self.parse_const(attrs, is_pub)?)]),
+            TokenKind::Extern => self.parse_extern(attrs, is_pub),
+            TokenKind::Interface => Ok(vec![Item::Interface(self.parse_interface(attrs, is_pub)?)]),
+            TokenKind::Impl => Ok(vec![Item::Impl(self.parse_impl(attrs)?)]),
+            TokenKind::Pure
+            | TokenKind::Async
+            | TokenKind::Test
+            | TokenKind::Unsafe
+            | TokenKind::Fn => Ok(vec![Item::Fn(self.parse_fn(attrs, is_pub)?)]),
+            TokenKind::Evolution => Ok(vec![Item::Evolution(self.parse_evolution(attrs)?)]),
+            TokenKind::LockLattice => Ok(vec![Item::LockLattice(self.parse_lock_lattice(is_pub)?)]),
+            TokenKind::Protocol => Ok(vec![Item::Protocol(self.parse_protocol(attrs, is_pub)?)]),
+            TokenKind::Stream => Ok(vec![Item::Stream(self.parse_stream(attrs, is_pub)?)]),
             TokenKind::Reactive | TokenKind::View => {
-                Ok(Item::View(self.parse_view(attrs, is_pub)?))
+                Ok(vec![Item::View(self.parse_view(attrs, is_pub)?)])
             }
-            TokenKind::Subscriber => Ok(Item::Subscriber(self.parse_subscriber(attrs, is_pub)?)),
+            TokenKind::Subscriber => Ok(vec![Item::Subscriber(self.parse_subscriber(attrs, is_pub)?)]),
             _ => Err(ParseError {
                 message: format!("unexpected token at top-level: {:?}", self.peek().kind),
                 span: self.peek().span,
             }),
         }
+    }
+
+    fn parse_extern(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Result<Vec<Item>, ParseError> {
+        let start = self.expect(TokenKind::Extern)?.span;
+        let abi = match self.peek().kind.clone() {
+            TokenKind::Str(s) => {
+                self.bump();
+                s
+            }
+            _ => "C".to_string(),
+        };
+        let block_link = crate::layout::extract_link_libs(&attrs).into_iter().next();
+        self.skip_newlines();
+        if self.peek().kind == TokenKind::LBrace {
+            self.bump();
+            let mut out = Vec::new();
+            loop {
+                self.skip_newlines();
+                if self.peek().kind == TokenKind::RBrace {
+                    self.bump();
+                    return Ok(out);
+                }
+                let mut fattrs = attrs.clone();
+                fattrs.extend(self.parse_attrs()?);
+                self.skip_newlines();
+                let fpub = self.eat(&TokenKind::Pub) || is_pub;
+                let ef = self.parse_extern_fn_sig(fattrs, fpub, &abi, block_link.clone(), start)?;
+                out.push(Item::ExternFn(ef));
+                self.eat_sep();
+            }
+        } else {
+            let ef = self.parse_extern_fn_sig(attrs, is_pub, &abi, block_link, start)?;
+            Ok(vec![Item::ExternFn(ef)])
+        }
+    }
+
+    fn parse_extern_fn_sig(
+        &mut self,
+        attrs: Vec<Attr>,
+        is_pub: bool,
+        abi: &str,
+        default_link: Option<String>,
+        start: Span,
+    ) -> Result<ExternFnDecl, ParseError> {
+        let _ = self.eat(&TokenKind::Unsafe);
+        let fstart = self.expect(TokenKind::Fn)?.span;
+        let (name, _nspan) = self.expect_ident()?;
+        self.expect(TokenKind::LParen)?;
+        let mut params = Vec::new();
+        let mut is_variadic = false;
+        let mut end;
+        loop {
+            self.skip_newlines();
+            if self.peek().kind == TokenKind::RParen {
+                end = self.bump().span;
+                break;
+            }
+            if self.peek().kind == TokenKind::DotDotDot {
+                self.bump();
+                is_variadic = true;
+                end = self.expect(TokenKind::RParen)?.span;
+                break;
+            }
+            let pstart = self.peek().span;
+            let is_inout = self.eat(&TokenKind::Inout);
+            let (pname, pspan) = self.expect_ident()?;
+            let pty = self.parse_type_expr()?;
+            params.push(ParamDecl {
+                is_inout,
+                is_comptime: false,
+                name: pname,
+                ty: pty,
+                predicate: None,
+                span: pstart.merge(pspan),
+            });
+            if !self.eat(&TokenKind::Comma) {
+                end = self.expect(TokenKind::RParen)?.span;
+                break;
+            }
+        }
+        let ret_ty = if matches!(
+            self.peek().kind,
+            TokenKind::Ident(_) | TokenKind::LParen | TokenKind::LBracket | TokenKind::Fn
+        ) {
+            let r = self.parse_type_expr()?;
+            end = match &r {
+                TypeExpr::Named { span, .. }
+                | TypeExpr::Dyn { span, .. }
+                | TypeExpr::Tuple(_, span)
+                | TypeExpr::Fn { span, .. }
+                | TypeExpr::Array { span, .. } => *span,
+            };
+            Some(r)
+        } else {
+            None
+        };
+        let link_lib = crate::layout::extract_link_libs(&attrs)
+            .into_iter()
+            .next()
+            .or(default_link);
+        Ok(ExternFnDecl {
+            attrs,
+            is_pub,
+            abi: abi.to_string(),
+            name,
+            params,
+            ret_ty,
+            is_variadic,
+            link_lib,
+            span: start.merge(fstart).merge(end),
+        })
+    }
+
+    fn parse_bitfield(
+        &mut self,
+        attrs: Vec<Attr>,
+        is_pub: bool,
+    ) -> Result<BitfieldDecl, ParseError> {
+        let start = self.expect(TokenKind::Bitfield)?.span;
+        let (name, _) = self.expect_ident()?;
+        let _ = self.eat(&TokenKind::Colon);
+        let backing_ty = self.parse_type_expr()?;
+        self.expect(TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.peek().kind == TokenKind::RBrace {
+                let end = self.bump().span;
+                return Ok(BitfieldDecl {
+                    attrs,
+                    is_pub,
+                    name,
+                    backing_ty,
+                    fields,
+                    span: start.merge(end),
+                });
+            }
+            let (fname, fstart) = self.expect_ident()?;
+            self.expect(TokenKind::Colon)?;
+            let tok = self.bump();
+            let bits = match tok.kind {
+                TokenKind::Int(n) if n > 0 && n <= 64 => n as u32,
+                _ => {
+                    return Err(ParseError {
+                        message: format!(
+                            "expected bitfield width integer (1..=64), found {:?}",
+                            tok.kind
+                        ),
+                        span: tok.span,
+                    });
+                }
+            };
+            fields.push(BitfieldFieldDecl {
+                name: fname,
+                bits,
+                span: fstart.merge(tok.span),
+            });
+            self.eat_sep();
+        }
+    }
+
+    fn parse_union(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Result<UnionDecl, ParseError> {
+        let start = self.expect(TokenKind::Union)?.span;
+        let (name, _) = self.expect_ident()?;
+        self.expect(TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.peek().kind == TokenKind::RBrace {
+                let end = self.bump().span;
+                return Ok(UnionDecl {
+                    attrs,
+                    is_pub,
+                    name,
+                    fields,
+                    span: start.merge(end),
+                });
+            }
+            let fattrs = self.parse_attrs()?;
+            fields.push(self.parse_field(fattrs)?);
+            self.eat_sep();
+        }
+    }
+
+    fn parse_const(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Result<ConstDecl, ParseError> {
+        let start = self.expect(TokenKind::Const)?.span;
+        let (name, _) = self.expect_ident()?;
+        let ty = self.parse_type_expr()?;
+        self.expect(TokenKind::Eq)?;
+        let value = self.parse_expr()?;
+        let end = value.span;
+        Ok(ConstDecl {
+            attrs,
+            is_pub,
+            name,
+            ty,
+            value,
+            span: start.merge(end),
+        })
     }
 
     fn parse_type_params(&mut self) -> Result<Vec<String>, ParseError> {
@@ -724,6 +938,7 @@ impl Parser {
         let mut is_pure = false;
         let mut is_async = false;
         let mut is_test = false;
+        let mut is_unsafe = false;
         loop {
             self.skip_newlines();
             match self.peek().kind {
@@ -738,6 +953,10 @@ impl Parser {
                 TokenKind::Test => {
                     self.bump();
                     is_test = true;
+                }
+                TokenKind::Unsafe => {
+                    self.bump();
+                    is_unsafe = true;
                 }
                 _ => break,
             }
@@ -781,6 +1000,7 @@ impl Parser {
             is_pure,
             is_async,
             is_test,
+            is_unsafe,
             name,
             type_params,
             type_param_bounds,
@@ -957,6 +1177,7 @@ impl Parser {
                 is_pure: true,
                 is_async: false,
                 is_test: false,
+                is_unsafe: false,
                 name: mname.clone(),
                 type_params: Vec::new(),
                 type_param_bounds: BTreeMap::new(),
@@ -1505,14 +1726,19 @@ impl Parser {
             }
             let ret = if matches!(
                 self.peek().kind,
-                TokenKind::Ident(_) | TokenKind::Dyn | TokenKind::LParen | TokenKind::Fn
+                TokenKind::Ident(_)
+                    | TokenKind::Dyn
+                    | TokenKind::LParen
+                    | TokenKind::LBracket
+                    | TokenKind::Fn
             ) {
                 let r = self.parse_type_expr()?;
                 end = match &r {
                     TypeExpr::Named { span, .. }
                     | TypeExpr::Dyn { span, .. }
                     | TypeExpr::Tuple(_, span)
-                    | TypeExpr::Fn { span, .. } => *span,
+                    | TypeExpr::Fn { span, .. }
+                    | TypeExpr::Array { span, .. } => *span,
                 };
                 Some(Box::new(r))
             } else {
@@ -1521,6 +1747,27 @@ impl Parser {
             return Ok(TypeExpr::Fn {
                 params,
                 ret,
+                span: start.merge(end),
+            });
+        }
+        if self.peek().kind == TokenKind::LBracket {
+            let start = self.bump().span;
+            let elem = self.parse_type_expr()?;
+            self.expect(TokenKind::Semi)?;
+            let tok = self.bump();
+            let len = match tok.kind {
+                TokenKind::Int(n) if n >= 0 => n as usize,
+                _ => {
+                    return Err(ParseError {
+                        message: format!("expected array length integer, found {:?}", tok.kind),
+                        span: tok.span,
+                    });
+                }
+            };
+            let end = self.expect(TokenKind::RBracket)?.span;
+            return Ok(TypeExpr::Array {
+                elem: Box::new(elem),
+                len,
                 span: start.merge(end),
             });
         }
@@ -1602,6 +1849,15 @@ impl Parser {
                 }
             }
         }
+        if name == "Array" && args.len() == 2 {
+            if let Ok(len) = args[1].display_name().parse::<usize>() {
+                return Ok(TypeExpr::Array {
+                    elem: Box::new(args.remove(0)),
+                    len,
+                    span: start.merge(end),
+                });
+            }
+        }
         Ok(TypeExpr::Named {
             name,
             version,
@@ -1635,6 +1891,7 @@ impl Parser {
                     | TokenKind::For
                     | TokenKind::Break
                     | TokenKind::Continue
+                    | TokenKind::Defer
             ) {
                 stmts.push(self.parse_stmt()?);
                 self.eat_sep();
@@ -1844,6 +2101,23 @@ impl Parser {
             TokenKind::Continue => {
                 let span = self.bump().span;
                 Ok(Stmt::Continue { span })
+            }
+            TokenKind::Defer => {
+                let start = self.bump().span;
+                self.skip_newlines();
+                let body = if self.peek().kind == TokenKind::LBrace {
+                    self.parse_block()?
+                } else {
+                    let expr = self.parse_expr()?;
+                    let espan = expr.span;
+                    Block {
+                        stmts: vec![Stmt::Expr { expr, span: espan }],
+                        tail: None,
+                        span: espan,
+                    }
+                };
+                let span = start.merge(body.span);
+                Ok(Stmt::Defer { body, span })
             }
             _ => {
                 let expr = self.parse_expr()?;
@@ -2062,7 +2336,7 @@ impl Parser {
     }
 
     fn parse_mul(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_unary()?;
+        let mut left = self.parse_cast()?;
         while let Some(op) = match self.peek().kind {
             TokenKind::Star => Some(BinOp::Mul),
             TokenKind::Slash => Some(BinOp::Div),
@@ -2071,13 +2345,37 @@ impl Parser {
         } {
             self.bump();
             self.skip_newlines();
-            let right = self.parse_unary()?;
+            let right = self.parse_cast()?;
             let span = left.span.merge(right.span);
             left = Expr {
                 kind: ExprKind::Binary {
                     op,
                     left: Box::new(left),
                     right: Box::new(right),
+                },
+                span,
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_cast(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_unary()?;
+        while self.peek().kind == TokenKind::As {
+            self.bump();
+            let ty = self.parse_type_expr()?;
+            let end = match &ty {
+                TypeExpr::Named { span, .. }
+                | TypeExpr::Dyn { span, .. }
+                | TypeExpr::Tuple(_, span)
+                | TypeExpr::Fn { span, .. }
+                | TypeExpr::Array { span, .. } => *span,
+            };
+            let span = left.span.merge(end);
+            left = Expr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(left),
+                    ty,
                 },
                 span,
             };
@@ -2107,6 +2405,18 @@ impl Parser {
                 Ok(Expr {
                     kind: ExprKind::Unary {
                         op: UnOp::Not,
+                        expr: Box::new(expr),
+                    },
+                    span,
+                })
+            }
+            TokenKind::Tilde => {
+                let start = self.bump().span;
+                let expr = self.parse_unary()?;
+                let span = start.merge(expr.span);
+                Ok(Expr {
+                    kind: ExprKind::Unary {
+                        op: UnOp::BitNot,
                         expr: Box::new(expr),
                     },
                     span,
@@ -2569,25 +2879,74 @@ impl Parser {
             }
             TokenKind::LBracket => {
                 self.bump();
-                let mut elems = Vec::new();
-                loop {
-                    self.skip_newlines();
-                    if self.peek().kind == TokenKind::RBracket {
-                        let end = self.bump().span;
-                        return Ok(Expr {
-                            kind: ExprKind::List(elems),
-                            span: tok.span.merge(end),
-                        });
-                    }
-                    elems.push(self.parse_expr()?);
-                    if !self.eat(&TokenKind::Comma) {
-                        let end = self.expect(TokenKind::RBracket)?.span;
-                        return Ok(Expr {
-                            kind: ExprKind::List(elems),
-                            span: tok.span.merge(end),
-                        });
-                    }
+                self.skip_newlines();
+                if self.peek().kind == TokenKind::RBracket {
+                    let end = self.bump().span;
+                    return Ok(Expr {
+                        kind: ExprKind::List(Vec::new()),
+                        span: tok.span.merge(end),
+                    });
                 }
+                let first = self.parse_expr()?;
+                if self.eat(&TokenKind::Semi) {
+                    let ltok = self.bump();
+                    let len = match ltok.kind {
+                        TokenKind::Int(n) if n >= 0 => n as usize,
+                        _ => {
+                            return Err(ParseError {
+                                message: format!(
+                                    "expected integer array repeat count, found {:?}",
+                                    ltok.kind
+                                ),
+                                span: ltok.span,
+                            });
+                        }
+                    };
+                    let end = self.expect(TokenKind::RBracket)?.span;
+                    return Ok(Expr {
+                        kind: ExprKind::ArrayRepeat {
+                            value: Box::new(first),
+                            len,
+                        },
+                        span: tok.span.merge(end),
+                    });
+                }
+                let mut elems = vec![first];
+                if self.eat(&TokenKind::Comma) {
+                    loop {
+                        self.skip_newlines();
+                        if self.peek().kind == TokenKind::RBracket {
+                            let end = self.bump().span;
+                            return Ok(Expr {
+                                kind: ExprKind::List(elems),
+                                span: tok.span.merge(end),
+                            });
+                        }
+                        elems.push(self.parse_expr()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            let end = self.expect(TokenKind::RBracket)?.span;
+                            return Ok(Expr {
+                                kind: ExprKind::List(elems),
+                                span: tok.span.merge(end),
+                            });
+                        }
+                    }
+                } else {
+                    let end = self.expect(TokenKind::RBracket)?.span;
+                    return Ok(Expr {
+                        kind: ExprKind::List(elems),
+                        span: tok.span.merge(end),
+                    });
+                }
+            }
+            TokenKind::Unsafe => {
+                let start = self.bump().span;
+                let blk = self.parse_block()?;
+                let span = start.merge(blk.span);
+                Ok(Expr {
+                    kind: ExprKind::Unsafe(blk),
+                    span,
+                })
             }
             TokenKind::LBrace => {
                 let blk = self.parse_block()?;

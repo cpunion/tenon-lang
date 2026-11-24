@@ -1,0 +1,65 @@
+// Tenon Standard Library — Real POSIX / Non-Blocking TCP Sockets
+
+pub record TcpStream {
+    fd Int
+}
+
+pub record TcpListener {
+    fd Int
+}
+
+pub fn tcp_listen(addr Text) Result[TcpListener, Int] {
+    let fd = net_tcp_listen(addr)
+    if fd < 0 {
+        return Err(fd)
+    }
+    Ok(TcpListener { fd = fd })
+}
+
+pub fn tcp_connect(addr Text) Result[TcpStream, Int] {
+    let fd = net_tcp_connect(addr)
+    if fd < 0 {
+        return Err(fd)
+    }
+    Ok(TcpStream { fd = fd })
+}
+
+impl TcpListener {
+    pub fn local_port(self) Int {
+        net_tcp_local_port(self.fd)
+    }
+
+    pub fn accept(self) Result[TcpStream, Int] {
+        let cfd = net_tcp_accept(self.fd)
+        if cfd < 0 {
+            return Err(cfd)
+        }
+        Ok(TcpStream { fd = cfd })
+    }
+
+    pub fn set_nonblocking(self, nb Bool) Bool {
+        net_set_nonblocking(self.fd, nb)
+    }
+
+    pub fn close(self) {
+        net_close(self.fd)
+    }
+}
+
+impl TcpStream {
+    pub fn read(self, max_bytes Int) Bytes {
+        net_read(self.fd, max_bytes)
+    }
+
+    pub fn write(self, data Bytes) Int {
+        net_write(self.fd, data)
+    }
+
+    pub fn set_nonblocking(self, nb Bool) Bool {
+        net_set_nonblocking(self.fd, nb)
+    }
+
+    pub fn close(self) {
+        net_close(self.fd)
+    }
+}

@@ -65,6 +65,7 @@ fn type_head_name(ty: &TypeExpr) -> String {
         TypeExpr::Dyn { interface, .. } => format!("dyn {}", interface),
         TypeExpr::Tuple(_, _) => "Tuple".into(),
         TypeExpr::Fn { .. } => "Fn".into(),
+        TypeExpr::Array { .. } => "Array".into(),
     }
 }
 
@@ -90,6 +91,9 @@ fn mangle_ty(ty: &TypeExpr) -> String {
                 .map(|t| mangle_ty(t))
                 .unwrap_or_else(|| "Unit".into());
             format!("fn_{}__to_{}", parts.join("_"), r)
+        }
+        TypeExpr::Array { elem, len, .. } => {
+            format!("arr_{}_{}", mangle_ty(elem), len)
         }
     }
 }
@@ -130,6 +134,11 @@ fn subst_type(ty: &TypeExpr, subst: &BTreeMap<String, TypeExpr>) -> TypeExpr {
         TypeExpr::Fn { params, ret, span } => TypeExpr::Fn {
             params: params.iter().map(|p| subst_type(p, subst)).collect(),
             ret: ret.as_ref().map(|r| Box::new(subst_type(r, subst))),
+            span: *span,
+        },
+        TypeExpr::Array { elem, len, span } => TypeExpr::Array {
+            elem: Box::new(subst_type(elem, subst)),
+            len: *len,
             span: *span,
         },
     }
@@ -252,6 +261,15 @@ fn subst_expr_types(expr: &Expr, subst: &BTreeMap<String, TypeExpr>) -> Expr {
                 .collect(),
         },
         ExprKind::Block(b) => ExprKind::Block(subst_block_types(b, subst)),
+        ExprKind::Unsafe(b) => ExprKind::Unsafe(subst_block_types(b, subst)),
+        ExprKind::Cast { expr: inner, ty } => ExprKind::Cast {
+            expr: Box::new(subst_expr_types(inner, subst)),
+            ty: subst_type(ty, subst),
+        },
+        ExprKind::ArrayRepeat { value, len } => ExprKind::ArrayRepeat {
+            value: Box::new(subst_expr_types(value, subst)),
+            len: *len,
+        },
         ExprKind::Await(inner) => ExprKind::Await(Box::new(subst_expr_types(inner, subst))),
         ExprKind::Old(inner) => ExprKind::Old(Box::new(subst_expr_types(inner, subst))),
         other => other.clone(),
@@ -329,6 +347,10 @@ fn subst_block_types(blk: &Block, subst: &BTreeMap<String, TypeExpr>) -> Block {
                     body: subst_block_types(body, subst),
                     span: *span,
                 },
+                Stmt::Defer { body, span } => Stmt::Defer {
+                    body: subst_block_types(body, subst),
+                    span: *span,
+                },
                 Stmt::While {
                     cond,
                     invariants,
@@ -382,6 +404,12 @@ struct LowerCtx {
     mono_enums: Vec<EnumDecl>,
     enum_names: BTreeSet<String>,
     enum_variants: BTreeMap<String, (String, Vec<TypeExpr>)>,
+    unions: BTreeMap<String, UnionDecl>,
+    bitfields: BTreeMap<String, BitfieldLayout>,
+    extern_fns: BTreeMap<String, ExternFnDecl>,
+    consts: BTreeMap<String, (TypeExpr, Expr)>,
+    layout: LayoutEngine,
+    defer_stack: Vec<Vec<Block>>,
     interfaces: BTreeMap<String, InterfaceDecl>,
     /// Inherent methods: `(TypeName, method_name) -> mangled_fn_name`
     inherent_methods: BTreeMap<(String, String), String>,
@@ -437,11 +465,27 @@ impl LowerCtx {
     fn type_is_rc(&self, ty: &TypeExpr) -> bool {
         let resolved = self.resolve_alias(ty);
         match resolved {
-            TypeExpr::Dyn { .. } | TypeExpr::Tuple(_, _) | TypeExpr::Fn { .. } => true,
+            TypeExpr::Dyn { .. }
+            | TypeExpr::Tuple(_, _)
+            | TypeExpr::Fn { .. }
+            | TypeExpr::Array { .. } => true,
             TypeExpr::Named { name, .. } => {
-                matches!(name.as_str(), "Text" | "List" | "Option" | "Result" | "Range")
+                matches!(
+                    name.as_str(),
+                    "Text"
+                        | "List"
+                        | "Option"
+                        | "Result"
+                        | "Range"
+                        | "Bytes"
+                        | "BytesSlice"
+                        | "AtomicInt"
+                        | "Mutex"
+                        | "Channel"
+                ) || SimdKind::from_name(&name).is_some()
                     || self.records.contains_key(&name)
                     || self.generic_records.contains_key(&name)
+                    || self.unions.contains_key(&name)
                     || self.enum_names.contains(&name)
                     || self.generic_enums.contains_key(&name)
             }
@@ -453,23 +497,30 @@ impl LowerCtx {
             || self.generic_records.contains_key(name)
             || self.enum_names.contains(name)
             || self.generic_enums.contains_key(name)
+            || self.bitfields.contains_key(name)
+            || self.unions.contains_key(name)
             || self.alias_bases.contains_key(name)
+            || ScalarKind::from_name(name).is_some()
+            || SimdKind::from_name(name).is_some()
             || matches!(
                 name,
-                "Int"
-                    | "Int64"
-                    | "Int32"
-                    | "UInt16"
-                    | "USize"
-                    | "Float"
-                    | "Float64"
-                    | "Float32"
-                    | "Bool"
+                "Bool"
                     | "Text"
+                    | "Bytes"
+                    | "BytesSlice"
                     | "Option"
                     | "Result"
                     | "List"
                     | "Range"
+                    | "Array"
+                    | "Ptr"
+                    | "MutPtr"
+                    | "CStr"
+                    | "CVoid"
+                    | "AtomicInt"
+                    | "Mutex"
+                    | "Channel"
+                    | "Simd"
             )
     }
 
@@ -593,9 +644,17 @@ impl LowerCtx {
                 ..
             } => named_ty("Bool"),
             ExprKind::Binary { op, left, right } => {
-                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
-                    && (self.is_float_ty(&self.infer_expr_ty(left, var_types))
-                        || self.is_float_ty(&self.infer_expr_ty(right, var_types)))
+                let lt = self.infer_expr_ty(left, var_types);
+                let rt = self.infer_expr_ty(right, var_types);
+                if matches!(left.kind, ExprKind::Int(_) | ExprKind::Float(_))
+                    && matches!(self.resolve_alias(&rt), TypeExpr::Named { ref name, .. } if ScalarKind::from_name(name).is_some())
+                {
+                    rt
+                } else if matches!(self.resolve_alias(&lt), TypeExpr::Named { ref name, .. } if ScalarKind::from_name(name).is_some())
+                {
+                    lt
+                } else if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod)
+                    && (self.is_float_ty(&lt) || self.is_float_ty(&rt))
                 {
                     named_ty("Float")
                 } else {
@@ -603,11 +662,27 @@ impl LowerCtx {
                 }
             }
             ExprKind::Unary { op: UnOp::Not, .. } => named_ty("Bool"),
-            ExprKind::Unary { op: UnOp::Neg, expr: inner } => {
-                if self.is_float_ty(&self.infer_expr_ty(inner, var_types)) {
+            ExprKind::Unary { op: UnOp::Neg | UnOp::BitNot, expr: inner } => {
+                let it = self.infer_expr_ty(inner, var_types);
+                if matches!(self.resolve_alias(&it), TypeExpr::Named { ref name, .. } if ScalarKind::from_name(name).is_some()) {
+                    it
+                } else if self.is_float_ty(&it) {
                     named_ty("Float")
                 } else {
                     named_ty("Int")
+                }
+            }
+            ExprKind::Cast { ty, .. } => ty.clone(),
+            ExprKind::Unsafe(b) => {
+                let mut local = var_types.clone();
+                self.infer_block_ty(b, &mut local)
+            }
+            ExprKind::ArrayRepeat { value, len } => {
+                let et = self.infer_expr_ty(value, var_types);
+                TypeExpr::Array {
+                    elem: Box::new(et),
+                    len: *len,
+                    span: expr.span,
                 }
             }
             ExprKind::Field { target, field } => {
@@ -637,17 +712,28 @@ impl LowerCtx {
                             return fl.ty.clone();
                         }
                     }
+                    if let Some(bf) = self.bitfields.get(&rname) {
+                        if bf.fields.iter().any(|f| f.name == *field) {
+                            return named_ty(bf.backing.canonical_name());
+                        }
+                    }
+                    if let Some(u) = self.unions.get(&rname) {
+                        if let Some(fl) = u.fields.iter().find(|f| f.name == *field) {
+                            return fl.ty.clone();
+                        }
+                    }
                 }
                 named_ty("Any")
             }
             ExprKind::Index { target, .. } => {
                 let t = self.resolve_alias(&self.infer_expr_ty(target, var_types));
-                if let TypeExpr::Named { name, args, .. } = t {
-                    if name == "List" && !args.is_empty() {
-                        return args[0].clone();
+                match t {
+                    TypeExpr::Array { elem, .. } => *elem,
+                    TypeExpr::Named { name, args, .. } if name == "List" && !args.is_empty() => {
+                        args[0].clone()
                     }
+                    _ => named_ty("Any"),
                 }
-                named_ty("Any")
             }
             ExprKind::Call { callee, args } => match &callee.kind {
                 ExprKind::Ident(fname) => {
@@ -735,8 +821,124 @@ impl LowerCtx {
                     if let Some((ename, ptys)) = self.enum_variants.get(fname) {
                         return self.infer_enum_ctor_ty(ename, ptys, args, var_types);
                     }
-                    if matches!(fname.as_str(), "int_to_float" | "parse_float") {
+                    if let Some(ef) = self.extern_fns.get(fname) {
+                        return ef.ret_ty.clone().unwrap_or_else(|| named_ty("Any"));
+                    }
+                    if (fname == "ptr_of" || fname == "mut_ptr_of") && args.len() == 1 {
+                        let raw_inner = self.infer_expr_ty(&args[0].value, var_types);
+                        let inner = match self.resolve_alias(&raw_inner) {
+                            TypeExpr::Array { elem, .. } => *elem,
+                            _ => raw_inner,
+                        };
+                        let pname = if fname == "mut_ptr_of" { "MutPtr" } else { "Ptr" };
+                        return generic_ty(pname, vec![inner]);
+                    }
+                    if (fname == "ptr_add" || fname == "__ptr_add") && !args.is_empty() {
+                        return self.infer_expr_ty(&args[0].value, var_types);
+                    }
+                    if (fname == "ptr_read" || fname == "volatile_read") && args.len() == 1 {
+                        if let TypeExpr::Named { name, args: pa, .. } =
+                            self.resolve_alias(&self.infer_expr_ty(&args[0].value, var_types))
+                        {
+                            if (name == "Ptr" || name == "MutPtr") && !pa.is_empty() {
+                                return pa[0].clone();
+                            }
+                        }
+                        return named_ty("Any");
+                    }
+                    if fname == "mutex_new" || fname == "__mutex_new" {
+                        return generic_ty(
+                            "Mutex",
+                            vec![args
+                                .first()
+                                .map(|a| self.infer_expr_ty(&a.value, var_types))
+                                .unwrap_or_else(|| named_ty("Any"))],
+                        );
+                    }
+                    if fname == "mutex_get" && args.len() == 1 {
+                        if let TypeExpr::Named { name, args: ma, .. } =
+                            self.resolve_alias(&self.infer_expr_ty(&args[0].value, var_types))
+                        {
+                            if name == "Mutex" && !ma.is_empty() {
+                                return ma[0].clone();
+                            }
+                        }
+                        return named_ty("Any");
+                    }
+                    if (fname == "chan_recv" || fname == "chan_try_recv") && args.len() == 1 {
+                        if let TypeExpr::Named { name, args: ca, .. } =
+                            self.resolve_alias(&self.infer_expr_ty(&args[0].value, var_types))
+                        {
+                            if name == "Channel" && !ca.is_empty() {
+                                return generic_ty("Option", vec![ca[0].clone()]);
+                            }
+                        }
+                        return generic_ty("Option", vec![named_ty("Any")]);
+                    }
+                    if matches!(fname.as_str(), "int_to_float" | "parse_float" | "simd_f64x4_lane" | "simd_f64x4_reduce_sum" | "simd_f64x4_dot") {
                         return named_ty("Float");
+                    }
+                    if matches!(fname.as_str(), "parse_f32" | "simd_f32x4_lane" | "simd_f32x4_reduce_sum" | "simd_f32x4_dot") {
+                        return named_ty("Float32");
+                    }
+                    if matches!(fname.as_str(), "bytes_get" | "slice_get" | "simd_u8x16_lane") {
+                        return named_ty("UInt8");
+                    }
+                    if matches!(fname.as_str(), "bswap16" | "bytes_read_u16_le" | "bytes_read_u16_be") {
+                        return named_ty("UInt16");
+                    }
+                    if matches!(fname.as_str(), "bswap32" | "bytes_read_u32_le" | "bytes_read_u32_be") {
+                        return named_ty("UInt32");
+                    }
+                    if matches!(fname.as_str(), "bswap64" | "rotl64" | "rotr64" | "bytes_read_u64_le" | "bytes_read_u64_be") {
+                        return named_ty("UInt64");
+                    }
+                    if matches!(fname.as_str(), "simd_i32x4_lane" | "simd_i32x4_reduce_sum") {
+                        return named_ty("Int32");
+                    }
+                    if matches!(
+                        fname.as_str(),
+                        "bytes_new"
+                            | "bytes_filled"
+                            | "bytes_set"
+                            | "bytes_push"
+                            | "bytes_write_u16_le"
+                            | "bytes_write_u16_be"
+                            | "bytes_write_u32_le"
+                            | "bytes_write_u32_be"
+                            | "bytes_write_u64_le"
+                            | "bytes_write_u64_be"
+                            | "text_to_bytes"
+                            | "net_read"
+                    ) {
+                        return named_ty("Bytes");
+                    }
+                    if fname == "bytes_slice" {
+                        return named_ty("BytesSlice");
+                    }
+                    if fname == "atomic_new" {
+                        return named_ty("AtomicInt");
+                    }
+                    if matches!(fname.as_str(), "bytes_ptr" | "text_cstr_ptr") {
+                        return generic_ty("Ptr", vec![named_ty("UInt8")]);
+                    }
+                    if matches!(fname.as_str(), "raw_alloc" | "raw_memcpy" | "raw_memset") {
+                        return generic_ty("MutPtr", vec![named_ty("UInt8")]);
+                    }
+                    if fname.starts_with("simd_f32x4_") {
+                        return named_ty("Float32x4");
+                    }
+                    if fname.starts_with("simd_f64x4_") {
+                        return named_ty("Float64x4");
+                    }
+                    if fname.starts_with("simd_i32x4_") {
+                        return named_ty("Int32x4");
+                    }
+                    if fname.starts_with("simd_i64x4_") {
+                        return named_ty("Int64x4");
+                    }
+                    if fname.starts_with("simd_u8x16_") {
+                        return named_ty("UInt8x16");
                     }
                     if matches!(
                         fname.as_str(),
@@ -745,6 +947,9 @@ impl LowerCtx {
                             | "str_concat"
                             | "buf_finish"
                             | "float_to_text"
+                            | "f32_to_text"
+                            | "bytes_to_text"
+                            | "cstr_to_text"
                             | "sys_read_line"
                             | "sys_env"
                             | "sys_cwd"
@@ -758,6 +963,10 @@ impl LowerCtx {
                     if matches!(
                         fname.as_str(),
                         "float_is_nan"
+                            | "ptr_is_null"
+                            | "atomic_cas"
+                            | "chan_send"
+                            | "net_set_nonblocking"
                             | "sys_is_eof"
                             | "sys_file_ok"
                             | "sys_write_file"
@@ -1219,9 +1428,17 @@ impl LowerCtx {
         ret_ty: Option<&TypeExpr>,
     ) -> Block {
         let saved = var_types.clone();
+        self.defer_stack.push(Vec::new());
         let mut stmts = Vec::with_capacity(blk.stmts.len());
         for s in &blk.stmts {
             match s {
+                Stmt::Defer { body, .. } => {
+                    let mut dv = var_types.clone();
+                    let lowered_defer = self.lower_block(body, &mut dv, None);
+                    if let Some(top) = self.defer_stack.last_mut() {
+                        top.push(lowered_defer);
+                    }
+                }
                 Stmt::Let {
                     name,
                     ty,
@@ -1229,11 +1446,36 @@ impl LowerCtx {
                     is_mut,
                     span,
                 } => {
-                    let pre_ty = if matches!(&value.kind, ExprKind::Range { .. }) {
-                        Some(generic_ty("Range", vec![named_ty("Int")]))
-                    } else {
-                        None
+                    let pre_ty = match &value.kind {
+                        ExprKind::Range { .. } => {
+                            Some(generic_ty("Range", vec![named_ty("Int")]))
+                        }
+                        ExprKind::RecordLit { name: rname, .. }
+                            if self.bitfields.contains_key(rname) =>
+                        {
+                            Some(named_ty(rname))
+                        }
+                        ExprKind::Call { callee, .. } => match &callee.kind {
+                            ExprKind::Field { target, field }
+                                if field == "from_raw" =>
+                            {
+                                match &target.kind {
+                                    ExprKind::Ident(bname)
+                                        if self.bitfields.contains_key(bname) =>
+                                    {
+                                        Some(named_ty(bname))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        },
+                        _ => None,
                     };
+                    let is_bf_pre = matches!(
+                        &pre_ty,
+                        Some(TypeExpr::Named { name: bn, .. }) if self.bitfields.contains_key(bn)
+                    );
                     let mut lv = self.lower_expr(value, var_types, ret_ty, ty.as_ref());
                     let inferred = pre_ty.unwrap_or_else(|| self.infer_expr_ty(&lv, var_types));
                     let eff_ty = if let Some(t) = ty {
@@ -1242,10 +1484,15 @@ impl LowerCtx {
                     } else {
                         inferred
                     };
+                    let emitted_ty = if ty.is_none() && is_bf_pre {
+                        Some(eff_ty.clone())
+                    } else {
+                        ty.clone()
+                    };
                     var_types.insert(name.clone(), eff_ty);
                     stmts.push(Stmt::Let {
                         name: name.clone(),
-                        ty: ty.clone(),
+                        ty: emitted_ty,
                         value: lv,
                         is_mut: *is_mut,
                         span: *span,
@@ -1257,6 +1504,92 @@ impl LowerCtx {
                     value,
                     span,
                 } => {
+                    // Bitfield field assignment: `bf.flag = v` -> `bf = (bf & ~(mask << off)) | (((v as U) & mask) << off)`
+                    if *op == AssignOp::Set {
+                        if let ExprKind::Field { target: bf_tgt, field } = &target.kind {
+                            let bty = self.resolve_alias(&self.infer_expr_ty(bf_tgt, var_types));
+                            if let TypeExpr::Named { name: bname, .. } = &bty {
+                                if let Some(bl) = self.bitfields.get(bname).cloned() {
+                                    if let Some(fl) = bl.fields.iter().find(|f| f.name == *field) {
+                                        let lbf = self.lower_expr(bf_tgt, var_types, ret_ty, None);
+                                        let bty_expr = named_ty(bl.backing.canonical_name());
+                                        let lv = self.lower_expr(value, var_types, ret_ty, Some(&bty_expr));
+                                        let clear_mask = !(fl.mask << fl.bit_offset) as i64;
+                                        let cleared = Expr {
+                                            kind: ExprKind::Binary {
+                                                op: BinOp::BitAnd,
+                                                left: Box::new(lbf.clone()),
+                                                right: Box::new(Expr {
+                                                    kind: ExprKind::Cast {
+                                                        expr: Box::new(Expr {
+                                                            kind: ExprKind::Int(clear_mask),
+                                                            span: *span,
+                                                        }),
+                                                        ty: bty_expr.clone(),
+                                                    },
+                                                    span: *span,
+                                                }),
+                                            },
+                                            span: *span,
+                                        };
+                                        let masked_v = Expr {
+                                            kind: ExprKind::Binary {
+                                                op: BinOp::BitAnd,
+                                                left: Box::new(Expr {
+                                                    kind: ExprKind::Cast {
+                                                        expr: Box::new(lv),
+                                                        ty: bty_expr.clone(),
+                                                    },
+                                                    span: *span,
+                                                }),
+                                                right: Box::new(Expr {
+                                                    kind: ExprKind::Cast {
+                                                        expr: Box::new(Expr {
+                                                            kind: ExprKind::Int(fl.mask as i64),
+                                                            span: *span,
+                                                        }),
+                                                        ty: bty_expr.clone(),
+                                                    },
+                                                    span: *span,
+                                                }),
+                                            },
+                                            span: *span,
+                                        };
+                                        let shifted_v = if fl.bit_offset == 0 {
+                                            masked_v
+                                        } else {
+                                            Expr {
+                                                kind: ExprKind::Binary {
+                                                    op: BinOp::Shl,
+                                                    left: Box::new(masked_v),
+                                                    right: Box::new(Expr {
+                                                        kind: ExprKind::Int(fl.bit_offset as i64),
+                                                        span: *span,
+                                                    }),
+                                                },
+                                                span: *span,
+                                            }
+                                        };
+                                        let updated = Expr {
+                                            kind: ExprKind::Binary {
+                                                op: BinOp::BitOr,
+                                                left: Box::new(cleared),
+                                                right: Box::new(shifted_v),
+                                            },
+                                            span: *span,
+                                        };
+                                        stmts.push(Stmt::Assign {
+                                            target: lbf,
+                                            op: AssignOp::Set,
+                                            value: updated,
+                                            span: *span,
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let lt = self.lower_expr(target, var_types, ret_ty, None);
                     let target_exp = self.infer_expr_ty(&lt, var_types);
                     let exp_opt = if target_exp.display_name() != "Any" {
@@ -1300,10 +1633,49 @@ impl LowerCtx {
                             le
                         }
                     });
-                    stmts.push(Stmt::Return {
-                        value: lv,
-                        span: *span,
-                    });
+                    let has_defers = self.defer_stack.iter().any(|scope| !scope.is_empty());
+                    if has_defers {
+                        let final_val = if let Some(val_expr) = lv {
+                            let tid = self.fresh_id();
+                            let tname = format!("__defer_ret_{}", tid);
+                            let vty = ret_ty
+                                .cloned()
+                                .unwrap_or_else(|| self.infer_expr_ty(&val_expr, var_types));
+                            stmts.push(Stmt::Let {
+                                name: tname.clone(),
+                                ty: Some(vty),
+                                value: val_expr,
+                                is_mut: false,
+                                span: *span,
+                            });
+                            Some(Expr {
+                                kind: ExprKind::Ident(tname),
+                                span: *span,
+                            })
+                        } else {
+                            None
+                        };
+                        for scope in self.defer_stack.iter().rev() {
+                            for db in scope.iter().rev() {
+                                stmts.push(Stmt::Expr {
+                                    expr: Expr {
+                                        kind: ExprKind::Block(db.clone()),
+                                        span: db.span,
+                                    },
+                                    span: db.span,
+                                });
+                            }
+                        }
+                        stmts.push(Stmt::Return {
+                            value: final_val,
+                            span: *span,
+                        });
+                    } else {
+                        stmts.push(Stmt::Return {
+                            value: lv,
+                            span: *span,
+                        });
+                    }
                 }
                 Stmt::Assert { cond, span } => stmts.push(Stmt::Assert {
                     cond: self.lower_expr(cond, var_types, ret_ty, None),
@@ -1766,13 +2138,15 @@ impl LowerCtx {
                                     span: sp,
                                 });
                             }
-                            // Case 4: `List[T]` (default iterable)
+                            // Case 4: `Array[T, N]` or `List[T]` (default iterable)
                             _ => {
-                                let elem_ty = match &iter_ty {
-                                    TypeExpr::Named { name, args, .. } if name == "List" => {
-                                        args.first().cloned().unwrap_or_else(|| named_ty("Any"))
-                                    }
-                                    _ => named_ty("Any"),
+                                let (elem_ty, fixed_len) = match &iter_ty {
+                                    TypeExpr::Array { elem, len, .. } => ((**elem).clone(), Some(*len)),
+                                    TypeExpr::Named { name, args, .. } if name == "List" => (
+                                        args.first().cloned().unwrap_or_else(|| named_ty("Any")),
+                                        None,
+                                    ),
+                                    _ => (named_ty("Any"), None),
                                 };
                                 let src_name = format!("__for_src_{}", id);
                                 stmts.push(Stmt::Let {
@@ -1782,10 +2156,13 @@ impl LowerCtx {
                                     is_mut: false,
                                     span: sp,
                                 });
-                                stmts.push(Stmt::Let {
-                                    name: end_name.clone(),
-                                    ty: Some(named_ty("Int")),
-                                    value: Expr {
+                                let end_expr = if let Some(n) = fixed_len {
+                                    Expr {
+                                        kind: ExprKind::Int(n as i64),
+                                        span: sp,
+                                    }
+                                } else {
+                                    Expr {
                                         kind: ExprKind::Call {
                                             callee: Box::new(Expr {
                                                 kind: ExprKind::Ident("len".into()),
@@ -1800,7 +2177,12 @@ impl LowerCtx {
                                             }],
                                         },
                                         span: sp,
-                                    },
+                                    }
+                                };
+                                stmts.push(Stmt::Let {
+                                    name: end_name.clone(),
+                                    ty: Some(named_ty("Int")),
+                                    value: end_expr,
                                     is_mut: false,
                                     span: sp,
                                 });
@@ -1926,14 +2308,53 @@ impl LowerCtx {
                         }
                     }
                 }
+                Stmt::Break { span } => {
+                    if let Some(top) = self.defer_stack.last() {
+                        for db in top.iter().rev() {
+                            stmts.push(Stmt::Expr {
+                                expr: Expr {
+                                    kind: ExprKind::Block(db.clone()),
+                                    span: db.span,
+                                },
+                                span: db.span,
+                            });
+                        }
+                    }
+                    stmts.push(Stmt::Break { span: *span });
+                }
+                Stmt::Continue { span } => {
+                    if let Some(top) = self.defer_stack.last() {
+                        for db in top.iter().rev() {
+                            stmts.push(Stmt::Expr {
+                                expr: Expr {
+                                    kind: ExprKind::Block(db.clone()),
+                                    span: db.span,
+                                },
+                                span: db.span,
+                            });
+                        }
+                    }
+                    stmts.push(Stmt::Continue { span: *span });
+                }
                 Stmt::Expr { expr, span } => stmts.push(Stmt::Expr {
                     expr: self.lower_expr(expr, var_types, ret_ty, None),
                     span: *span,
                 }),
-                other => stmts.push(other.clone()),
             }
         }
-        let tail = blk.tail.as_ref().map(|t| {
+        let scope_defers = self.defer_stack.pop().unwrap_or_default();
+        let tail = if scope_defers.is_empty() {
+            blk.tail.as_ref().map(|t| {
+                let lt = self.lower_expr(t, var_types, ret_ty, ret_ty);
+                let boxed = if let Some(rt) = ret_ty {
+                    let aty = self.infer_expr_ty(&lt, var_types);
+                    self.maybe_box_dyn(lt, rt, &aty)
+                } else {
+                    lt
+                };
+                Box::new(boxed)
+            })
+        } else if let Some(t) = blk.tail.as_ref() {
             let lt = self.lower_expr(t, var_types, ret_ty, ret_ty);
             let boxed = if let Some(rt) = ret_ty {
                 let aty = self.infer_expr_ty(&lt, var_types);
@@ -1941,8 +2362,43 @@ impl LowerCtx {
             } else {
                 lt
             };
-            Box::new(boxed)
-        });
+            let tid = self.fresh_id();
+            let tname = format!("__defer_tail_{}", tid);
+            let tty = ret_ty
+                .cloned()
+                .unwrap_or_else(|| self.infer_expr_ty(&boxed, var_types));
+            stmts.push(Stmt::Let {
+                name: tname.clone(),
+                ty: Some(tty),
+                value: boxed,
+                is_mut: false,
+                span: t.span,
+            });
+            for db in scope_defers.iter().rev() {
+                stmts.push(Stmt::Expr {
+                    expr: Expr {
+                        kind: ExprKind::Block(db.clone()),
+                        span: db.span,
+                    },
+                    span: db.span,
+                });
+            }
+            Some(Box::new(Expr {
+                kind: ExprKind::Ident(tname),
+                span: t.span,
+            }))
+        } else {
+            for db in scope_defers.iter().rev() {
+                stmts.push(Stmt::Expr {
+                    expr: Expr {
+                        kind: ExprKind::Block(db.clone()),
+                        span: db.span,
+                    },
+                    span: db.span,
+                });
+            }
+            None
+        };
         *var_types = saved;
         Block {
             stmts,
@@ -2102,6 +2558,7 @@ impl LowerCtx {
             is_pure: false,
             is_async: false,
             is_test: false,
+            is_unsafe: false,
             name: cname.clone(),
             type_params: vec![],
             type_param_bounds: BTreeMap::new(),
@@ -2212,27 +2669,85 @@ impl LowerCtx {
     ) -> Expr {
         let sp = expr.span;
         let kind = match &expr.kind {
+            ExprKind::Float(x) => {
+                if let Some(exp) = expected_ty {
+                    if matches!(self.resolve_alias(exp), TypeExpr::Named { ref name, .. } if name == "Float32") {
+                        return Expr {
+                            kind: ExprKind::Cast {
+                                expr: Box::new(Expr {
+                                    kind: ExprKind::Float(*x),
+                                    span: sp,
+                                }),
+                                ty: named_ty("Float32"),
+                            },
+                            span: sp,
+                        };
+                    }
+                }
+                ExprKind::Float(*x)
+            }
+            ExprKind::Ident(s) => {
+                if !var_types.contains_key(s) {
+                    if let Some((_, cval)) = self.consts.get(s).cloned() {
+                        return self.lower_expr(&cval, var_types, ret_ty, expected_ty);
+                    }
+                }
+                ExprKind::Ident(s.clone())
+            }
+            ExprKind::Unsafe(b) => {
+                let mut lv = var_types.clone();
+                ExprKind::Block(self.lower_block(b, &mut lv, expected_ty))
+            }
+            ExprKind::Cast { expr: inner, ty } => ExprKind::Cast {
+                expr: Box::new(self.lower_expr(inner, var_types, ret_ty, None)),
+                ty: ty.clone(),
+            },
+            ExprKind::ArrayRepeat { value, len } => {
+                let exp_elem = match expected_ty.map(|t| self.resolve_alias(t)) {
+                    Some(TypeExpr::Array { elem, .. }) => Some(*elem),
+                    _ => None,
+                };
+                ExprKind::ArrayRepeat {
+                    value: Box::new(self.lower_expr(value, var_types, ret_ty, exp_elem.as_ref())),
+                    len: *len,
+                }
+            }
             ExprKind::Binary { op, left, right } => {
-                let ll = self.lower_expr(left, var_types, ret_ty, None);
-                let lr = self.lower_expr(right, var_types, ret_ty, None);
+                let arith_exp = if matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                ) {
+                    expected_ty
+                } else {
+                    None
+                };
+                let ll0 = self.lower_expr(left, var_types, ret_ty, arith_exp);
+                let l_inferred = self.infer_expr_ty(&ll0, var_types);
+                let r_exp = if matches!(self.resolve_alias(&l_inferred), TypeExpr::Named { ref name, .. } if name == "Float32") {
+                    Some(named_ty("Float32"))
+                } else {
+                    arith_exp.cloned()
+                };
+                let lr = self.lower_expr(right, var_types, ret_ty, r_exp.as_ref());
+                let r_inferred = self.infer_expr_ty(&lr, var_types);
+                let ll = if matches!(left.kind, ExprKind::Float(_))
+                    && matches!(self.resolve_alias(&r_inferred), TypeExpr::Named { ref name, .. } if name == "Float32")
+                    && !matches!(self.resolve_alias(&l_inferred), TypeExpr::Named { ref name, .. } if name == "Float32")
+                {
+                    self.lower_expr(left, var_types, ret_ty, Some(&named_ty("Float32")))
+                } else {
+                    ll0
+                };
                 if matches!(op, BinOp::Eq | BinOp::Ne) {
                     let lty = self.infer_expr_ty(&ll, var_types);
                     let lbase = self.resolve_alias(&lty);
                     if let TypeExpr::Named { name, args: rargs, .. } = &lbase {
-                        let is_prim = matches!(
-                            name.as_str(),
-                            "Int"
-                                | "Int64"
-                                | "Int32"
-                                | "UInt16"
-                                | "USize"
-                                | "Float"
-                                | "Float64"
-                                | "Float32"
-                                | "Bool"
-                                | "Text"
-                                | "Any"
-                        );
+                        let is_prim = ScalarKind::from_name(name).is_some()
+                            || self.bitfields.contains_key(name)
+                            || matches!(
+                                name.as_str(),
+                                "Bool" | "Text" | "Any" | "Ptr" | "MutPtr" | "CStr"
+                            );
                         if !is_prim {
                             let lookup_name = if let TypeExpr::Named { name: orig, .. } = &lty {
                                 if self.lookup_concrete_method(orig, "eq").is_some() {
@@ -2294,14 +2809,64 @@ impl LowerCtx {
                     right: Box::new(lr),
                 }
             }
-            ExprKind::Unary { op, expr: inner } => ExprKind::Unary {
-                op: *op,
-                expr: Box::new(self.lower_expr(inner, var_types, ret_ty, None)),
-            },
-            ExprKind::Field { target, field } => ExprKind::Field {
-                target: Box::new(self.lower_expr(target, var_types, ret_ty, None)),
-                field: field.clone(),
-            },
+            ExprKind::Unary { op, expr: inner } => {
+                let inner_exp = if matches!(op, UnOp::Neg | UnOp::BitNot) {
+                    expected_ty
+                } else {
+                    None
+                };
+                ExprKind::Unary {
+                    op: *op,
+                    expr: Box::new(self.lower_expr(inner, var_types, ret_ty, inner_exp)),
+                }
+            }
+            ExprKind::Field { target, field } => {
+                let lt = self.lower_expr(target, var_types, ret_ty, None);
+                let tty = self.resolve_alias(&self.infer_expr_ty(&lt, var_types));
+                if let TypeExpr::Named { name: bname, .. } = &tty {
+                    if let Some(bl) = self.bitfields.get(bname).cloned() {
+                        if let Some(fl) = bl.fields.iter().find(|f| f.name == *field) {
+                            let bty = named_ty(bl.backing.canonical_name());
+                            let shifted = if fl.bit_offset == 0 {
+                                lt
+                            } else {
+                                Expr {
+                                    kind: ExprKind::Binary {
+                                        op: BinOp::Shr,
+                                        left: Box::new(lt),
+                                        right: Box::new(Expr {
+                                            kind: ExprKind::Int(fl.bit_offset as i64),
+                                            span: sp,
+                                        }),
+                                    },
+                                    span: sp,
+                                }
+                            };
+                            return Expr {
+                                kind: ExprKind::Binary {
+                                    op: BinOp::BitAnd,
+                                    left: Box::new(shifted),
+                                    right: Box::new(Expr {
+                                        kind: ExprKind::Cast {
+                                            expr: Box::new(Expr {
+                                                kind: ExprKind::Int(fl.mask as i64),
+                                                span: sp,
+                                            }),
+                                            ty: bty,
+                                        },
+                                        span: sp,
+                                    }),
+                                },
+                                span: sp,
+                            };
+                        }
+                    }
+                }
+                ExprKind::Field {
+                    target: Box::new(lt),
+                    field: field.clone(),
+                }
+            }
             ExprKind::Index { target, index } => ExprKind::Index {
                 target: Box::new(self.lower_expr(target, var_types, ret_ty, None)),
                 index: Box::new(self.lower_expr(index, var_types, ret_ty, None)),
@@ -2435,6 +3000,72 @@ impl LowerCtx {
                 version,
                 fields,
             } => {
+                // Bitfield literal -> packed unboxed unsigned integer!
+                if let Some(bl) = self.bitfields.get(name).cloned() {
+                    let bty = named_ty(bl.backing.canonical_name());
+                    let mut acc = Expr {
+                        kind: ExprKind::Cast {
+                            expr: Box::new(Expr {
+                                kind: ExprKind::Int(0),
+                                span: sp,
+                            }),
+                            ty: bty.clone(),
+                        },
+                        span: sp,
+                    };
+                    for (fname, fval) in fields {
+                        if let Some(fl) = bl.fields.iter().find(|f| f.name == *fname) {
+                            let lv = self.lower_expr(fval, var_types, ret_ty, Some(&bty));
+                            let masked = Expr {
+                                kind: ExprKind::Binary {
+                                    op: BinOp::BitAnd,
+                                    left: Box::new(Expr {
+                                        kind: ExprKind::Cast {
+                                            expr: Box::new(lv),
+                                            ty: bty.clone(),
+                                        },
+                                        span: sp,
+                                    }),
+                                    right: Box::new(Expr {
+                                        kind: ExprKind::Cast {
+                                            expr: Box::new(Expr {
+                                                kind: ExprKind::Int(fl.mask as i64),
+                                                span: sp,
+                                            }),
+                                            ty: bty.clone(),
+                                        },
+                                        span: sp,
+                                    }),
+                                },
+                                span: sp,
+                            };
+                            let shifted = if fl.bit_offset == 0 {
+                                masked
+                            } else {
+                                Expr {
+                                    kind: ExprKind::Binary {
+                                        op: BinOp::Shl,
+                                        left: Box::new(masked),
+                                        right: Box::new(Expr {
+                                            kind: ExprKind::Int(fl.bit_offset as i64),
+                                            span: sp,
+                                        }),
+                                    },
+                                    span: sp,
+                                }
+                            };
+                            acc = Expr {
+                                kind: ExprKind::Binary {
+                                    op: BinOp::BitOr,
+                                    left: Box::new(acc),
+                                    right: Box::new(shifted),
+                                },
+                                span: sp,
+                            };
+                        }
+                    }
+                    return acc;
+                }
                 let rec_opt = self
                     .records
                     .get(name)
@@ -2450,18 +3081,26 @@ impl LowerCtx {
                         }
                     }
                 }
+                let union_opt = self.unions.get(name).cloned();
                 let new_fields = fields
                     .iter()
                     .map(|(k, v)| {
-                        let f_expected = rec_opt.as_ref().and_then(|rec| {
-                            rec.fields.iter().find(|f| f.name == *k).map(|fd| {
-                                if rec_subst.is_empty() {
-                                    fd.ty.clone()
-                                } else {
-                                    subst_type(&fd.ty, &rec_subst)
-                                }
+                        let f_expected = rec_opt
+                            .as_ref()
+                            .and_then(|rec| {
+                                rec.fields.iter().find(|f| f.name == *k).map(|fd| {
+                                    if rec_subst.is_empty() {
+                                        fd.ty.clone()
+                                    } else {
+                                        subst_type(&fd.ty, &rec_subst)
+                                    }
+                                })
                             })
-                        });
+                            .or_else(|| {
+                                union_opt.as_ref().and_then(|u| {
+                                    u.fields.iter().find(|f| f.name == *k).map(|fd| fd.ty.clone())
+                                })
+                            });
                         let mut lv = self.lower_expr(v, var_types, ret_ty, f_expected.as_ref());
                         if let Some(fty) = &f_expected {
                             let aty = self.infer_expr_ty(&lv, var_types);
@@ -2536,9 +3175,78 @@ impl LowerCtx {
             }
             ExprKind::Call { callee, args } => {
                 match &callee.kind {
-                    // 1. Explicit generic call `decode[Order](raw)`
+                    // 1. Explicit generic call `decode[Order](raw)` or layout/ptr/chan intrinsics
                     ExprKind::GenericInst { expr: inner, type_args } => {
                         if let ExprKind::Ident(fname) = &inner.kind {
+                            if fname == "size_of" && args.is_empty() {
+                                let sz = type_args
+                                    .first()
+                                    .map(|t| self.layout.size_and_align(t).0 as i64)
+                                    .unwrap_or(8);
+                                return Expr {
+                                    kind: ExprKind::Cast {
+                                        expr: Box::new(Expr {
+                                            kind: ExprKind::Int(sz),
+                                            span: sp,
+                                        }),
+                                        ty: named_ty("USize"),
+                                    },
+                                    span: sp,
+                                };
+                            }
+                            if fname == "align_of" && args.is_empty() {
+                                let al = type_args
+                                    .first()
+                                    .map(|t| self.layout.size_and_align(t).1 as i64)
+                                    .unwrap_or(8);
+                                return Expr {
+                                    kind: ExprKind::Cast {
+                                        expr: Box::new(Expr {
+                                            kind: ExprKind::Int(al),
+                                            span: sp,
+                                        }),
+                                        ty: named_ty("USize"),
+                                    },
+                                    span: sp,
+                                };
+                            }
+                            if fname == "null_ptr" && args.is_empty() {
+                                let target_ty = generic_ty(
+                                    "MutPtr",
+                                    vec![type_args.first().cloned().unwrap_or_else(|| named_ty("CVoid"))],
+                                );
+                                return Expr {
+                                    kind: ExprKind::Cast {
+                                        expr: Box::new(Expr {
+                                            kind: ExprKind::Int(0),
+                                            span: sp,
+                                        }),
+                                        ty: target_ty,
+                                    },
+                                    span: sp,
+                                };
+                            }
+                            if fname == "chan_new" && args.is_empty() {
+                                let is_rc = type_args
+                                    .first()
+                                    .is_some_and(|t| self.type_is_rc(t));
+                                return Expr {
+                                    kind: ExprKind::Call {
+                                        callee: Box::new(Expr {
+                                            kind: ExprKind::Ident("chan_new".into()),
+                                            span: callee.span,
+                                        }),
+                                        args: vec![CallArg {
+                                            name: None,
+                                            value: Expr {
+                                                kind: ExprKind::Int(if is_rc { 1 } else { 0 }),
+                                                span: sp,
+                                            },
+                                        }],
+                                    },
+                                    span: sp,
+                                };
+                            }
                             if let Some(tmpl) = self.generic_templates.get(fname).cloned() {
                                 let mut subst = BTreeMap::new();
                                 for (tp, ta) in tmpl.type_params.iter().zip(type_args.iter()) {
@@ -2584,6 +3292,101 @@ impl LowerCtx {
                     }
                     // 2. Direct function call OR indirect closure variable call!
                     ExprKind::Ident(fname) => {
+                        if fname == "offset_of" && args.len() == 2 {
+                            let off = if let (ExprKind::Ident(tname), ExprKind::Str(field_name)) =
+                                (&args[0].value.kind, &args[1].value.kind)
+                            {
+                                self.layout.offset_of(tname, field_name).unwrap_or(0) as i64
+                            } else {
+                                0
+                            };
+                            return Expr {
+                                kind: ExprKind::Cast {
+                                    expr: Box::new(Expr {
+                                        kind: ExprKind::Int(off),
+                                        span: sp,
+                                    }),
+                                    ty: named_ty("USize"),
+                                },
+                                span: sp,
+                            };
+                        }
+                        if fname == "mutex_new" && args.len() == 1 {
+                            let lv = self.lower_expr(&args[0].value, var_types, ret_ty, None);
+                            let vty = self.infer_expr_ty(&lv, var_types);
+                            let is_rc = if self.type_is_rc(&vty) { 1 } else { 0 };
+                            return Expr {
+                                kind: ExprKind::Call {
+                                    callee: callee.clone(),
+                                    args: vec![
+                                        CallArg { name: None, value: lv },
+                                        CallArg {
+                                            name: None,
+                                            value: Expr {
+                                                kind: ExprKind::Int(is_rc),
+                                                span: sp,
+                                            },
+                                        },
+                                    ],
+                                },
+                                span: sp,
+                            };
+                        }
+                        if fname == "chan_new" && args.is_empty() {
+                            let is_rc = match expected_ty.map(|t| self.resolve_alias(t)) {
+                                Some(TypeExpr::Named { name, args: ca, .. })
+                                    if name == "Channel" && !ca.is_empty() =>
+                                {
+                                    if self.type_is_rc(&ca[0]) { 1 } else { 0 }
+                                }
+                                _ => 0,
+                            };
+                            return Expr {
+                                kind: ExprKind::Call {
+                                    callee: callee.clone(),
+                                    args: vec![CallArg {
+                                        name: None,
+                                        value: Expr {
+                                            kind: ExprKind::Int(is_rc),
+                                            span: sp,
+                                        },
+                                    }],
+                                },
+                                span: sp,
+                            };
+                        }
+                        if fname == "ptr_add" && args.len() == 2 {
+                            let lp = self.lower_expr(&args[0].value, var_types, ret_ty, None);
+                            let ln = self.lower_expr(&args[1].value, var_types, ret_ty, None);
+                            let elem_sz = match self.resolve_alias(&self.infer_expr_ty(&lp, var_types)) {
+                                TypeExpr::Named { name, args: pa, .. }
+                                    if (name == "Ptr" || name == "MutPtr") && !pa.is_empty() =>
+                                {
+                                    self.layout.size_and_align(&pa[0]).0.max(1) as i64
+                                }
+                                _ => 1,
+                            };
+                            return Expr {
+                                kind: ExprKind::Call {
+                                    callee: Box::new(Expr {
+                                        kind: ExprKind::Ident("__ptr_add".into()),
+                                        span: callee.span,
+                                    }),
+                                    args: vec![
+                                        CallArg { name: None, value: lp },
+                                        CallArg { name: None, value: ln },
+                                        CallArg {
+                                            name: None,
+                                            value: Expr {
+                                                kind: ExprKind::Int(elem_sz),
+                                                span: sp,
+                                            },
+                                        },
+                                    ],
+                                },
+                                span: sp,
+                            };
+                        }
                         // 2a. Local variable / parameter of type `fn(...)` -> `__call_closure(fname, args...)`
                         if let Some(vty) = var_types.get(fname).cloned() {
                             if let TypeExpr::Fn { params: fparams, .. } = self.resolve_alias(&vty) {
@@ -2640,12 +3443,18 @@ impl LowerCtx {
                                 };
                             }
                         }
-                        // 2c. Concrete function / builtin / enum variant call
-                        let expected_ptys: Vec<TypeExpr> = self
-                            .fn_sigs
-                            .get(fname)
-                            .map(|sig| sig.params.iter().map(|p| p.ty.clone()).collect())
-                            .unwrap_or_default();
+                        // 2c. Concrete function / extern fn / builtin / enum variant call
+                        let expected_ptys: Vec<TypeExpr> = if let Some(sig) = self.fn_sigs.get(fname) {
+                            sig.params.iter().map(|p| p.ty.clone()).collect()
+                        } else if let Some(ef) = self.extern_fns.get(fname) {
+                            ef.params.iter().map(|p| p.ty.clone()).collect()
+                        } else if fname == "simd_f32x4_new" {
+                            vec![named_ty("Float32"); 4]
+                        } else if fname == "simd_f32x4_splat" || fname == "f32_to_text" {
+                            vec![named_ty("Float32")]
+                        } else {
+                            Vec::new()
+                        };
                         let mut empty_subst = BTreeMap::new();
                         let mut lowered_args = self.lower_args_two_pass(
                             args,
@@ -2747,6 +3556,18 @@ impl LowerCtx {
                             }
                         }
                         if let ExprKind::Ident(ename) = &target.kind {
+                            if field == "from_raw" && args.len() == 1 {
+                                if let Some(bl) = self.bitfields.get(ename).cloned() {
+                                    let lv = self.lower_expr(&args[0].value, var_types, ret_ty, None);
+                                    return Expr {
+                                        kind: ExprKind::Cast {
+                                            expr: Box::new(lv),
+                                            ty: named_ty(bl.backing.canonical_name()),
+                                        },
+                                        span: sp,
+                                    };
+                                }
+                            }
                             if self.enum_variants.contains_key(&format!("{}.{}", ename, field)) {
                                 let lowered_args: Vec<CallArg> = args
                                     .iter()
@@ -2844,6 +3665,17 @@ impl LowerCtx {
                                 }
                             }
                             TypeExpr::Named { name, args: rargs, .. } => {
+                                if field == "raw" && args.is_empty() {
+                                    if let Some(bl) = self.bitfields.get(name).cloned() {
+                                        return Expr {
+                                            kind: ExprKind::Cast {
+                                                expr: Box::new(lowered_target),
+                                                ty: named_ty(bl.backing.canonical_name()),
+                                            },
+                                            span: sp,
+                                        };
+                                    }
+                                }
                                 let lookup_name = if let TypeExpr::Named { name: orig, .. } = &recv_ty {
                                     if self.lookup_concrete_method(orig, field).is_some() {
                                         orig.clone()
@@ -3118,6 +3950,14 @@ impl LowerCtx {
                 args,
                 span,
             } => {
+                if let Some(bl) = self.bitfields.get(name) {
+                    return TypeExpr::Named {
+                        name: bl.backing.canonical_name().to_string(),
+                        version: None,
+                        args: Vec::new(),
+                        span: *span,
+                    };
+                }
                 if self.generic_records.contains_key(name) && !args.is_empty() {
                     let mono_name = self.ensure_record_monomorphized(name, args);
                     return TypeExpr::Named {
@@ -3143,6 +3983,11 @@ impl LowerCtx {
                     span: *span,
                 }
             }
+            TypeExpr::Array { elem, len, span } => TypeExpr::Array {
+                elem: Box::new(self.rewrite_generic_record_ty(elem)),
+                len: *len,
+                span: *span,
+            },
             TypeExpr::Dyn {
                 interface,
                 args,
@@ -3503,9 +4348,16 @@ impl LowerCtx {
                     self.rewrite_expr_generic_records(&mut arm.body, &av, expected_ty);
                 }
             }
-            ExprKind::Block(b) => {
+            ExprKind::Block(b) | ExprKind::Unsafe(b) => {
                 let mut bv = var_types.clone();
                 self.rewrite_block_generic_records(b, &mut bv, expected_ty);
+            }
+            ExprKind::Cast { expr, ty } => {
+                self.rewrite_expr_generic_records(expr, var_types, None);
+                *ty = self.rewrite_generic_record_ty(ty);
+            }
+            ExprKind::ArrayRepeat { value, .. } => {
+                self.rewrite_expr_generic_records(value, var_types, None);
             }
             _ => {}
         }
@@ -3583,6 +4435,9 @@ fn collect_free_vars_block(blk: &Block, bound: &BTreeSet<String>, free: &mut BTr
                 collect_free_vars_expr(cond, &local_bound, free);
                 collect_free_vars_block(body, &local_bound, free);
             }
+            Stmt::Defer { body, .. } => {
+                collect_free_vars_block(body, &local_bound, free);
+            }
             Stmt::For { binding, iter, body, .. } => {
                 collect_free_vars_expr(iter, &local_bound, free);
                 let mut fbound = local_bound.clone();
@@ -3626,6 +4481,8 @@ fn collect_free_vars_expr(expr: &Expr, bound: &BTreeSet<String>, free: &mut BTre
         | ExprKind::Try(inner)
         | ExprKind::Await(inner)
         | ExprKind::Old(inner)
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::ArrayRepeat { value: inner, .. }
         | ExprKind::GenericInst { expr: inner, .. } => {
             collect_free_vars_expr(inner, bound, free);
         }
@@ -3669,7 +4526,7 @@ fn collect_free_vars_expr(expr: &Expr, bound: &BTreeSet<String>, free: &mut BTre
                 collect_free_vars_expr(&arm.body, &abound, free);
             }
         }
-        ExprKind::Block(b) => collect_free_vars_block(b, bound, free),
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => collect_free_vars_block(b, bound, free),
         ExprKind::Lambda { params, body, .. } => {
             let mut lbound = bound.clone();
             for p in params {
@@ -3713,6 +4570,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
         expand_derives(&mut expanded);
     }
 
+    let layout = LayoutEngine::from_program(&expanded);
     let mut ctx = LowerCtx {
         alias_bases: BTreeMap::new(),
         records: BTreeMap::new(),
@@ -3723,6 +4581,11 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
         mono_enums: Vec::new(),
         enum_names: BTreeSet::new(),
         enum_variants: BTreeMap::new(),
+        unions: BTreeMap::new(),
+        bitfields: BTreeMap::new(),
+        extern_fns: BTreeMap::new(),
+        consts: BTreeMap::new(),
+        layout,
         interfaces: BTreeMap::new(),
         inherent_methods: BTreeMap::new(),
         impl_methods: BTreeMap::new(),
@@ -3734,9 +4597,10 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
         lifted_closures: Vec::new(),
         next_tmp_id: 0,
         dyn_interfaces: BTreeMap::new(),
+        defer_stack: Vec::new(),
     };
 
-    // Pass 1: collect types, interfaces, and top-level fns
+    // Pass 1: collect types, interfaces, unions, bitfields, externs, consts, and top-level fns
     for item in &expanded.items {
         match item {
             Item::TypeAlias(ta) => {
@@ -3762,6 +4626,20 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
                     ctx.enum_variants
                         .insert(format!("{}.{}", e.name, v.name), (e.name.clone(), ptys));
                 }
+            }
+            Item::Union(u) => {
+                ctx.unions.insert(u.name.clone(), u.clone());
+            }
+            Item::Bitfield(bf) => {
+                if let Some(bl) = ctx.layout.bitfield_layout(&bf.name) {
+                    ctx.bitfields.insert(bf.name.clone(), bl);
+                }
+            }
+            Item::ExternFn(ef) => {
+                ctx.extern_fns.insert(ef.name.clone(), ef.clone());
+            }
+            Item::Const(c) => {
+                ctx.consts.insert(c.name.clone(), (c.ty.clone(), c.value.clone()));
             }
             Item::Interface(iface) => {
                 ctx.interfaces.insert(iface.name.clone(), iface.clone());
@@ -3860,6 +4738,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
                                     is_pub: true,
                                     is_pure: im.is_pure,
                                     is_async: im.is_async,
+                                    is_unsafe: false,
                                     is_test: false,
                                     name: mangled.clone(),
                                     type_params: imp.type_params.clone(),
@@ -3946,7 +4825,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
                     final_items.push(Item::Fn(ctx.lower_fn(f)));
                 }
             }
-            Item::Impl(_) => {} // flattened above
+            Item::Impl(_) | Item::Bitfield(_) | Item::Const(_) => {} // lowered/inlined
             other => final_items.push(other.clone()),
         }
     }
@@ -3960,9 +4839,12 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
         final_items.push(Item::Fn(cf));
     }
 
-    // Pass 4: Monomorphize all concrete generic record & generic enum types
-    // (e.g. `Map[Text, Text]` -> `Map__Text_Text`, `Tree[Int]` -> `Tree__Int`)
-    if !ctx.generic_records.is_empty() || !ctx.generic_enums.is_empty() {
+    // Pass 4: Monomorphize all concrete generic record & generic enum types, and lower bitfield types
+    // (e.g. `Map[Text, Text]` -> `Map__Text_Text`, `Tree[Int]` -> `Tree__Int`, `Flags` -> `UInt8`)
+    if !ctx.generic_records.is_empty()
+        || !ctx.generic_enums.is_empty()
+        || !ctx.bitfields.is_empty()
+    {
         let mut rewritten_items: Vec<Item> = Vec::with_capacity(final_items.len());
         for mut item in final_items {
             match &mut item {
@@ -3972,6 +4854,19 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
                     }
                     for f in &mut r.fields {
                         f.ty = ctx.rewrite_generic_record_ty(&f.ty);
+                    }
+                }
+                Item::Union(u) => {
+                    for f in &mut u.fields {
+                        f.ty = ctx.rewrite_generic_record_ty(&f.ty);
+                    }
+                }
+                Item::ExternFn(ef) => {
+                    for p in &mut ef.params {
+                        p.ty = ctx.rewrite_generic_record_ty(&p.ty);
+                    }
+                    if let Some(rt) = &mut ef.ret_ty {
+                        *rt = ctx.rewrite_generic_record_ty(rt);
                     }
                 }
                 Item::Enum(e) => {
@@ -4019,7 +4914,10 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
     }
 
     PreparedProgram {
-        program: Program { items: final_items },
+        program: Program {
+            items: final_items,
+            source_files: expanded.source_files,
+        },
         vtables,
         dyn_interfaces: ctx.dyn_interfaces,
     }

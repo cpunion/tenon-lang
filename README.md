@@ -1,7 +1,7 @@
 # Tenon 语言设计与技术方案（已拍板定稿）
 
 > **Working Codename**: `Tenon`（榫卯）—— 寓意**强约束精化类型、分层形式化验证、无别名污染的内存模型、系统级版本演化与可验证分布式协议**严丝合缝。  
-> **状态**: 核心架构已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md) & [ADR-0002](docs/adr/0002-interfaces-comptime-and-stdlib.md)），**极简语言核心 → 4 层纯 Tenon 标准库（`std/{core,text,collections,encoding,os}`）→ 解耦的应用层 SDK（`examples/agent/lib/{llm,tools}.tn`）与真实交互式 CLI Agent（`examples/agent/cli_agent.tn`）已彻底贯通**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 独立原生二进制** + `interface`/`impl`/静态单态化/`dyn` 虚表胖对象 + `@derive(ToJson, FromJson, JsonSchema)` + 版本优先 `@evolve` + Perceus RC/COW/`rc_mask` `live_objects=0` + 无栈 `async` 状态机 + `@no_heap_alloc` + 通用 `.tn` AST 协议检测 + 真多进程 Authority/Worker/Fabric Sandbox + `.tn` 直编 `.wasm` 客户端 + `dast-os` OpenAI Responses API 实跑验证）。  
+> **状态**: 核心架构已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md) & [ADR-0002](docs/adr/0002-interfaces-comptime-and-stdlib.md)），**极简语言核心 → 完整系统编程能力（S1/S2/S3：精确宽度整数与 `Float32`、`@repr(C)`/`@packed`/`@align`、零分配 `bitfield`、非标签 `union`、`unsafe` 裸指针/volatile、双向 C FFI + `--lib static|shared` + `--emit-header`、真实 OS 多线程/原子/互斥锁/MPMC Channel + 条件原子 RC、非阻塞 TCP、原生 LLVM SIMD 向量 IR、DWARF `-g` 调试信息、`tenon fmt`）→ 4 层纯 Tenon 标准库（`std/{core,text,collections,encoding,os,sync,simd}`）→ 解耦的应用层 SDK（`examples/agent/lib/{llm,tools}.tn`）与真实交互式 CLI Agent（`examples/agent/cli_agent.tn`）已彻底贯通**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 独立原生二进制，单线程性能 0.95x–1.06x C `-O3`**）。
 > **上游沉淀**: 综合 [`loom-lang`](../loom-lang)（984 PR 自举实践）、[`lang-research`](../lang-research)（2026-11 多语言可复现实验）与 [`dast-os-kernel`](../../dast.ai/dast-os-kernel/README.md)（227 轮分布式调和内核审计），并结合 2025–2026 全球最新编程语言与形式化验证进展形成的全新通用编程语言设计。
 
 ---
@@ -11,7 +11,7 @@
 前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）、`z3`、LLVM `clang`（已验证 LLVM 22.1.8；可选 `node` 验证编译出的 `.wasm`）。
 
 ```bash
-# 1. 全工作区 39 项自动化测试（含 Float64 / 闭包与高阶函数 / for 循环 / ? 错误传播 / 元组与嵌套模式匹配 / 泛型 enum 单态化 / @derive(Eq, Hash) / f-string / interface+impl+静态单态化+dyn 虚表零泄漏 / OOP List & Map & Set / benchmarks 编译证明回归 / Liskov 契约检查 / 版本优先 @evolve / Perceus+rc_mask 零泄漏 / 无栈 async / LLVM 22 AOT + tenon-rt 链接 / V8 Wasm / OpenAI SSE + Webhook / Fabric Sandbox + 410 Reset）
+# 1. 全工作区 45 项自动化测试（含 S1/S2/S3 完整系统编程套件：精确宽度整型/Float32/bitfield/@repr(C)/@packed/union/defer/[T;N]/Bytes/Store/unsafe+裸指针+volatile/双向 C FFI(.a+.h+--c-src)/原生 LLVM SIMD/4 线程+原子+Mutex+Channel/TCP 环回/DWARF -g/跨模块 pub 可见性，以及 Float64/闭包/for/?/元组与嵌套匹配/泛型 enum/@derive/f-string/interface+dyn/benchmarks 回归/Liskov/@evolve/Perceus 零泄漏/无栈 async/V8 Wasm/OpenAI SSE/Fabric Sandbox）
 cargo test --workspace
 
 # 2. 精化类型别名复用（Year/Month/Odd/Even/Amount）+ 跨字段 Date + Cranelift 原生执行
@@ -59,19 +59,29 @@ cargo run --bin tenon -- serve examples/dast_os_kernel/kernel_v2.tn --addr 127.0
 # 9. 多语言性能基准与编译回归套件（C / Rust / Go / Tenon LLVM 22 -O3 ThinLTO AOT；详见 benchmarks/README.md）
 python3 benchmarks/run.py --check-only                                   # 编译 + 证明 + 跨语言校验和回归
 python3 benchmarks/run.py --warmup 1 --reps 7 --save benchmarks/results.json
+
+# 10. 完整系统编程能力端到端自测（S1+S2+S3：103 项 L0/L1 静态证明，JIT & LLVM 22 -O3 AOT 双端 live_objects=0）
+cargo run --bin tenon -- check examples/systems_test.tn
+cargo run --bin tenon -- run   examples/systems_test.tn
+cargo run --bin tenon -- build examples/systems_test.tn -o target/systems_test_bin --opt O3 && ./target/systems_test_bin
+# 双向 C FFI、静态/动态库与头文件导出、DWARF 调试信息与格式化器：
+cargo run --bin tenon -- build examples/systems_test.tn -o target/systems_dbg -g --opt O0
+cargo run --bin tenon -- fmt   examples/systems_test.tn --check
+# 导出 C 静态库 + C99 头文件：tenon build mylib.tn --lib static --emit-header mylib.h -o libmylib.a
+# 链接外部 C 源码/系统库：     tenon build app.tn --c-src helper.c -L /usr/local/lib -l z -o app
 ```
 
 ### 四层分层架构（极简核心 → 4 层纯 Tenon 标准库 → 应用层 SDK & CLI Agent）
 
 | 层级 / 模块 | 职责 |
 | --- | --- |
-| [`crates/tenon-syntax`](crates/tenon-syntax) | `loom/Go` 风格词法/语法分析器、`import "..." [as alias]` 拓扑模块解析、`Float` 字面量、闭包 `\|x\| expr` & `fn(A) B`、`for`/`a..b`、`?` 错误传播、元组与嵌套多载荷模式匹配、`f"..."` 插值字符串、泛型 `enum`/`record` 与约束 `[T I]`、`interface`/`impl`/`for`/`dyn`、`@derive(Eq, Hash, ToJson, FromJson, JsonSchema)`、精化/`mutate`/`async`/`evolution`/`lock_lattice`/`protocol state_machine`/`stream`/`view`/`subscriber` |
-| [`crates/tenon-rt`](crates/tenon-rt) | 极简语言核心运行时（`rlib` + `staticlib`，零 Cargo 外部依赖）：Perceus RC/COW/`rc_mask` + `TAG_DYN`/`TAG_CLOSURE`/`TAG_TUPLE` 对象支持 + 无栈协程调度 + 最小字节/浮点/O(n) 缓冲/OS/通用 HTTP-SSE 原语（零 JSON、零 `.env`、零厂商协议逻辑） |
-| [`crates/tenon-verify`](crates/tenon-verify) | `IncrementalDb` 增量缓存 + L0 流敏感精化求解（含纯域谓词如 `SafeRelPath`、`for` 区间绑定与递归嵌套穷尽性检查）+ L1 Z3 SMT（`mutate`、接口 Liskov 契约 `E0500`–`E0506`、`Eq` 运算符协议、双向闭包类型推导、`?` 返回类型检查、`dyn` 对象安全与 `@no_heap_alloc`、`async` 效应）+ **版本优先 `@evolve`** + L2-b 通用 AST 模型检测/锁序格/Trace Refinement |
-| [`crates/tenon-codegen`](crates/tenon-codegen) | 统一前置降级（方法扁平化、泛型函数/记录/枚举单态化、闭包转换、`for`/`?`/元组/`Eq` 降级、`dyn` 虚表与 COW `inout self` 分发）+ Cranelift Dev JIT + **LLVM 22 AOT Release 后端（`tenon build -O3`，独立原生二进制 ~33–170 KB）** + 直出 `.wasm` 客户端编译器 |
-| [`std/`](std) | **100% 纯 Tenon 编写的 4 层正交 OOP 标准库**：<br>• Layer 0 [`std/core/{types,ops}.tn`](std/core)：`NonNegative`/`Positive`/`Float` 方法与 `Eq`/`Hash`/`Display`、`List[T]`（`filled`/`push`/`set`/`pop`/`clear` + 高阶 `map`/`filter`/`fold`/`any`/`all`/`find_by`/`each`）/`Option`/`Result`（`map`/`map_err`/`and_then`）/`Writer`<br>• Layer 1 [`std/text/{text,builder}.tn`](std/text) & [`std/collections/{map,set}.tn`](std/collections)：`Text`/`Int` 流畅方法、O(n) `TextBuilder`、**泛型 O(1) 紧凑开放寻址哈希表 `Map[K Hash + Eq, V]` 与集合 `Set[T Hash + Eq]`**（单态化 SoA + 2 的幂次桶表 + 63 位缓存哈希 + O(1) swap-remove + COW）<br>• Layer 2 [`std/encoding/{json,dotenv}.tn`](std/encoding)：`JsonValue` ADT（含真 IEEE-754 `JFloat`）+ `ToJson`/`FromJson`/`JsonSchema` + O(n) 序列化器与游标解析器 + `Dotenv`<br>• Layer 3 [`std/os/{io,path,fs,env,process,http}.tn`](std/os)：`Stdout`/`Console`、`SafeRelPath`/`Path`、`FsError`、`interface FileSystem`（`OsFs`/`MemFs`）、`Env`/`Process`/`HttpStream` |
-| [`examples/agent/`](examples/agent) | **与标准库彻底解耦的应用层 SDK 与交互式 CLI Agent**：[`lib/llm.tn`](examples/agent/lib/llm.tn)（`interface LlmProvider` + `OpenAIProvider`）、[`lib/tools.tn`](examples/agent/lib/tools.tn)（`interface Tool` + 6 个 `@derive(FromJson, JsonSchema)` + `SafeRelPath` 工具插件）与 [`cli_agent.tn`](examples/agent/cli_agent.tn)（`dyn LlmProvider` + `List[dyn Tool]` + Z3 `AgentLease` + `lock_lattice` + `protocol state_machine`） |
-| [`crates/tenon-dist`](crates/tenon-dist) & [`crates/tenon-cli`](crates/tenon-cli) | SQLite WAL 分布式权威内核、真多进程 Authority/Worker/Fabric Sandbox、`tenon` 统一 CLI |
+| [`crates/tenon-syntax`](crates/tenon-syntax) | `loom/Go` 风格词法/语法分析器、`import "..." [as alias]` 拓扑模块解析、精确宽度整数（`Int8..64`/`UInt8..64`/`ISize`/`USize`/`Byte`/`C*`）与 `Float32`/`Float64`、`0x`/`0b`/`0o` 字面量、`as` 显式转换、`~`、`defer`、定长数组 `[T; N]`/`[v; N]`、`const`、`@cfg`/`@inline`/`@cold`、`@repr(C)`/`@packed`/`@align(N)` + `LayoutEngine`、`bitfield`、`union`、`unsafe`、`extern "C"`/`@link`/`@export`、闭包/高阶/`for`/`?`/元组/嵌套匹配/`f"..."`/泛型/`interface`/`@derive`/精化/`mutate`/`async`/`evolution`/`protocol` |
+| [`crates/tenon-rt`](crates/tenon-rt) | 极简语言核心运行时（`rlib` + `staticlib`，零 Cargo 外部依赖）：Perceus RC/COW/`rc_mask`（含字节载荷 COW 与 NUL 终止 `Text`）+ `Bytes`/`BytesSlice`/`TAG_CSTRUCT`/`TAG_SIMD`/`TAG_ATOMIC`/`TAG_MUTEX`/`TAG_CHANNEL` + 硬件位原语/原始内存与 volatile/OS 多线程与显式内存序原子/互斥锁/MPMC Channel/非阻塞 TCP + 无栈协程调度 + 最小 OS/HTTP-SSE 原语 |
+| [`crates/tenon-verify`](crates/tenon-verify) | `IncrementalDb` 增量缓存 + L0 精化求解（精确整型区间边界、`Float` 常量精化如 `UnitFloat`、定长数组越界、`bitfield` 位宽校验 `E0610`、`offset_of` 字段校验、`SafeRelPath` 与递归嵌套穷尽性）+ L1 Z3 SMT（`mutate`、接口 Liskov 契约 `E0500`–`E0506`、`unsafe` 强制边界 `E0800`、跨模块 `pub` 可见性 `E0105`、`@no_heap_alloc`、`async` 效应）+ **版本优先 `@evolve`** + L2-b 通用 AST 协议模型检测 |
+| [`crates/tenon-codegen`](crates/tenon-codegen) | 统一前置降级（`defer` LIFO 展开、零分配 `bitfield` 位掩码降级、`const`/`size_of`/`align_of`/`offset_of` 常量折叠、方法扁平化、泛型单态化、闭包转换、`for`/`?`/元组/`Eq`、`dyn` 虚表）+ Cranelift Dev JIT（含实时 `dlsym` C FFI）+ **LLVM 22 AOT Release 后端（`tenon build -O3`，原生 LLVM SIMD 向量 IR、条件线程安全原子 RC 保持单线程 ~1.0x C 性能与 33–51 KB 原生二进制、双向 C FFI `--lib static\|shared` + `--emit-header` + `--c-src`、DWARF `-g` 调试信息）** + `.wasm` 客户端编译器 |
+| [`std/`](std) | **100% 纯 Tenon 编写的 4 层正交 OOP 标准库**：<br>• Layer 0 [`std/core/{types,ops}.tn`](std/core)：`NonNegative`/`Positive`/`Float`、`Eq`/`Hash`/`Display`、`List[T]`/`Option`/`Result`/`Writer`<br>• Layer 1 [`std/text/`](std/text)、[`std/collections/{map,set,bytes,store}.tn`](std/collections) & [`std/simd/simd.tn`](std/simd)：O(n) `TextBuilder`、紧凑 O(1) 哈希表 `Map[K,V]`/`Set[T]`、**1 字节紧凑 `Bytes` + 零拷贝 RC `BytesSlice` + 大小端读写**、**代次安全 `Store[T]` + `Handle`**、**原生 LLVM 硬件向量 `Float32x4`/`Float64x4`/`Int32x4`/`Int64x4`/`UInt8x16`**<br>• Layer 2 [`std/encoding/{json,dotenv}.tn`](std/encoding)：`JsonValue` ADT + `ToJson`/`FromJson`/`JsonSchema` + `Dotenv`<br>• Layer 3 [`std/os/`](std/os) & [`std/sync/sync.tn`](std/sync/sync.tn)：`Console`/`SafeRelPath`/`FileSystem`/`Env`/`Process`/`HttpStream`、**非阻塞 TCP `TcpListener`/`TcpStream`**、**真实 OS `Thread` + `AtomicInt` + `Mutex[T]` + MPMC `Channel[T]`** |
+| [`examples/agent/`](examples/agent) & [`examples/systems_test.tn`](examples/systems_test.tn) | 应用层 SDK 与交互式 CLI Agent（`dyn LlmProvider` + `List[dyn Tool]` + `@derive(FromJson, JsonSchema)` + `SafeRelPath` + Z3 `AgentLease` + Protocol 模型检测）与完整 S1+S2+S3 系统编程端到端套件 |
+| [`crates/tenon-dist`](crates/tenon-dist) & [`crates/tenon-cli`](crates/tenon-cli) | SQLite WAL 分布式权威内核、真多进程 Authority/Worker/Fabric Sandbox、`tenon` 统一 CLI（含 `check`/`run`/`build`/`build-wasm`/`evolve`/`modelcheck`/`serve`/`fmt`） |
 
 ---
 
