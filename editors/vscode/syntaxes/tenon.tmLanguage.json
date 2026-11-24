@@ -89,7 +89,7 @@
         },
         {
           "name": "keyword.declaration.tenon",
-          "match": "\\b(fn|pure|comptime|macro|record|enum|interface|impl|type|const|union|bitfield|import|as|extern|evolution|protocol|stream|view|subscriber|test|let|var)\\b"
+          "match": "\\b(fn|pure|comptime|macro|attr|record|enum|interface|impl|type|const|union|bitfield|import|as|extern|evolution|protocol|stream|view|subscriber|test|let|var)\\b"
         },
         {
           "name": "storage.modifier.tenon",

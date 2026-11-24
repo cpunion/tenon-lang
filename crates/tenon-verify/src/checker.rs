@@ -663,7 +663,67 @@ impl CheckerCtx {
     }
 
     fn check_all(&mut self, program: &Program) {
+        let mut attr_decls: BTreeMap<String, AttrDecl> = BTreeMap::new();
         for item in &program.items {
+            if let Item::AttrDecl(a) = item {
+                attr_decls.insert(a.name.clone(), a.clone());
+            }
+        }
+        for item in &program.items {
+            let item_attrs: &[Attr] = match item {
+                Item::Fn(d) => &d.attrs,
+                Item::Record(d) => &d.attrs,
+                Item::Enum(d) => &d.attrs,
+                Item::Interface(d) => &d.attrs,
+                Item::Impl(d) => &d.attrs,
+                Item::TypeAlias(d) => &d.attrs,
+                Item::ExternFn(d) => &d.attrs,
+                Item::Bitfield(d) => &d.attrs,
+                Item::Union(d) => &d.attrs,
+                Item::Const(d) => &d.attrs,
+                Item::AttrDecl(d) => &d.attrs,
+                _ => &[],
+            };
+            if !attr_decls.is_empty() && !item_attrs.is_empty() {
+                let empty_vars = BTreeMap::new();
+                for attr in item_attrs {
+                    if let Some(decl) = attr_decls.get(&attr.name) {
+                        if attr.args.len() != decl.params.len() {
+                            self.diagnostics.push(Diagnostic {
+                                code: "E0202".into(),
+                                message: format!(
+                                    "attribute `@{}` expects {} argument(s), found {}",
+                                    attr.name,
+                                    decl.params.len(),
+                                    attr.args.len()
+                                ),
+                                span: attr.span,
+                                notes: vec![],
+                                counterexample: BTreeMap::new(),
+                            });
+                        } else {
+                            for (p, a) in decl.params.iter().zip(attr.args.iter()) {
+                                let aty = self.infer_expr_type_expected(&a.value, Some(&p.ty), &empty_vars);
+                                if !self.types_compatible(&p.ty, &aty) {
+                                    self.diagnostics.push(Diagnostic {
+                                        code: "E0205".into(),
+                                        message: format!(
+                                            "attribute `@{}` parameter `{}` expects `{}`, found `{}`",
+                                            attr.name,
+                                            p.name,
+                                            p.ty.display_name(),
+                                            aty.display_name()
+                                        ),
+                                        span: a.value.span,
+                                        notes: vec![],
+                                        counterexample: BTreeMap::new(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             match item {
                 Item::Bitfield(bf) => self.check_bitfield_decl(bf),
                 Item::Const(c) => self.check_const_decl(c),

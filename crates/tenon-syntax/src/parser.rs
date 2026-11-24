@@ -224,6 +224,7 @@ impl Parser {
             file_packages: Vec::new(),
             test_file_ids: Vec::new(),
             build_config: BTreeMap::new(),
+            comptime_items: Vec::new(),
         })
     }
 
@@ -428,6 +429,43 @@ impl Parser {
                     params,
                     body,
                     span,
+                })]);
+            }
+            if kw == "attr" {
+                let start = self.bump().span;
+                let (aname, name_span) = self.expect_ident()?;
+                let mut params = Vec::new();
+                let mut end = name_span;
+                if self.eat(&TokenKind::LParen) {
+                    loop {
+                        self.skip_newlines();
+                        if self.peek().kind == TokenKind::RParen {
+                            end = self.bump().span;
+                            break;
+                        }
+                        let (pname, pstart) = self.expect_ident()?;
+                        let pty = self.parse_type_expr()?;
+                        let pspan = pstart;
+                        params.push(ParamDecl {
+                            is_inout: false,
+                            is_comptime: false,
+                            name: pname,
+                            ty: pty,
+                            predicate: None,
+                            span: pspan,
+                        });
+                        if !self.eat(&TokenKind::Comma) {
+                            end = self.expect(TokenKind::RParen)?.span;
+                            break;
+                        }
+                    }
+                }
+                return Ok(vec![Item::AttrDecl(AttrDecl {
+                    attrs,
+                    is_pub,
+                    name: aname,
+                    params,
+                    span: start.merge(end),
                 })]);
             }
         }

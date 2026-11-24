@@ -138,7 +138,7 @@ test('real `tenon lsp` process handles initialize, diagnostics, hover, definitio
     const hoverResp = await hoverP;
     assert.ok(hoverResp.result.contents.value.includes('@post("/users")'), 'hover should display @post("/users")');
 
-    // Hover over `@get` attribute -> attribute doc, NOT List.get
+    // Hover over `@get` attribute -> shows declared `pub attr get(path Text)` + doc
     const getAttrLine = text.split('\n').findIndex((l) => l.includes('@get("/health")'));
     const attrHoverP = rpc.waitFor((m) => m.id === 30);
     rpc.send({
@@ -148,9 +148,9 @@ test('real `tenon lsp` process handles initialize, diagnostics, hover, definitio
       params: { textDocument: { uri }, position: { line: getAttrLine, character: 2 } },
     });
     const attrHoverResp = await attrHoverP;
-    assert.ok(attrHoverResp.result.contents.value.includes('HTTP `GET` route handler attribute'));
+    assert.ok(attrHoverResp.result.contents.value.includes('pub attr get(path Text)'), `unexpected @get hover: ${attrHoverResp.result.contents.value}`);
 
-    // Go to definition on `@get` MUST return null (must NOT jump to std/core/ops.tn List.get!)
+    // Go to definition on `@get` MUST jump to `pub attr get(path Text)` in std/web/app.tn!
     const attrDefP = rpc.waitFor((m) => m.id === 31);
     rpc.send({
       jsonrpc: '2.0',
@@ -159,7 +159,19 @@ test('real `tenon lsp` process handles initialize, diagnostics, hover, definitio
       params: { textDocument: { uri }, position: { line: getAttrLine, character: 2 } },
     });
     const attrDefResp = await attrDefP;
-    assert.equal(attrDefResp.result, null, 'definition on @get must not jump to List.get');
+    assert.ok(attrDefResp.result && attrDefResp.result.uri.endsWith('/std/web/app.tn'), `expected @get -> std/web/app.tn, got ${JSON.stringify(attrDefResp.result)}`);
+
+    // Go to definition on `mount_annotated_routes!()` MUST jump to `pub comptime fn mount_annotated_routes` in std/web/app.tn!
+    const mountLine = text.split('\n').findIndex((l) => l.trim().startsWith('mount_annotated_routes!()'));
+    const mountDefP = rpc.waitFor((m) => m.id === 33);
+    rpc.send({
+      jsonrpc: '2.0',
+      id: 33,
+      method: 'textDocument/definition',
+      params: { textDocument: { uri }, position: { line: mountLine, character: 4 } },
+    });
+    const mountDefResp = await mountDefP;
+    assert.ok(mountDefResp.result && mountDefResp.result.uri.endsWith('/std/web/app.tn'), `expected mount_annotated_routes -> std/web/app.tn, got ${JSON.stringify(mountDefResp.result)}`);
 
     // Go to definition on `conn.get("/health")` MUST jump to HttpConn.get in std/net/http.tn!
     const connGetLine = text.split('\n').findIndex((l) => l.includes('conn.get("/health")'));

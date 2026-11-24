@@ -369,12 +369,18 @@ pub fn expand_comptime_and_macros(program: &mut Program) -> Result<(), String> {
     for item in &mut program.items {
         expand_item(&ctx, item)?;
     }
-    // Strip declarative `Item::Macro` and compile-time-only `comptime fn` definitions after expansion
-    program.items.retain(|i| match i {
-        Item::Macro(_) => false,
-        Item::Fn(f) if f.is_comptime => false,
-        _ => true,
-    });
+    // Move declarative `Item::Macro` and compile-time-only `comptime fn` definitions out of
+    // runtime `program.items` into `program.comptime_items` so codegen never emits them while
+    // LSP / IDE navigation retains exact spans & signatures!
+    let mut kept = Vec::with_capacity(program.items.len());
+    for item in std::mem::take(&mut program.items) {
+        match item {
+            Item::Macro(_) => program.comptime_items.push(item),
+            Item::Fn(ref f) if f.is_comptime => program.comptime_items.push(item),
+            other => kept.push(other),
+        }
+    }
+    program.items = kept;
     Ok(())
 }
 

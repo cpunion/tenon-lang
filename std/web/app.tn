@@ -7,6 +7,13 @@ import "std/net/http.tn"
 import "std/web/router.tn"
 import "std/web/middleware.tn"
 
+// First-class typed HTTP route attributes (scanned at compile time by `routes_of()` / `mount_annotated_routes!()`).
+pub attr get(path Text)
+pub attr post(path Text)
+pub attr put(path Text)
+pub attr delete(path Text)
+pub attr patch(path Text)
+
 pub record RouteEntry {
     method  Text
     path    Text

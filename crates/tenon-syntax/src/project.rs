@@ -345,6 +345,7 @@ pub fn load_package_with_overlays(
         file_packages: loader.file_packages,
         test_file_ids: loader.test_file_ids,
         build_config: loader.build_config,
+        comptime_items: Vec::new(),
     };
     crate::eval_cfg_attrs(&mut prog);
     crate::comptime::expand_comptime_and_macros(&mut prog)?;
@@ -806,6 +807,12 @@ impl ProjectLoader {
                         exports.all_symbols.insert(m.name.clone());
                         if m.is_pub && !pf.is_test {
                             exports.pub_symbols.insert(m.name.clone(), m.name.clone());
+                        }
+                    }
+                    Item::AttrDecl(a) => {
+                        exports.all_symbols.insert(a.name.clone());
+                        if a.is_pub && !pf.is_test {
+                            exports.pub_symbols.insert(a.name.clone(), a.name.clone());
                         }
                     }
                     _ => {}

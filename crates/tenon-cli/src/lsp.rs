@@ -19,7 +19,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tenon_syntax::{
-    Attr, BitfieldDecl, ConstDecl, EnumDecl, Expr, ExprKind, FnDecl, InterfaceDecl,
+    Attr, AttrDecl, BitfieldDecl, ConstDecl, EnumDecl, Expr, ExprKind, FnDecl, InterfaceDecl,
     InterfaceMethodDecl, Item, LayoutEngine, LoadMode, MacroDecl, Program, RecordDecl, Span,
     TypeAliasDecl, UnionDecl, load_package_with_overlays, parse_with_file_id,
 };
@@ -435,7 +435,17 @@ impl LspServer {
         if tok.is_string_lit {
             return Value::Null;
         }
+        let analyzed = self.analysis.get(&uri);
+        let prog = analyzed.and_then(|a| a.full_program.as_ref().or(a.raw_program.as_ref()));
+        let report = analyzed.and_then(|a| a.report.as_ref());
+
         if tok.is_attr {
+            if let Some(prog) = prog {
+                if let Some(ad) = find_attr_decl(prog, &tok.word) {
+                    let md = format_attr_decl_hover(ad);
+                    return json!({ "contents": { "kind": "markdown", "value": md } });
+                }
+            }
             if let Some(md) = attribute_hover(&tok.word) {
                 return json!({
                     "contents": {
@@ -451,10 +461,6 @@ impl LspServer {
                 }
             });
         }
-
-        let analyzed = self.analysis.get(&uri);
-        let prog = analyzed.and_then(|a| a.full_program.as_ref().or(a.raw_program.as_ref()));
-        let report = analyzed.and_then(|a| a.report.as_ref());
 
         if let Some(prog) = prog {
             let layout = LayoutEngine::from_program(prog);
@@ -519,8 +525,7 @@ impl LspServer {
         let Some(tok) = word_at_position(&doc.text, line, ch) else {
             return Value::Null;
         };
-        // Attributes (`@get`, `@repr`, `@derive`, ...) and string literals are not symbol references
-        if tok.is_attr || tok.is_string_lit {
+        if tok.is_string_lit {
             return Value::Null;
         }
         let Some(analyzed) = self.analysis.get(&uri) else {
@@ -529,6 +534,24 @@ impl LspServer {
         let Some(prog) = analyzed.full_program.as_ref().or(analyzed.raw_program.as_ref()) else {
             return Value::Null;
         };
+
+        // Declared attributes (`pub attr get(path Text)`) jump straight to their `attr` declaration!
+        // Built-in compiler directives (`@repr(C)`, `@packed`, `@derive`) return null (no source file).
+        if tok.is_attr {
+            if let Some(ad) = find_attr_decl(prog, &tok.word) {
+                let target_uri = span_file_uri(prog, ad.span, &uri);
+                let l0 = ad.span.line.saturating_sub(1);
+                let c0 = ad.span.col.saturating_sub(1);
+                return json!({
+                    "uri": target_uri,
+                    "range": {
+                        "start": { "line": l0, "character": c0 },
+                        "end": { "line": l0, "character": c0 + tok.word.len() }
+                    }
+                });
+            }
+            return Value::Null;
+        }
 
         let found_span = if let Some(pref) = &tok.qual_prefix {
             let mangled = format!("{}__{}", pref, tok.word);
@@ -584,6 +607,19 @@ impl LspServer {
                 .rsplit_once('@')
                 .is_some_and(|(_, tail)| !tail.is_empty() && tail.chars().all(|c| c.is_alphanumeric() || c == '_'))
         {
+            if let Some(prog) = prog {
+                for it in &prog.items {
+                    if let Item::AttrDecl(a) = it {
+                        if seen.insert(a.name.clone()) {
+                            items.push(json!({
+                                "label": a.name,
+                                "kind": 14,
+                                "detail": format_attr_decl_sig(a)
+                            }));
+                        }
+                    }
+                }
+            }
             for (attr, detail) in [
                 ("repr(C)", "C-ABI compatible struct layout"),
                 ("packed", "Unaligned packed struct layout (1-byte alignment)"),
@@ -592,18 +628,17 @@ impl LspServer {
                 ("link(\"m\")", "Link external C/native library"),
                 ("cfg(os = \"macos\")", "Conditional compilation attribute"),
                 ("derive(ToJson, FromJson)", "Derive JSON serialization/deserialization"),
-                ("get(\"/path\")", "Register HTTP GET route handler"),
-                ("post(\"/path\")", "Register HTTP POST route handler"),
-                ("put(\"/path\")", "Register HTTP PUT route handler"),
-                ("delete(\"/path\")", "Register HTTP DELETE route handler"),
                 ("evolve(\"entity.Name\")", "Versioned schema evolution entity"),
                 ("field(1)", "Stable schema evolution field ID"),
             ] {
-                items.push(json!({
-                    "label": attr,
-                    "kind": 14,
-                    "detail": detail
-                }));
+                let key = attr.split('(').next().unwrap_or(attr);
+                if seen.insert(key.to_string()) {
+                    items.push(json!({
+                        "label": attr,
+                        "kind": 14,
+                        "detail": detail
+                    }));
+                }
             }
             return json!(items);
         }
@@ -909,6 +944,15 @@ impl LspServer {
                 Item::Macro(m) => {
                     syms.push(make_doc_symbol(&m.name, 12, m.span, "macro".into(), vec![]));
                 }
+                Item::AttrDecl(a) => {
+                    syms.push(make_doc_symbol(
+                        &format!("@{}", a.name),
+                        14,
+                        a.span,
+                        format_attr_decl_sig(a),
+                        vec![],
+                    ));
+                }
                 _ => {}
             }
         }
@@ -1136,8 +1180,19 @@ fn make_doc_symbol(name: &str, kind: u32, span: Span, detail: String, children: 
     })
 }
 
-fn find_top_level_item_span(prog: &Program, name: &str) -> Option<Span> {
+fn find_attr_decl<'a>(prog: &'a Program, name: &str) -> Option<&'a AttrDecl> {
     for item in &prog.items {
+        if let Item::AttrDecl(a) = item {
+            if a.name == name {
+                return Some(a);
+            }
+        }
+    }
+    None
+}
+
+fn find_top_level_item_span(prog: &Program, name: &str) -> Option<Span> {
+    for item in prog.items.iter().chain(prog.comptime_items.iter()) {
         match item {
             Item::Fn(f) if f.name == name => return Some(f.span),
             Item::ExternFn(f) if f.name == name => return Some(f.span),
@@ -1149,6 +1204,7 @@ fn find_top_level_item_span(prog: &Program, name: &str) -> Option<Span> {
             Item::TypeAlias(t) if t.name == name => return Some(t.span),
             Item::Const(c) if c.name == name => return Some(c.span),
             Item::Macro(m) if m.name == name => return Some(m.span),
+            Item::AttrDecl(a) if a.name == name => return Some(a.span),
             _ => {}
         }
     }
@@ -1694,6 +1750,39 @@ fn format_const_hover(c: &ConstDecl) -> String {
     )
 }
 
+fn format_attr_decl_sig(a: &AttrDecl) -> String {
+    let mut s = String::new();
+    if a.is_pub {
+        s.push_str("pub ");
+    }
+    s.push_str("attr ");
+    s.push_str(&a.name);
+    if !a.params.is_empty() {
+        s.push('(');
+        let ps: Vec<String> = a
+            .params
+            .iter()
+            .map(|p| format!("{} {}", p.name, p.ty.display_name()))
+            .collect();
+        s.push_str(&ps.join(", "));
+        s.push(')');
+    }
+    s
+}
+
+fn format_attr_decl_hover(a: &AttrDecl) -> String {
+    let mut out = format!("```tenon\n{}\n```", format_attr_decl_sig(a));
+    if let Some(doc) = attribute_hover(&a.name) {
+        if let Some((_, rest)) = doc.split_once("\n\n") {
+            out.push_str("\n\n");
+            out.push_str(rest);
+        }
+    } else {
+        out.push_str("\n\nDeclared Tenon compile-time attribute.");
+    }
+    out
+}
+
 fn format_macro_hover(m: &MacroDecl) -> String {
     format!(
         "```tenon\n{}macro {}({})\n```\n\nCompile-time declarative AST macro.",
@@ -1709,7 +1798,7 @@ fn format_item_hover(
     report: Option<&CheckReport>,
     name: &str,
 ) -> Option<String> {
-    for item in &prog.items {
+    for item in prog.items.iter().chain(prog.comptime_items.iter()) {
         match item {
             Item::Fn(f) if f.name == name => return Some(format_fn_hover(f, None, report)),
             Item::Record(r) if r.name == name => return Some(format_record_hover(r, layout)),
@@ -1720,6 +1809,7 @@ fn format_item_hover(
             Item::TypeAlias(t) if t.name == name => return Some(format_type_alias_hover(t)),
             Item::Const(c) if c.name == name => return Some(format_const_hover(c)),
             Item::Macro(m) if m.name == name => return Some(format_macro_hover(m)),
+            Item::AttrDecl(a) if a.name == name => return Some(format_attr_decl_hover(a)),
             _ => {}
         }
     }

@@ -5153,6 +5153,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
             file_packages: expanded.file_packages,
             test_file_ids: expanded.test_file_ids,
             build_config: expanded.build_config,
+            comptime_items: expanded.comptime_items,
         },
         vtables,
         dyn_interfaces: ctx.dyn_interfaces,

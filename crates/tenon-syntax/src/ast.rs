@@ -17,6 +17,9 @@ pub struct Program {
     /// `[configuration]` key-value map from `tenon.toml` for compile-time queries.
     #[serde(default)]
     pub build_config: BTreeMap<String, String>,
+    /// Preserved compile-time-only items (`macro`, `comptime fn`) after expansion for IDE/LSP navigation.
+    #[serde(default)]
+    pub comptime_items: Vec<Item>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,6 +56,15 @@ pub struct MacroDecl {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttrDecl {
+    pub attrs: Vec<Attr>,
+    pub is_pub: bool,
+    pub name: String,
+    pub params: Vec<ParamDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Attr {
     pub name: String,
     pub args: Vec<AttrArg>,
@@ -76,6 +88,7 @@ pub enum Item {
         span: Span,
     },
     Macro(MacroDecl),
+    AttrDecl(AttrDecl),
     ComptimeBlock(Block),
     MacroCall {
         name: String,

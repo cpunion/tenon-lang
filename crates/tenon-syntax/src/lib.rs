@@ -40,6 +40,7 @@ pub fn eval_cfg_attrs(program: &mut Program) {
             Item::View(d) => &d.attrs,
             Item::Subscriber(d) => &d.attrs,
             Item::Macro(d) => &d.attrs,
+            Item::AttrDecl(d) => &d.attrs,
             Item::Import { .. }
             | Item::LockLattice(_)
             | Item::ComptimeBlock(_)
