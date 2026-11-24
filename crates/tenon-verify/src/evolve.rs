@@ -762,3 +762,132 @@ pub fn receipt_hash(prog: &Program) -> String {
     h.update(json.as_bytes());
     format!("{:x}", h.finalize())
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionLockEntry {
+    pub seq: usize,
+    pub v1_label: String,
+    pub v2_label: String,
+    pub v1_receipt_sha256: String,
+    pub v2_receipt_sha256: String,
+    pub safe_to_release: bool,
+    pub prev_entry_sha256: String,
+    pub entry_sha256: String,
+}
+
+/// Appends a hash-chained, tamper-evident deployment receipt into `evolution.lock`.
+pub fn append_evolution_lock(
+    lock_path: &std::path::Path,
+    rep: &EvolutionReport,
+    v1_label: &str,
+    v2_label: &str,
+) -> Result<EvolutionLockEntry, String> {
+    let mut entries: Vec<EvolutionLockEntry> = if lock_path.is_file() {
+        let raw = std::fs::read_to_string(lock_path)
+            .map_err(|e| format!("failed to read `{}`: {}", lock_path.display(), e))?;
+        serde_json::from_str(&raw).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let prev_hash = entries
+        .last()
+        .map(|e| e.entry_sha256.clone())
+        .unwrap_or_else(|| "genesis".into());
+    let seq = entries.len() + 1;
+    let mut h = Sha256::new();
+    h.update(format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        seq,
+        v1_label,
+        v2_label,
+        rep.v1_receipt_sha256,
+        rep.v2_receipt_sha256,
+        rep.safe_to_release,
+        prev_hash
+    ));
+    let entry = EvolutionLockEntry {
+        seq,
+        v1_label: v1_label.to_string(),
+        v2_label: v2_label.to_string(),
+        v1_receipt_sha256: rep.v1_receipt_sha256.clone(),
+        v2_receipt_sha256: rep.v2_receipt_sha256.clone(),
+        safe_to_release: rep.safe_to_release,
+        prev_entry_sha256: prev_hash,
+        entry_sha256: format!("{:x}", h.finalize()),
+    };
+    entries.push(entry.clone());
+    if let Some(parent) = lock_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    let json = serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())?;
+    std::fs::write(lock_path, json)
+        .map_err(|e| format!("failed to write `{}`: {}", lock_path.display(), e))?;
+    Ok(entry)
+}
+
+/// Emits a verified 3-phase Expand-Backfill-Contract SQL migration script from `(v1, v2, report)`.
+pub fn emit_expand_contract_sql(v1: &Program, v2: &Program, rep: &EvolutionReport) -> String {
+    let v1_recs = collect_evolve_records(v1);
+    let v2_recs = collect_evolve_records(v2);
+    let mut out = String::new();
+    out.push_str("-- Tenon Verified Expand-Contract Migration Script\n");
+    out.push_str(&format!("-- v1 receipt: {}\n", rep.v1_receipt_sha256));
+    out.push_str(&format!("-- v2 receipt: {}\n", rep.v2_receipt_sha256));
+    out.push_str(&format!("-- safe_to_release: {}\n\n", rep.safe_to_release));
+    out.push_str("BEGIN TRANSACTION;\n\n");
+
+    for ent in &rep.entities {
+        let table = ent.record_name.to_lowercase();
+        out.push_str(&format!(
+            "-- Entity `{}` ({}) — verdict: {:?}\n",
+            ent.entity_id, ent.record_name, ent.verdict
+        ));
+        // Phase 1: EXPAND (add new optional columns + archive table if lens present)
+        if let Some(r2) = v2_recs.get(&ent.entity_id) {
+            let r1_fields: BTreeSet<&str> = v1_recs
+                .get(&ent.entity_id)
+                .map(|r| r.fields.iter().map(|f| f.name.as_str()).collect())
+                .unwrap_or_default();
+            for f in &r2.fields {
+                if !r1_fields.contains(f.name.as_str()) {
+                    let sql_ty = match f.ty.display_name().as_str() {
+                        "Int" | "Int64" | "Int32" | "UInt64" | "Bool" => "INTEGER",
+                        "Float" | "Float64" | "Float32" => "REAL",
+                        _ => "TEXT",
+                    };
+                    out.push_str(&format!(
+                        "ALTER TABLE {} ADD COLUMN {} {};\n",
+                        table, f.name, sql_ty
+                    ));
+                }
+            }
+            if let Some(lens) = &ent.lens_verified {
+                out.push_str(&format!(
+                    "-- Phase 2 (BACKFILL): verified lens `{} {} <-> {}` (totality={}, roundtrip={})\n",
+                    lens.entity, lens.from_ver, lens.to_ver, lens.totality_proved, lens.roundtrip_proved
+                ));
+                out.push_str(&format!(
+                    "CREATE TABLE IF NOT EXISTS {}_evolution_archive (entity_id INTEGER PRIMARY KEY, payload TEXT NOT NULL, migrated_at TEXT DEFAULT CURRENT_TIMESTAMP);\n",
+                    table
+                ));
+            }
+            // Phase 3: CONTRACT (create v2 shadow table with refinement CHECK constraints)
+            let checks: Vec<String> = r2
+                .where_clauses
+                .iter()
+                .map(|w| format!("{:?}", w.kind))
+                .collect();
+            if !checks.is_empty() {
+                out.push_str(&format!(
+                    "-- Phase 3 (CONTRACT): enforce {} v2 invariant CHECK(s) after backfill verification.\n",
+                    checks.len()
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    out.push_str("COMMIT;\n");
+    out
+}

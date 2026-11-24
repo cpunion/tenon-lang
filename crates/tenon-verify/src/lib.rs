@@ -12,8 +12,14 @@ pub use checker::{
     check_type_subsumption,
 };
 pub use db::{IncrementalDb, QueryStats};
-pub use evolve::{CompatVerdict, EvolutionReport, check_evolution};
+pub use evolve::{
+    CompatVerdict, EvolutionLockEntry, EvolutionReport, append_evolution_lock, check_evolution,
+    emit_expand_contract_sql,
+};
 pub use mir::{MirFnSummary, VerifiedMir};
+pub use smt::{
+    ExportedProofCert, begin_proof_recording, end_proof_recording, export_proof_certificates,
+};
 pub use modelcheck::{
     ModelCheckSuiteReport, TraceEvent, TraceRefinementReport, check_program_protocols,
     export_program_tla_specs, export_tla_specs, run_all_protocol_checks, verify_runtime_trace,
@@ -1549,5 +1555,59 @@ pub pure fn bad_hof(x Range[1, 10]) Range[2, 20] {
             "expected >= 2 E0410 for HOF lambda return and HOF call arg violations, got {:?}",
             r_bad.diagnostics
         );
+    }
+
+    #[test]
+    fn exports_independent_smtlib2_proof_certificates_verified_offline_by_z3_and_evolve_migration() {
+        let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        let adv_path = ws_root.join("examples/refinements/advanced_verification.tn");
+        let prog = tenon_syntax::load_program_with_imports(&adv_path).unwrap();
+
+        begin_proof_recording();
+        let rep = check_program(&prog);
+        let certs = end_proof_recording();
+        assert!(rep.ok);
+        assert!(
+            certs.len() >= 5,
+            "expected >= 5 exported L1 SMT-LIB2 proof certificates, got {}",
+            certs.len()
+        );
+
+        let cert_dir = std::env::temp_dir().join(format!("tenon_proof_certs_{}", std::process::id()));
+        let count = export_proof_certificates(&cert_dir, &certs).unwrap();
+        assert_eq!(count, certs.len());
+        assert!(cert_dir.join("proof_manifest.json").is_file());
+
+        // Independently re-verify exported `.smt2` certificates directly with `z3` (TCB minimization)!
+        for c in certs.iter().take(4) {
+            let f = cert_dir.join(format!("vc_{:04}_{}.smt2", c.index, &c.sha256[..12]));
+            let out = std::process::Command::new("z3").arg(&f).output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.trim() == "unsat",
+                "independent Z3 re-check of {} failed: stdout={} stderr={}",
+                f.display(),
+                stdout,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cert_dir);
+
+        // Evolution lock ledger + Expand-Contract SQL migration codegen
+        let v1 = tenon_syntax::load_program_with_imports(&ws_root.join("examples/dast_os_kernel/kernel_v1.tn")).unwrap();
+        let v2 = tenon_syntax::load_program_with_imports(&ws_root.join("examples/dast_os_kernel/kernel_v2.tn")).unwrap();
+        let ev_rep = check_evolution(&v1, &v2);
+        let lock_path = std::env::temp_dir().join(format!("tenon_evo_lock_{}.json", std::process::id()));
+        let e1 = append_evolution_lock(&lock_path, &ev_rep, "v1", "v2").unwrap();
+        let e2 = append_evolution_lock(&lock_path, &ev_rep, "v2", "v3").unwrap();
+        assert_eq!(e1.seq, 1);
+        assert_eq!(e2.prev_entry_sha256, e1.entry_sha256);
+        let _ = std::fs::remove_file(&lock_path);
+
+        let sql = emit_expand_contract_sql(&v1, &v2, &ev_rep);
+        assert!(sql.contains("BEGIN TRANSACTION;") && sql.contains("COMMIT;"));
     }
 }

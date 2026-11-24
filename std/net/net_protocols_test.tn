@@ -69,7 +69,13 @@ async fn async_echo_server_once(lfd Int) Int {
     let _ = r1
     let r2 = await async_wait_writable(rfd, cfd, 2000)
     let _ = r2
-    let msg = net_read_text(cfd, 1024)
+    var msg = net_read_text(cfd, 1024)
+    var tries = 0
+    while len(msg) == 0 && tries < 200 {
+        let _ = thread_sleep_ms(1)
+        msg = net_read_text(cfd, 1024)
+        tries += 1
+    }
     let _ = net_write_text(cfd, "echo:" ++ msg)
     let n = len(msg)
     let _ = net_close(cfd)

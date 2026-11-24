@@ -11,16 +11,25 @@
 前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）、`z3`、LLVM `clang`（已验证 LLVM 22.1.8；可选 `node` 验证编译出的 `.wasm`）。
 
 ```bash
-# 1. 全工作区 55 项自动化测试（含完整 L0+Z3 形式化验证闭环：while 不变量基例/归纳/终止性 `E0431`–`E0433`、`old(x)`/`ghost`/`lemma` 零开销擦除、Float `Real` 与 BitVector 理论、递归 `pure fn` 展开、LLVM 越界检查消除、子类型依赖转换 `as`/`as?`/`refine_cast[T](x)`/`is_subtype[S,T]()` 与磁盘 VC 缓存；目录包与 Go/通配/选择性 import、comptime/宏/反射、跨包 pub E0105 / 测试隔离 E0107 / 线程 Send E0810、tenon lsp 协议全链路、Web 框架与多包 LLVM AOT 零泄漏，以及完整 S1/S2/S3 系统编程套件、4 层标准库、benchmarks 回归、Liskov/@evolve/Perceus/无栈 async/V8 Wasm/OpenAI SSE/Fabric Sandbox）
+# 1. 全工作区 64 项自动化测试（含 P0–P3 全栈能力：`VerifiedMir` + `nsw`/溢出检查消除 + 逃逸分析 + `@fip`；Const 精化 `Range[LO, HI]` + `forall`/`exists` Z3 Array 理论 + 高阶函数契约 + LSP Inlay Hints/Quick Fix/References/Rename/Semantic Tokens + `F5` DWARF 调试；`async/await` 融合 `kqueue` + RFC 6455 WebSocket + SSE + OpenSSL TLS + SQLite3 `CHECK` 驱动 + Postgres v3 + `tenon pkg lock|verify|tree` + `--target` 交叉编译；通用 Wasm32 + TS/Swift/Kotlin 绑定 + `@evolve` `evolution.lock`/Expand-Contract SQL + 独立 `.smt2` 证明证书 + 撮合风控/文档自举 Dogfooding）
 cargo test --workspace
 
-# 2. 精化类型别名复用（Year/Month/Odd/Even/Amount）+ 跨字段 Date + 高阶形式化验证闭环（while/old/ghost/lemma/Float Real/BitVec/LLVM 越界消除/refine_cast）
+# 2. 精化类型别名复用（Year/Month/Odd/Even/Amount）+ 跨字段 Date + 高阶形式化验证闭环（while/old/ghost/lemma/Float Real/BitVec/LLVM 越界消除/refine_cast）+ 独立证明证书导出
 cargo run --bin tenon -- check examples/refinements/date_and_odd.tn
 cargo run --bin tenon -- run   examples/refinements/date_and_odd.tn
 cargo run --bin tenon -- check examples/refinements/bad_date.tn          # 负例：2023-02-29 编译期拦截
-cargo run --bin tenon -- check examples/refinements/advanced_verification.tn
+cargo run --bin tenon -- check examples/refinements/advanced_verification.tn --emit-proofs target/proof_certs
 cargo run --bin tenon -- run   examples/refinements/advanced_verification.tn
-cargo run --bin tenon -- build examples/refinements/advanced_verification.tn -o target/adv_ver_bin --opt O3 && ./target/adv_ver_bin
+cargo run --bin tenon -- build examples/refinements/advanced_verification.tn -o target/adv_ver_bin --opt O3 --checked-overflow && ./target/adv_ver_bin
+
+# 2b. 生产级 Dogfooding 自举应用（撮合风控引擎 + SQLite3 CHECK + Const Range[LO,HI] + forall Z3 Array + @fip，以及纯 Tenon API 文档生成器）
+cargo run --bin tenon -- build examples/dogfood/matching_engine.tn -o target/matching_bin --opt O3 && ./target/matching_bin
+cargo run --bin tenon -- build examples/dogfood/tenon_docgen.tn    -o target/docgen_bin   --opt O3 && ./target/docgen_bin
+# 通用 Wasm32 + TypeScript / Swift / Kotlin 跨端绑定 + 包锁文件 + `@evolve` Expand-Contract 迁移 SQL：
+cargo run --bin tenon -- test std/db && cargo run --bin tenon -- test std/net
+cargo run --bin tenon -- pkg tree examples/web_app
+cargo run --bin tenon -- build examples/refinements/date_and_odd.tn --target wasm32 -o target/date.wasm --emit-ts target/date.d.ts --emit-swift target/date.swift --emit-kotlin target/Date.kt
+cargo run --bin tenon -- evolve check examples/dast_os_kernel/kernel_v1.tn examples/dast_os_kernel/kernel_v2.tn --lock target/evolution.lock --emit-migration target/migration.sql
 
 # 3. M1：Perceus 精确 RC 原地复用 + MVS COW + 自动派生 Date.parse(...) + 符号化 mutate Z3 证明
 cargo run --bin tenon -- run   examples/m1_records_perceus/date_parse_and_mutate.tn

@@ -8826,4 +8826,60 @@ pub fn main() Int {
             }
         }
     }
+
+    #[test]
+    fn llvm_aot_dogfood_matching_engine_and_tenon_docgen_zero_leaks() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let pid = std::process::id();
+
+        // 1. Dogfood #1: Verified Limit-Order-Book Matching Engine + Const Range[LO,HI] + forall Array + @fip + SQLite3
+        let me_prog = tenon_syntax::load_program_with_imports(
+            &repo_root.join("examples/dogfood/matching_engine.tn"),
+        )
+        .expect("matching_engine.tn must load");
+        let me_rep = tenon_verify::check_program(&me_prog);
+        assert!(me_rep.ok, "matching_engine verify failed: {:?}", me_rep.diagnostics);
+        assert!(me_rep.mir.fip_verified_fns.contains("adjust_order_qty"));
+        assert!(me_rep.mir.proved_safe_indices.len() >= 2);
+        let me_bin = std::env::temp_dir().join(format!("tenon_dogfood_me_{}", pid));
+        let mut opts = BuildOptions {
+            opt_level: "O3".into(),
+            ..Default::default()
+        };
+        opts.apply_verified_mir(&me_rep.mir);
+        compile_with_options(&me_prog, &me_bin, &opts).expect("matching_engine LLVM AOT build");
+        let run1 = Command::new(&me_bin).output().unwrap();
+        let _ = fs::remove_file(&me_bin);
+        let out1 = String::from_utf8_lossy(&run1.stdout);
+        assert!(
+            run1.status.success() && out1.contains("main() => 5730") && out1.contains("live_objects=0"),
+            "matching_engine AOT run failed: stdout={} stderr={}",
+            out1,
+            String::from_utf8_lossy(&run1.stderr)
+        );
+
+        // 2. Dogfood #2: Self-hosting Tenon API Documentation Generator (`tenon_docgen.tn`)
+        let doc_prog = tenon_syntax::load_program_with_imports(
+            &repo_root.join("examples/dogfood/tenon_docgen.tn"),
+        )
+        .expect("tenon_docgen.tn must load");
+        let doc_rep = tenon_verify::check_program(&doc_prog);
+        assert!(doc_rep.ok, "tenon_docgen verify failed: {:?}", doc_rep.diagnostics);
+        let doc_bin = std::env::temp_dir().join(format!("tenon_dogfood_doc_{}", pid));
+        let mut doc_opts = BuildOptions {
+            opt_level: "O3".into(),
+            ..Default::default()
+        };
+        doc_opts.apply_verified_mir(&doc_rep.mir);
+        compile_with_options(&doc_prog, &doc_bin, &doc_opts).expect("tenon_docgen LLVM AOT build");
+        let run2 = Command::new(&doc_bin).output().unwrap();
+        let _ = fs::remove_file(&doc_bin);
+        let out2 = String::from_utf8_lossy(&run2.stdout);
+        assert!(
+            run2.status.success() && out2.contains("main() => 4") && out2.contains("live_objects=0"),
+            "tenon_docgen AOT run failed: stdout={} stderr={}",
+            out2,
+            String::from_utf8_lossy(&run2.stderr)
+        );
+    }
 }

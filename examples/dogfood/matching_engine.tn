@@ -1,0 +1,130 @@
+// examples/dogfood/matching_engine.tn — Real Self-Hosting Dogfooding App #1:
+// Verified Limit-Order-Book & Backtest Risk Kernel written in pure Tenon!
+// Exercises EVERY major Tenon capability together:
+//  - Const-parameterized refinement types `Range[LO, HI]`
+//  - Subtype-dependent `refine_cast[T](x)` (infallible widening & fallible narrowing)
+//  - Closed-loop `while` (`invariant` + `forall` Z3 Array proof + `decreases`)
+//  - Proved-safe unchecked LLVM list indexing + overflow-free `nsw` arithmetic
+//  - `@fip` zero-net-alloc in-place order fill + `@no_heap_alloc` risk fee math
+//  - Real SQLite3 trade ledger (`std/db/sqlite.tn`) with refinement-derived `CHECK(...)` constraints
+
+import "std/core/ops.tn"
+import "std/text/text.tn"
+import "std/db/sqlite.tn"
+
+pub type Range[LO Int, HI Int] = Int where self >= LO && self <= HI
+pub type Price    = Range[1, 1000000]
+pub type Qty      = Range[1, 100000]
+pub type FeeBps   = Range[0, 500]
+pub type SafePx   = Range[1, 500000]
+
+pub record Order {
+    id    Int
+    price Price
+    qty   Qty
+}
+
+// `@no_heap_alloc`: strictly register-only fee computation (proved overflow-free `nsw`!)
+@no_heap_alloc
+pub pure fn calc_fee_notional(px Price, qty Qty, bps FeeBps) Int {
+    let notional = px * qty
+    (notional * bps) / 10000
+}
+
+// `@fip`: zero net heap allocation by reusing owned `Order` Perceus cell in-place!
+@fip
+pub pure fn adjust_order_qty(o Order, new_qty Qty) Order {
+    Order { id = o.id, price = o.price, qty = new_qty }
+}
+
+// Subtype-dependent risk-limit check using `refine_cast[SafePx]` (returns `Result[SafePx, Text]`)
+pub pure fn check_price_risk(px Price) Result[SafePx, Text] {
+    refine_cast[SafePx](px)
+}
+
+// Widening: `SafePx` <: `Price` is statically proved infallible -> bare `Price` (zero runtime check!)
+pub pure fn promote_safe_price(px SafePx) Price {
+    refine_cast[Price](px)
+}
+
+// Verified price-level book builder: Z3 proves EVERY level is strictly positive (`forall k in 0..n: bids[k] >= 1`)
+// and proves ALL index writes & reads in bounds -> LLVM eliminates every bounds check!
+pub fn build_and_score_book(n Int where self >= 1 && self <= 32, base_px Range[100, 10000]) Int {
+    var bids List[Int] = list_filled(n, base_px)
+    var i = 0
+    while i < n
+        invariant 0 <= i && i <= n
+        invariant forall k in 0..i: bids[k] >= 1
+        decreases n - i
+    {
+        bids[i] = base_px + i * 10
+        i += 1
+    }
+    ghost {
+        assert i == n
+        assert forall k in 0..n: bids[k] >= 1
+    }
+
+    var total_px = 0
+    var j = 0
+    while j < n
+        invariant 0 <= j && j <= n
+        decreases n - j
+    {
+        total_px += bids[j]
+        j += 1
+    }
+    total_px
+}
+
+pub fn main() Int {
+    // 1. Order adjustment via `@fip` + risk check via `refine_cast`
+    let o0 = Order { id = 1, price = 42000, qty = 10 }
+    let o1 = adjust_order_qty(o0, 15)
+    let fee = calc_fee_notional(o1.price, o1.qty, 10)
+
+    let risk_ok = match check_price_risk(o1.price) {
+        Ok(safe) => promote_safe_price(safe)
+        Err(_) => 0
+    }
+    assert risk_ok == 42000
+
+    let rejected_risk = match check_price_risk(900000) {
+        Ok(_) => 0
+        Err(_) => 1
+    }
+    assert rejected_risk == 1
+
+    // 2. Verified book levels: 5 levels starting at 1000 -> 1000+1010+1020+1030+1040 = 5100
+    let book_sum = build_and_score_book(5, 1000)
+    assert book_sum == 5100
+
+    // 3. Persist verified trades into real SQLite3 with refinement `CHECK(...)` constraints
+    let db = match sqlite_open(":memory:") {
+        Ok(d) => d
+        Err(_) => { return -1 }
+    }
+    let ddl = sql_create_table_ddl(
+        "fills",
+        ["id INTEGER PRIMARY KEY", "price INTEGER NOT NULL", "qty INTEGER NOT NULL", "fee INTEGER NOT NULL"],
+        ["price >= 1 AND price <= 1000000", "qty >= 1 AND qty <= 100000"]
+    )
+    let _ = db.exec(ddl)
+    let ins_sql = "INSERT INTO fills(id, price, qty, fee) VALUES (1, " ++ int_to_text(o1.price) ++ ", " ++ int_to_text(o1.qty) ++ ", " ++ int_to_text(fee) ++ ");"
+    let _ = db.exec(ins_sql)
+    // Verify SQLite enforces the exact same refinement invariant at the storage boundary:
+    let bad_rejected = match db.exec("INSERT INTO fills(id, price, qty, fee) VALUES (2, 0, 10, 0);") {
+        Ok(_) => 0
+        Err(_) => 1
+    }
+    assert bad_rejected == 1
+
+    let persisted_fee = match db.query_int("SELECT SUM(fee) FROM fills;") {
+        Ok(v) => v
+        Err(_) => -2
+    }
+    db.close()
+
+    // fee = (42000 * 15 * 10) / 10000 = 630; 630 + 5100 = 5730
+    persisted_fee + book_sum
+}

@@ -7837,20 +7837,13 @@ impl CheckerCtx {
             }
             return;
         }
-        let Some(alias) = self.type_aliases.get(name).cloned() else {
-            return;
-        };
-        let ty_args: &[TypeExpr] = match ty {
-            TypeExpr::Named { args, .. } => args.as_slice(),
-            _ => &[],
-        };
-        let Some(pred_owned) = instantiate_alias_predicate(&alias, ty_args) else {
+        let Some(pred_owned) = self.resolve_alias_predicate(ty) else {
             return;
         };
         let pred = &pred_owned;
 
         // Float refinement verification: L0 constant -> L0 float interval -> L1 Z3 `Real`!
-        if self.is_float_ty(&alias.base) {
+        if self.is_float_ty(ty) {
             if let Some(fval) = eval_const_float(expr, &self.consts) {
                 match check_float_refinement_l0(pred, fval) {
                     Some(true) => {
@@ -8221,6 +8214,35 @@ impl CheckerCtx {
         None
     }
 
+    fn resolve_alias_predicate(&self, ty: &TypeExpr) -> Option<Expr> {
+        let mut combined: Option<Expr> = None;
+        let mut cur = ty.clone();
+        for _ in 0..16 {
+            let TypeExpr::Named { name, args, .. } = cur else {
+                break;
+            };
+            let Some(alias) = self.type_aliases.get(&name) else {
+                break;
+            };
+            if let Some(p) = instantiate_alias_predicate(alias, &args) {
+                let p_span = p.span;
+                combined = Some(match combined {
+                    None => p,
+                    Some(acc) => Expr {
+                        kind: ExprKind::Binary {
+                            op: BinOp::And,
+                            left: Box::new(acc),
+                            right: Box::new(p),
+                        },
+                        span: p_span,
+                    },
+                });
+            }
+            cur = alias.base.clone();
+        }
+        combined
+    }
+
     fn eval_type_subsumption(&self, src_ty: &TypeExpr, dst_ty: &TypeExpr) -> CastVerdict {
         let sn = src_ty.display_name();
         let dn = dst_ty.display_name();
@@ -8229,13 +8251,7 @@ impl CheckerCtx {
         }
         let s_base = self.resolve_base_type(src_ty);
         let d_base = self.resolve_base_type(dst_ty);
-        let dst_pred = if let TypeExpr::Named { name, args, .. } = dst_ty {
-            self.type_aliases
-                .get(name)
-                .and_then(|a| instantiate_alias_predicate(a, args))
-        } else {
-            None
-        };
+        let dst_pred = self.resolve_alias_predicate(dst_ty);
         let Some(pred) = dst_pred else {
             // Unrefined target: check scalar widening
             if s_base.display_name() == d_base.display_name() {
@@ -8364,13 +8380,7 @@ impl CheckerCtx {
         smt_int_vars: &BTreeSet<String>,
         smt_premises: &[(Expr, BTreeMap<String, String>)],
     ) -> CastVerdict {
-        let dst_pred = if let TypeExpr::Named { name, args, .. } = dst_ty {
-            self.type_aliases
-                .get(name)
-                .and_then(|a| instantiate_alias_predicate(a, args))
-        } else {
-            None
-        };
+        let dst_pred = self.resolve_alias_predicate(dst_ty);
         let Some(pred) = dst_pred else {
             return CastVerdict::Infallible;
         };

@@ -93,11 +93,28 @@ fn load_and_parse(path: &str) -> Result<tenon_syntax::Program, String> {
 }
 
 fn cmd_check(args: &[String]) -> ExitCode {
-    let Some(file) = args.iter().find(|a| !a.starts_with('-')) else {
-        eprintln!("usage: tenon check <file.tn> [--json]");
+    let mut file_opt: Option<&str> = None;
+    let mut emit_proofs: Option<PathBuf> = None;
+    let as_json = args.iter().any(|a| a == "--json");
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--emit-proofs" if i + 1 < args.len() => {
+                emit_proofs = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--json" => i += 1,
+            s if !s.starts_with('-') && file_opt.is_none() => {
+                file_opt = Some(s);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(file) = file_opt else {
+        eprintln!("usage: tenon check <file.tn> [--json] [--emit-proofs <dir>]");
         return ExitCode::from(2);
     };
-    let as_json = args.iter().any(|a| a == "--json");
 
     let prog = match load_and_parse(file) {
         Ok(p) => p,
@@ -107,7 +124,21 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
     };
 
+    if emit_proofs.is_some() {
+        tenon_verify::begin_proof_recording();
+    }
     let report = check_program(&prog);
+    if let Some(pdir) = emit_proofs {
+        let certs = tenon_verify::end_proof_recording();
+        match tenon_verify::export_proof_certificates(&pdir, &certs) {
+            Ok(n) => println!(
+                "Exported {} independent SMT-LIB2 proof certificate(s) -> `{}`",
+                n,
+                pdir.display()
+            ),
+            Err(e) => eprintln!("warning: failed to export proof certificates: {}", e),
+        }
+    }
     if as_json {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         return if report.ok {
@@ -471,12 +502,20 @@ fn cmd_test(args: &[String]) -> ExitCode {
 
 fn cmd_evolve(args: &[String]) -> ExitCode {
     if args.len() < 3 || args[0] != "check" {
-        eprintln!("usage: tenon evolve check <v1.tn> <v2.tn> [--json]");
+        eprintln!("usage: tenon evolve check <v1.tn> <v2.tn> [--json] [--lock <evolution.lock>] [--emit-migration <out.sql>]");
         return ExitCode::from(2);
     }
     let v1_path = &args[1];
     let v2_path = &args[2];
     let as_json = args.iter().any(|a| a == "--json");
+    let lock_path = args
+        .windows(2)
+        .find(|w| w[0] == "--lock")
+        .map(|w| PathBuf::from(&w[1]));
+    let migration_path = args
+        .windows(2)
+        .find(|w| w[0] == "--emit-migration")
+        .map(|w| PathBuf::from(&w[1]));
 
     let v1 = match load_and_parse(v1_path) {
         Ok(p) => p,
@@ -494,6 +533,30 @@ fn cmd_evolve(args: &[String]) -> ExitCode {
     };
 
     let rep = check_evolution(&v1, &v2);
+    if let Some(lp) = &lock_path {
+        match tenon_verify::append_evolution_lock(lp, &rep, v1_path, v2_path) {
+            Ok(ent) => println!(
+                "Appended evolution receipt #{} ({}…) -> `{}`",
+                ent.seq,
+                &ent.entry_sha256[..12],
+                lp.display()
+            ),
+            Err(e) => eprintln!("warning: failed to update evolution lock: {}", e),
+        }
+    }
+    if let Some(mp) = &migration_path {
+        let sql = tenon_verify::emit_expand_contract_sql(&v1, &v2, &rep);
+        if let Some(parent) = mp.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        if let Err(e) = fs::write(mp, sql) {
+            eprintln!("failed to write `{}`: {}", mp.display(), e);
+            return ExitCode::from(1);
+        }
+        println!("Emitted verified Expand-Contract SQL migration -> `{}`", mp.display());
+    }
     if as_json {
         println!("{}", serde_json::to_string_pretty(&rep).unwrap());
         return if rep.safe_to_release {
@@ -1219,14 +1282,52 @@ fn cmd_build_wasm(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let emit_ts = args
+        .windows(2)
+        .find(|w| w[0] == "--emit-ts")
+        .map(|w| PathBuf::from(&w[1]));
     let report = check_program(&prog);
     if !report.ok {
         eprintln!("FAIL-CLOSED: verification failed for `{}`.", file);
         return ExitCode::from(1);
     }
+    if let Some(ts_path) = &emit_ts {
+        let ts = tenon_codegen::bindings::emit_typescript_bindings(&prog);
+        if let Some(parent) = ts_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        if let Err(e) = fs::write(ts_path, ts) {
+            eprintln!("failed to write `{}`: {}", ts_path.display(), e);
+            return ExitCode::from(1);
+        }
+        println!("Emitted TypeScript Wasm bindings -> `{}`", ts_path.display());
+    }
     let Some(manifest) = report.manifest else {
-        eprintln!("error: `{}` has no distributed views/subscribers.", file);
-        return ExitCode::from(1);
+        // General-purpose Tenon -> standalone `.wasm` compilation!
+        let bytes = match tenon_codegen::wasm_general::compile_program_to_wasm(&prog) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("general wasm32 compilation failed: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+        if let Some(parent) = Path::new(out_path).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(out_path, &bytes) {
+            eprintln!("failed to write `{}`: {}", out_path, e);
+            return ExitCode::from(1);
+        }
+        println!(
+            "Compiled general Wasm32 `{}` -> `{}` ({} bytes, {} proofs verified)",
+            file,
+            out_path,
+            bytes.len(),
+            report.proofs.len()
+        );
+        return ExitCode::SUCCESS;
     };
 
     let coalesce_ms = manifest
@@ -1273,6 +1374,9 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     let mut file_arg: Option<String> = None;
     let mut out_bin = "target/tenon_out".to_string();
     let mut opts = tenon_codegen::llvm_aot::BuildOptions::default();
+    let mut emit_ts: Option<PathBuf> = None;
+    let mut emit_swift: Option<PathBuf> = None;
+    let mut emit_kotlin: Option<PathBuf> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -1287,6 +1391,18 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             }
             "--emit-header" if i + 1 < args.len() => {
                 opts.emit_header_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-ts" if i + 1 < args.len() => {
+                emit_ts = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-swift" if i + 1 < args.len() => {
+                emit_swift = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-kotlin" if i + 1 < args.len() => {
+                emit_kotlin = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--opt" if i + 1 < args.len() => {
@@ -1370,6 +1486,38 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             }
         }
         return ExitCode::from(1);
+    }
+
+    if let Some(p) = &emit_ts {
+        let _ = fs::write(p, tenon_codegen::bindings::emit_typescript_bindings(&prog));
+        println!("Emitted TypeScript bindings -> `{}`", p.display());
+    }
+    if let Some(p) = &emit_swift {
+        let _ = fs::write(p, tenon_codegen::bindings::emit_swift_bindings(&prog));
+        println!("Emitted Swift C-ABI bindings -> `{}`", p.display());
+    }
+    if let Some(p) = &emit_kotlin {
+        let _ = fs::write(p, tenon_codegen::bindings::emit_kotlin_bindings(&prog, "com.tenon.generated"));
+        println!("Emitted Kotlin bindings -> `{}`", p.display());
+    }
+    if opts.target_triple.as_deref() == Some("wasm32") {
+        return match tenon_codegen::wasm_general::compile_program_to_wasm(&prog) {
+            Ok(bytes) => {
+                if let Some(parent) = Path::new(&out_bin).parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Err(e) = fs::write(&out_bin, &bytes) {
+                    eprintln!("failed to write `{}`: {}", out_bin, e);
+                    return ExitCode::from(1);
+                }
+                println!("Wasm32 Built `{}` -> `{}` ({} bytes, {} proofs verified)", file, out_bin, bytes.len(), report.proofs.len());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Wasm32 build failed: {}", e);
+                ExitCode::from(1)
+            }
+        };
     }
 
     opts.apply_verified_mir(&report.mir);

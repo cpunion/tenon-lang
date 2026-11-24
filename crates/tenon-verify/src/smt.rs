@@ -16,6 +16,80 @@ pub enum SmtOutcome {
 
 static VC_CACHE: OnceLock<Mutex<BTreeMap<String, SmtOutcome>>> = OnceLock::new();
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedProofCert {
+    pub index: usize,
+    pub sha256: String,
+    pub smtlib2: String,
+}
+
+static PROOF_RECORDER: OnceLock<Mutex<Option<Vec<ExportedProofCert>>>> = OnceLock::new();
+
+fn recorder() -> &'static Mutex<Option<Vec<ExportedProofCert>>> {
+    PROOF_RECORDER.get_or_init(|| Mutex::new(None))
+}
+
+/// Starts recording standalone SMT-LIB2 proof certificates for all proved L1 obligations.
+pub fn begin_proof_recording() {
+    *recorder().lock().unwrap() = Some(Vec::new());
+}
+
+/// Stops recording and returns all captured standalone SMT-LIB2 proof certificates.
+pub fn end_proof_recording() -> Vec<ExportedProofCert> {
+    recorder().lock().unwrap().take().unwrap_or_default()
+}
+
+/// Writes standalone `.smt2` proof certificates + `proof_manifest.json` to `dir`.
+pub fn export_proof_certificates(
+    dir: &std::path::Path,
+    certs: &[ExportedProofCert],
+) -> Result<usize, String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("failed to create `{}`: {}", dir.display(), e))?;
+    let mut manifest = Vec::new();
+    for c in certs {
+        let fname = format!("vc_{:04}_{}.smt2", c.index, &c.sha256[..12]);
+        let path = dir.join(&fname);
+        std::fs::write(&path, &c.smtlib2)
+            .map_err(|e| format!("failed to write `{}`: {}", path.display(), e))?;
+        manifest.push(serde_json::json!({
+            "index": c.index,
+            "file": fname,
+            "sha256": c.sha256,
+            "expected": "unsat"
+        }));
+    }
+    let mpath = dir.join("proof_manifest.json");
+    let mjson = serde_json::to_string_pretty(&serde_json::json!({
+        "format": "tenon-smtlib2-proof-certificates-v1",
+        "count": certs.len(),
+        "certificates": manifest
+    }))
+    .map_err(|e| e.to_string())?;
+    std::fs::write(&mpath, mjson)
+        .map_err(|e| format!("failed to write `{}`: {}", mpath.display(), e))?;
+    Ok(certs.len())
+}
+
+fn maybe_record_proved_cert(hash: &str, script: &str) {
+    let mut guard = recorder().lock().unwrap();
+    if let Some(list) = guard.as_mut() {
+        let idx = list.len() + 1;
+        // Standalone certificate omits `(get-model)` so offline `z3 file.smt2` returns clean `unsat` (exit 0)
+        let cert_script = format!(
+            "; Tenon Independent SMT-LIB2 Proof Certificate #{}\n; SHA-256: {}\n; Verify independently: z3 <file.smt2>  (expected: unsat)\n{}",
+            idx,
+            hash,
+            script.replace("(get-model)\n", "")
+        );
+        list.push(ExportedProofCert {
+            index: idx,
+            sha256: hash.to_string(),
+            smtlib2: cert_script,
+        });
+    }
+}
+
 fn disk_cache_path() -> Option<PathBuf> {
     if std::env::var_os("TENON_NO_DISK_CACHE").is_some() {
         return None;
@@ -303,10 +377,16 @@ impl SmtQuery {
         let hash = format!("{:x}", hasher.finalize());
 
         if let Some(hit) = cache().lock().unwrap().get(&hash).cloned() {
+            if hit == SmtOutcome::Proved {
+                maybe_record_proved_cert(&hash, &script);
+            }
             return hit;
         }
 
         let outcome = run_z3(&script, &self.vars);
+        if outcome == SmtOutcome::Proved {
+            maybe_record_proved_cert(&hash, &script);
+        }
         // Only cache definite answers (Proved / Counterexample); never cache transient errors!
         if matches!(outcome, SmtOutcome::Proved | SmtOutcome::Counterexample(_)) {
             let mut guard = cache().lock().unwrap();

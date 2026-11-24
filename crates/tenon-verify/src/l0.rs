@@ -730,6 +730,11 @@ impl L0Env {
                 }
             }
             ExprKind::Call { callee, args } => {
+                if let ExprKind::GenericInst { expr: inner, .. } = &callee.kind {
+                    if matches!(&inner.kind, ExprKind::Ident(n) if n == "refine_cast") && args.len() == 1 {
+                        return self.eval_abs_int(&args[0].value, self_var);
+                    }
+                }
                 if let ExprKind::Field { field, .. } = &callee.kind {
                     if matches!(field.as_str(), "len" | "byte_len" | "size") && args.is_empty() {
                         return AbsInt::top().refine_interval(Interval {
@@ -1239,6 +1244,11 @@ impl L0Env {
             }
             ExprKind::Block(blk) => self.ctfe_block(blk, locals, budget - 1),
             ExprKind::Call { callee, args } => {
+                if let ExprKind::GenericInst { expr: inner, .. } = &callee.kind {
+                    if matches!(&inner.kind, ExprKind::Ident(n) if n == "refine_cast") && args.len() == 1 {
+                        return self.ctfe_expr(&args[0].value, locals, budget - 1);
+                    }
+                }
                 if let ExprKind::Ident(fname) = &callee.kind {
                     let mut vals = Vec::new();
                     for a in args {

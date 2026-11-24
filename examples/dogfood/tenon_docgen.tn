@@ -1,0 +1,71 @@
+// examples/dogfood/tenon_docgen.tn — Real Self-Hosting Dogfooding App #2:
+// Pure Tenon API Documentation Extractor & Markdown Generator (zero Perceus leaks!).
+
+import "std/text/text.tn"
+import "std/text/builder.tn"
+
+pub record DocEntry {
+    kind Text
+    sig  Text
+}
+
+pub pure fn extract_doc_entries(src Text) List[DocEntry] {
+    var out List[DocEntry] = []
+    let n = len(src)
+    var line_start = 0
+    var i = 0
+    while i <= n {
+        let is_nl = i == n || byte_at(src, i) == 10
+        if is_nl {
+            let raw = str_slice(src, line_start, i)
+            let line = raw.trim()
+            if line.starts_with("pub pure fn ") || line.starts_with("pub fn ") || line.starts_with("pub async fn ") {
+                out = push(out, DocEntry { kind = "Function", sig = line })
+            } else if line.starts_with("pub record ") {
+                out = push(out, DocEntry { kind = "Record", sig = line })
+            } else if line.starts_with("pub type ") {
+                out = push(out, DocEntry { kind = "Refinement", sig = line })
+            } else if line.starts_with("lemma ") {
+                out = push(out, DocEntry { kind = "Lemma", sig = line })
+            }
+            line_start = i + 1
+        }
+        i += 1
+    }
+    out
+}
+
+pub pure fn render_markdown_docs(module_name Text, entries List[DocEntry]) Text {
+    var b = TextBuilder.new()
+    b.push("# Module `")
+    b.push(module_name)
+    b.push("`\n\n")
+    var i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        b.push("- **")
+        b.push(e.kind)
+        b.push("**: `")
+        b.push(e.sig)
+        b.push("`\n")
+        i += 1
+    }
+    b.finish()
+}
+
+pub fn main() Int {
+    let sample = """pub type Price = Range[1, 1000000]
+pub record Order { id Int }
+lemma nonneg_price(p Price) ensures p >= 1 { assert p >= 1 }
+pub pure fn calc_fee(px Price) Int { px / 100 }
+fn private_helper() Int { 0 }
+"""
+    let entries = extract_doc_entries(sample)
+    assert len(entries) == 4
+    let md = render_markdown_docs("matching_engine", entries)
+    assert md.contains("# Module `matching_engine`")
+    assert md.contains("**Refinement**: `pub type Price = Range[1, 1000000]`")
+    assert md.contains("**Lemma**: `lemma nonneg_price")
+    assert !md.contains("private_helper")
+    len(entries)
+}
