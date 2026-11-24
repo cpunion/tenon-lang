@@ -141,6 +141,7 @@ struct CheckerCtx {
     enums: BTreeMap<String, EnumDecl>,
     enum_variants: BTreeMap<String, VariantInfo>,
     pure_fns: BTreeMap<String, FnDecl>,
+    smt_pure_fns: BTreeMap<String, FnDecl>,
     no_heap_fns: BTreeSet<String>,
     all_fns: BTreeMap<String, FnDecl>,
     async_fns: BTreeSet<String>,
@@ -200,12 +201,60 @@ impl CheckerCtx {
             }
         }
 
+        // Compute fixpoint subset of `pure_fns` that are strictly scalar (Int/Bool) and SMT-encodable
+        let is_scalar_smt_ty = |ty: &TypeExpr| -> bool {
+            let mut cur = ty;
+            for _ in 0..8 {
+                if let TypeExpr::Named { name, args, .. } = cur {
+                    if !args.is_empty() {
+                        return false;
+                    }
+                    if matches!(
+                        name.as_str(),
+                        "Int" | "Int64" | "Int32" | "UInt16" | "USize" | "Bool"
+                    ) {
+                        return true;
+                    }
+                    if let Some(alias) = type_aliases.get(name) {
+                        cur = &alias.base;
+                        continue;
+                    }
+                    return false;
+                }
+                return false;
+            }
+            false
+        };
+        let mut smt_pure_fns: BTreeMap<String, FnDecl> = BTreeMap::new();
+        loop {
+            let mut added = false;
+            for (name, f) in &pure_fns {
+                if smt_pure_fns.contains_key(name) {
+                    continue;
+                }
+                let ret_ok = f.ret_ty.as_ref().is_some_and(&is_scalar_smt_ty);
+                let params_ok = f.params.iter().all(|p| is_scalar_smt_ty(&p.ty));
+                if !ret_ok || !params_ok || !crate::smt::can_encode_pure_fn(f) {
+                    continue;
+                }
+                let callees = crate::smt::pure_fn_callees(f);
+                if callees.iter().all(|c| c != name && smt_pure_fns.contains_key(c)) {
+                    smt_pure_fns.insert(name.clone(), f.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
         Self {
             type_aliases,
             records,
             enums,
             enum_variants,
             pure_fns,
+            smt_pure_fns,
             no_heap_fns,
             all_fns,
             async_fns,
@@ -257,9 +306,7 @@ impl CheckerCtx {
                 let ExprKind::Ident(fname) = &callee.kind else {
                     return false;
                 };
-                self.pure_fns
-                    .get(fname)
-                    .is_some_and(crate::smt::can_encode_pure_fn)
+                self.smt_pure_fns.contains_key(fname)
                     && args.iter().all(|a| self.expr_smt_encodable(&a.value))
             }
             _ => false,
@@ -1097,6 +1144,47 @@ impl CheckerCtx {
                                 span: *span,
                             };
                             smt_premises.push((eq, BTreeMap::new()));
+                        } else {
+                            // Bridge sound L0 domain bounds (e.g. `len(x) >= 0`, `byte_at in [-1, 255]`,
+                            // callee `ensures` bounds) into L1 SMT premises.
+                            if refined.interval.min > i64::MIN as i128
+                                && refined.interval.min <= i64::MAX as i128
+                            {
+                                let ge = Expr {
+                                    kind: ExprKind::Binary {
+                                        op: BinOp::Ge,
+                                        left: Box::new(Expr {
+                                            kind: ExprKind::Ident(name.clone()),
+                                            span: *span,
+                                        }),
+                                        right: Box::new(Expr {
+                                            kind: ExprKind::Int(refined.interval.min as i64),
+                                            span: *span,
+                                        }),
+                                    },
+                                    span: *span,
+                                };
+                                smt_premises.push((ge, BTreeMap::new()));
+                            }
+                            if refined.interval.max < i64::MAX as i128
+                                && refined.interval.max >= i64::MIN as i128
+                            {
+                                let le = Expr {
+                                    kind: ExprKind::Binary {
+                                        op: BinOp::Le,
+                                        left: Box::new(Expr {
+                                            kind: ExprKind::Ident(name.clone()),
+                                            span: *span,
+                                        }),
+                                        right: Box::new(Expr {
+                                            kind: ExprKind::Int(refined.interval.max as i64),
+                                            span: *span,
+                                        }),
+                                    },
+                                    span: *span,
+                                };
+                                smt_premises.push((le, BTreeMap::new()));
+                            }
                         }
                     }
                 }
@@ -1521,7 +1609,7 @@ impl CheckerCtx {
                         });
                     }
                     L0Result::Unknown => {
-                        let mut q = SmtQuery::new(self.pure_fns.clone());
+                        let mut q = SmtQuery::new(self.smt_pure_fns.clone());
                         for v in smt_int_vars {
                             q.declare_int(v.clone());
                         }
@@ -1580,7 +1668,7 @@ impl CheckerCtx {
         }
 
         for wc in &rec.where_clauses {
-            let mut q = SmtQuery::new(self.pure_fns.clone());
+            let mut q = SmtQuery::new(self.smt_pure_fns.clone());
             for v in smt_int_vars {
                 q.declare_int(v.clone());
             }
@@ -2386,7 +2474,7 @@ impl CheckerCtx {
                 });
             }
             L0Result::Unknown => {
-                let mut q = SmtQuery::new(self.pure_fns.clone());
+                let mut q = SmtQuery::new(self.smt_pure_fns.clone());
                 for v in smt_int_vars {
                     q.declare_int(v.clone());
                 }
@@ -2527,7 +2615,7 @@ impl CheckerCtx {
                         });
                     }
                     L0Result::Unknown => {
-                        let mut q = SmtQuery::new(self.pure_fns.clone());
+                        let mut q = SmtQuery::new(self.smt_pure_fns.clone());
                         for v in &local_vars {
                             q.declare_int(v.clone());
                         }
@@ -2613,7 +2701,7 @@ impl CheckerCtx {
                     });
                 }
                 L0Result::Unknown => {
-                    let mut q = SmtQuery::new(self.pure_fns.clone());
+                    let mut q = SmtQuery::new(self.smt_pure_fns.clone());
                     for v in &local_vars {
                         q.declare_int(v.clone());
                     }
@@ -2691,7 +2779,7 @@ impl CheckerCtx {
                 });
             }
             L0Result::Unknown => {
-                let mut q = SmtQuery::new(self.pure_fns.clone());
+                let mut q = SmtQuery::new(self.smt_pure_fns.clone());
                 for v in smt_int_vars {
                     q.declare_int(v.clone());
                 }
@@ -2794,7 +2882,7 @@ impl CheckerCtx {
             L0Result::Unknown => {}
         }
 
-        let mut q = SmtQuery::new(self.pure_fns.clone());
+        let mut q = SmtQuery::new(self.smt_pure_fns.clone());
         for v in smt_int_vars {
             q.declare_int(v.clone());
         }

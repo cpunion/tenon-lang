@@ -77,12 +77,18 @@ impl SmtQuery {
         out.push_str(&format!("(set-option :rlimit {})\n", self.rlimit));
         out.push_str("(set-option :smt.random_seed 42)\n");
 
-        // Topologically emit pure functions (simple dependency sort by name length / two-pass)
+        // Topologically emit pure functions whose callees are all declared in `self.pure_fns`
         let ordered = order_pure_fns(&self.pure_fns);
+        let mut emitted = std::collections::BTreeSet::new();
         for f in ordered {
-            if let Ok(def) = encode_pure_fn(&f) {
-                out.push_str(&def);
-                out.push('\n');
+            let mut deps = Vec::new();
+            collect_calls_in_block(&f.body, &mut deps);
+            if deps.iter().all(|d| d != &f.name && emitted.contains(d)) {
+                if let Ok(def) = encode_pure_fn(&f) {
+                    out.push_str(&def);
+                    out.push('\n');
+                    emitted.insert(f.name.clone());
+                }
             }
         }
 
@@ -298,6 +304,12 @@ fn type_to_smt_sort(ty: &TypeExpr) -> Result<&'static str, String> {
 
 pub fn can_encode_pure_fn(f: &FnDecl) -> bool {
     encode_pure_fn(f).is_ok()
+}
+
+pub fn pure_fn_callees(f: &FnDecl) -> Vec<String> {
+    let mut deps = Vec::new();
+    collect_calls_in_block(&f.body, &mut deps);
+    deps
 }
 
 fn encode_pure_fn(f: &FnDecl) -> Result<String, String> {

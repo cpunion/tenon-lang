@@ -221,6 +221,23 @@ impl AbsInt {
         }
         self
     }
+
+    pub fn join(self, other: Self) -> Self {
+        let interval = self.interval.join(other.interval);
+        let cong = if self.cong == other.cong {
+            self.cong
+        } else {
+            Congruence::TOP
+        };
+        let non_zero = (self.non_zero && other.non_zero)
+            || interval.min > 0
+            || interval.max < 0;
+        Self {
+            interval,
+            cong,
+            non_zero,
+        }
+    }
 }
 
 /// Abstract environment for L0 fast verification.
@@ -576,6 +593,63 @@ impl L0Env {
                     }
                 }
                 AbsInt::top()
+            }
+            ExprKind::Block(blk) => {
+                if let Some(tail) = &blk.tail {
+                    self.eval_abs_int(tail, self_var)
+                } else {
+                    AbsInt::top()
+                }
+            }
+            ExprKind::If {
+                cond,
+                then_block,
+                else_branch,
+            } => {
+                let mut then_env = self.clone();
+                then_env.assume_expr(cond, self_var);
+                let then_val = then_block
+                    .tail
+                    .as_deref()
+                    .map(|e| then_env.eval_abs_int(e, self_var))
+                    .unwrap_or_else(AbsInt::top);
+                if let Some(eb) = else_branch {
+                    let mut else_env = self.clone();
+                    let neg_cond = Expr {
+                        kind: ExprKind::Unary {
+                            op: UnOp::Not,
+                            expr: cond.clone(),
+                        },
+                        span: cond.span,
+                    };
+                    else_env.assume_expr(&neg_cond, self_var);
+                    let else_val = else_env.eval_abs_int(eb, self_var);
+                    then_val.join(else_val)
+                } else {
+                    AbsInt::top()
+                }
+            }
+            ExprKind::Match { arms, .. } => {
+                let mut joined: Option<AbsInt> = None;
+                for arm in arms {
+                    // Skip diverging arm blocks (`{ return ... }`, `{ continue }`, `{ break }`)
+                    if let ExprKind::Block(b) = &arm.body.kind {
+                        if b.tail.is_none()
+                            && matches!(
+                                b.stmts.last(),
+                                Some(Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. })
+                            )
+                        {
+                            continue;
+                        }
+                    }
+                    let av = self.eval_abs_int(&arm.body, self_var);
+                    joined = Some(match joined {
+                        Some(acc) => acc.join(av),
+                        None => av,
+                    });
+                }
+                joined.unwrap_or_else(AbsInt::top)
             }
             _ => AbsInt::top(),
         }

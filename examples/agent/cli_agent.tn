@@ -2,15 +2,16 @@
 //
 // Layered architecture:
 //   1. Minimal Language Core (`tenon-rt`: Perceus RC + 19 byte/OS/SSE transport syscalls)
-//   2. Pure-Tenon Standard Library (`std/io.tn`, `std/text.tn`, `std/json.tn`,
-//      `std/env.tn`, `std/tools.tn`, `std/openai.tn`)
+//   2. Idiomatic, Contract-Verified Pure-Tenon Standard Library (`std/io.tn`, `std/text.tn`,
+//      `std/fs.tn`, `std/json.tn` with `JsonValue` ADT, `std/env.tn`, `std/tools.tn`, `std/openai.tn`)
 //   3. This Interactive CLI Agent (`examples/agent/cli_agent.tn`), formally verified with
-//      refined types, Z3 `mutate` proofs, `@no_heap_alloc`, `lock_lattice`, and
-//      `protocol state_machine`, runnable via BOTH Cranelift JIT (`tenon run`) AND
-//      LLVM 22 `-O3` AOT standalone native binary (`tenon build`)!
+//      refined types, Z3 `mutate` proofs, exhaustive `Option`/`Result`/`JsonValue` matching,
+//      `@no_heap_alloc`, `lock_lattice`, and `protocol state_machine`, runnable via BOTH
+//      Cranelift JIT (`tenon run`) AND LLVM 22 `-O3` AOT standalone native binary (`tenon build`)!
 
 import "std/io.tn"
 import "std/text.tn"
+import "std/fs.tn"
 import "std/json.tn"
 import "std/env.tn"
 import "std/tools.tn"
@@ -84,10 +85,10 @@ pub protocol state_machine TenonCliAgentFence {
 }
 
 // =========================================================================
-// 2. Tool Schemas & Pure-Tenon Tool Dispatcher (Shell + File Tools)
+// 2. Structured `JsonValue` Tool Schemas & Typed Tool Dispatcher
 // =========================================================================
 
-pub fn agent_instructions(workspace Text) Text {
+pub pure fn agent_instructions(workspace Text) Text {
     "You are the Tenon CLI Agent — an interactive coding and systems assistant implemented natively in the Tenon programming language. " ++
     "Current workspace: " ++ workspace ++ ". " ++
     "You have real tools: shell, read_file, write_file, edit_file, list_dir, grep_search. " ++
@@ -95,57 +96,132 @@ pub fn agent_instructions(workspace Text) Text {
     "Be concise and direct in your answers."
 }
 
-pub fn agent_tools_json() Text {
-    "[" ++
-    "{\"type\":\"function\",\"name\":\"shell\",\"description\":\"Execute a shell command in the workspace and return exit_code plus combined stdout/stderr.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"Shell command to run via /bin/sh -c\"}},\"required\":[\"command\"]}}," ++
-    "{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file relative to the workspace with line numbers.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Relative file path\"}},\"required\":[\"path\"]}}," ++
-    "{\"type\":\"function\",\"name\":\"write_file\",\"description\":\"Create or overwrite a file relative to the workspace.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Relative file path\"},\"content\":{\"type\":\"string\",\"description\":\"Full file content\"}},\"required\":[\"path\",\"content\"]}}," ++
-    "{\"type\":\"function\",\"name\":\"edit_file\",\"description\":\"Replace the first exact occurrence of target text with replacement in a workspace file.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Relative file path\"},\"target\":{\"type\":\"string\",\"description\":\"Exact substring to replace\"},\"replacement\":{\"type\":\"string\",\"description\":\"Replacement text\"}},\"required\":[\"path\",\"target\",\"replacement\"]}}," ++
-    "{\"type\":\"function\",\"name\":\"list_dir\",\"description\":\"List files and subdirectories in the workspace.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Relative directory path (default '.')\"}},\"required\":[]}}," ++
-    "{\"type\":\"function\",\"name\":\"grep_search\",\"description\":\"Recursively search for text in workspace files.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search text\"},\"path\":{\"type\":\"string\",\"description\":\"Optional relative subdirectory\"}},\"required\":[\"query\"]}}" ++
-    "]"
+pub pure fn agent_tools_json() JsonValue {
+    var tools = json_arr_new()
+
+    var shell_props = json_obj_new()
+    shell_props = json_obj_set(shell_props, "command", openai_string_prop("Shell command to run via /bin/sh -c"))
+    let shell_req List[Text] = ["command"]
+    tools = json_arr_push(tools, openai_function_tool(
+        "shell",
+        "Execute a shell command in the workspace and return exit_code plus combined stdout/stderr.",
+        shell_props,
+        shell_req
+    ))
+
+    var read_props = json_obj_new()
+    read_props = json_obj_set(read_props, "path", openai_string_prop("Relative file path"))
+    let read_req List[Text] = ["path"]
+    tools = json_arr_push(tools, openai_function_tool(
+        "read_file",
+        "Read a file relative to the workspace with line numbers.",
+        read_props,
+        read_req
+    ))
+
+    var write_props = json_obj_new()
+    write_props = json_obj_set(write_props, "path", openai_string_prop("Relative file path"))
+    write_props = json_obj_set(write_props, "content", openai_string_prop("Full file content"))
+    let write_req List[Text] = ["path", "content"]
+    tools = json_arr_push(tools, openai_function_tool(
+        "write_file",
+        "Create or overwrite a file relative to the workspace.",
+        write_props,
+        write_req
+    ))
+
+    var edit_props = json_obj_new()
+    edit_props = json_obj_set(edit_props, "path", openai_string_prop("Relative file path"))
+    edit_props = json_obj_set(edit_props, "target", openai_string_prop("Exact substring to replace"))
+    edit_props = json_obj_set(edit_props, "replacement", openai_string_prop("Replacement text"))
+    let edit_req List[Text] = ["path", "target", "replacement"]
+    tools = json_arr_push(tools, openai_function_tool(
+        "edit_file",
+        "Replace the first exact occurrence of target text with replacement in a workspace file.",
+        edit_props,
+        edit_req
+    ))
+
+    var list_props = json_obj_new()
+    list_props = json_obj_set(list_props, "path", openai_string_prop("Relative directory path (default '.')"))
+    let list_req List[Text] = []
+    tools = json_arr_push(tools, openai_function_tool(
+        "list_dir",
+        "List files and subdirectories in the workspace.",
+        list_props,
+        list_req
+    ))
+
+    var grep_props = json_obj_new()
+    grep_props = json_obj_set(grep_props, "query", openai_string_prop("Search text"))
+    grep_props = json_obj_set(grep_props, "path", openai_string_prop("Optional relative subdirectory"))
+    let grep_req List[Text] = ["query"]
+    tools = json_arr_push(tools, openai_function_tool(
+        "grep_search",
+        "Recursively search for text in workspace files.",
+        grep_props,
+        grep_req
+    ))
+
+    tools
 }
 
-pub fn dispatch_tool(workspace Text, name Text, args_json Text) Text {
+pub pure fn arg_str(args JsonValue, key Text) Text {
+    match json_get_str(args, key) {
+        Some(s) => s
+        None => ""
+    }
+}
+
+pub pure fn format_tool_result(res Result[Text, Text]) Text {
+    match res {
+        Ok(out) => out
+        Err(msg) => "error: " ++ msg
+    }
+}
+
+pub fn dispatch_tool(workspace Text, call ToolCall) Text {
+    let name = call.name
+    let args = call.arguments
     if name == "shell" {
-        let cmd = json_get_string(args_json, "command")
+        let cmd = arg_str(args, "command")
         let _ = println("  [tool:shell] $ " ++ cmd)
-        return tool_shell(workspace, cmd)
+        return format_tool_result(tool_shell(workspace, cmd))
     }
     if name == "read_file" {
-        let path = json_get_string(args_json, "path")
+        let path = arg_str(args, "path")
         let _ = println("  [tool:read_file] " ++ path)
-        return tool_read_file(workspace, path)
+        return format_tool_result(tool_read_file(workspace, path))
     }
     if name == "write_file" {
-        let path = json_get_string(args_json, "path")
-        let content = json_get_string(args_json, "content")
+        let path = arg_str(args, "path")
+        let content = arg_str(args, "content")
         let _ = println("  [tool:write_file] " ++ path ++ " (" ++ int_to_text(len(content)) ++ " bytes)")
-        return tool_write_file(workspace, path, content)
+        return format_tool_result(tool_write_file(workspace, path, content))
     }
     if name == "edit_file" {
-        let path = json_get_string(args_json, "path")
-        let target = json_get_string(args_json, "target")
-        let replacement = json_get_string(args_json, "replacement")
+        let path = arg_str(args, "path")
+        let target = arg_str(args, "target")
+        let replacement = arg_str(args, "replacement")
         let _ = println("  [tool:edit_file] " ++ path)
-        return tool_edit_file(workspace, path, target, replacement)
+        return format_tool_result(tool_edit_file(workspace, path, target, replacement))
     }
     if name == "list_dir" {
-        let path = json_get_string(args_json, "path")
+        let path = arg_str(args, "path")
         let _ = println("  [tool:list_dir] " ++ path)
-        return tool_list_dir(workspace, path)
+        return format_tool_result(tool_list_dir(workspace, path))
     }
     if name == "grep_search" {
-        let query = json_get_string(args_json, "query")
-        let path = json_get_string(args_json, "path")
+        let query = arg_str(args, "query")
+        let path = arg_str(args, "path")
         let _ = println("  [tool:grep_search] " ++ query)
-        return tool_grep(workspace, query, path)
+        return format_tool_result(tool_grep(workspace, query, path))
     }
     "error: unknown tool `" ++ name ++ "`"
 }
 
 // =========================================================================
-// 3. Multi-Round Pure-Tenon ReAct Agent Loop
+// 3. Multi-Round Pure-Tenon ReAct Agent Loop (`List[JsonValue]` history)
 // =========================================================================
 
 pub fn run_agent_turn(
@@ -154,18 +230,19 @@ pub fn run_agent_turn(
     model Text,
     effort Text,
     workspace Text,
-    conv_items_csv Text,
+    conv_items List[JsonValue],
     user_prompt Text
-) Text {
+) List[JsonValue] {
     bump_turn_epoch(lease)
     let active_epoch = lease.epoch
     assert is_epoch_valid(lease.epoch, active_epoch)
 
     let session_id = "tenon-cli-b" ++ int_to_text(lease.branch_id)
     let instructions = agent_instructions(workspace)
-    let tools_json = agent_tools_json()
+    let tools = agent_tools_json()
 
-    var items_csv = json_csv_append(conv_items_csv, openai_user_item(user_prompt))
+    var items List[JsonValue] = conv_items
+    items = push(items, openai_user_item(user_prompt))
     var rounds = 0
     var total_tools = 0
     var total_in = 0
@@ -174,41 +251,44 @@ pub fn run_agent_turn(
 
     while rounds < 12 {
         rounds += 1
-        let turn = openai_stream_turn(
+        match openai_stream_turn(
             api_key,
             model,
             effort,
             session_id,
             instructions,
-            items_csv,
-            tools_json,
+            items,
+            tools,
             true
-        )
-        if len(turn.error) > 0 {
-            let _ = println("[agent error] " ++ turn.error)
-            return items_csv
-        }
-        if len(turn.output_items_json) > 0 {
-            items_csv = json_csv_append(items_csv, turn.output_items_json)
-        }
-        total_in += turn.input_tokens
-        total_cached += turn.cached_tokens
-        total_out += turn.output_tokens
+        ) {
+            Err(err) => {
+                let _ = println("[agent error] " ++ err)
+                return items
+            }
+            Ok(turn) => {
+                var oi = 0
+                while oi < len(turn.output_items) {
+                    items = push(items, turn.output_items[oi])
+                    oi += 1
+                }
+                total_in += turn.usage.input_tokens
+                total_cached += turn.usage.cached_tokens
+                total_out += turn.usage.output_tokens
 
-        if turn.call_count == 0 {
-            break
-        }
+                let ncalls = len(turn.tool_calls)
+                if ncalls == 0 {
+                    break
+                }
 
-        var idx = 0
-        while idx < turn.call_count {
-            let call_obj = json_array_get_raw(turn.calls_json, idx)
-            let call_id = json_get_string(call_obj, "call_id")
-            let tname = json_get_string(call_obj, "name")
-            let targs = json_get_string(call_obj, "arguments")
-            let tool_out = dispatch_tool(workspace, tname, targs)
-            items_csv = json_csv_append(items_csv, openai_tool_output_item(call_id, tool_out))
-            total_tools += 1
-            idx += 1
+                var ci = 0
+                while ci < ncalls {
+                    let call = turn.tool_calls[ci]
+                    let tool_out = dispatch_tool(workspace, call)
+                    items = push(items, openai_tool_output_item(call.call_id, tool_out))
+                    total_tools += 1
+                    ci += 1
+                }
+            }
         }
     }
 
@@ -222,7 +302,7 @@ pub fn run_agent_turn(
         " cached=" ++ int_to_text(total_cached) ++
         " out=" ++ int_to_text(total_out) ++ "]"
     )
-    items_csv
+    items
 }
 
 // =========================================================================
@@ -241,32 +321,40 @@ pub fn print_help() Int {
 }
 
 pub fn main() Int {
-    let api_key = env_or_dotenv("OPENAI_API_KEY")
-    if len(api_key) == 0 {
-        let _ = println("error: OPENAI_API_KEY not found in environment or .env")
-        return 1
+    let api_key = match env_or_dotenv("OPENAI_API_KEY") {
+        Some(k) => k
+        None => {
+            let _ = println("error: OPENAI_API_KEY not found in environment or .env")
+            return 1
+        }
     }
 
-    var workspace = sys_env("TENON_WORKSPACE")
-    if len(workspace) == 0 {
-        workspace = sys_cwd()
+    let workspace = match env_get("TENON_WORKSPACE") {
+        Some(w) => w
+        None => sys_cwd()
     }
-    var model = resolve_dast_model(sys_env("TENON_MODEL"))
+    let initial_model = match env_get("TENON_MODEL") {
+        Some(m) => m
+        None => ""
+    }
+    var model = resolve_dast_model(initial_model)
     var effort = resolve_dast_effort(model)
     var lease AgentLease = AgentLease { branch_id = 1, epoch = 0, turns_done = 0 }
-    var conv_items_csv = ""
+    var conv_items List[JsonValue] = []
 
     // Single-shot mode via TENON_PROMPT="..."
-    let single_prompt = sys_env("TENON_PROMPT")
-    if len(single_prompt) > 0 {
-        let _ = println("Tenon Pure-Language CLI Agent | model=" ++ model ++ " (" ++ effort ++ ") | workspace=" ++ workspace)
-        conv_items_csv = run_agent_turn(lease, api_key, model, effort, workspace, conv_items_csv, single_prompt)
-        return 0
+    match env_get("TENON_PROMPT") {
+        Some(single_prompt) => {
+            let _ = println("Tenon Pure-Language CLI Agent | model=" ++ model ++ " (" ++ effort ++ ") | workspace=" ++ workspace)
+            conv_items = run_agent_turn(lease, api_key, model, effort, workspace, conv_items, single_prompt)
+            return 0
+        }
+        None => {}
     }
 
     // Interactive REPL mode
     let _ = println("======================================================================")
-    let _ = println("  Tenon Interactive CLI Agent (Written 100% in Tenon + std/*.tn)")
+    let _ = println("  Tenon Interactive CLI Agent (100% Pure Tenon + Typed Stdlib v2)")
     let _ = println("  Model:     " ++ model ++ " (reasoning=" ++ effort ++ ")")
     let _ = println("  Workspace: " ++ workspace)
     let _ = println("  Tools:     shell, read_file, write_file, edit_file, list_dir, grep_search")
@@ -275,10 +363,12 @@ pub fn main() Int {
 
     while true {
         let _ = print("\ntenon[" ++ model ++ "]> ")
-        let raw_line = read_line()
-        if is_eof() {
-            let _ = println("\nBye.")
-            break
+        let raw_line = match read_line() {
+            None => {
+                let _ = println("\nBye.")
+                break
+            }
+            Some(l) => l
         }
         let line = str_trim(raw_line)
         if len(line) == 0 {
@@ -292,12 +382,15 @@ pub fn main() Int {
             let _ = print_help()
             continue
         }
-        if str_starts_with(line, "/model ") {
-            let alias = str_trim(str_strip_prefix(line, "/model "))
-            model = resolve_dast_model(alias)
-            effort = resolve_dast_effort(model)
-            let _ = println("Switched model -> " ++ model ++ " (reasoning=" ++ effort ++ ")")
-            continue
+        match str_strip_prefix(line, "/model ") {
+            Some(raw_alias) => {
+                let alias = str_trim(raw_alias)
+                model = resolve_dast_model(alias)
+                effort = resolve_dast_effort(model)
+                let _ = println("Switched model -> " ++ model ++ " (reasoning=" ++ effort ++ ")")
+                continue
+            }
+            None => {}
         }
         if line == "/state" {
             let _ = println(
@@ -307,13 +400,13 @@ pub fn main() Int {
                 " model=" ++ model ++
                 " effort=" ++ effort ++
                 " workspace=" ++ workspace ++
-                " context_bytes=" ++ int_to_text(len(conv_items_csv))
+                " context_items=" ++ int_to_text(len(conv_items))
             )
             continue
         }
         if line == "/branch" {
             fork_clean_branch(lease)
-            conv_items_csv = ""
+            conv_items = []
             let _ = println(
                 "Forked clean branch -> branch=#" ++ int_to_text(lease.branch_id) ++
                 " epoch=" ++ int_to_text(lease.epoch)
@@ -321,12 +414,12 @@ pub fn main() Int {
             continue
         }
         if line == "/clear" {
-            conv_items_csv = ""
+            conv_items = []
             let _ = println("Cleared conversation context.")
             continue
         }
 
-        conv_items_csv = run_agent_turn(lease, api_key, model, effort, workspace, conv_items_csv, line)
+        conv_items = run_agent_turn(lease, api_key, model, effort, workspace, conv_items, line)
     }
     0
 }

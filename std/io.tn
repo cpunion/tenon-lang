@@ -1,5 +1,5 @@
 // Tenon Standard Library: std/io.tn
-// Console I/O built directly on minimal OS syscalls.
+// Console I/O returning structured `Option[Text]` instead of global EOF side-channels.
 
 pub fn print(s Text) Int {
     sys_write_stdout(s)
@@ -9,10 +9,10 @@ pub fn println(s Text) Int {
     sys_write_stdout(s ++ "\n")
 }
 
-pub fn read_line() Text {
-    sys_read_line()
-}
-
-pub fn is_eof() Bool {
-    sys_is_eof()
+pub fn read_line() Option[Text] {
+    let line = sys_read_line()
+    if sys_is_eof() {
+        return None
+    }
+    Some(line)
 }

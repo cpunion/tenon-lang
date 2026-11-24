@@ -1923,6 +1923,7 @@ impl Parser {
                 self.bump();
                 let cond = self.parse_expr()?;
                 let then_block = self.parse_block()?;
+                let saved_pos = self.pos;
                 let else_branch = if self.eat(&TokenKind::Else) {
                     self.skip_newlines();
                     if self.peek().kind == TokenKind::If {
@@ -1936,6 +1937,7 @@ impl Parser {
                         }))
                     }
                 } else {
+                    self.pos = saved_pos;
                     None
                 };
                 let end = else_branch

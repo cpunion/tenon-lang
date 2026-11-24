@@ -1,16 +1,234 @@
 // Tenon Standard Library: std/json.tn
-// 100% pure-Tenon structural JSON encoder and depth-aware parser!
+// First-class algebraic `JsonValue` ADT, recursive-descent parser returning
+// `Result[JsonValue, JsonError]`, exhaustive serializer `json_stringify`,
+// immutable builders, and typed `Option[T]` accessors — 100% pure Tenon!
 
 import "std/text.tn"
 
-pub fn json_escape(s Text) Text {
+pub record JsonEntry {
+    key Text
+    val JsonValue
+}
+
+pub record JsonError {
+    pos     NonNegative
+    message Text
+}
+
+pub enum JsonValue {
+    JNull
+    JBool(Bool)
+    JInt(Int)
+    JStr(Text)
+    JArr(List[JsonValue])
+    JObj(List[JsonEntry])
+}
+
+pub record JsonParsed {
+    value JsonValue
+    next  NonNegative
+}
+
+// =========================================================================
+// 1. Constructors & Immutable MVS Builders
+// =========================================================================
+
+pub pure fn json_null() JsonValue {
+    JNull
+}
+
+pub pure fn json_bool(b Bool) JsonValue {
+    JBool(b)
+}
+
+pub pure fn json_int(n Int) JsonValue {
+    JInt(n)
+}
+
+pub pure fn json_str(s Text) JsonValue {
+    JStr(s)
+}
+
+pub pure fn json_arr_new() JsonValue {
+    let empty List[JsonValue] = []
+    JArr(empty)
+}
+
+pub pure fn json_obj_new() JsonValue {
+    let empty List[JsonEntry] = []
+    JObj(empty)
+}
+
+pub pure fn json_arr_push(arr JsonValue, item JsonValue) JsonValue {
+    match arr {
+        JArr(items) => {
+            var next List[JsonValue] = items
+            next = push(next, item)
+            JArr(next)
+        }
+        JNull => {
+            var next List[JsonValue] = []
+            next = push(next, item)
+            JArr(next)
+        }
+        JBool(_) => arr
+        JInt(_) => arr
+        JStr(_) => arr
+        JObj(_) => arr
+    }
+}
+
+pub pure fn json_obj_set(obj JsonValue, key Text, val JsonValue) JsonValue {
+    match obj {
+        JObj(entries) => {
+            var next List[JsonEntry] = []
+            var replaced = false
+            var i = 0
+            while i < len(entries) {
+                let e = entries[i]
+                if e.key == key {
+                    next = push(next, JsonEntry { key = key, val = val })
+                    replaced = true
+                } else {
+                    next = push(next, e)
+                }
+                i += 1
+            }
+            if !replaced {
+                next = push(next, JsonEntry { key = key, val = val })
+            }
+            JObj(next)
+        }
+        JNull => {
+            var next List[JsonEntry] = []
+            next = push(next, JsonEntry { key = key, val = val })
+            JObj(next)
+        }
+        JBool(_) => obj
+        JInt(_) => obj
+        JStr(_) => obj
+        JArr(_) => obj
+    }
+}
+
+// =========================================================================
+// 2. Typed Accessors (`Option[T]` with Exhaustive Match)
+// =========================================================================
+
+pub pure fn json_get(v JsonValue, key Text) Option[JsonValue] {
+    match v {
+        JObj(entries) => {
+            var i = 0
+            while i < len(entries) {
+                let e = entries[i]
+                if e.key == key {
+                    return Some(e.val)
+                }
+                i += 1
+            }
+            None
+        }
+        JNull => None
+        JBool(_) => None
+        JInt(_) => None
+        JStr(_) => None
+        JArr(_) => None
+    }
+}
+
+pub pure fn json_at(v JsonValue, idx NonNegative) Option[JsonValue] {
+    match v {
+        JArr(items) => {
+            if idx >= len(items) {
+                return None
+            }
+            Some(items[idx])
+        }
+        JNull => None
+        JBool(_) => None
+        JInt(_) => None
+        JStr(_) => None
+        JObj(_) => None
+    }
+}
+
+pub pure fn json_len(v JsonValue) NonNegative {
+    match v {
+        JArr(items) => len(items)
+        JObj(entries) => len(entries)
+        JStr(s) => len(s)
+        JNull => 0
+        JBool(_) => 0
+        JInt(_) => 0
+    }
+}
+
+pub pure fn json_as_str(v JsonValue) Option[Text] {
+    match v {
+        JStr(s) => Some(s)
+        JNull => None
+        JBool(_) => None
+        JInt(_) => None
+        JArr(_) => None
+        JObj(_) => None
+    }
+}
+
+pub pure fn json_as_int(v JsonValue) Option[Int] {
+    match v {
+        JInt(n) => Some(n)
+        JNull => None
+        JBool(_) => None
+        JStr(_) => None
+        JArr(_) => None
+        JObj(_) => None
+    }
+}
+
+pub pure fn json_as_bool(v JsonValue) Option[Bool] {
+    match v {
+        JBool(b) => Some(b)
+        JNull => None
+        JInt(_) => None
+        JStr(_) => None
+        JArr(_) => None
+        JObj(_) => None
+    }
+}
+
+pub pure fn json_get_str(v JsonValue, key Text) Option[Text] {
+    match json_get(v, key) {
+        Some(inner) => json_as_str(inner)
+        None => None
+    }
+}
+
+pub pure fn json_get_int(v JsonValue, key Text) Option[Int] {
+    match json_get(v, key) {
+        Some(inner) => json_as_int(inner)
+        None => None
+    }
+}
+
+pub pure fn json_get_bool(v JsonValue, key Text) Option[Bool] {
+    match json_get(v, key) {
+        Some(inner) => json_as_bool(inner)
+        None => None
+    }
+}
+
+// =========================================================================
+// 3. String Escaping & Exhaustive `json_stringify(v JsonValue) Text`
+// =========================================================================
+
+pub pure fn json_escape(s Text) Text {
     let n = len(s)
     var out = ""
     var run_start = 0
     var i = 0
     while i < n {
         let b = byte_at(s, i)
-        if b == 34 || b == 92 || b == 10 || b == 13 || b == 9 || b < 32 {
+        if b == 34 || b == 92 || b == 10 || b == 13 || b == 9 || (b >= 0 && b < 32) {
             if i > run_start {
                 out = out ++ str_slice(s, run_start, i)
             }
@@ -25,9 +243,11 @@ pub fn json_escape(s Text) Text {
             } else if b == 9 {
                 out = out ++ "\\t"
             } else {
-                let hi = b / 16
+                let hi = (b / 16) % 16
                 let lo = b % 16
-                out = out ++ "\\u00" ++ hex_nibble(hi) ++ hex_nibble(lo)
+                if hi >= 0 && hi <= 15 && lo >= 0 && lo <= 15 {
+                    out = out ++ "\\u00" ++ hex_nibble(hi) ++ hex_nibble(lo)
+                }
             }
             run_start = i + 1
         }
@@ -42,14 +262,49 @@ pub fn json_escape(s Text) Text {
     out
 }
 
-pub fn json_quote(s Text) Text {
+pub pure fn json_quote(s Text) Text {
     "\"" ++ json_escape(s) ++ "\""
 }
 
-pub fn codepoint_to_utf8(cp Int) Text {
-    if cp < 0 {
-        return ""
+pub pure fn json_stringify(v JsonValue) Text {
+    match v {
+        JNull => "null"
+        JBool(b) => if b { "true" } else { "false" }
+        JInt(n) => int_to_text(n)
+        JStr(s) => json_quote(s)
+        JArr(items) => {
+            var out = "["
+            var i = 0
+            while i < len(items) {
+                if i > 0 {
+                    out = out ++ ","
+                }
+                out = out ++ json_stringify(items[i])
+                i += 1
+            }
+            out ++ "]"
+        }
+        JObj(entries) => {
+            var out = "{"
+            var i = 0
+            while i < len(entries) {
+                if i > 0 {
+                    out = out ++ ","
+                }
+                let e = entries[i]
+                out = out ++ json_quote(e.key) ++ ":" ++ json_stringify(e.val)
+                i += 1
+            }
+            out ++ "}"
+        }
     }
+}
+
+// =========================================================================
+// 4. Full Recursive-Descent Parser (`json_parse -> Result[JsonValue, JsonError]`)
+// =========================================================================
+
+pub pure fn codepoint_to_utf8(cp NonNegative) Text {
     if cp < 128 {
         return byte_to_text(cp)
     }
@@ -64,7 +319,7 @@ pub fn codepoint_to_utf8(cp Int) Text {
     byte_to_text(b1) ++ byte_to_text(b2) ++ byte_to_text(b3)
 }
 
-pub fn json_unescape(raw Text) Text {
+pub pure fn json_unescape(raw Text) Text {
     let n = len(raw)
     var out = ""
     var run_start = 0
@@ -100,12 +355,12 @@ pub fn json_unescape(raw Text) Text {
                 out = out ++ byte_to_text(12)
                 i += 2
             } else if esc == 117 && i + 5 < n {
-                let h0 = parse_hex_digit(byte_at(raw, i + 2))
-                let h1 = parse_hex_digit(byte_at(raw, i + 3))
-                let h2 = parse_hex_digit(byte_at(raw, i + 4))
-                let h3 = parse_hex_digit(byte_at(raw, i + 5))
+                let h0 = parse_hex_digit_raw(byte_at(raw, i + 2))
+                let h1 = parse_hex_digit_raw(byte_at(raw, i + 3))
+                let h2 = parse_hex_digit_raw(byte_at(raw, i + 4))
+                let h3 = parse_hex_digit_raw(byte_at(raw, i + 5))
                 if h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0 {
-                    let cp = h0 * 4096 + h1 * 256 + h2 * 16 + h3
+                    let cp = clamp_non_neg(h0 * 4096 + h1 * 256 + h2 * 16 + h3)
                     out = out ++ codepoint_to_utf8(cp)
                     i += 6
                 } else {
@@ -130,211 +385,196 @@ pub fn json_unescape(raw Text) Text {
     out
 }
 
-pub fn json_skip_ws(s Text, pos Int) Int {
-    let n = len(s)
+pub pure fn json_skip_ws(src Text, pos NonNegative) NonNegative {
+    let n = len(src)
     var i = pos
-    while i < n && is_space_byte(byte_at(s, i)) {
+    while i < n && is_space_byte(byte_at(src, i)) {
         i += 1
     }
-    i
+    clamp_non_neg(i)
 }
 
-// Given `pos` pointing at an opening `"`, returns the index right AFTER the closing `"`, or -1.
-pub fn json_scan_string_end(s Text, pos Int) Int {
-    let n = len(s)
-    if pos >= n || byte_at(s, pos) != 34 {
-        return -1
+pub pure fn json_parse_string_at(src Text, start NonNegative) Result[JsonParsed, JsonError] {
+    let n = len(src)
+    if start >= n || byte_at(src, start) != 34 {
+        return Err(JsonError { pos = start, message = "expected opening '\"'" })
     }
-    var i = pos + 1
+    var i = start + 1
     while i < n {
-        let b = byte_at(s, i)
+        let b = byte_at(src, i)
         if b == 92 {
+            if i + 1 >= n {
+                return Err(JsonError { pos = clamp_non_neg(i), message = "unterminated escape in JSON string" })
+            }
             i += 2
             continue
         }
         if b == 34 {
-            return i + 1
+            let raw = str_slice(src, start + 1, i)
+            let decoded = json_unescape(raw)
+            return Ok(JsonParsed {
+                value = JStr(decoded),
+                next = clamp_non_neg(i + 1)
+            })
         }
         i += 1
     }
-    -1
+    Err(JsonError { pos = start, message = "unterminated JSON string" })
 }
 
-// Given `pos` pointing at the start of any JSON value, returns the index right AFTER that value.
-pub fn json_skip_value(s Text, pos Int) Int {
-    let n = len(s)
-    var i = json_skip_ws(s, pos)
-    if i >= n {
-        return n
+pub pure fn json_parse_number_at(src Text, start NonNegative) Result[JsonParsed, JsonError] {
+    let n = len(src)
+    var i = start
+    var neg = false
+    if i < n && byte_at(src, i) == 45 {
+        neg = true
+        i += 1
     }
-    let first = byte_at(s, i)
-    if first == 34 {
-        let end = json_scan_string_end(s, i)
-        if end < 0 {
-            return n
-        }
-        return end
+    if i >= n || !is_digit_byte(byte_at(src, i)) {
+        return Err(JsonError { pos = start, message = "invalid JSON number" })
     }
-    if first == 123 || first == 91 {
-        var depth = 0
-        var in_str = false
-        while i < n {
-            let b = byte_at(s, i)
-            if in_str {
-                if b == 92 {
-                    i += 2
-                    continue
-                }
-                if b == 34 {
-                    in_str = false
-                }
-                i += 1
-                continue
-            }
-            if b == 34 {
-                in_str = true
-            } else if b == 123 || b == 91 {
-                depth += 1
-            } else if b == 125 || b == 93 {
-                depth -= 1
-                if depth == 0 {
-                    return i + 1
-                }
-            }
+    var acc = 0
+    while i < n && is_digit_byte(byte_at(src, i)) {
+        acc = acc * 10 + (byte_at(src, i) - 48)
+        i += 1
+    }
+    // Consume optional fractional / exponent parts (e.g. `1.0`, `1e-5`) cleanly
+    if i < n && byte_at(src, i) == 46 {
+        i += 1
+        while i < n && is_digit_byte(byte_at(src, i)) {
             i += 1
         }
-        return n
     }
-    // Primitive token: number, true, false, null
-    while i < n {
-        let b = byte_at(s, i)
-        if b == 44 || b == 125 || b == 93 || is_space_byte(b) {
-            break
-        }
+    if i < n && (byte_at(src, i) == 101 || byte_at(src, i) == 69) {
         i += 1
+        if i < n && (byte_at(src, i) == 43 || byte_at(src, i) == 45) {
+            i += 1
+        }
+        while i < n && is_digit_byte(byte_at(src, i)) {
+            i += 1
+        }
     }
-    i
+    let val = if neg { -acc } else { acc }
+    Ok(JsonParsed {
+        value = JInt(val),
+        next = clamp_non_neg(i)
+    })
 }
 
-// Find direct member `key` in a JSON object `{...}`, returning the byte index of its value, or -1.
-pub fn json_find_value_pos(obj Text, key Text) Int {
-    let n = len(obj)
-    var i = json_skip_ws(obj, 0)
-    if i >= n || byte_at(obj, i) != 123 {
-        return -1
+pub pure fn json_parse_array_at(src Text, start NonNegative) Result[JsonParsed, JsonError] {
+    let n = len(src)
+    if start >= n || byte_at(src, start) != 91 {
+        return Err(JsonError { pos = start, message = "expected '['" })
     }
-    i = json_skip_ws(obj, i + 1)
+    var i = json_skip_ws(src, clamp_non_neg(start + 1))
+    var items List[JsonValue] = []
+    if i < n && byte_at(src, i) == 93 {
+        return Ok(JsonParsed { value = JArr(items), next = clamp_non_neg(i + 1) })
+    }
     while i < n {
-        if byte_at(obj, i) == 125 {
-            return -1
-        }
-        if byte_at(obj, i) != 34 {
-            return -1
-        }
-        let key_end = json_scan_string_end(obj, i)
-        if key_end < 0 {
-            return -1
-        }
-        let k = str_slice(obj, i + 1, key_end - 1)
-        i = json_skip_ws(obj, key_end)
-        if i >= n || byte_at(obj, i) != 58 {
-            return -1
-        }
-        let val_pos = json_skip_ws(obj, i + 1)
-        if k == key {
-            return val_pos
-        }
-        let after_val = json_skip_value(obj, val_pos)
-        i = json_skip_ws(obj, after_val)
-        if i < n && byte_at(obj, i) == 44 {
-            i = json_skip_ws(obj, i + 1)
+        match json_parse_value_at(src, clamp_non_neg(i)) {
+            Err(e) => { return Err(e) }
+            Ok(parsed) => {
+                items = push(items, parsed.value)
+                i = json_skip_ws(src, parsed.next)
+                if i < n && byte_at(src, i) == 44 {
+                    i = json_skip_ws(src, clamp_non_neg(i + 1))
+                    continue
+                }
+                if i < n && byte_at(src, i) == 93 {
+                    return Ok(JsonParsed { value = JArr(items), next = clamp_non_neg(i + 1) })
+                }
+                return Err(JsonError { pos = clamp_non_neg(i), message = "expected ',' or ']' in JSON array" })
+            }
         }
     }
-    -1
+    Err(JsonError { pos = start, message = "unterminated JSON array" })
 }
 
-pub fn json_get_raw(obj Text, key Text) Text {
-    let pos = json_find_value_pos(obj, key)
-    if pos < 0 {
-        return ""
+pub pure fn json_parse_object_at(src Text, start NonNegative) Result[JsonParsed, JsonError] {
+    let n = len(src)
+    if start >= n || byte_at(src, start) != 123 {
+        return Err(JsonError { pos = start, message = "expected '{'" })
     }
-    let end = json_skip_value(obj, pos)
-    str_slice(obj, pos, end)
-}
-
-pub fn json_get_object_raw(obj Text, key Text) Text {
-    let pos = json_find_value_pos(obj, key)
-    if pos < 0 || byte_at(obj, pos) != 123 {
-        return ""
+    var i = json_skip_ws(src, clamp_non_neg(start + 1))
+    var entries List[JsonEntry] = []
+    if i < n && byte_at(src, i) == 125 {
+        return Ok(JsonParsed { value = JObj(entries), next = clamp_non_neg(i + 1) })
     }
-    let end = json_skip_value(obj, pos)
-    str_slice(obj, pos, end)
-}
-
-pub fn json_get_string(obj Text, key Text) Text {
-    let pos = json_find_value_pos(obj, key)
-    if pos < 0 || byte_at(obj, pos) != 34 {
-        return ""
-    }
-    let end = json_scan_string_end(obj, pos)
-    if end < 0 {
-        return ""
-    }
-    let raw = str_slice(obj, pos + 1, end - 1)
-    json_unescape(raw)
-}
-
-pub fn json_get_int(obj Text, key Text) Int {
-    let raw = json_get_raw(obj, key)
-    if len(raw) == 0 {
-        return 0
-    }
-    text_to_int(raw)
-}
-
-pub fn json_array_len(arr Text) Int {
-    let n = len(arr)
-    var i = json_skip_ws(arr, 0)
-    if i >= n || byte_at(arr, i) != 91 {
-        return 0
-    }
-    i = json_skip_ws(arr, i + 1)
-    var count = 0
     while i < n {
-        if byte_at(arr, i) == 93 {
-            return count
-        }
-        count += 1
-        let next = json_skip_value(arr, i)
-        i = json_skip_ws(arr, next)
-        if i < n && byte_at(arr, i) == 44 {
-            i = json_skip_ws(arr, i + 1)
+        match json_parse_string_at(src, clamp_non_neg(i)) {
+            Err(e) => { return Err(e) }
+            Ok(key_parsed) => {
+                let key_text = match key_parsed.value {
+                    JStr(k) => k
+                    _ => ""
+                }
+                i = json_skip_ws(src, key_parsed.next)
+                if i >= n || byte_at(src, i) != 58 {
+                    return Err(JsonError { pos = clamp_non_neg(i), message = "expected ':' after JSON object key" })
+                }
+                let val_pos = json_skip_ws(src, clamp_non_neg(i + 1))
+                match json_parse_value_at(src, val_pos) {
+                    Err(e) => { return Err(e) }
+                    Ok(val_parsed) => {
+                        entries = push(entries, JsonEntry { key = key_text, val = val_parsed.value })
+                        i = json_skip_ws(src, val_parsed.next)
+                        if i < n && byte_at(src, i) == 44 {
+                            i = json_skip_ws(src, clamp_non_neg(i + 1))
+                            continue
+                        }
+                        if i < n && byte_at(src, i) == 125 {
+                            return Ok(JsonParsed { value = JObj(entries), next = clamp_non_neg(i + 1) })
+                        }
+                        return Err(JsonError { pos = clamp_non_neg(i), message = "expected ',' or '}' in JSON object" })
+                    }
+                }
+            }
         }
     }
-    count
+    Err(JsonError { pos = start, message = "unterminated JSON object" })
 }
 
-pub fn json_array_get_raw(arr Text, target_idx Int) Text {
-    let n = len(arr)
-    var i = json_skip_ws(arr, 0)
-    if i >= n || byte_at(arr, i) != 91 {
-        return ""
+pub pure fn json_parse_value_at(src Text, pos NonNegative) Result[JsonParsed, JsonError] {
+    let n = len(src)
+    let i = json_skip_ws(src, pos)
+    if i >= n {
+        return Err(JsonError { pos = i, message = "unexpected end of JSON input" })
     }
-    i = json_skip_ws(arr, i + 1)
-    var idx = 0
-    while i < n {
-        if byte_at(arr, i) == 93 {
-            return ""
-        }
-        let end = json_skip_value(arr, i)
-        if idx == target_idx {
-            return str_slice(arr, i, end)
-        }
-        idx += 1
-        i = json_skip_ws(arr, end)
-        if i < n && byte_at(arr, i) == 44 {
-            i = json_skip_ws(arr, i + 1)
+    let b = byte_at(src, i)
+    if b == 34 {
+        return json_parse_string_at(src, i)
+    }
+    if b == 123 {
+        return json_parse_object_at(src, i)
+    }
+    if b == 91 {
+        return json_parse_array_at(src, i)
+    }
+    if b == 45 || is_digit_byte(b) {
+        return json_parse_number_at(src, i)
+    }
+    if i + 4 <= n && str_slice(src, i, i + 4) == "true" {
+        return Ok(JsonParsed { value = JBool(true), next = clamp_non_neg(i + 4) })
+    }
+    if i + 5 <= n && str_slice(src, i, i + 5) == "false" {
+        return Ok(JsonParsed { value = JBool(false), next = clamp_non_neg(i + 5) })
+    }
+    if i + 4 <= n && str_slice(src, i, i + 4) == "null" {
+        return Ok(JsonParsed { value = JNull, next = clamp_non_neg(i + 4) })
+    }
+    Err(JsonError { pos = i, message = "unexpected token in JSON input" })
+}
+
+pub pure fn json_parse(src Text) Result[JsonValue, JsonError] {
+    match json_parse_value_at(src, 0) {
+        Err(e) => Err(e)
+        Ok(parsed) => {
+            let tail = json_skip_ws(src, parsed.next)
+            if tail < len(src) {
+                return Err(JsonError { pos = tail, message = "trailing characters after JSON value" })
+            }
+            Ok(parsed.value)
         }
     }
-    ""
 }

@@ -148,9 +148,20 @@ fn compare_record_versions(
         merged_pure.insert(format!("v2__{}", k), rename_fn_calls(f, "v2__", v2_pure));
     }
 
-    // Map fields by stable `@field(N)` ID (falling back to field name)
-    let f1_map = index_fields_by_slot(rec1);
-    let f2_map = index_fields_by_slot(rec2);
+    // Map fields by name (default), `@from("old_name")` / `@alias("old_name")` rename lineage,
+    // or optional explicit `@field(N)` binary wire slot.
+    let f1_map = index_fields_by_identity(rec1);
+    let f2_map = index_fields_by_identity(rec2);
+
+    // Map any renamed v2 field names back to their canonical v1 SMT variable name
+    let mut v2_name_map = BTreeMap::new();
+    for (slot, f1) in &f1_map {
+        if let Some(f2) = f2_map.get(slot) {
+            if f2.name != f1.name {
+                v2_name_map.insert(f2.name.clone(), f1.name.clone());
+            }
+        }
+    }
 
     let mut added_optional = Vec::new();
     let mut notes = Vec::new();
@@ -160,19 +171,19 @@ fn compare_record_versions(
             if f2.default.is_some() || f2.ty.display_name().starts_with("Option[") {
                 added_optional.push(f2.name.clone());
                 notes.push(format!(
-                    "field `{}` (slot {}) added with default/Option: backward-compatible, mark `retain_on_downgrade`",
+                    "field `{}` (id `{}`) added with default/Option: backward-compatible, mark `retain_on_downgrade`",
                     f2.name, slot
                 ));
             } else {
                 notes.push(format!(
-                    "field `{}` (slot {}) added as required without default: breaking upgrade",
+                    "field `{}` (id `{}`) added as required without default: breaking upgrade",
                     f2.name, slot
                 ));
             }
         }
     }
 
-    // Build combined SMT predicates P1 and P2 over shared field slots
+    // Build combined SMT predicates P1 and P2 over shared field identities
     let mut vars = Vec::new();
     let mut p1_clauses = Vec::new();
     let mut p2_clauses = Vec::new();
@@ -180,30 +191,32 @@ fn compare_record_versions(
     for (slot, f1) in &f1_map {
         let var = f1.name.clone();
         vars.push(var.clone());
-        let mut subst = BTreeMap::new();
-        subst.insert("self".into(), var.clone());
+        let mut subst1 = BTreeMap::new();
+        subst1.insert("self".into(), var.clone());
         if let Some(ap) = v1_aliases.get(&f1.ty.display_name()) {
             let renamed = rename_expr_calls(ap, "v1__", v1_pure);
-            if let Ok(s) = encode_expr(&renamed, &subst) {
+            if let Ok(s) = encode_expr(&renamed, &subst1) {
                 p1_clauses.push(s);
             }
         }
         if let Some(pred) = &f1.predicate {
             let renamed = rename_expr_calls(pred, "v1__", v1_pure);
-            if let Ok(s) = encode_expr(&renamed, &subst) {
+            if let Ok(s) = encode_expr(&renamed, &subst1) {
                 p1_clauses.push(s);
             }
         }
         if let Some(f2) = f2_map.get(slot) {
+            let mut subst2 = v2_name_map.clone();
+            subst2.insert("self".into(), var.clone());
             if let Some(ap) = v2_aliases.get(&f2.ty.display_name()) {
                 let renamed = rename_expr_calls(ap, "v2__", v2_pure);
-                if let Ok(s) = encode_expr(&renamed, &subst) {
+                if let Ok(s) = encode_expr(&renamed, &subst2) {
                     p2_clauses.push(s);
                 }
             }
             if let Some(pred) = &f2.predicate {
                 let renamed = rename_expr_calls(pred, "v2__", v2_pure);
-                if let Ok(s) = encode_expr(&renamed, &subst) {
+                if let Ok(s) = encode_expr(&renamed, &subst2) {
                     p2_clauses.push(s);
                 }
             }
@@ -500,10 +513,11 @@ fn check_capabilities(v1: &Program, v2: &Program) -> Vec<CapabilityCheckResult> 
     out
 }
 
-fn index_fields_by_slot(rec: &RecordDecl) -> BTreeMap<String, FieldDecl> {
+fn index_fields_by_identity(rec: &RecordDecl) -> BTreeMap<String, FieldDecl> {
     let mut map = BTreeMap::new();
     for f in &rec.fields {
-        let slot = f
+        // Priority: explicit binary wire `@field(N)` -> explicit rename `@from("old")` / `@alias("old")` -> field name (default)
+        let explicit_slot = f
             .attrs
             .iter()
             .find(|a| a.name == "field")
@@ -511,9 +525,20 @@ fn index_fields_by_slot(rec: &RecordDecl) -> BTreeMap<String, FieldDecl> {
             .and_then(|arg| match &arg.value.kind {
                 ExprKind::Int(n) => Some(format!("slot#{}", n)),
                 _ => None,
-            })
+            });
+        let rename_from = f
+            .attrs
+            .iter()
+            .find(|a| a.name == "from" || a.name == "alias")
+            .and_then(|a| a.args.first())
+            .and_then(|arg| match &arg.value.kind {
+                ExprKind::Str(old) => Some(old.clone()),
+                _ => None,
+            });
+        let key = explicit_slot
+            .or(rename_from)
             .unwrap_or_else(|| f.name.clone());
-        map.insert(slot, f.clone());
+        map.insert(key, f.clone());
     }
     map
 }
@@ -523,11 +548,15 @@ fn collect_evolve_records(prog: &Program) -> BTreeMap<String, RecordDecl> {
     for item in &prog.items {
         if let Item::Record(r) = item {
             if let Some(attr) = r.attrs.iter().find(|a| a.name == "evolve") {
-                if let Some(arg) = attr.args.first() {
-                    if let ExprKind::Str(id) = &arg.value.kind {
-                        map.insert(id.clone(), r.clone());
-                    }
-                }
+                let id = attr
+                    .args
+                    .first()
+                    .and_then(|arg| match &arg.value.kind {
+                        ExprKind::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| r.name.clone());
+                map.insert(id, r.clone());
             }
         }
     }

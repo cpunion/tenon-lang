@@ -1214,6 +1214,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
     }
 
     fn infer_expr_type(&self, expr: &Expr) -> TypeExpr {
+        self.infer_expr_type_with(expr, &BTreeMap::new())
+    }
+
+    fn infer_expr_type_with(&self, expr: &Expr, extra_vars: &BTreeMap<String, TypeExpr>) -> TypeExpr {
         match &expr.kind {
             ExprKind::Int(_) => named_ty("Int"),
             ExprKind::Bool(_) => named_ty("Bool"),
@@ -1221,6 +1225,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
             ExprKind::Ident(s) => {
                 if s == "None" {
                     return generic_ty("Option", vec![named_ty("Any")]);
+                }
+                if let Some(ty) = extra_vars.get(s) {
+                    return ty.clone();
                 }
                 if let Some(ty) = self.var_types.get(s) {
                     return ty.clone();
@@ -1233,7 +1240,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             ExprKind::RecordLit { name, .. } => named_ty(name),
             ExprKind::List(elems) => {
                 if let Some(first) = elems.first() {
-                    generic_ty("List", vec![self.infer_expr_type(first)])
+                    generic_ty("List", vec![self.infer_expr_type_with(first, extra_vars)])
                 } else {
                     generic_ty("List", vec![named_ty("Any")])
                 }
@@ -1252,13 +1259,18 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         return named_ty(&vl.enum_name);
                     }
                 }
-                if let Ok((_, Some(fl))) = self.resolve_field_layout(target, field) {
-                    return fl.ty;
+                let obj_ty = resolve_alias_ty(&self.infer_expr_type_with(target, extra_vars), self.alias_bases);
+                if let TypeExpr::Named { name: rname, .. } = obj_ty {
+                    if let Some(layout) = self.records.get(&rname) {
+                        if let Some(fl) = layout.fields.iter().find(|f| f.name == *field) {
+                            return fl.ty.clone();
+                        }
+                    }
                 }
                 named_ty("Any")
             }
             ExprKind::Index { target, .. } => {
-                let tt = self.infer_expr_type(target);
+                let tt = self.infer_expr_type_with(target, extra_vars);
                 self.list_elem_ty(&tt).unwrap_or_else(|| named_ty("Any"))
             }
             ExprKind::Call { callee, args } => match &callee.kind {
@@ -1278,20 +1290,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 }
                 ExprKind::Ident(f) => {
                     if f == "Ok" && args.len() == 1 {
-                        return generic_ty("Result", vec![self.infer_expr_type(&args[0].value), named_ty("Any")]);
+                        return generic_ty("Result", vec![self.infer_expr_type_with(&args[0].value, extra_vars), named_ty("Any")]);
                     }
                     if f == "Err" && args.len() == 1 {
-                        return generic_ty("Result", vec![named_ty("Any"), self.infer_expr_type(&args[0].value)]);
+                        return generic_ty("Result", vec![named_ty("Any"), self.infer_expr_type_with(&args[0].value, extra_vars)]);
                     }
                     if f == "Some" && args.len() == 1 {
-                        return generic_ty("Option", vec![self.infer_expr_type(&args[0].value)]);
+                        return generic_ty("Option", vec![self.infer_expr_type_with(&args[0].value, extra_vars)]);
                     }
                     if f == "push" && args.len() == 2 {
-                        let lt = self.infer_expr_type(&args[0].value);
+                        let lt = self.infer_expr_type_with(&args[0].value, extra_vars);
                         if self.list_elem_ty(&lt).is_some_and(|e| e.display_name() != "Any") {
                             return lt;
                         }
-                        return generic_ty("List", vec![self.infer_expr_type(&args[1].value)]);
+                        return generic_ty("List", vec![self.infer_expr_type_with(&args[1].value, extra_vars)]);
                     }
                     if let Some(meta) = self.fn_metas.get(f) {
                         if let Some(rt) = &meta.ret_ty {
@@ -1306,33 +1318,53 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 _ => named_ty("Any"),
             },
             ExprKind::If { then_block, else_branch, .. } => {
-                if let Some(t) = &then_block.tail {
-                    let ty = self.infer_expr_type(t);
-                    if ty.display_name() != "Any" {
-                        return ty;
-                    }
+                let then_ty = self.infer_block_type_with(then_block, extra_vars);
+                if then_ty.display_name() != "Any" {
+                    return then_ty;
                 }
                 if let Some(eb) = else_branch {
-                    return self.infer_expr_type(eb);
+                    return self.infer_expr_type_with(eb, extra_vars);
                 }
                 named_ty("Any")
             }
-            ExprKind::Match { arms, .. } => {
+            ExprKind::Match { scrutinee, arms } => {
+                let st = self.infer_expr_type_with(scrutinee, extra_vars);
                 for arm in arms {
-                    let t = self.infer_expr_type(&arm.body);
+                    let mut arm_vars = extra_vars.clone();
+                    for p in &arm.patterns {
+                        if let Pattern::Variant { name, binding: Some(bname), .. } = p {
+                            if bname != "_" {
+                                arm_vars.insert(
+                                    bname.clone(),
+                                    self.infer_match_binding_type(&st, name),
+                                );
+                            }
+                        }
+                    }
+                    let t = self.infer_expr_type_with(&arm.body, &arm_vars);
                     if t.display_name() != "Any" {
                         return t;
                     }
                 }
                 named_ty("Any")
             }
-            ExprKind::Block(blk) => blk
-                .tail
-                .as_deref()
-                .map(|t| self.infer_expr_type(t))
-                .unwrap_or_else(|| named_ty("Any")),
+            ExprKind::Block(blk) => self.infer_block_type_with(blk, extra_vars),
             _ => named_ty("Any"),
         }
+    }
+
+    fn infer_block_type_with(&self, blk: &Block, extra_vars: &BTreeMap<String, TypeExpr>) -> TypeExpr {
+        let mut local = extra_vars.clone();
+        for s in &blk.stmts {
+            if let Stmt::Let { name, ty, value, .. } = s {
+                let lt = ty.clone().unwrap_or_else(|| self.infer_expr_type_with(value, &local));
+                local.insert(name.clone(), lt);
+            }
+        }
+        blk.tail
+            .as_deref()
+            .map(|t| self.infer_expr_type_with(t, &local))
+            .unwrap_or_else(|| named_ty("Any"))
     }
 
     fn resolve_field_layout(&self, obj_expr: &Expr, field: &str) -> Result<(usize, Option<FieldLayout>), String> {
@@ -1364,6 +1396,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
     }
 
     fn expr_produces_rc(&self, expr: &Expr) -> bool {
+        if self.type_is_rc(&self.infer_expr_type(expr)) {
+            return true;
+        }
         match &expr.kind {
             ExprKind::RecordLit { .. } | ExprKind::List(_) | ExprKind::Str(_) => true,
             ExprKind::Binary { op: BinOp::Concat, .. } => true,

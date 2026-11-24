@@ -379,4 +379,92 @@ pub fn bad_checks(v JsonVal) Int {
         assert!(codes.contains(&"E0205"), "expected E0205 type mismatch, got {:?}", codes);
         assert!(codes.contains(&"E0301"), "expected E0301 non-exhaustive match, got {:?}", codes);
     }
+
+    #[test]
+    fn rejects_stdlib_v2_contract_violations() {
+        let bad = parse(r#"
+pub type NonNegative = Int where self >= 0
+pub type HexNibble   = Int where 0 <= self && self <= 15
+pub type MaxBytes    = Int where self >= 64
+
+pub record SliceRange {
+    start NonNegative
+    end   NonNegative
+    where start <= end
+}
+
+pub enum JsonValue {
+    JNull
+    JStr(Text)
+}
+
+pub pure fn hex_nibble(n HexNibble) Text {
+    byte_to_text(48 + n)
+}
+
+pub pure fn truncate_output(s Text, max_bytes MaxBytes) Text {
+    str_slice(s, 0, max_bytes)
+}
+
+@no_heap_alloc
+pub pure fn bad_no_heap(a Text, b Text) JsonValue {
+    JStr(a ++ b)
+}
+
+pub fn bad_uses(opt Option[Int]) Int {
+    let _ = SliceRange { start = 8, end = 3 }
+    let _ = SliceRange { start = 0 }
+    let _ = hex_nibble(20)
+    let _ = truncate_output("hello", 10)
+    let _ = hex_nibble(1, 2)
+    match opt {
+        Some(v) => v
+    }
+}
+"#).unwrap();
+        let rep = check_program(&bad);
+        assert!(!rep.ok);
+        let codes: Vec<&str> = rep.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0701"), "expected E0701 @no_heap_alloc violation, got {:?}", codes);
+        assert!(codes.contains(&"E0414"), "expected E0414 SliceRange invariant violation, got {:?}", codes);
+        assert!(codes.contains(&"E0204"), "expected E0204 missing record field, got {:?}", codes);
+        assert!(codes.contains(&"E0410"), "expected E0410 HexNibble/MaxBytes violation, got {:?}", codes);
+        assert!(codes.contains(&"E0202"), "expected E0202 arity mismatch, got {:?}", codes);
+        assert!(codes.contains(&"E0301"), "expected E0301 non-exhaustive Option match, got {:?}", codes);
+    }
+
+    #[test]
+    fn evolve_matches_by_field_name_and_from_rename_without_field_ids() {
+        let v1 = parse(r#"
+@evolve
+pub record Order {
+    id     Int64
+    amount Int64 where self >= 0
+}
+"#).unwrap();
+        let v2_safe = parse(r#"
+@evolve
+pub record Order {
+    id Int64
+    @from("amount") total_cents Int64 where self >= 0
+    note Option[Text] = None
+}
+"#).unwrap();
+        let rep_safe = check_evolution(&v1, &v2_safe);
+        assert!(rep_safe.safe_to_release, "name-first @evolve + @from rename + optional field must be upgrade-safe");
+        assert_eq!(rep_safe.entities[0].verdict, CompatVerdict::WideningBackwardSafe);
+        assert_eq!(rep_safe.entities[0].added_optional_fields, vec!["note".to_string()]);
+
+        let v2_narrow = parse(r#"
+@evolve
+pub record Order {
+    id Int64
+    @from("amount") total_cents Int64 where self > 0
+}
+"#).unwrap();
+        let rep_narrow = check_evolution(&v1, &v2_narrow);
+        assert!(!rep_narrow.safe_to_release, "narrowing renamed field must be caught by Z3");
+        assert_eq!(rep_narrow.entities[0].verdict, CompatVerdict::NarrowingBreaking);
+        assert_eq!(rep_narrow.entities[0].counterexample.get("amount").map(|s| s.as_str()), Some("0"));
+    }
 }
