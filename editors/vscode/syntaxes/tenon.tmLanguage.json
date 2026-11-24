@@ -97,7 +97,7 @@
         },
         {
           "name": "keyword.other.contract.tenon",
-          "match": "\\b(where|requires|ensures|invariant|decreases|result|old)\\b"
+          "match": "\\b(where|requires|ensures|invariant|decreases|result|old|forall|exists)\\b"
         },
         {
           "name": "constant.language.tenon",

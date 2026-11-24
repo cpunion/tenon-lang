@@ -440,7 +440,7 @@ fn subst_fn_types(f: &FnDecl, subst: &BTreeMap<String, TypeExpr>) -> FnDecl {
 
 struct LowerCtx {
     alias_bases: BTreeMap<String, TypeExpr>,
-    alias_preds: BTreeMap<String, Expr>,
+    type_aliases: BTreeMap<String, TypeAliasDecl>,
     ghost_fns: BTreeSet<String>,
     infallible_casts: BTreeSet<usize>,
     orig_program: Program,
@@ -4720,9 +4720,11 @@ impl LowerCtx {
         while guard < 16 {
             guard += 1;
             match cur {
-                TypeExpr::Named { ref name, .. } => {
-                    if let Some(p) = self.alias_preds.get(name) {
-                        preds.push(p.clone());
+                TypeExpr::Named { ref name, ref args, .. } => {
+                    if let Some(ta) = self.type_aliases.get(name) {
+                        if let Some(p) = instantiate_alias_predicate(ta, args) {
+                            preds.push(p);
+                        }
                     }
                     if let Some(base) = self.alias_bases.get(name) {
                         cur = base.clone();
@@ -5192,7 +5194,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
     };
     let mut ctx = LowerCtx {
         alias_bases: BTreeMap::new(),
-        alias_preds: BTreeMap::new(),
+        type_aliases: BTreeMap::new(),
         ghost_fns: BTreeSet::new(),
         infallible_casts,
         orig_program: expanded.clone(),
@@ -5229,9 +5231,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
         match item {
             Item::TypeAlias(ta) => {
                 ctx.alias_bases.insert(ta.name.clone(), ta.base.clone());
-                if let Some(pred) = &ta.predicate {
-                    ctx.alias_preds.insert(ta.name.clone(), pred.clone());
-                }
+                ctx.type_aliases.insert(ta.name.clone(), ta.clone());
             }
             Item::Record(r) => {
                 if r.type_params.is_empty() {

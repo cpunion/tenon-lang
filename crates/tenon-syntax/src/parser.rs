@@ -2161,6 +2161,21 @@ impl Parser {
                         args: Vec::new(),
                         span: sp,
                     });
+                } else if self.peek().kind == TokenKind::Minus
+                    && matches!(self.peek_ahead_non_nl(1).kind, TokenKind::Int(_))
+                {
+                    let msp = self.bump().span;
+                    let tok = self.bump();
+                    let n = match tok.kind {
+                        TokenKind::Int(v) => v,
+                        _ => unreachable!(),
+                    };
+                    args.push(TypeExpr::Named {
+                        name: format!("-{}", n),
+                        version: None,
+                        args: Vec::new(),
+                        span: msp.merge(tok.span),
+                    });
                 } else {
                     args.push(self.parse_type_expr()?);
                 }
@@ -3162,6 +3177,36 @@ impl Parser {
                 })
             }
             TokenKind::Forall => {
+                if matches!(self.peek_ahead_non_nl(1).kind, TokenKind::Ident(_))
+                    && self.peek_ahead_non_nl(2).kind == TokenKind::In
+                {
+                    self.bump();
+                    let (var, _) = self.expect_ident()?;
+                    self.expect(TokenKind::In)?;
+                    let range_expr = self.parse_range()?;
+                    let (lo, hi) = match range_expr.kind {
+                        ExprKind::Range { start, end } => (start, end),
+                        _ => {
+                            return Err(ParseError {
+                                message: "quantifier requires a `lo..hi` range after `in`".into(),
+                                span: range_expr.span,
+                            });
+                        }
+                    };
+                    self.expect(TokenKind::Colon)?;
+                    let body = self.parse_expr()?;
+                    let end = body.span;
+                    return Ok(Expr {
+                        kind: ExprKind::Quantifier {
+                            is_forall: true,
+                            var,
+                            lo,
+                            hi,
+                            body: Box::new(body),
+                        },
+                        span: tok.span.merge(end),
+                    });
+                }
                 self.bump();
                 let mut binders = Vec::new();
                 loop {
@@ -3438,6 +3483,39 @@ impl Parser {
                 })
             }
             TokenKind::Ident(s) => {
+                // First-class verification quantifiers: `forall i in lo..hi: pred` / `exists i in lo..hi: pred`
+                if (s == "forall" || s == "exists")
+                    && matches!(self.peek_ahead_non_nl(1).kind, TokenKind::Ident(_))
+                    && self.peek_ahead_non_nl(2).kind == TokenKind::In
+                {
+                    let is_forall = s == "forall";
+                    self.bump();
+                    let (var, _) = self.expect_ident()?;
+                    self.expect(TokenKind::In)?;
+                    let range_expr = self.parse_range()?;
+                    let (lo, hi) = match range_expr.kind {
+                        ExprKind::Range { start, end } => (start, end),
+                        _ => {
+                            return Err(ParseError {
+                                message: "quantifier requires a `lo..hi` range after `in`".into(),
+                                span: range_expr.span,
+                            });
+                        }
+                    };
+                    self.expect(TokenKind::Colon)?;
+                    let body = self.parse_expr()?;
+                    let end = body.span;
+                    return Ok(Expr {
+                        kind: ExprKind::Quantifier {
+                            is_forall,
+                            var,
+                            lo,
+                            hi,
+                            body: Box::new(body),
+                        },
+                        span: tok.span.merge(end),
+                    });
+                }
                 self.bump();
                 // Check for versioned record literal `Order@v1 { ... }` or `Date { year = 2024, ... }`
                 let version = if self.peek().kind == TokenKind::At {

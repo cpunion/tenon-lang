@@ -89,6 +89,39 @@ async function activate(context) {
     vscode.window.showInformationMessage('Tenon Language Server restarted.');
   });
   context.subscriptions.push(restartCmd);
+
+  const debugCmd = vscode.commands.registerCommand('tenon.debugFile', async () => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.languageId !== 'tenon') {
+      vscode.window.showWarningMessage('Open a .tn file to build & debug with Tenon.');
+      return;
+    }
+    await editor.document.save();
+    const filePath = editor.document.uri.fsPath;
+    const cmd = resolveTenonExecutable(vscode);
+    const outBin = path.join(os.tmpdir(), `tenon_dbg_${path.basename(filePath, '.tn')}`);
+    const { execFile } = require('child_process');
+    outputChannel.appendLine(`[tenon] Building DWARF debug binary: ${cmd} build ${filePath} -g --opt O0 -o ${outBin}`);
+    execFile(cmd, ['build', filePath, '-g', '--opt', 'O0', '-o', outBin], async (err, stdout, stderr) => {
+      if (err) {
+        outputChannel.show(true);
+        outputChannel.appendLine(stderr || stdout || String(err));
+        vscode.window.showErrorMessage(`Tenon debug build failed: ${stderr || err.message}`);
+        return;
+      }
+      outputChannel.appendLine(stdout);
+      const debugType = vscode.extensions.getExtension('vadimcn.vscode-lldb') ? 'lldb' : 'cppdbg';
+      await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
+        name: `Tenon Debug (${path.basename(filePath)})`,
+        type: debugType,
+        request: 'launch',
+        program: outBin,
+        cwd: path.dirname(filePath),
+        MIMode: 'lldb',
+      });
+    });
+  });
+  context.subscriptions.push(debugCmd);
 }
 
 async function deactivate() {

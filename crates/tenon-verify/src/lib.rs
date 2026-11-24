@@ -2,6 +2,7 @@ pub mod checker;
 pub mod db;
 pub mod evolve;
 pub mod l0;
+pub mod mir;
 pub mod modelcheck;
 pub mod smt;
 pub mod sync_solver;
@@ -12,6 +13,7 @@ pub use checker::{
 };
 pub use db::{IncrementalDb, QueryStats};
 pub use evolve::{CompatVerdict, EvolutionReport, check_evolution};
+pub use mir::{MirFnSummary, VerifiedMir};
 pub use modelcheck::{
     ModelCheckSuiteReport, TraceEvent, TraceRefinementReport, check_program_protocols,
     export_program_tla_specs, export_tla_specs, run_all_protocol_checks, verify_runtime_trace,
@@ -1372,6 +1374,179 @@ pub pure fn bad_casts(x Range3to5) Int {
         assert!(
             e0416_count >= 3,
             "expected >= 3 E0416 diagnostics for disjoint Range3to5 -> Range10to20 casts, got {:?}",
+            r_bad.diagnostics
+        );
+    }
+
+    #[test]
+    fn verifies_mir_overflow_proofs_escape_analysis_and_fip_contract() {
+        let good = parse(r#"
+pub type Small = Int where self >= 0 && self <= 1000
+pub record Pair { a Int  b Int }
+
+@fip
+pub pure fn swap_pair_in_place(p Pair) Pair {
+    Pair { a = p.b, b = p.a }
+}
+
+pub pure fn bounded_sum(a Small, b Small) Int {
+    let local = Pair { a = a + b, b = a * b }
+    local.a + local.b
+}
+"#)
+        .unwrap();
+        let rep = check_program(&good);
+        assert!(rep.ok, "valid MIR/@fip program failed: {:?}", rep.diagnostics);
+        assert!(
+            rep.mir.fip_verified_fns.contains("swap_pair_in_place"),
+            "expected swap_pair_in_place to be @fip verified"
+        );
+        assert!(
+            rep.mir.proved_no_overflow.len() >= 2,
+            "expected bounded `a + b` and `a * b` to be proved overflow-free, got {:?}",
+            rep.mir.proved_no_overflow
+        );
+        assert!(
+            rep.mir
+                .non_escaping_vars
+                .get("bounded_sum")
+                .is_some_and(|s| s.contains("local")),
+            "expected `local` to be proved non-escaping in bounded_sum, got {:?}",
+            rep.mir.non_escaping_vars
+        );
+
+        // Negative `@fip` violations -> E0620
+        let bad = parse(r#"
+pub record Pair { a Int  b Int }
+
+@fip
+pub pure fn bad_fip_alloc(x Int) Pair {
+    let xs = [x, x]
+    let _ = xs
+    Pair { a = x, b = x }
+}
+"#)
+        .unwrap();
+        let r_bad = check_program(&bad);
+        assert!(!r_bad.ok);
+        let e0620_count = r_bad.diagnostics.iter().filter(|d| d.code == "E0620").count();
+        assert!(
+            e0620_count >= 2,
+            "expected >= 2 E0620 diagnostics for bad @fip (List + uncredited Record), got {:?}",
+            r_bad.diagnostics
+        );
+    }
+
+    #[test]
+    fn verifies_const_param_refinements_quantifiers_arrays_and_higher_order_contracts() {
+        // 1. Const-parameterized `Range[LO, HI]` + `refine_cast` + `is_subtype` + Z3 `forall`/`exists` Array invariants + HOF contracts
+        let good = parse(r#"
+pub type Range[LO Int, HI Int] = Int where self >= LO && self <= HI
+
+pub pure fn widen_range(x Range[3, 5]) Range[2, 6] {
+    let w = refine_cast[Range[2, 6]](x)
+    let _ Range[2, 6] = w
+    w
+}
+
+pub pure fn narrow_range(x Range[3, 5]) Result[Range[2, 4], Text] {
+    refine_cast[Range[2, 4]](x)
+}
+
+pub pure fn neg_range(x Range[-5, -1]) Range[-10, 0] {
+    x as Range[-10, 0]
+}
+
+pub pure fn comptime_param_sub() Int {
+    let a = comptime if is_subtype[Range[3, 5], Range[2, 6]]() { 1 } else { 0 }
+    let b = comptime if is_subtype[Range[3, 5], Range[2, 4]]() { 10 } else { 0 }
+    a + b
+}
+
+pub fn fill_positive(n Int where self >= 1 && self <= 64) Int {
+    var xs List[Int] = list_filled(n, 0)
+    ghost {
+        assert forall k in 0..n: xs[k] == 0
+    }
+    var i = 0
+    while i < n
+        invariant 0 <= i && i <= n
+        invariant forall k in 0..i: xs[k] >= 1
+        decreases n - i
+    {
+        xs[i] = i + 1
+        i += 1
+    }
+    ghost {
+        assert forall k in 0..n: xs[k] >= 1
+        assert exists k in 0..n: xs[k] >= 1
+    }
+    xs[0]
+}
+
+pub pure fn apply_refined(x Range[1, 10], f fn(Range[1, 10]) Range[2, 20]) Range[2, 20] {
+    f(x)
+}
+
+pub pure fn use_hof(x Range[1, 10]) Range[2, 20] {
+    apply_refined(x, |v| v + 1)
+}
+"#)
+        .unwrap();
+        let rep = check_program(&good);
+        assert!(
+            rep.ok,
+            "const refinements / quantifiers / HOF program failed: {:?}",
+            rep.diagnostics
+        );
+        let rc_vals: Vec<&str> = rep.refine_cast_types.values().map(|s| s.as_str()).collect();
+        assert!(rc_vals.contains(&"Range[2, 6]"), "got {:?}", rc_vals);
+        assert!(rc_vals.contains(&"Result[Range[2, 4], Text]"), "got {:?}", rc_vals);
+
+        // 2. Negative controls:
+        //    - Disjoint `Range[3, 5]` -> `Range[10, 20]` -> E0416
+        //    - Bad `forall` inductive invariant -> E0432
+        //    - Bad HOF lambda return (`|v| v - 5` violates `Range[2, 20]`) -> E0410
+        //    - Bad indirect HOF call (`f(0)` violates `Range[1, 10]`) -> E0410
+        let bad = parse(r#"
+pub type Range[LO Int, HI Int] = Int where self >= LO && self <= HI
+
+pub pure fn bad_disjoint(x Range[3, 5]) Int {
+    let _ = refine_cast[Range[10, 20]](x)
+    0
+}
+
+pub fn bad_quant_loop(n Int where self >= 1) Int {
+    var xs List[Int] = list_filled(n, 0)
+    var i = 0
+    while i < n
+        invariant 0 <= i && i <= n
+        invariant forall k in 0..i: xs[k] >= 5
+    {
+        xs[i] = 1
+        i += 1
+    }
+    0
+}
+
+pub pure fn apply_refined(x Range[1, 10], f fn(Range[1, 10]) Range[2, 20]) Range[2, 20] {
+    let _ = f(0)
+    f(x)
+}
+
+pub pure fn bad_hof(x Range[1, 10]) Range[2, 20] {
+    apply_refined(x, |v| v - 5)
+}
+"#)
+        .unwrap();
+        let r_bad = check_program(&bad);
+        assert!(!r_bad.ok);
+        let codes: Vec<&str> = r_bad.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E0416"), "expected E0416 for disjoint Range[3,5]->Range[10,20], got {:?}", codes);
+        assert!(codes.contains(&"E0432"), "expected E0432 for bad forall loop invariant, got {:?}", codes);
+        assert!(
+            codes.iter().filter(|c| **c == "E0410").count() >= 2,
+            "expected >= 2 E0410 for HOF lambda return and HOF call arg violations, got {:?}",
             r_bad.diagnostics
         );
     }

@@ -40,6 +40,14 @@ pub struct BuildOptions {
     pub extra_c_sources: Vec<PathBuf>,
     /// Span start offsets of `List`/`Bytes` index reads/writes statically proved in-bounds (`0 <= i < len(xs)`) by `tenon-verify`.
     pub proved_safe_indices: BTreeSet<usize>,
+    /// Span start offsets of integer `+`/`-`/`*` statically proved overflow-free by `tenon-verify` (`VerifiedMir`).
+    pub proved_no_overflow: BTreeSet<usize>,
+    /// Per-function local variables proved non-escaping (Tier-2 escape analysis -> eliminates COW uniqueness checks).
+    pub non_escaping_vars: BTreeMap<String, BTreeSet<String>>,
+    /// Emit checked signed integer overflow traps for arithmetic NOT statically proved overflow-free.
+    pub checked_overflow: bool,
+    /// Optional target triple override for cross-compilation (e.g. `x86_64-unknown-linux-gnu`).
+    pub target_triple: Option<String>,
 }
 
 impl Default for BuildOptions {
@@ -54,7 +62,20 @@ impl Default for BuildOptions {
             link_dirs: Vec::new(),
             extra_c_sources: Vec::new(),
             proved_safe_indices: BTreeSet::new(),
+            proved_no_overflow: BTreeSet::new(),
+            non_escaping_vars: BTreeMap::new(),
+            checked_overflow: false,
+            target_triple: None,
         }
+    }
+}
+
+impl BuildOptions {
+    /// Applies all proof-guided optimization facts from `tenon_verify::VerifiedMir`.
+    pub fn apply_verified_mir(&mut self, mir: &tenon_verify::VerifiedMir) {
+        self.proved_safe_indices = mir.proved_safe_indices.clone();
+        self.proved_no_overflow = mir.proved_no_overflow.clone();
+        self.non_escaping_vars = mir.non_escaping_vars.clone();
     }
 }
 
@@ -122,6 +143,11 @@ static int64_t g_suspends = 0;
 
 void tenon_rt_assert_fail(int64_t line) {
     fprintf(stderr, "TENON ASSERTION FAILED at line %lld\n", (long long)line);
+    exit(1);
+}
+
+void tenon_rt_overflow_trap(int64_t line) {
+    fprintf(stderr, "TENON INTEGER OVERFLOW TRAP at line %lld\n", (long long)line);
     exit(1);
 }
 
@@ -1276,6 +1302,9 @@ pub fn compile_with_options(
 
             let mut c1 = Command::new("clang");
             c1.arg(opt_flag).arg("-c").arg("-Wno-override-module");
+            if let Some(triple) = &opts.target_triple {
+                c1.arg(format!("--target={}", triple));
+            }
             if opts.debug_info {
                 c1.arg("-g");
             }
@@ -1350,34 +1379,45 @@ pub fn compile_with_options(
             }
         }
         OutputKind::SharedLib | OutputKind::Executable => {
+            let emit_obj_only = output_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e == "o" || e == "obj");
             let mut cmd = Command::new("clang");
             cmd.arg(opt_flag);
+            if let Some(triple) = &opts.target_triple {
+                cmd.arg(format!("--target={}", triple));
+            }
             if opts.debug_info {
                 cmd.arg("-g");
             }
-            if opts.output_kind == OutputKind::SharedLib {
-                cmd.args(["-shared", "-fPIC"]);
-            } else if opt_flag == "-O3" && !opts.debug_info {
-                cmd.arg("-flto=thin");
-            }
-            cmd.args([
-                "-Wno-override-module",
-                tmp_ll.to_str().unwrap(),
-                tmp_rt.to_str().unwrap(),
-            ]);
-            for csrc in &opts.extra_c_sources {
-                cmd.arg(csrc.to_str().unwrap());
-            }
-            for dir in &opts.link_dirs {
-                cmd.arg(format!("-L{}", dir));
-            }
-            if uses_http {
-                cmd.args(["-lcurl", "-lpthread"]);
-            } else if uses_sync {
-                cmd.arg("-lpthread");
-            }
-            for lib in &all_link_libs {
-                cmd.arg(format!("-l{}", lib));
+            if emit_obj_only {
+                cmd.args(["-c", "-Wno-override-module", tmp_ll.to_str().unwrap()]);
+            } else {
+                if opts.output_kind == OutputKind::SharedLib {
+                    cmd.args(["-shared", "-fPIC"]);
+                } else if opt_flag == "-O3" && !opts.debug_info && opts.target_triple.is_none() {
+                    cmd.arg("-flto=thin");
+                }
+                cmd.args([
+                    "-Wno-override-module",
+                    tmp_ll.to_str().unwrap(),
+                    tmp_rt.to_str().unwrap(),
+                ]);
+                for csrc in &opts.extra_c_sources {
+                    cmd.arg(csrc.to_str().unwrap());
+                }
+                for dir in &opts.link_dirs {
+                    cmd.arg(format!("-L{}", dir));
+                }
+                if uses_http {
+                    cmd.args(["-lcurl", "-lpthread"]);
+                } else if uses_sync {
+                    cmd.arg("-lpthread");
+                }
+                for lib in &all_link_libs {
+                    cmd.arg(format!("-l{}", lib));
+                }
             }
             cmd.args(["-o", output_path.to_str().unwrap()]);
             let out = cmd
@@ -1868,6 +1908,10 @@ pub fn emit_llvm_ir_with_build_options(
 ) -> Result<String, String> {
     let debug_info = opts.debug_info;
     let proved_safe_indices = &opts.proved_safe_indices;
+    let proved_no_overflow = &opts.proved_no_overflow;
+    let non_escaping_vars = &opts.non_escaping_vars;
+    let checked_overflow = opts.checked_overflow;
+    let target_triple = opts.target_triple.as_deref();
     let prepared = prepare_program_for_codegen(program);
     let program = &prepared.program;
     let layout_engine = LayoutEngine::from_program(program);
@@ -2156,6 +2200,9 @@ pub fn emit_llvm_ir_with_build_options(
             dyn_interfaces,
             &vtable_ifaces,
             proved_safe_indices,
+            proved_no_overflow,
+            non_escaping_vars,
+            checked_overflow,
             &mut string_globals,
             &mut string_intern,
             &mut unit_enum_tags,
@@ -2190,6 +2237,9 @@ pub fn emit_llvm_ir_with_build_options(
             dyn_interfaces,
             &vtable_ifaces,
             proved_safe_indices,
+            proved_no_overflow,
+            non_escaping_vars,
+            checked_overflow,
             &mut string_globals,
             &mut string_intern,
             &mut unit_enum_tags,
@@ -2217,6 +2267,9 @@ pub fn emit_llvm_ir_with_build_options(
             dyn_interfaces,
             &vtable_ifaces,
             proved_safe_indices,
+            proved_no_overflow,
+            non_escaping_vars,
+            checked_overflow,
             &mut string_globals,
             &mut string_intern,
             &mut unit_enum_tags,
@@ -2231,7 +2284,11 @@ pub fn emit_llvm_ir_with_build_options(
     let uses_sync = ir_uses_sync_runtime(&fn_defs);
 
     let mut ir = String::new();
-    ir.push_str("; Generated by Tenon LLVM 22 AOT Release Backend\n\n");
+    ir.push_str("; Generated by Tenon LLVM 22 AOT Release Backend\n");
+    if let Some(triple) = target_triple {
+        ir.push_str(&format!("target triple = \"{}\"\n", triple));
+    }
+    ir.push('\n');
     ir.push_str("declare void @llvm.assume(i1)\n");
     ir.push_str("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
     ir.push_str("declare i32 @memcmp(ptr, ptr, i64)\n");
@@ -2271,6 +2328,9 @@ pub fn emit_llvm_ir_with_build_options(
         ("@llvm.vector.reduce.fadd.v4f64", "declare double @llvm.vector.reduce.fadd.v4f64(double, <4 x double>)\n"),
         ("@llvm.vector.reduce.add.v4i32", "declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)\n"),
         ("@llvm.vector.reduce.add.v4i64", "declare i64 @llvm.vector.reduce.add.v4i64(<4 x i64>)\n"),
+        ("@llvm.sadd.with.overflow.i64", "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n"),
+        ("@llvm.ssub.with.overflow.i64", "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n"),
+        ("@llvm.smul.with.overflow.i64", "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n"),
         ("@llvm.vector.reduce.add.v16i8", "declare i8 @llvm.vector.reduce.add.v16i8(<16 x i8>)\n"),
     ];
     for (needle, decl) in optional_intrinsics {
@@ -2279,6 +2339,7 @@ pub fn emit_llvm_ir_with_build_options(
         }
     }
     ir.push_str("declare void @tenon_rt_assert_fail(i64) cold\n");
+    ir.push_str("declare void @tenon_rt_overflow_trap(i64) cold\n");
     ir.push_str("declare i64 @tenon_rt_print_int(i64)\n");
     ir.push_str("declare i64 @tenon_rc_alloc(i64, i64)\n");
     ir.push_str("declare void @tenon_rc_set_rc_mask(i64, i64)\n");
@@ -2467,6 +2528,9 @@ struct LlvmFnGen<'a> {
     dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
     vtable_ifaces: &'a BTreeMap<String, String>,
     proved_safe_indices: &'a BTreeSet<usize>,
+    proved_no_overflow: &'a BTreeSet<usize>,
+    non_escaping_vars: &'a BTreeMap<String, BTreeSet<String>>,
+    checked_overflow: bool,
     string_globals: &'a mut Vec<(String, String)>,
     string_intern: &'a mut BTreeMap<String, String>,
     unit_enum_tags: &'a mut BTreeSet<i64>,
@@ -2510,6 +2574,9 @@ impl<'a> LlvmFnGen<'a> {
         dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
         vtable_ifaces: &'a BTreeMap<String, String>,
         proved_safe_indices: &'a BTreeSet<usize>,
+        proved_no_overflow: &'a BTreeSet<usize>,
+        non_escaping_vars: &'a BTreeMap<String, BTreeSet<String>>,
+        checked_overflow: bool,
         string_globals: &'a mut Vec<(String, String)>,
         string_intern: &'a mut BTreeMap<String, String>,
         unit_enum_tags: &'a mut BTreeSet<i64>,
@@ -2532,6 +2599,9 @@ impl<'a> LlvmFnGen<'a> {
             dyn_interfaces,
             vtable_ifaces,
             proved_safe_indices,
+            proved_no_overflow,
+            non_escaping_vars,
+            checked_overflow,
             string_globals,
             string_intern,
             unit_enum_tags,
@@ -4358,6 +4428,9 @@ impl<'a> LlvmFnGen<'a> {
         self.fn_returns_rc = self.fn_metas.get(&f.name).is_some_and(|m| m.returns_rc);
         self.fn_ret_ty = f.ret_ty.clone();
         self.always_unique_vars = collect_always_unique_locals(&f.body);
+        if let Some(ne) = self.non_escaping_vars.get(&f.name) {
+            self.always_unique_vars.extend(ne.iter().cloned());
+        }
 
         let ret_val = self.lower_block(&f.body, self.fn_returns_rc, f.ret_ty.as_ref())?;
         if !self.terminated {
@@ -6650,11 +6723,59 @@ impl<'a> LlvmFnGen<'a> {
                     op,
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
                 );
+                let is_i64_signed = matches!(eff_sk, None | Some(ScalarKind::I64));
+                let is_proved_no_ov = self.proved_no_overflow.contains(&expr.span.start);
+                let emit_checked_i64 = self.checked_overflow && !is_proved_no_ov && is_i64_signed;
                 let res = self.fresh_tmp();
                 match op {
-                    BinOp::Add => self.code.push_str(&format!("  {} = add i64 {}, {}\n", res, l, r)),
-                    BinOp::Sub => self.code.push_str(&format!("  {} = sub i64 {}, {}\n", res, l, r)),
-                    BinOp::Mul => self.code.push_str(&format!("  {} = mul i64 {}, {}\n", res, l, r)),
+                    BinOp::Add => {
+                        if emit_checked_i64 {
+                            let ov_tup = self.fresh_tmp();
+                            let ov_bit = self.fresh_tmp();
+                            let ok_lbl = self.fresh_lbl("ov_ok");
+                            let trap_lbl = self.fresh_lbl("ov_trap");
+                            self.code.push_str(&format!(
+                                "  {} = call {{ i64, i1 }} @llvm.sadd.with.overflow.i64(i64 {}, i64 {})\n  {} = extractvalue {{ i64, i1 }} {}, 1\n  br i1 {}, label %{}, label %{}\n{}:\n  call void @tenon_rt_overflow_trap(i64 {})\n  unreachable\n{}:\n  {} = extractvalue {{ i64, i1 }} {}, 0\n",
+                                ov_tup, l, r, ov_bit, ov_tup, ov_bit, trap_lbl, ok_lbl, trap_lbl, expr.span.line, ok_lbl, res, ov_tup
+                            ));
+                        } else if is_proved_no_ov && is_i64_signed {
+                            self.code.push_str(&format!("  {} = add nsw i64 {}, {}\n", res, l, r));
+                        } else {
+                            self.code.push_str(&format!("  {} = add i64 {}, {}\n", res, l, r));
+                        }
+                    }
+                    BinOp::Sub => {
+                        if emit_checked_i64 {
+                            let ov_tup = self.fresh_tmp();
+                            let ov_bit = self.fresh_tmp();
+                            let ok_lbl = self.fresh_lbl("ov_ok");
+                            let trap_lbl = self.fresh_lbl("ov_trap");
+                            self.code.push_str(&format!(
+                                "  {} = call {{ i64, i1 }} @llvm.ssub.with.overflow.i64(i64 {}, i64 {})\n  {} = extractvalue {{ i64, i1 }} {}, 1\n  br i1 {}, label %{}, label %{}\n{}:\n  call void @tenon_rt_overflow_trap(i64 {})\n  unreachable\n{}:\n  {} = extractvalue {{ i64, i1 }} {}, 0\n",
+                                ov_tup, l, r, ov_bit, ov_tup, ov_bit, trap_lbl, ok_lbl, trap_lbl, expr.span.line, ok_lbl, res, ov_tup
+                            ));
+                        } else if is_proved_no_ov && is_i64_signed {
+                            self.code.push_str(&format!("  {} = sub nsw i64 {}, {}\n", res, l, r));
+                        } else {
+                            self.code.push_str(&format!("  {} = sub i64 {}, {}\n", res, l, r));
+                        }
+                    }
+                    BinOp::Mul => {
+                        if emit_checked_i64 {
+                            let ov_tup = self.fresh_tmp();
+                            let ov_bit = self.fresh_tmp();
+                            let ok_lbl = self.fresh_lbl("ov_ok");
+                            let trap_lbl = self.fresh_lbl("ov_trap");
+                            self.code.push_str(&format!(
+                                "  {} = call {{ i64, i1 }} @llvm.smul.with.overflow.i64(i64 {}, i64 {})\n  {} = extractvalue {{ i64, i1 }} {}, 1\n  br i1 {}, label %{}, label %{}\n{}:\n  call void @tenon_rt_overflow_trap(i64 {})\n  unreachable\n{}:\n  {} = extractvalue {{ i64, i1 }} {}, 0\n",
+                                ov_tup, l, r, ov_bit, ov_tup, ov_bit, trap_lbl, ok_lbl, trap_lbl, expr.span.line, ok_lbl, res, ov_tup
+                            ));
+                        } else if is_proved_no_ov && is_i64_signed {
+                            self.code.push_str(&format!("  {} = mul nsw i64 {}, {}\n", res, l, r));
+                        } else {
+                            self.code.push_str(&format!("  {} = mul i64 {}, {}\n", res, l, r));
+                        }
+                    }
                     BinOp::Div => {
                         let iop = if is_unsigned { "udiv" } else { "sdiv" };
                         self.code.push_str(&format!("  {} = {} i64 {}, {}\n", res, iop, l, r));
@@ -8522,5 +8643,72 @@ pub fn main() Int {
             out,
             String::from_utf8_lossy(&run.stderr)
         );
+    }
+
+    #[test]
+    fn llvm_aot_checked_overflow_elides_proved_nsw_and_traps_unproved() {
+        let prog = parse(r#"
+pub type Small = Int where self >= 0 && self <= 1000
+
+pub pure fn safe_add(a Small, b Small) Int {
+    a + b
+}
+
+pub pure fn unchecked_add(a Int, b Int) Int {
+    a + b
+}
+
+pub fn main() Int {
+    let s = safe_add(10, 20)
+    let u = unchecked_add(10, 2)
+    s + u
+}
+"#)
+        .unwrap();
+        let rep = tenon_verify::check_program(&prog);
+        assert!(rep.ok, "verify failed: {:?}", rep.diagnostics);
+
+        let pid = std::process::id();
+        let bin = std::env::temp_dir().join(format!("tenon_llvm_ov_{}", pid));
+        let ir_path = std::env::temp_dir().join(format!("tenon_llvm_ov_{}.ll", pid));
+        let mut opts = BuildOptions {
+            opt_level: "O2".into(),
+            emit_ll_path: Some(ir_path.clone()),
+            checked_overflow: true,
+            ..Default::default()
+        };
+        opts.apply_verified_mir(&rep.mir);
+        compile_with_options(&prog, &bin, &opts).expect("checked overflow AOT build");
+        let ir = fs::read_to_string(&ir_path).unwrap();
+        let _ = fs::remove_file(&ir_path);
+        assert!(
+            ir.contains("add nsw i64"),
+            "expected `add nsw i64` for proved overflow-free `safe_add`"
+        );
+        assert!(
+            ir.contains("@llvm.sadd.with.overflow.i64"),
+            "expected `@llvm.sadd.with.overflow.i64` for unproved `unchecked_add`"
+        );
+        let run = Command::new(&bin).output().unwrap();
+        let _ = fs::remove_file(&bin);
+        let out = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success() && out.contains("main() => 42"),
+            "checked overflow run failed: stdout={} stderr={}",
+            out,
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        // Cross-compile object emission test (`x86_64-unknown-linux-gnu`)
+        let obj_path = std::env::temp_dir().join(format!("tenon_xcompile_{}.o", pid));
+        let mut xopts = BuildOptions {
+            opt_level: "O2".into(),
+            target_triple: Some("x86_64-unknown-linux-gnu".into()),
+            ..Default::default()
+        };
+        xopts.apply_verified_mir(&rep.mir);
+        compile_with_options(&prog, &obj_path, &xopts).expect("cross-compile x86_64-linux .o");
+        assert!(fs::metadata(&obj_path).unwrap().len() > 100);
+        let _ = fs::remove_file(&obj_path);
     }
 }

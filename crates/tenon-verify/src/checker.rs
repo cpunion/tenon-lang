@@ -1,4 +1,5 @@
 use crate::l0::{AbsInt, Interval, L0Env, L0Result};
+use crate::mir::{MirFnSummary, VerifiedMir, analyze_function_escapes, prove_binop_no_overflow, verify_fip_function};
 use crate::smt::{SmtOutcome, SmtQuery};
 use crate::sync_solver::{DistributedAppManifest, solve_distributed_manifest};
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,9 @@ pub struct CheckReport {
     /// Resolved display type name for every `refine_cast[T](x)` call (`T` vs `Result[T, Text]`).
     #[serde(default)]
     pub refine_cast_types: BTreeMap<usize, String>,
+    /// Unified verified middle-end IR facts (bounds elision, overflow-free ops, Tier-2 escape analysis, `@fip`).
+    #[serde(default)]
+    pub mir: VerifiedMir,
 }
 
 struct BuiltinSig {
@@ -305,6 +309,21 @@ pub fn check_program(program: &Program) -> CheckReport {
     // Derive SQL CHECK constraints for visible refined records
     let sql_checks = derive_sqlite_checks(program);
 
+    let refine_cast_types: BTreeMap<usize, String> = ctx
+        .refine_cast_types
+        .into_iter()
+        .map(|(k, v)| (k, v.display_name()))
+        .collect();
+    let mir = VerifiedMir {
+        proved_safe_indices: ctx.proved_safe_indices.clone(),
+        proved_no_overflow: ctx.proved_no_overflow.clone(),
+        infallible_casts: ctx.infallible_casts.clone(),
+        refine_cast_types: refine_cast_types.clone(),
+        non_escaping_vars: ctx.non_escaping_vars,
+        fip_verified_fns: ctx.fip_verified_fns,
+        fn_summaries: ctx.fn_summaries,
+    };
+
     CheckReport {
         ok: ctx.diagnostics.is_empty(),
         proofs: ctx.proofs,
@@ -313,11 +332,8 @@ pub fn check_program(program: &Program) -> CheckReport {
         manifest,
         proved_safe_indices: ctx.proved_safe_indices,
         infallible_casts: ctx.infallible_casts,
-        refine_cast_types: ctx
-            .refine_cast_types
-            .into_iter()
-            .map(|(k, v)| (k, v.display_name()))
-            .collect(),
+        refine_cast_types,
+        mir,
     }
 }
 
@@ -351,6 +367,8 @@ struct CheckerCtx {
     pure_fns: BTreeMap<String, FnDecl>,
     smt_pure_fns: BTreeMap<String, FnDecl>,
     no_heap_fns: BTreeSet<String>,
+    fip_fns: BTreeSet<String>,
+    fip_verified_fns: BTreeSet<String>,
     all_fns: BTreeMap<String, FnDecl>,
     async_fns: BTreeSet<String>,
     cur_type_params: BTreeSet<String>,
@@ -363,8 +381,11 @@ struct CheckerCtx {
     file_packages: Vec<u32>,
     test_file_ids: BTreeSet<u32>,
     proved_safe_indices: BTreeSet<usize>,
+    proved_no_overflow: BTreeSet<usize>,
     infallible_casts: BTreeSet<usize>,
     refine_cast_types: BTreeMap<usize, TypeExpr>,
+    non_escaping_vars: BTreeMap<String, BTreeSet<String>>,
+    fn_summaries: BTreeMap<String, MirFnSummary>,
     proofs: Vec<ProofRecord>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -482,6 +503,7 @@ impl CheckerCtx {
         let mut impl_methods: BTreeMap<(String, String), Vec<(String, FnDecl)>> = BTreeMap::new();
         let mut pure_fns = BTreeMap::new();
         let mut no_heap_fns = BTreeSet::new();
+        let mut fip_fns = BTreeSet::new();
         let mut all_fns = BTreeMap::new();
         let mut async_fns = BTreeSet::new();
         async_fns.insert("yield_val".into());
@@ -534,6 +556,9 @@ impl CheckerCtx {
                     }
                     if f.attrs.iter().any(|a| a.name == "no_heap_alloc") {
                         no_heap_fns.insert(f.name.clone());
+                    }
+                    if f.attrs.iter().any(|a| a.name == "fip") {
+                        fip_fns.insert(f.name.clone());
                     }
                     if f.is_async {
                         async_fns.insert(f.name.clone());
@@ -680,6 +705,8 @@ impl CheckerCtx {
             pure_fns,
             smt_pure_fns,
             no_heap_fns,
+            fip_fns,
+            fip_verified_fns: BTreeSet::new(),
             all_fns,
             async_fns,
             cur_type_params: BTreeSet::new(),
@@ -692,8 +719,11 @@ impl CheckerCtx {
             file_packages: program.file_packages.clone(),
             test_file_ids: program.test_file_ids.iter().copied().collect(),
             proved_safe_indices: BTreeSet::new(),
+            proved_no_overflow: BTreeSet::new(),
             infallible_casts: BTreeSet::new(),
             refine_cast_types: BTreeMap::new(),
+            non_escaping_vars: BTreeMap::new(),
+            fn_summaries: BTreeMap::new(),
             proofs: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -1519,6 +1549,14 @@ impl CheckerCtx {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => true,
             ExprKind::Old(inner) => self.expr_smt_encodable(inner),
             ExprKind::Field { target, .. } => matches!(&target.kind, ExprKind::Ident(_)),
+            ExprKind::Index { target, index } => {
+                matches!(&target.kind, ExprKind::Ident(_)) && self.expr_smt_encodable(index)
+            }
+            ExprKind::Quantifier { lo, hi, body, .. } => {
+                self.expr_smt_encodable(lo)
+                    && self.expr_smt_encodable(hi)
+                    && self.expr_smt_encodable(body)
+            }
             ExprKind::Unary { expr: inner, .. } => self.expr_smt_encodable(inner),
             ExprKind::Binary { op, left, right } => {
                 !matches!(op, BinOp::Concat)
@@ -1660,7 +1698,7 @@ impl CheckerCtx {
                 }
                 named_ty("Float")
             }
-            ExprKind::Bool(_) => named_ty("Bool"),
+            ExprKind::Bool(_) | ExprKind::Quantifier { .. } => named_ty("Bool"),
             ExprKind::Str(_) => named_ty("Text"),
             ExprKind::Ident(s) => {
                 if s == "None" {
@@ -2490,10 +2528,49 @@ impl CheckerCtx {
             smt_premises.push((req.clone(), BTreeMap::new()));
         }
 
-        // 3. Static Effect, Purity & Memory Contract Checks (`async`, `pure`, `@no_heap_alloc`)
+        // 3. Static Effect, Purity & Memory Contract Checks (`async`, `pure`, `@no_heap_alloc`, `@fip`, Tier-2 Escape Analysis)
+        let no_heap = f.attrs.iter().any(|a| a.name == "no_heap_alloc");
+        let is_fip = f.attrs.iter().any(|a| a.name == "fip");
+        let non_esc = if f.is_ghost {
+            BTreeSet::new()
+        } else {
+            analyze_function_escapes(f)
+        };
+        if !non_esc.is_empty() {
+            self.non_escaping_vars.insert(f.name.clone(), non_esc.clone());
+        }
+        self.fn_summaries.insert(
+            f.name.clone(),
+            MirFnSummary {
+                name: f.name.clone(),
+                is_pure: f.is_pure,
+                is_ghost: f.is_ghost,
+                is_fip,
+                is_no_heap_alloc: no_heap,
+                param_count: f.params.len(),
+                non_escaping_locals: non_esc.into_iter().collect(),
+            },
+        );
         if !f.is_ghost {
-            let no_heap = f.attrs.iter().any(|a| a.name == "no_heap_alloc");
             self.check_block_effects(&f.body, f.is_async, f.is_pure, no_heap, &f.name, false);
+            if is_fip {
+                let non_alloc_builtins: BTreeSet<&str> = BUILTIN_SIGS
+                    .iter()
+                    .filter(|b| !b.allocates)
+                    .map(|b| b.name)
+                    .collect();
+                let fip_diags = verify_fip_function(f, &self.fip_fns, &self.no_heap_fns, &non_alloc_builtins);
+                if fip_diags.is_empty() {
+                    self.fip_verified_fns.insert(f.name.clone());
+                    self.proofs.push(ProofRecord {
+                        obligation: format!("@fip zero-net-alloc proof for `{}`", f.name),
+                        tier: ProofTier::L0Fast,
+                        span: f.span,
+                    });
+                } else {
+                    self.diagnostics.extend(fip_diags);
+                }
+            }
         }
 
         // 4. Walk statements & tail expression checking types, exhaustiveness, requires, div-by-zero, mutate & early returns
@@ -2883,6 +2960,10 @@ impl CheckerCtx {
         smt_int_vars: &mut BTreeSet<String>,
         smt_premises: &mut Vec<(Expr, BTreeMap<String, String>)>,
     ) {
+        if let TypeExpr::Fn { ret: Some(r), .. } = ty {
+            env.fn_var_ret_tys.insert(var_name.to_string(), (**r).clone());
+            return;
+        }
         if let TypeExpr::Named { name, .. } = ty {
             if let Some(sk) = ScalarKind::from_name(name) {
                 if sk.is_int() {
@@ -2900,14 +2981,18 @@ impl CheckerCtx {
                 }
             } else if let Some(alias) = self.type_aliases.get(name).cloned() {
                 self.assume_type_facts(var_name, &alias.base, env, smt_int_vars, smt_premises);
-                if let Some(pred) = &alias.predicate {
-                    env.assume_expr(pred, Some(var_name));
+                let ty_args: &[TypeExpr] = match ty {
+                    TypeExpr::Named { args, .. } => args.as_slice(),
+                    _ => &[],
+                };
+                if let Some(pred) = instantiate_alias_predicate(&alias, ty_args) {
+                    env.assume_expr(&pred, Some(var_name));
                     if self.is_float_ty(&alias.base) {
-                        env.assume_float_expr(pred, Some(var_name));
+                        env.assume_float_expr(&pred, Some(var_name));
                     }
                     let mut subst = BTreeMap::new();
                     subst.insert("self".into(), var_name.to_string());
-                    smt_premises.push((pred.clone(), subst));
+                    smt_premises.push((pred, subst));
                 }
             } else if let Some(rec) = self.records.get(name).cloned() {
                 let mut field_subst = BTreeMap::new();
@@ -3169,6 +3254,26 @@ impl CheckerCtx {
                                                 op: BinOp::Eq,
                                                 left: Box::new(Expr { kind: ExprKind::Ident(lk), span: *span }),
                                                 right: Box::new(args[0].value.clone()),
+                                            },
+                                            span: *span,
+                                        },
+                                        BTreeMap::new(),
+                                    ));
+                                }
+                                if self.expr_smt_encodable(&args[1].value) {
+                                    let ak = format!("__arr__{}", name);
+                                    smt_premises.push((
+                                        Expr {
+                                            kind: ExprKind::Binary {
+                                                op: BinOp::Eq,
+                                                left: Box::new(Expr { kind: ExprKind::Ident(ak), span: *span }),
+                                                right: Box::new(Expr {
+                                                    kind: ExprKind::Call {
+                                                        callee: Box::new(Expr { kind: ExprKind::Ident("__smt_const_array".into()), span: *span }),
+                                                        args: vec![CallArg { name: None, value: args[1].value.clone() }],
+                                                    },
+                                                    span: *span,
+                                                }),
                                             },
                                             span: *span,
                                         },
@@ -3563,6 +3668,42 @@ impl CheckerCtx {
                                                 tier,
                                                 span: target.span,
                                             });
+                                        }
+                                        // Track SSA array state `__arr__<lvar> = (store prev idx val)` for quantifier proofs!
+                                        if ln == "List"
+                                            && *op == AssignOp::Set
+                                            && self.expr_smt_encodable(index)
+                                            && self.expr_smt_encodable(value)
+                                        {
+                                            let ak = format!("__arr__{}", lvar);
+                                            let prev_ak = format!("__arr__ssa_{}_{}", lvar, self.ssa_counter);
+                                            self.ssa_counter += 1;
+                                            let mut idx_ren = index.clone();
+                                            let mut val_ren = value.clone();
+                                            rename_ident_in_expr(&mut idx_ren, &ak, &prev_ak);
+                                            rename_ident_in_expr(&mut val_ren, &ak, &prev_ak);
+                                            rename_ident_in_premises(smt_premises, &ak, &prev_ak);
+                                            smt_premises.push((
+                                                Expr {
+                                                    kind: ExprKind::Binary {
+                                                        op: BinOp::Eq,
+                                                        left: Box::new(Expr { kind: ExprKind::Ident(ak), span: *span }),
+                                                        right: Box::new(Expr {
+                                                            kind: ExprKind::Call {
+                                                                callee: Box::new(Expr { kind: ExprKind::Ident("__smt_store".into()), span: *span }),
+                                                                args: vec![
+                                                                    CallArg { name: None, value: Expr { kind: ExprKind::Ident(prev_ak), span: *span } },
+                                                                    CallArg { name: None, value: *idx_ren },
+                                                                    CallArg { name: None, value: val_ren },
+                                                                ],
+                                                            },
+                                                            span: *span,
+                                                        }),
+                                                    },
+                                                    span: *span,
+                                                },
+                                                BTreeMap::new(),
+                                            ));
                                         }
                                     }
                                 }
@@ -4600,6 +4741,12 @@ impl CheckerCtx {
                                 notes: vec!["convert explicitly with `as` cast (e.g. `x as Int64`)".into()],
                                 counterexample: BTreeMap::new(),
                             });
+                        } else if l_int
+                            && r_int
+                            && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                            && prove_binop_no_overflow(*op, left, right, l_sk.or(r_sk), env)
+                        {
+                            self.proved_no_overflow.insert(expr.span.start);
                         }
                     }
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
@@ -4718,6 +4865,23 @@ impl CheckerCtx {
                         });
                     }
                 }
+            }
+            ExprKind::Quantifier {
+                var,
+                lo,
+                hi,
+                body,
+                ..
+            } => {
+                self.check_expr(lo, cur_fn, env, smt_int_vars, smt_premises, var_types, mutable_vars, active_mutate, saw_return);
+                self.check_expr(hi, cur_fn, env, smt_int_vars, smt_premises, var_types, mutable_vars, active_mutate, saw_return);
+                let mut q_vars = var_types.clone();
+                q_vars.insert(var.clone(), named_ty("Int"));
+                let mut q_env = env.clone();
+                let mut q_smt_vars = smt_int_vars.clone();
+                q_smt_vars.insert(var.clone());
+                let mut q_premises = smt_premises.clone();
+                self.check_expr(body, cur_fn, &mut q_env, &mut q_smt_vars, &mut q_premises, &q_vars, mutable_vars, active_mutate, saw_return);
             }
             ExprKind::Unary { expr: inner, .. } | ExprKind::Await(inner) | ExprKind::Old(inner) => {
                 self.check_expr(
@@ -5604,6 +5768,9 @@ impl CheckerCtx {
                                         &format!("{}.{}", recv_ty.display_name(), field),
                                         &params,
                                         args,
+                                        env,
+                                        smt_int_vars,
+                                        smt_premises,
                                         var_types,
                                         expr.span,
                                     );
@@ -5660,6 +5827,9 @@ impl CheckerCtx {
                                     &format!("{}.{}", recv_ty.display_name(), field),
                                     &params,
                                     args,
+                                    env,
+                                    smt_int_vars,
+                                    smt_premises,
                                     var_types,
                                     expr.span,
                                 );
@@ -5911,7 +6081,16 @@ impl CheckerCtx {
                     ExprKind::Ident(fname) => {
                         if let Some(vty) = var_types.get(fname).cloned() {
                             if let TypeExpr::Fn { params, .. } = self.resolve_base_type(&vty) {
-                                self.check_indirect_fn_call(fname, &params, args, var_types, expr.span);
+                                self.check_indirect_fn_call(
+                                    fname,
+                                    &params,
+                                    args,
+                                    env,
+                                    smt_int_vars,
+                                    smt_premises,
+                                    var_types,
+                                    expr.span,
+                                );
                                 lambdas_checked = true;
                             } else if let Some(fdecl) = self.all_fns.get(fname).cloned() {
                                 self.check_direct_fn_call(
@@ -6237,7 +6416,16 @@ impl CheckerCtx {
                         if let TypeExpr::Fn { params, .. } =
                             self.resolve_base_type(&self.infer_expr_type(callee, var_types))
                         {
-                            self.check_indirect_fn_call("<fn>", &params, args, var_types, expr.span);
+                            self.check_indirect_fn_call(
+                                "<fn>",
+                                &params,
+                                args,
+                                env,
+                                smt_int_vars,
+                                smt_premises,
+                                var_types,
+                                expr.span,
+                            );
                             lambdas_checked = true;
                         }
                     }
@@ -7365,11 +7553,15 @@ impl CheckerCtx {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_indirect_fn_call(
         &mut self,
         label: &str,
         expected_params: &[TypeExpr],
         args: &[CallArg],
+        env: &L0Env,
+        smt_int_vars: &BTreeSet<String>,
+        smt_premises: &[(Expr, BTreeMap<String, String>)],
         var_types: &BTreeMap<String, TypeExpr>,
         span: Span,
     ) {
@@ -7387,7 +7579,7 @@ impl CheckerCtx {
                 counterexample: BTreeMap::new(),
             });
         }
-        for (ep, a) in expected_params.iter().zip(args.iter()) {
+        for (idx, (ep, a)) in expected_params.iter().zip(args.iter()).enumerate() {
             if let ExprKind::Lambda { params, ret_ty, body } = &a.value.kind {
                 self.check_lambda(params, ret_ty.as_ref(), body, Some(ep), var_types, a.value.span);
             }
@@ -7405,6 +7597,16 @@ impl CheckerCtx {
                     notes: vec![],
                     counterexample: BTreeMap::new(),
                 });
+            } else {
+                self.check_expr_satisfies_type(
+                    &a.value,
+                    ep,
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    &format!("argument #{} of higher-order `{}`", idx + 1, label),
+                    a.value.span,
+                );
             }
         }
     }
@@ -7569,6 +7771,17 @@ impl CheckerCtx {
                 });
             }
         }
+        if let Some(eff_rt) = &effective_ret {
+            self.check_expr_satisfies_type(
+                body,
+                eff_rt,
+                &lam_env,
+                &lam_smt_vars,
+                &lam_premises,
+                "higher-order lambda return",
+                body.span,
+            );
+        }
         let _ = &mut lam_mut;
     }
 
@@ -7627,9 +7840,14 @@ impl CheckerCtx {
         let Some(alias) = self.type_aliases.get(name).cloned() else {
             return;
         };
-        let Some(pred) = &alias.predicate else {
+        let ty_args: &[TypeExpr] = match ty {
+            TypeExpr::Named { args, .. } => args.as_slice(),
+            _ => &[],
+        };
+        let Some(pred_owned) = instantiate_alias_predicate(&alias, ty_args) else {
             return;
         };
+        let pred = &pred_owned;
 
         // Float refinement verification: L0 constant -> L0 float interval -> L1 Z3 `Real`!
         if self.is_float_ty(&alias.base) {
@@ -8011,8 +8229,10 @@ impl CheckerCtx {
         }
         let s_base = self.resolve_base_type(src_ty);
         let d_base = self.resolve_base_type(dst_ty);
-        let dst_pred = if let TypeExpr::Named { name, .. } = dst_ty {
-            self.type_aliases.get(name).and_then(|a| a.predicate.clone())
+        let dst_pred = if let TypeExpr::Named { name, args, .. } = dst_ty {
+            self.type_aliases
+                .get(name)
+                .and_then(|a| instantiate_alias_predicate(a, args))
         } else {
             None
         };
@@ -8098,6 +8318,10 @@ impl CheckerCtx {
         real_vars: &mut BTreeSet<String>,
         smt_premises: &mut Vec<(Expr, BTreeMap<String, String>)>,
     ) {
+        if let TypeExpr::Fn { ret: Some(r), .. } = ty {
+            env.fn_var_ret_tys.insert(var_name.to_string(), (**r).clone());
+            return;
+        }
         if let TypeExpr::Named { name, .. } = ty {
             if let Some(sk) = ScalarKind::from_name(name) {
                 if sk.is_int() {
@@ -8115,14 +8339,18 @@ impl CheckerCtx {
                 }
             } else if let Some(alias) = self.type_aliases.get(name) {
                 self.assume_type_facts_readonly(var_name, &alias.base, env, smt_int_vars, real_vars, smt_premises);
-                if let Some(pred) = &alias.predicate {
-                    env.assume_expr(pred, Some(var_name));
+                let ty_args: &[TypeExpr] = match ty {
+                    TypeExpr::Named { args, .. } => args.as_slice(),
+                    _ => &[],
+                };
+                if let Some(pred) = instantiate_alias_predicate(alias, ty_args) {
+                    env.assume_expr(&pred, Some(var_name));
                     if self.is_float_ty(&alias.base) {
-                        env.assume_float_expr(pred, Some(var_name));
+                        env.assume_float_expr(&pred, Some(var_name));
                     }
                     let mut subst = BTreeMap::new();
                     subst.insert("self".into(), var_name.to_string());
-                    smt_premises.push((pred.clone(), subst));
+                    smt_premises.push((pred, subst));
                 }
             }
         }
@@ -8136,8 +8364,10 @@ impl CheckerCtx {
         smt_int_vars: &BTreeSet<String>,
         smt_premises: &[(Expr, BTreeMap<String, String>)],
     ) -> CastVerdict {
-        let dst_pred = if let TypeExpr::Named { name, .. } = dst_ty {
-            self.type_aliases.get(name).and_then(|a| a.predicate.clone())
+        let dst_pred = if let TypeExpr::Named { name, args, .. } = dst_ty {
+            self.type_aliases
+                .get(name)
+                .and_then(|a| instantiate_alias_predicate(a, args))
         } else {
             None
         };
@@ -8259,6 +8489,36 @@ fn rename_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
             }
             for a in args {
                 rename_ident_in_expr(&mut a.value, old_name, new_name);
+            }
+        }
+        ExprKind::Index { target, index } => {
+            if let ExprKind::Ident(tv) = &target.kind {
+                let ak = if tv.starts_with("__arr__") {
+                    tv.clone()
+                } else {
+                    format!("__arr__{}", tv)
+                };
+                if ak == old_name {
+                    target.kind = ExprKind::Ident(new_name.to_string());
+                } else {
+                    rename_ident_in_expr(target, old_name, new_name);
+                }
+            } else {
+                rename_ident_in_expr(target, old_name, new_name);
+            }
+            rename_ident_in_expr(index, old_name, new_name);
+        }
+        ExprKind::Quantifier {
+            var,
+            lo,
+            hi,
+            body,
+            ..
+        } => {
+            rename_ident_in_expr(lo, old_name, new_name);
+            rename_ident_in_expr(hi, old_name, new_name);
+            if var != old_name {
+                rename_ident_in_expr(body, old_name, new_name);
             }
         }
         ExprKind::If { cond, then_block, else_branch } => {
@@ -8417,6 +8677,11 @@ fn collect_mutated_vars_in_block(blk: &Block, out: &mut BTreeSet<String>) {
                         out.insert(s.clone());
                     }
                 }
+                ExprKind::Index { target: list_expr, .. } => {
+                    if let ExprKind::Ident(s) = &list_expr.kind {
+                        out.insert(format!("__arr__{}", s));
+                    }
+                }
                 _ => {}
             },
             Stmt::Mutate { target, body, .. } => {
@@ -8462,6 +8727,15 @@ fn expr_mentions_ident(expr: &Expr, ident: &str) -> bool {
     match &expr.kind {
         ExprKind::Ident(s) => s == ident || s.starts_with(&prefix),
         ExprKind::Field { target, .. } => expr_mentions_ident(target, ident),
+        ExprKind::Index { target, index } => {
+            let arr_match = matches!(&target.kind, ExprKind::Ident(s) if format!("__arr__{}", s) == ident || s == ident);
+            arr_match || expr_mentions_ident(target, ident) || expr_mentions_ident(index, ident)
+        }
+        ExprKind::Quantifier { var, lo, hi, body, .. } => {
+            expr_mentions_ident(lo, ident)
+                || expr_mentions_ident(hi, ident)
+                || (var != ident && expr_mentions_ident(body, ident))
+        }
         ExprKind::Binary { left, right, .. } => {
             expr_mentions_ident(left, ident) || expr_mentions_ident(right, ident)
         }
@@ -8501,6 +8775,23 @@ fn substitute_expr_idents(expr: &Expr, map: &BTreeMap<String, Expr>) -> Expr {
             target: Box::new(substitute_expr_idents(target, map)),
             index: Box::new(substitute_expr_idents(index, map)),
         },
+        ExprKind::Quantifier {
+            is_forall,
+            var,
+            lo,
+            hi,
+            body,
+        } => {
+            let mut inner_map = map.clone();
+            inner_map.remove(var);
+            ExprKind::Quantifier {
+                is_forall: *is_forall,
+                var: var.clone(),
+                lo: Box::new(substitute_expr_idents(lo, map)),
+                hi: Box::new(substitute_expr_idents(hi, map)),
+                body: Box::new(substitute_expr_idents(body, &inner_map)),
+            }
+        }
         ExprKind::Call { callee, args } => ExprKind::Call {
             callee: callee.clone(),
             args: args

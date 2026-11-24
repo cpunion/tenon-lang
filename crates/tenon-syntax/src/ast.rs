@@ -693,6 +693,13 @@ pub enum ExprKind {
     Block(Block),
     Await(Box<Expr>),
     Old(Box<Expr>),
+    Quantifier {
+        is_forall: bool,
+        var: String,
+        lo: Box<Expr>,
+        hi: Box<Expr>,
+        body: Box<Expr>,
+    },
     Forall {
         binders: Vec<(String, TypeExpr)>,
         guard: Option<Box<Expr>>,
@@ -794,4 +801,112 @@ pub enum UnOp {
     Neg,
     Not,
     BitNot,
+}
+
+/// Instantiates const/value parameters on a parameterized refinement `TypeAliasDecl`
+/// (e.g. `type Range[LO Int, HI Int] = Int where self >= LO && self <= HI` instantiated with `Range[3, 5]`).
+pub fn instantiate_alias_predicate(ta: &TypeAliasDecl, args: &[TypeExpr]) -> Option<Expr> {
+    let pred = ta.predicate.as_ref()?;
+    if ta.type_params.is_empty() || ta.type_params.len() != args.len() {
+        return Some(pred.clone());
+    }
+    let mut const_map: BTreeMap<String, Expr> = BTreeMap::new();
+    for (tp, arg) in ta.type_params.iter().zip(args.iter()) {
+        if let TypeExpr::Named {
+            name,
+            args: inner,
+            span,
+            ..
+        } = arg
+        {
+            if inner.is_empty() {
+                if let Ok(iv) = name.parse::<i64>() {
+                    const_map.insert(
+                        tp.clone(),
+                        Expr {
+                            kind: ExprKind::Int(iv),
+                            span: *span,
+                        },
+                    );
+                } else if let Ok(fv) = name.parse::<f64>() {
+                    const_map.insert(
+                        tp.clone(),
+                        Expr {
+                            kind: ExprKind::Float(fv),
+                            span: *span,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    if const_map.is_empty() {
+        Some(pred.clone())
+    } else {
+        Some(subst_const_idents_in_expr(pred, &const_map))
+    }
+}
+
+fn subst_const_idents_in_expr(expr: &Expr, map: &BTreeMap<String, Expr>) -> Expr {
+    let kind = match &expr.kind {
+        ExprKind::Ident(s) => {
+            if let Some(rep) = map.get(s) {
+                return rep.clone();
+            }
+            expr.kind.clone()
+        }
+        ExprKind::Binary { op, left, right } => ExprKind::Binary {
+            op: *op,
+            left: Box::new(subst_const_idents_in_expr(left, map)),
+            right: Box::new(subst_const_idents_in_expr(right, map)),
+        },
+        ExprKind::Unary { op, expr: e } => ExprKind::Unary {
+            op: *op,
+            expr: Box::new(subst_const_idents_in_expr(e, map)),
+        },
+        ExprKind::Call { callee, args } => ExprKind::Call {
+            callee: Box::new(subst_const_idents_in_expr(callee, map)),
+            args: args
+                .iter()
+                .map(|a| CallArg {
+                    name: a.name.clone(),
+                    value: subst_const_idents_in_expr(&a.value, map),
+                })
+                .collect(),
+        },
+        ExprKind::Field { target, field } => ExprKind::Field {
+            target: Box::new(subst_const_idents_in_expr(target, map)),
+            field: field.clone(),
+        },
+        ExprKind::Index { target, index } => ExprKind::Index {
+            target: Box::new(subst_const_idents_in_expr(target, map)),
+            index: Box::new(subst_const_idents_in_expr(index, map)),
+        },
+        ExprKind::Cast { expr: e, ty } => ExprKind::Cast {
+            expr: Box::new(subst_const_idents_in_expr(e, map)),
+            ty: ty.clone(),
+        },
+        ExprKind::Quantifier {
+            is_forall,
+            var,
+            lo,
+            hi,
+            body,
+        } => {
+            let mut inner = map.clone();
+            inner.remove(var);
+            ExprKind::Quantifier {
+                is_forall: *is_forall,
+                var: var.clone(),
+                lo: Box::new(subst_const_idents_in_expr(lo, map)),
+                hi: Box::new(subst_const_idents_in_expr(hi, map)),
+                body: Box::new(subst_const_idents_in_expr(body, &inner)),
+            }
+        }
+        other => other.clone(),
+    };
+    Expr {
+        kind,
+        span: expr.span,
+    }
 }

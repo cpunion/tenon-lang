@@ -308,14 +308,22 @@ impl ComptimeContext {
         if sn == dn {
             return true;
         }
-        let s_alias = self.aliases.get(&sn);
-        let d_alias = self.aliases.get(&dn);
+        let (s_head, s_args): (&str, &[TypeExpr]) = match src {
+            TypeExpr::Named { name, args, .. } => (name.as_str(), args.as_slice()),
+            _ => (sn.as_str(), &[]),
+        };
+        let (d_head, d_args): (&str, &[TypeExpr]) = match dst {
+            TypeExpr::Named { name, args, .. } => (name.as_str(), args.as_slice()),
+            _ => (dn.as_str(), &[]),
+        };
+        let s_alias = self.aliases.get(s_head);
+        let d_alias = self.aliases.get(d_head);
         let s_base = s_alias
             .map(|a| a.base.display_name())
-            .unwrap_or_else(|| sn.clone());
+            .unwrap_or_else(|| s_head.to_string());
         let d_base = d_alias
             .map(|a| a.base.display_name())
-            .unwrap_or_else(|| dn.clone());
+            .unwrap_or_else(|| d_head.to_string());
         if s_base != d_base {
             // Check exact-width scalar widening (e.g. UInt8 <: UInt16 <: UInt32 <: UInt64)
             if let (Some(sk), Some(dk)) = (
@@ -333,15 +341,15 @@ impl ComptimeContext {
             return false;
         }
         // Target has no refinement predicate -> widening to base always holds!
-        let Some(d_pred) = d_alias.and_then(|a| a.predicate.as_ref()) else {
+        let Some(d_pred) = d_alias.and_then(|a| crate::instantiate_alias_predicate(a, d_args)) else {
             return true;
         };
-        let Some(s_pred) = s_alias.and_then(|a| a.predicate.as_ref()) else {
+        let Some(s_pred) = s_alias.and_then(|a| crate::instantiate_alias_predicate(a, s_args)) else {
             return false;
         };
         if let (Some((smin, smax)), Some((dmin, dmax))) = (
-            extract_simple_int_bounds(s_pred),
-            extract_simple_int_bounds(d_pred),
+            extract_simple_int_bounds(&s_pred),
+            extract_simple_int_bounds(&d_pred),
         ) {
             return smin >= dmin && smax <= dmax;
         }

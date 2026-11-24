@@ -99,7 +99,21 @@ impl LspServer {
                                     "triggerCharacters": [".", "@", "!"]
                                 },
                                 "documentSymbolProvider": true,
-                                "documentFormattingProvider": true
+                                "documentFormattingProvider": true,
+                                "inlayHintProvider": true,
+                                "codeActionProvider": true,
+                                "referencesProvider": true,
+                                "renameProvider": true,
+                                "semanticTokensProvider": {
+                                    "legend": {
+                                        "tokenTypes": [
+                                            "keyword", "type", "function", "variable",
+                                            "number", "string", "operator", "macro"
+                                        ],
+                                        "tokenModifiers": ["declaration", "readonly", "ghost"]
+                                    },
+                                    "full": true
+                                }
                             },
                             "serverInfo": {
                                 "name": "tenon-lsp",
@@ -240,6 +254,61 @@ impl LspServer {
                 }
                 "textDocument/formatting" => {
                     let result = self.handle_formatting(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/inlayHint" => {
+                    let result = self.handle_inlay_hint(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/codeAction" => {
+                    let result = self.handle_code_action(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/references" => {
+                    let result = self.handle_references(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/rename" => {
+                    let result = self.handle_rename(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/semanticTokens/full" => {
+                    let result = self.handle_semantic_tokens(&params);
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": id.unwrap_or(Value::Null),
@@ -1016,6 +1085,424 @@ impl LspServer {
             }
         ])
     }
+
+    fn handle_inlay_hint(&self, params: &Value) -> Value {
+        let Some(uri) = params
+            .get("textDocument")
+            .and_then(|t| t.get("uri"))
+            .and_then(|u| u.as_str())
+        else {
+            return json!([]);
+        };
+        let Some(doc) = self.docs.get(uri) else {
+            return json!([]);
+        };
+        let Some(analyzed) = self.analysis.get(uri) else {
+            return json!([]);
+        };
+        let Some(rep) = analyzed.report.as_ref() else {
+            return json!([]);
+        };
+        let mut hints: Vec<Value> = Vec::new();
+        let lines: Vec<&str> = doc.text.lines().collect();
+
+        // 1. Subtype-dependent `refine_cast[T](x)` resolved return type hints (`-> Range[2, 6]` vs `-> Result[Range[2, 4], Text]`)
+        for (&byte_off, resolved_ty) in &rep.mir.refine_cast_types {
+            let (l, _) = offset_to_line_col(&doc.text, byte_off);
+            if let Some(line_str) = lines.get(l as usize) {
+                let end_col = line_str.len() as u32;
+                hints.push(json!({
+                    "position": { "line": l, "character": end_col },
+                    "label": format!(" -> {}", resolved_ty),
+                    "kind": 1,
+                    "paddingLeft": true,
+                    "tooltip": format!("Subtype-dependent `refine_cast` statically resolved to `{}`", resolved_ty)
+                }));
+            }
+        }
+
+        // 2. Per-function static verification badges (`✓ L0/Z3`, `⚡ bounds`, `⚡ @fip`, `⚡ no-ov`)
+        if let Some(prog) = analyzed.raw_program.as_ref() {
+            for item in &prog.items {
+                if let Item::Fn(f) = item {
+                    let fn_line = f.span.line.saturating_sub(1) as u32;
+                    let fn_l0 = rep
+                        .proofs
+                        .iter()
+                        .filter(|p| {
+                            p.span.start >= f.span.start
+                                && p.span.end <= f.span.end
+                                && p.tier == ProofTier::L0Fast
+                        })
+                        .count();
+                    let fn_l1 = rep
+                        .proofs
+                        .iter()
+                        .filter(|p| {
+                            p.span.start >= f.span.start
+                                && p.span.end <= f.span.end
+                                && p.tier == ProofTier::L1Smt
+                        })
+                        .count();
+                    let fn_bounds = rep
+                        .mir
+                        .proved_safe_indices
+                        .iter()
+                        .filter(|&&off| off >= f.span.start && off <= f.span.end)
+                        .count();
+                    let fn_no_ov = rep
+                        .mir
+                        .proved_no_overflow
+                        .iter()
+                        .filter(|&&off| off >= f.span.start && off <= f.span.end)
+                        .count();
+                    let is_fip = rep.mir.fip_verified_fns.contains(&f.name);
+                    if fn_l0 + fn_l1 + fn_bounds + fn_no_ov > 0 || is_fip {
+                        let mut parts = Vec::new();
+                        if fn_l0 + fn_l1 > 0 {
+                            parts.push(format!("✓ {} L0 / {} Z3", fn_l0, fn_l1));
+                        }
+                        if fn_bounds > 0 {
+                            parts.push(format!("⚡ {} bounds", fn_bounds));
+                        }
+                        if fn_no_ov > 0 {
+                            parts.push(format!("⚡ {} nsw", fn_no_ov));
+                        }
+                        if is_fip {
+                            parts.push("⚡ @fip".into());
+                        }
+                        if let Some(line_str) = lines.get(fn_line as usize) {
+                            hints.push(json!({
+                                "position": { "line": fn_line, "character": line_str.len() as u32 },
+                                "label": format!("  [{}]", parts.join(" · ")),
+                                "kind": 2,
+                                "paddingLeft": true
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        json!(hints)
+    }
+
+    fn handle_code_action(&self, params: &Value) -> Value {
+        let Some(uri) = params
+            .get("textDocument")
+            .and_then(|t| t.get("uri"))
+            .and_then(|u| u.as_str())
+        else {
+            return json!([]);
+        };
+        let Some(doc) = self.docs.get(uri) else {
+            return json!([]);
+        };
+        let Some(rep) = self.analysis.get(uri).and_then(|a| a.report.as_ref()) else {
+            return json!([]);
+        };
+        let req_start_line = params
+            .pointer("/range/start/line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let req_end_line = params
+            .pointer("/range/end/line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::MAX) as usize;
+        let lines: Vec<&str> = doc.text.lines().collect();
+        let mut actions: Vec<Value> = Vec::new();
+
+        for d in &rep.diagnostics {
+            let dl = d.span.line.saturating_sub(1);
+            if dl < req_start_line || dl > req_end_line {
+                continue;
+            }
+            let Some(&line_str) = lines.get(dl) else {
+                continue;
+            };
+            // Quick Fix 1: `E0410` narrowing cast `expr as T` -> `expr as? T` or `refine_cast[T](expr)`
+            if d.code == "E0410" {
+                if let Some(as_pos) = line_str.find(" as ") {
+                    let fixed_try = format!(
+                        "{} as? {}",
+                        &line_str[..as_pos],
+                        &line_str[as_pos + 4..]
+                    );
+                    actions.push(json!({
+                        "title": "Convert narrowing cast to fallible `as?` (returns Result)",
+                        "kind": "quickfix",
+                        "isPreferred": true,
+                        "edit": {
+                            "changes": {
+                                uri: [{
+                                    "range": {
+                                        "start": { "line": dl, "character": 0 },
+                                        "end": { "line": dl, "character": line_str.len() }
+                                    },
+                                    "newText": fixed_try
+                                }]
+                            }
+                        }
+                    }));
+                    let rhs_ty = line_str[as_pos + 4..].trim();
+                    let lhs_part = &line_str[..as_pos];
+                    let (prefix, expr_str) = if let Some(eq_idx) = lhs_part.rfind('=') {
+                        (&lhs_part[..=eq_idx], lhs_part[eq_idx + 1..].trim())
+                    } else {
+                        ("", lhs_part.trim())
+                    };
+                    let fixed_rc = if prefix.is_empty() {
+                        format!(
+                            "{}refine_cast[{}]({})",
+                            &line_str[..line_str.len() - line_str.trim_start().len()],
+                            rhs_ty,
+                            expr_str
+                        )
+                    } else {
+                        format!("{} refine_cast[{}]({})", prefix, rhs_ty, expr_str)
+                    };
+                    actions.push(json!({
+                        "title": format!("Convert to subtype-dependent `refine_cast[{}]({})`", rhs_ty, expr_str),
+                        "kind": "quickfix",
+                        "edit": {
+                            "changes": {
+                                uri: [{
+                                    "range": {
+                                        "start": { "line": dl, "character": 0 },
+                                        "end": { "line": dl, "character": line_str.len() }
+                                    },
+                                    "newText": fixed_rc
+                                }]
+                            }
+                        }
+                    }));
+                }
+            }
+            // Quick Fix 2: `E0420` direct field mutation on invariant record -> wrap in `mutate <var> { ... }`
+            if d.code == "E0420" {
+                let indent_len = line_str.len() - line_str.trim_start().len();
+                let indent = &line_str[..indent_len];
+                let trimmed = line_str.trim();
+                if let Some(dot_idx) = trimmed.find('.') {
+                    let var_name = trimmed[..dot_idx].trim();
+                    if !var_name.is_empty() {
+                        let wrapped = format!(
+                            "{}mutate {} {{\n{}    {}\n{}}}",
+                            indent, var_name, indent, trimmed, indent
+                        );
+                        actions.push(json!({
+                            "title": format!("Wrap invariant mutation in `mutate {} {{ ... }}`", var_name),
+                            "kind": "quickfix",
+                            "isPreferred": true,
+                            "edit": {
+                                "changes": {
+                                    uri: [{
+                                        "range": {
+                                            "start": { "line": dl, "character": 0 },
+                                            "end": { "line": dl, "character": line_str.len() }
+                                        },
+                                        "newText": wrapped
+                                    }]
+                                }
+                            }
+                        }));
+                    }
+                }
+            }
+        }
+        json!(actions)
+    }
+
+    fn handle_references(&self, params: &Value) -> Value {
+        let Some((uri, line, ch)) = extract_text_doc_pos(params) else {
+            return json!([]);
+        };
+        let Some(doc) = self.docs.get(&uri) else {
+            return json!([]);
+        };
+        let Some(tok) = word_at_position(&doc.text, line, ch) else {
+            return json!([]);
+        };
+        let mut locs: Vec<Value> = Vec::new();
+        for (doc_uri, open) in &self.docs {
+            for (l, start_col, end_col) in find_word_occurrences(&open.text, &tok.word) {
+                locs.push(json!({
+                    "uri": doc_uri,
+                    "range": {
+                        "start": { "line": l, "character": start_col },
+                        "end": { "line": l, "character": end_col }
+                    }
+                }));
+            }
+        }
+        json!(locs)
+    }
+
+    fn handle_rename(&self, params: &Value) -> Value {
+        let Some((uri, line, ch)) = extract_text_doc_pos(params) else {
+            return Value::Null;
+        };
+        let Some(new_name) = params.get("newName").and_then(|v| v.as_str()) else {
+            return Value::Null;
+        };
+        let Some(doc) = self.docs.get(&uri) else {
+            return Value::Null;
+        };
+        let Some(tok) = word_at_position(&doc.text, line, ch) else {
+            return Value::Null;
+        };
+        let mut changes = serde_json::Map::new();
+        for (doc_uri, open) in &self.docs {
+            let edits: Vec<Value> = find_word_occurrences(&open.text, &tok.word)
+                .into_iter()
+                .map(|(l, start_col, end_col)| {
+                    json!({
+                        "range": {
+                            "start": { "line": l, "character": start_col },
+                            "end": { "line": l, "character": end_col }
+                        },
+                        "newText": new_name
+                    })
+                })
+                .collect();
+            if !edits.is_empty() {
+                changes.insert(doc_uri.clone(), Value::Array(edits));
+            }
+        }
+        json!({ "changes": Value::Object(changes) })
+    }
+
+    fn handle_semantic_tokens(&self, params: &Value) -> Value {
+        let Some(uri) = params
+            .get("textDocument")
+            .and_then(|t| t.get("uri"))
+            .and_then(|u| u.as_str())
+        else {
+            return json!({ "data": [] });
+        };
+        let Some(doc) = self.docs.get(uri) else {
+            return json!({ "data": [] });
+        };
+        // Token types: 0=keyword, 1=type, 2=function, 3=variable, 4=number, 5=string, 6=operator, 7=macro
+        // Modifiers: bit 0=declaration, bit 1=readonly, bit 2=ghost
+        let mut data: Vec<u32> = Vec::new();
+        let mut prev_line: u32 = 0;
+        let mut prev_col: u32 = 0;
+        for (l_idx, line) in doc.text.lines().enumerate() {
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                    break;
+                }
+                if bytes[i] == b'"' {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                    push_sem_tok(&mut data, &mut prev_line, &mut prev_col, l_idx as u32, start as u32, (i - start) as u32, 5, 0);
+                    continue;
+                }
+                if bytes[i].is_ascii_digit() {
+                    let start = i;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.') {
+                        i += 1;
+                    }
+                    push_sem_tok(&mut data, &mut prev_line, &mut prev_col, l_idx as u32, start as u32, (i - start) as u32, 4, 0);
+                    continue;
+                }
+                if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                    let start = i;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
+                    let word = &line[start..i];
+                    let is_macro = i < bytes.len() && bytes[i] == b'!';
+                    if is_macro {
+                        i += 1;
+                        push_sem_tok(&mut data, &mut prev_line, &mut prev_col, l_idx as u32, start as u32, (i - start) as u32, 7, 0);
+                    } else if matches!(
+                        word,
+                        "pub" | "fn" | "pure" | "async" | "unsafe" | "comptime" | "macro" | "attr"
+                            | "record" | "enum" | "interface" | "impl" | "type" | "const" | "let"
+                            | "var" | "if" | "else" | "match" | "while" | "for" | "in" | "return"
+                            | "break" | "continue" | "defer" | "assert" | "mutate" | "import" | "as"
+                            | "where" | "requires" | "ensures" | "invariant" | "decreases" | "old"
+                            | "forall" | "exists" | "inout" | "dyn"
+                    ) {
+                        push_sem_tok(&mut data, &mut prev_line, &mut prev_col, l_idx as u32, start as u32, word.len() as u32, 0, 0);
+                    } else if matches!(word, "ghost" | "lemma") {
+                        push_sem_tok(&mut data, &mut prev_line, &mut prev_col, l_idx as u32, start as u32, word.len() as u32, 0, 4);
+                    } else if word.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                        push_sem_tok(&mut data, &mut prev_line, &mut prev_col, l_idx as u32, start as u32, word.len() as u32, 1, 0);
+                    } else if i < bytes.len() && (bytes[i] == b'(' || bytes[i] == b'[') {
+                        push_sem_tok(&mut data, &mut prev_line, &mut prev_col, l_idx as u32, start as u32, word.len() as u32, 2, 0);
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+        }
+        json!({ "data": data })
+    }
+}
+
+fn offset_to_line_col(text: &str, byte_off: usize) -> (u32, u32) {
+    let clamped = byte_off.min(text.len());
+    let prefix = &text[..clamped];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() as u32;
+    let col = prefix.rsplit('\n').next().map(|s| s.len()).unwrap_or(0) as u32;
+    (line, col)
+}
+
+fn find_word_occurrences(text: &str, word: &str) -> Vec<(u32, u32, u32)> {
+    let mut out = Vec::new();
+    if word.is_empty() {
+        return out;
+    }
+    for (l_idx, line) in text.lines().enumerate() {
+        let bytes = line.as_bytes();
+        let wlen = word.len();
+        let mut i = 0usize;
+        while i + wlen <= bytes.len() {
+            if &line[i..i + wlen] == word {
+                let left_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                let right_ok = i + wlen == bytes.len()
+                    || !(bytes[i + wlen].is_ascii_alphanumeric() || bytes[i + wlen] == b'_');
+                if left_ok && right_ok {
+                    out.push((l_idx as u32, i as u32, (i + wlen) as u32));
+                    i += wlen;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_sem_tok(
+    data: &mut Vec<u32>,
+    prev_line: &mut u32,
+    prev_col: &mut u32,
+    line: u32,
+    col: u32,
+    len: u32,
+    ty: u32,
+    mods: u32,
+) {
+    let dl = line - *prev_line;
+    let dc = if dl == 0 { col.saturating_sub(*prev_col) } else { col };
+    data.extend_from_slice(&[dl, dc, len, ty, mods]);
+    *prev_line = line;
+    *prev_col = col;
 }
 
 // ---------------------------------------------------------------------------
@@ -2167,5 +2654,78 @@ pub pure fn demo(r Range3to5) Int {
             "expected narrowing hover `Result[Range2to4, Text]`, got: {}",
             md_narrow
         );
+    }
+
+    #[test]
+    fn lsp_inlay_hints_code_actions_references_rename_and_semantic_tokens() {
+        let src = r#"pub type Range[LO Int, HI Int] = Int where self >= LO && self <= HI
+pub record Boxed { val Int where self >= 0 }
+
+pub fn demo(r Range[3, 5], inout b Boxed) Int {
+    let w = refine_cast[Range[2, 6]](r)
+    let bad Range[2, 4] = r as Range[2, 4]
+    b.val = 10
+    w + bad
+}
+"#;
+        let uri = "file:///tmp/tenon_lsp_killer.tn";
+        let mut input = Vec::new();
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": uri, "languageId": "tenon", "version": 1, "text": src } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "textDocument/inlayHint",
+            "params": { "textDocument": { "uri": uri } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "textDocument/codeAction",
+            "params": { "textDocument": { "uri": uri }, "range": { "start": { "line": 4, "character": 0 }, "end": { "line": 7, "character": 0 } } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "textDocument/references",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 3, "character": 12 } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 5, "method": "textDocument/rename",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 3, "character": 12 }, "newName": "val_r" }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 6, "method": "textDocument/semanticTokens/full",
+            "params": { "textDocument": { "uri": uri } }
+        })));
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "id": 7, "method": "shutdown", "params": null })));
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "method": "exit", "params": null })));
+
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        let mut server = LspServer::new();
+        assert!(server.run_loop(&mut reader, &mut output));
+
+        let msgs = read_all_messages(&output);
+        let hints = msgs.iter().find(|m| m.get("id") == Some(&json!(2))).unwrap()["result"].as_array().unwrap();
+        assert!(
+            hints.iter().any(|h| h["label"].as_str().unwrap_or("").contains("-> Range[2, 6]")),
+            "expected inlayHint for refine_cast -> Range[2, 6], got {:?}",
+            hints
+        );
+        let actions = msgs.iter().find(|m| m.get("id") == Some(&json!(3))).unwrap()["result"].as_array().unwrap();
+        assert!(
+            actions.iter().any(|a| a["title"].as_str().unwrap_or("").contains("as?")),
+            "expected E0410 quickfix to `as?`, got {:?}",
+            actions
+        );
+        assert!(
+            actions.iter().any(|a| a["title"].as_str().unwrap_or("").contains("mutate b")),
+            "expected E0420 quickfix wrapping in `mutate b`, got {:?}",
+            actions
+        );
+        let refs = msgs.iter().find(|m| m.get("id") == Some(&json!(4))).unwrap()["result"].as_array().unwrap();
+        assert!(refs.len() >= 3, "expected >= 3 references for `r`, got {:?}", refs);
+        let ren = &msgs.iter().find(|m| m.get("id") == Some(&json!(5))).unwrap()["result"]["changes"][uri];
+        assert!(ren.as_array().unwrap().len() >= 3, "expected >= 3 rename edits");
+        let sem = msgs.iter().find(|m| m.get("id") == Some(&json!(6))).unwrap()["result"]["data"].as_array().unwrap();
+        assert!(sem.len() >= 25 && sem.len() % 5 == 0, "expected valid semantic token tuples");
     }
 }

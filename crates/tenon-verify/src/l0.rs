@@ -255,6 +255,8 @@ pub struct L0Env {
     pub pure_fns: BTreeMap<String, FnDecl>,
     /// Refined type alias predicates available for callee return-type summaries.
     pub type_aliases: BTreeMap<String, TypeAliasDecl>,
+    /// Higher-order function parameter/local return types (`f -> RetTy`) for L0 refinement summaries.
+    pub fn_var_ret_tys: BTreeMap<String, TypeExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -775,10 +777,10 @@ impl L0Env {
                             type_aliases: self.type_aliases.clone(),
                             ..Default::default()
                         };
-                        if let Some(TypeExpr::Named { name: rty, .. }) = &fdecl.ret_ty {
+                        if let Some(TypeExpr::Named { name: rty, args: rargs, .. }) = &fdecl.ret_ty {
                             if let Some(alias) = self.type_aliases.get(rty) {
-                                if let Some(pred) = &alias.predicate {
-                                    summary_env.assume_expr(pred, Some("result"));
+                                if let Some(pred) = instantiate_alias_predicate(alias, rargs) {
+                                    summary_env.assume_expr(&pred, Some("result"));
                                 }
                             }
                         }
@@ -786,6 +788,22 @@ impl L0Env {
                             summary_env.assume_expr(ens, Some("result"));
                         }
                         return summary_env.get_int("result");
+                    }
+                    // 3. Higher-order function value call `f(args)` -> apply declared return refinement!
+                    if let Some(TypeExpr::Named { name: rty, args: rargs, .. }) =
+                        self.fn_var_ret_tys.get(fname)
+                    {
+                        if let Some(alias) = self.type_aliases.get(rty) {
+                            if let Some(pred) = instantiate_alias_predicate(alias, rargs) {
+                                let mut summary_env = L0Env {
+                                    pure_fns: self.pure_fns.clone(),
+                                    type_aliases: self.type_aliases.clone(),
+                                    ..Default::default()
+                                };
+                                summary_env.assume_expr(&pred, Some("result"));
+                                return summary_env.get_int("result");
+                            }
+                        }
                     }
                 }
                 AbsInt::top()

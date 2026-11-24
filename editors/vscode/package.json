@@ -30,6 +30,17 @@
       {
         "command": "tenon.restartServer",
         "title": "Tenon: Restart Language Server"
+      },
+      {
+        "command": "tenon.debugFile",
+        "title": "Tenon: Build & Debug Active File (DWARF -g)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "tenon.debugFile",
+        "key": "f5",
+        "when": "editorLangId == tenon && !inDebugMode"
       }
     ],
     "languages": [

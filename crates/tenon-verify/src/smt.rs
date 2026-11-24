@@ -73,6 +73,7 @@ pub enum SmtSort {
     Int,
     Bool,
     Real,
+    IntArray,
 }
 
 impl SmtSort {
@@ -81,6 +82,7 @@ impl SmtSort {
             SmtSort::Int => "Int",
             SmtSort::Bool => "Bool",
             SmtSort::Real => "Real",
+            SmtSort::IntArray => "(Array Int Int)",
         }
     }
 }
@@ -116,10 +118,110 @@ impl SmtQuery {
     }
 
     pub fn add_premise_expr(&mut self, expr: &Expr, subst: &BTreeMap<String, String>) -> Result<(), String> {
+        let mut bound = BTreeSet::new();
+        if !self.expr_vars_declared(expr, subst, &mut bound) {
+            return Err("premise references non-SMT variable".into());
+        }
         let rvars = self.real_var_set();
         let s = encode_expr_with_reals(expr, subst, &rvars)?;
         self.premises.push(s);
         Ok(())
+    }
+
+    fn expr_vars_declared(
+        &self,
+        expr: &Expr,
+        subst: &BTreeMap<String, String>,
+        bound: &mut BTreeSet<String>,
+    ) -> bool {
+        match &expr.kind {
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => true,
+            ExprKind::Ident(s) => {
+                if bound.contains(s)
+                    || s.starts_with("__len__")
+                    || s.starts_with("__arr__")
+                    || s.starts_with("old__")
+                {
+                    return true;
+                }
+                if let Some(rep) = subst.get(s) {
+                    return rep.starts_with('(')
+                        || bound.contains(rep)
+                        || rep.starts_with("__len__")
+                        || rep.starts_with("__arr__")
+                        || self.vars.contains_key(rep);
+                }
+                self.vars.contains_key(s)
+            }
+            ExprKind::Old(inner) => match &inner.kind {
+                ExprKind::Ident(s) => self.vars.contains_key(&format!("old__{}", s)),
+                ExprKind::Field { target, field } => {
+                    matches!(&target.kind, ExprKind::Ident(b) if self.vars.contains_key(&format!("old__{}__{}", b, field)))
+                }
+                _ => false,
+            },
+            ExprKind::Field { target, field } => {
+                if let ExprKind::Ident(base) = &target.kind {
+                    let full = format!("{}.{}", base, field);
+                    if subst.contains_key(&full) || self.vars.contains_key(&full) {
+                        return true;
+                    }
+                    if base == "self" {
+                        if let Some(prefix) = subst.get("self") {
+                            return self.vars.contains_key(&format!("{}.{}", prefix, field));
+                        }
+                        return self.vars.contains_key(field);
+                    }
+                }
+                false
+            }
+            ExprKind::Index { target, index } => {
+                let target_ok = matches!(&target.kind, ExprKind::Ident(_))
+                    || matches!(&target.kind, ExprKind::Field { target: obj, .. } if matches!(&obj.kind, ExprKind::Ident(_)));
+                target_ok && self.expr_vars_declared(index, subst, bound)
+            }
+            ExprKind::Unary { expr: inner, .. } | ExprKind::Cast { expr: inner, .. } => {
+                self.expr_vars_declared(inner, subst, bound)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_vars_declared(left, subst, bound)
+                    && self.expr_vars_declared(right, subst, bound)
+            }
+            ExprKind::Quantifier { var, lo, hi, body, .. } => {
+                if !self.expr_vars_declared(lo, subst, bound)
+                    || !self.expr_vars_declared(hi, subst, bound)
+                {
+                    return false;
+                }
+                let newly_inserted = bound.insert(var.clone());
+                let ok = self.expr_vars_declared(body, subst, bound);
+                if newly_inserted {
+                    bound.remove(var);
+                }
+                ok
+            }
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Ident(fname) = &callee.kind {
+                    if fname == "len" && args.len() == 1 && matches!(&args[0].value.kind, ExprKind::Ident(_)) {
+                        return true;
+                    }
+                    if matches!(fname.as_str(), "__smt_const_array" | "__smt_store")
+                        || self.pure_fns.contains_key(fname)
+                    {
+                        return args
+                            .iter()
+                            .all(|a| self.expr_vars_declared(&a.value, subst, bound));
+                    }
+                }
+                false
+            }
+            ExprKind::If { cond, then_block, else_branch } => {
+                self.expr_vars_declared(cond, subst, bound)
+                    && then_block.tail.as_deref().is_some_and(|t| self.expr_vars_declared(t, subst, bound))
+                    && else_branch.as_deref().is_some_and(|e| self.expr_vars_declared(e, subst, bound))
+            }
+            _ => false,
+        }
     }
 
     pub fn set_goal_expr(&mut self, expr: &Expr, subst: &BTreeMap<String, String>) -> Result<(), String> {
@@ -158,14 +260,19 @@ impl SmtQuery {
             }
         }
 
-        // Auto-declare non-negative `__len__*` variables referenced in premises or goal
+        // Auto-declare non-negative `__len__*` and `(Array Int Int)` `__arr__*` symbols referenced in premises or goal
         let mut auto_len_vars = BTreeSet::new();
+        let mut auto_arr_vars = BTreeSet::new();
         for s in self.premises.iter().chain(std::iter::once(&self.goal)) {
-            collect_len_symbols(s, &mut auto_len_vars);
+            collect_prefixed_symbols(s, "__len__", &mut auto_len_vars);
+            collect_prefixed_symbols(s, "__arr__", &mut auto_arr_vars);
         }
         let mut all_vars = self.vars.clone();
         for lv in &auto_len_vars {
             all_vars.entry(lv.clone()).or_insert(SmtSort::Int);
+        }
+        for av in &auto_arr_vars {
+            all_vars.entry(av.clone()).or_insert(SmtSort::IntArray);
         }
 
         for (name, sort) in &all_vars {
@@ -395,9 +502,9 @@ pub fn pure_fn_callees(f: &FnDecl) -> Vec<String> {
     deps
 }
 
-fn collect_len_symbols(s: &str, out: &mut BTreeSet<String>) {
+fn collect_prefixed_symbols(s: &str, prefix: &str, out: &mut BTreeSet<String>) {
     let bytes = s.as_bytes();
-    let needle = b"__len__";
+    let needle = prefix.as_bytes();
     let mut i = 0;
     while i + needle.len() <= bytes.len() {
         if &bytes[i..i + needle.len()] == needle {
@@ -761,6 +868,62 @@ pub fn encode_expr_with_reals(
             encode_match_arms(&sc, arms, subst, real_vars)
         }
         ExprKind::Block(blk) => encode_block_with_reals(blk, subst, real_vars),
+        ExprKind::Index { target, index } => {
+            let arr_s = match &target.kind {
+                ExprKind::Ident(v) => {
+                    let ak = if v.starts_with("__arr__") {
+                        v.clone()
+                    } else {
+                        format!("__arr__{}", v)
+                    };
+                    if let Some(rep) = subst.get(&ak) {
+                        smt_ident(rep)
+                    } else {
+                        smt_ident(&ak)
+                    }
+                }
+                ExprKind::Field { target: obj, field } => {
+                    if let ExprKind::Ident(b) = &obj.kind {
+                        let b_res = if b == "self" {
+                            subst.get("self").map(|s| s.as_str()).unwrap_or("self")
+                        } else {
+                            b.as_str()
+                        };
+                        smt_ident(&format!("__arr__{}__{}", b_res, field))
+                    } else {
+                        return Err("complex array field target in SMT".into());
+                    }
+                }
+                _ => return Err("complex array target in SMT".into()),
+            };
+            let idx_s = encode_expr_with_reals(index, subst, real_vars)?;
+            Ok(format!("(select {} {})", arr_s, idx_s))
+        }
+        ExprKind::Quantifier {
+            is_forall,
+            var,
+            lo,
+            hi,
+            body,
+        } => {
+            let lo_s = encode_expr_with_reals(lo, subst, real_vars)?;
+            let hi_s = encode_expr_with_reals(hi, subst, real_vars)?;
+            let mut inner_subst = subst.clone();
+            inner_subst.remove(var);
+            let body_s = encode_expr_with_reals(body, &inner_subst, real_vars)?;
+            let v_s = smt_ident(var);
+            if *is_forall {
+                Ok(format!(
+                    "(forall (({} Int)) (=> (and (<= {} {}) (< {} {})) {}))",
+                    v_s, lo_s, v_s, v_s, hi_s, body_s
+                ))
+            } else {
+                Ok(format!(
+                    "(exists (({} Int)) (and (<= {} {}) (< {} {}) {}))",
+                    v_s, lo_s, v_s, v_s, hi_s, body_s
+                ))
+            }
+        }
         ExprKind::Call { callee, args } => {
             if let ExprKind::Ident(fname) = &callee.kind {
                 if fname == "len" && args.len() == 1 {
@@ -768,6 +931,16 @@ pub fn encode_expr_with_reals(
                         let resolved = subst.get(var).map(|s| s.as_str()).unwrap_or(var.as_str());
                         return Ok(smt_ident(&format!("__len__{}", resolved)));
                     }
+                }
+                if fname == "__smt_const_array" && args.len() == 1 {
+                    let v_s = encode_expr_with_reals(&args[0].value, subst, real_vars)?;
+                    return Ok(format!("((as const (Array Int Int)) {})", v_s));
+                }
+                if fname == "__smt_store" && args.len() == 3 {
+                    let a_s = encode_expr_with_reals(&args[0].value, subst, real_vars)?;
+                    let i_s = encode_expr_with_reals(&args[1].value, subst, real_vars)?;
+                    let v_s = encode_expr_with_reals(&args[2].value, subst, real_vars)?;
+                    return Ok(format!("(store {} {} {})", a_s, i_s, v_s));
                 }
                 let call_name = subst
                     .get(&format!("__fn__{}", fname))

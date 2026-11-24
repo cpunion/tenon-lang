@@ -1307,6 +1307,14 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 opts.debug_info = true;
                 i += 1;
             }
+            "--checked-overflow" => {
+                opts.checked_overflow = true;
+                i += 1;
+            }
+            "--target" if i + 1 < args.len() => {
+                opts.target_triple = Some(args[i + 1].clone());
+                i += 2;
+            }
             "-l" if i + 1 < args.len() => {
                 opts.link_libs.push(args[i + 1].clone());
                 i += 2;
@@ -1363,7 +1371,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    opts.proved_safe_indices = report.proved_safe_indices.clone();
+    opts.apply_verified_mir(&report.mir);
     match tenon_codegen::llvm_aot::compile_with_options(&prog, Path::new(&out_bin), &opts) {
         Ok(art) => {
             let kind_str = match opts.output_kind {
@@ -1372,7 +1380,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 tenon_codegen::llvm_aot::OutputKind::SharedLib => "shared library",
             };
             println!(
-                "LLVM AOT Built `{}` -> `{}` ({} bytes {}, {} bytes LLVM IR, opt={}, debug={}, {} proofs verified, {} bounds checks eliminated)",
+                "LLVM AOT Built `{}` -> `{}` ({} bytes {}, {} bytes LLVM IR, opt={}, debug={}, {} proofs verified, {} bounds checks eliminated, {} overflow-free ops)",
                 file,
                 art.output_path,
                 art.binary_bytes,
@@ -1381,7 +1389,8 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 art.opt_level,
                 opts.debug_info,
                 report.proofs.len(),
-                report.proved_safe_indices.len()
+                report.mir.proved_safe_indices.len(),
+                report.mir.proved_no_overflow.len()
             );
             ExitCode::SUCCESS
         }
