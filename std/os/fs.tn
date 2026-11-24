@@ -1,0 +1,81 @@
+// Tenon Standard Library — Layer 3: std/os/fs.tn
+// Structured `FsError`, `FileSystem` interface (enabling both real `OsFs` and sandboxed `MemFs` via `dyn FileSystem`!).
+
+import "std/core/types.tn"
+import "std/collections/map.tn"
+
+pub enum FsError {
+    NotFound(Text)
+    IoFailure(Text)
+}
+
+impl FsError {
+    pub pure fn message(self) Text {
+        match self {
+            NotFound(p) => "not found: " ++ p
+            IoFailure(m) => m
+        }
+    }
+}
+
+pub interface FileSystem {
+    fn read_text(self, path Text) Result[Text, FsError]
+    fn write_text(inout self, path Text, content Text) Result[NonNegative, FsError]
+}
+
+pub record OsFs {
+    root Text
+}
+
+pub pure fn os_fs_new() OsFs {
+    OsFs { root = "" }
+}
+
+impl FileSystem for OsFs {
+    fn read_text(self, path Text) Result[Text, FsError] {
+        let data = sys_read_file(path)
+        if !sys_file_ok() {
+            return Err(IoFailure(data))
+        }
+        Ok(data)
+    }
+
+    fn write_text(inout self, path Text, content Text) Result[NonNegative, FsError] {
+        if !sys_write_file(path, content) {
+            return Err(IoFailure("failed to write `" ++ path ++ "`"))
+        }
+        Ok(len(content))
+    }
+}
+
+/// Pure in-memory `FileSystem` implementation (ideal for deterministic tests & sandboxes!).
+pub record MemFs {
+    files TextMap
+}
+
+pub pure fn mem_fs_new() MemFs {
+    MemFs { files = text_map_new() }
+}
+
+impl FileSystem for MemFs {
+    fn read_text(self, path Text) Result[Text, FsError] {
+        match self.files.get(path) {
+            Some(content) => Ok(content)
+            None => Err(NotFound(path))
+        }
+    }
+
+    fn write_text(inout self, path Text, content Text) Result[NonNegative, FsError] {
+        self.files = self.files.set(path, content)
+        Ok(len(content))
+    }
+}
+
+pub fn fs_read(path Text) Result[Text, FsError] {
+    os_fs_new().read_text(path)
+}
+
+pub fn fs_write(path Text, content Text) Result[NonNegative, FsError] {
+    var os = os_fs_new()
+    os.write_text(path, content)
+}

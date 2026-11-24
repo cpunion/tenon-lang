@@ -1,11 +1,11 @@
-//! Minimal Tenon Core Byte & OS/Network Syscall Primitives (19 primitives total).
+//! Minimal Tenon Core Byte, Buffer & OS/HTTP Syscall Primitives (24 primitives total).
 //!
-//! By design, this module contains ZERO high-level stdlib logic:
-//! - NO JSON parsing or serialization (written in pure Tenon in `std/json.tn`)
-//! - NO string utilities like trim/index_of/replace/int_to_text (written in `std/text.tn`)
-//! - NO `.env` parsing (written in `std/env.tn`)
-//! - NO file edit/line-numbering/workspace-guard logic (written in `std/tools.tn`)
-//! - NO OpenAI protocol or agent ReAct loop logic (written in `std/openai.tn` & `examples/agent/cli_agent.tn`)
+//! By design, this module contains ZERO high-level stdlib or vendor logic:
+//! - NO JSON parsing/serialization/schema (written in pure Tenon in `std/encoding/json.tn` + `@derive`)
+//! - NO string utilities like trim/find/replace/parse_int (written in `std/text/text.tn` & `std/text/builder.tn`)
+//! - NO `.env` parsing (written in `std/encoding/dotenv.tn`)
+//! - NO file edit/workspace-guard/tool logic (written in `std/os/{path,fs}.tn` & `examples/agent/lib/tools.tn`)
+//! - NO OpenAI protocol or agent ReAct loop logic (written in `std/os/http.tn`, `examples/agent/lib/llm.tn` & `examples/agent/cli_agent.tn`)
 
 use crate::perceus::{make_text, make_text_bytes, read_text, read_text_bytes};
 use futures_util::StreamExt;

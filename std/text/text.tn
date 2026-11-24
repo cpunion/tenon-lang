@@ -1,88 +1,7 @@
-// Tenon Standard Library: std/text.tn
-// Pure-Tenon string utilities utilizing refined types, `@no_heap_alloc`, `pure fn`,
-// `requires`/`ensures` contracts, and structured `Option[T]` / `Result[T, E]`!
+// Tenon Standard Library — Layer 1: std/text/text.tn
+// Idiomatic `Text` methods (`impl Text`) + verified slice contracts + integer formatting/parsing.
 
-pub type NonNegative = Int where self >= 0
-pub type Positive    = Int where self >= 1
-pub type ByteVal     = Int where 0 <= self && self <= 255
-pub type HexNibble   = Int where 0 <= self && self <= 15
-
-pub record SliceRange {
-    start NonNegative
-    end   NonNegative
-    where start <= end
-}
-
-@no_heap_alloc
-pub pure fn is_space_byte(b Int) Bool {
-    b == 32 || b == 9 || b == 10 || b == 13
-}
-
-@no_heap_alloc
-pub pure fn is_digit_byte(b Int) Bool {
-    b >= 48 && b <= 57
-}
-
-@no_heap_alloc
-pub pure fn clamp_non_neg(n Int) NonNegative
-    ensures result >= 0
-{
-    if n < 0 {
-        return 0
-    }
-    n
-}
-
-@no_heap_alloc
-pub pure fn min_int(a Int, b Int) Int
-    ensures result <= a && result <= b
-{
-    if a <= b {
-        return a
-    }
-    b
-}
-
-@no_heap_alloc
-pub pure fn max_int(a Int, b Int) Int
-    ensures result >= a && result >= b
-{
-    if a >= b {
-        return a
-    }
-    b
-}
-
-@no_heap_alloc
-pub pure fn parse_hex_digit_raw(b Int) Int
-    ensures -1 <= result && result <= 15
-{
-    if b >= 48 && b <= 57 {
-        return b - 48
-    }
-    if b >= 65 && b <= 70 {
-        return 10 + (b - 65)
-    }
-    if b >= 97 && b <= 102 {
-        return 10 + (b - 97)
-    }
-    -1
-}
-
-pub pure fn parse_hex_digit(b Int) Option[HexNibble] {
-    let v = parse_hex_digit_raw(b)
-    if v < 0 {
-        return None
-    }
-    Some(v)
-}
-
-pub pure fn hex_nibble(n HexNibble) Text {
-    if n < 10 {
-        return byte_to_text(48 + n)
-    }
-    byte_to_text(97 + (n - 10))
-}
+import "std/core/types.tn"
 
 pub pure fn str_slice_checked(s Text, start NonNegative, end NonNegative) Text
     requires start <= end
@@ -215,22 +134,30 @@ pub pure fn str_replace_all(s Text, target Text, replacement Text) Text {
         return s
     }
     let slen = len(s)
-    var out = ""
+    let b = buf_new()
     var pos = 0
     while pos <= slen {
         let p_ok = clamp_non_neg(pos)
         match str_index_of_from(s, target, p_ok) {
             None => {
-                out = out ++ str_slice(s, p_ok, slen)
+                let _ = buf_push_str(b, str_slice(s, p_ok, slen))
                 break
             }
             Some(idx) => {
-                out = out ++ str_slice(s, p_ok, idx) ++ replacement
+                let _ = buf_push_str(b, str_slice(s, p_ok, idx))
+                let _ = buf_push_str(b, replacement)
                 pos = idx + tlen
             }
         }
     }
-    out
+    buf_finish(b)
+}
+
+pub pure fn truncate_output(s Text, max_bytes MaxBytes) Text {
+    if len(s) <= max_bytes {
+        return s
+    }
+    str_slice_checked(s, 0, max_bytes) ++ "\n... (truncated, total " ++ int_to_text(len(s)) ++ " bytes)"
 }
 
 pub pure fn int_to_text(n Int) Text {
@@ -283,4 +210,58 @@ pub pure fn text_parse_int(s Text) Result[Int, Text] {
         return Ok(-acc)
     }
     Ok(acc)
+}
+
+impl Text {
+    pub pure fn byte_len(self) NonNegative {
+        len(self)
+    }
+
+    pub pure fn is_empty(self) Bool {
+        len(self) == 0
+    }
+
+    pub pure fn trim(self) Text {
+        str_trim(self)
+    }
+
+    pub pure fn starts_with(self, prefix Text) Bool {
+        str_starts_with(self, prefix)
+    }
+
+    pub pure fn ends_with(self, suffix Text) Bool {
+        str_ends_with(self, suffix)
+    }
+
+    pub pure fn strip_prefix(self, prefix Text) Option[Text] {
+        str_strip_prefix(self, prefix)
+    }
+
+    pub pure fn find(self, needle Text) Option[NonNegative] {
+        str_index_of(self, needle)
+    }
+
+    pub pure fn find_from(self, needle Text, start NonNegative) Option[NonNegative] {
+        str_index_of_from(self, needle, start)
+    }
+
+    pub pure fn contains(self, needle Text) Bool {
+        str_contains(self, needle)
+    }
+
+    pub pure fn replace_first(self, target Text, replacement Text) Text {
+        str_replace_first(self, target, replacement)
+    }
+
+    pub pure fn replace_all(self, target Text, replacement Text) Text {
+        str_replace_all(self, target, replacement)
+    }
+
+    pub pure fn slice_range(self, r SliceRange) Text {
+        str_slice_range(self, r)
+    }
+
+    pub pure fn parse_int(self) Result[Int, Text] {
+        text_parse_int(self)
+    }
 }

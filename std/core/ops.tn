@@ -1,0 +1,66 @@
+// Tenon Standard Library — Layer 0: std/core/ops.tn
+// Foundational static & dynamic interfaces (`Display`, `Writer`) and generic `Option`/`Result` helpers.
+
+import "std/core/types.tn"
+
+pub interface Display {
+    pure fn display(self) Text
+}
+
+pub interface Writer {
+    fn write_str(inout self, s Text) Int
+        ensures result >= 0
+    fn write_byte(inout self, b ByteVal) Int
+        ensures result >= 0
+    fn write_line(inout self, s Text) Int {
+        let a = self.write_str(s)
+        let b = self.write_byte(10)
+        a + b
+    }
+}
+
+impl[T] Option[T] {
+    pub pure fn is_some(self) Bool {
+        match self {
+            Some(_) => true
+            None => false
+        }
+    }
+
+    pub pure fn is_none(self) Bool {
+        match self {
+            Some(_) => false
+            None => true
+        }
+    }
+
+    pub pure fn unwrap_or(self, fallback T) T {
+        match self {
+            Some(v) => v
+            None => fallback
+        }
+    }
+}
+
+impl[T, E] Result[T, E] {
+    pub pure fn is_ok(self) Bool {
+        match self {
+            Ok(_) => true
+            Err(_) => false
+        }
+    }
+
+    pub pure fn is_err(self) Bool {
+        match self {
+            Ok(_) => false
+            Err(_) => true
+        }
+    }
+
+    pub pure fn unwrap_or(self, fallback T) T {
+        match self {
+            Ok(v) => v
+            Err(_) => fallback
+        }
+    }
+}

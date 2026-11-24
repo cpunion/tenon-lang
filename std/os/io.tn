@@ -1,0 +1,39 @@
+// Tenon Standard Library — Layer 3: std/os/io.tn
+// Console I/O (`Stdout` implementing `Writer` interface + structured `read_line() Option[Text]`).
+
+import "std/core/types.tn"
+import "std/core/ops.tn"
+
+pub record Stdout {
+    fd Int
+}
+
+pub pure fn stdout_new() Stdout {
+    Stdout { fd = 1 }
+}
+
+impl Writer for Stdout {
+    fn write_str(inout self, s Text) Int {
+        clamp_non_neg(sys_write_stdout(s))
+    }
+
+    fn write_byte(inout self, b ByteVal) Int {
+        clamp_non_neg(sys_write_stdout(byte_to_text(b)))
+    }
+}
+
+pub fn print(s Text) Int {
+    sys_write_stdout(s)
+}
+
+pub fn println(s Text) Int {
+    sys_write_stdout(s ++ "\n")
+}
+
+pub fn read_line() Option[Text] {
+    let line = sys_read_line()
+    if sys_is_eof() {
+        return None
+    }
+    Some(line)
+}

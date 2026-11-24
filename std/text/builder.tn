@@ -1,0 +1,37 @@
+// Tenon Standard Library — Layer 1: std/text/builder.tn
+// O(n) buffered text builder implementing `Writer` interface (supports both static `[W Writer]` & `dyn Writer`).
+
+import "std/core/types.tn"
+import "std/core/ops.tn"
+
+pub record TextBuilder {
+    handle Int
+}
+
+pub pure fn text_builder_new() TextBuilder {
+    TextBuilder { handle = buf_new() }
+}
+
+impl TextBuilder {
+    pub pure fn push_str(self, s Text) NonNegative {
+        clamp_non_neg(buf_push_str(self.handle, s))
+    }
+
+    pub pure fn push_byte(self, b ByteVal) NonNegative {
+        clamp_non_neg(buf_push_byte(self.handle, b))
+    }
+
+    pub pure fn finish(self) Text {
+        buf_finish(self.handle)
+    }
+}
+
+impl Writer for TextBuilder {
+    fn write_str(inout self, s Text) Int {
+        clamp_non_neg(buf_push_str(self.handle, s))
+    }
+
+    fn write_byte(inout self, b ByteVal) Int {
+        clamp_non_neg(buf_push_byte(self.handle, b))
+    }
+}

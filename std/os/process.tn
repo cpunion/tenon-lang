@@ -1,0 +1,16 @@
+// Tenon Standard Library — Layer 3: std/os/process.tn
+// Structured subprocess execution wrapper.
+
+pub record ExecOutput {
+    exit_code Int
+    output    Text
+}
+
+pub fn exec_sh(cmd Text) ExecOutput {
+    let out = sys_exec(cmd)
+    let code = sys_exec_exit_code()
+    ExecOutput {
+        exit_code = code,
+        output = out
+    }
+}

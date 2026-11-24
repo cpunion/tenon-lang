@@ -1,0 +1,91 @@
+// Tenon Standard Library — Layer 0: std/core/types.tn
+// Zero-OS pure refined primitives, range invariants, and `@no_heap_alloc` integer contracts.
+
+pub type NonNegative = Int where self >= 0
+pub type Positive    = Int where self >= 1
+pub type NonZero     = Int where self != 0
+pub type ByteVal     = Int where 0 <= self && self <= 255
+pub type HexNibble   = Int where 0 <= self && self <= 15
+pub type MaxBytes    = Int where self >= 64
+
+pub record SliceRange {
+    start NonNegative
+    end   NonNegative
+    where start <= end
+}
+
+@no_heap_alloc
+pub pure fn is_space_byte(b Int) Bool {
+    b == 32 || b == 9 || b == 10 || b == 13
+}
+
+@no_heap_alloc
+pub pure fn is_digit_byte(b Int) Bool {
+    b >= 48 && b <= 57
+}
+
+@no_heap_alloc
+pub pure fn clamp_non_neg(n Int) NonNegative
+    ensures result >= 0
+{
+    if n < 0 {
+        return 0
+    }
+    n
+}
+
+@no_heap_alloc
+pub pure fn min_int(a Int, b Int) Int
+    ensures result <= a && result <= b
+{
+    if a <= b {
+        return a
+    }
+    b
+}
+
+@no_heap_alloc
+pub pure fn max_int(a Int, b Int) Int
+    ensures result >= a && result >= b
+{
+    if a >= b {
+        return a
+    }
+    b
+}
+
+@no_heap_alloc
+pub pure fn div_exact(a Int, b NonZero) Int {
+    a / b
+}
+
+@no_heap_alloc
+pub pure fn parse_hex_digit_raw(b Int) Int
+    ensures -1 <= result && result <= 15
+{
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 65 && b <= 70 {
+        return 10 + (b - 65)
+    }
+    if b >= 97 && b <= 102 {
+        return 10 + (b - 97)
+    }
+    -1
+}
+
+pub pure fn parse_hex_digit(b Int) Option[HexNibble] {
+    let v = parse_hex_digit_raw(b)
+    if v < 0 {
+        return None
+    }
+    Some(v)
+}
+
+pub pure fn hex_nibble(n HexNibble) Text {
+    if n < 10 {
+        return byte_to_text(48 + n)
+    }
+    byte_to_text(97 + (n - 10))
+}

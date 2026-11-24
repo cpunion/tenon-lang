@@ -1,0 +1,314 @@
+// Application SDK — examples/agent/lib/tools.tn
+// Cleanly decoupled from language `std/`!
+// Demonstrates:
+//   - `interface Tool` + `List[dyn Tool]` extensible plugin registry (ZERO hardcoded if-else dispatch!)
+//   - `@derive(FromJson, JsonSchema)` with `SafeRelPath` refinement:
+//     Single Source of Truth for BOTH OpenAI JSON Schema AND type-safe argument decoding!
+
+import "std/core/types.tn"
+import "std/core/ops.tn"
+import "std/text/text.tn"
+import "std/text/builder.tn"
+import "std/encoding/json.tn"
+import "std/os/io.tn"
+import "std/os/path.tn"
+import "std/os/fs.tn"
+import "std/os/process.tn"
+
+pub interface Tool {
+    pure fn name(self) Text
+    pure fn description(self) Text
+    pure fn params_schema(self) JsonValue
+    fn execute(self, workspace Text, args JsonValue) Result[Text, Text]
+
+    pure fn openai_schema(self) JsonValue {
+        json_obj_new()
+            .set("type", JStr("function"))
+            .set("name", JStr(self.name()))
+            .set("description", JStr(self.description()))
+            .set("strict", JBool(false))
+            .set("parameters", self.params_schema())
+    }
+}
+
+// =========================================================================
+// 1. Strongly-Typed Tool Argument Records (`@derive(FromJson, JsonSchema)`)
+// =========================================================================
+
+@derive(FromJson, JsonSchema)
+pub record ShellArgs {
+    @doc("Shell command to run via /bin/sh -c")
+    command Text
+}
+
+@derive(FromJson, JsonSchema)
+pub record ReadFileArgs {
+    @doc("Relative file path inside workspace")
+    path SafeRelPath
+}
+
+@derive(FromJson, JsonSchema)
+pub record WriteFileArgs {
+    @doc("Relative file path inside workspace")
+    path    SafeRelPath
+    @doc("Full file content")
+    content Text
+}
+
+@derive(FromJson, JsonSchema)
+pub record EditFileArgs {
+    @doc("Relative file path inside workspace")
+    path        SafeRelPath
+    @doc("Exact substring to replace")
+    target      Text
+    @doc("Replacement text")
+    replacement Text
+}
+
+@derive(FromJson, JsonSchema)
+pub record ListDirArgs {
+    @doc("Relative directory path (default '.')")
+    path Option[Text] = None
+}
+
+@derive(FromJson, JsonSchema)
+pub record GrepArgs {
+    @doc("Search text")
+    query Text
+    @doc("Optional relative subdirectory")
+    path  Option[Text] = None
+}
+
+// =========================================================================
+// 2. Concrete Tool Implementations (`impl Tool for ...`)
+// =========================================================================
+
+pub record ShellTool { max_bytes MaxBytes }
+
+impl Tool for ShellTool {
+    pub pure fn name(self) Text { "shell" }
+    pub pure fn description(self) Text {
+        "Execute a shell command in the workspace and return exit_code plus combined stdout/stderr."
+    }
+    pub pure fn params_schema(self) JsonValue { ShellArgs.json_schema() }
+
+    pub fn execute(self, workspace Text, args JsonValue) Result[Text, Text] {
+        let parsed = match ShellArgs.from_json(args) {
+            Ok(a) => a
+            Err(e) => { return Err(e.message) }
+        }
+        if parsed.command.trim().is_empty() {
+            return Err("empty command")
+        }
+        let _ = println("  [tool:shell] $ " ++ parsed.command)
+        let res = exec_sh("cd " ++ shell_quote(workspace) ++ " && " ++ parsed.command)
+        Ok("exit_code=" ++ int_to_text(res.exit_code) ++ "\n" ++ truncate_output(res.output, self.max_bytes))
+    }
+}
+
+pub record ReadFileTool { max_bytes MaxBytes }
+
+impl Tool for ReadFileTool {
+    pub pure fn name(self) Text { "read_file" }
+    pub pure fn description(self) Text {
+        "Read a file relative to the workspace with line numbers."
+    }
+    pub pure fn params_schema(self) JsonValue { ReadFileArgs.json_schema() }
+
+    pub fn execute(self, workspace Text, args JsonValue) Result[Text, Text] {
+        let parsed = match ReadFileArgs.from_json(args) {
+            Ok(a) => a
+            Err(e) => { return Err(e.message) }
+        }
+        let _ = println("  [tool:read_file] " ++ parsed.path)
+        let full = path_join(workspace, parsed.path)
+        match fs_read(full) {
+            Err(err) => Err("cannot read `" ++ parsed.path ++ "`: " ++ err.message())
+            Ok(raw) => {
+                let n = len(raw)
+                if n == 0 {
+                    return Ok("(empty file)")
+                }
+                let b = text_builder_new()
+                var pos = 0
+                var line_no = 1
+                var written = 0
+                while pos < n {
+                    let p_ok = clamp_non_neg(pos)
+                    let nl = raw.find_from("\n", p_ok).unwrap_or(n)
+                    let line = str_slice(raw, p_ok, nl)
+                    written = b.push_str(int_to_text(line_no) ++ ": " ++ line ++ "\n")
+                    pos = nl + 1
+                    line_no += 1
+                    if written > self.max_bytes {
+                        let _ = b.push_str("... (truncated at line " ++ int_to_text(line_no) ++ ")\n")
+                        break
+                    }
+                }
+                Ok(b.finish())
+            }
+        }
+    }
+}
+
+pub record WriteFileTool { tag Int }
+
+impl Tool for WriteFileTool {
+    pub pure fn name(self) Text { "write_file" }
+    pub pure fn description(self) Text {
+        "Create or overwrite a file relative to the workspace."
+    }
+    pub pure fn params_schema(self) JsonValue { WriteFileArgs.json_schema() }
+
+    pub fn execute(self, workspace Text, args JsonValue) Result[Text, Text] {
+        let parsed = match WriteFileArgs.from_json(args) {
+            Ok(a) => a
+            Err(e) => { return Err(e.message) }
+        }
+        let _ = println("  [tool:write_file] " ++ parsed.path ++ " (" ++ int_to_text(len(parsed.content)) ++ " bytes)")
+        let full = path_join(workspace, parsed.path)
+        match fs_write(full, parsed.content) {
+            Ok(bytes) => Ok("wrote " ++ int_to_text(bytes) ++ " bytes to " ++ parsed.path)
+            Err(err) => Err(err.message())
+        }
+    }
+}
+
+pub record EditFileTool { tag Int }
+
+impl Tool for EditFileTool {
+    pub pure fn name(self) Text { "edit_file" }
+    pub pure fn description(self) Text {
+        "Replace the first exact occurrence of target text with replacement in a workspace file."
+    }
+    pub pure fn params_schema(self) JsonValue { EditFileArgs.json_schema() }
+
+    pub fn execute(self, workspace Text, args JsonValue) Result[Text, Text] {
+        let parsed = match EditFileArgs.from_json(args) {
+            Ok(a) => a
+            Err(e) => { return Err(e.message) }
+        }
+        if parsed.target.is_empty() {
+            return Err("target must be non-empty")
+        }
+        let _ = println("  [tool:edit_file] " ++ parsed.path)
+        let full = path_join(workspace, parsed.path)
+        match fs_read(full) {
+            Err(err) => Err("cannot read `" ++ parsed.path ++ "`: " ++ err.message())
+            Ok(raw) => {
+                if !raw.contains(parsed.target) {
+                    return Err("target snippet not found in " ++ parsed.path)
+                }
+                let updated = raw.replace_first(parsed.target, parsed.replacement)
+                match fs_write(full, updated) {
+                    Ok(bytes) => Ok("edited " ++ parsed.path ++ " (" ++ int_to_text(bytes) ++ " bytes)")
+                    Err(err) => Err(err.message())
+                }
+            }
+        }
+    }
+}
+
+pub record ListDirTool { max_bytes MaxBytes }
+
+impl Tool for ListDirTool {
+    pub pure fn name(self) Text { "list_dir" }
+    pub pure fn description(self) Text {
+        "List files and subdirectories in the workspace."
+    }
+    pub pure fn params_schema(self) JsonValue { ListDirArgs.json_schema() }
+
+    pub fn execute(self, workspace Text, args JsonValue) Result[Text, Text] {
+        let parsed = match ListDirArgs.from_json(args) {
+            Ok(a) => a
+            Err(e) => { return Err(e.message) }
+        }
+        let rel = parsed.path.unwrap_or(".")
+        if !rel.is_empty() && rel != "." && !is_safe_rel_path(rel) {
+            return Err("path `" ++ rel ++ "` escapes workspace")
+        }
+        let _ = println("  [tool:list_dir] " ++ rel)
+        let full = path_join(workspace, rel)
+        let cmd = "cd " ++ shell_quote(full) ++ " && find . -maxdepth 3 -not -path '*/.git*' -not -path '*/target*' -not -path '*/node_modules*' | sort | head -n 200"
+        let res = exec_sh(cmd)
+        if res.exit_code != 0 {
+            return Err("exit " ++ int_to_text(res.exit_code) ++ ": " ++ res.output)
+        }
+        if res.output.trim().is_empty() {
+            return Ok("(empty directory)")
+        }
+        Ok(truncate_output(res.output, self.max_bytes))
+    }
+}
+
+pub record GrepTool { max_bytes MaxBytes }
+
+impl Tool for GrepTool {
+    pub pure fn name(self) Text { "grep_search" }
+    pub pure fn description(self) Text {
+        "Recursively search for text in workspace files."
+    }
+    pub pure fn params_schema(self) JsonValue { GrepArgs.json_schema() }
+
+    pub fn execute(self, workspace Text, args JsonValue) Result[Text, Text] {
+        let parsed = match GrepArgs.from_json(args) {
+            Ok(a) => a
+            Err(e) => { return Err(e.message) }
+        }
+        if parsed.query.is_empty() {
+            return Err("empty grep query")
+        }
+        let rel = parsed.path.unwrap_or(".")
+        if !rel.is_empty() && rel != "." && !is_safe_rel_path(rel) {
+            return Err("path `" ++ rel ++ "` escapes workspace")
+        }
+        let _ = println("  [tool:grep_search] " ++ parsed.query)
+        let full = path_join(workspace, rel)
+        let cmd = "cd " ++ shell_quote(full) ++ " && grep -rn --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules -- " ++ shell_quote(parsed.query) ++ " . | head -n 80"
+        let res = exec_sh(cmd)
+        if res.output.trim().is_empty() {
+            return Ok("(no matches)")
+        }
+        Ok(truncate_output(res.output, self.max_bytes))
+    }
+}
+
+// =========================================================================
+// 3. Extensible `List[dyn Tool]` Registry & Dynamic Dispatch!
+// =========================================================================
+
+pub pure fn default_agent_tools() List[dyn Tool] {
+    var tools List[dyn Tool] = []
+    tools = push(tools, ShellTool { max_bytes = 14000 })
+    tools = push(tools, ReadFileTool { max_bytes = 16000 })
+    tools = push(tools, WriteFileTool { tag = 0 })
+    tools = push(tools, EditFileTool { tag = 0 })
+    tools = push(tools, ListDirTool { max_bytes = 12000 })
+    tools = push(tools, GrepTool { max_bytes = 12000 })
+    tools
+}
+
+pub pure fn build_tools_schema(tools List[dyn Tool]) JsonValue {
+    var arr = json_arr_new()
+    var i = 0
+    while i < len(tools) {
+        arr = arr.push_val(tools[i].openai_schema())
+        i += 1
+    }
+    arr
+}
+
+pub fn dispatch_dyn_tool(tools List[dyn Tool], workspace Text, name Text, args JsonValue) Text {
+    var i = 0
+    while i < len(tools) {
+        let t dyn Tool = tools[i]
+        if t.name() == name {
+            return match t.execute(workspace, args) {
+                Ok(out) => out
+                Err(msg) => "error: " ++ msg
+            }
+        }
+        i += 1
+    }
+    "error: unknown tool `" ++ name ++ "`"
+}

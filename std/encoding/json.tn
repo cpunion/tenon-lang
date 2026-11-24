@@ -1,9 +1,12 @@
-// Tenon Standard Library: std/json.tn
-// First-class algebraic `JsonValue` ADT, recursive-descent parser returning
-// `Result[JsonValue, JsonError]`, exhaustive serializer `json_stringify`,
-// immutable builders, and typed `Option[T]` accessors — 100% pure Tenon!
+// Tenon Standard Library — Layer 2: std/encoding/json.tn
+// First-class `JsonValue` ADT, fluent `impl JsonValue` methods, O(n) `TextBuilder` serializer,
+// `ToJson` / `FromJson` / `JsonSchema` interfaces (powering `@derive(...)`),
+// and static generic `json_encode[T ToJson]` & `json_decode[T FromJson]`!
 
-import "std/text.tn"
+import "std/core/types.tn"
+import "std/core/ops.tn"
+import "std/text/text.tn"
+import "std/text/builder.tn"
 
 pub record JsonEntry {
     key Text
@@ -30,24 +33,40 @@ pub record JsonParsed {
 }
 
 // =========================================================================
-// 1. Constructors & Immutable MVS Builders
+// 1. Serialization / Deserialization / Schema Interfaces (for `@derive`)
 // =========================================================================
 
-pub pure fn json_null() JsonValue {
-    JNull
+pub interface ToJson {
+    pure fn to_json(self) JsonValue
 }
 
-pub pure fn json_bool(b Bool) JsonValue {
-    JBool(b)
+pub interface FromJson {
+    pure fn from_json(v JsonValue) Result[Self, JsonError]
 }
 
-pub pure fn json_int(n Int) JsonValue {
-    JInt(n)
+pub interface JsonSchema {
+    pure fn json_schema() JsonValue
 }
 
-pub pure fn json_str(s Text) JsonValue {
-    JStr(s)
+pub pure fn json_encode[T ToJson](val T) Text {
+    json_stringify(val.to_json())
 }
+
+pub pure fn json_decode[T FromJson](src Text) Result[T, JsonError] {
+    match json_parse(src) {
+        Err(e) => Err(e)
+        Ok(v) => T.from_json(v)
+    }
+}
+
+// =========================================================================
+// 2. Constructors & Immutable MVS Builders
+// =========================================================================
+
+pub pure fn json_null() JsonValue { JNull }
+pub pure fn json_bool(b Bool) JsonValue { JBool(b) }
+pub pure fn json_int(n Int) JsonValue { JInt(n) }
+pub pure fn json_str(s Text) JsonValue { JStr(s) }
 
 pub pure fn json_arr_new() JsonValue {
     let empty List[JsonValue] = []
@@ -112,7 +131,7 @@ pub pure fn json_obj_set(obj JsonValue, key Text, val JsonValue) JsonValue {
 }
 
 // =========================================================================
-// 2. Typed Accessors (`Option[T]` with Exhaustive Match)
+// 3. Typed Accessors (`Option[T]` with Exhaustive Match) & `impl JsonValue`
 // =========================================================================
 
 pub pure fn json_get(v JsonValue, key Text) Option[JsonValue] {
@@ -217,91 +236,135 @@ pub pure fn json_get_bool(v JsonValue, key Text) Option[Bool] {
     }
 }
 
+impl JsonValue {
+    pub pure fn get(self, key Text) Option[JsonValue] { json_get(self, key) }
+    pub pure fn at(self, idx NonNegative) Option[JsonValue] { json_at(self, idx) }
+    pub pure fn size(self) NonNegative { json_len(self) }
+    pub pure fn as_str(self) Option[Text] { json_as_str(self) }
+    pub pure fn as_int(self) Option[Int] { json_as_int(self) }
+    pub pure fn as_bool(self) Option[Bool] { json_as_bool(self) }
+    pub pure fn get_str(self, key Text) Option[Text] { json_get_str(self, key) }
+    pub pure fn get_int(self, key Text) Option[Int] { json_get_int(self, key) }
+    pub pure fn get_bool(self, key Text) Option[Bool] { json_get_bool(self, key) }
+    pub pure fn set(self, key Text, val JsonValue) JsonValue { json_obj_set(self, key, val) }
+    pub pure fn push_val(self, item JsonValue) JsonValue { json_arr_push(self, item) }
+    pub pure fn stringify(self) Text { json_stringify(self) }
+}
+
+impl ToJson for JsonValue {
+    pub pure fn to_json(self) JsonValue { self }
+}
+
+impl Display for JsonValue {
+    pub pure fn display(self) Text { json_stringify(self) }
+}
+
 // =========================================================================
-// 3. String Escaping & Exhaustive `json_stringify(v JsonValue) Text`
+// 4. O(n) Buffered JSON Serializer (`TextBuilder` — Zero Quadratic Copying!)
 // =========================================================================
 
-pub pure fn json_escape(s Text) Text {
+pub pure fn json_write_escaped(b TextBuilder, s Text) Int {
     let n = len(s)
-    var out = ""
     var run_start = 0
     var i = 0
     while i < n {
-        let b = byte_at(s, i)
-        if b == 34 || b == 92 || b == 10 || b == 13 || b == 9 || (b >= 0 && b < 32) {
+        let ch = byte_at(s, i)
+        if ch == 34 || ch == 92 || ch == 10 || ch == 13 || ch == 9 || (ch >= 0 && ch < 32) {
             if i > run_start {
-                out = out ++ str_slice(s, run_start, i)
+                let _ = b.push_str(str_slice(s, run_start, i))
             }
-            if b == 34 {
-                out = out ++ "\\\""
-            } else if b == 92 {
-                out = out ++ "\\\\"
-            } else if b == 10 {
-                out = out ++ "\\n"
-            } else if b == 13 {
-                out = out ++ "\\r"
-            } else if b == 9 {
-                out = out ++ "\\t"
+            if ch == 34 {
+                let _ = b.push_str("\\\"")
+            } else if ch == 92 {
+                let _ = b.push_str("\\\\")
+            } else if ch == 10 {
+                let _ = b.push_str("\\n")
+            } else if ch == 13 {
+                let _ = b.push_str("\\r")
+            } else if ch == 9 {
+                let _ = b.push_str("\\t")
             } else {
-                let hi = (b / 16) % 16
-                let lo = b % 16
+                let hi = (ch / 16) % 16
+                let lo = ch % 16
                 if hi >= 0 && hi <= 15 && lo >= 0 && lo <= 15 {
-                    out = out ++ "\\u00" ++ hex_nibble(hi) ++ hex_nibble(lo)
+                    let _ = b.push_str("\\u00" ++ hex_nibble(hi) ++ hex_nibble(lo))
                 }
             }
             run_start = i + 1
         }
         i += 1
     }
-    if run_start == 0 {
-        return s
-    }
     if n > run_start {
-        out = out ++ str_slice(s, run_start, n)
+        let _ = b.push_str(str_slice(s, run_start, n))
     }
-    out
+    0
 }
 
-pub pure fn json_quote(s Text) Text {
-    "\"" ++ json_escape(s) ++ "\""
-}
-
-pub pure fn json_stringify(v JsonValue) Text {
+pub pure fn json_write_value(b TextBuilder, v JsonValue) Int {
     match v {
-        JNull => "null"
-        JBool(b) => if b { "true" } else { "false" }
-        JInt(n) => int_to_text(n)
-        JStr(s) => json_quote(s)
+        JNull => {
+            let _ = b.push_str("null")
+            0
+        }
+        JBool(flag) => {
+            if flag {
+                let _ = b.push_str("true")
+            } else {
+                let _ = b.push_str("false")
+            }
+            0
+        }
+        JInt(n) => {
+            let _ = b.push_str(int_to_text(n))
+            0
+        }
+        JStr(s) => {
+            let _ = b.push_byte(34)
+            let _ = json_write_escaped(b, s)
+            let _ = b.push_byte(34)
+            0
+        }
         JArr(items) => {
-            var out = "["
+            let _ = b.push_byte(91)
             var i = 0
             while i < len(items) {
                 if i > 0 {
-                    out = out ++ ","
+                    let _ = b.push_byte(44)
                 }
-                out = out ++ json_stringify(items[i])
+                let _ = json_write_value(b, items[i])
                 i += 1
             }
-            out ++ "]"
+            let _ = b.push_byte(93)
+            0
         }
         JObj(entries) => {
-            var out = "{"
+            let _ = b.push_byte(123)
             var i = 0
             while i < len(entries) {
                 if i > 0 {
-                    out = out ++ ","
+                    let _ = b.push_byte(44)
                 }
                 let e = entries[i]
-                out = out ++ json_quote(e.key) ++ ":" ++ json_stringify(e.val)
+                let _ = b.push_byte(34)
+                let _ = json_write_escaped(b, e.key)
+                let _ = b.push_str("\":")
+                let _ = json_write_value(b, e.val)
                 i += 1
             }
-            out ++ "}"
+            let _ = b.push_byte(125)
+            0
         }
     }
 }
 
+pub pure fn json_stringify(v JsonValue) Text {
+    let b = text_builder_new()
+    let _ = json_write_value(b, v)
+    b.finish()
+}
+
 // =========================================================================
-// 4. Full Recursive-Descent Parser (`json_parse -> Result[JsonValue, JsonError]`)
+// 5. Full Recursive-Descent Parser (`json_parse -> Result[JsonValue, JsonError]`)
 // =========================================================================
 
 pub pure fn codepoint_to_utf8(cp NonNegative) Text {
@@ -321,38 +384,50 @@ pub pure fn codepoint_to_utf8(cp NonNegative) Text {
 
 pub pure fn json_unescape(raw Text) Text {
     let n = len(raw)
-    var out = ""
+    var has_esc = false
+    var k = 0
+    while k < n {
+        if byte_at(raw, k) == 92 {
+            has_esc = true
+            break
+        }
+        k += 1
+    }
+    if !has_esc {
+        return raw
+    }
+    let b = text_builder_new()
     var run_start = 0
     var i = 0
     while i < n {
         if byte_at(raw, i) == 92 && i + 1 < n {
             if i > run_start {
-                out = out ++ str_slice(raw, run_start, i)
+                let _ = b.push_str(str_slice(raw, run_start, i))
             }
             let esc = byte_at(raw, i + 1)
             if esc == 110 {
-                out = out ++ "\n"
+                let _ = b.push_byte(10)
                 i += 2
             } else if esc == 114 {
-                out = out ++ "\r"
+                let _ = b.push_byte(13)
                 i += 2
             } else if esc == 116 {
-                out = out ++ "\t"
+                let _ = b.push_byte(9)
                 i += 2
             } else if esc == 34 {
-                out = out ++ "\""
+                let _ = b.push_byte(34)
                 i += 2
             } else if esc == 92 {
-                out = out ++ "\\"
+                let _ = b.push_byte(92)
                 i += 2
             } else if esc == 47 {
-                out = out ++ "/"
+                let _ = b.push_byte(47)
                 i += 2
             } else if esc == 98 {
-                out = out ++ byte_to_text(8)
+                let _ = b.push_byte(8)
                 i += 2
             } else if esc == 102 {
-                out = out ++ byte_to_text(12)
+                let _ = b.push_byte(12)
                 i += 2
             } else if esc == 117 && i + 5 < n {
                 let h0 = parse_hex_digit_raw(byte_at(raw, i + 2))
@@ -361,14 +436,14 @@ pub pure fn json_unescape(raw Text) Text {
                 let h3 = parse_hex_digit_raw(byte_at(raw, i + 5))
                 if h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0 {
                     let cp = clamp_non_neg(h0 * 4096 + h1 * 256 + h2 * 16 + h3)
-                    out = out ++ codepoint_to_utf8(cp)
+                    let _ = b.push_str(codepoint_to_utf8(cp))
                     i += 6
                 } else {
-                    out = out ++ byte_to_text(esc)
+                    let _ = b.push_str(byte_to_text(esc))
                     i += 2
                 }
             } else {
-                out = out ++ byte_to_text(esc)
+                let _ = b.push_str(byte_to_text(esc))
                 i += 2
             }
             run_start = i
@@ -376,13 +451,10 @@ pub pure fn json_unescape(raw Text) Text {
             i += 1
         }
     }
-    if run_start == 0 {
-        return raw
-    }
     if n > run_start {
-        out = out ++ str_slice(raw, run_start, n)
+        let _ = b.push_str(str_slice(raw, run_start, n))
     }
-    out
+    b.finish()
 }
 
 pub pure fn json_skip_ws(src Text, pos NonNegative) NonNegative {
@@ -438,7 +510,6 @@ pub pure fn json_parse_number_at(src Text, start NonNegative) Result[JsonParsed,
         acc = acc * 10 + (byte_at(src, i) - 48)
         i += 1
     }
-    // Consume optional fractional / exponent parts (e.g. `1.0`, `1e-5`) cleanly
     if i < n && byte_at(src, i) == 46 {
         i += 1
         while i < n && is_digit_byte(byte_at(src, i)) {

@@ -1,100 +1,121 @@
-// Pure-Tenon Standard Library Self-Test
-// Verifies first-class `JsonValue` ADT, `Option[T]`, `Result[T, E]`, refined types,
-// `@no_heap_alloc`, `requires`/`ensures`, exhaustive `match`, and Perceus zero-leak RC
-// in BOTH Cranelift JIT and LLVM 22 `-O3` AOT!
+// Tenon Standard Library Self-Test (4-Layer Architecture + Interfaces + @derive JSON/Schema)
+// Verifies:
+//   - Layer 0 (`std/core/types`, `std/core/ops`): refined primitives, `Option`/`Result` methods, `Display`/`Writer`
+//   - Layer 1 (`std/text/text`, `std/text/builder`, `std/collections/map`): `impl Text` methods, O(n) `TextBuilder`, `TextMap`
+//   - Layer 2 (`std/encoding/json`, `std/encoding/dotenv`): `JsonValue` fluent methods, `import ... as json`,
+//     `@derive(ToJson, FromJson, JsonSchema)` with refined `SliceRange` & `SafeRelPath` boundary proofs!
+//   - Layer 3 (`std/os/io`, `std/os/path`, `std/os/fs`, `std/os/env`, `std/os/process`):
+//     `SafeRelPath`, `FsError`, `dyn FileSystem` (`MemFs` + `OsFs`), `dyn Writer` + static `[W Writer]`!
 
-import "std/io.tn"
-import "std/text.tn"
-import "std/fs.tn"
-import "std/json.tn"
-import "std/env.tn"
-import "std/tools.tn"
-import "std/openai.tn"
+import "std/core/types.tn"
+import "std/core/ops.tn"
+import "std/text/text.tn"
+import "std/text/builder.tn"
+import "std/collections/map.tn"
+import "std/encoding/json.tn" as json
+import "std/encoding/dotenv.tn" as dotenv
+import "std/os/io.tn"
+import "std/os/path.tn"
+import "std/os/fs.tn" as fs
+import "std/os/process.tn"
+
+@derive(ToJson, FromJson, JsonSchema)
+pub record FilePatchReq {
+    @doc("Workspace-relative path")
+    path        SafeRelPath
+    @doc("Line number (1-based)")
+    line_no     Positive
+    @rename("new_text")
+    @doc("Replacement content")
+    replacement Text
+    @skip_if_none
+    note        Option[Text] = None
+}
+
+@derive(ToJson, FromJson)
+@tag("type")
+pub enum AgentEvent {
+    Ping
+    Message(Text)
+}
+
+pub fn write_labeled[W Writer](inout w W, label Text, body Text) Int {
+    let a = w.write_str(label)
+    let b = w.write_byte(58)
+    let c = w.write_str(body)
+    a + b + c
+}
+
+pub fn write_dyn(inout w dyn Writer, text Text) Int {
+    w.write_line(text)
+}
+
+pub fn roundtrip_fs(inout storage dyn FileSystem, path Text, content Text) Result[Text, FsError] {
+    match storage.write_text(path, content) {
+        Err(e) => { return Err(e) }
+        Ok(_) => {}
+    }
+    storage.read_text(path)
+}
 
 pub fn main() Int {
-    // 1. std/text — refined types, SliceRange invariant, Option, Result
+    // 1. Layer 0 + Layer 1: Refined types, `impl Text`, `impl Option`/`Result`, `TextMap`, `TextBuilder`
     let r = SliceRange { start = 0, end = 5 }
-    assert str_slice_range("tenon-lang", r) == "tenon"
-    assert str_starts_with("data: {\"a\":1}", "data:")
-    assert str_ends_with("hello.tn", ".tn")
-    assert str_trim("  \t hello world \r\n ") == "hello world"
-    let stripped = match str_strip_prefix("data: hello", "data: ") {
-        Some(v) => v
-        None => ""
-    }
-    assert stripped == "hello"
-    let found_pos = match str_index_of("abcdef", "cd") {
-        Some(idx) => idx
-        None => -1
-    }
-    assert found_pos == 2
-    let not_found = match str_index_of("abcdef", "zz") {
-        Some(_) => false
-        None => true
-    }
-    assert not_found
-    assert str_contains("tenon-lang", "lang")
-    assert str_replace_first("a b a", "a", "X") == "X b a"
-    assert str_replace_all("a'b'c", "'", "'\\''") == "a'\\''b'\\''c"
+    assert "tenon-lang".slice_range(r) == "tenon"
+    assert "data: {\"a\":1}".starts_with("data:")
+    assert "hello.tn".ends_with(".tn")
+    assert "  \t hello world \r\n ".trim() == "hello world"
+    assert "data: hello".strip_prefix("data: ").unwrap_or("") == "hello"
+    assert "abcdef".find("cd").unwrap_or(999) == 2
+    assert "abcdef".find("zz").is_none()
+    assert "tenon-lang".contains("lang")
+    assert "a b a".replace_first("a", "X") == "X b a"
+    assert "a'b'c".replace_all("'", "'\\''") == "a'\\''b'\\''c"
     assert int_to_text(-42) == "-42"
+    assert "  -12345 ".parse_int().unwrap_or(0) == -12345
+    assert "12x".parse_int().is_err()
+    assert div_exact(21, 3) == 7
 
-    let parsed_ok = match text_parse_int("  -12345 ") {
-        Ok(n) => n
-        Err(_) => 0
-    }
-    assert parsed_ok == -12345
-    let parsed_bad = match text_parse_int("12x") {
-        Ok(_) => false
-        Err(_) => true
-    }
-    assert parsed_bad
+    var m = text_map_new()
+    m = m.set("lang", "tenon").set("ver", "3")
+    assert m.size() == 2
+    assert m.has("lang")
+    assert m.get("ver").unwrap_or("") == "3"
 
-    // 2. std/json — REAL JsonValue ADT parsing, traversal, error reporting & serialization!
-    let sample = "{\"type\":\"response.output_item.done\",\"ok\":true,\"empty\":null,\"nums\":[10,20,30],\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_99\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"demo.txt\\\",\\\"content\\\":\\\"line1\\\\nline2 \\\\u4f60\\\\u597d\\\"}\"},\"usage\":{\"input_tokens\":120,\"output_tokens\":35}}"
-    let ev = match json_parse(sample) {
+    // Static `[W Writer]` + Dynamic `dyn Writer` (with default method `write_line`!)
+    var tb = text_builder_new()
+    let _ = write_labeled(tb, "tenon", "ok")
+    assert tb.finish() == "tenon:ok"
+
+    let tb2 = text_builder_new()
+    var dw dyn Writer = tb2
+    let _ = write_dyn(dw, "line1")
+    assert tb2.finish() == "line1\n"
+
+    // 2. Layer 2: Aliased `json.*` + fluent `JsonValue` methods + O(n) `TextBuilder` serializer!
+    let sample = "{\"type\":\"response.output_item.done\",\"ok\":true,\"empty\":null,\"nums\":[10,20,30],\"item\":{\"arguments\":\"{\\\"path\\\":\\\"demo.txt\\\",\\\"content\\\":\\\"line1\\\\nline2 \\\\u4f60\\\\u597d\\\"}\"}}"
+    let ev = match json.parse(sample) {
         Ok(v) => v
         Err(err) => {
-            let _ = println("json parse error at " ++ int_to_text(err.pos) ++ ": " ++ err.message)
+            let _ = println("json parse error: " ++ err.message)
             return 1
         }
     }
-    let ev_type = match json_get_str(ev, "type") {
-        Some(s) => s
-        None => ""
-    }
-    assert ev_type == "response.output_item.done"
-    let ok_flag = match json_get_bool(ev, "ok") {
-        Some(b) => b
-        None => false
-    }
-    assert ok_flag
-    let is_null = match json_get(ev, "empty") {
-        Some(v) => match v {
-            JNull => true
-            _ => false
-        }
-        None => false
-    }
-    assert is_null
-    let num1 = match json_get(ev, "nums") {
-        Some(arr) => match json_at(arr, 1) {
-            Some(v) => match json_as_int(v) {
-                Some(n) => n
-                None => -1
-            }
+    assert ev.get_str("type").unwrap_or("") == "response.output_item.done"
+    assert ev.get_bool("ok").unwrap_or(false)
+    let num1 = match ev.get("nums") {
+        Some(arr) => match arr.at(1) {
+            Some(v) => v.as_int().unwrap_or(-1)
             None => -1
         }
         None => -1
     }
     assert num1 == 20
 
-    let parsed_content = match json_get(ev, "item") {
-        Some(item) => match json_get_str(item, "arguments") {
-            Some(raw_args) => match json_parse(raw_args) {
-                Ok(aobj) => match json_get_str(aobj, "content") {
-                    Some(c) => c
-                    None => ""
-                }
+    let parsed_content = match ev.get("item") {
+        Some(item) => match item.get_str("arguments") {
+            Some(raw_args) => match json.parse(raw_args) {
+                Ok(aobj) => aobj.get_str("content").unwrap_or("")
                 Err(_) => ""
             }
             None => ""
@@ -103,85 +124,88 @@ pub fn main() Int {
     }
     assert parsed_content == "line1\nline2 你好"
 
-    // Malformed JSON MUST return structured Err(JsonError { pos, message })!
-    let bad_json_err_pos = match json_parse("{\"a\": [1, 2, }") {
+    // Malformed JSON -> structured Err(JsonError)
+    let bad_pos = match json.parse("{\"a\": [1, 2, }") {
         Ok(_) => -1
         Err(e) => e.pos
     }
-    assert bad_json_err_pos > 0
+    assert bad_pos > 0
 
-    // Roundtrip structured JsonValue builder -> json_stringify -> json_parse!
-    var built = json_obj_new()
-    built = json_obj_set(built, "lang", JStr("tenon"))
-    built = json_obj_set(built, "ver", JInt(2))
-    built = json_obj_set(built, "verified", JBool(true))
-    var tags = json_arr_new()
-    tags = json_arr_push(tags, JStr("z3"))
-    tags = json_arr_push(tags, JStr("perceus"))
-    built = json_obj_set(built, "tags", tags)
-    let serialized = json_stringify(built)
-    assert serialized == "{\"lang\":\"tenon\",\"ver\":2,\"verified\":true,\"tags\":[\"z3\",\"perceus\"]}"
-    let rt_ok = match json_parse(serialized) {
-        Ok(rt) => match json_get_int(rt, "ver") {
-            Some(v) => v == 2
-            None => false
+    // 3. `@derive(ToJson, FromJson, JsonSchema)` + Generic `json.encode` / `json.decode[T]`!
+    let p_ok = match safe_rel_path_parse("src/main.tn") {
+        Ok(p) => p
+        Err(_) => { return 2 }
+    }
+    let req = FilePatchReq {
+        path = p_ok,
+        line_no = 12,
+        replacement = "hello tenon",
+        note = Some("verified")
+    }
+    let encoded = json.encode(req)
+    assert encoded == "{\"path\":\"src/main.tn\",\"line_no\":12,\"new_text\":\"hello tenon\",\"note\":\"verified\"}"
+
+    let decoded = match json.decode[FilePatchReq](encoded) {
+        Ok(d) => d
+        Err(e) => {
+            let _ = println("decode error: " ++ e.message)
+            return 3
         }
-        Err(_) => false
     }
-    assert rt_ok
+    assert decoded.path == "src/main.tn"
+    assert decoded.line_no == 12
+    assert decoded.replacement == "hello tenon"
+    assert decoded.note.unwrap_or("") == "verified"
 
-    // 3. std/env — Option[Text] lookup
-    let dotenv_src = "# comment\nDAST_AUTH_EMAIL_FROM=DastAI <login@auth.dast.ai>\nexport FOO = \"bar_baz\"\n"
-    let foo_val = match dotenv_lookup(dotenv_src, "FOO") {
-        Some(v) => v
-        None => ""
-    }
-    assert foo_val == "bar_baz"
-    let missing_env = match dotenv_lookup(dotenv_src, "NO_SUCH_KEY") {
-        Some(_) => false
-        None => true
-    }
-    assert missing_env
+    // Refinement boundary enforcement in derived `FromJson`:
+    // (a) path traversal `../etc/passwd` MUST be rejected!
+    assert json.decode[FilePatchReq]("{\"path\":\"../etc/passwd\",\"line_no\":1,\"new_text\":\"x\"}").is_err()
+    // (b) non-positive `line_no: 0` MUST be rejected!
+    assert json.decode[FilePatchReq]("{\"path\":\"ok.tn\",\"line_no\":0,\"new_text\":\"x\"}").is_err()
 
-    // 4. std/tools — Result[Text, Text] + workspace path guard
-    assert is_safe_rel_path("sub/demo.txt")
-    assert !is_safe_rel_path("../etc/passwd")
-    assert !is_safe_rel_path("/etc/passwd")
+    // Derived `JsonSchema` includes description + minimum: 1 from `Positive`!
+    let sch = FilePatchReq.json_schema()
+    assert sch.get_str("type").unwrap_or("") == "object"
+    let sch_text = sch.stringify()
+    assert sch_text.contains("\"minimum\":1")
+    assert sch_text.contains("\"new_text\"")
 
-    let ws = "/tmp/tenon_stdlib_v2_test_ws"
-    let wr_ok = match tool_write_file(ws, "hello.txt", "alpha\nbeta\n") {
-        Ok(_) => true
-        Err(_) => false
+    // Derived Tagged Union Enum `AgentEvent` (`@tag("type")`) roundtrip!
+    let ev_msg = Message("hello")
+    let ev_json = json.encode(ev_msg)
+    assert ev_json == "{\"type\":\"Message\",\"value\":\"hello\"}"
+    let ev_rt = match json.decode[AgentEvent](ev_json) {
+        Ok(e) => match e {
+            Message(s) => s
+            Ping => ""
+        }
+        Err(_) => ""
     }
-    assert wr_ok
-    let ed_ok = match tool_edit_file(ws, "hello.txt", "beta", "tenon_std_v2") {
-        Ok(_) => true
-        Err(_) => false
+    assert ev_rt == "hello"
+
+    // 4. Layer 2: Aliased `dotenv.parse` returning `TextMap`
+    let env_map = dotenv.parse("# c\nexport FOO = \"bar_baz\"\nA=1\n")
+    assert env_map.get("FOO").unwrap_or("") == "bar_baz"
+    assert env_map.get("MISSING").is_none()
+
+    // 5. Layer 3: `dyn FileSystem` with BOTH pure in-memory `MemFs` AND real `OsFs`!
+    var mem dyn FileSystem = mem_fs_new()
+    let mem_res = match roundtrip_fs(mem, "virtual/hello.txt", "sandboxed") {
+        Ok(txt) => txt
+        Err(e) => e.message()
     }
-    assert ed_ok
-    let rd_ok = match tool_read_file(ws, "hello.txt") {
-        Ok(txt) => str_contains(txt, "2: tenon_std_v2")
-        Err(_) => false
+    assert mem_res == "sandboxed"
+
+    let ws = "/tmp/tenon_stdlib_v3_test_ws"
+    let _ = exec_sh("mkdir -p " ++ shell_quote(ws))
+    var real_fs dyn FileSystem = os_fs_new()
+    let os_res = match roundtrip_fs(real_fs, path_join(ws, "real.txt"), "from os_fs") {
+        Ok(txt) => txt
+        Err(e) => e.message()
     }
-    assert rd_ok
-    let bad_path_rejected = match tool_read_file(ws, "../etc/passwd") {
-        Ok(_) => false
-        Err(_) => true
-    }
-    assert bad_path_rejected
+    assert os_res == "from os_fs"
     let _ = exec_sh("rm -rf " ++ shell_quote(ws))
 
-    // 5. std/openai structured JsonValue request builder!
-    let uitem = openai_user_item("hello")
-    var conv List[JsonValue] = []
-    conv = push(conv, uitem)
-    let req = openai_build_request("gpt-6-luna", "low", "s1", "be concise", conv, json_arr_new())
-    let req_model = match json_get_str(req, "model") {
-        Some(m) => m
-        None => ""
-    }
-    assert req_model == "gpt-6-luna"
-
-    let _ = println("PASS: Pure-Tenon Standard Library v2 (JsonValue ADT, Option/Result, Contracts & Proofs) verified!")
+    let _ = println("PASS: Tenon 4-Layer Standard Library + Interfaces (Static & dyn) + @derive JSON/Schema verified!")
     0
 }

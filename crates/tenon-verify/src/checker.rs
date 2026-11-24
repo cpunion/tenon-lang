@@ -334,7 +334,12 @@ impl CheckerCtx {
                     }
                 } else {
                     for m in &imp.methods {
-                        let sub = subst_fn_self(m, &imp.target_ty);
+                        let mut sub = subst_fn_self(m, &imp.target_ty);
+                        for tp in &imp.type_params {
+                            if !sub.type_params.contains(tp) {
+                                sub.type_params.push(tp.clone());
+                            }
+                        }
                         inherent_methods.insert((tname.clone(), m.name.clone()), sub);
                     }
                 }
@@ -3455,6 +3460,23 @@ impl CheckerCtx {
             };
             let abs = local_env.eval_abs_int(val_expr, None);
             local_env.set_int(f.name.clone(), abs);
+            if let ExprKind::Ident(vname) = &val_expr.kind {
+                let extra: Vec<String> = local_env
+                    .proved_calls
+                    .iter()
+                    .filter_map(|c| {
+                        let pat = format!("({})", vname);
+                        if c.ends_with(&pat) {
+                            Some(format!("{}({})", &c[..c.len() - pat.len()], f.name))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for e in extra {
+                    local_env.proved_calls.insert(e);
+                }
+            }
             local_vars.insert(f.name.clone());
             let eq = Expr {
                 kind: ExprKind::Binary {
@@ -3840,6 +3862,23 @@ impl CheckerCtx {
         let mut check_env = env.clone();
         let abs = env.eval_abs_int(expr, None);
         check_env.set_int("__val", abs);
+        if let ExprKind::Ident(vname) = &expr.kind {
+            let extra: Vec<String> = env
+                .proved_calls
+                .iter()
+                .filter_map(|c| {
+                    let pat = format!("({})", vname);
+                    if c.ends_with(&pat) {
+                        Some(format!("{}(__val)", &c[..c.len() - pat.len()]))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for e in extra {
+                check_env.proved_calls.insert(e);
+            }
+        }
 
         match check_env.check_predicate(pred, Some("__val")) {
             L0Result::Proved => {

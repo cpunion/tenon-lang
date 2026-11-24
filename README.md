@@ -1,7 +1,7 @@
 # Tenon 语言设计与技术方案（已拍板定稿）
 
 > **Working Codename**: `Tenon`（榫卯）—— 寓意**强约束精化类型、分层形式化验证、无别名污染的内存模型、系统级版本演化与可验证分布式协议**严丝合缝。  
-> **状态**: 核心架构 13 项决策已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md)），**极简语言核心 → 纯 Tenon 标准库（`std/*.tn`）→ 纯 Tenon 编写的真实交互式 CLI Agent（`examples/agent/cli_agent.tn`）三层闭环已彻底贯通**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 独立原生二进制** + Perceus RC/COW/`rc_mask` 零泄漏 + 无栈 `async` 状态机 + `@no_heap_alloc` + 通用 `.tn` AST 协议检测 + 真多进程 Authority/Worker/Fabric Sandbox + `.tn` 直编二进制 `.wasm` 客户端 + `dast-os` OpenAI Responses API 实跑验证）。  
+> **状态**: 核心架构已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md) & [ADR-0002](docs/adr/0002-interfaces-comptime-and-stdlib.md)），**极简语言核心 → 4 层纯 Tenon 标准库（`std/{core,text,collections,encoding,os}`）→ 解耦的应用层 SDK（`examples/agent/lib/{llm,tools}.tn`）与真实交互式 CLI Agent（`examples/agent/cli_agent.tn`）已彻底贯通**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 独立原生二进制** + `interface`/`impl`/静态单态化/`dyn` 虚表胖对象 + `@derive(ToJson, FromJson, JsonSchema)` + 版本优先 `@evolve` + Perceus RC/COW/`rc_mask` `live_objects=0` + 无栈 `async` 状态机 + `@no_heap_alloc` + 通用 `.tn` AST 协议检测 + 真多进程 Authority/Worker/Fabric Sandbox + `.tn` 直编 `.wasm` 客户端 + `dast-os` OpenAI Responses API 实跑验证）。  
 > **上游沉淀**: 综合 [`loom-lang`](../loom-lang)（984 PR 自举实践）、[`lang-research`](../lang-research)（2026-11 多语言可复现实验）与 [`dast-os-kernel`](../../dast.ai/dast-os-kernel/README.md)（227 轮分布式调和内核审计），并结合 2025–2026 全球最新编程语言与形式化验证进展形成的全新通用编程语言设计。
 
 ---
@@ -11,7 +11,7 @@
 前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）、`z3`、LLVM `clang`（已验证 LLVM 22.1.8；可选 `node` 验证编译出的 `.wasm`）。
 
 ```bash
-# 1. 全工作区 22 项自动化测试（含 import 模块系统、Perceus/rc_mask 零泄漏、无栈 async、LLVM 22 AOT + tenon-rt 链接、V8 Wasm、OpenAI SSE + Webhook、Fabric Sandbox + 410 Reset）
+# 1. 全工作区 29 项自动化测试（含 interface/impl/静态单态化/dyn 虚表零泄漏、Liskov 契约检查、版本优先 @evolve、Perceus/rc_mask 零泄漏、无栈 async、LLVM 22 AOT + tenon-rt 链接、V8 Wasm、OpenAI SSE + Webhook、Fabric Sandbox + 410 Reset）
 cargo test --workspace
 
 # 2. 精化类型别名复用（Year/Month/Odd/Even/Amount）+ 跨字段 Date + Cranelift 原生执行
@@ -38,12 +38,12 @@ cargo run --bin tenon -- build        examples/dast_os_kernel/kernel_v2.tn -o ta
 cargo run --bin tenon -- build-wasm   examples/dast_os_kernel/kernel_v2.tn -o target/dast_kernel_client.wasm
 cargo run --bin tenon -- cluster-demo examples/dast_os_kernel/kernel_v2.tn
 
-# 6. 纯 Tenon 标准库自测（std/io, std/text, std/json, std/env, std/tools, std/openai 全部由 .tn 编写，底层仅 19 个字节/OS/SSE 系统调用）
+# 6. 4 层纯 Tenon 标准库自测（std/{core,text,collections,encoding,os}，含 interface/impl/静态泛型/dyn 虚表 + @derive(ToJson, FromJson, JsonSchema) + SafeRelPath 边界证明，235 项静态证明，live_objects=0）
 cargo run --bin tenon -- check examples/stdlib_test.tn
 cargo run --bin tenon -- run   examples/stdlib_test.tn
 cargo run --bin tenon -- build examples/stdlib_test.tn -o target/stdlib_test_bin --opt O3 && ./target/stdlib_test_bin
 
-# 7. 纯 Tenon 编写的真实交互式 CLI Agent（examples/agent/cli_agent.tn，直连 dast-os OpenAI Responses API：gpt-6-luna / gpt-6.1-sol / gpt-6.1-terra / gpt-6-astra + shell/文件工具 + Z3 AgentLease + Protocol 模型检测）
+# 7. 纯 Tenon 编写的真实交互式 CLI Agent（examples/agent/cli_agent.tn + examples/agent/lib/{llm,tools}.tn，基于 dyn LlmProvider + List[dyn Tool] + @derive(FromJson, JsonSchema) + SafeRelPath + Z3 AgentLease + Protocol 模型检测，334 项静态证明，live_objects=0）
 cargo run --bin tenon -- check      examples/agent/cli_agent.tn
 cargo run --bin tenon -- modelcheck examples/agent/cli_agent.tn
 # 方式 A：Cranelift JIT 直接运行（支持交互 REPL 或 TENON_PROMPT 单轮执行；自动统计 Perceus live_objects=0）
@@ -57,16 +57,16 @@ TENON_MODEL=luna ./target/tenon_agent
 cargo run --bin tenon -- serve examples/dast_os_kernel/kernel_v2.tn --addr 127.0.0.1:8787
 ```
 
-### 三层分层架构（极简核心 → 纯 Tenon 标准库 → 纯 Tenon 应用）
+### 四层分层架构（极简核心 → 4 层纯 Tenon 标准库 → 应用层 SDK & CLI Agent）
 
 | 层级 / 模块 | 职责 |
 | --- | --- |
-| [`crates/tenon-syntax`](crates/tenon-syntax) | `loom/Go` 风格词法/语法分析器、`import "..."` 拓扑模块解析、UTF-8 字面量、`break`/`continue`、精化/`mutate`/`async`/`evolution`/`lock_lattice`/`protocol state_machine`/`stream`/`view`/`subscriber` |
-| [`crates/tenon-rt`](crates/tenon-rt) | 极简语言核心运行时（`rlib` + `staticlib`）：Perceus RC/COW/`rc_mask` + 无栈协程调度 + **仅 19 个最小字节/OS/原始 HTTPS-SSE 行流系统调用**（零 JSON、零 `.env`、零 OpenAI 协议逻辑） |
-| [`crates/tenon-verify`](crates/tenon-verify) | `IncrementalDb` 增量缓存 + L0 极速求解 + L1 Z3 SMT（`mutate` 符号后态、`async` 效应纪律、`@no_heap_alloc`、别名继承）+ 版本演化/透镜证明 + 分布式约束求解 + L2-b 通用 AST 模型检测/锁序格/Trace Refinement |
-| [`crates/tenon-codegen`](crates/tenon-codegen) | Cranelift Dev JIT + **LLVM 22 AOT Release 后端（`tenon build -O3`，自动链接 `libtenon_rt.a` 生成独立原生二进制）** + 块级 RAII 与临时对象精确回收 + 直出二进制 WebAssembly (`.wasm`) 客户端编译器 |
-| [`std/*.tn`](std) | **100% 纯 Tenon 编写的标准库**：`std/io.tn`、`std/text.tn`（trim/index_of/replace/int_to_text）、`std/json.tn`（深度感知结构化 JSON 解析器与转义器）、`std/env.tn`（安全 `.env` 解析）、`std/tools.tn`（工作区隔离的文件读写编辑/目录/grep/shell）、`std/openai.tn`（OpenAI Responses API SSE 流式客户端与 `dast-os` 模型路由） |
-| [`examples/agent/cli_agent.tn`](examples/agent/cli_agent.tn) | **100% 纯 Tenon 编写的交互式 CLI Agent**：基于 `std/*.tn` + Z3 证明的 `AgentLease` + `@no_heap_alloc` + `lock_lattice` + `protocol state_machine`，支持多轮 ReAct 工具调用、流式输出与 `/model`/`/state`/`/branch`/`/clear`/`/help`/`/exit` 交互命令 |
+| [`crates/tenon-syntax`](crates/tenon-syntax) | `loom/Go` 风格词法/语法分析器、`import "..." [as alias]` 拓扑模块解析、`interface`/`impl`/`for`/`dyn`、泛型约束 `[T I]`、`@derive(ToJson, FromJson, JsonSchema)`（`@rename`/`@skip`/`@skip_if_none`/`@doc`/`@tag`）、精化/`mutate`/`async`/`evolution`/`lock_lattice`/`protocol state_machine`/`stream`/`view`/`subscriber` |
+| [`crates/tenon-rt`](crates/tenon-rt) | 极简语言核心运行时（`rlib` + `staticlib`）：Perceus RC/COW/`rc_mask` + `TAG_DYN` 虚表胖对象支持 + 无栈协程调度 + **仅 24 个最小字节/O(n) 缓冲/OS/通用 HTTP-SSE 原语**（零 JSON、零 `.env`、零厂商协议逻辑） |
+| [`crates/tenon-verify`](crates/tenon-verify) | `IncrementalDb` 增量缓存 + L0 流敏感精化求解（含纯域谓词如 `SafeRelPath`）+ L1 Z3 SMT（`mutate`、接口 Liskov 契约 `E0500`–`E0506`、`dyn` 对象安全与 `@no_heap_alloc`、`async` 效应）+ **版本优先 `@evolve`**（跨版本字段改类型/改范围/改名/删字段检测 + 双向透镜证明）+ L2-b 通用 AST 模型检测/锁序格/Trace Refinement |
+| [`crates/tenon-codegen`](crates/tenon-codegen) | 统一前置降级（方法扁平化、泛型单态化、`dyn` 虚表与 COW `inout self` 分发）+ Cranelift Dev JIT + **LLVM 22 AOT Release 后端（`tenon build -O3`，自动链接 `libtenon_rt.a` 生成独立原生二进制）** + 直出 `.wasm` 客户端编译器 |
+| [`std/`](std) | **100% 纯 Tenon 编写的 4 层正交标准库**：<br>• Layer 0 [`std/core/{types,ops}.tn`](std/core)：`NonNegative`/`Positive`/`Port`/`Option`/`Result`/`Display`/`Writer`<br>• Layer 1 [`std/text/{text,builder}.tn`](std/text) & [`std/collections/map.tn`](std/collections)：`impl Text` 流畅方法、O(n) `TextBuilder`、COW `TextMap`<br>• Layer 2 [`std/encoding/{json,dotenv}.tn`](std/encoding)：`JsonValue` ADT + `ToJson`/`FromJson`/`JsonSchema` + O(n) 序列化器与递归下降解析器 + `.env` 解析<br>• Layer 3 [`std/os/{io,path,fs,env,process,http}.tn`](std/os)：`Stdout`、`SafeRelPath`、`FsError`、`interface FileSystem`（`OsFs`/`MemFs`）、`HttpStream` |
+| [`examples/agent/`](examples/agent) | **与标准库彻底解耦的应用层 SDK 与交互式 CLI Agent**：[`lib/llm.tn`](examples/agent/lib/llm.tn)（`interface LlmProvider` + `OpenAIProvider`）、[`lib/tools.tn`](examples/agent/lib/tools.tn)（`interface Tool` + 6 个 `@derive(FromJson, JsonSchema)` + `SafeRelPath` 工具插件）与 [`cli_agent.tn`](examples/agent/cli_agent.tn)（`dyn LlmProvider` + `List[dyn Tool]` + Z3 `AgentLease` + `lock_lattice` + `protocol state_machine`） |
 | [`crates/tenon-dist`](crates/tenon-dist) & [`crates/tenon-cli`](crates/tenon-cli) | SQLite WAL 分布式权威内核、真多进程 Authority/Worker/Fabric Sandbox、`tenon` 统一 CLI |
 
 ---
@@ -84,9 +84,9 @@ cargo run --bin tenon -- serve examples/dast_os_kernel/kernel_v2.tn --addr 127.0
    - 逻辑层采用**默认可变值语义（MVS）+ 局部 `inout`（零 `'a` 生命周期标注）**，彻底消灭普通值上的共享可变别名爆炸，使验证引擎复杂度直降一个数量级。
    - 运行时以 **Perceus 精确引用计数与唯一引用原地复用（COW/FBIP）** 为无限制语义基座（递归、逃逸闭包、Wasm、嵌入式全无限制，无 STW GC 停顿）；Goose 式区域降级为**透明 Tier-2 局部优化**（默认分块池化 Slab Arena），配强制报错的 `@no_heap_alloc` / `@fip` 契约；长期可变图走显式 `Store[T] + 不可回绕代次 Handle + phase`。
    - 并发采用**无栈协程（Stackless MIR 状态机）+ 显式 `async` 效应（配效应多态）**，原生服务端、Wasm 前端与无 MMU 嵌入式一套统一。
-4. **双层系统级版本演化与兼容性自动推导**
-   - 保留普通文本文件，仅对持久化/Wire/公开跨版本契约显式标注 `@evolve` 与稳定槽位 `@field(N)`；
-   - 融合 **SMT 精化蕴涵 + 残差域 $\Delta$ + 已证明双向透镜（`evolution V1 <-> V2`）** 与 **按职责少版本化能力子集（`required(record, op) ⊆ supported(consumer, op)`）**，覆盖升级、灰度共存、降级保留数据与再升级全生命周期。
+4. **版本优先的双层系统级演化与兼容性自动推导**
+   - 保留普通文本文件，以版本对 `(v1, v2)` + 字段名为默认演化依据（无需在每个字段写 `@field(N)`）；仅对持久化/Wire/公开跨版本契约显式标注 `@evolve`；
+   - 自动检测跨版本**字段类型变更**（如 `Int64 -> Text`）、**精化范围收窄/放宽**、**新增/删除/重命名字段**（`@from("old")` 或 `evolution V1 <-> V2` 双向透镜），融合 **SMT 精化蕴涵 + 残差域 $\Delta$ + 已证明双向透镜** 与 **按职责少版本化能力子集**，覆盖升级、灰度共存、降级保留数据与再升级全生命周期。
 5. **极简通用核心 + 可验证标准库分布式微内核**
    - 语言核心只内建极简通用原语，三轴调和、锁序格、Attempt 双围栏、4 种可扩展 `SyncArchetype` 与响应式数据流/pacing 在标准库实现；
    - 面向 `dast-os` 级云端多端系统，提出**分片单写者 + 存储/代理双端硬 Fencing + 不可变 Turn DAG + 声明式响应式流**架构，并**单源直编**为服务端原生二进制 + Web Wasm（薄 TS 胶水）+ iOS/Android/Desktop Native C-ABI（薄 Swift/Kotlin 绑定）。
@@ -148,14 +148,14 @@ pub fn shift_to_prev_year_safe(inout d Date) {
 }
 ```
 
-### 系统级版本演化与双向透镜示例
+### 系统级版本演化与双向透镜示例（版本优先，零 `@field(N)` 噪音）
 
 ```tenon
 @evolve("billing.Order", storage = "orders")
 pub record Order {
-    @field(1) id     Int64
-    @field(2) amount Int64 where self > 0       // 相对 v1 (self >= 0) 收紧！编译器算出残差域 Δ: amount == 0
-    @field(3) note   Option[Text] = None        // 新增可选字段：后向兼容，降级保留
+    id     Int64
+    amount Int64 where self > 0       // 相对 v1 (self >= 0) 收紧！编译器算出残差域 Δ: amount == 0；若类型变化也会自动拦截
+    note   Option[Text] = None        // 新增可选字段：后向兼容，降级保留
 }
 
 evolution Order: v1 <-> v2 {
@@ -191,7 +191,8 @@ evolution Order: v1 <-> v2 {
 
 | 文档 | 内容摘要 |
 | --- | --- |
-| **[ADR-0001 — 13 项核心架构决议总表](docs/adr/0001-architecture-decisions.md)** | **最高裁决真相源**：记录全部 13 项已拍板架构决议（战略定位、核心边界、MVS+Perceus、无栈协程、checked 整数+Fail-Closed、双层演化、分片单写者+Turn DAG、Wasm/Native 单源产物、双引擎协议验证、Rust+Salsa+Cranelift/LLVM、loom/Go 语法、M0–M4 节奏）。 |
+| **[ADR-0001 — 13 项核心架构决议总表](docs/adr/0001-architecture-decisions.md)** | **最高裁决真相源**：记录全部 13 项已拍板架构决议（战略定位、核心边界、MVS+Perceus、无栈协程、checked 整数+Fail-Closed、版本优先双层演化、分片单写者+Turn DAG、Wasm/Native 单源产物、双引擎协议验证、Rust+Salsa+Cranelift/LLVM、loom/Go 语法、M0–M4 节奏）。 |
+| **[ADR-0002 — 接口/实现双轨、`@derive` 序列化、轻量 `@evolve` 与 4 层标准库](docs/adr/0002-interfaces-comptime-and-stdlib.md)** | 统一 `interface` + `impl` + 静态单态化 `[T I]` & 动态 `dyn I` Perceus 胖对象 + Liskov 契约检查、`@derive(ToJson, FromJson, JsonSchema)` 与精化边界单源真相、版本优先 `@evolve`、4 层正交 `std/` 与应用 SDK 解耦。 |
 | [01 — 现状、竞品与近一年（2025–2026）新语言全景调研](docs/01-landscape-and-positioning.md) | 复盘 `loom-lang` 进展与结构性张力、`lang-research` 核心实验，评估近 1 年 20+ 新语言/验证体系（MoonBit 0.9、Ora、Bend 2、Gojo、Goose、Wyzer、Hylo、Ante、Zed、Blood、Ambient、Jacquard、Mog、Flux、Verus 等）的优缺点与定位空白。 |
 | [02 — 强约束精化类型系统设计](docs/02-type-system-and-refinements.md) | 标量/同余/域值/跨字段依赖记录（`Date`、`DateRange`、集合、状态机）语法与语义；流敏感精化；原子 `mutate` 块；精化子类型格与零开销消除；单源真相自动派生边界解析器与 SQL/JSON 约束。 |
 | [03 — 三层分层形式化验证引擎设计](docs/03-formal-verification-engine.md) | L0 进程内极速抽象域求解器（区间/同余/八边形/有界 CTFE）+ L1 增量 SMT（Z3/CVC5 + 缓存 + 可解释反例）+ L2 双引擎协议验证与 Ghost/Lemma；MVS 减负对比；AI Vericoding 协议。 |

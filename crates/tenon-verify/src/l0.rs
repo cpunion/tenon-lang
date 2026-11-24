@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tenon_syntax::*;
 
 /// Closed integer interval [min, max] in mathematical integers (i128 to avoid overflow during analysis).
@@ -247,6 +247,8 @@ pub struct L0Env {
     pub bools: BTreeMap<String, bool>,
     /// Difference bounds `a - b <= c` stored as `(a, b) -> c`.
     pub diffs: BTreeMap<(String, String), i128>,
+    /// Flow-sensitively assumed pure predicate calls (e.g. `is_safe_rel_path(p)`).
+    pub proved_calls: BTreeSet<String>,
     /// Pure function declarations available for bounded CTFE and ensures summaries.
     pub pure_fns: BTreeMap<String, FnDecl>,
     /// Refined type alias predicates available for callee return-type summaries.
@@ -285,6 +287,11 @@ impl L0Env {
             ExprKind::Ident(name) => {
                 let key = resolve_self(name, self_var);
                 self.bools.insert(key, true);
+            }
+            ExprKind::Call { callee, args } => {
+                if let Some(ck) = canonical_pred_call(callee, args, self_var) {
+                    self.proved_calls.insert(ck);
+                }
             }
             ExprKind::Unary {
                 op: UnOp::Not,
@@ -731,6 +738,11 @@ impl L0Env {
                 _ => L0Result::Unknown,
             },
             ExprKind::Call { callee, args } => {
+                if let Some(ck) = canonical_pred_call(callee, args, self_var) {
+                    if self.proved_calls.contains(&ck) {
+                        return L0Result::Proved;
+                    }
+                }
                 if let ExprKind::Ident(fname) = &callee.kind {
                     let mut const_args = Vec::new();
                     for a in args {
@@ -1038,6 +1050,23 @@ pub enum CtfeVal {
     Int(i128),
     Bool(bool),
     Unit,
+}
+
+fn canonical_pred_call(callee: &Expr, args: &[CallArg], self_var: Option<&str>) -> Option<String> {
+    let ExprKind::Ident(fname) = &callee.kind else {
+        return None;
+    };
+    let mut parts = Vec::with_capacity(args.len());
+    for a in args {
+        if let Some(v) = expr_var_name(&a.value, self_var) {
+            parts.push(v);
+        } else if let ExprKind::Int(n) = &a.value.kind {
+            parts.push(n.to_string());
+        } else {
+            return None;
+        }
+    }
+    Some(format!("{}({})", fname, parts.join(",")))
 }
 
 fn resolve_self(name: &str, self_var: Option<&str>) -> String {

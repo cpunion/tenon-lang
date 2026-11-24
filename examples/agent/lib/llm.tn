@@ -1,0 +1,272 @@
+// Application SDK — examples/agent/lib/llm.tn
+// Cleanly decoupled from language `std/`!
+// Defines `interface LlmProvider` (usable via both static `[P LlmProvider]` and `dyn LlmProvider`)
+// and `OpenAIProvider` built on generic `std/os/http.tn` + `std/encoding/json.tn`!
+
+import "std/core/types.tn"
+import "std/core/ops.tn"
+import "std/text/text.tn"
+import "std/encoding/json.tn" as json
+import "std/os/io.tn"
+import "std/os/http.tn"
+
+pub record ToolCall {
+    call_id   Text
+    name      Text
+    arguments JsonValue
+}
+
+pub record TokenUsage {
+    input_tokens  NonNegative
+    cached_tokens NonNegative
+    output_tokens NonNegative
+}
+
+pub record LlmTurn {
+    output_items List[JsonValue]
+    tool_calls   List[ToolCall]
+    usage        TokenUsage
+}
+
+pub record LlmRequest {
+    session_id   Text
+    instructions Text
+    input_items  List[JsonValue]
+    tools        JsonValue
+    stream       Bool
+}
+
+pub interface LlmProvider {
+    pure fn model_name(self) Text
+    pure fn effort_name(self) Text
+    fn stream_turn(self, req LlmRequest) Result[LlmTurn, Text]
+}
+
+pub pure fn resolve_dast_model(alias Text) Text {
+    let m = alias.trim()
+    if m == "luna" || m == "" {
+        return "gpt-6-luna"
+    }
+    if m == "terra" {
+        return "gpt-6.1-terra"
+    }
+    if m == "sol" {
+        return "gpt-6.1-sol"
+    }
+    if m == "astra" {
+        return "gpt-6-astra"
+    }
+    m
+}
+
+pub pure fn resolve_dast_effort(model Text) Text {
+    if model == "gpt-6-luna" {
+        return "low"
+    }
+    if model == "gpt-6-astra" {
+        return "high"
+    }
+    "medium"
+}
+
+pub pure fn llm_user_item(text Text) JsonValue {
+    let part = json_obj_new()
+        .set("type", JStr("input_text"))
+        .set("text", JStr(text))
+    let content = json_arr_new().push_val(part)
+    json_obj_new()
+        .set("role", JStr("user"))
+        .set("content", content)
+}
+
+pub pure fn llm_tool_output_item(call_id Text, tool_output Text) JsonValue {
+    json_obj_new()
+        .set("type", JStr("function_call_output"))
+        .set("call_id", JStr(call_id))
+        .set("output", JStr(tool_output))
+}
+
+pub pure fn openai_endpoint(base_url Option[Text]) Text {
+    match base_url {
+        None => "https://api.openai.com/v1/responses"
+        Some(b) => {
+            if b.ends_with("/responses") {
+                return b
+            }
+            if b.ends_with("/") {
+                return b ++ "responses"
+            }
+            b ++ "/responses"
+        }
+    }
+}
+
+pub record OpenAIProvider {
+    api_key  Text
+    endpoint Text
+    model    Text
+    effort   Text
+}
+
+pub pure fn openai_provider_new(
+    api_key Text,
+    base_url Option[Text],
+    model_alias Text
+) OpenAIProvider {
+    let model = resolve_dast_model(model_alias)
+    let effort = resolve_dast_effort(model)
+    OpenAIProvider {
+        api_key = api_key,
+        endpoint = openai_endpoint(base_url),
+        model = model,
+        effort = effort
+    }
+}
+
+impl OpenAIProvider {
+    pub pure fn build_payload(self, req LlmRequest) JsonValue {
+        let reasoning = json_obj_new().set("effort", JStr(self.effort))
+        let include = json_arr_new().push_val(JStr("reasoning.encrypted_content"))
+        json_obj_new()
+            .set("model", JStr(self.model))
+            .set("instructions", JStr(req.instructions))
+            .set("input", JArr(req.input_items))
+            .set("tools", req.tools)
+            .set("stream", JBool(true))
+            .set("store", JBool(false))
+            .set("reasoning", reasoning)
+            .set("include", include)
+            .set("prompt_cache_key", JStr("tenon-agent:" ++ req.session_id))
+    }
+}
+
+impl LlmProvider for OpenAIProvider {
+    pub pure fn model_name(self) Text { self.model }
+    pub pure fn effort_name(self) Text { self.effort }
+
+    pub fn stream_turn(self, req LlmRequest) Result[LlmTurn, Text] {
+        let body = self.build_payload(req).stringify()
+        let headers = "Content-Type: application/json\nAccept: text/event-stream\nAuthorization: Bearer " ++ self.api_key ++ "\n"
+        let stream = http_open("POST", self.endpoint, headers, body)
+
+        var out_items List[JsonValue] = []
+        var calls List[ToolCall] = []
+        var in_tok = 0
+        var cached_tok = 0
+        var out_tok = 0
+        var err_msg = ""
+        var printed_any = false
+
+        while true {
+            let line = match stream.next_line() {
+                None => { break }
+                Some(l) => l
+            }
+            let data = match line.strip_prefix("data:") {
+                Some(rest) => rest.trim()
+                None => { continue }
+            }
+            if data.is_empty() || data == "[DONE]" {
+                continue
+            }
+            match json.parse(data) {
+                Err(_) => { continue }
+                Ok(ev) => {
+                    let ev_type = ev.get_str("type").unwrap_or("")
+                    if ev_type == "response.output_text.delta" {
+                        match ev.get_str("delta") {
+                            Some(delta) => {
+                                if req.stream && !delta.is_empty() {
+                                    let _ = print(delta)
+                                    printed_any = true
+                                }
+                            }
+                            None => {}
+                        }
+                    } else if ev_type == "response.output_item.done" {
+                        match ev.get("item") {
+                            Some(item) => {
+                                let itype = item.get_str("type").unwrap_or("")
+                                if itype == "function_call" || itype == "message" || itype == "reasoning" {
+                                    out_items = push(out_items, item)
+                                }
+                                if itype == "function_call" {
+                                    let cid = item.get_str("call_id").unwrap_or("")
+                                    let cname = item.get_str("name").unwrap_or("")
+                                    let parsed_args = match item.get_str("arguments") {
+                                        Some(raw_args) => match json.parse(raw_args) {
+                                            Ok(v) => v
+                                            Err(_) => json_obj_new()
+                                        }
+                                        None => json_obj_new()
+                                    }
+                                    calls = push(calls, ToolCall {
+                                        call_id = cid,
+                                        name = cname,
+                                        arguments = parsed_args
+                                    })
+                                }
+                            }
+                            None => {}
+                        }
+                    } else if ev_type == "response.completed" {
+                        match ev.get("response") {
+                            Some(resp) => match resp.get("usage") {
+                                Some(usage) => {
+                                    in_tok = usage.get_int("input_tokens").unwrap_or(0)
+                                    out_tok = usage.get_int("output_tokens").unwrap_or(0)
+                                    match usage.get("input_tokens_details") {
+                                        Some(det) => {
+                                            cached_tok = det.get_int("cached_tokens").unwrap_or(0)
+                                        }
+                                        None => {}
+                                    }
+                                }
+                                None => {}
+                            }
+                            None => {}
+                        }
+                    } else if ev_type == "response.failed" {
+                        err_msg = match ev.get("response") {
+                            Some(resp) => match resp.get("error") {
+                                Some(eobj) => eobj.get_str("message").unwrap_or("OpenAI response.failed")
+                                None => "OpenAI response.failed"
+                            }
+                            None => "OpenAI response.failed"
+                        }
+                    } else if ev_type == "error" {
+                        err_msg = match ev.get_str("message") {
+                            Some(m) => m
+                            None => match ev.get("error") {
+                                Some(eobj) => eobj.get_str("message").unwrap_or("OpenAI error event")
+                                None => "OpenAI error event"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let close_res = stream.close()
+        if printed_any && req.stream {
+            let _ = println("")
+        }
+        if !err_msg.is_empty() {
+            return Err(err_msg)
+        }
+        match close_res {
+            Err(net_err) => { return Err(net_err) }
+            Ok(_) => {}
+        }
+
+        Ok(LlmTurn {
+            output_items = out_items,
+            tool_calls = calls,
+            usage = TokenUsage {
+                input_tokens = clamp_non_neg(in_tok),
+                cached_tokens = clamp_non_neg(cached_tok),
+                output_tokens = clamp_non_neg(out_tok)
+            }
+        })
+    }
+}

@@ -1,0 +1,41 @@
+// Tenon Standard Library — Layer 3: std/os/path.tn
+// Refined `SafeRelPath` domain type (Parse, Don't Validate!) preventing workspace path traversal.
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+
+pub pure fn is_safe_rel_path(path Text) Bool {
+    if len(path) == 0 {
+        return false
+    }
+    if path.starts_with("/") {
+        return false
+    }
+    if path.contains("..") {
+        return false
+    }
+    true
+}
+
+pub type SafeRelPath = Text where is_safe_rel_path(self)
+
+pub pure fn safe_rel_path_parse(raw Text) Result[SafeRelPath, Text] {
+    if !is_safe_rel_path(raw) {
+        return Err("unsafe or empty relative path `" ++ raw ++ "`")
+    }
+    Ok(raw)
+}
+
+pub pure fn path_join(base Text, rel Text) Text {
+    if len(rel) == 0 || rel == "." {
+        return base
+    }
+    if base.ends_with("/") {
+        return base ++ rel
+    }
+    base ++ "/" ++ rel
+}
+
+pub pure fn shell_quote(s Text) Text {
+    "'" ++ s.replace_all("'", "'\\''") ++ "'"
+}

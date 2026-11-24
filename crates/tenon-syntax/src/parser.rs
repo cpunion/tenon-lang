@@ -2066,7 +2066,16 @@ impl Parser {
                         };
                     }
                 }
-                _ => break,
+                _ => {
+                    // Allow fluent multiline `.method()` chaining across newlines
+                    let saved = self.pos;
+                    self.skip_newlines();
+                    if self.peek().kind == TokenKind::Dot {
+                        continue;
+                    }
+                    self.pos = saved;
+                    break;
+                }
             }
         }
         Ok(expr)
