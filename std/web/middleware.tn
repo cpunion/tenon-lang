@@ -2,6 +2,7 @@
 
 import "std/net/http.tn"
 import "std/web/router.tn"
+import "std/sync/sync.tn"
 
 pub type Handler = fn(Context) HttpResponse
 pub type Middleware = fn(Context, fn(Context) HttpResponse) HttpResponse
@@ -37,6 +38,30 @@ pub pure fn security_headers_middleware() Middleware {
         res
             .with_header("X-Content-Type-Options", "nosniff")
             .with_header("X-Frame-Options", "DENY")
+    }
+}
+
+/// Assigns a monotonic atomic `X-Request-Id` header to every response.
+pub fn request_id_middleware() Middleware {
+    let seq = atomic_new(0)
+    |ctx, next| {
+        let rid = seq.fetch_add(1, ORDER_SEQ_CST) + 1
+        let res = next(ctx)
+        res.with_header("X-Request-Id", "req-" ++ int_to_text(rid))
+    }
+}
+
+/// Emits structured JSON access logs (`{"method","path","status","latency_us"}`) to stdout.
+pub fn structured_log_middleware() Middleware {
+    |ctx, next| {
+        let t0 = time_now_ns()
+        let m = ctx.req.method
+        let p = ctx.req.path
+        let res = next(ctx)
+        let dt_us = (time_now_ns() - t0) / 1000
+        let line = "{\"method\":\"" ++ m ++ "\",\"path\":\"" ++ p ++ "\",\"status\":" ++ int_to_text(res.status) ++ ",\"latency_us\":" ++ int_to_text(dt_us) ++ "}\n"
+        let _ = sys_write_stdout(line)
+        res
     }
 }
 

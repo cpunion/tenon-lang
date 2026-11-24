@@ -1,18 +1,22 @@
 // std/web/app.tn — Metaprogramming-Powered High-Performance Tenon Web Framework
-// Combines compile-time route scanning (`@get`, `@post`, `@put`, `@delete`, `@patch` via `routes_of()`),
-// automatic OpenAPI 3.1 spec generation, composable middleware, refined-type JSON extraction,
+// Combines compile-time route scanning (`@get`, `@post`, `@put`, `@delete`, `@patch`, `@ws`, `@sse`),
+// O(depth) Radix Trie Router, automatic OpenAPI 3.1 spec generation, composable middleware,
+// path-traversal-safe static file serving, refined-type JSON extraction,
 // and the multi-worker `kqueue`/`epoll` Keep-Alive HTTP/1.1 engine.
 
 import "std/net/http.tn"
 import "std/web/router.tn"
 import "std/web/middleware.tn"
+import "std/os/fs.tn"
 
-// First-class typed HTTP route attributes (scanned at compile time by `routes_of()` / `mount_annotated_routes!()`).
+// First-class typed HTTP/WebSocket/SSE route attributes (scanned at compile time by `routes_of()`).
 pub attr get(path Text)
 pub attr post(path Text)
 pub attr put(path Text)
 pub attr delete(path Text)
 pub attr patch(path Text)
+pub attr ws(path Text)
+pub attr sse(path Text)
 
 pub record RouteEntry {
     method  Text
@@ -22,6 +26,7 @@ pub record RouteEntry {
 
 pub record WebApp {
     routes       List[RouteEntry]
+    radix        RadixRouter
     middlewares  List[Middleware]
     openapi_json Text
 }
@@ -29,17 +34,43 @@ pub record WebApp {
 pub pure fn web_app_new() WebApp {
     WebApp {
         routes = []
+        radix = radix_router_new()
         middlewares = []
         openapi_json = ""
     }
 }
 
+pure fn infer_mime_type(path Text) Text {
+    if path.ends_with(".html") || path.ends_with(".htm") { "text/html; charset=utf-8" }
+    else if path.ends_with(".js") || path.ends_with(".mjs") { "application/javascript; charset=utf-8" }
+    else if path.ends_with(".css") { "text/css; charset=utf-8" }
+    else if path.ends_with(".json") { "application/json" }
+    else if path.ends_with(".wasm") { "application/wasm" }
+    else if path.ends_with(".svg") { "image/svg+xml" }
+    else { "text/plain; charset=utf-8" }
+}
+
+/// Path-traversal-safe static file response helper (rejects `..` and leading `/` escapes).
+pub fn serve_static_file(root_dir Text, rel_path Text) HttpResponse {
+    if len(rel_path) == 0 || rel_path.contains("..") || byte_at(rel_path, 0) == 47 {
+        return http_bad_request("invalid static file path")
+    }
+    let full = root_dir ++ "/" ++ rel_path
+    match fs_read(full) {
+        Ok(content) => http_response(200, infer_mime_type(rel_path), content)
+        Err(_) => http_not_found("static file not found")
+    }
+}
+
 impl WebApp {
     pub pure fn route(self, method Text, path Text, handler Handler) WebApp {
+        let idx = len(self.routes)
         var rs = self.routes
         rs = push(rs, RouteEntry { method = method, path = path, handler = handler })
+        let rx = self.radix.insert(method, path, idx)
         WebApp {
             routes = rs
+            radix = rx
             middlewares = self.middlewares
             openapi_json = self.openapi_json
         }
@@ -61,11 +92,24 @@ impl WebApp {
         self.route("DELETE", path, handler)
     }
 
+    /// Mounts a path-traversal-safe static directory at `prefix/*file` (e.g. `"/static"`).
+    pub fn static_dir(self, prefix Text, root_dir Text) WebApp {
+        let dir = root_dir
+        let pat = prefix ++ "/*file"
+        self.get(pat, |ctx| {
+            match ctx.param("file") {
+                Some(rel) => serve_static_file(dir, rel)
+                None => http_not_found("missing file path")
+            }
+        })
+    }
+
     pub pure fn use_mw(self, mw Middleware) WebApp {
         var mws = self.middlewares
         mws = push(mws, mw)
         WebApp {
             routes = self.routes
+            radix = self.radix
             middlewares = mws
             openapi_json = self.openapi_json
         }
@@ -74,32 +118,25 @@ impl WebApp {
     pub pure fn with_openapi(self, spec_json Text) WebApp {
         WebApp {
             routes = self.routes
+            radix = self.radix
             middlewares = self.middlewares
             openapi_json = spec_json
         }
     }
 
+    /// O(depth) Radix Trie dispatch with OpenAPI auto-mount and RFC-compliant 405 Method Not Allowed.
     pub pure fn dispatch_core(self, ctx Context) HttpResponse {
         if len(self.openapi_json) > 0 && ctx.req.method == "GET" && ctx.req.path == "/openapi.json" {
             return http_json(200, self.openapi_json)
         }
-        var path_matched_other_method = false
-        var i = 0
-        while i < len(self.routes) {
-            let rt = self.routes[i]
-            let m = match_route_pattern(rt.path, ctx.req.path)
-            if m.matched {
-                if rt.method == ctx.req.method {
-                    let bound = Context { req = ctx.req, params = m.params }
-                    let h = rt.handler
-                    return h(bound)
-                } else {
-                    path_matched_other_method = true
-                }
-            }
-            i += 1
+        let hit = self.radix.lookup(ctx.req.method, ctx.req.path)
+        if hit.route_idx >= 0 && hit.route_idx < len(self.routes) {
+            let rt = self.routes[hit.route_idx]
+            let bound = Context { req = ctx.req, params = hit.params }
+            let h = rt.handler
+            return h(bound)
         }
-        if path_matched_other_method {
+        if hit.matched_other_m {
             http_json(405, "{\"error\":\"method not allowed\"}")
         } else {
             http_not_found("route not found")
@@ -123,9 +160,9 @@ impl WebApp {
 }
 
 /// Compile-time metaprogramming generator macro!
-/// Scans ALL `@get`/`@post`/`@put`/`@delete`/`@patch` annotated handler functions in the project
+/// Scans ALL `@get`/`@post`/`@put`/`@delete`/`@patch`/`@ws`/`@sse` annotated handler functions
 /// via `routes_of()` and generates:
-///   1. `pub pure fn mount_routes(app WebApp) WebApp` (zero-reflection compiled router wiring)
+///   1. `pub pure fn mount_routes(app WebApp) WebApp` (zero-reflection compiled Radix router wiring)
 ///   2. `pub pure fn generated_openapi_json() Text` (compile-time OpenAPI 3.1 specification!)
 pub comptime fn mount_annotated_routes() Text {
     let rs = routes_of()

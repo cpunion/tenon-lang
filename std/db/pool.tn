@@ -1,0 +1,48 @@
+// std/db/pool.tn — Thread-Safe Generic Connection Pool over MPMC Channels + Atomics
+
+import "std/sync/sync.tn"
+
+pub record ConnPool[T] {
+    idle     Channel[T]
+    in_use   AtomicInt
+    max_size Int
+}
+
+pub fn conn_pool_new[T](initial List[T]) ConnPool[T] {
+    let ch Channel[T] = chan_new()
+    var i = 0
+    while i < len(initial) {
+        let _ = ch.send(initial[i])
+        i += 1
+    }
+    ConnPool {
+        idle = ch
+        in_use = atomic_new(0)
+        max_size = len(initial)
+    }
+}
+
+impl[T] ConnPool[T] {
+    pub fn acquire(self) Option[T] {
+        match self.idle.recv() {
+            Some(conn) => {
+                let _ = self.in_use.fetch_add(1, ORDER_SEQ_CST)
+                Some(conn)
+            }
+            None => None
+        }
+    }
+
+    pub fn release(self, conn T) {
+        let _ = self.in_use.fetch_sub(1, ORDER_SEQ_CST)
+        let _ = self.idle.send(conn)
+    }
+
+    pub fn active_count(self) Int {
+        self.in_use.load(ORDER_SEQ_CST)
+    }
+
+    pub fn close(self) {
+        self.idle.close()
+    }
+}

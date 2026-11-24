@@ -12,6 +12,31 @@ test fn router_matches_static_param_and_wildcard() {
     assert !m3.matched
 }
 
+test fn radix_router_and_static_security_work() {
+    var rx = radix_router_new()
+    rx = rx.insert("GET", "/health", 0)
+    rx = rx.insert("GET", "/users/:id/posts/:pid", 1)
+    rx = rx.insert("POST", "/users/:id/posts/:pid", 2)
+    rx = rx.insert("GET", "/static/*file", 3)
+
+    let h0 = rx.lookup("GET", "/health")
+    assert h0.route_idx == 0 && !h0.matched_other_m
+
+    let h1 = rx.lookup("GET", "/users/42/posts/9")
+    assert h1.route_idx == 1 && len(h1.params) == 2
+    assert h1.params[0].value == "42" && h1.params[1].value == "9"
+
+    let h405 = rx.lookup("DELETE", "/users/42/posts/9")
+    assert h405.route_idx == -1 && h405.matched_other_m
+
+    let hw = rx.lookup("GET", "/static/js/app.js")
+    assert hw.route_idx == 3 && hw.params[0].value == "js/app.js"
+
+    // Path traversal attack (`..`) MUST be rejected with 400 Bad Request
+    let bad = serve_static_file("examples/web_app", "../secret.txt")
+    assert bad.status == 400
+}
+
 test fn web_app_end_to_end_live_http_and_openapi() {
     assert main() == 200
 }

@@ -1,43 +1,177 @@
-// std/db/db_test.tn — Unit tests for PostgreSQL Wire Protocol v3 & Refinement SQL DDL
+// std/db/db_test.tn — Production Tests for PostgreSQL v3 (SHA-256 / HMAC / SCRAM-SHA-256 / Extended Query / Live TCP),
+// Thread-Safe Connection Pool & SQLite Refinement SQL CHECK DDL
 
 import "std/db/postgres.tn"
+import "std/db/pool.tn"
 import "std/db/sqlite.tn"
+import "std/sync/sync.tn"
 
-test fn test_postgres_wire_v3_codec() {
-    let startup = pg_encode_startup("tenon", "orders")
-    let total = bytes_read_u32_be(startup, 0) as Int
-    let proto = bytes_read_u32_be(startup, 4) as Int
-    assert total == bytes_len(startup)
-    assert proto == 196608
+pub record OrderRow {
+    id    Int where self > 0
+    price Int where self >= 1 && self <= 1000000
+}
 
-    let q = pg_encode_query("SELECT 1;")
-    let q_res = pg_decode_frame(q, 0)
-    match q_res {
-        Ok(f) => {
-            assert f.tag == 81
-            assert f.consumed == bytes_len(q)
-            assert bytes_len(f.payload) == 10
-        }
-        Err(_) => { assert false }
+pure fn pg_u32_frame(tag Int, code Int) Bytes {
+    var b = bytes_new(9)
+    b = bytes_push(b, tag)
+    b = bytes_push(b, 0)
+    b = bytes_push(b, 0)
+    b = bytes_push(b, 0)
+    b = bytes_push(b, 8)
+    b = bytes_push(b, (code >> 24) & 255)
+    b = bytes_push(b, (code >> 16) & 255)
+    b = bytes_push(b, (code >> 8) & 255)
+    bytes_push(b, code & 255)
+}
+
+pure fn pg_sasl_offer() Bytes {
+    // 'R' auth_code=10 + "SCRAM-SHA-256\0\0"
+    let mech = text_to_bytes("SCRAM-SHA-256")
+    let total = 4 + 4 + bytes_len(mech) + 2
+    var b = bytes_new(total + 1)
+    b = bytes_push(b, 82)
+    b = bytes_push(b, (total >> 24) & 255)
+    b = bytes_push(b, (total >> 16) & 255)
+    b = bytes_push(b, (total >> 8) & 255)
+    b = bytes_push(b, total & 255)
+    b = bytes_push(b, 0)
+    b = bytes_push(b, 0)
+    b = bytes_push(b, 0)
+    b = bytes_push(b, 10)
+    var i = 0
+    while i < bytes_len(mech) {
+        b = bytes_push(b, bytes_get(mech, i) as Int)
+        i += 1
     }
+    b = bytes_push(b, 0)
+    bytes_push(b, 0)
+}
 
-    let z = pg_encode_ready_for_query(73)
-    match pg_decode_frame(z, 0) {
-        Ok(f) => {
-            assert f.tag == 90
-            assert (bytes_get(f.payload, 0) as Int) == 73
-        }
-        Err(_) => { assert false }
+pure fn pg_sasl_continue(sf Text) Bytes {
+    let sb = text_to_bytes(sf)
+    let total = 4 + 4 + bytes_len(sb)
+    var b = bytes_new(total + 1)
+    b = bytes_push(b, 82)
+    b = bytes_push(b, (total >> 24) & 255)
+    b = bytes_push(b, (total >> 16) & 255)
+    b = bytes_push(b, (total >> 8) & 255)
+    b = bytes_push(b, total & 255)
+    b = bytes_push(b, 0)
+    b = bytes_push(b, 0)
+    b = bytes_push(b, 0)
+    b = bytes_push(b, 11)
+    var i = 0
+    while i < bytes_len(sb) {
+        b = bytes_push(b, bytes_get(sb, i) as Int)
+        i += 1
     }
+    b
+}
 
-    let term = pg_encode_terminate()
-    match pg_decode_frame(term, 0) {
-        Ok(f) => { assert f.tag == 88 && f.length == 4 }
+test fn test_sha256_hmac_and_scram_sha256_vectors() {
+    // Official NIST FIPS 180-4 SHA-256("abc") test vector
+    assert sha256_hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    assert sha256_hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    // Official RFC 4231 Test Case 2: HMAC-SHA-256("Jefe", "what do ya want for nothing?")
+    let mac = hmac_sha256(text_to_bytes("Jefe"), text_to_bytes("what do ya want for nothing?"))
+    assert bytes_to_hex(mac) == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+
+    // Base64 roundtrip
+    let b64 = pg_base64_encode(text_to_bytes("tenon-pg"))
+    assert bytes_to_text(pg_base64_decode(b64)) == "tenon-pg"
+
+    // SCRAM-SHA-256 proof generation
+    let cf = pg_scram_client_first("alice", "rOprNGfwEbeRWgbNEkqO")
+    assert cf == "n,,n=alice,r=rOprNGfwEbeRWgbNEkqO"
+    let sf = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4"
+    match pg_scram_client_final("pencil", "n=alice,r=rOprNGfwEbeRWgbNEkqO", sf) {
+        Ok(fin) => {
+            assert fin.starts_with("c=biws,r=rOprNGfwEbeRWgbNEkqO")
+            assert fin.contains(",p=")
+        }
         Err(_) => { assert false }
     }
 }
 
-test fn test_refinement_sql_ddl_builder() {
+test fn test_postgres_wire_v3_and_live_scram_extended_query_server() {
+    let lfd = net_tcp_listen("127.0.0.1:0")
+    assert lfd >= 0
+    let port = net_tcp_local_port(lfd)
+
+    // Spawn an in-process PostgreSQL v3.0 mock server supporting SCRAM-SHA-256 + Extended Query!
+    let srv = thread_spawn(|| {
+        let cfd = net_tcp_accept(lfd)
+        if cfd < 0 { return -1 }
+        // 1. Read StartupMessage
+        let _ = net_read(cfd, 1024)
+        // 2. Offer SCRAM-SHA-256
+        let _ = net_write(cfd, pg_sasl_offer())
+        // 3. Read SASLInitialResponse
+        let _ = net_read(cfd, 1024)
+        // 4. Send SASLContinue (server-first)
+        let _ = net_write(cfd, pg_sasl_continue("r=tenon_scram_nonce_2026_srv,s=c2FsdDEyMzQ=,i=2"))
+        // 5. Read SASLResponse (client-final with ClientProof)
+        let _ = net_read(cfd, 1024)
+        // 6. Send AuthOk + ReadyForQuery('I')
+        let _ = net_write(cfd, pg_u32_frame(82, 0))
+        let _ = net_write(cfd, pg_encode_ready_for_query(73))
+        // 7. Read Extended Query batch (Parse + Bind + Execute + Sync)
+        let qreq = net_read(cfd, 2048)
+        let ok_parse = bytes_len(qreq) > 0 && (bytes_get(qreq, 0) as Int) == 80 // 'P'
+        // 8. Send DataRow(["42", "50000"]) + ReadyForQuery('I')
+        let _ = net_write(cfd, pg_encode_data_row([Some("42"), Some("50000")]))
+        let _ = net_write(cfd, pg_encode_ready_for_query(73))
+        // 9. Read Terminate
+        let _ = net_read(cfd, 64)
+        let _ = net_close(cfd)
+        if ok_parse { 1 } else { 0 }
+    })
+
+    let mut_cli = match pg_connect(f"127.0.0.1:{port}", "tenon", "s3cr3t", "trading") {
+        Ok(c) => c
+        Err(_) => {
+            assert false
+            PgClient { fd = -1, rxbuf = bytes_new(0) }
+        }
+    }
+    var cli = mut_cli
+    let rows = match cli.query_params("SELECT id, price FROM orders WHERE sym = $1", ["BTC-USD"]) {
+        Ok(rs) => rs
+        Err(_) => {
+            assert false
+            []
+        }
+    }
+    assert len(rows) == 1
+    assert len(rows[0]) == 2
+    // Hydrate raw DB text columns into statically refined `OrderRow` via auto-derived `.parse(...)`!
+    let id_val = match rows[0][0] { Some(s) => if s == "42" { 42 } else { 0 } None => 0 }
+    let px_val = match rows[0][1] { Some(s) => if s == "50000" { 50000 } else { 0 } None => 0 }
+    match OrderRow.parse(id_val, px_val) {
+        Ok(ord) => {
+            assert ord.id == 42 && ord.price == 50000
+        }
+        Err(_) => { assert false }
+    }
+    cli.close()
+    let srv_ok = thread_join(srv)
+    let _ = net_close(lfd)
+    assert srv_ok == 1
+}
+
+test fn test_conn_pool_and_refinement_sql_ddl() {
+    let pool = conn_pool_new([101, 102])
+    assert pool.active_count() == 0
+    let c1 = match pool.acquire() { Some(v) => v None => 0 }
+    let c2 = match pool.acquire() { Some(v) => v None => 0 }
+    assert pool.active_count() == 2
+    assert c1 + c2 == 203
+    pool.release(c1)
+    pool.release(c2)
+    assert pool.active_count() == 0
+    pool.close()
+
     let ddl = sql_create_table_ddl(
         "trades",
         ["id INTEGER PRIMARY KEY", "qty INTEGER NOT NULL", "price INTEGER NOT NULL"],

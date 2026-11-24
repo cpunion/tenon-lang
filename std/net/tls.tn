@@ -1,5 +1,17 @@
 // std/net/tls.tn — Production OpenSSL/TLS C-ABI Bindings (`@link("ssl")`, `@link("crypto")`)
-// Links directly against system OpenSSL/LibreSSL via Tenon's bidirectional C FFI.
+// Supports TLS 1.2/1.3 client & server contexts, SNI (`SSL_CTRL_SET_TLSEXT_HOSTNAME`),
+// system CA peer verification (`SSL_VERIFY_PEER`), PEM certificate/key loading,
+// non-blocking Reactor (`SSL_ERROR_WANT_READ`/`SSL_ERROR_WANT_WRITE`), and HTTPS helpers.
+
+import "std/net/reactor.tn"
+import "std/net/http.tn"
+
+pub const SSL_VERIFY_NONE         Int = 0
+pub const SSL_VERIFY_PEER         Int = 1
+pub const SSL_FILETYPE_PEM        Int = 1
+pub const SSL_CTRL_SET_TLSEXT_HOSTNAME Int = 55
+pub const SSL_ERROR_WANT_READ     Int = 2
+pub const SSL_ERROR_WANT_WRITE    Int = 3
 
 @link("crypto")
 extern "C" fn OpenSSL_version_num() UInt64
@@ -17,16 +29,34 @@ extern "C" fn SSL_CTX_new(method Ptr[CVoid]) MutPtr[CVoid]
 extern "C" fn SSL_CTX_free(ctx MutPtr[CVoid])
 
 @link("ssl")
+extern "C" fn SSL_CTX_set_default_verify_paths(ctx MutPtr[CVoid]) CInt
+
+@link("ssl")
+extern "C" fn SSL_CTX_set_verify(ctx MutPtr[CVoid], mode CInt, cb Ptr[CVoid])
+
+@link("ssl")
+extern "C" fn SSL_CTX_use_certificate_chain_file(ctx MutPtr[CVoid], file Ptr[UInt8]) CInt
+
+@link("ssl")
+extern "C" fn SSL_CTX_use_PrivateKey_file(ctx MutPtr[CVoid], file Ptr[UInt8], typ CInt) CInt
+
+@link("ssl")
 extern "C" fn SSL_new(ctx MutPtr[CVoid]) MutPtr[CVoid]
 
 @link("ssl")
 extern "C" fn SSL_set_fd(ssl MutPtr[CVoid], fd CInt) CInt
 
 @link("ssl")
+extern "C" fn SSL_ctrl(ssl MutPtr[CVoid], cmd CInt, larg Int64, parg Ptr[CVoid]) Int64
+
+@link("ssl")
 extern "C" fn SSL_connect(ssl MutPtr[CVoid]) CInt
 
 @link("ssl")
 extern "C" fn SSL_accept(ssl MutPtr[CVoid]) CInt
+
+@link("ssl")
+extern "C" fn SSL_get_error(ssl MutPtr[CVoid], ret CInt) CInt
 
 @link("ssl")
 extern "C" fn SSL_read(ssl MutPtr[CVoid], buf MutPtr[UInt8], num CInt) CInt
@@ -80,17 +110,67 @@ pub fn tls_server_context() Result[TlsContext, Text] {
 }
 
 impl TlsContext {
-    pub fn connect_fd(self, sock_fd Int) Result[TlsStream, Text] {
+    pub fn enable_verify_peer(self) Result[Bool, Text] {
+        unsafe {
+            let rc = SSL_CTX_set_default_verify_paths(self.raw)
+            if rc != 1 {
+                return Err("SSL_CTX_set_default_verify_paths failed")
+            }
+            let null_cb Ptr[CVoid] = 0 as Ptr[CVoid]
+            SSL_CTX_set_verify(self.raw, SSL_VERIFY_PEER as CInt, null_cb)
+            Ok(true)
+        }
+    }
+
+    pub fn load_cert_key(self, cert_path Text, key_path Text) Result[Bool, Text] {
+        unsafe {
+            let cp = text_cstr_ptr(cert_path)
+            if SSL_CTX_use_certificate_chain_file(self.raw, cp) != 1 {
+                return Err("SSL_CTX_use_certificate_chain_file failed for " ++ cert_path)
+            }
+            let kp = text_cstr_ptr(key_path)
+            if SSL_CTX_use_PrivateKey_file(self.raw, kp, SSL_FILETYPE_PEM as CInt) != 1 {
+                return Err("SSL_CTX_use_PrivateKey_file failed for " ++ key_path)
+            }
+            Ok(true)
+        }
+    }
+
+    pub fn connect_fd_sni(self, sock_fd Int, sni_host Text) Result[TlsStream, Text] {
         unsafe {
             let ssl = SSL_new(self.raw)
             if ptr_is_null(ssl) {
                 return Err("SSL_new failed")
             }
             let _ = SSL_set_fd(ssl, sock_fd as CInt)
+            if len(sni_host) > 0 {
+                let hp = text_cstr_ptr(sni_host)
+                let _ = SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME as CInt, 0, hp as Ptr[CVoid])
+            }
             let rc = SSL_connect(ssl)
             if rc != 1 {
                 SSL_free(ssl)
                 return Err("TLS handshake SSL_connect failed")
+            }
+            Ok(TlsStream { raw = ssl, fd = sock_fd })
+        }
+    }
+
+    pub fn connect_fd(self, sock_fd Int) Result[TlsStream, Text] {
+        self.connect_fd_sni(sock_fd, "")
+    }
+
+    pub fn accept_fd(self, sock_fd Int) Result[TlsStream, Text] {
+        unsafe {
+            let ssl = SSL_new(self.raw)
+            if ptr_is_null(ssl) {
+                return Err("SSL_new failed")
+            }
+            let _ = SSL_set_fd(ssl, sock_fd as CInt)
+            let rc = SSL_accept(ssl)
+            if rc != 1 {
+                SSL_free(ssl)
+                return Err("TLS handshake SSL_accept failed")
             }
             Ok(TlsStream { raw = ssl, fd = sock_fd })
         }
@@ -114,6 +194,79 @@ impl TlsStream {
         }
     }
 
+    pub fn write_all(self, data Text) Result[Int, Text] {
+        let total = len(data)
+        var sent = 0
+        while sent < total {
+            let chunk = if sent == 0 { data } else { str_slice(data, sent, total) }
+            let n = self.write_text(chunk)
+            if n <= 0 {
+                return Err("SSL_write failed")
+            }
+            sent += n
+        }
+        Ok(sent)
+    }
+
+    pub fn read_text(self, max_bytes Int) Text {
+        let cap = if max_bytes < 1 { 1 } else { max_bytes }
+        unsafe {
+            let buf MutPtr[UInt8] = raw_alloc(cap + 1)
+            if ptr_is_null(buf) {
+                return ""
+            }
+            let n = SSL_read(self.raw, buf, cap as CInt) as Int
+            if n <= 0 {
+                let _ = raw_free(buf, cap + 1)
+                return ""
+            }
+            let end_p = ptr_add(buf, n)
+            ptr_write(end_p, 0 as UInt8)
+            let s = cstr_to_text(buf as Ptr[UInt8])
+            let _ = raw_free(buf, cap + 1)
+            s
+        }
+    }
+
+    /// Non-blocking TLS read integrated with OS `kqueue`/`epoll` Reactor (`SSL_ERROR_WANT_READ`/`WANT_WRITE`).
+    pub fn read_reactor(self, max_bytes Int, rfd Int, timeout_ms Int) Result[Text, Text] {
+        let cap = if max_bytes < 1 { 1 } else { max_bytes }
+        unsafe {
+            let buf MutPtr[UInt8] = raw_alloc(cap + 1)
+            if ptr_is_null(buf) {
+                return Err("raw_alloc failed")
+            }
+            var tries = 0
+            while tries < 32 {
+                let rc = SSL_read(self.raw, buf, cap as CInt)
+                let n = rc as Int
+                if n > 0 {
+                    let end_p = ptr_add(buf, n)
+                    ptr_write(end_p, 0 as UInt8)
+                    let s = cstr_to_text(buf as Ptr[UInt8])
+                    let _ = raw_free(buf, cap + 1)
+                    return Ok(s)
+                }
+                let err = SSL_get_error(self.raw, rc) as Int
+                if err == SSL_ERROR_WANT_READ {
+                    let _ = reactor_add(rfd, self.fd, EVENT_READ, 1)
+                    let _ = reactor_wait(rfd, timeout_ms, 8)
+                    let _ = reactor_del(rfd, self.fd)
+                } else if err == SSL_ERROR_WANT_WRITE {
+                    let _ = reactor_add(rfd, self.fd, EVENT_WRITE, 1)
+                    let _ = reactor_wait(rfd, timeout_ms, 8)
+                    let _ = reactor_del(rfd, self.fd)
+                } else {
+                    let _ = raw_free(buf, cap + 1)
+                    return Ok("")
+                }
+                tries += 1
+            }
+            let _ = raw_free(buf, cap + 1)
+            Err("TLS read_reactor timed out")
+        }
+    }
+
     pub fn close(self) {
         unsafe {
             if !ptr_is_null(self.raw) {
@@ -122,4 +275,80 @@ impl TlsStream {
             }
         }
     }
+}
+
+/// Performs a complete HTTP/1.1 GET over TLS using `ctx` and optional SNI hostname.
+pub fn https_get_with_context(ctx TlsContext, host_port Text, sni_host Text, target Text) Result[HttpResponse, Text] {
+    let fd = net_tcp_connect(host_port)
+    if fd < 0 {
+        return Err("TCP connect failed: " ++ host_port)
+    }
+    let _ = net_set_nodelay(fd, true)
+    let stream = match ctx.connect_fd_sni(fd, sni_host) {
+        Ok(s) => s
+        Err(e) => {
+            let _ = net_close(fd)
+            return Err(e)
+        }
+    }
+    let req_wire = encode_http_request("GET", host_port, target, [], "", false)
+    match stream.write_all(req_wire) {
+        Ok(_) => {}
+        Err(e) => {
+            stream.close()
+            let _ = net_close(fd)
+            return Err(e)
+        }
+    }
+    var buf = ""
+    while true {
+        let chunk = stream.read_text(8192)
+        if len(chunk) == 0 {
+            break
+        }
+        buf = buf ++ chunk
+        match parse_http_response(buf) {
+            Some((res, _)) => {
+                stream.close()
+                let _ = net_close(fd)
+                return Ok(res)
+            }
+            None => {}
+        }
+    }
+    stream.close()
+    let _ = net_close(fd)
+    match parse_http_response(buf) {
+        Some((res, _)) => Ok(res)
+        None => Err("incomplete HTTPS response")
+    }
+}
+
+/// Serves one HTTP/1.1 request over an accepted TLS stream.
+pub fn https_serve_stream(stream TlsStream, handler fn(HttpRequest) HttpResponse) Int {
+    var buf = ""
+    while true {
+        let chunk = stream.read_text(8192)
+        if len(chunk) == 0 {
+            return 0
+        }
+        buf = buf ++ chunk
+        match parse_http_request(buf) {
+            Some((req, _)) => {
+                var res = handler(req)
+                res = HttpResponse {
+                    status = res.status
+                    reason = res.reason
+                    headers = res.headers
+                    body = res.body
+                    keep_alive = false
+                }
+                let wire = encode_http_response(res)
+                let _ = stream.write_all(wire)
+                return 1
+            }
+            None => {}
+        }
+    }
+    0
 }

@@ -257,6 +257,8 @@ impl ComptimeContext {
                     "delete" => "DELETE",
                     "patch" => "PATCH",
                     "head" => "HEAD",
+                    "ws" => "GET",
+                    "sse" => "GET",
                     _ => continue,
                 };
                 let path = attr

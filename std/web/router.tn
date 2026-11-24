@@ -1,5 +1,6 @@
-// std/web/router.tn — Fast Segmented HTTP Router & Typed Request Context
-// Supports static segments (`/health`), named params (`/users/:id`), and wildcards (`/files/*path`).
+// std/web/router.tn — Radix / Segment Trie HTTP Router & Typed Request Context
+// Supports O(depth) dispatch for static segments (`/health`), named params (`/users/:id`),
+// and wildcards (`/files/*path`), plus zero-dependency typed JSON/param extraction.
 
 import "std/core/types.tn"
 import "std/text/text.tn"
@@ -14,6 +15,50 @@ pub record RouteParam {
 pub record RouteMatch {
     matched Bool
     params  List[RouteParam]
+}
+
+pub record RadixEdge {
+    segment Text
+    child   Int
+}
+
+pub record RadixMethodSlot {
+    method    Text
+    route_idx Int
+}
+
+pub record RadixNode {
+    edges       List[RadixEdge]
+    param_child Int
+    param_name  Text
+    wild_child  Int
+    wild_name   Text
+    handlers    List[RadixMethodSlot]
+}
+
+pub record RadixRouter {
+    nodes List[RadixNode]
+}
+
+pub record RadixLookup {
+    route_idx        Int
+    matched_other_m  Bool
+    params           List[RouteParam]
+}
+
+pure fn empty_radix_node() RadixNode {
+    RadixNode {
+        edges = []
+        param_child = -1
+        param_name = ""
+        wild_child = -1
+        wild_name = ""
+        handlers = []
+    }
+}
+
+pub pure fn radix_router_new() RadixRouter {
+    RadixRouter { nodes = [empty_radix_node()] }
 }
 
 pure fn split_path_segments(path Text) List[Text] {
@@ -50,6 +95,141 @@ pure fn join_from(segs List[Text], start Int) Text {
     out
 }
 
+pure fn find_static_edge(edges List[RadixEdge], seg Text) Int {
+    var i = 0
+    while i < len(edges) {
+        let e = edges[i]
+        if e.segment == seg {
+            return e.child
+        }
+        i += 1
+    }
+    -1
+}
+
+impl RadixRouter {
+    /// Inserts `(method, pattern, route_idx)` into the segment radix trie.
+    pub pure fn insert(self, method Text, pattern Text, route_idx Int) RadixRouter {
+        let segs = split_path_segments(pattern)
+        var nodes = self.nodes
+        var cur = 0
+        var i = 0
+        while i < len(segs) {
+            let s = segs[i]
+            let node = nodes[cur]
+            if len(s) > 0 && byte_at(s, 0) == 42 {
+                // Wildcard `*name`
+                let wname = str_slice(s, 1, len(s))
+                if node.wild_child >= 0 {
+                    cur = node.wild_child
+                } else {
+                    let nid = len(nodes)
+                    nodes = push(nodes, empty_radix_node())
+                    nodes[cur] = RadixNode {
+                        edges = node.edges
+                        param_child = node.param_child
+                        param_name = node.param_name
+                        wild_child = nid
+                        wild_name = wname
+                        handlers = node.handlers
+                    }
+                    cur = nid
+                }
+                break
+            } else if len(s) > 0 && byte_at(s, 0) == 58 {
+                // Param `:name`
+                let pname = str_slice(s, 1, len(s))
+                if node.param_child >= 0 {
+                    cur = node.param_child
+                } else {
+                    let nid = len(nodes)
+                    nodes = push(nodes, empty_radix_node())
+                    nodes[cur] = RadixNode {
+                        edges = node.edges
+                        param_child = nid
+                        param_name = pname
+                        wild_child = node.wild_child
+                        wild_name = node.wild_name
+                        handlers = node.handlers
+                    }
+                    cur = nid
+                }
+            } else {
+                let existing = find_static_edge(node.edges, s)
+                if existing >= 0 {
+                    cur = existing
+                } else {
+                    let nid = len(nodes)
+                    nodes = push(nodes, empty_radix_node())
+                    var new_edges = node.edges
+                    new_edges = push(new_edges, RadixEdge { segment = s, child = nid })
+                    nodes[cur] = RadixNode {
+                        edges = new_edges
+                        param_child = node.param_child
+                        param_name = node.param_name
+                        wild_child = node.wild_child
+                        wild_name = node.wild_name
+                        handlers = node.handlers
+                    }
+                    cur = nid
+                }
+            }
+            i += 1
+        }
+        let leaf = nodes[cur]
+        var hs = leaf.handlers
+        hs = push(hs, RadixMethodSlot { method = method, route_idx = route_idx })
+        nodes[cur] = RadixNode {
+            edges = leaf.edges
+            param_child = leaf.param_child
+            param_name = leaf.param_name
+            wild_child = leaf.wild_child
+            wild_name = leaf.wild_name
+            handlers = hs
+        }
+        RadixRouter { nodes = nodes }
+    }
+
+    /// O(path depth) lookup: static edges take priority over `:param`, which takes priority over `*wildcard`.
+    pub pure fn lookup(self, method Text, path Text) RadixLookup {
+        let segs = split_path_segments(path)
+        var params List[RouteParam] = []
+        var cur = 0
+        var i = 0
+        while i < len(segs) {
+            let s = segs[i]
+            let node = self.nodes[cur]
+            let st_child = find_static_edge(node.edges, s)
+            if st_child >= 0 {
+                cur = st_child
+            } else if node.param_child >= 0 {
+                params = push(params, RouteParam { name = node.param_name, value = s })
+                cur = node.param_child
+            } else if node.wild_child >= 0 {
+                let rest = join_from(segs, i)
+                params = push(params, RouteParam { name = node.wild_name, value = rest })
+                cur = node.wild_child
+                break
+            } else {
+                return RadixLookup { route_idx = -1, matched_other_m = false, params = [] }
+            }
+            i += 1
+        }
+        let leaf = self.nodes[cur]
+        var matched_other = false
+        var hi = 0
+        while hi < len(leaf.handlers) {
+            let slot = leaf.handlers[hi]
+            if slot.method == method {
+                return RadixLookup { route_idx = slot.route_idx, matched_other_m = false, params = params }
+            }
+            matched_other = true
+            hi += 1
+        }
+        RadixLookup { route_idx = -1, matched_other_m = matched_other, params = [] }
+    }
+}
+
 pub pure fn match_route_pattern(pattern Text, path Text) RouteMatch {
     let psegs = split_path_segments(pattern)
     let tsegs = split_path_segments(path)
@@ -58,7 +238,6 @@ pub pure fn match_route_pattern(pattern Text, path Text) RouteMatch {
     while i < len(psegs) {
         let ps = psegs[i]
         if len(ps) > 0 && byte_at(ps, 0) == 42 {
-            // Wildcard `*name` captures the rest of the path
             let pname = str_slice(ps, 1, len(ps))
             let rest = join_from(tsegs, i)
             params = push(params, RouteParam { name = pname, value = rest })
@@ -69,7 +248,6 @@ pub pure fn match_route_pattern(pattern Text, path Text) RouteMatch {
         }
         let ts = tsegs[i]
         if len(ps) > 0 && byte_at(ps, 0) == 58 {
-            // Named parameter `:id`
             let pname = str_slice(ps, 1, len(ps))
             params = push(params, RouteParam { name = pname, value = ts })
         } else if ps != ts {

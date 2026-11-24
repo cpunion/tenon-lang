@@ -243,17 +243,20 @@ pure fn parse_hex_int(s Text) Int {
     acc
 }
 
-pure fn trim_ascii(s Text) Text {
-    let n = len(s)
-    var a = 0
-    while a < n && (byte_at(s, a) == 32 || byte_at(s, a) == 9 || byte_at(s, a) == 13) {
+pure fn trim_slice(s Text, start Int, end Int) Text {
+    var a = start
+    while a < end && (byte_at(s, a) == 32 || byte_at(s, a) == 9 || byte_at(s, a) == 13) {
         a += 1
     }
-    var b = n
+    var b = end
     while b > a && (byte_at(s, b - 1) == 32 || byte_at(s, b - 1) == 9 || byte_at(s, b - 1) == 13) {
         b -= 1
     }
     str_slice(s, a, b)
+}
+
+pure fn trim_ascii(s Text) Text {
+    trim_slice(s, 0, len(s))
 }
 
 pure fn decode_chunked_body(raw Text, start Int) Option[(Text, Int)] {
@@ -343,19 +346,24 @@ pub pure fn parse_http_request(raw Text) Option[(HttpRequest, Int)] {
             colon += 1
         }
         if colon < lend {
-            let hname = trim_ascii(str_slice(raw, pos, colon))
-            let hval = trim_ascii(str_slice(raw, colon + 1, lend))
-            if ascii_eq_ignore_case(hname, "content-length") {
-                content_len = parse_decimal_int(hval)
-            } else if ascii_eq_ignore_case(hname, "transfer-encoding") {
-                if ascii_eq_ignore_case(hval, "chunked") {
-                    is_chunked = true
+            let hname = trim_slice(raw, pos, colon)
+            let hval = trim_slice(raw, colon + 1, lend)
+            let fl = ascii_lower_byte(byte_at(hname, 0))
+            if fl == 99 { // 'c'
+                if ascii_eq_ignore_case(hname, "content-length") {
+                    content_len = parse_decimal_int(hval)
+                } else if ascii_eq_ignore_case(hname, "connection") {
+                    if ascii_eq_ignore_case(hval, "close") {
+                        keep_alive = false
+                    } else if ascii_eq_ignore_case(hval, "keep-alive") {
+                        keep_alive = true
+                    }
                 }
-            } else if ascii_eq_ignore_case(hname, "connection") {
-                if ascii_eq_ignore_case(hval, "close") {
-                    keep_alive = false
-                } else if ascii_eq_ignore_case(hval, "keep-alive") {
-                    keep_alive = true
+            } else if fl == 116 { // 't'
+                if ascii_eq_ignore_case(hname, "transfer-encoding") {
+                    if ascii_eq_ignore_case(hval, "chunked") {
+                        is_chunked = true
+                    }
                 }
             }
             headers = push(headers, HttpHeader { name = hname, value = hval })

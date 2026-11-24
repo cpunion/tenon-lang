@@ -9417,7 +9417,7 @@ pub fn main() Int {
             String::from_utf8_lossy(&run1.stderr)
         );
 
-        // 2. Real OpenSSL TLS context (`std/net/tls.tn`) when OpenSSL libs are discovered via pkg-config
+        // 2. Real OpenSSL TLS 1.3 loopback HTTPS handshake + GET/200 (`std/net/tls.tn`)
         if let Ok(pc) = Command::new("pkg-config").args(["--libs-only-L", "openssl"]).output() {
             if pc.status.success() {
                 let lflags = String::from_utf8_lossy(&pc.stdout);
@@ -9425,21 +9425,75 @@ pub fn main() Int {
                     .split_whitespace()
                     .filter_map(|t| t.strip_prefix("-L").map(|s| s.to_string()))
                     .collect();
-                let tls_src = r#"
-import "std/net/tls.tn"
+                let cert_path = std::env::temp_dir().join(format!("tenon_tls_cert_{}.pem", pid));
+                let key_path = std::env::temp_dir().join(format!("tenon_tls_key_{}.pem", pid));
+                let gen_ok = Command::new("openssl")
+                    .args([
+                        "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", &key_path.to_string_lossy(),
+                        "-out", &cert_path.to_string_lossy(),
+                        "-days", "1", "-subj", "/CN=localhost",
+                    ])
+                    .output()
+                    .is_ok_and(|o| o.status.success());
 
+                let tls_src = if gen_ok {
+                    format!(
+                        r#"
+import "std/net/tls.tn"
+import "std/sync/sync.tn"
+
+pub fn main() Int {{
+    let ver = tls_openssl_version()
+    let sctx = match tls_server_context() {{ Ok(c) => c Err(_) => {{ return -1 }} }}
+    match sctx.load_cert_key("{}", "{}") {{
+        Ok(_) => {{}}
+        Err(_) => {{ sctx.close(); return -2 }}
+    }}
+    let cctx = match tls_client_context() {{ Ok(c) => c Err(_) => {{ sctx.close(); return -3 }} }}
+    let lfd = net_tcp_listen("127.0.0.1:0")
+    if lfd < 0 {{ cctx.close(); sctx.close(); return -4 }}
+    let port = net_tcp_local_port(lfd)
+    let srv = thread_spawn(|| {{
+        let cfd = net_tcp_accept(lfd)
+        if cfd < 0 {{ return -1 }}
+        let served = match sctx.accept_fd(cfd) {{
+            Ok(st) => {{
+                let n = https_serve_stream(st, |req| http_ok("tls:" ++ req.path))
+                st.close()
+                n
+            }}
+            Err(_) => -1
+        }}
+        let _ = net_close(cfd)
+        served
+    }})
+    let ok = match https_get_with_context(cctx, f"127.0.0.1:{{port}}", "localhost", "/secure") {{
+        Ok(res) => if res.status == 200 && res.body == "tls:/secure" && ver > 0 {{ 1 }} else {{ -5 }}
+        Err(_) => -6
+    }}
+    let srv_n = thread_join(srv)
+    let _ = net_close(lfd)
+    cctx.close()
+    sctx.close()
+    if ok == 1 && srv_n == 1 {{ 1 }} else {{ ok }}
+}}
+"#,
+                        cert_path.to_string_lossy().replace('\\', "\\\\"),
+                        key_path.to_string_lossy().replace('\\', "\\\\")
+                    )
+                } else {
+                    r#"
+import "std/net/tls.tn"
 pub fn main() Int {
     let ver = tls_openssl_version()
-    let ctx_res = tls_client_context()
-    match ctx_res {
-        Ok(ctx) => {
-            ctx.close()
-            if ver > 0 { 1 } else { 0 }
-        }
+    match tls_client_context() {
+        Ok(ctx) => { ctx.close(); if ver > 0 { 1 } else { 0 } }
         Err(_) => 0
     }
 }
-"#;
+"#.to_string()
+                };
                 let tmp_tls = repo_root.join(format!("target/tenon_tls_test_{}.tn", pid));
                 fs::write(&tmp_tls, tls_src).unwrap();
                 let tls_prog = tenon_syntax::load_program_with_imports(&tmp_tls).unwrap();
@@ -9455,6 +9509,8 @@ pub fn main() Int {
                 compile_with_options(&tls_prog, &tls_bin, &tls_opts).expect("OpenSSL TLS LLVM AOT link failed");
                 let run2 = Command::new(&tls_bin).output().unwrap();
                 let _ = fs::remove_file(&tls_bin);
+                let _ = fs::remove_file(&cert_path);
+                let _ = fs::remove_file(&key_path);
                 let out2 = String::from_utf8_lossy(&run2.stdout);
                 assert!(
                     run2.status.success() && out2.contains("main() => 1") && out2.contains("live_objects=0"),
