@@ -13,8 +13,9 @@ pub use derive::expand_derives;
 pub use layout::*;
 pub use parser::{parse, parse_expr_str, parse_with_file_id};
 pub use project::{
-    DepSpec, LoadMode, TenonManifest, discover_test_packages, find_enclosing_manifest,
-    is_test_source_file, load_package, load_package_with_config, load_package_with_overlays,
+    DepSpec, LoadMode, LockedPackage, TenonManifest, discover_test_packages,
+    find_enclosing_manifest, format_dep_tree, generate_lockfile, is_test_source_file, load_package,
+    load_package_with_config, load_package_with_overlays, verify_lockfile,
 };
 pub use span::{ParseError, Span};
 

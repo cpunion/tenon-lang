@@ -8711,4 +8711,119 @@ pub fn main() Int {
         assert!(fs::metadata(&obj_path).unwrap().len() > 100);
         let _ = fs::remove_file(&obj_path);
     }
+
+    #[test]
+    fn llvm_aot_sqlite3_check_constraints_and_openssl_tls_zero_leaks() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let pid = std::process::id();
+
+        // 1. Real SQLite3 `:memory:` DB with refinement-derived `CHECK(qty > 0)` constraint!
+        let sql_src = r#"
+import "std/db/sqlite.tn"
+
+pub fn main() Int {
+    let db = match sqlite_open(":memory:") {
+        Ok(d) => d
+        Err(_) => { return -1 }
+    }
+    let ddl = sql_create_table_ddl(
+        "orders",
+        ["id INTEGER PRIMARY KEY", "sym TEXT NOT NULL", "qty INTEGER NOT NULL", "px INTEGER NOT NULL"],
+        ["qty > 0", "px >= 1"]
+    )
+    match db.exec(ddl) {
+        Ok(_) => {}
+        Err(_) => { db.close(); return -2 }
+    }
+    let _ = db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (1, 'BTC', 10, 50000);")
+    let _ = db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (2, 'ETH', 25, 3000);")
+    // Invalid row (`qty = -5`) MUST be rejected by SQLite CHECK constraint!
+    let rejected = match db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (3, 'BAD', -5, 100);") {
+        Ok(_) => 0
+        Err(_) => 1
+    }
+    let sum_qty = match db.query_int("SELECT SUM(qty) FROM orders;") {
+        Ok(v) => v
+        Err(_) => -3
+    }
+    let first_sym = match db.query_text("SELECT sym FROM orders WHERE id = 1;") {
+        Ok(s) => s
+        Err(_) => ""
+    }
+    db.close()
+    if rejected == 1 && first_sym == "BTC" { sum_qty } else { -99 }
+}
+"#;
+        let tmp_tn = repo_root.join(format!("target/tenon_sqlite_test_{}.tn", pid));
+        let _ = fs::create_dir_all(tmp_tn.parent().unwrap());
+        fs::write(&tmp_tn, sql_src).unwrap();
+        let sql_prog = tenon_syntax::load_program_with_imports(&tmp_tn).unwrap();
+        let _ = fs::remove_file(&tmp_tn);
+        let sql_rep = tenon_verify::check_program(&sql_prog);
+        assert!(sql_rep.ok, "sqlite test failed verification: {:?}", sql_rep.diagnostics);
+
+        let sql_bin = std::env::temp_dir().join(format!("tenon_llvm_sqlite_{}", pid));
+        let opts = BuildOptions {
+            opt_level: "O2".into(),
+            ..Default::default()
+        };
+        compile_with_options(&sql_prog, &sql_bin, &opts).expect("SQLite3 LLVM AOT link failed");
+        let run1 = Command::new(&sql_bin).output().unwrap();
+        let _ = fs::remove_file(&sql_bin);
+        let out1 = String::from_utf8_lossy(&run1.stdout);
+        assert!(
+            run1.status.success() && out1.contains("main() => 35") && out1.contains("live_objects=0"),
+            "SQLite3 AOT run failed: stdout={} stderr={}",
+            out1,
+            String::from_utf8_lossy(&run1.stderr)
+        );
+
+        // 2. Real OpenSSL TLS context (`std/net/tls.tn`) when OpenSSL libs are discovered via pkg-config
+        if let Ok(pc) = Command::new("pkg-config").args(["--libs-only-L", "openssl"]).output() {
+            if pc.status.success() {
+                let lflags = String::from_utf8_lossy(&pc.stdout);
+                let link_dirs: Vec<String> = lflags
+                    .split_whitespace()
+                    .filter_map(|t| t.strip_prefix("-L").map(|s| s.to_string()))
+                    .collect();
+                let tls_src = r#"
+import "std/net/tls.tn"
+
+pub fn main() Int {
+    let ver = tls_openssl_version()
+    let ctx_res = tls_client_context()
+    match ctx_res {
+        Ok(ctx) => {
+            ctx.close()
+            if ver > 0 { 1 } else { 0 }
+        }
+        Err(_) => 0
+    }
+}
+"#;
+                let tmp_tls = repo_root.join(format!("target/tenon_tls_test_{}.tn", pid));
+                fs::write(&tmp_tls, tls_src).unwrap();
+                let tls_prog = tenon_syntax::load_program_with_imports(&tmp_tls).unwrap();
+                let _ = fs::remove_file(&tmp_tls);
+                let tls_rep = tenon_verify::check_program(&tls_prog);
+                assert!(tls_rep.ok, "tls test verify failed: {:?}", tls_rep.diagnostics);
+                let tls_bin = std::env::temp_dir().join(format!("tenon_llvm_tls_{}", pid));
+                let tls_opts = BuildOptions {
+                    opt_level: "O2".into(),
+                    link_dirs,
+                    ..Default::default()
+                };
+                compile_with_options(&tls_prog, &tls_bin, &tls_opts).expect("OpenSSL TLS LLVM AOT link failed");
+                let run2 = Command::new(&tls_bin).output().unwrap();
+                let _ = fs::remove_file(&tls_bin);
+                let out2 = String::from_utf8_lossy(&run2.stdout);
+                assert!(
+                    run2.status.success() && out2.contains("main() => 1") && out2.contains("live_objects=0"),
+                    "OpenSSL TLS AOT run failed: stdout={} stderr={}",
+                    out2,
+                    String::from_utf8_lossy(&run2.stderr)
+                );
+            }
+        }
+    }
 }

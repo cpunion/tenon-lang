@@ -1,0 +1,96 @@
+// std/net/net_protocols_test.tn — End-to-End Tests for Async Reactor Fusion, RFC 6455 WebSocket & SSE
+
+import "std/net/reactor.tn"
+import "std/net/async_net.tn"
+import "std/net/ws.tn"
+import "std/net/sse.tn"
+import "std/sync/sync.tn"
+
+test fn test_ws_rfc6455_test_vector_and_frame_roundtrip() {
+    // Official RFC 6455 Section 1.3 test vector!
+    let accept = ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==")
+    assert accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+
+    let upgrade = ws_upgrade_response("dGhlIHNhbXBsZSBub25jZQ==")
+    assert upgrade.contains("101 Switching Protocols")
+    assert upgrade.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+
+    // Masked client frame roundtrip
+    let masked = ws_encode_frame(WS_OP_TEXT, "hello tenon ws!", true, 305419896)
+    match ws_decode_frame(masked, 0) {
+        Ok(f) => {
+            assert f.fin
+            assert f.opcode == WS_OP_TEXT
+            assert f.masked
+            assert f.payload == "hello tenon ws!"
+            assert f.consumed == bytes_len(masked)
+        }
+        Err(_) => { assert false }
+    }
+
+    // Unmasked server frame roundtrip (16-bit extended length > 125 bytes)
+    var big = ""
+    var i = 0
+    while i < 140 {
+        big = big ++ "A"
+        i += 1
+    }
+    let srv = ws_encode_frame(WS_OP_TEXT, big, false, 0)
+    match ws_decode_frame(srv, 0) {
+        Ok(f) => {
+            assert !f.masked
+            assert len(f.payload) == 140
+            assert f.payload == big
+        }
+        Err(_) => { assert false }
+    }
+}
+
+test fn test_sse_format_and_parse_roundtrip() {
+    let evs = [
+        SseEvent { event = "tick", id = "1", data = "{\"px\":100}" },
+        SseEvent { event = "tick", id = "2", data = "{\"px\":102}" }
+    ]
+    let resp = sse_http_response(evs)
+    assert resp.status == 200
+    let parsed = sse_parse_stream(resp.body)
+    assert len(parsed) == 2
+    assert parsed[0].event == "tick"
+    assert parsed[0].id == "1"
+    assert parsed[0].data == "{\"px\":100}"
+    assert parsed[1].id == "2"
+    assert parsed[1].data == "{\"px\":102}"
+}
+
+async fn async_echo_server_once(lfd Int) Int {
+    let rfd = reactor_new()
+    let cfd = await async_accept(rfd, lfd, 2000)
+    let r1 = await async_wait_readable(rfd, cfd, 2000)
+    let _ = r1
+    let r2 = await async_wait_writable(rfd, cfd, 2000)
+    let _ = r2
+    let msg = net_read_text(cfd, 1024)
+    let _ = net_write_text(cfd, "echo:" ++ msg)
+    let n = len(msg)
+    let _ = net_close(cfd)
+    let _ = reactor_close(rfd)
+    n
+}
+
+test fn test_async_reactor_tcp_echo() {
+    let lfd = net_tcp_listen("127.0.0.1:0")
+    assert lfd >= 0
+    let port = net_tcp_local_port(lfd)
+    let srv = thread_spawn(|| {
+        block_on(async_echo_server_once(lfd))
+    })
+    let cfd = net_tcp_connect(f"127.0.0.1:{port}")
+    assert cfd >= 0
+    let _ = net_write_text(cfd, "ping_async")
+    let reply = net_read_text(cfd, 1024)
+    let _ = net_close(cfd)
+    let n = thread_join(srv)
+    let _ = net_close(lfd)
+    assert n == 10
+    assert reply == "echo:ping_async"
+}

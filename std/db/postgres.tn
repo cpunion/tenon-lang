@@ -1,0 +1,101 @@
+// std/db/postgres.tn — Pure Tenon PostgreSQL Wire Protocol v3.0 Codec
+// Encodes StartupMessage, Simple Query ('Q'), Terminate ('X') and decodes backend frames
+// ('R' Auth, 'S' ParameterStatus, 'T' RowDescription, 'D' DataRow, 'C' CommandComplete, 'Z' ReadyForQuery, 'E' Error).
+
+pub record PgFrame {
+    tag      Int
+    length   Int
+    payload  Bytes
+    consumed Int
+}
+
+pure fn push_u32_be(buf Bytes, v Int) Bytes {
+    var out = bytes_push(buf, (v >> 24) & 255)
+    out = bytes_push(out, (v >> 16) & 255)
+    out = bytes_push(out, (v >> 8) & 255)
+    bytes_push(out, v & 255)
+}
+
+pure fn push_cstr(buf Bytes, s Text) Bytes {
+    let sb = text_to_bytes(s)
+    let n = bytes_len(sb)
+    var out = buf
+    var i = 0
+    while i < n {
+        out = bytes_push(out, bytes_get(sb, i) as Int)
+        i += 1
+    }
+    bytes_push(out, 0)
+}
+
+/// Encodes a PostgreSQL v3.0 StartupMessage (`protocol = 196608`).
+pub pure fn pg_encode_startup(user Text, database Text) Bytes {
+    var body = bytes_new(64)
+    body = push_u32_be(body, 196608)
+    body = push_cstr(body, "user")
+    body = push_cstr(body, user)
+    body = push_cstr(body, "database")
+    body = push_cstr(body, database)
+    body = bytes_push(body, 0)
+
+    let total = bytes_len(body) + 4
+    var msg = bytes_new(total)
+    msg = push_u32_be(msg, total)
+    var i = 0
+    while i < bytes_len(body) {
+        msg = bytes_push(msg, bytes_get(body, i) as Int)
+        i += 1
+    }
+    msg
+}
+
+/// Encodes a PostgreSQL Simple Query (`'Q'` = 81).
+pub pure fn pg_encode_query(sql Text) Bytes {
+    let slen = len(sql)
+    let msg_len = slen + 5
+    var out = bytes_new(msg_len + 1)
+    out = bytes_push(out, 81)
+    out = push_u32_be(out, msg_len)
+    push_cstr(out, sql)
+}
+
+/// Encodes a PostgreSQL Terminate message (`'X'` = 88).
+pub pure fn pg_encode_terminate() Bytes {
+    var out = bytes_new(5)
+    out = bytes_push(out, 88)
+    push_u32_be(out, 4)
+}
+
+/// Encodes a PostgreSQL Backend ReadyForQuery frame (`'Z'` = 90, status `'I'` = 73).
+pub pure fn pg_encode_ready_for_query(status_byte Int) Bytes {
+    var out = bytes_new(6)
+    out = bytes_push(out, 90)
+    out = push_u32_be(out, 5)
+    bytes_push(out, status_byte)
+}
+
+/// Decodes one PostgreSQL wire frame starting at byte offset `start`.
+pub pure fn pg_decode_frame(buf Bytes, start Int) Result[PgFrame, Text] {
+    let blen = bytes_len(buf)
+    if blen - start < 5 {
+        return Err("incomplete postgres frame header")
+    }
+    let tag = bytes_get(buf, start) as Int
+    let msg_len = bytes_read_u32_be(buf, start + 1) as Int
+    if msg_len < 4 || blen - start < 1 + msg_len {
+        return Err("incomplete postgres frame body")
+    }
+    let plen = msg_len - 4
+    var payload = bytes_new(plen)
+    var i = 0
+    while i < plen {
+        payload = bytes_push(payload, bytes_get(buf, start + 5 + i) as Int)
+        i += 1
+    }
+    Ok(PgFrame {
+        tag = tag
+        length = msg_len
+        payload = payload
+        consumed = 1 + msg_len
+    })
+}

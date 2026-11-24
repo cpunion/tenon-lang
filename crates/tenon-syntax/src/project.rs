@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::parser::parse_with_file_id;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,9 @@ pub enum LoadMode {
 #[derive(Debug, Clone, Default)]
 pub struct DepSpec {
     pub path: String,
+    pub git: Option<String>,
+    pub rev: Option<String>,
+    pub version: Option<String>,
     pub configuration: BTreeMap<String, String>,
 }
 
@@ -84,8 +88,12 @@ impl TenonManifest {
                 }
                 Section::Dep(dep) => {
                     let entry = manifest.dependencies.entry(dep.clone()).or_default();
-                    if key == "path" {
-                        entry.path = val;
+                    match key {
+                        "path" => entry.path = val,
+                        "git" => entry.git = Some(val),
+                        "rev" | "tag" | "branch" => entry.rev = Some(val),
+                        "version" => entry.version = Some(val),
+                        _ => {}
                     }
                 }
                 Section::DepConfig(dep) => {
@@ -1448,4 +1456,218 @@ fn rewrite_expr_bindings(expr: &mut Expr, bindings: &LocalBindings) {
         }
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// Package Manager: Deterministic `tenon.lock` Generation, Verification & Tree
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct LockedPackage {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub sha256: String,
+    pub deps: Vec<String>,
+}
+
+fn hash_package_dir(dir: &Path) -> Result<String, String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_pkg_files(dir, dir, &mut files)?;
+    files.sort();
+    let mut hasher = Sha256::new();
+    for f in files {
+        let rel = f
+            .strip_prefix(dir)
+            .unwrap_or(&f)
+            .to_string_lossy()
+            .replace('\\', "/");
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        let bytes = fs::read(&f)
+            .map_err(|e| format!("failed to hash `{}`: {}", f.display(), e))?;
+        hasher.update(&bytes);
+        hasher.update(b"\n");
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_pkg_files(root: &Path, cur: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(cur)
+        .map_err(|e| format!("failed to read `{}`: {}", cur.display(), e))?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            if p != root && p.join("tenon.toml").is_file() {
+                continue;
+            }
+            collect_pkg_files(root, &p, out)?;
+        } else if p.is_file() {
+            let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if fname == "tenon.toml" || fname.ends_with(".tn") {
+                out.push(p);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_locked_graph(
+    dir: &Path,
+    visited: &mut BTreeMap<String, LockedPackage>,
+) -> Result<(), String> {
+    let manifest = TenonManifest::load_from_dir(dir)?
+        .ok_or_else(|| format!("no `tenon.toml` found in `{}`", dir.display()))?;
+    let pkg_name = if manifest.name.is_empty() {
+        dir.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("root")
+            .to_string()
+    } else {
+        manifest.name.clone()
+    };
+    if visited.contains_key(&pkg_name) {
+        return Ok(());
+    }
+    let version = if manifest.version.is_empty() {
+        "0.1.0".to_string()
+    } else {
+        manifest.version.clone()
+    };
+    let digest = hash_package_dir(dir)?;
+    let dep_names: Vec<String> = manifest.dependencies.keys().cloned().collect();
+    visited.insert(
+        pkg_name.clone(),
+        LockedPackage {
+            name: pkg_name,
+            version,
+            source: format!("path:{}", dir.display()),
+            sha256: digest,
+            deps: dep_names,
+        },
+    );
+    for (dep_name, spec) in &manifest.dependencies {
+        if !spec.path.is_empty() {
+            let dep_dir = dir.join(&spec.path);
+            let canon = fs::canonicalize(&dep_dir).unwrap_or(dep_dir);
+            if canon.join("tenon.toml").is_file() {
+                resolve_locked_graph(&canon, visited)?;
+            } else {
+                let dhash = if canon.is_dir() {
+                    hash_package_dir(&canon)?
+                } else {
+                    "missing".into()
+                };
+                visited.entry(dep_name.clone()).or_insert(LockedPackage {
+                    name: dep_name.clone(),
+                    version: spec.version.clone().unwrap_or_else(|| "0.1.0".into()),
+                    source: format!("path:{}", spec.path),
+                    sha256: dhash,
+                    deps: vec![],
+                });
+            }
+        } else if let Some(git_url) = &spec.git {
+            let mut h = Sha256::new();
+            h.update(git_url.as_bytes());
+            if let Some(r) = &spec.rev {
+                h.update(b"@");
+                h.update(r.as_bytes());
+            }
+            visited.entry(dep_name.clone()).or_insert(LockedPackage {
+                name: dep_name.clone(),
+                version: spec.version.clone().unwrap_or_else(|| "0.0.0".into()),
+                source: format!(
+                    "git:{}{}",
+                    git_url,
+                    spec.rev.as_ref().map(|r| format!("#{}", r)).unwrap_or_default()
+                ),
+                sha256: format!("{:x}", h.finalize()),
+                deps: vec![],
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Generates a deterministic `tenon.lock` TOML string for the package at `pkg_dir`.
+pub fn generate_lockfile(pkg_dir: &Path) -> Result<(String, usize), String> {
+    let canon = fs::canonicalize(pkg_dir).unwrap_or_else(|_| pkg_dir.to_path_buf());
+    let mut graph = BTreeMap::new();
+    resolve_locked_graph(&canon, &mut graph)?;
+    let mut out = String::from("# Generated by `tenon pkg lock` — do not edit manually\nversion = 1\n\n");
+    for pkg in graph.values() {
+        out.push_str("[[package]]\n");
+        out.push_str(&format!("name = \"{}\"\n", pkg.name));
+        out.push_str(&format!("version = \"{}\"\n", pkg.version));
+        out.push_str(&format!("source = \"{}\"\n", pkg.source));
+        out.push_str(&format!("sha256 = \"{}\"\n", pkg.sha256));
+        if !pkg.deps.is_empty() {
+            let ds: Vec<String> = pkg.deps.iter().map(|d| format!("\"{}\"", d)).collect();
+            out.push_str(&format!("dependencies = [{}]\n", ds.join(", ")));
+        }
+        out.push('\n');
+    }
+    Ok((out, graph.len()))
+}
+
+/// Verifies that the current package tree matches `tenon.lock` SHA-256 digests (Fail-Closed).
+pub fn verify_lockfile(pkg_dir: &Path) -> Result<usize, String> {
+    let lock_path = pkg_dir.join("tenon.lock");
+    let existing = fs::read_to_string(&lock_path)
+        .map_err(|_| format!("`{}` not found; run `tenon pkg lock` first", lock_path.display()))?;
+    let (fresh, count) = generate_lockfile(pkg_dir)?;
+    if existing.trim() != fresh.trim() {
+        return Err(format!(
+            "FAIL-CLOSED: `tenon.lock` drift detected in `{}` (re-run `tenon pkg lock` after auditing changes)",
+            pkg_dir.display()
+        ));
+    }
+    Ok(count)
+}
+
+/// Formats a human-readable dependency tree for `tenon pkg tree`.
+pub fn format_dep_tree(pkg_dir: &Path) -> Result<String, String> {
+    let canon = fs::canonicalize(pkg_dir).unwrap_or_else(|_| pkg_dir.to_path_buf());
+    let mut graph = BTreeMap::new();
+    resolve_locked_graph(&canon, &mut graph)?;
+    let manifest = TenonManifest::load_from_dir(&canon)?
+        .ok_or_else(|| format!("no `tenon.toml` found in `{}`", canon.display()))?;
+    let root_name = if manifest.name.is_empty() {
+        canon
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("root")
+            .to_string()
+    } else {
+        manifest.name
+    };
+    let mut out = String::new();
+    fn render(
+        name: &str,
+        graph: &BTreeMap<String, LockedPackage>,
+        indent: usize,
+        out: &mut String,
+        seen: &mut BTreeSet<String>,
+    ) {
+        let pad = "  ".repeat(indent);
+        if let Some(pkg) = graph.get(name) {
+            let short_hash = &pkg.sha256[..pkg.sha256.len().min(12)];
+            out.push_str(&format!(
+                "{}{} v{} ({}…)\n",
+                pad, pkg.name, pkg.version, short_hash
+            ));
+            if seen.insert(name.to_string()) {
+                for dep in &pkg.deps {
+                    render(dep, graph, indent + 1, out, seen);
+                }
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    render(&root_name, &graph, 0, &mut out, &mut seen);
+    Ok(out)
 }

@@ -1,0 +1,144 @@
+// std/db/sqlite.tn — Production SQLite3 C-FFI Driver + Refinement-to-SQL `CHECK` DDL Builder
+
+import "std/text/builder.tn"
+
+@link("sqlite3")
+extern "C" fn sqlite3_open(filename Ptr[UInt8], pp_db MutPtr[MutPtr[CVoid]]) CInt
+
+@link("sqlite3")
+extern "C" fn sqlite3_close(db MutPtr[CVoid]) CInt
+
+@link("sqlite3")
+extern "C" fn sqlite3_exec(db MutPtr[CVoid], sql Ptr[UInt8], cb Ptr[CVoid], arg MutPtr[CVoid], err_out MutPtr[MutPtr[UInt8]]) CInt
+
+@link("sqlite3")
+extern "C" fn sqlite3_prepare_v2(db MutPtr[CVoid], sql Ptr[UInt8], nbyte CInt, pp_stmt MutPtr[MutPtr[CVoid]], pz_tail MutPtr[Ptr[UInt8]]) CInt
+
+@link("sqlite3")
+extern "C" fn sqlite3_step(stmt MutPtr[CVoid]) CInt
+
+@link("sqlite3")
+extern "C" fn sqlite3_column_int64(stmt MutPtr[CVoid], col CInt) Int64
+
+@link("sqlite3")
+extern "C" fn sqlite3_column_text(stmt MutPtr[CVoid], col CInt) Ptr[UInt8]
+
+@link("sqlite3")
+extern "C" fn sqlite3_finalize(stmt MutPtr[CVoid]) CInt
+
+@link("sqlite3")
+extern "C" fn sqlite3_changes(db MutPtr[CVoid]) CInt
+
+pub const SQLITE_OK   Int = 0
+pub const SQLITE_ROW  Int = 100
+pub const SQLITE_DONE Int = 101
+
+pub record SqliteDb {
+    raw MutPtr[CVoid]
+}
+
+/// Builds a `CREATE TABLE IF NOT EXISTS` DDL embedding Tenon refinement `CHECK(...)` constraints.
+pub pure fn sql_create_table_ddl(table Text, columns List[Text], check_constraints List[Text]) Text {
+    var b = TextBuilder.new()
+    b.push("CREATE TABLE IF NOT EXISTS ")
+    b.push(table)
+    b.push(" (")
+    var i = 0
+    while i < len(columns) {
+        if i > 0 {
+            b.push(", ")
+        }
+        b.push(columns[i])
+        i += 1
+    }
+    var j = 0
+    while j < len(check_constraints) {
+        b.push(", CHECK(")
+        b.push(check_constraints[j])
+        b.push(")")
+        j += 1
+    }
+    b.push(");")
+    b.finish()
+}
+
+pub fn sqlite_open(path Text) Result[SqliteDb, Text] {
+    unsafe {
+        let slot = raw_alloc(8) as MutPtr[MutPtr[CVoid]]
+        let rc = sqlite3_open(text_cstr_ptr(path), slot) as Int
+        let db = ptr_read(slot)
+        let _ = raw_free(slot as MutPtr[UInt8], 8)
+        if rc != SQLITE_OK || ptr_is_null(db) {
+            Err("sqlite3_open failed")
+        } else {
+            Ok(SqliteDb { raw = db })
+        }
+    }
+}
+
+impl SqliteDb {
+    pub fn exec(self, sql Text) Result[Int, Text] {
+        unsafe {
+            let null_cb = null_ptr[CVoid]() as Ptr[CVoid]
+            let null_arg = null_ptr[CVoid]()
+            let null_err = null_ptr[MutPtr[UInt8]]()
+            let rc = sqlite3_exec(self.raw, text_cstr_ptr(sql), null_cb, null_arg, null_err) as Int
+            if rc != SQLITE_OK {
+                Err("sqlite3_exec failed (constraint or syntax error)")
+            } else {
+                Ok(sqlite3_changes(self.raw) as Int)
+            }
+        }
+    }
+
+    pub fn query_int(self, sql Text) Result[Int, Text] {
+        unsafe {
+            let stmt_slot = raw_alloc(8) as MutPtr[MutPtr[CVoid]]
+            let null_tail = null_ptr[Ptr[UInt8]]()
+            let prc = sqlite3_prepare_v2(self.raw, text_cstr_ptr(sql), -1 as CInt, stmt_slot, null_tail) as Int
+            let stmt = ptr_read(stmt_slot)
+            let _ = raw_free(stmt_slot as MutPtr[UInt8], 8)
+            if prc != SQLITE_OK || ptr_is_null(stmt) {
+                return Err("sqlite3_prepare_v2 failed")
+            }
+            let src = sqlite3_step(stmt) as Int
+            if src != SQLITE_ROW {
+                let _ = sqlite3_finalize(stmt)
+                return Err("sqlite3 query returned no row")
+            }
+            let v = sqlite3_column_int64(stmt, 0 as CInt) as Int
+            let _ = sqlite3_finalize(stmt)
+            Ok(v)
+        }
+    }
+
+    pub fn query_text(self, sql Text) Result[Text, Text] {
+        unsafe {
+            let stmt_slot = raw_alloc(8) as MutPtr[MutPtr[CVoid]]
+            let null_tail = null_ptr[Ptr[UInt8]]()
+            let prc = sqlite3_prepare_v2(self.raw, text_cstr_ptr(sql), -1 as CInt, stmt_slot, null_tail) as Int
+            let stmt = ptr_read(stmt_slot)
+            let _ = raw_free(stmt_slot as MutPtr[UInt8], 8)
+            if prc != SQLITE_OK || ptr_is_null(stmt) {
+                return Err("sqlite3_prepare_v2 failed")
+            }
+            let src = sqlite3_step(stmt) as Int
+            if src != SQLITE_ROW {
+                let _ = sqlite3_finalize(stmt)
+                return Err("sqlite3 query returned no row")
+            }
+            let cstr = sqlite3_column_text(stmt, 0 as CInt)
+            let txt = if ptr_is_null(cstr) { "" } else { cstr_to_text(cstr) }
+            let _ = sqlite3_finalize(stmt)
+            Ok(txt)
+        }
+    }
+
+    pub fn close(self) {
+        unsafe {
+            if !ptr_is_null(self.raw) {
+                let _ = sqlite3_close(self.raw)
+            }
+        }
+    }
+}

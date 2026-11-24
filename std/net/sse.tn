@@ -1,0 +1,104 @@
+// std/net/sse.tn — Unified Server-Sent Events (`text/event-stream`) Parser & Formatter
+
+import "std/text/text.tn"
+import "std/text/builder.tn"
+import "std/net/http.tn"
+
+pub record SseEvent {
+    event Text
+    id    Text
+    data  Text
+}
+
+pub pure fn sse_format_event(ev SseEvent) Text {
+    var b = TextBuilder.new()
+    if len(ev.id) > 0 {
+        b.push("id: ")
+        b.push(ev.id)
+        b.push("\n")
+    }
+    if len(ev.event) > 0 {
+        b.push("event: ")
+        b.push(ev.event)
+        b.push("\n")
+    }
+    b.push("data: ")
+    b.push(ev.data)
+    b.push("\n\n")
+    b.finish()
+}
+
+pub pure fn sse_http_response(events List[SseEvent]) HttpResponse {
+    var b = TextBuilder.new()
+    var i = 0
+    while i < len(events) {
+        b.push(sse_format_event(events[i]))
+        i += 1
+    }
+    HttpResponse {
+        status = 200
+        reason = "OK"
+        headers = [
+            HttpHeader { name = "Content-Type", value = "text/event-stream" },
+            HttpHeader { name = "Cache-Control", value = "no-cache" }
+        ]
+        body = b.finish()
+        keep_alive = true
+    }
+}
+
+pub pure fn sse_parse_stream(raw Text) List[SseEvent] {
+    var out List[SseEvent] = []
+    var cur_event = ""
+    var cur_id = ""
+    var cur_data = ""
+    var has_data = false
+    let n = len(raw)
+    var line_start = 0
+    var i = 0
+    while i <= n {
+        let is_end = i == n || byte_at(raw, i) == 10
+        if is_end {
+            var line_end = i
+            if line_end > line_start && byte_at(raw, line_end - 1) == 13 {
+                line_end -= 1
+            }
+            let line = str_slice(raw, line_start, line_end)
+            if len(line) == 0 {
+                if has_data {
+                    out = push(out, SseEvent {
+                        event = cur_event
+                        id = cur_id
+                        data = cur_data
+                    })
+                    cur_event = ""
+                    cur_id = ""
+                    cur_data = ""
+                    has_data = false
+                }
+            } else if line.starts_with("event:") {
+                cur_event = str_slice(line, 6, len(line)).trim()
+            } else if line.starts_with("id:") {
+                cur_id = str_slice(line, 3, len(line)).trim()
+            } else if line.starts_with("data:") {
+                let d = str_slice(line, 5, len(line)).trim()
+                if has_data {
+                    cur_data = cur_data ++ "\n" ++ d
+                } else {
+                    cur_data = d
+                    has_data = true
+                }
+            }
+            line_start = i + 1
+        }
+        i += 1
+    }
+    if has_data {
+        out = push(out, SseEvent {
+            event = cur_event
+            id = cur_id
+            data = cur_data
+        })
+    }
+    out
+}

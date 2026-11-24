@@ -1,0 +1,64 @@
+// std/net/async_net.tn — Stackless `async/await` Fused with OS `kqueue`/`epoll` Reactor
+// Suspends stackless coroutines at OS readiness boundaries with zero heap leaks (`live_objects == 0`).
+
+import "std/net/reactor.tn"
+
+fn poll_fd_ready(rfd Int, fd Int, events Int, timeout_ms Int) Int {
+    let _ = reactor_add(rfd, fd, events, fd)
+    let evs = reactor_wait(rfd, timeout_ms, 8)
+    let _ = reactor_del(rfd, fd)
+    len(evs)
+}
+
+pub async fn async_accept(rfd Int, listen_fd Int, timeout_ms Int) Int {
+    let _ = net_set_nonblocking(listen_fd, true)
+    let ready = await yield_val(listen_fd)
+    let _ = ready
+    let deadline = time_now_ms() + timeout_ms
+    var client_fd = net_tcp_accept(listen_fd)
+    while client_fd < 0 && time_now_ms() < deadline {
+        let _ = poll_fd_ready(rfd, listen_fd, EVENT_READ, 20)
+        client_fd = net_tcp_accept(listen_fd)
+    }
+    if client_fd >= 0 {
+        let _ = net_set_nonblocking(client_fd, true)
+        let _ = net_set_nodelay(client_fd, true)
+    }
+    client_fd
+}
+
+pub async fn async_wait_readable(rfd Int, fd Int, timeout_ms Int) Int {
+    let y = await yield_val(fd)
+    let _ = y
+    poll_fd_ready(rfd, fd, EVENT_READ, timeout_ms)
+}
+
+pub async fn async_wait_writable(rfd Int, fd Int, timeout_ms Int) Int {
+    let y = await yield_val(fd)
+    let _ = y
+    poll_fd_ready(rfd, fd, EVENT_WRITE, timeout_ms)
+}
+
+pub async fn async_sleep_ms(ms Int) Int {
+    let y = await yield_val(ms)
+    let _ = y
+    let _ = thread_sleep_ms(ms)
+    ms
+}
+
+/// Multiplexes readiness across two descriptors in a single OS `kqueue`/`epoll` wait.
+/// Returns the ready `fd`, or `-1` on timeout.
+pub async fn async_select_readable2(rfd Int, fd1 Int, fd2 Int, timeout_ms Int) Int {
+    let y = await yield_val(fd1)
+    let _ = y
+    let _ = reactor_add(rfd, fd1, EVENT_READ, fd1)
+    let _ = reactor_add(rfd, fd2, EVENT_READ, fd2)
+    let evs = reactor_wait(rfd, timeout_ms, 8)
+    let _ = reactor_del(rfd, fd1)
+    let _ = reactor_del(rfd, fd2)
+    if len(evs) > 0 {
+        event_token(evs[0])
+    } else {
+        -1
+    }
+}

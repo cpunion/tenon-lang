@@ -44,6 +44,7 @@ async fn main() -> ExitCode {
         "agent" => cmd_agent(&args[2..]).await,
         "build" => cmd_build_aot(&args[2..]),
         "build-wasm" => cmd_build_wasm(&args[2..]),
+        "pkg" => cmd_pkg(&args[2..]),
         "fmt" => cmd_fmt(&args[2..]),
         "lsp" => lsp::run_lsp_stdio(),
         "-h" | "--help" | "help" => {
@@ -1397,6 +1398,115 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("LLVM AOT build failed: {}", e);
             ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_pkg(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: tenon pkg <lock|verify|tree|add> [dir]");
+        return ExitCode::from(2);
+    }
+    match args[0].as_str() {
+        "lock" => {
+            let dir = PathBuf::from(args.get(1).map(|s| s.as_str()).unwrap_or("."));
+            match tenon_syntax::generate_lockfile(&dir) {
+                Ok((content, count)) => {
+                    let lock_path = dir.join("tenon.lock");
+                    if let Err(e) = fs::write(&lock_path, content) {
+                        eprintln!("failed to write `{}`: {}", lock_path.display(), e);
+                        return ExitCode::from(1);
+                    }
+                    println!("Locked {} package(s) -> `{}`", count, lock_path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "verify" => {
+            let dir = PathBuf::from(args.get(1).map(|s| s.as_str()).unwrap_or("."));
+            match tenon_syntax::verify_lockfile(&dir) {
+                Ok(count) => {
+                    println!("PASS: verified {} locked package(s) in `{}`", count, dir.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "tree" => {
+            let dir = PathBuf::from(args.get(1).map(|s| s.as_str()).unwrap_or("."));
+            match tenon_syntax::format_dep_tree(&dir) {
+                Ok(tree) => {
+                    print!("{}", tree);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    ExitCode::from(1)
+                }
+            }
+        }
+        "add" => {
+            if args.len() < 2 {
+                eprintln!("usage: tenon pkg add <name> --path <dir> [--version <v>] [--git <url>] [--dir <pkg_dir>]");
+                return ExitCode::from(2);
+            }
+            let dep_name = &args[1];
+            let mut dep_path = String::new();
+            let mut dep_git: Option<String> = None;
+            let mut dep_ver: Option<String> = None;
+            let mut pkg_dir = PathBuf::from(".");
+            let mut i = 2usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--path" if i + 1 < args.len() => {
+                        dep_path = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--git" if i + 1 < args.len() => {
+                        dep_git = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--version" if i + 1 < args.len() => {
+                        dep_ver = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--dir" if i + 1 < args.len() => {
+                        pkg_dir = PathBuf::from(&args[i + 1]);
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            let toml_path = pkg_dir.join("tenon.toml");
+            let mut existing = fs::read_to_string(&toml_path).unwrap_or_default();
+            let mut block = format!("\n[dependencies.{}]\n", dep_name);
+            if !dep_path.is_empty() {
+                block.push_str(&format!("path = \"{}\"\n", dep_path));
+            }
+            if let Some(g) = dep_git {
+                block.push_str(&format!("git = \"{}\"\n", g));
+            }
+            if let Some(v) = dep_ver {
+                block.push_str(&format!("version = \"{}\"\n", v));
+            }
+            existing.push_str(&block);
+            if let Err(e) = fs::write(&toml_path, existing) {
+                eprintln!("failed to update `{}`: {}", toml_path.display(), e);
+                return ExitCode::from(1);
+            }
+            println!("Added dependency `{}` to `{}`", dep_name, toml_path.display());
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("unknown `tenon pkg` command `{}` (expected lock|verify|tree|add)", other);
+            ExitCode::from(2)
         }
     }
 }

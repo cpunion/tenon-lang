@@ -1,0 +1,276 @@
+// std/net/ws.tn — Pure Tenon RFC 6455 WebSocket (SHA-1 + Base64 + Frame Codec + Upgrade)
+// Zero external dependencies; Perceus RC leak-free (`live_objects == 0`).
+
+import "std/text/text.tn"
+import "std/text/builder.tn"
+
+pub const WS_OP_CONT   Int = 0
+pub const WS_OP_TEXT   Int = 1
+pub const WS_OP_BINARY Int = 2
+pub const WS_OP_CLOSE  Int = 8
+pub const WS_OP_PING   Int = 9
+pub const WS_OP_PONG   Int = 10
+
+pub record WsFrame {
+    fin      Bool
+    opcode   Int
+    masked   Bool
+    payload  Text
+    consumed Int
+}
+
+pure fn u32_mask(x Int) Int {
+    x & 4294967295
+}
+
+pure fn rotl32(x Int, n Int) Int {
+    let v = u32_mask(x)
+    u32_mask((v << n) | (v >> (32 - n)))
+}
+
+/// Pure Tenon RFC 3174 SHA-1 returning 20-byte `Bytes` digest.
+pub pure fn sha1_digest(msg Text) Bytes {
+    let raw = text_to_bytes(msg)
+    let orig_len = bytes_len(raw)
+    let bit_len = orig_len * 8
+
+    var padded = bytes_new(orig_len + 72)
+    var i = 0
+    while i < orig_len {
+        padded = bytes_push(padded, bytes_get(raw, i) as Int)
+        i += 1
+    }
+    padded = bytes_push(padded, 128)
+    while (bytes_len(padded) % 64) != 56 {
+        padded = bytes_push(padded, 0)
+    }
+    // Append 64-bit big-endian bit length
+    var sh = 56
+    while sh >= 0 {
+        padded = bytes_push(padded, (bit_len >> sh) & 255)
+        sh -= 8
+    }
+
+    var h0 = 1732584193
+    var h1 = 4023233417
+    var h2 = 2562383102
+    var h3 = 271733878
+    var h4 = 3285377520
+
+    var w List[Int] = list_filled(80, 0)
+    let total_len = bytes_len(padded)
+    var off = 0
+    while off < total_len {
+        var t = 0
+        while t < 16 {
+            let b0 = bytes_get(padded, off + t * 4) as Int
+            let b1 = bytes_get(padded, off + t * 4 + 1) as Int
+            let b2 = bytes_get(padded, off + t * 4 + 2) as Int
+            let b3 = bytes_get(padded, off + t * 4 + 3) as Int
+            w[t] = u32_mask((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+            t += 1
+        }
+        while t < 80 {
+            w[t] = rotl32(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1)
+            t += 1
+        }
+
+        var a = h0
+        var b = h1
+        var c = h2
+        var d = h3
+        var e = h4
+
+        var r = 0
+        while r < 80 {
+            var f = 0
+            var k = 0
+            if r < 20 {
+                f = (b & c) | (u32_mask(~b) & d)
+                k = 1518500249
+            } else if r < 40 {
+                f = b ^ c ^ d
+                k = 1859775393
+            } else if r < 60 {
+                f = (b & c) | (b & d) | (c & d)
+                k = 2400959708
+            } else {
+                f = b ^ c ^ d
+                k = 3395469782
+            }
+            let tmp = u32_mask(rotl32(a, 5) + f + e + k + w[r])
+            e = d
+            d = c
+            c = rotl32(b, 30)
+            b = a
+            a = tmp
+            r += 1
+        }
+
+        h0 = u32_mask(h0 + a)
+        h1 = u32_mask(h1 + b)
+        h2 = u32_mask(h2 + c)
+        h3 = u32_mask(h3 + d)
+        h4 = u32_mask(h4 + e)
+        off += 64
+    }
+
+    var out = bytes_new(20)
+    let words = [h0, h1, h2, h3, h4]
+    var wi = 0
+    while wi < 5 {
+        let word = words[wi]
+        out = bytes_push(out, (word >> 24) & 255)
+        out = bytes_push(out, (word >> 16) & 255)
+        out = bytes_push(out, (word >> 8) & 255)
+        out = bytes_push(out, word & 255)
+        wi += 1
+    }
+    out
+}
+
+/// Pure Tenon RFC 4648 Base64 encoder.
+pub pure fn base64_encode(data Bytes) Text {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    let n = bytes_len(data)
+    var b = TextBuilder.new()
+    var i = 0
+    while i < n {
+        let b0 = bytes_get(data, i) as Int
+        let has1 = i + 1 < n
+        let has2 = i + 2 < n
+        let b1 = if has1 { bytes_get(data, i + 1) as Int } else { 0 }
+        let b2 = if has2 { bytes_get(data, i + 2) as Int } else { 0 }
+        let triple = (b0 << 16) | (b1 << 8) | b2
+        b.push_byte(byte_at(alphabet, (triple >> 18) & 63) & 255)
+        b.push_byte(byte_at(alphabet, (triple >> 12) & 63) & 255)
+        if has1 {
+            b.push_byte(byte_at(alphabet, (triple >> 6) & 63) & 255)
+        } else {
+            b.push_byte(61)
+        }
+        if has2 {
+            b.push_byte(byte_at(alphabet, triple & 63) & 255)
+        } else {
+            b.push_byte(61)
+        }
+        i += 3
+    }
+    b.finish()
+}
+
+/// Computes RFC 6455 `Sec-WebSocket-Accept` from `Sec-WebSocket-Key`.
+pub pure fn ws_accept_key(client_key Text) Text {
+    let magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    base64_encode(sha1_digest(client_key ++ magic))
+}
+
+/// Builds an HTTP/1.1 101 Switching Protocols upgrade response for a WebSocket handshake.
+pub pure fn ws_upgrade_response(client_key Text) Text {
+    let accept = ws_accept_key(client_key)
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " ++ accept ++ "\r\n\r\n"
+}
+
+/// Encodes an RFC 6455 WebSocket frame. Pass `masked = true` for client->server frames.
+pub pure fn ws_encode_frame(opcode Int, payload Text, masked Bool, mask_key Int) Bytes {
+    let pbytes = text_to_bytes(payload)
+    let plen = bytes_len(pbytes)
+    var out = bytes_new(plen + 16)
+    out = bytes_push(out, 128 | (opcode & 15))
+    let mbit = if masked { 128 } else { 0 }
+    if plen < 126 {
+        out = bytes_push(out, mbit | plen)
+    } else if plen < 65536 {
+        out = bytes_push(out, mbit | 126)
+        out = bytes_push(out, (plen >> 8) & 255)
+        out = bytes_push(out, plen & 255)
+    } else {
+        out = bytes_push(out, mbit | 127)
+        var sh = 56
+        while sh >= 0 {
+            out = bytes_push(out, (plen >> sh) & 255)
+            sh -= 8
+        }
+    }
+    let m0 = (mask_key >> 24) & 255
+    let m1 = (mask_key >> 16) & 255
+    let m2 = (mask_key >> 8) & 255
+    let m3 = mask_key & 255
+    if masked {
+        out = bytes_push(out, m0)
+        out = bytes_push(out, m1)
+        out = bytes_push(out, m2)
+        out = bytes_push(out, m3)
+    }
+    let mask_arr = [m0, m1, m2, m3]
+    var i = 0
+    while i < plen {
+        let raw_b = bytes_get(pbytes, i) as Int
+        let b = if masked { raw_b ^ mask_arr[i & 3] } else { raw_b }
+        out = bytes_push(out, b)
+        i += 1
+    }
+    out
+}
+
+/// Decodes an RFC 6455 WebSocket frame from `buf` starting at byte offset `start`.
+pub pure fn ws_decode_frame(buf Bytes, start Int) Result[WsFrame, Text] {
+    let blen = bytes_len(buf)
+    if blen - start < 2 {
+        return Err("incomplete websocket frame header")
+    }
+    let b0 = bytes_get(buf, start) as Int
+    let b1 = bytes_get(buf, start + 1) as Int
+    let fin = (b0 & 128) != 0
+    let opcode = b0 & 15
+    let masked = (b1 & 128) != 0
+    var plen = b1 & 127
+    var pos = start + 2
+    if plen == 126 {
+        if blen - pos < 2 {
+            return Err("incomplete 16-bit websocket length")
+        }
+        plen = ((bytes_get(buf, pos) as Int) << 8) | (bytes_get(buf, pos + 1) as Int)
+        pos += 2
+    } else if plen == 127 {
+        if blen - pos < 8 {
+            return Err("incomplete 64-bit websocket length")
+        }
+        plen = 0
+        var k = 0
+        while k < 8 {
+            plen = (plen << 8) | (bytes_get(buf, pos + k) as Int)
+            k += 1
+        }
+        pos += 8
+    }
+    var mask_arr = [0, 0, 0, 0]
+    if masked {
+        if blen - pos < 4 {
+            return Err("incomplete websocket mask key")
+        }
+        mask_arr[0] = bytes_get(buf, pos) as Int
+        mask_arr[1] = bytes_get(buf, pos + 1) as Int
+        mask_arr[2] = bytes_get(buf, pos + 2) as Int
+        mask_arr[3] = bytes_get(buf, pos + 3) as Int
+        pos += 4
+    }
+    if blen - pos < plen {
+        return Err("incomplete websocket payload")
+    }
+    var out = bytes_new(plen)
+    var i = 0
+    while i < plen {
+        let rb = bytes_get(buf, pos + i) as Int
+        let b = if masked { rb ^ mask_arr[i & 3] } else { rb }
+        out = bytes_push(out, b)
+        i += 1
+    }
+    Ok(WsFrame {
+        fin = fin
+        opcode = opcode
+        masked = masked
+        payload = bytes_to_text(out)
+        consumed = (pos + plen) - start
+    })
+}

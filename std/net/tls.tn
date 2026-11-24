@@ -1,0 +1,125 @@
+// std/net/tls.tn — Production OpenSSL/TLS C-ABI Bindings (`@link("ssl")`, `@link("crypto")`)
+// Links directly against system OpenSSL/LibreSSL via Tenon's bidirectional C FFI.
+
+@link("crypto")
+extern "C" fn OpenSSL_version_num() UInt64
+
+@link("ssl")
+extern "C" fn TLS_client_method() Ptr[CVoid]
+
+@link("ssl")
+extern "C" fn TLS_server_method() Ptr[CVoid]
+
+@link("ssl")
+extern "C" fn SSL_CTX_new(method Ptr[CVoid]) MutPtr[CVoid]
+
+@link("ssl")
+extern "C" fn SSL_CTX_free(ctx MutPtr[CVoid])
+
+@link("ssl")
+extern "C" fn SSL_new(ctx MutPtr[CVoid]) MutPtr[CVoid]
+
+@link("ssl")
+extern "C" fn SSL_set_fd(ssl MutPtr[CVoid], fd CInt) CInt
+
+@link("ssl")
+extern "C" fn SSL_connect(ssl MutPtr[CVoid]) CInt
+
+@link("ssl")
+extern "C" fn SSL_accept(ssl MutPtr[CVoid]) CInt
+
+@link("ssl")
+extern "C" fn SSL_read(ssl MutPtr[CVoid], buf MutPtr[UInt8], num CInt) CInt
+
+@link("ssl")
+extern "C" fn SSL_write(ssl MutPtr[CVoid], buf Ptr[UInt8], num CInt) CInt
+
+@link("ssl")
+extern "C" fn SSL_shutdown(ssl MutPtr[CVoid]) CInt
+
+@link("ssl")
+extern "C" fn SSL_free(ssl MutPtr[CVoid])
+
+pub record TlsContext {
+    raw MutPtr[CVoid]
+}
+
+pub record TlsStream {
+    raw MutPtr[CVoid]
+    fd  Int
+}
+
+pub fn tls_openssl_version() Int {
+    unsafe {
+        OpenSSL_version_num() as Int
+    }
+}
+
+pub fn tls_client_context() Result[TlsContext, Text] {
+    unsafe {
+        let method = TLS_client_method()
+        let ctx = SSL_CTX_new(method)
+        if ptr_is_null(ctx) {
+            Err("SSL_CTX_new(TLS_client_method) failed")
+        } else {
+            Ok(TlsContext { raw = ctx })
+        }
+    }
+}
+
+pub fn tls_server_context() Result[TlsContext, Text] {
+    unsafe {
+        let method = TLS_server_method()
+        let ctx = SSL_CTX_new(method)
+        if ptr_is_null(ctx) {
+            Err("SSL_CTX_new(TLS_server_method) failed")
+        } else {
+            Ok(TlsContext { raw = ctx })
+        }
+    }
+}
+
+impl TlsContext {
+    pub fn connect_fd(self, sock_fd Int) Result[TlsStream, Text] {
+        unsafe {
+            let ssl = SSL_new(self.raw)
+            if ptr_is_null(ssl) {
+                return Err("SSL_new failed")
+            }
+            let _ = SSL_set_fd(ssl, sock_fd as CInt)
+            let rc = SSL_connect(ssl)
+            if rc != 1 {
+                SSL_free(ssl)
+                return Err("TLS handshake SSL_connect failed")
+            }
+            Ok(TlsStream { raw = ssl, fd = sock_fd })
+        }
+    }
+
+    pub fn close(self) {
+        unsafe {
+            if !ptr_is_null(self.raw) {
+                SSL_CTX_free(self.raw)
+            }
+        }
+    }
+}
+
+impl TlsStream {
+    pub fn write_text(self, data Text) Int {
+        unsafe {
+            let ptr = text_cstr_ptr(data)
+            let n = len(data)
+            SSL_write(self.raw, ptr, n as CInt) as Int
+        }
+    }
+
+    pub fn close(self) {
+        unsafe {
+            if !ptr_is_null(self.raw) {
+                let _ = SSL_shutdown(self.raw)
+                SSL_free(self.raw)
+            }
+        }
+    }
+}

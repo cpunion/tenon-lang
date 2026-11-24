@@ -1,0 +1,47 @@
+// std/db/db_test.tn — Unit tests for PostgreSQL Wire Protocol v3 & Refinement SQL DDL
+
+import "std/db/postgres.tn"
+import "std/db/sqlite.tn"
+
+test fn test_postgres_wire_v3_codec() {
+    let startup = pg_encode_startup("tenon", "orders")
+    let total = bytes_read_u32_be(startup, 0) as Int
+    let proto = bytes_read_u32_be(startup, 4) as Int
+    assert total == bytes_len(startup)
+    assert proto == 196608
+
+    let q = pg_encode_query("SELECT 1;")
+    let q_res = pg_decode_frame(q, 0)
+    match q_res {
+        Ok(f) => {
+            assert f.tag == 81
+            assert f.consumed == bytes_len(q)
+            assert bytes_len(f.payload) == 10
+        }
+        Err(_) => { assert false }
+    }
+
+    let z = pg_encode_ready_for_query(73)
+    match pg_decode_frame(z, 0) {
+        Ok(f) => {
+            assert f.tag == 90
+            assert (bytes_get(f.payload, 0) as Int) == 73
+        }
+        Err(_) => { assert false }
+    }
+
+    let term = pg_encode_terminate()
+    match pg_decode_frame(term, 0) {
+        Ok(f) => { assert f.tag == 88 && f.length == 4 }
+        Err(_) => { assert false }
+    }
+}
+
+test fn test_refinement_sql_ddl_builder() {
+    let ddl = sql_create_table_ddl(
+        "trades",
+        ["id INTEGER PRIMARY KEY", "qty INTEGER NOT NULL", "price INTEGER NOT NULL"],
+        ["qty > 0", "price >= 1"]
+    )
+    assert ddl == "CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL, price INTEGER NOT NULL, CHECK(qty > 0), CHECK(price >= 1));"
+}
