@@ -8,8 +8,8 @@
 //! - NO OpenAI protocol or agent ReAct loop logic (written in `std/os/http.tn`, `examples/agent/lib/llm.tn` & `examples/agent/cli_agent.tn`)
 
 use crate::perceus::{make_text, make_text_bytes, read_text, read_text_bytes};
-use futures_util::StreamExt;
 use std::collections::BTreeMap;
+use std::ffi::{CString, c_char, c_int, c_long, c_void};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -272,6 +272,70 @@ pub extern "C" fn tenon_sys_http_open(method: i64, url: i64, headers: i64, body:
     spawn_http_line_stream(method_s, url_s, headers_s, body_bytes)
 }
 
+#[link(name = "curl")]
+unsafe extern "C" {
+    fn curl_easy_init() -> *mut c_void;
+    fn curl_easy_setopt(curl: *mut c_void, option: c_int, ...) -> c_int;
+    fn curl_easy_perform(curl: *mut c_void) -> c_int;
+    fn curl_easy_getinfo(curl: *mut c_void, info: c_int, ...) -> c_int;
+    fn curl_easy_strerror(code: c_int) -> *const c_char;
+    fn curl_easy_cleanup(curl: *mut c_void);
+    fn curl_slist_append(list: *mut c_void, string: *const c_char) -> *mut c_void;
+    fn curl_slist_free_all(list: *mut c_void);
+}
+
+const CURLOPT_WRITEDATA: c_int = 10001;
+const CURLOPT_URL: c_int = 10002;
+const CURLOPT_WRITEFUNCTION: c_int = 20011;
+const CURLOPT_TIMEOUT: c_int = 13;
+const CURLOPT_POSTFIELDS: c_int = 10015;
+const CURLOPT_HTTPHEADER: c_int = 10023;
+const CURLOPT_CUSTOMREQUEST: c_int = 10036;
+const CURLOPT_FOLLOWLOCATION: c_int = 52;
+const CURLOPT_POSTFIELDSIZE: c_int = 60;
+const CURLINFO_RESPONSE_CODE: c_int = 0x200002;
+
+struct CurlStreamCtx {
+    tx: mpsc::Sender<String>,
+    buf: Vec<u8>,
+    err_preview: Vec<u8>,
+    closed: bool,
+}
+
+unsafe extern "C" fn curl_write_cb(
+    ptr: *const c_char,
+    size: usize,
+    nmemb: usize,
+    userdata: *mut c_void,
+) -> usize {
+    let total = size.saturating_mul(nmemb);
+    if total == 0 || ptr.is_null() || userdata.is_null() {
+        return total;
+    }
+    let ctx = unsafe { &mut *(userdata as *mut CurlStreamCtx) };
+    let chunk = unsafe { std::slice::from_raw_parts(ptr as *const u8, total) };
+    if ctx.err_preview.len() < 4096 {
+        let take = (4096 - ctx.err_preview.len()).min(chunk.len());
+        ctx.err_preview.extend_from_slice(&chunk[..take]);
+    }
+    ctx.buf.extend_from_slice(chunk);
+    while let Some(nl_pos) = ctx.buf.iter().position(|&b| b == b'\n') {
+        let mut line_bytes: Vec<u8> = ctx.buf.drain(..=nl_pos).collect();
+        if line_bytes.ends_with(b"\n") {
+            line_bytes.pop();
+        }
+        if line_bytes.ends_with(b"\r") {
+            line_bytes.pop();
+        }
+        let line = String::from_utf8_lossy(&line_bytes).into_owned();
+        if ctx.tx.send(line).is_err() {
+            ctx.closed = true;
+            return 0;
+        }
+    }
+    total
+}
+
 fn spawn_http_line_stream(
     method_s: String,
     url_s: String,
@@ -283,88 +347,80 @@ fn spawn_http_line_stream(
     let err_bg = err_slot.clone();
 
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(r) => r,
-            Err(e) => {
-                *err_bg.lock().unwrap() = Some(format!("runtime error: {}", e));
+        let Ok(c_url) = CString::new(url_s) else {
+            *err_bg.lock().unwrap() = Some("invalid URL (interior NUL)".into());
+            return;
+        };
+        let Ok(c_method) = CString::new(if method_s.is_empty() { "POST".to_string() } else { method_s }) else {
+            *err_bg.lock().unwrap() = Some("invalid HTTP method".into());
+            return;
+        };
+        unsafe {
+            let curl = curl_easy_init();
+            if curl.is_null() {
+                *err_bg.lock().unwrap() = Some("curl_easy_init failed".into());
                 return;
             }
-        };
-        rt.block_on(async move {
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    *err_bg.lock().unwrap() = Some(format!("http client error: {}", e));
-                    return;
-                }
-            };
-            let http_method = reqwest::Method::from_bytes(method_s.as_bytes())
-                .unwrap_or(reqwest::Method::POST);
-            let mut req = client.request(http_method, &url_s);
+            let mut slist: *mut c_void = std::ptr::null_mut();
+            let mut header_cstrs = Vec::new();
             for line in headers_s.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    let key = k.trim();
-                    let val = v.trim();
-                    if !key.is_empty() {
-                        req = req.header(key, val);
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && trimmed.contains(':') {
+                    if let Ok(ch) = CString::new(trimmed) {
+                        slist = curl_slist_append(slist, ch.as_ptr());
+                        header_cstrs.push(ch);
                     }
                 }
+            }
+            let mut ctx = Box::new(CurlStreamCtx {
+                tx,
+                buf: Vec::new(),
+                err_preview: Vec::new(),
+                closed: false,
+            });
+            let cb: unsafe extern "C" fn(*const c_char, usize, usize, *mut c_void) -> usize = curl_write_cb;
+            curl_easy_setopt(curl, CURLOPT_URL, c_url.as_ptr());
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, c_method.as_ptr());
+            if !slist.is_null() {
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
             }
             if !body_bytes.is_empty() {
-                req = req.body(body_bytes);
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_bytes.as_ptr() as *const c_char);
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, body_bytes.len() as c_long);
             }
-            let resp = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    *err_bg.lock().unwrap() = Some(format!("http request failed: {}", e));
-                    return;
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300 as c_long);
+            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1 as c_long);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cb);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &mut *ctx as *mut CurlStreamCtx as *mut c_void);
+
+            let res = curl_easy_perform(curl);
+            let mut http_code: c_long = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &mut http_code as *mut c_long);
+
+            if !ctx.buf.is_empty() && !ctx.closed {
+                if ctx.buf.ends_with(b"\r") {
+                    ctx.buf.pop();
                 }
-            };
-            let status = resp.status();
-            if !status.is_success() {
-                let err_body = resp.text().await.unwrap_or_default();
-                *err_bg.lock().unwrap() = Some(format!("HTTP {}: {}", status.as_u16(), err_body));
-                return;
+                let line = String::from_utf8_lossy(&ctx.buf).into_owned();
+                let _ = ctx.tx.send(line);
             }
-            let mut byte_stream = resp.bytes_stream();
-            let mut buf = Vec::<u8>::new();
-            while let Some(chunk_res) = byte_stream.next().await {
-                let chunk = match chunk_res {
-                    Ok(c) => c,
-                    Err(e) => {
-                        *err_bg.lock().unwrap() = Some(format!("stream read error: {}", e));
-                        return;
-                    }
-                };
-                buf.extend_from_slice(&chunk);
-                while let Some(nl_pos) = buf.iter().position(|&b| b == b'\n') {
-                    let mut line_bytes = buf.drain(..=nl_pos).collect::<Vec<u8>>();
-                    if line_bytes.ends_with(b"\n") {
-                        line_bytes.pop();
-                    }
-                    if line_bytes.ends_with(b"\r") {
-                        line_bytes.pop();
-                    }
-                    let line = String::from_utf8_lossy(&line_bytes).into_owned();
-                    if tx.send(line).is_err() {
-                        return;
-                    }
-                }
+
+            if res != 0 && !ctx.closed {
+                let msg = std::ffi::CStr::from_ptr(curl_easy_strerror(res))
+                    .to_string_lossy()
+                    .into_owned();
+                *err_bg.lock().unwrap() = Some(format!("http request failed: {}", msg));
+            } else if http_code >= 400 {
+                let preview = String::from_utf8_lossy(&ctx.err_preview).into_owned();
+                *err_bg.lock().unwrap() = Some(format!("HTTP {}: {}", http_code, preview));
             }
-            if !buf.is_empty() {
-                if buf.ends_with(b"\r") {
-                    buf.pop();
-                }
-                let line = String::from_utf8_lossy(&buf).into_owned();
-                let _ = tx.send(line);
+
+            if !slist.is_null() {
+                curl_slist_free_all(slist);
             }
-        });
+            drop(header_cstrs);
+            curl_easy_cleanup(curl);
+        }
     });
 
     let id = NEXT_SSE_HANDLE.fetch_add(1, Ordering::SeqCst);

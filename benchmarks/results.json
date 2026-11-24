@@ -17,63 +17,63 @@
       "checksum": "102334155",
       "results": {
         "c": {
-          "cpu_median_ms": 187.28,
-          "cpu_min_ms": 184.52,
-          "wall_median_ms": 189.13,
+          "cpu_median_ms": 184.49,
+          "cpu_min_ms": 180.76,
+          "wall_median_ms": 186.38,
           "size_kb": 32.7,
           "cpu_samples_ms": [
-            187.32,
-            192.77,
-            189.91,
-            187.28,
-            186.44,
-            185.54,
-            184.52
+            180.76,
+            185.39,
+            184.49,
+            185.95,
+            183.33,
+            183.46,
+            186.05
           ]
         },
         "rust": {
-          "cpu_median_ms": 185.11,
-          "cpu_min_ms": 182.28,
-          "wall_median_ms": 186.81,
+          "cpu_median_ms": 182.15,
+          "cpu_min_ms": 181.16,
+          "wall_median_ms": 183.86,
           "size_kb": 461.1,
           "cpu_samples_ms": [
-            185.47,
-            187.65,
-            185.11,
-            183.44,
-            185.7,
-            184.12,
-            182.28
+            184.02,
+            181.16,
+            181.6,
+            182.15,
+            181.3,
+            183.28,
+            185.0
           ]
         },
         "go": {
-          "cpu_median_ms": 239.66,
-          "cpu_min_ms": 238.7,
-          "wall_median_ms": 241.59,
+          "cpu_median_ms": 237.28,
+          "cpu_min_ms": 233.97,
+          "wall_median_ms": 239.02,
           "size_kb": 2372.8,
           "cpu_samples_ms": [
-            245.19,
-            245.93,
-            250.47,
-            238.7,
-            239.58,
-            239.66,
-            238.89
+            236.59,
+            233.97,
+            238.58,
+            238.8,
+            236.02,
+            240.05,
+            237.28
           ]
         },
         "tenon": {
-          "cpu_median_ms": 187.19,
-          "cpu_min_ms": 184.52,
-          "wall_median_ms": 189.52,
+          "cpu_median_ms": 174.95,
+          "cpu_min_ms": 172.47,
+          "wall_median_ms": 176.58,
           "size_kb": 33.1,
           "cpu_samples_ms": [
-            187.19,
-            188.47,
-            186.21,
-            184.52,
-            186.98,
-            188.96,
-            191.8
+            176.53,
+            174.62,
+            175.08,
+            174.51,
+            172.47,
+            174.95,
+            175.3
           ]
         }
       }
@@ -84,63 +84,63 @@
       "checksum": "4378771939937074704",
       "results": {
         "c": {
-          "cpu_median_ms": 66.63,
-          "cpu_min_ms": 65.74,
-          "wall_median_ms": 68.51,
+          "cpu_median_ms": 65.82,
+          "cpu_min_ms": 65.23,
+          "wall_median_ms": 67.67,
           "size_kb": 32.7,
           "cpu_samples_ms": [
-            65.74,
-            65.91,
-            65.99,
-            66.84,
-            66.63,
-            67.6,
-            67.72
+            65.97,
+            67.03,
+            65.82,
+            65.41,
+            65.23,
+            65.56,
+            65.97
           ]
         },
         "rust": {
-          "cpu_median_ms": 67.37,
-          "cpu_min_ms": 66.4,
-          "wall_median_ms": 69.87,
+          "cpu_median_ms": 66.26,
+          "cpu_min_ms": 65.46,
+          "wall_median_ms": 67.79,
           "size_kb": 460.7,
           "cpu_samples_ms": [
-            66.4,
-            66.62,
-            67.98,
-            67.23,
-            67.37,
-            68.76,
-            68.39
+            65.86,
+            66.29,
+            66.26,
+            66.13,
+            65.46,
+            66.43,
+            67.2
           ]
         },
         "go": {
-          "cpu_median_ms": 94.22,
-          "cpu_min_ms": 92.68,
-          "wall_median_ms": 95.25,
+          "cpu_median_ms": 92.71,
+          "cpu_min_ms": 91.87,
+          "wall_median_ms": 94.09,
           "size_kb": 2372.8,
           "cpu_samples_ms": [
-            93.46,
+            93.19,
+            91.87,
+            91.94,
+            92.71,
+            94.16,
             93.4,
-            94.22,
-            94.61,
-            92.68,
-            96.49,
-            96.43
+            92.42
           ]
         },
         "tenon": {
-          "cpu_median_ms": 67.01,
-          "cpu_min_ms": 65.73,
-          "wall_median_ms": 68.69,
+          "cpu_median_ms": 66.32,
+          "cpu_min_ms": 65.37,
+          "wall_median_ms": 67.85,
           "size_kb": 33.1,
           "cpu_samples_ms": [
-            66.52,
-            65.73,
-            65.81,
-            68.47,
-            67.4,
-            67.44,
-            67.01
+            66.69,
+            65.37,
+            66.32,
+            65.88,
+            66.68,
+            65.69,
+            67.17
           ]
         }
       }
@@ -151,63 +151,63 @@
       "checksum": "392490",
       "results": {
         "c": {
-          "cpu_median_ms": 8.22,
-          "cpu_min_ms": 8.19,
-          "wall_median_ms": 9.88,
+          "cpu_median_ms": 8.13,
+          "cpu_min_ms": 7.97,
+          "wall_median_ms": 9.59,
           "size_kb": 32.8,
           "cpu_samples_ms": [
-            8.22,
-            8.19,
-            8.23,
             8.2,
-            8.42,
-            8.23,
-            8.21
+            8.29,
+            8.13,
+            8.05,
+            8.14,
+            7.97,
+            7.99
           ]
         },
         "rust": {
-          "cpu_median_ms": 8.41,
-          "cpu_min_ms": 8.32,
-          "wall_median_ms": 10.06,
+          "cpu_median_ms": 8.34,
+          "cpu_min_ms": 8.02,
+          "wall_median_ms": 9.98,
           "size_kb": 477.3,
           "cpu_samples_ms": [
-            8.41,
-            8.63,
-            8.66,
-            8.82,
-            8.35,
-            8.32,
-            8.37
+            8.23,
+            8.34,
+            8.55,
+            8.25,
+            8.4,
+            8.59,
+            8.02
           ]
         },
         "go": {
           "cpu_median_ms": 13.51,
-          "cpu_min_ms": 13.15,
-          "wall_median_ms": 14.36,
+          "cpu_min_ms": 12.8,
+          "wall_median_ms": 14.18,
           "size_kb": 2372.8,
           "cpu_samples_ms": [
-            13.89,
-            13.65,
-            13.74,
+            13.62,
             13.51,
-            13.46,
-            13.38,
-            13.15
+            12.8,
+            13.5,
+            13.31,
+            13.68,
+            13.53
           ]
         },
         "tenon": {
-          "cpu_median_ms": 19.97,
-          "cpu_min_ms": 19.77,
-          "wall_median_ms": 21.58,
-          "size_kb": 33.6,
+          "cpu_median_ms": 8.9,
+          "cpu_min_ms": 8.69,
+          "wall_median_ms": 10.47,
+          "size_kb": 33.4,
           "cpu_samples_ms": [
-            20.53,
-            19.97,
-            19.85,
-            20.52,
-            19.87,
-            20.01,
-            19.77
+            8.97,
+            8.9,
+            8.8,
+            8.81,
+            8.69,
+            8.96,
+            8.9
           ]
         }
       }
@@ -218,63 +218,63 @@
       "checksum": "708334",
       "results": {
         "c": {
-          "cpu_median_ms": 16.32,
-          "cpu_min_ms": 15.26,
-          "wall_median_ms": 18.03,
+          "cpu_median_ms": 15.78,
+          "cpu_min_ms": 15.71,
+          "wall_median_ms": 17.43,
           "size_kb": 33.1,
           "cpu_samples_ms": [
-            16.92,
-            15.26,
-            16.6,
-            16.41,
-            15.85,
-            16.14,
-            16.32
+            16.82,
+            16.61,
+            15.71,
+            16.32,
+            15.76,
+            15.77,
+            15.78
           ]
         },
         "rust": {
-          "cpu_median_ms": 15.01,
-          "cpu_min_ms": 14.49,
-          "wall_median_ms": 16.96,
+          "cpu_median_ms": 15.17,
+          "cpu_min_ms": 14.7,
+          "wall_median_ms": 16.98,
           "size_kb": 480.8,
           "cpu_samples_ms": [
-            15.87,
-            14.95,
-            15.88,
-            14.49,
-            15.01,
-            14.54,
-            15.46
+            15.59,
+            15.56,
+            15.17,
+            15.1,
+            15.19,
+            14.7,
+            14.91
           ]
         },
         "go": {
-          "cpu_median_ms": 16.47,
-          "cpu_min_ms": 15.77,
-          "wall_median_ms": 15.26,
+          "cpu_median_ms": 16.27,
+          "cpu_min_ms": 15.73,
+          "wall_median_ms": 14.77,
           "size_kb": 2373.1,
           "cpu_samples_ms": [
-            16.96,
-            15.77,
-            16.47,
-            15.87,
-            15.99,
-            16.99,
-            17.04
+            15.73,
+            16.27,
+            16.38,
+            16.43,
+            15.92,
+            16.27,
+            15.86
           ]
         },
         "tenon": {
-          "cpu_median_ms": 27.59,
-          "cpu_min_ms": 27.17,
-          "wall_median_ms": 29.18,
-          "size_kb": 34.6,
+          "cpu_median_ms": 16.24,
+          "cpu_min_ms": 15.93,
+          "wall_median_ms": 17.91,
+          "size_kb": 34.2,
           "cpu_samples_ms": [
-            28.69,
-            28.58,
-            27.37,
-            27.6,
-            27.49,
-            27.59,
-            27.17
+            16.12,
+            15.93,
+            16.45,
+            16.24,
+            16.46,
+            16.02,
+            16.65
           ]
         }
       }
@@ -285,63 +285,63 @@
       "checksum": "483984",
       "results": {
         "c": {
-          "cpu_median_ms": 6.57,
-          "cpu_min_ms": 6.03,
-          "wall_median_ms": 8.16,
+          "cpu_median_ms": 6.42,
+          "cpu_min_ms": 6.09,
+          "wall_median_ms": 7.8,
           "size_kb": 33.2,
           "cpu_samples_ms": [
-            6.85,
-            6.38,
-            6.84,
-            6.66,
-            6.54,
-            6.03,
-            6.57
+            6.09,
+            6.42,
+            6.52,
+            6.77,
+            6.25,
+            6.64,
+            6.37
           ]
         },
         "rust": {
-          "cpu_median_ms": 6.54,
-          "cpu_min_ms": 6.12,
-          "wall_median_ms": 8.11,
+          "cpu_median_ms": 6.3,
+          "cpu_min_ms": 6.11,
+          "wall_median_ms": 7.78,
           "size_kb": 479.4,
           "cpu_samples_ms": [
-            6.68,
-            6.42,
-            6.54,
-            6.36,
-            6.12,
-            6.74,
-            6.69
+            6.31,
+            6.11,
+            6.3,
+            6.39,
+            6.13,
+            6.33,
+            6.21
           ]
         },
         "go": {
-          "cpu_median_ms": 15.72,
-          "cpu_min_ms": 15.19,
-          "wall_median_ms": 16.48,
+          "cpu_median_ms": 15.23,
+          "cpu_min_ms": 14.88,
+          "wall_median_ms": 15.7,
           "size_kb": 3679.3,
           "cpu_samples_ms": [
-            15.19,
-            15.44,
-            16.76,
-            16.0,
-            16.02,
-            15.51,
-            15.72
+            15.21,
+            14.88,
+            15.58,
+            15.08,
+            15.25,
+            15.23,
+            15.25
           ]
         },
         "tenon": {
-          "cpu_median_ms": 19.89,
-          "cpu_min_ms": 19.07,
-          "wall_median_ms": 21.66,
-          "size_kb": 50.9,
+          "cpu_median_ms": 6.11,
+          "cpu_min_ms": 6.04,
+          "wall_median_ms": 7.67,
+          "size_kb": 50.6,
           "cpu_samples_ms": [
-            19.07,
-            20.44,
-            19.52,
-            20.08,
-            20.52,
-            19.78,
-            19.89
+            6.22,
+            6.06,
+            6.27,
+            6.11,
+            6.09,
+            6.04,
+            6.38
           ]
         }
       }
@@ -352,63 +352,63 @@
       "checksum": "840988148304462647",
       "results": {
         "c": {
-          "cpu_median_ms": 5.74,
-          "cpu_min_ms": 5.64,
-          "wall_median_ms": 7.16,
+          "cpu_median_ms": 5.37,
+          "cpu_min_ms": 5.23,
+          "wall_median_ms": 6.64,
           "size_kb": 32.9,
           "cpu_samples_ms": [
-            5.76,
-            5.64,
-            5.71,
-            5.76,
-            5.74,
-            5.67,
-            5.87
+            5.39,
+            5.3,
+            5.35,
+            5.23,
+            5.37,
+            5.53,
+            5.5
           ]
         },
         "rust": {
-          "cpu_median_ms": 5.84,
-          "cpu_min_ms": 5.68,
-          "wall_median_ms": 7.44,
+          "cpu_median_ms": 5.59,
+          "cpu_min_ms": 5.39,
+          "wall_median_ms": 6.96,
           "size_kb": 461.9,
           "cpu_samples_ms": [
-            5.75,
-            6.03,
-            6.18,
-            5.84,
-            5.94,
-            5.68,
-            5.83
+            5.71,
+            5.7,
+            5.64,
+            5.46,
+            5.59,
+            5.56,
+            5.39
           ]
         },
         "go": {
-          "cpu_median_ms": 7.95,
-          "cpu_min_ms": 7.56,
-          "wall_median_ms": 9.2,
+          "cpu_median_ms": 7.66,
+          "cpu_min_ms": 7.42,
+          "wall_median_ms": 8.93,
           "size_kb": 2373.3,
           "cpu_samples_ms": [
-            7.93,
-            8.14,
-            7.98,
-            8.14,
-            7.69,
-            7.95,
-            7.56
+            7.61,
+            7.78,
+            7.42,
+            7.68,
+            7.66,
+            7.59,
+            7.8
           ]
         },
         "tenon": {
-          "cpu_median_ms": 19.92,
-          "cpu_min_ms": 19.43,
-          "wall_median_ms": 21.49,
-          "size_kb": 34.0,
+          "cpu_median_ms": 5.36,
+          "cpu_min_ms": 5.26,
+          "wall_median_ms": 6.72,
+          "size_kb": 33.7,
           "cpu_samples_ms": [
-            20.31,
-            20.49,
-            19.8,
-            19.84,
-            19.43,
-            19.92,
-            20.71
+            5.36,
+            5.38,
+            5.33,
+            5.26,
+            5.66,
+            5.45,
+            5.34
           ]
         }
       }

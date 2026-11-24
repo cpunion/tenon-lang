@@ -22,11 +22,11 @@ pub fn main() Int {
                     }
                     None => 0
                 }
-                let built = JsonValue.object()
-                    .set("type", JStr(t))
-                    .set("seq", JInt(seq + i))
-                    .set("pick", JInt(num2))
-                    .set("ok", JBool(true))
+                var built = JsonValue.object()
+                built.put("type", JStr(t))
+                built.put("seq", JInt(seq + i))
+                built.put("pick", JInt(num2))
+                built.put("ok", JBool(true))
                 let out = built.stringify()
                 checksum += out.len() + num2
             }

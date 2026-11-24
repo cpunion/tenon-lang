@@ -18,9 +18,11 @@ pub record TextMapEntry {
 pub record TextMap {
     /// Open-addressing power-of-2 hash index table: -1 = empty, -2 = tombstone, >= 0 = entry index
     buckets List[Int]
-    /// Dense insertion-ordered key/value storage
-    entries List[TextMapEntry]
-    /// Cached 63-bit hashes parallel to `entries` (-1 = deleted tombstone entry)
+    /// Dense SoA insertion-ordered key storage (zero per-entry wrapper allocation or pointer chase)
+    keys    List[Text]
+    /// Dense SoA insertion-ordered value storage parallel to `keys`
+    vals    List[Text]
+    /// Cached 63-bit hashes parallel to `keys`/`vals` (-1 = deleted tombstone entry)
     hashes  List[Int]
     /// Number of live key/value pairs
     count   NonNegative
@@ -45,11 +47,13 @@ pub pure fn map_next_pow2_cap(min_cap NonNegative) Positive
 impl TextMap {
     pub pure fn new() TextMap {
         let empty_buckets List[Int] = []
-        let empty_entries List[TextMapEntry] = []
+        let empty_keys List[Text] = []
+        let empty_vals List[Text] = []
         let empty_hashes List[Int] = []
         TextMap {
             buckets = empty_buckets,
-            entries = empty_entries,
+            keys = empty_keys,
+            vals = empty_vals,
             hashes = empty_hashes,
             count = 0,
             used = 0
@@ -60,11 +64,13 @@ impl TextMap {
     pub pure fn with_capacity(expected_items NonNegative) TextMap {
         let needed = clamp_non_neg((expected_items * 10) / 7 + 1)
         let cap = map_next_pow2_cap(needed)
-        let empty_entries List[TextMapEntry] = []
+        let empty_keys List[Text] = []
+        let empty_vals List[Text] = []
         let empty_hashes List[Int] = []
         TextMap {
             buckets = List.filled(cap, -1),
-            entries = empty_entries,
+            keys = empty_keys,
+            vals = empty_vals,
             hashes = empty_hashes,
             count = 0,
             used = 0
@@ -97,8 +103,8 @@ impl TextMap {
             if idx == -1 {
                 return None
             }
-            if idx >= 0 && self.hashes[idx] == h && self.entries[idx].key == key {
-                return Some(self.entries[idx].val)
+            if idx >= 0 && self.hashes[idx] == h && self.keys[idx] == key {
+                return Some(self.vals[idx])
             }
             slot = (slot + 1) & mask
             probes += 1
@@ -114,11 +120,13 @@ impl TextMap {
         let cap = map_next_pow2_cap(target_cap)
         let mask = cap - 1
         var new_buckets = List.filled(cap, -1)
-        var new_entries List[TextMapEntry] = []
+        var new_keys List[Text] = []
+        var new_vals List[Text] = []
         var new_hashes List[Int] = []
         var live = 0
         var i = 0
-        while i < self.entries.len() {
+        let total = self.keys.len()
+        while i < total {
             let h = self.hashes[i]
             if h >= 0 {
                 var slot = h & mask
@@ -126,7 +134,8 @@ impl TextMap {
                     slot = (slot + 1) & mask
                 }
                 new_buckets[slot] = live
-                new_entries.push(self.entries[i])
+                new_keys.push(self.keys[i])
+                new_vals.push(self.vals[i])
                 new_hashes.push(h)
                 live += 1
             }
@@ -135,7 +144,8 @@ impl TextMap {
         let live_ok = clamp_non_neg(live)
         mutate self {
             self.buckets = new_buckets
-            self.entries = new_entries
+            self.keys = new_keys
+            self.vals = new_vals
             self.hashes = new_hashes
             self.count = live_ok
             self.used = live_ok
@@ -163,8 +173,9 @@ impl TextMap {
             let idx = self.buckets[slot]
             if idx == -1 {
                 let target = if first_tombstone >= 0 { first_tombstone } else { slot }
-                let new_idx = self.entries.len()
-                self.entries.push(TextMapEntry { key = key, val = val })
+                let new_idx = self.keys.len()
+                self.keys.push(key)
+                self.vals.push(val)
                 self.hashes.push(h)
                 self.buckets[target] = new_idx
                 if first_tombstone >= 0 {
@@ -183,8 +194,8 @@ impl TextMap {
                 if first_tombstone < 0 {
                     first_tombstone = slot
                 }
-            } else if self.hashes[idx] == h && self.entries[idx].key == key {
-                self.entries[idx] = TextMapEntry { key = key, val = val }
+            } else if self.hashes[idx] == h && self.keys[idx] == key {
+                self.vals[idx] = val
                 return
             }
             slot = (slot + 1) & mask
@@ -212,11 +223,12 @@ impl TextMap {
             if idx == -1 {
                 return None
             }
-            if idx >= 0 && self.hashes[idx] == h && self.entries[idx].key == key {
-                let old_val = self.entries[idx].val
+            if idx >= 0 && self.hashes[idx] == h && self.keys[idx] == key {
+                let old_val = self.vals[idx]
                 self.buckets[slot] = -2
                 self.hashes[idx] = -1
-                self.entries[idx] = TextMapEntry { key = "", val = "" }
+                self.keys[idx] = ""
+                self.vals[idx] = ""
                 if self.count > 0 {
                     mutate self {
                         self.count -= 1
@@ -233,9 +245,10 @@ impl TextMap {
     pub pure fn keys(self) List[Text] {
         var out List[Text] = []
         var i = 0
-        while i < self.entries.len() {
+        let total = self.keys.len()
+        while i < total {
             if self.hashes[i] >= 0 {
-                out.push(self.entries[i].key)
+                out.push(self.keys[i])
             }
             i += 1
         }
@@ -245,9 +258,10 @@ impl TextMap {
     pub pure fn values(self) List[Text] {
         var out List[Text] = []
         var i = 0
-        while i < self.entries.len() {
+        let total = self.vals.len()
+        while i < total {
             if self.hashes[i] >= 0 {
-                out.push(self.entries[i].val)
+                out.push(self.vals[i])
             }
             i += 1
         }
@@ -256,11 +270,13 @@ impl TextMap {
 
     pub pure fn clear(inout self) {
         let empty_buckets List[Int] = []
-        let empty_entries List[TextMapEntry] = []
+        let empty_keys List[Text] = []
+        let empty_vals List[Text] = []
         let empty_hashes List[Int] = []
         mutate self {
             self.buckets = empty_buckets
-            self.entries = empty_entries
+            self.keys = empty_keys
+            self.vals = empty_vals
             self.hashes = empty_hashes
             self.count = 0
             self.used = 0

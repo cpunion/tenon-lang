@@ -8,6 +8,3 @@ license.workspace = true
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
-tokio.workspace = true
-reqwest.workspace = true
-futures-util.workspace = true

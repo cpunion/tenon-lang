@@ -8,7 +8,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tenon_syntax::*;
@@ -85,9 +85,22 @@ int64_t tenon_rt_print_int(int64_t v) {
     return v;
 }
 
+#define TENON_FREELIST_MAX_CAP 8
+#define TENON_FREELIST_LIMIT 512
+
+static TenonObj* g_freelist[TENON_FREELIST_MAX_CAP + 1] = {0};
+static int g_freelist_len[TENON_FREELIST_MAX_CAP + 1] = {0};
+
 static inline TenonObj* tenon_rc_alloc_raw(int64_t tag, int64_t lu, int64_t cap) {
-    TenonObj* obj = (TenonObj*)malloc(sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
-    if (!obj) abort();
+    TenonObj* obj;
+    if (__builtin_expect(cap >= 1 && cap <= TENON_FREELIST_MAX_CAP && g_freelist[cap] != NULL, 1)) {
+        obj = g_freelist[cap];
+        g_freelist[cap] = *(TenonObj**)obj;
+        g_freelist_len[cap]--;
+    } else {
+        obj = (TenonObj*)malloc(sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
+        if (!obj) abort();
+    }
     obj->rc = 1;
     obj->tag = tag;
     obj->len = lu;
@@ -102,7 +115,14 @@ int64_t tenon_rc_alloc(int64_t tag, int64_t len) {
     int64_t lu = len < 0 ? 0 : len;
     int64_t cap = lu < 1 ? 1 : lu;
     TenonObj* obj = tenon_rc_alloc_raw(tag, lu, cap);
-    memset(obj->fields, 0, (size_t)cap * sizeof(int64_t));
+    if (cap == 1) {
+        obj->fields[0] = 0;
+    } else if (cap == 2) {
+        obj->fields[0] = 0;
+        obj->fields[1] = 0;
+    } else {
+        memset(obj->fields, 0, (size_t)cap * sizeof(int64_t));
+    }
     return (int64_t)(uintptr_t)obj;
 }
 
@@ -112,8 +132,11 @@ void tenon_rc_set_rc_mask(int64_t ptr, int64_t mask) {
 }
 
 int64_t tenon_rc_inc(int64_t ptr) {
-    if (ptr == 0) return 0;
-    ((TenonObj*)(uintptr_t)ptr)->rc++;
+    if (__builtin_expect(ptr == 0, 0)) return 0;
+    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
+    if (__builtin_expect(obj->rc > 0, 1)) {
+        obj->rc++;
+    }
     return ptr;
 }
 
@@ -135,14 +158,28 @@ static void tenon_rc_free_slow(TenonObj* obj) {
         }
     }
     g_live--;
+    int64_t cap = obj->cap;
+    if (__builtin_expect(cap >= 1 && cap <= TENON_FREELIST_MAX_CAP && g_freelist_len[cap] < TENON_FREELIST_LIMIT, 1)) {
+        *(TenonObj**)obj = g_freelist[cap];
+        g_freelist[cap] = obj;
+        g_freelist_len[cap]++;
+        return;
+    }
     free(obj);
+}
+
+void tenon_rc_free_obj(int64_t ptr) {
+    if (__builtin_expect(ptr == 0, 0)) return;
+    tenon_rc_free_slow((TenonObj*)(uintptr_t)ptr);
 }
 
 void tenon_rc_dec(int64_t ptr) {
     if (__builtin_expect(ptr == 0, 0)) return;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    if (__builtin_expect(--obj->rc <= 0, 0)) {
-        tenon_rc_free_slow(obj);
+    if (__builtin_expect(obj->rc > 0, 1)) {
+        if (__builtin_expect(--obj->rc <= 0, 0)) {
+            tenon_rc_free_slow(obj);
+        }
     }
 }
 
@@ -393,11 +430,16 @@ int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc) {
     TenonObj* fresh = tenon_rc_alloc_raw(4, n, cap);
     if (elem_is_rc != 0) {
         fresh->rc_mask = UINT64_MAX;
+        if (init_val != 0 && n > 0) {
+            TenonObj* iv = (TenonObj*)(uintptr_t)init_val;
+            if (iv->rc > 0) iv->rc += n;
+        }
     }
-    for (int64_t i = 0; i < n; i++) {
-        fresh->fields[i] = init_val;
-        if (elem_is_rc != 0 && init_val != 0) {
-            tenon_rc_inc(init_val);
+    if (init_val == 0) {
+        memset(fresh->fields, 0, (size_t)n * sizeof(int64_t));
+    } else {
+        for (int64_t i = 0; i < n; i++) {
+            fresh->fields[i] = init_val;
         }
     }
     return (int64_t)(uintptr_t)fresh;
@@ -469,7 +511,9 @@ int64_t tenon_async_block_on(int64_t frame) {
 }
 
 extern int64_t tenon_fn_main(void);
+"#;
 
+const TENON_AOT_MAIN_STATS_C: &str = r#"
 int main(void) {
     int64_t res = tenon_fn_main();
     printf("main() => %lld\n", (long long)res);
@@ -482,67 +526,434 @@ int main(void) {
 }
 "#;
 
-const TENON_RT_MAIN_SHIM_C: &str = r#"
-#include <stdint.h>
-extern int64_t tenon_fn_main(void);
+const TENON_AOT_MAIN_CLI_C: &str = r#"
 int main(void) {
     return (int)tenon_fn_main();
 }
 "#;
 
-fn ir_uses_tenon_rt_syscalls(ir: &str) -> bool {
+const TENON_AOT_OS_C: &str = r#"
+#include <errno.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int g_stdin_eof = 0;
+static int g_file_ok = 1;
+static int64_t g_exec_exit_code = 0;
+
+static char* tenon_cstr_copy(int64_t s) {
+    if (s == 0) {
+        char* empty = (char*)malloc(1);
+        empty[0] = '\0';
+        return empty;
+    }
+    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
+    size_t n = (size_t)hdr->len;
+    char* out = (char*)malloc(n + 1);
+    if (n > 0) memcpy(out, (const void*)hdr->fields, n);
+    out[n] = '\0';
+    return out;
+}
+
+int64_t tenon_sys_write_stdout(int64_t s) {
+    if (s == 0) return 0;
+    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
+    if (hdr->len > 0) {
+        fwrite((const void*)hdr->fields, 1, (size_t)hdr->len, stdout);
+        fflush(stdout);
+    }
+    return hdr->len;
+}
+
+int64_t tenon_sys_read_line(void) {
+    size_t cap = 256, len = 0;
+    char* buf = (char*)malloc(cap);
+    int ch;
+    while ((ch = fgetc(stdin)) != EOF) {
+        if (ch == '\n') break;
+        if (len + 1 >= cap) {
+            cap *= 2;
+            buf = (char*)realloc(buf, cap);
+        }
+        buf[len++] = (char)ch;
+    }
+    if (ch == EOF && len == 0) {
+        g_stdin_eof = 1;
+        free(buf);
+        return tenon_text_new(0, 0);
+    }
+    g_stdin_eof = 0;
+    if (len > 0 && buf[len - 1] == '\r') len--;
+    int64_t res = tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)len);
+    free(buf);
+    return res;
+}
+
+int64_t tenon_sys_is_eof(void) { return g_stdin_eof ? 1 : 0; }
+
+int64_t tenon_sys_env(int64_t key) {
+    char* k = tenon_cstr_copy(key);
+    const char* v = getenv(k);
+    free(k);
+    if (!v) return tenon_text_new(0, 0);
+    return tenon_text_new((int64_t)(uintptr_t)v, (int64_t)strlen(v));
+}
+
+int64_t tenon_sys_cwd(void) {
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) return tenon_text_new((int64_t)(uintptr_t)".", 1);
+    return tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)strlen(buf));
+}
+
+int64_t tenon_sys_read_file(int64_t path) {
+    char* p = tenon_cstr_copy(path);
+    FILE* f = fopen(p, "rb");
+    if (!f) {
+        g_file_ok = 0;
+        char msg[256];
+        int ml = snprintf(msg, sizeof(msg), "%s", strerror(errno));
+        free(p);
+        return tenon_text_new((int64_t)(uintptr_t)msg, (int64_t)ml);
+    }
+    free(p);
+    size_t cap = 4096, len = 0;
+    char* buf = (char*)malloc(cap);
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len, f)) > 0) {
+        len += n;
+        if (len == cap) {
+            cap *= 2;
+            buf = (char*)realloc(buf, cap);
+        }
+    }
+    fclose(f);
+    g_file_ok = 1;
+    int64_t res = tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)len);
+    free(buf);
+    return res;
+}
+
+int64_t tenon_sys_file_ok(void) { return g_file_ok ? 1 : 0; }
+
+int64_t tenon_sys_write_file(int64_t path, int64_t content) {
+    char* p = tenon_cstr_copy(path);
+    FILE* f = fopen(p, "wb");
+    free(p);
+    if (!f) {
+        g_file_ok = 0;
+        return 0;
+    }
+    int ok = 1;
+    if (content != 0) {
+        TenonObj* hdr = (TenonObj*)(uintptr_t)content;
+        if (hdr->len > 0) {
+            ok = fwrite((const void*)hdr->fields, 1, (size_t)hdr->len, f) == (size_t)hdr->len;
+        }
+    }
+    if (fclose(f) != 0) ok = 0;
+    g_file_ok = ok;
+    return ok ? 1 : 0;
+}
+
+int64_t tenon_sys_exec(int64_t cmd) {
+    char* c = tenon_cstr_copy(cmd);
+    size_t clen = strlen(c);
+    char* wrapped = (char*)malloc(clen + 16);
+    snprintf(wrapped, clen + 16, "%s 2>&1", c);
+    free(c);
+    FILE* fp = popen(wrapped, "r");
+    free(wrapped);
+    if (!fp) {
+        g_exec_exit_code = -1;
+        return tenon_text_new(0, 0);
+    }
+    size_t cap = 4096, len = 0;
+    char* buf = (char*)malloc(cap);
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len, fp)) > 0) {
+        len += n;
+        if (len == cap) {
+            cap *= 2;
+            buf = (char*)realloc(buf, cap);
+        }
+    }
+    int st = pclose(fp);
+    if (WIFEXITED(st)) g_exec_exit_code = WEXITSTATUS(st);
+    else g_exec_exit_code = -1;
+    int64_t res = tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)len);
+    free(buf);
+    return res;
+}
+
+int64_t tenon_sys_exec_exit_code(void) { return g_exec_exit_code; }
+"#;
+
+const TENON_AOT_HTTP_C: &str = r#"
+#include <curl/curl.h>
+#include <pthread.h>
+
+typedef struct HttpLineNode {
+    char* data;
+    size_t len;
+    struct HttpLineNode* next;
+} HttpLineNode;
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    HttpLineNode* head;
+    HttpLineNode* tail;
+    int done;
+    int eof;
+    int closed;
+    char* err;
+    char* method;
+    char* url;
+    char* headers;
+    char* body;
+    size_t body_len;
+    char* line_buf;
+    size_t line_len;
+    size_t line_cap;
+    char err_preview[4096];
+    size_t err_preview_len;
+    pthread_t th;
+} TenonHttpStream;
+
+static void http_push_line(TenonHttpStream* st, const char* data, size_t len) {
+    HttpLineNode* node = (HttpLineNode*)malloc(sizeof(HttpLineNode));
+    node->data = (char*)malloc(len + 1);
+    if (len > 0) memcpy(node->data, data, len);
+    node->data[len] = '\0';
+    node->len = len;
+    node->next = NULL;
+    pthread_mutex_lock(&st->mu);
+    if (!st->closed) {
+        if (st->tail) st->tail->next = node;
+        else st->head = node;
+        st->tail = node;
+        pthread_cond_signal(&st->cv);
+    } else {
+        free(node->data);
+        free(node);
+    }
+    pthread_mutex_unlock(&st->mu);
+}
+
+static size_t tenon_curl_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    size_t total = size * nmemb;
+    TenonHttpStream* st = (TenonHttpStream*)userdata;
+    if (st->err_preview_len < sizeof(st->err_preview) - 1) {
+        size_t take = sizeof(st->err_preview) - 1 - st->err_preview_len;
+        if (total < take) take = total;
+        memcpy(st->err_preview + st->err_preview_len, ptr, take);
+        st->err_preview_len += take;
+        st->err_preview[st->err_preview_len] = '\0';
+    }
+    if (st->line_len + total > st->line_cap) {
+        size_t nc = st->line_cap ? st->line_cap * 2 : 1024;
+        while (nc < st->line_len + total) nc *= 2;
+        st->line_buf = (char*)realloc(st->line_buf, nc);
+        st->line_cap = nc;
+    }
+    memcpy(st->line_buf + st->line_len, ptr, total);
+    st->line_len += total;
+
+    size_t start = 0;
+    for (size_t i = 0; i < st->line_len; i++) {
+        if (st->line_buf[i] == '\n') {
+            size_t llen = i - start;
+            if (llen > 0 && st->line_buf[start + llen - 1] == '\r') llen--;
+            http_push_line(st, st->line_buf + start, llen);
+            start = i + 1;
+        }
+    }
+    if (start > 0) {
+        size_t rem = st->line_len - start;
+        if (rem > 0) memmove(st->line_buf, st->line_buf + start, rem);
+        st->line_len = rem;
+    }
+    pthread_mutex_lock(&st->mu);
+    int closed = st->closed;
+    pthread_mutex_unlock(&st->mu);
+    return closed ? 0 : total;
+}
+
+static void* tenon_http_thread(void* arg) {
+    TenonHttpStream* st = (TenonHttpStream*)arg;
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        pthread_mutex_lock(&st->mu);
+        st->err = strdup("curl_easy_init failed");
+        st->done = 1;
+        pthread_cond_signal(&st->cv);
+        pthread_mutex_unlock(&st->mu);
+        return NULL;
+    }
+    struct curl_slist* slist = NULL;
+    char* p = st->headers;
+    while (p && *p) {
+        char* nl = strchr(p, '\n');
+        size_t l = nl ? (size_t)(nl - p) : strlen(p);
+        while (l > 0 && (p[l - 1] == '\r' || p[l - 1] == ' ')) l--;
+        if (l > 0) {
+            char* h = (char*)malloc(l + 1);
+            memcpy(h, p, l);
+            h[l] = '\0';
+            if (strchr(h, ':')) slist = curl_slist_append(slist, h);
+            free(h);
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, st->url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, st->method[0] ? st->method : "POST");
+    if (slist) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
+    if (st->body_len > 0) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, st->body);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)st->body_len);
+    }
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, tenon_curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, st);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    if (st->line_len > 0) {
+        size_t llen = st->line_len;
+        if (llen > 0 && st->line_buf[llen - 1] == '\r') llen--;
+        http_push_line(st, st->line_buf, llen);
+    }
+    pthread_mutex_lock(&st->mu);
+    if (res != CURLE_OK && !st->closed) {
+        const char* em = curl_easy_strerror(res);
+        size_t el = strlen(em) + 32;
+        st->err = (char*)malloc(el);
+        snprintf(st->err, el, "http request failed: %s", em);
+    } else if (http_code >= 400 && !st->err) {
+        size_t el = st->err_preview_len + 32;
+        st->err = (char*)malloc(el);
+        snprintf(st->err, el, "HTTP %ld: %s", http_code, st->err_preview);
+    }
+    st->done = 1;
+    pthread_cond_signal(&st->cv);
+    pthread_mutex_unlock(&st->mu);
+
+    if (slist) curl_slist_free_all(slist);
+    curl_easy_cleanup(curl);
+    return NULL;
+}
+
+int64_t tenon_sys_http_open(int64_t method, int64_t url, int64_t headers, int64_t body) {
+    TenonHttpStream* st = (TenonHttpStream*)calloc(1, sizeof(TenonHttpStream));
+    pthread_mutex_init(&st->mu, NULL);
+    pthread_cond_init(&st->cv, NULL);
+    st->method = tenon_cstr_copy(method);
+    st->url = tenon_cstr_copy(url);
+    st->headers = tenon_cstr_copy(headers);
+    if (body != 0) {
+        TenonObj* hdr = (TenonObj*)(uintptr_t)body;
+        st->body_len = (size_t)hdr->len;
+        st->body = (char*)malloc(st->body_len + 1);
+        if (st->body_len > 0) memcpy(st->body, (const void*)hdr->fields, st->body_len);
+        st->body[st->body_len] = '\0';
+    }
+    pthread_create(&st->th, NULL, tenon_http_thread, st);
+    return (int64_t)(uintptr_t)st;
+}
+
+int64_t tenon_sys_http_sse_open(int64_t url, int64_t bearer, int64_t body) {
+    char* b = tenon_cstr_copy(bearer);
+    size_t bl = strlen(b);
+    size_t hl = bl + 128;
+    char* h = (char*)malloc(hl);
+    if (bl > 0) snprintf(h, hl, "Content-Type: application/json\nAccept: text/event-stream\nAuthorization: Bearer %s\n", b);
+    else snprintf(h, hl, "Content-Type: application/json\nAccept: text/event-stream\n");
+    free(b);
+    int64_t m = tenon_text_new((int64_t)(uintptr_t)"POST", 4);
+    int64_t hs = tenon_text_new((int64_t)(uintptr_t)h, (int64_t)strlen(h));
+    free(h);
+    int64_t res = tenon_sys_http_open(m, url, hs, body);
+    tenon_rc_dec(m);
+    tenon_rc_dec(hs);
+    return res;
+}
+
+int64_t tenon_sys_http_sse_next_line(int64_t handle) {
+    if (handle == 0) return tenon_text_new(0, 0);
+    TenonHttpStream* st = (TenonHttpStream*)(uintptr_t)handle;
+    pthread_mutex_lock(&st->mu);
+    while (!st->head && !st->done) {
+        pthread_cond_wait(&st->cv, &st->mu);
+    }
+    if (!st->head) {
+        st->eof = 1;
+        pthread_mutex_unlock(&st->mu);
+        return tenon_text_new(0, 0);
+    }
+    HttpLineNode* node = st->head;
+    st->head = node->next;
+    if (!st->head) st->tail = NULL;
+    pthread_mutex_unlock(&st->mu);
+    int64_t res = tenon_text_new((int64_t)(uintptr_t)node->data, (int64_t)node->len);
+    free(node->data);
+    free(node);
+    return res;
+}
+
+int64_t tenon_sys_http_sse_eof(int64_t handle) {
+    if (handle == 0) return 1;
+    TenonHttpStream* st = (TenonHttpStream*)(uintptr_t)handle;
+    pthread_mutex_lock(&st->mu);
+    int e = st->eof;
+    pthread_mutex_unlock(&st->mu);
+    return e ? 1 : 0;
+}
+
+int64_t tenon_sys_http_sse_error(int64_t handle) {
+    if (handle == 0) return tenon_text_new(0, 0);
+    TenonHttpStream* st = (TenonHttpStream*)(uintptr_t)handle;
+    pthread_mutex_lock(&st->mu);
+    int64_t res = st->err ? tenon_text_new((int64_t)(uintptr_t)st->err, (int64_t)strlen(st->err)) : tenon_text_new(0, 0);
+    pthread_mutex_unlock(&st->mu);
+    return res;
+}
+
+int64_t tenon_sys_http_sse_close(int64_t handle) {
+    if (handle == 0) return 0;
+    TenonHttpStream* st = (TenonHttpStream*)(uintptr_t)handle;
+    pthread_mutex_lock(&st->mu);
+    st->closed = 1;
+    pthread_mutex_unlock(&st->mu);
+    pthread_join(st->th, NULL);
+    while (st->head) {
+        HttpLineNode* n = st->head;
+        st->head = n->next;
+        free(n->data);
+        free(n);
+    }
+    free(st->err);
+    free(st->method);
+    free(st->url);
+    free(st->headers);
+    free(st->body);
+    free(st->line_buf);
+    pthread_cond_destroy(&st->cv);
+    pthread_mutex_destroy(&st->mu);
+    free(st);
+    return 0;
+}
+"#;
+
+fn ir_uses_os_syscalls(ir: &str) -> bool {
     ir.contains("call i64 @tenon_sys_")
 }
 
-fn find_or_build_tenon_rt_staticlib() -> Result<PathBuf, String> {
-    let mut candidates = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("target/release/libtenon_rt.a"));
-        candidates.push(cwd.join("target/debug/libtenon_rt.a"));
-    }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Some(ws_root) = manifest_dir.parent().and_then(|p| p.parent()) {
-        candidates.push(ws_root.join("target/release/libtenon_rt.a"));
-        candidates.push(ws_root.join("target/debug/libtenon_rt.a"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("libtenon_rt.a"));
-            if let Some(parent) = dir.parent() {
-                candidates.push(parent.join("libtenon_rt.a"));
-            }
-        }
-    }
-    for c in &candidates {
-        if c.exists() {
-            return Ok(c.clone());
-        }
-    }
-    let ws_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let build = Command::new("cargo")
-        .args(["build", "-p", "tenon-rt"])
-        .current_dir(&ws_root)
-        .output()
-        .map_err(|e| format!("failed to build tenon-rt staticlib: {}", e))?;
-    if !build.status.success() {
-        return Err(format!(
-            "cargo build -p tenon-rt failed:\n{}",
-            String::from_utf8_lossy(&build.stderr)
-        ));
-    }
-    let built = ws_root.join("target/debug/libtenon_rt.a");
-    if built.exists() {
-        Ok(built)
-    } else {
-        Err(format!(
-            "expected staticlib at `{}` after cargo build",
-            built.display()
-        ))
-    }
+fn ir_uses_http_syscalls(ir: &str) -> bool {
+    ir.contains("call i64 @tenon_sys_http_")
 }
 
 pub fn compile_to_native_binary(
@@ -558,12 +969,22 @@ pub fn compile_to_native_binary(
     let tmp_rt = std::env::temp_dir().join(format!("tenon_rt_{}_{}.c", pid, seq));
 
     fs::write(&tmp_ll, &ir).map_err(|e| e.to_string())?;
-    let needs_full_rt = ir_uses_tenon_rt_syscalls(&ir);
-    if needs_full_rt {
-        fs::write(&tmp_rt, TENON_RT_MAIN_SHIM_C).map_err(|e| e.to_string())?;
-    } else {
-        fs::write(&tmp_rt, TENON_AOT_RUNTIME_C).map_err(|e| e.to_string())?;
+    let uses_os = ir_uses_os_syscalls(&ir);
+    let uses_http = ir_uses_http_syscalls(&ir);
+    let mut rt_c = String::with_capacity(TENON_AOT_RUNTIME_C.len() + 8192);
+    rt_c.push_str(TENON_AOT_RUNTIME_C);
+    if uses_os {
+        rt_c.push_str(TENON_AOT_OS_C);
     }
+    if uses_http {
+        rt_c.push_str(TENON_AOT_HTTP_C);
+    }
+    if uses_os {
+        rt_c.push_str(TENON_AOT_MAIN_CLI_C);
+    } else {
+        rt_c.push_str(TENON_AOT_MAIN_STATS_C);
+    }
+    fs::write(&tmp_rt, &rt_c).map_err(|e| e.to_string())?;
     if let Some(p) = emit_ll_path {
         if let Some(parent) = p.parent() {
             let _ = fs::create_dir_all(parent);
@@ -582,7 +1003,7 @@ pub fn compile_to_native_binary(
 
     let mut cmd = Command::new("clang");
     cmd.arg(opt_flag);
-    if !needs_full_rt && opt_flag == "-O3" {
+    if opt_flag == "-O3" {
         cmd.arg("-flto=thin");
     }
     cmd.args([
@@ -590,28 +1011,8 @@ pub fn compile_to_native_binary(
         tmp_ll.to_str().unwrap(),
         tmp_rt.to_str().unwrap(),
     ]);
-    if needs_full_rt {
-        let staticlib = find_or_build_tenon_rt_staticlib()?;
-        cmd.arg(staticlib.to_str().unwrap());
-        #[cfg(target_os = "macos")]
-        {
-            cmd.args([
-                "-framework",
-                "Security",
-                "-framework",
-                "CoreFoundation",
-                "-framework",
-                "SystemConfiguration",
-                "-liconv",
-                "-lpthread",
-                "-ldl",
-                "-lm",
-            ]);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            cmd.args(["-lpthread", "-ldl", "-lm"]);
-        }
+    if uses_http {
+        cmd.args(["-lcurl", "-lpthread"]);
     }
     cmd.args(["-o", output_path.to_str().unwrap()]);
 
@@ -638,6 +1039,315 @@ pub fn compile_to_native_binary(
         opt_level: opt_flag.to_string(),
     })
 }
+
+const TENON_INLINE_IR_HELPERS: &str = r#"
+define internal i64 @__tn_rc_inc(i64 %p) alwaysinline {
+entry:
+  %nz = icmp ne i64 %p, 0
+  br i1 %nz, label %chk, label %done
+chk:
+  %obj = inttoptr i64 %p to ptr
+  %rc = load i64, ptr %obj, align 8, !tbaa !6
+  %pos = icmp sgt i64 %rc, 0
+  br i1 %pos, label %inc, label %done
+inc:
+  %nrc = add nsw i64 %rc, 1
+  store i64 %nrc, ptr %obj, align 8, !tbaa !6
+  br label %done
+done:
+  ret i64 %p
+}
+
+define internal void @__tn_rc_dec(i64 %p) alwaysinline {
+entry:
+  %nz = icmp ne i64 %p, 0
+  br i1 %nz, label %chk, label %done
+chk:
+  %obj = inttoptr i64 %p to ptr
+  %rc = load i64, ptr %obj, align 8, !tbaa !6
+  %pos = icmp sgt i64 %rc, 0
+  br i1 %pos, label %dec, label %done
+dec:
+  %nrc = add nsw i64 %rc, -1
+  store i64 %nrc, ptr %obj, align 8, !tbaa !6
+  %zero = icmp sle i64 %nrc, 0
+  br i1 %zero, label %free, label %done
+free:
+  tail call void @tenon_rc_free_obj(i64 %p)
+  br label %done
+done:
+  ret void
+}
+
+define internal i64 @__tn_rc_ensure_unique(i64 %p) alwaysinline {
+entry:
+  %nz = icmp ne i64 %p, 0
+  br i1 %nz, label %chk, label %ret0
+chk:
+  %obj = inttoptr i64 %p to ptr
+  %rc = load i64, ptr %obj, align 8, !tbaa !6
+  %uniq = icmp eq i64 %rc, 1
+  br i1 %uniq, label %retp, label %slow
+slow:
+  %cow = tail call i64 @tenon_rc_ensure_unique(i64 %p)
+  ret i64 %cow
+retp:
+  ret i64 %p
+ret0:
+  ret i64 0
+}
+
+define internal void @__tn_rc_set_rc_mask(i64 %p, i64 %mask) alwaysinline {
+entry:
+  %nz = icmp ne i64 %p, 0
+  br i1 %nz, label %do, label %done
+do:
+  %obj = inttoptr i64 %p to ptr
+  %mp = getelementptr inbounds i8, ptr %obj, i64 32
+  store i64 %mask, ptr %mp, align 8, !tbaa !9
+  br label %done
+done:
+  ret void
+}
+
+define internal i64 @__tn_slot_get(i64 %p, i64 %idx) alwaysinline {
+entry:
+  %obj = inttoptr i64 %p to ptr
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
+  %v = load i64, ptr %fp, align 8, !tbaa !10
+  ret i64 %v
+}
+
+define internal void @__tn_slot_set_prim(i64 %p, i64 %idx, i64 %val) alwaysinline {
+entry:
+  %obj = inttoptr i64 %p to ptr
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
+  store i64 %val, ptr %fp, align 8, !tbaa !10
+  ret void
+}
+
+define internal void @__tn_slot_set_rc(i64 %p, i64 %idx, i64 %val) alwaysinline {
+entry:
+  %obj = inttoptr i64 %p to ptr
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
+  %old = load i64, ptr %fp, align 8, !tbaa !10
+  store i64 %val, ptr %fp, align 8, !tbaa !10
+  call void @__tn_rc_dec(i64 %old)
+  ret void
+}
+
+define internal i64 @__tn_list_get(i64 %p, i64 %idx) alwaysinline {
+entry:
+  %nz = icmp ne i64 %p, 0
+  br i1 %nz, label %chk, label %oob
+chk:
+  %obj = inttoptr i64 %p to ptr
+  %lp = getelementptr inbounds i8, ptr %obj, i64 16
+  %len = load i64, ptr %lp, align 8, !tbaa !8
+  %ok = icmp ult i64 %idx, %len
+  br i1 %ok, label %inb, label %oob
+inb:
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
+  %v = load i64, ptr %fp, align 8, !tbaa !10
+  ret i64 %v
+oob:
+  ret i64 0
+}
+
+define internal i64 @__tn_list_get_nonnull(i64 %p, i64 %idx) alwaysinline {
+entry:
+  %obj = inttoptr i64 %p to ptr
+  %lp = getelementptr inbounds i8, ptr %obj, i64 16
+  %len = load i64, ptr %lp, align 8, !tbaa !8
+  %ok = icmp ult i64 %idx, %len
+  br i1 %ok, label %inb, label %oob
+inb:
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
+  %v = load i64, ptr %fp, align 8, !tbaa !10
+  ret i64 %v
+oob:
+  ret i64 0
+}
+
+define internal void @__tn_list_set_prim(i64 %p, i64 %idx, i64 %val) alwaysinline {
+entry:
+  %nz = icmp ne i64 %p, 0
+  br i1 %nz, label %chk, label %done
+chk:
+  %obj = inttoptr i64 %p to ptr
+  %lp = getelementptr inbounds i8, ptr %obj, i64 16
+  %len = load i64, ptr %lp, align 8, !tbaa !8
+  %ok = icmp ult i64 %idx, %len
+  br i1 %ok, label %inb, label %done
+inb:
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
+  store i64 %val, ptr %fp, align 8, !tbaa !10
+  br label %done
+done:
+  ret void
+}
+
+define internal void @__tn_list_set_prim_nonnull(i64 %p, i64 %idx, i64 %val) alwaysinline {
+entry:
+  %obj = inttoptr i64 %p to ptr
+  %lp = getelementptr inbounds i8, ptr %obj, i64 16
+  %len = load i64, ptr %lp, align 8, !tbaa !8
+  %ok = icmp ult i64 %idx, %len
+  br i1 %ok, label %inb, label %done
+inb:
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
+  store i64 %val, ptr %fp, align 8, !tbaa !10
+  br label %done
+done:
+  ret void
+}
+
+define internal void @__tn_list_set_rc(i64 %p, i64 %idx, i64 %val) alwaysinline {
+entry:
+  %nz = icmp ne i64 %p, 0
+  br i1 %nz, label %chk, label %done
+chk:
+  %obj = inttoptr i64 %p to ptr
+  %lp = getelementptr inbounds i8, ptr %obj, i64 16
+  %len = load i64, ptr %lp, align 8, !tbaa !8
+  %ok = icmp ult i64 %idx, %len
+  br i1 %ok, label %inb, label %done
+inb:
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
+  %old = load i64, ptr %fp, align 8, !tbaa !10
+  store i64 %val, ptr %fp, align 8, !tbaa !10
+  call void @__tn_rc_dec(i64 %old)
+  br label %done
+done:
+  ret void
+}
+
+define internal i64 @__tn_rc_len(i64 %p) alwaysinline {
+entry:
+  %nz = icmp ne i64 %p, 0
+  br i1 %nz, label %do, label %ret0
+do:
+  %obj = inttoptr i64 %p to ptr
+  %lp = getelementptr inbounds i8, ptr %obj, i64 16
+  %len = load i64, ptr %lp, align 8, !tbaa !8
+  ret i64 %len
+ret0:
+  ret i64 0
+}
+
+define internal i64 @__tn_rc_tag(i64 %p) alwaysinline {
+entry:
+  %nz = icmp ne i64 %p, 0
+  br i1 %nz, label %do, label %retm1
+do:
+  %obj = inttoptr i64 %p to ptr
+  %tp = getelementptr inbounds i8, ptr %obj, i64 8
+  %tag = load i64, ptr %tp, align 8, !tbaa !7
+  ret i64 %tag
+retm1:
+  ret i64 -1
+}
+
+define internal i64 @__tn_byte_at(i64 %s, i64 %idx) alwaysinline {
+entry:
+  %nz = icmp ne i64 %s, 0
+  br i1 %nz, label %chk, label %oob
+chk:
+  %obj = inttoptr i64 %s to ptr
+  %lp = getelementptr inbounds i8, ptr %obj, i64 16
+  %len = load i64, ptr %lp, align 8, !tbaa !8
+  %ok = icmp ult i64 %idx, %len
+  br i1 %ok, label %inb, label %oob
+inb:
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %bp = getelementptr inbounds i8, ptr %base, i64 %idx
+  %b = load i8, ptr %bp, align 1, !tbaa !10
+  %ext = zext i8 %b to i64
+  ret i64 %ext
+oob:
+  ret i64 -1
+}
+
+define internal i64 @__tn_buf_push_byte(i64 %h, i64 %byte_val) alwaysinline {
+entry:
+  %nz = icmp ne i64 %h, 0
+  br i1 %nz, label %chk, label %ret0
+chk:
+  %bp = inttoptr i64 %h to ptr
+  %lp = getelementptr inbounds i8, ptr %bp, i64 8
+  %cp = getelementptr inbounds i8, ptr %bp, i64 16
+  %len = load i64, ptr %lp, align 8
+  %cap = load i64, ptr %cp, align 8
+  %ok = icmp ult i64 %len, %cap
+  br i1 %ok, label %fast, label %slow
+fast:
+  %dp = load ptr, ptr %bp, align 8
+  %dst = getelementptr inbounds i8, ptr %dp, i64 %len
+  %b8 = trunc i64 %byte_val to i8
+  store i8 %b8, ptr %dst, align 1
+  %nlen = add nuw i64 %len, 1
+  store i64 %nlen, ptr %lp, align 8
+  ret i64 %nlen
+slow:
+  %r = tail call i64 @tenon_buf_push_byte(i64 %h, i64 %byte_val)
+  ret i64 %r
+ret0:
+  ret i64 0
+}
+
+define internal i64 @__tn_text_eq(i64 %a, i64 %b) alwaysinline {
+entry:
+  %same = icmp eq i64 %a, %b
+  br i1 %same, label %ret1, label %chk_nz
+chk_nz:
+  %anz = icmp ne i64 %a, 0
+  %bnz = icmp ne i64 %b, 0
+  %both = and i1 %anz, %bnz
+  br i1 %both, label %chk_len, label %ret0
+chk_len:
+  %pa = inttoptr i64 %a to ptr
+  %pb = inttoptr i64 %b to ptr
+  %la_p = getelementptr inbounds i8, ptr %pa, i64 16
+  %lb_p = getelementptr inbounds i8, ptr %pb, i64 16
+  %la = load i64, ptr %la_p, align 8, !tbaa !8
+  %lb = load i64, ptr %lb_p, align 8, !tbaa !8
+  %leq = icmp eq i64 %la, %lb
+  br i1 %leq, label %cmp_mem, label %ret0
+cmp_mem:
+  %ba = getelementptr inbounds i8, ptr %pa, i64 40
+  %bb = getelementptr inbounds i8, ptr %pb, i64 40
+  %mc = call i32 @memcmp(ptr %ba, ptr %bb, i64 %la)
+  %eq = icmp eq i32 %mc, 0
+  %res = zext i1 %eq to i64
+  ret i64 %res
+ret1:
+  ret i64 1
+ret0:
+  ret i64 0
+}
+"#;
+
+const TENON_TBAA_METADATA: &str = r#"
+!0 = !{!"Tenon TBAA"}
+!1 = !{!"tn_rc", !0, i64 0}
+!2 = !{!"tn_tag", !0, i64 0}
+!3 = !{!"tn_len", !0, i64 0}
+!4 = !{!"tn_mask", !0, i64 0}
+!5 = !{!"tn_field", !0, i64 0}
+!6 = !{!1, !1, i64 0}
+!7 = !{!2, !2, i64 0}
+!8 = !{!3, !3, i64 0}
+!9 = !{!4, !4, i64 0}
+!10 = !{!5, !5, i64 0}
+"#;
 
 pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     let prepared = prepare_program_for_codegen(program);
@@ -818,6 +1528,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     }
 
     let mut string_globals: Vec<(String, String)> = Vec::new();
+    let mut string_intern: BTreeMap<String, String> = BTreeMap::new();
+    let mut unit_enum_tags: BTreeSet<i64> = BTreeSet::new();
     let mut fn_defs = String::new();
 
     for f in &sync_fns {
@@ -834,6 +1546,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             dyn_interfaces,
             &vtable_ifaces,
             &mut string_globals,
+            &mut string_intern,
+            &mut unit_enum_tags,
         );
         fn_defs.push_str(&cg.emit_sync_fn(f)?);
         fn_defs.push('\n');
@@ -856,6 +1570,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             dyn_interfaces,
             &vtable_ifaces,
             &mut string_globals,
+            &mut string_intern,
+            &mut unit_enum_tags,
         );
         fn_defs.push_str(&cg.emit_record_parser(rname, layout)?);
         fn_defs.push('\n');
@@ -875,6 +1591,8 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
             dyn_interfaces,
             &vtable_ifaces,
             &mut string_globals,
+            &mut string_intern,
+            &mut unit_enum_tags,
         );
         fn_defs.push_str(&cg.emit_async_fn(f)?);
         fn_defs.push('\n');
@@ -882,13 +1600,16 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
 
     let mut ir = String::new();
     ir.push_str("; Generated by Tenon LLVM 22 AOT Release Backend\n\n");
-    ir.push_str("declare void @tenon_rt_assert_fail(i64)\n");
+    ir.push_str("declare void @llvm.assume(i1)\n");
+    ir.push_str("declare i32 @memcmp(ptr, ptr, i64)\n");
+    ir.push_str("declare void @tenon_rt_assert_fail(i64) cold\n");
     ir.push_str("declare i64 @tenon_rt_print_int(i64)\n");
     ir.push_str("declare i64 @tenon_rc_alloc(i64, i64)\n");
     ir.push_str("declare void @tenon_rc_set_rc_mask(i64, i64)\n");
     ir.push_str("declare i64 @tenon_rc_inc(i64)\n");
     ir.push_str("declare void @tenon_rc_dec(i64)\n");
-    ir.push_str("declare i64 @tenon_rc_ensure_unique(i64)\n");
+    ir.push_str("declare void @tenon_rc_free_obj(i64) cold\n");
+    ir.push_str("declare i64 @tenon_rc_ensure_unique(i64) cold\n");
     ir.push_str("declare i64 @tenon_rc_get_field(i64, i64)\n");
     ir.push_str("declare void @tenon_rc_set_field(i64, i64, i64)\n");
     ir.push_str("declare void @tenon_rc_set_field_raw(i64, i64, i64)\n");
@@ -907,18 +1628,36 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
         let params = vec!["i64"; spec.arity].join(", ");
         ir.push_str(&format!("declare i64 @{}({})\n", spec.c_symbol, params));
     }
+    ir.push_str(TENON_INLINE_IR_HELPERS);
     ir.push('\n');
 
     for (gname, text) in &string_globals {
-        let escaped = escape_llvm_bytes(text.as_bytes());
-        ir.push_str(&format!(
-            "@{} = private unnamed_addr constant [{} x i8] c\"{}\"\n",
-            gname,
-            text.len(),
-            escaped
-        ));
+        let blen = text.len();
+        let words = ((blen + 7) / 8).max(1);
+        if blen == 0 {
+            ir.push_str(&format!(
+                "@{} = private unnamed_addr constant {{ i64, i64, i64, i64, i64, [1 x i8] }} {{ i64 -1, i64 5, i64 0, i64 1, i64 0, [1 x i8] zeroinitializer }}, align 8\n",
+                gname
+            ));
+        } else {
+            let escaped = escape_llvm_bytes(text.as_bytes());
+            ir.push_str(&format!(
+                "@{} = private unnamed_addr constant {{ i64, i64, i64, i64, i64, [{} x i8] }} {{ i64 -1, i64 5, i64 {}, i64 {}, i64 0, [{} x i8] c\"{}\" }}, align 8\n",
+                gname, blen, blen, words, blen, escaped
+            ));
+        }
     }
     if !string_globals.is_empty() {
+        ir.push('\n');
+    }
+
+    for &tag in &unit_enum_tags {
+        ir.push_str(&format!(
+            "@.unit_enum.{} = private unnamed_addr constant {{ i64, i64, i64, i64, i64, i64 }} {{ i64 -1, i64 {}, i64 0, i64 1, i64 0, i64 0 }}, align 8\n",
+            tag, tag
+        ));
+    }
+    if !unit_enum_tags.is_empty() {
         ir.push('\n');
     }
 
@@ -940,6 +1679,7 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
     }
 
     ir.push_str(&fn_defs);
+    ir.push_str(TENON_TBAA_METADATA);
     Ok(ir)
 }
 
@@ -982,6 +1722,8 @@ struct LlvmFnGen<'a> {
     dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
     vtable_ifaces: &'a BTreeMap<String, String>,
     string_globals: &'a mut Vec<(String, String)>,
+    string_intern: &'a mut BTreeMap<String, String>,
+    unit_enum_tags: &'a mut BTreeSet<i64>,
     tmp: usize,
     lbl: usize,
     slot_id: usize,
@@ -992,6 +1734,7 @@ struct LlvmFnGen<'a> {
     inout_vars: BTreeSet<String>,
     owned_rc_vars: BTreeSet<String>,
     borrowed_rc_vars: BTreeSet<String>,
+    always_unique_vars: BTreeSet<String>,
     rc_scopes: Vec<Vec<(String, String)>>,
     temp_rc_scopes: Vec<Vec<String>>,
     loop_stack: Vec<LlvmLoopCtx>,
@@ -1016,6 +1759,8 @@ impl<'a> LlvmFnGen<'a> {
         dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
         vtable_ifaces: &'a BTreeMap<String, String>,
         string_globals: &'a mut Vec<(String, String)>,
+        string_intern: &'a mut BTreeMap<String, String>,
+        unit_enum_tags: &'a mut BTreeSet<i64>,
     ) -> Self {
         Self {
             alias_bases,
@@ -1030,6 +1775,8 @@ impl<'a> LlvmFnGen<'a> {
             dyn_interfaces,
             vtable_ifaces,
             string_globals,
+            string_intern,
+            unit_enum_tags,
             tmp: 0,
             lbl: 0,
             slot_id: 0,
@@ -1040,6 +1787,7 @@ impl<'a> LlvmFnGen<'a> {
             inout_vars: BTreeSet::new(),
             owned_rc_vars: BTreeSet::new(),
             borrowed_rc_vars: BTreeSet::new(),
+            always_unique_vars: BTreeSet::new(),
             rc_scopes: Vec::new(),
             temp_rc_scopes: Vec::new(),
             loop_stack: Vec::new(),
@@ -1092,10 +1840,30 @@ impl<'a> LlvmFnGen<'a> {
         self.fresh_var_slot(name)
     }
 
+    fn intern_string_global(&mut self, s: &str) -> String {
+        if let Some(g) = self.string_intern.get(s) {
+            return g.clone();
+        }
+        let gname = format!(".str.{}", self.string_globals.len());
+        self.string_globals.push((gname.clone(), s.to_string()));
+        self.string_intern.insert(s.to_string(), gname.clone());
+        gname
+    }
+
+    fn emit_unit_enum_const(&mut self, tag: i64) -> String {
+        self.unit_enum_tags.insert(tag);
+        let o = self.fresh_tmp();
+        self.code.push_str(&format!(
+            "  {} = ptrtoint ptr @.unit_enum.{} to i64\n",
+            o, tag
+        ));
+        o
+    }
+
     fn flush_temps(&mut self, temps: &[String]) {
         for v in temps.iter().rev() {
             self.code
-                .push_str(&format!("  call void @tenon_rc_dec(i64 {})\n", v));
+                .push_str(&format!("  call void @__tn_rc_dec(i64 {})\n", v));
         }
     }
 
@@ -1108,7 +1876,7 @@ impl<'a> LlvmFnGen<'a> {
                 }
                 let h = self.fresh_tmp();
                 self.code.push_str(&format!(
-                    "  {} = load i64, ptr {}\n  call void @tenon_rc_dec(i64 {})\n",
+                    "  {} = load i64, ptr {}\n  call void @__tn_rc_dec(i64 {})\n",
                     h, slot, h
                 ));
             }
@@ -1120,7 +1888,7 @@ impl<'a> LlvmFnGen<'a> {
         for scope in scopes.iter().rev() {
             for val in scope.iter().rev() {
                 self.code
-                    .push_str(&format!("  call void @tenon_rc_dec(i64 {})\n", val));
+                    .push_str(&format!("  call void @__tn_rc_dec(i64 {})\n", val));
             }
         }
     }
@@ -1493,14 +2261,17 @@ impl<'a> LlvmFnGen<'a> {
 
         self.fn_returns_rc = self.fn_metas.get(&f.name).is_some_and(|m| m.returns_rc);
         self.fn_ret_ty = f.ret_ty.clone();
+        self.always_unique_vars = collect_always_unique_locals(&f.body);
 
         let ret_val = self.lower_block(&f.body, self.fn_returns_rc, f.ret_ty.as_ref())?;
         if !self.terminated {
             self.code.push_str(&format!("  ret i64 {}\n", ret_val));
         }
 
+        let linkage = if f.name == "main" { "" } else { "internal " };
         Ok(format!(
-            "define i64 @tenon_fn_{}({}) {{\nentry:\n{}{}}}\n",
+            "define {}i64 @tenon_fn_{}({}) {{\nentry:\n{}{}}}\n",
+            linkage,
             sanitize(&f.name),
             param_list.join(", "),
             self.entry_allocas,
@@ -1543,7 +2314,7 @@ impl<'a> LlvmFnGen<'a> {
                 self.code.push_str(&format!("{}:\n", fail_l));
                 let eo = self.fresh_tmp();
                 self.code.push_str(&format!(
-                    "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 1)\n  call void @tenon_rc_set_field(i64 {}, i64 0, i64 {})\n  ret i64 {}\n",
+                    "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 1)\n  call void @__tn_slot_set_prim(i64 {}, i64 0, i64 {})\n  ret i64 {}\n",
                     eo, TAG_ERR, eo, idx + 1, eo
                 ));
                 self.code.push_str(&format!("{}:\n", ok_l));
@@ -1564,7 +2335,7 @@ impl<'a> LlvmFnGen<'a> {
             self.code.push_str(&format!("{}:\n", fail_l));
             let eo = self.fresh_tmp();
             self.code.push_str(&format!(
-                "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 1)\n  call void @tenon_rc_set_field(i64 {}, i64 0, i64 99)\n  ret i64 {}\n",
+                "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 1)\n  call void @__tn_slot_set_prim(i64 {}, i64 0, i64 99)\n  ret i64 {}\n",
                 eo, TAG_ERR, eo, eo
             ));
             self.code.push_str(&format!("{}:\n", ok_l));
@@ -1579,7 +2350,7 @@ impl<'a> LlvmFnGen<'a> {
         ));
         if layout.rc_mask != 0 {
             self.code.push_str(&format!(
-                "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
                 rec, layout.rc_mask
             ));
         }
@@ -1591,22 +2362,22 @@ impl<'a> LlvmFnGen<'a> {
             if fl.is_rc {
                 let inc = self.fresh_tmp();
                 self.code
-                    .push_str(&format!("  {} = call i64 @tenon_rc_inc(i64 {})\n", inc, fv));
+                    .push_str(&format!("  {} = call i64 @__tn_rc_inc(i64 {})\n", inc, fv));
                 fv = inc;
             }
             self.code.push_str(&format!(
-                "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
+                "  call void @__tn_slot_set_prim(i64 {}, i64 {}, i64 {})\n",
                 rec, idx, fv
             ));
         }
         let ok_obj = self.fresh_tmp();
         self.code.push_str(&format!(
-            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 1)\n  call void @tenon_rc_set_rc_mask(i64 {}, i64 1)\n  call void @tenon_rc_set_field(i64 {}, i64 0, i64 {})\n  ret i64 {}\n",
+            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 1)\n  call void @__tn_rc_set_rc_mask(i64 {}, i64 1)\n  call void @__tn_slot_set_prim(i64 {}, i64 0, i64 {})\n  ret i64 {}\n",
             ok_obj, TAG_OK, ok_obj, ok_obj, rec, ok_obj
         ));
 
         Ok(format!(
-            "define i64 @tenon_fn_{}__parse({}) {{\nentry:\n{}{}}}\n",
+            "define internal i64 @tenon_fn_{}__parse({}) {{\nentry:\n{}{}}}\n",
             sanitize(rname),
             param_list.join(", "),
             self.entry_allocas,
@@ -1642,13 +2413,13 @@ impl<'a> LlvmFnGen<'a> {
         for (i, p) in f.params.iter().enumerate() {
             ctor_params.push(format!("i64 %arg_{}", i));
             ctor_body.push_str(&format!(
-                "  call void @tenon_rc_set_field(i64 %fr, i64 {}, i64 %arg_{})\n",
+                "  call void @__tn_slot_set_prim(i64 %fr, i64 {}, i64 %arg_{})\n",
                 frame_slots[&p.name], i
             ));
         }
         ctor_body.push_str("  ret i64 %fr\n");
         let ctor_ir = format!(
-            "define i64 @tenon_fn_{}({}) {{\nentry:\n{}}}\n\n",
+            "define internal i64 @tenon_fn_{}({}) {{\nentry:\n{}}}\n\n",
             sname,
             ctor_params.join(", "),
             ctor_body
@@ -1658,13 +2429,13 @@ impl<'a> LlvmFnGen<'a> {
             let vp = self.ensure_var_slot(vname);
             let lv = self.fresh_tmp();
             self.code.push_str(&format!(
-                "  {} = call i64 @tenon_rc_get_field(i64 %frame, i64 {})\n  store i64 {}, ptr {}\n",
+                "  {} = call i64 @__tn_slot_get(i64 %frame, i64 {})\n  store i64 {}, ptr {}\n",
                 lv, slot, lv, vp
             ));
         }
         let cur_st = self.fresh_tmp();
         self.code
-            .push_str(&format!("  {} = call i64 @tenon_rc_get_field(i64 %frame, i64 0)\n", cur_st));
+            .push_str(&format!("  {} = call i64 @__tn_slot_get(i64 %frame, i64 0)\n", cur_st));
 
         let n_awaits = segments.await_steps.len();
         let mut start_lbls = Vec::new();
@@ -1695,13 +2466,13 @@ impl<'a> LlvmFnGen<'a> {
                 let vp = self.var_ptrs[vname].clone();
                 let lv = self.fresh_tmp();
                 self.code.push_str(&format!(
-                    "  {} = load i64, ptr {}\n  call void @tenon_rc_set_field(i64 %frame, i64 {}, i64 {})\n",
+                    "  {} = load i64, ptr {}\n  call void @__tn_slot_set_prim(i64 %frame, i64 {}, i64 {})\n",
                     lv, vp, slot, lv
                 ));
             }
             let cframe = self.lower_expr_owned(&step.child_expr, None)?;
             self.code.push_str(&format!(
-                "  call void @tenon_rc_set_field(i64 %frame, i64 3, i64 {})\n  call void @tenon_rc_set_field(i64 %frame, i64 0, i64 {})\n  br label %{}\n",
+                "  call void @__tn_slot_set_prim(i64 %frame, i64 3, i64 {})\n  call void @__tn_slot_set_prim(i64 %frame, i64 0, i64 {})\n  br label %{}\n",
                 cframe,
                 2 * s + 1,
                 poll_lbls[s]
@@ -1715,21 +2486,21 @@ impl<'a> LlvmFnGen<'a> {
             let pend_l = self.fresh_lbl("pend");
             let res_l = self.fresh_lbl("res");
             self.code.push_str(&format!(
-                "  {} = call i64 @tenon_rc_get_field(i64 %frame, i64 3)\n  {} = call i64 @tenon_async_poll_frame(i64 {})\n  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n",
+                "  {} = call i64 @__tn_slot_get(i64 %frame, i64 3)\n  {} = call i64 @tenon_async_poll_frame(i64 {})\n  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n",
                 cf, rdy, cf, cmp, rdy, cmp, res_l, pend_l
             ));
             self.code.push_str(&format!("{}:\n  ret i64 0\n", pend_l));
             self.code.push_str(&format!("{}:\n", res_l));
             let cres = self.fresh_tmp();
             self.code.push_str(&format!(
-                "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 2)\n  call void @tenon_rc_dec(i64 {})\n  call void @tenon_rc_set_field(i64 %frame, i64 3, i64 0)\n",
+                "  {} = call i64 @__tn_slot_get(i64 {}, i64 2)\n  call void @__tn_rc_dec(i64 {})\n  call void @__tn_slot_set_prim(i64 %frame, i64 3, i64 0)\n",
                 cres, cf, cf
             ));
             if let Some(bname) = &step.bind_var {
                 let slot = frame_slots[bname];
                 let vp = self.var_ptrs[bname].clone();
                 self.code.push_str(&format!(
-                    "  call void @tenon_rc_set_field(i64 %frame, i64 {}, i64 {})\n  store i64 {}, ptr {}\n",
+                    "  call void @__tn_slot_set_prim(i64 %frame, i64 {}, i64 {})\n  store i64 {}, ptr {}\n",
                     slot, cres, cres, vp
                 ));
             }
@@ -1739,7 +2510,7 @@ impl<'a> LlvmFnGen<'a> {
                 final_lbl.as_str()
             };
             self.code.push_str(&format!(
-                "  call void @tenon_rc_set_field(i64 %frame, i64 0, i64 {})\n  br label %{}\n",
+                "  call void @__tn_slot_set_prim(i64 %frame, i64 0, i64 {})\n  br label %{}\n",
                 2 * (s + 1),
                 next_lbl
             ));
@@ -1754,12 +2525,12 @@ impl<'a> LlvmFnGen<'a> {
         };
         let fval = self.lower_block(&final_blk, true, None)?;
         self.code.push_str(&format!(
-            "  call void @tenon_rc_set_field(i64 %frame, i64 2, i64 {})\n  call void @tenon_rc_set_field(i64 %frame, i64 0, i64 -1)\n  ret i64 1\n",
+            "  call void @__tn_slot_set_prim(i64 %frame, i64 2, i64 {})\n  call void @__tn_slot_set_prim(i64 %frame, i64 0, i64 -1)\n  ret i64 1\n",
             fval
         ));
 
         let poll_ir = format!(
-            "define i64 @tenon_fn_{}__poll(i64 %frame) {{\nentry:\n{}{}}}\n",
+            "define internal i64 @tenon_fn_{}__poll(i64 %frame) {{\nentry:\n{}{}}}\n",
             sname, self.entry_allocas, self.code
         );
         Ok(format!("{}{}", ctor_ir, poll_ir))
@@ -1865,7 +2636,7 @@ impl<'a> LlvmFnGen<'a> {
                             let xs_val = self.load_ident_val(name)?;
                             let val_v = if elem_is_rc {
                                 self.code.push_str(&format!(
-                                    "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                    "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
                                     xs_val, RC_MASK_ALL as i64
                                 ));
                                 self.lower_expr_owned(&args[1].value, None)?
@@ -1905,7 +2676,7 @@ impl<'a> LlvmFnGen<'a> {
                         if target_is_rc && !consuming_in_place && !is_inout {
                             let old = self.fresh_tmp();
                             self.code.push_str(&format!(
-                                "  {} = load i64, ptr {}\n  store i64 {}, ptr {}\n  call void @tenon_rc_dec(i64 {})\n",
+                                "  {} = load i64, ptr {}\n  store i64 {}, ptr {}\n  call void @__tn_rc_dec(i64 {})\n",
                                 old, slot, rhs, slot, old
                             ));
                         } else if is_inout {
@@ -1918,7 +2689,7 @@ impl<'a> LlvmFnGen<'a> {
                             if inout_is_rc && !consuming_in_place && *op == AssignOp::Set {
                                 let old = self.fresh_tmp();
                                 self.code.push_str(&format!(
-                                    "  {} = load i64, ptr {}\n  store i64 {}, ptr {}\n  call void @tenon_rc_dec(i64 {})\n",
+                                    "  {} = load i64, ptr {}\n  store i64 {}, ptr {}\n  call void @__tn_rc_dec(i64 {})\n",
                                     old, ap, rhs, ap, old
                                 ));
                             } else {
@@ -2004,7 +2775,7 @@ impl<'a> LlvmFnGen<'a> {
                             };
                             let uniq = self.fresh_tmp();
                             self.code.push_str(&format!(
-                                "  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n",
+                                "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
                                 uniq, cur_h
                             ));
                             if is_inout {
@@ -2024,7 +2795,7 @@ impl<'a> LlvmFnGen<'a> {
                                     let cf = self.fresh_tmp();
                                     let res = self.fresh_tmp();
                                     self.code.push_str(&format!(
-                                        "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
+                                        "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
                                         cf, uniq, fidx, res, cf, rhs
                                     ));
                                     res
@@ -2033,15 +2804,26 @@ impl<'a> LlvmFnGen<'a> {
                                     let cf = self.fresh_tmp();
                                     let res = self.fresh_tmp();
                                     self.code.push_str(&format!(
-                                        "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
+                                        "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
                                         cf, uniq, fidx, res, cf, rhs
                                     ));
                                     res
                                 }
                             };
+                            let setter = if *op != AssignOp::Set {
+                                "@__tn_slot_set_prim"
+                            } else if let Some(ref f) = fl {
+                                if f.is_rc {
+                                    "@__tn_slot_set_rc"
+                                } else {
+                                    "@__tn_slot_set_prim"
+                                }
+                            } else {
+                                "@tenon_rc_set_field"
+                            };
                             self.code.push_str(&format!(
-                                "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
-                                uniq, fidx, new_fv
+                                "  call void {}(i64 {}, i64 {}, i64 {})\n",
+                                setter, uniq, fidx, new_fv
                             ));
                         }
                     }
@@ -2071,39 +2853,50 @@ impl<'a> LlvmFnGen<'a> {
                                     v
                                 };
                                 let cur_list = self.load_ident_val(vname)?;
-                                let uniq_list = self.fresh_tmp();
-                                self.code.push_str(&format!(
-                                    "  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n",
-                                    uniq_list, cur_list
-                                ));
-                                let vslot = self.var_ptrs[vname].clone();
-                                if self.inout_vars.contains(vname) {
-                                    let ai = self.fresh_tmp();
-                                    let ap = self.fresh_tmp();
-                                    self.code.push_str(&format!(
-                                        "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
-                                        ai, vslot, ap, ai, uniq_list, ap
-                                    ));
+                                let is_always_uniq = self.always_unique_vars.contains(vname);
+                                let uniq_list = if is_always_uniq {
+                                    cur_list
                                 } else {
+                                    let u = self.fresh_tmp();
                                     self.code.push_str(&format!(
-                                        "  store i64 {}, ptr {}\n",
-                                        uniq_list, vslot
+                                        "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
+                                        u, cur_list
                                     ));
-                                }
+                                    let vslot = self.var_ptrs[vname].clone();
+                                    if self.inout_vars.contains(vname) {
+                                        let ai = self.fresh_tmp();
+                                        let ap = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                            ai, vslot, ap, ai, u, ap
+                                        ));
+                                    } else {
+                                        self.code.push_str(&format!(
+                                            "  store i64 {}, ptr {}\n",
+                                            u, vslot
+                                        ));
+                                    }
+                                    u
+                                };
                                 if elem_is_rc {
                                     self.code.push_str(&format!(
-                                        "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                        "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
                                         uniq_list, RC_MASK_ALL as i64
                                     ));
                                 }
+                                let getter = if is_always_uniq {
+                                    "@__tn_list_get_nonnull"
+                                } else {
+                                    "@__tn_list_get"
+                                };
                                 let new_val = match op {
                                     AssignOp::Set => rhs,
                                     AssignOp::AddSet => {
                                         let ce = self.fresh_tmp();
                                         let res = self.fresh_tmp();
                                         self.code.push_str(&format!(
-                                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
-                                            ce, uniq_list, idx_v, res, ce, rhs
+                                            "  {} = call i64 {}(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
+                                            ce, getter, uniq_list, idx_v, res, ce, rhs
                                         ));
                                         res
                                     }
@@ -2111,15 +2904,27 @@ impl<'a> LlvmFnGen<'a> {
                                         let ce = self.fresh_tmp();
                                         let res = self.fresh_tmp();
                                         self.code.push_str(&format!(
-                                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
-                                            ce, uniq_list, idx_v, res, ce, rhs
+                                            "  {} = call i64 {}(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
+                                            ce, getter, uniq_list, idx_v, res, ce, rhs
                                         ));
                                         res
                                     }
                                 };
+                                let setter = if *op != AssignOp::Set {
+                                    if is_always_uniq { "@__tn_list_set_prim_nonnull" } else { "@__tn_list_set_prim" }
+                                } else if elem_is_rc {
+                                    "@__tn_list_set_rc"
+                                } else if elem_ty
+                                    .as_ref()
+                                    .is_some_and(|et| et.display_name() != "Any")
+                                {
+                                    if is_always_uniq { "@__tn_list_set_prim_nonnull" } else { "@__tn_list_set_prim" }
+                                } else {
+                                    "@tenon_rc_set_field"
+                                };
                                 self.code.push_str(&format!(
-                                    "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
-                                    uniq_list, idx_v, new_val
+                                    "  call void {}(i64 {}, i64 {}, i64 {})\n",
+                                    setter, uniq_list, idx_v, new_val
                                 ));
                             }
                             ExprKind::Field { target: obj, field }
@@ -2145,7 +2950,7 @@ impl<'a> LlvmFnGen<'a> {
                                 let cur_obj = self.load_ident_val(vname)?;
                                 let uniq_obj = self.fresh_tmp();
                                 self.code.push_str(&format!(
-                                    "  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n",
+                                    "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
                                     uniq_obj, cur_obj
                                 ));
                                 let vslot = self.var_ptrs[vname].clone();
@@ -2165,12 +2970,12 @@ impl<'a> LlvmFnGen<'a> {
                                 let cur_list = self.fresh_tmp();
                                 let uniq_list = self.fresh_tmp();
                                 self.code.push_str(&format!(
-                                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n  call void @tenon_rc_set_field_raw(i64 {}, i64 {}, i64 {})\n",
+                                    "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n  call void @__tn_slot_set_prim(i64 {}, i64 {}, i64 {})\n",
                                     cur_list, uniq_obj, fidx, uniq_list, cur_list, uniq_obj, fidx, uniq_list
                                 ));
                                 if elem_is_rc {
                                     self.code.push_str(&format!(
-                                        "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                        "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
                                         uniq_list, RC_MASK_ALL as i64
                                     ));
                                 }
@@ -2180,7 +2985,7 @@ impl<'a> LlvmFnGen<'a> {
                                         let ce = self.fresh_tmp();
                                         let res = self.fresh_tmp();
                                         self.code.push_str(&format!(
-                                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
+                                            "  {} = call i64 @__tn_list_get(i64 {}, i64 {})\n  {} = add i64 {}, {}\n",
                                             ce, uniq_list, idx_v, res, ce, rhs
                                         ));
                                         res
@@ -2189,15 +2994,27 @@ impl<'a> LlvmFnGen<'a> {
                                         let ce = self.fresh_tmp();
                                         let res = self.fresh_tmp();
                                         self.code.push_str(&format!(
-                                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
+                                            "  {} = call i64 @__tn_list_get(i64 {}, i64 {})\n  {} = sub i64 {}, {}\n",
                                             ce, uniq_list, idx_v, res, ce, rhs
                                         ));
                                         res
                                     }
                                 };
+                                let setter = if *op != AssignOp::Set {
+                                    "@__tn_list_set_prim"
+                                } else if elem_is_rc {
+                                    "@__tn_list_set_rc"
+                                } else if elem_ty
+                                    .as_ref()
+                                    .is_some_and(|et| et.display_name() != "Any")
+                                {
+                                    "@__tn_list_set_prim"
+                                } else {
+                                    "@tenon_rc_set_field"
+                                };
                                 self.code.push_str(&format!(
-                                    "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
-                                    uniq_list, idx_v, new_val
+                                    "  call void {}(i64 {}, i64 {}, i64 {})\n",
+                                    setter, uniq_list, idx_v, new_val
                                 ));
                             }
                             _ => {}
@@ -2388,28 +3205,18 @@ impl<'a> LlvmFnGen<'a> {
                     }
                 }
                 if s == "None" {
-                    let o = self.fresh_tmp();
-                    self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
-                        o, TAG_NONE
-                    ));
-                    return Ok(o);
+                    return Ok(self.emit_unit_enum_const(TAG_NONE));
                 }
                 if let Some(&tag) = self.enum_tags.get(s) {
                     if !self.var_ptrs.contains_key(s) {
-                        let o = self.fresh_tmp();
-                        self.code.push_str(&format!(
-                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
-                            o, tag
-                        ));
-                        return Ok(o);
+                        return Ok(self.emit_unit_enum_const(tag));
                     }
                 }
                 let v = self.load_ident_val(s)?;
                 if self.is_rc_ident(s) {
                     let inc = self.fresh_tmp();
                     self.code
-                        .push_str(&format!("  {} = call i64 @tenon_rc_inc(i64 {})\n", inc, v));
+                        .push_str(&format!("  {} = call i64 @__tn_rc_inc(i64 {})\n", inc, v));
                     Ok(inc)
                 } else {
                     Ok(v)
@@ -2419,12 +3226,7 @@ impl<'a> LlvmFnGen<'a> {
                 if let ExprKind::Ident(ename) = &target.kind {
                     let key = format!("{}.{}", ename, field);
                     if let Some(&tag) = self.enum_tags.get(&key) {
-                        let o = self.fresh_tmp();
-                        self.code.push_str(&format!(
-                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
-                            o, tag
-                        ));
-                        return Ok(o);
+                        return Ok(self.emit_unit_enum_const(tag));
                     }
                 }
                 let (idx, fl) = self.resolve_field_layout(target, field)?;
@@ -2432,13 +3234,13 @@ impl<'a> LlvmFnGen<'a> {
                 let obj = self.lower_expr_borrowed(target, &mut temps)?;
                 let mut res = self.fresh_tmp();
                 self.code.push_str(&format!(
-                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
+                    "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
                     res, obj, idx
                 ));
                 if fl.as_ref().is_some_and(|f| f.is_rc) {
                     let inc = self.fresh_tmp();
                     self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_rc_inc(i64 {})\n",
+                        "  {} = call i64 @__tn_rc_inc(i64 {})\n",
                         inc, res
                     ));
                     res = inc;
@@ -2455,13 +3257,13 @@ impl<'a> LlvmFnGen<'a> {
                 let i = self.lower_expr_borrowed(index, &mut temps)?;
                 let mut res = self.fresh_tmp();
                 self.code.push_str(&format!(
-                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
+                    "  {} = call i64 @__tn_list_get(i64 {}, i64 {})\n",
                     res, t, i
                 ));
                 if elem_is_rc {
                     let inc = self.fresh_tmp();
                     self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_rc_inc(i64 {})\n",
+                        "  {} = call i64 @__tn_rc_inc(i64 {})\n",
                         inc, res
                     ));
                     res = inc;
@@ -2490,6 +3292,13 @@ impl<'a> LlvmFnGen<'a> {
         match &expr.kind {
             ExprKind::Int(n) => Ok(n.to_string()),
             ExprKind::Bool(b) => Ok(if *b { "1" } else { "0" }.into()),
+            ExprKind::Str(s) => {
+                let gname = self.intern_string_global(s);
+                let obj = self.fresh_tmp();
+                self.code
+                    .push_str(&format!("  {} = ptrtoint ptr @{} to i64\n", obj, gname));
+                Ok(obj)
+            }
             ExprKind::Ident(s) => {
                 if s == "self" {
                     if let Some(sv) = self.self_var.clone() {
@@ -2501,23 +3310,11 @@ impl<'a> LlvmFnGen<'a> {
                     }
                 }
                 if s == "None" {
-                    let o = self.fresh_tmp();
-                    self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
-                        o, TAG_NONE
-                    ));
-                    temps.push(o.clone());
-                    return Ok(o);
+                    return Ok(self.emit_unit_enum_const(TAG_NONE));
                 }
                 if let Some(&tag) = self.enum_tags.get(s) {
                     if !self.var_ptrs.contains_key(s) {
-                        let o = self.fresh_tmp();
-                        self.code.push_str(&format!(
-                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
-                            o, tag
-                        ));
-                        temps.push(o.clone());
-                        return Ok(o);
+                        return Ok(self.emit_unit_enum_const(tag));
                     }
                 }
                 self.load_ident_val(s)
@@ -2526,31 +3323,27 @@ impl<'a> LlvmFnGen<'a> {
                 if let ExprKind::Ident(ename) = &target.kind {
                     let key = format!("{}.{}", ename, field);
                     if let Some(&tag) = self.enum_tags.get(&key) {
-                        let o = self.fresh_tmp();
-                        self.code.push_str(&format!(
-                            "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 0)\n",
-                            o, tag
-                        ));
-                        temps.push(o.clone());
-                        return Ok(o);
+                        return Ok(self.emit_unit_enum_const(tag));
                     }
                 }
                 let (idx, _) = self.resolve_field_layout(target, field)?;
                 let obj = self.lower_expr_borrowed(target, temps)?;
                 let res = self.fresh_tmp();
                 self.code.push_str(&format!(
-                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
+                    "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
                     res, obj, idx
                 ));
                 Ok(res)
             }
             ExprKind::Index { target, index } => {
+                let is_nonnull = matches!(&target.kind, ExprKind::Ident(n) if self.always_unique_vars.contains(n));
                 let t = self.lower_expr_borrowed(target, temps)?;
                 let i = self.lower_expr_borrowed(index, temps)?;
                 let res = self.fresh_tmp();
+                let getter = if is_nonnull { "@__tn_list_get_nonnull" } else { "@__tn_list_get" };
                 self.code.push_str(&format!(
-                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
-                    res, t, i
+                    "  {} = call i64 {}(i64 {}, i64 {})\n",
+                    res, getter, t, i
                 ));
                 Ok(res)
             }
@@ -2686,7 +3479,7 @@ impl<'a> LlvmFnGen<'a> {
         let cmp_val = if is_variant {
             let tg = self.fresh_tmp();
             self.code
-                .push_str(&format!("  {} = call i64 @tenon_rc_get_tag(i64 {})\n", tg, sv));
+                .push_str(&format!("  {} = call i64 @__tn_rc_tag(i64 {})\n", tg, sv));
             tg
         } else {
             sv.clone()
@@ -2766,15 +3559,13 @@ impl<'a> LlvmFnGen<'a> {
                         e
                     }
                     Pattern::Str(s, _) if is_str => {
-                        let gname = format!(".str.{}", self.string_globals.len());
-                        self.string_globals.push((gname.clone(), s.clone()));
-                        let pi = self.fresh_tmp();
+                        let gname = self.intern_string_global(s);
                         let ptxt = self.fresh_tmp();
                         let teq = self.fresh_tmp();
                         let e = self.fresh_tmp();
                         self.code.push_str(&format!(
-                            "  {} = ptrtoint ptr @{} to i64\n  {} = call i64 @tenon_text_new(i64 {}, i64 {})\n  {} = call i64 @tenon_text_eq(i64 {}, i64 {})\n  call void @tenon_rc_dec(i64 {})\n  {} = icmp ne i64 {}, 0\n",
-                            pi, gname, ptxt, pi, s.len(), teq, cmp_val, ptxt, ptxt, e, teq
+                            "  {} = ptrtoint ptr @{} to i64\n  {} = call i64 @__tn_text_eq(i64 {}, i64 {})\n  {} = icmp ne i64 {}, 0\n",
+                            ptxt, gname, teq, cmp_val, ptxt, e, teq
                         ));
                         e
                     }
@@ -2818,7 +3609,7 @@ impl<'a> LlvmFnGen<'a> {
                 let pay = self.fresh_tmp();
                 let bslot = self.fresh_var_slot(&bn);
                 self.code.push_str(&format!(
-                    "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 0)\n  store i64 {}, ptr {}\n",
+                    "  {} = call i64 @__tn_slot_get(i64 {}, i64 0)\n  store i64 {}, ptr {}\n",
                     pay, sv, pay, bslot
                 ));
                 let bty = self.infer_match_binding_type(&scrutinee_ty, &vname);
@@ -2879,14 +3670,10 @@ impl<'a> LlvmFnGen<'a> {
             ExprKind::Int(n) => Ok(n.to_string()),
             ExprKind::Bool(b) => Ok(if *b { "1" } else { "0" }.into()),
             ExprKind::Str(s) => {
-                let gname = format!(".str.{}", self.string_globals.len());
-                self.string_globals.push((gname.clone(), s.clone()));
-                let pi = self.fresh_tmp();
+                let gname = self.intern_string_global(s);
                 let obj = self.fresh_tmp();
-                self.code.push_str(&format!(
-                    "  {} = ptrtoint ptr @{} to i64\n  {} = call i64 @tenon_text_new(i64 {}, i64 {})\n",
-                    pi, gname, obj, pi, s.len()
-                ));
+                self.code
+                    .push_str(&format!("  {} = ptrtoint ptr @{} to i64\n", obj, gname));
                 Ok(obj)
             }
             ExprKind::RecordLit { name, fields, .. } => {
@@ -2904,7 +3691,7 @@ impl<'a> LlvmFnGen<'a> {
                 ));
                 if layout.rc_mask != 0 {
                     self.code.push_str(&format!(
-                        "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                        "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
                         obj, layout.rc_mask
                     ));
                 }
@@ -2924,7 +3711,7 @@ impl<'a> LlvmFnGen<'a> {
                             v
                         };
                         self.code.push_str(&format!(
-                            "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
+                            "  call void @__tn_slot_set_prim(i64 {}, i64 {}, i64 {})\n",
                             obj, idx, fv
                         ));
                     }
@@ -2946,7 +3733,7 @@ impl<'a> LlvmFnGen<'a> {
                 ));
                 if elem_is_rc {
                     self.code.push_str(&format!(
-                        "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                        "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
                         obj, RC_MASK_ALL as i64
                     ));
                 }
@@ -2960,7 +3747,7 @@ impl<'a> LlvmFnGen<'a> {
                         v
                     };
                     self.code.push_str(&format!(
-                        "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
+                        "  call void @__tn_slot_set_prim(i64 {}, i64 {}, i64 {})\n",
                         obj, idx, ev
                     ));
                 }
@@ -3070,7 +3857,7 @@ impl<'a> LlvmFnGen<'a> {
                 if tcmp && matches!(op, BinOp::Eq | BinOp::Ne) {
                     let eq = self.fresh_tmp();
                     self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_text_eq(i64 {}, i64 {})\n",
+                        "  {} = call i64 @__tn_text_eq(i64 {}, i64 {})\n",
                         eq, l, r
                     ));
                     self.flush_temps(&temps);
@@ -3172,7 +3959,7 @@ impl<'a> LlvmFnGen<'a> {
                         if dm.is_inout_self {
                             let d_uniq = self.fresh_tmp();
                             self.code.push_str(&format!(
-                                "  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n",
+                                "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
                                 d_uniq, d_val
                             ));
                             if let ExprKind::Ident(vname) = &target.kind {
@@ -3193,7 +3980,7 @@ impl<'a> LlvmFnGen<'a> {
                             d_val = d_uniq.clone();
                             let data_val = self.fresh_tmp();
                             self.code.push_str(&format!(
-                                "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 0)\n",
+                                "  {} = call i64 @__tn_slot_get(i64 {}, i64 0)\n",
                                 data_val, d_val
                             ));
                             self.slot_id += 1;
@@ -3212,7 +3999,7 @@ impl<'a> LlvmFnGen<'a> {
                         } else {
                             let data_val = self.fresh_tmp();
                             self.code.push_str(&format!(
-                                "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 0)\n",
+                                "  {} = call i64 @__tn_slot_get(i64 {}, i64 0)\n",
                                 data_val, d_val
                             ));
                             call_args.push(format!("i64 {}", data_val));
@@ -3229,7 +4016,7 @@ impl<'a> LlvmFnGen<'a> {
                         let fn_ptr = self.fresh_tmp();
                         let res = self.fresh_tmp();
                         self.code.push_str(&format!(
-                            "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 1)\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds ptr, ptr {}, i64 {}\n  {} = load ptr, ptr {}\n  {} = call i64 {}({})\n",
+                            "  {} = call i64 @__tn_slot_get(i64 {}, i64 1)\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds ptr, ptr {}, i64 {}\n  {} = load ptr, ptr {}\n  {} = call i64 {}({})\n",
                             vt_i64, d_val,
                             vt_ptr, vt_i64,
                             slot_ptr, vt_ptr, dm.slot_idx,
@@ -3239,7 +4026,7 @@ impl<'a> LlvmFnGen<'a> {
                         if let Some((d_uniq, slot, _)) = inout_dyn_slot {
                             let updated = self.fresh_tmp();
                             self.code.push_str(&format!(
-                                "  {} = load i64, ptr {}\n  call void @tenon_rc_set_field_raw(i64 {}, i64 0, i64 {})\n",
+                                "  {} = load i64, ptr {}\n  call void @__tn_slot_set_prim(i64 {}, i64 0, i64 {})\n",
                                 updated, slot, d_uniq, updated
                             ));
                         }
@@ -3275,12 +4062,12 @@ impl<'a> LlvmFnGen<'a> {
                         ));
                         if data_is_rc {
                             self.code.push_str(&format!(
-                                "  call void @tenon_rc_set_rc_mask(i64 {}, i64 1)\n",
+                                "  call void @__tn_rc_set_rc_mask(i64 {}, i64 1)\n",
                                 obj
                             ));
                         }
                         self.code.push_str(&format!(
-                            "  call void @tenon_rc_set_field(i64 {}, i64 0, i64 {})\n  {} = ptrtoint ptr @{} to i64\n  call void @tenon_rc_set_field(i64 {}, i64 1, i64 {})\n",
+                            "  call void @__tn_slot_set_prim(i64 {}, i64 0, i64 {})\n  {} = ptrtoint ptr @{} to i64\n  call void @__tn_slot_set_prim(i64 {}, i64 1, i64 {})\n",
                             obj, data_val,
                             vt_i64, sanitize(&vsym),
                             obj, vt_i64
@@ -3303,7 +4090,7 @@ impl<'a> LlvmFnGen<'a> {
                         let v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
                         let res = self.fresh_tmp();
                         self.code.push_str(&format!(
-                            "  {} = call i64 @tenon_rc_get_len(i64 {})\n",
+                            "  {} = call i64 @__tn_rc_len(i64 {})\n",
                             res, v
                         ));
                         self.flush_temps(&temps);
@@ -3318,7 +4105,7 @@ impl<'a> LlvmFnGen<'a> {
                         let xs = self.lower_expr_owned(&args[0].value, expected_ty)?;
                         let val = if elem_is_rc {
                             self.code.push_str(&format!(
-                                "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                                "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
                                 xs, RC_MASK_ALL as i64
                             ));
                             self.lower_expr_owned(&args[1].value, None)?
@@ -3351,6 +4138,25 @@ impl<'a> LlvmFnGen<'a> {
                             count_v,
                             init_v,
                             if elem_is_rc { 1 } else { 0 }
+                        ));
+                        let lf_pos = self.fresh_tmp();
+                        let lf_exp = self.fresh_tmp();
+                        let lf_nz = self.fresh_tmp();
+                        let lf_obj = self.fresh_tmp();
+                        let lf_lp = self.fresh_tmp();
+                        let lf_len = self.fresh_tmp();
+                        let lf_eq = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = icmp sgt i64 {}, 0\n  {} = select i1 {}, i64 {}, i64 0\n  {} = icmp ne i64 {}, 0\n  call void @llvm.assume(i1 {})\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 16\n  {} = load i64, ptr {}, align 8, !tbaa !8\n  {} = icmp eq i64 {}, {}\n  call void @llvm.assume(i1 {})\n",
+                            lf_pos, count_v,
+                            lf_exp, lf_pos, count_v,
+                            lf_nz, res,
+                            lf_nz,
+                            lf_obj, res,
+                            lf_lp, lf_obj,
+                            lf_len, lf_lp,
+                            lf_eq, lf_len, lf_exp,
+                            lf_eq
                         ));
                         self.flush_temps(&temps);
                         return Ok(res);
@@ -3394,10 +4200,15 @@ impl<'a> LlvmFnGen<'a> {
                             ));
                         }
                         let res = self.fresh_tmp();
+                        let target_sym = match csym {
+                            "tenon_byte_at" => "__tn_byte_at",
+                            "tenon_buf_push_byte" => "__tn_buf_push_byte",
+                            _ => csym,
+                        };
                         self.code.push_str(&format!(
                             "  {} = call i64 @{}({})\n",
                             res,
-                            csym,
+                            target_sym,
                             avals.join(", ")
                         ));
                         self.flush_temps(&temps);
@@ -3465,7 +4276,7 @@ impl<'a> LlvmFnGen<'a> {
                                     let cur_obj = self.load_ident_val(vn)?;
                                     let uniq_obj = self.fresh_tmp();
                                     self.code.push_str(&format!(
-                                        "  {} = call i64 @tenon_rc_ensure_unique(i64 {})\n",
+                                        "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
                                         uniq_obj, cur_obj
                                     ));
                                     let vslot = self.var_ptrs[vn].clone();
@@ -3484,7 +4295,7 @@ impl<'a> LlvmFnGen<'a> {
                                     }
                                     let cur_fv = self.fresh_tmp();
                                     self.code.push_str(&format!(
-                                        "  {} = call i64 @tenon_rc_get_field(i64 {}, i64 {})\n",
+                                        "  {} = call i64 @__tn_slot_get(i64 {}, i64 {})\n",
                                         cur_fv, uniq_obj, fidx
                                     ));
                                     self.slot_id += 1;
@@ -3542,7 +4353,7 @@ impl<'a> LlvmFnGen<'a> {
                     for (uniq_obj, fidx, tmp_slot) in field_writebacks {
                         let updated = self.fresh_tmp();
                         self.code.push_str(&format!(
-                            "  {} = load i64, ptr {}\n  call void @tenon_rc_set_field_raw(i64 {}, i64 {}, i64 {})\n",
+                            "  {} = load i64, ptr {}\n  call void @__tn_slot_set_prim(i64 {}, i64 {}, i64 {})\n",
                             updated, tmp_slot, uniq_obj, fidx, updated
                         ));
                     }
@@ -3560,6 +4371,9 @@ impl<'a> LlvmFnGen<'a> {
         payload_tys: &[TypeExpr],
         args: &[CallArg],
     ) -> Result<String, String> {
+        if args.is_empty() {
+            return Ok(self.emit_unit_enum_const(tag));
+        }
         let o = self.fresh_tmp();
         self.code.push_str(&format!(
             "  {} = call i64 @tenon_rc_alloc(i64 {}, i64 {})\n",
@@ -3583,17 +4397,173 @@ impl<'a> LlvmFnGen<'a> {
                 v
             };
             self.code.push_str(&format!(
-                "  call void @tenon_rc_set_field(i64 {}, i64 {}, i64 {})\n",
+                "  call void @__tn_slot_set_prim(i64 {}, i64 {}, i64 {})\n",
                 o, i, av
             ));
         }
         if rc_mask != 0 {
             self.code.push_str(&format!(
-                "  call void @tenon_rc_set_rc_mask(i64 {}, i64 {})\n",
+                "  call void @__tn_rc_set_rc_mask(i64 {}, i64 {})\n",
                 o, rc_mask as i64
             ));
         }
         Ok(o)
+    }
+}
+
+fn collect_always_unique_locals(body: &Block) -> BTreeSet<String> {
+    let mut candidates: Vec<(usize, String)> = Vec::new();
+    for (idx, stmt) in body.stmts.iter().enumerate() {
+        if let Stmt::Let { name, value, .. } = stmt {
+            let is_fresh_unique = match &value.kind {
+                ExprKind::List(_) | ExprKind::RecordLit { .. } => true,
+                ExprKind::Call { callee, .. } => matches!(&callee.kind, ExprKind::Ident(f) if f == "list_filled"),
+                _ => false,
+            };
+            if is_fresh_unique {
+                candidates.push((idx, name.clone()));
+            }
+        }
+    }
+    let mut result = BTreeSet::new();
+    for (decl_idx, name) in candidates {
+        let mut ok = true;
+        for stmt in &body.stmts[(decl_idx + 1)..] {
+            if !stmt_keeps_unique(stmt, &name) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            if let Some(tail) = &body.tail {
+                if !expr_keeps_unique(tail, &name) {
+                    ok = false;
+                }
+            }
+        }
+        if ok {
+            result.insert(name);
+        }
+    }
+    result
+}
+
+fn block_keeps_unique(blk: &Block, name: &str) -> bool {
+    for stmt in &blk.stmts {
+        if !stmt_keeps_unique(stmt, name) {
+            return false;
+        }
+    }
+    blk.tail.as_deref().is_none_or(|t| expr_keeps_unique(t, name))
+}
+
+fn stmt_keeps_unique(stmt: &Stmt, name: &str) -> bool {
+    match stmt {
+        Stmt::Let { name: ln, value, .. } => ln != name && expr_keeps_unique(value, name),
+        Stmt::Assign { target, op, value, .. } => match &target.kind {
+            ExprKind::Ident(vn) if vn == name => {
+                if *op != AssignOp::Set {
+                    return false;
+                }
+                match &value.kind {
+                    ExprKind::Call { callee, args }
+                        if matches!(&callee.kind, ExprKind::Ident(f) if f == "push")
+                            && args.len() == 2
+                            && matches!(&args[0].value.kind, ExprKind::Ident(s) if s == name) =>
+                    {
+                        expr_keeps_unique(&args[1].value, name)
+                    }
+                    ExprKind::Call { callee, args }
+                        if matches!(&callee.kind, ExprKind::Ident(f) if f == "list_pop_shrink")
+                            && args.len() == 1
+                            && matches!(&args[0].value.kind, ExprKind::Ident(s) if s == name) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            ExprKind::Index { target: lt, index } => {
+                let t_ok = matches!(&lt.kind, ExprKind::Ident(s) if s == name)
+                    || expr_keeps_unique(lt, name);
+                t_ok && expr_keeps_unique(index, name) && expr_keeps_unique(value, name)
+            }
+            ExprKind::Field { target: ot, .. } => {
+                let t_ok = matches!(&ot.kind, ExprKind::Ident(s) if s == name)
+                    || expr_keeps_unique(ot, name);
+                t_ok && expr_keeps_unique(value, name)
+            }
+            _ => expr_keeps_unique(target, name) && expr_keeps_unique(value, name),
+        },
+        Stmt::Mutate { body, .. } => block_keeps_unique(body, name),
+        Stmt::Return { value, .. } => value.as_ref().is_none_or(|e| expr_keeps_unique(e, name)),
+        Stmt::Assert { cond, .. } => expr_keeps_unique(cond, name),
+        Stmt::While { cond, body, .. } => {
+            expr_keeps_unique(cond, name) && block_keeps_unique(body, name)
+        }
+        Stmt::Expr { expr, .. } => expr_keeps_unique(expr, name),
+        Stmt::Break { .. } | Stmt::Continue { .. } => true,
+    }
+}
+
+fn expr_keeps_unique(expr: &Expr, name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(s) => s != name,
+        ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Str(_) => true,
+        ExprKind::Index { target, index } => {
+            let t_ok = matches!(&target.kind, ExprKind::Ident(s) if s == name)
+                || expr_keeps_unique(target, name);
+            t_ok && expr_keeps_unique(index, name)
+        }
+        ExprKind::Field { target, .. } => {
+            matches!(&target.kind, ExprKind::Ident(s) if s == name)
+                || expr_keeps_unique(target, name)
+        }
+        ExprKind::Call { callee, args } => {
+            if matches!(&callee.kind, ExprKind::Ident(f) if f == "len")
+                && args.len() == 1
+                && matches!(&args[0].value.kind, ExprKind::Ident(s) if s == name)
+            {
+                return true;
+            }
+            expr_keeps_unique(callee, name)
+                && args.iter().all(|a| expr_keeps_unique(&a.value, name))
+        }
+        ExprKind::Unary { expr: inner, .. } => expr_keeps_unique(inner, name),
+        ExprKind::Binary { left, right, .. } => {
+            expr_keeps_unique(left, name) && expr_keeps_unique(right, name)
+        }
+        ExprKind::RecordLit { fields, .. } => {
+            fields.iter().all(|(_, e)| expr_keeps_unique(e, name))
+        }
+        ExprKind::List(es) => es.iter().all(|e| expr_keeps_unique(e, name)),
+        ExprKind::If {
+            cond,
+            then_block,
+            else_branch,
+        } => {
+            expr_keeps_unique(cond, name)
+                && block_keeps_unique(then_block, name)
+                && else_branch
+                    .as_deref()
+                    .is_none_or(|e| expr_keeps_unique(e, name))
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            if !expr_keeps_unique(scrutinee, name) {
+                return false;
+            }
+            arms.iter().all(|a| {
+                let shadows = a.patterns.iter().any(|p| {
+                    matches!(p, Pattern::Variant { binding: Some(b), .. } if b == name)
+                });
+                !shadows
+                    && a.guard.as_ref().is_none_or(|g| expr_keeps_unique(g, name))
+                    && expr_keeps_unique(&a.body, name)
+            })
+        }
+        ExprKind::Block(blk) => block_keeps_unique(blk, name),
+        ExprKind::Await(e) => expr_keeps_unique(e, name),
+        _ => false,
     }
 }
 

@@ -10,9 +10,51 @@ pub pure fn str_slice_checked(s Text, start NonNegative, end NonNegative) Text
     str_slice(s, start, end)
 }
 
+pure fn buf_push_u8_digits(b Int, val Int, pad_eight Bool) {
+    var v = val
+    var packed = 0
+    var count = 0
+    if pad_eight {
+        while count < 8 {
+            let q = v / 10
+            let d = v - q * 10
+            packed = (packed << 8) | (48 + d)
+            v = q
+            count += 1
+        }
+    } else {
+        while v > 0 {
+            let q = v / 10
+            let d = v - q * 10
+            packed = (packed << 8) | (48 + d)
+            v = q
+            count += 1
+        }
+    }
+    while count > 0 {
+        let _ = buf_push_byte(b, packed & 255)
+        packed = packed >> 8
+        count -= 1
+    }
+}
+
 pub pure fn int_to_text(n Int) Text {
-    if n == 0 {
-        return "0"
+    if n >= 0 && n < 10 {
+        return match n {
+            0 => "0"
+            1 => "1"
+            2 => "2"
+            3 => "3"
+            4 => "4"
+            5 => "5"
+            6 => "6"
+            7 => "7"
+            8 => "8"
+            _ => "9"
+        }
+    }
+    if n == -9223372036854775807 - 1 {
+        return "-9223372036854775808"
     }
     let b = buf_new()
     var v = n
@@ -20,15 +62,21 @@ pub pure fn int_to_text(n Int) Text {
         let _ = buf_push_byte(b, 45)
         v = -v
     }
-    var div = 1
-    while div <= v / 10 {
-        div = div * 10
-    }
-    while div > 0 {
-        let d = v / div
-        let _ = buf_push_byte(b, 48 + d)
-        v = v - d * div
-        div = div / 10
+    if v < 100000000 {
+        buf_push_u8_digits(b, v, false)
+    } else if v < 10000000000000000 {
+        let hi = v / 100000000
+        let lo = v - hi * 100000000
+        buf_push_u8_digits(b, hi, false)
+        buf_push_u8_digits(b, lo, true)
+    } else {
+        let top = v / 10000000000000000
+        let rem = v - top * 10000000000000000
+        let mid = rem / 100000000
+        let lo = rem - mid * 100000000
+        buf_push_u8_digits(b, top, false)
+        buf_push_u8_digits(b, mid, true)
+        buf_push_u8_digits(b, lo, true)
     }
     buf_finish(b)
 }

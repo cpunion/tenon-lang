@@ -27,21 +27,26 @@ python3 benchmarks/run.py --only 04_hashmap 05_json
 
 | Benchmark | 负载说明 | C (`-O3`) | Rust (`-O3`) | Go (`1.27`) | Tenon (`-O3`) | Tenon/C | Tenon/Go | Tenon 体积 | Checksum |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `01_fib` | 递归 `fib(40)`（`@no_heap_alloc`） | 187.28 ms | 185.11 ms | 239.66 ms | **187.19 ms** | **1.00x** | **0.78x** | 33.1 KB | `102334155` |
-| `02_compute_loop` | 1 亿次 SplitMix64 标量/位运算循环 | 66.63 ms | 67.37 ms | 94.22 ms | **67.01 ms** | **1.01x** | **0.71x** | 33.1 KB | `4378771939937074704` |
-| `03_sieve` | 埃拉托斯特尼筛（1M × 5 次，原地数组写） | 8.22 ms | 8.41 ms | 13.51 ms | **19.97 ms** | 2.43x | 1.48x | 33.6 KB | `392490` |
-| `04_hashmap` | 50k 字符串 HashMap 增/改/查/删 25k/复查 | 16.32 ms | 15.01 ms | 16.47 ms | **27.59 ms** | **1.69x** | **1.68x** | 34.6 KB | `708334` |
-| `05_json` | 5,000 次嵌套 JSON 解析/取字段/重建/序列化 | 6.57 ms | 6.54 ms | 15.72 ms | **19.89 ms** | 3.03x | **1.27x** | 50.9 KB | `483984` |
-| `06_dyn_dispatch` | 500 万次异构 `dyn Op` 虚表动态分发 | 5.74 ms | 5.84 ms | 7.95 ms | **19.92 ms** | 3.47x | 2.51x | 34.0 KB | `840988148304462647` |
+| `01_fib` | 递归 `fib(40)`（`@no_heap_alloc`） | 184.49 ms | 182.15 ms | 237.28 ms | **174.95 ms** | **0.95x** | **0.74x** | 33.1 KB | `102334155` |
+| `02_compute_loop` | 1 亿次 SplitMix64 标量/位运算循环 | 65.82 ms | 66.26 ms | 92.71 ms | **66.32 ms** | **1.01x** | **0.72x** | 33.1 KB | `4378771939937074704` |
+| `03_sieve` | 埃拉托斯特尼筛（1M × 5 次，原地数组写） | 8.13 ms | 8.34 ms | 13.51 ms | **8.90 ms** | **1.09x** | **0.66x** | 33.4 KB | `392490` |
+| `04_hashmap` | 50k 字符串 HashMap 增/改/查/删 25k/复查 | 15.78 ms | 15.17 ms | 16.27 ms | **16.24 ms** | **1.03x** | **1.00x** | 34.2 KB | `708334` |
+| `05_json` | 5,000 次嵌套 JSON 解析/取字段/重建/序列化 | 6.42 ms | 6.30 ms | 15.23 ms | **6.11 ms** | **0.95x** | **0.40x** | 50.6 KB | `483984` |
+| `06_dyn_dispatch` | 500 万次异构 `dyn Op` 虚表动态分发 | 5.37 ms | 5.59 ms | 7.66 ms | **5.36 ms** | **1.00x** | **0.70x** | 33.7 KB | `840988148304462647` |
 
-### 二进制体积对比
-- **C**：32.7–33.2 KB
-- **Tenon (`-O3` ThinLTO)**：**33.1–50.9 KB**（无 GC 运行时，且内置 Perceus 零泄漏退出校验）
+**几何平均（6 项汇总）**：**`1.004x` C (`-O3`)**、**`0.69x` Go（比 Go 快 ~45%）**，全部 6 项在 L0/L1 静态证明通过且 Perceus `live_objects == 0` 严格零泄漏下运行。
+
+### 二进制体积对比（含带 OS / HTTPS-SSE 的完整应用）
+- **C (`-O3`)**：32.7–33.2 KB
+- **Tenon (`-O3` ThinLTO，纯计算/标准库基准)**：**33.1–50.6 KB**（无 GC 运行时，内置 Perceus 零泄漏退出校验）
+- **Tenon (`-O3` ThinLTO，全量 4 层标准库测试 `examples/stdlib_test.tn`)**：**118 KB**（优化前 25.8 MB，缩小 **218×**）
+- **Tenon (`-O3` ThinLTO，完整 HTTPS-SSE Coding Agent `examples/agent/cli_agent.tn`)**：**154 KB**（优化前 25.8 MB，缩小 **167×**；按需链接系统 `libcurl` + `libSystem`，零 `tokio`/`reqwest`/`rustls` 膨胀）
 - **Rust (`-O3`)**：460–481 KB
 - **Go (`1.27`)**：2.37–3.68 MB
 
-### 关键剖析与后续优化方向
-1. **纯标量/计算密集型（`01_fib`、`02_compute_loop`）**：Tenon 已达到 **1.00x–1.01x C / Rust**，领先 Go **22%–29%**。
-2. **纯 Tenon 标准库（`04_hashmap`、`05_json`）**：`TextMap` 在升级为开放寻址紧凑哈希表 + `int_to_text` 单缓冲 + `TenonBuf` SBO 后，跑出 **1.69x C / 1.68x Go**（零 COW 拷贝、零泄漏）；`std/encoding/json.tn` 达到 Go `encoding/json` 的 **1.27x**。主要差距来自 `JsonValue.set` 借用 `self` 触发的 COW 与每个短字符串的独立 RC 堆对象头。
-3. **密集数组写（`03_sieve`, 2.43x C）**：仅 5 次堆分配、0 次 COW，主要开销是内层循环每次 `flags[m] = 0` 的 `rc == 1` 检查与边界检查；未来在 MIR 层加入**循环外唯一性提升（LICM uniqueness hoist）**与 L0 证明后的边界检查消除即可逼近 1.0x C。
-4. **动态接口分发（`06_dyn_dispatch`, 3.47x C）**：当前 `dyn Op` 为 2 槽位堆胖对象（导致循环中多了 1 层堆解引用与字段边界检查）；未来升级为**非装箱栈/寄存器 2-word 胖指针 `(data_ptr, vtable_ptr)`** 可将开销压至 ~1.0x C/Rust。
+### 核心编译器与运行时优化架构
+1. **模块内 `alwaysinline` LLVM IR 辅助函数 + TBAA 别名元数据 + `internal` 链接**：将 Perceus `rc_inc`/`rc_dec`/`ensure_unique`、记录字段读/写、`dyn` 虚表槽位读取、列表索引、`byte_at`、`buf_push_byte` 与 `memcmp` 文本比较全部内联至同一 `.ll` 模块，并为对象头字段（`rc`/`tag`/`len`/`rc_mask`）与载荷区（`fields[]`）注入独立 `!tbaa` 树，使 `06_dyn_dispatch` 从 `19.92ms` 降至 **`5.36ms`（1.00x C）**。
+2. **静态唯一性数据流分析 + `list_filled` 长度后置条件（`@llvm.assume`）**：对函数内未发生别名的局部唯一对象跳过每次写入的 `ensure_unique` 与判空，并向 LLVM 声明 `list_filled(n, v)` 返回列表长度恒等于 `max(n, 0)`，解锁内层循环边界检查消除与 ARM64 NEON 自动向量化，将 `03_sieve` 从 `19.97ms` 降至 **`8.90ms`（1.09x C，领先 Go 34%）**。
+3. **只读永生常量（`rc = -1`）与小对象 LIFO Freelist**：字符串字面量与无载荷枚举变体（`None`、`JNull` 等）直接下沉到 `.rodata` 零分配常量（LLVM 在编译期彻底折叠其 `rc_inc`/`rc_dec`）；AOT 运行时为 `cap <= 8` 的小对象提供 L1 热缓存 LIFO Freelist（仍严格维护 `g_live == 0` 泄漏断言）。
+4. **高质量纯 Tenon 标准库**：`std/collections/map.tn` 采用 SoA 紧凑开放寻址布局（`keys`/`vals`/`hashes` 平行存储，零 `Entry` 包装分配与二次解引用），`std/text/text.tn` 的 `int_to_text` 用常量除 10 位打包消除全部硬件 `sdiv`，`std/encoding/json.tn` 采用零中间装箱游标解析 + `JsonValue.put(inout self, ...)` 零 COW 原地构建，使 `04_hashmap` 达到 **`1.03x C`**、`05_json` 从 `19.89ms` 降至 **`6.11ms`（0.95x C，领先 C/Rust 并比 Go 快 2.49×）**。
+5. **零依赖 `tenon-rt` 与按需轻量 AOT C 运行时**：彻底移除 `tenon-rt` 的 `tokio`/`reqwest`/`futures-util` 依赖（`Cargo.toml` 0 第三方依赖，编译耗时 `0.31s`），JIT 通过 Rust `#[link(name = "curl")]` FFI、AOT 通过按需注入的自包含 C POSIX + `<curl/curl.h>` 运行时实现流式 HTTP/SSE，彻底消除 25.8 MB 静态库链接膨胀。
