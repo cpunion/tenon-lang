@@ -795,6 +795,17 @@ impl Parser {
                     break;
                 }
                 let is_comptime = self.eat(&TokenKind::Comptime);
+                // Effect polymorphism parameter: `effect E` (ADR-0001 D04)
+                if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "effect") {
+                    self.bump();
+                    let (ename, _) = self.expect_ident()?;
+                    bounds.insert(ename, vec!["__effect__".into()]);
+                    if !self.eat(&TokenKind::Comma) {
+                        self.expect(TokenKind::RBracket)?;
+                        break;
+                    }
+                    continue;
+                }
                 let (name, _) = self.expect_ident()?;
                 // Optional bound(s) e.g. `T Tool` or `K Hash + Eq` or `comptime N USize where ...`
                 if !matches!(
@@ -1275,10 +1286,11 @@ impl Parser {
         let (name, _) = self.expect_ident()?;
         let (type_params, type_param_bounds) = self.parse_type_params_with_bounds()?;
         let params = self.parse_params()?;
-        // Optional return type before `{`, `requires`, `ensures`, `retain`, `allow_loss`
+        // Optional return type before `{`, `/`, `requires`, `ensures`, `retain`, `allow_loss`
         let ret_ty = if !matches!(
             self.peek_non_nl().kind,
             TokenKind::LBrace
+                | TokenKind::Slash
                 | TokenKind::Requires
                 | TokenKind::Ensures
                 | TokenKind::Retain
@@ -1288,6 +1300,29 @@ impl Parser {
         } else {
             None
         };
+        let mut attrs = attrs;
+        if self.eat(&TokenKind::Slash) {
+            let eff_start = self.peek().span;
+            let mut eff_args = Vec::new();
+            loop {
+                let (ename, espan) = self.expect_ident()?;
+                eff_args.push(AttrArg {
+                    key: None,
+                    value: Expr {
+                        kind: ExprKind::Str(ename),
+                        span: espan,
+                    },
+                });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            attrs.push(Attr {
+                name: "__effects".into(),
+                args: eff_args,
+                span: eff_start,
+            });
+        }
         let mut requires = Vec::new();
         let mut ensures = Vec::new();
         loop {
@@ -2058,6 +2093,16 @@ impl Parser {
             } else {
                 None
             };
+            // Optional effect polymorphism clause on function type: `fn(T) U / E` or `fn(T) U / io`
+            if self.eat(&TokenKind::Slash) {
+                loop {
+                    let (_, espan) = self.expect_ident()?;
+                    end = espan;
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
             return Ok(TypeExpr::Fn {
                 params,
                 ret,

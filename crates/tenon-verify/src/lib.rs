@@ -9,7 +9,7 @@ pub mod sync_solver;
 
 pub use checker::{
     CastVerdict, CheckReport, Diagnostic, ProofRecord, ProofTier, check_program,
-    check_type_subsumption,
+    check_type_subsumption, emit_repro_test_from_diagnostics,
 };
 pub use db::{IncrementalDb, QueryStats, program_full_hash, program_signature_hash};
 pub use evolve::{
@@ -18,12 +18,14 @@ pub use evolve::{
 };
 pub use mir::{MirFnSummary, VerifiedMir};
 pub use smt::{
-    ExportedProofCert, begin_proof_recording, end_proof_recording, export_proof_certificates,
-    solve_batch_parallel,
+    ExportedProofCert, ProofAuditReport, begin_proof_recording, end_proof_recording,
+    export_proof_certificates, solve_batch_parallel, verify_proof_certificates_dir,
 };
 pub use modelcheck::{
-    ModelCheckSuiteReport, TraceEvent, TraceRefinementReport, check_program_protocols,
-    export_program_tla_specs, export_tla_specs, run_all_protocol_checks, verify_runtime_trace,
+    LivenessCheckResult, ModelCheckSuiteReport, TraceEvent, TraceRefinementReport,
+    check_builtin_liveness, check_liveness_leads_to, check_program_protocols,
+    export_program_tla_specs, export_tla_specs, replay_trace_jsonl_file, run_all_protocol_checks,
+    verify_runtime_trace,
 };
 pub use sync_solver::{
     DistributedAppManifest, ResolvedStreamSpec, ResolvedSubscriberSpec, ResolvedViewSpec,
@@ -1696,5 +1698,104 @@ pub fn bad_arena_escape() Pair {
         let outcomes = solve_batch_parallel(&qs);
         assert_eq!(outcomes.len(), 4);
         assert!(outcomes.iter().all(|o| *o == smt::SmtOutcome::Proved));
+    }
+
+    #[test]
+    fn verifies_effect_polymorphism_z3_adt_sets_proof_audit_repro_test_and_l2_liveness() {
+        // 1. Effect Polymorphism (ADR-0001 D04): `[T, U, effect E] / E` works in both pure & impure callers!
+        let eff_ok = r#"
+pub fn apply_eff[T, U, effect E](x T, f fn(T) U / E) U / E {
+    f(x)
+}
+
+pub fn log_val(x Int) Int / io {
+    let _ = print_int(x)
+    x
+}
+
+pub pure fn pure_caller(v Int) Int {
+    apply_eff(v, |n| n + 1)
+}
+
+pub fn impure_caller(v Int) Int / io {
+    apply_eff(v, |n| log_val(n))
+}
+"#;
+        let rep_eff = check_program(&parse(eff_ok).unwrap());
+        assert!(rep_eff.ok, "effect polymorphism failed: {:?}", rep_eff.diagnostics);
+
+        // Negative control: calling `/ io` inside `pure fn` MUST fail with E0610
+        let eff_bad = r#"
+pub fn log_val(x Int) Int / io {
+    let _ = print_int(x)
+    x
+}
+
+pub pure fn illegal_pure(v Int) Int {
+    log_val(v)
+}
+"#;
+        let rep_bad = check_program(&parse(eff_bad).unwrap());
+        assert!(!rep_bad.ok && rep_bad.diagnostics.iter().any(|d| d.code == "E0610"));
+
+        // 2. Z3 Algebraic Datatype (`Option[Int]`) & Set (`(Array Int Bool)`) SMT Theories!
+        let mut q_adt = smt::SmtQuery::new(std::collections::BTreeMap::new());
+        q_adt.vars.insert("x".into(), smt::SmtSort::Int);
+        q_adt.vars.insert("opt".into(), smt::SmtSort::OptionInt);
+        q_adt.premises.push("(> x 5)".into());
+        q_adt.premises.push("(= opt (TN_Some x))".into());
+        q_adt.goal = "(and ((_ is TN_Some) opt) (> (tn_some_val opt) 5))".into();
+        assert_eq!(q_adt.solve(), smt::SmtOutcome::Proved);
+
+        let mut q_set = smt::SmtQuery::new(std::collections::BTreeMap::new());
+        q_set.vars.insert("k".into(), smt::SmtSort::Int);
+        q_set.vars.insert("__set__s".into(), smt::SmtSort::IntSet);
+        q_set.vars.insert("__set__s2".into(), smt::SmtSort::IntSet);
+        q_set.premises.push("(= __set__s2 (store __set__s k true))".into());
+        q_set.goal = "(select __set__s2 k)".into();
+        assert_eq!(q_set.solve(), smt::SmtOutcome::Proved);
+
+        // 3. Independent Multi-Solver Proof Certificate Auditor (`verify_proof_certificates_dir`)
+        let cert_dir = std::env::temp_dir().join(format!("tenon_audit_p2_{}", std::process::id()));
+        begin_proof_recording();
+        let _ = q_adt.solve();
+        let _ = q_set.solve();
+        let certs = end_proof_recording();
+        assert!(!certs.is_empty());
+        let _ = export_proof_certificates(&cert_dir, &certs).unwrap();
+        let audit = verify_proof_certificates_dir(&cert_dir, "auto").unwrap();
+        let _ = std::fs::remove_dir_all(&cert_dir);
+        assert!(audit.ok && audit.verified == audit.total && audit.total >= 2, "audit failed: {:?}", audit);
+
+        // 4. Counterexample-to-Test synthesis
+        let bad_prog = parse("pub pure fn bad_inc(x Int) Int ensures result > 10 { x + 1 }").unwrap();
+        let bad_rep = check_program(&bad_prog);
+        assert!(!bad_rep.ok);
+        let repro_src = emit_repro_test_from_diagnostics("bad.tn", &bad_rep.diagnostics);
+        assert!(repro_src.contains("test fn repro_counterexample_1()"));
+
+        // 5. L2 Temporal Liveness (`eventually` / `leads_to`) & JSONL Trace Replay
+        let live_results = check_builtin_liveness();
+        assert!(!live_results.is_empty() && live_results.iter().all(|r| r.passed));
+        let trace_path = std::env::temp_dir().join(format!("tenon_trace_p2_{}.jsonl", std::process::id()));
+        let trace_lines = [
+            serde_json::to_string(&TraceEvent::ClaimSlice {
+                session_id: "s1".into(),
+                worker_id: "w1".into(),
+                branch_id: 1,
+                exec_epoch: 1,
+            }).unwrap(),
+            serde_json::to_string(&TraceEvent::ProxyEmit {
+                session_id: "s1".into(),
+                branch_id: 1,
+                exec_epoch: 1,
+                run_id: "r1".into(),
+                seq: 1,
+            }).unwrap(),
+        ];
+        std::fs::write(&trace_path, trace_lines.join("\n")).unwrap();
+        let tr = replay_trace_jsonl_file(&trace_path).unwrap();
+        let _ = std::fs::remove_file(&trace_path);
+        assert!(tr.ok && tr.events_checked == 2);
     }
 }

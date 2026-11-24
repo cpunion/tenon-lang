@@ -1015,3 +1015,152 @@ NoCrossBranchPollution == ~branchPolluted
 
     Ok(files)
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivenessCheckResult {
+    pub property: String,
+    pub passed: bool,
+    pub states_checked: usize,
+    pub counterexample_trace: Vec<String>,
+}
+
+/// Checks temporal liveness `P ~> Q` (`leads_to` / `eventually`):
+/// From every reachable state satisfying `trigger(s)`, there MUST exist a finite path
+/// reaching a state satisfying `goal(s)` (no deadlock or inescapable livelock trap!).
+pub fn check_liveness_leads_to<S, Trig, Goal, Trans>(
+    property: &str,
+    init: S,
+    trigger: Trig,
+    goal: Goal,
+    transitions: Trans,
+) -> LivenessCheckResult
+where
+    S: Clone + Eq + Ord,
+    Trig: Fn(&S) -> bool,
+    Goal: Fn(&S) -> bool,
+    Trans: Fn(&S) -> Vec<(String, S)>,
+{
+    let mut visited: BTreeSet<S> = BTreeSet::new();
+    let mut traces: BTreeMap<S, Vec<String>> = BTreeMap::new();
+    let mut edges: BTreeMap<S, Vec<S>> = BTreeMap::new();
+    let mut queue: VecDeque<S> = VecDeque::new();
+    visited.insert(init.clone());
+    traces.insert(init.clone(), vec!["Init".into()]);
+    queue.push_back(init);
+
+    while let Some(st) = queue.pop_front() {
+        let mut outs = Vec::new();
+        let tr = traces.get(&st).cloned().unwrap_or_default();
+        for (lbl, nxt) in transitions(&st) {
+            outs.push(nxt.clone());
+            if visited.insert(nxt.clone()) {
+                let mut nt = tr.clone();
+                nt.push(lbl);
+                traces.insert(nxt.clone(), nt);
+                queue.push_back(nxt);
+            }
+        }
+        edges.insert(st, outs);
+    }
+
+    // Reverse-BFS from all goal states to find every state that can eventually reach `goal`.
+    let mut rev: BTreeMap<S, Vec<S>> = BTreeMap::new();
+    for (u, vs) in &edges {
+        for v in vs {
+            rev.entry(v.clone()).or_default().push(u.clone());
+        }
+    }
+    let mut can_reach_goal: BTreeSet<S> = BTreeSet::new();
+    let mut rq: VecDeque<S> = VecDeque::new();
+    for st in &visited {
+        if goal(st) {
+            can_reach_goal.insert(st.clone());
+            rq.push_back(st.clone());
+        }
+    }
+    while let Some(cur) = rq.pop_front() {
+        if let Some(preds) = rev.get(&cur) {
+            for p in preds {
+                if can_reach_goal.insert(p.clone()) {
+                    rq.push_back(p.clone());
+                }
+            }
+        }
+    }
+
+    for st in &visited {
+        if trigger(st) && !can_reach_goal.contains(st) {
+            return LivenessCheckResult {
+                property: property.to_string(),
+                passed: false,
+                states_checked: visited.len(),
+                counterexample_trace: traces.get(st).cloned().unwrap_or_default(),
+            };
+        }
+    }
+    LivenessCheckResult {
+        property: property.to_string(),
+        passed: true,
+        states_checked: visited.len(),
+        counterexample_trace: Vec::new(),
+    }
+}
+
+/// Verifies liveness properties on the built-in Fenced Execution & 410 Journal Recovery protocols:
+/// every behind client MUST eventually be able to catch up to `server_head` (`client_checkpoint < server_head ~> client_checkpoint == server_head`).
+pub fn check_builtin_liveness() -> Vec<LivenessCheckResult> {
+    let journal_live = check_liveness_leads_to(
+        "JournalRecovery::EventuallyCatchUp (client < head ~> client == head)",
+        OverlayState {
+            server_head: 1,
+            server_floor: 0,
+            client_checkpoint: 0,
+            overlay_run_active: false,
+            committed_contains_run: false,
+            duplicate_bubble_visible: false,
+            silent_gap_accepted: false,
+        },
+        |s| s.client_checkpoint < s.server_head,
+        |s| s.client_checkpoint == s.server_head,
+        |s| {
+            let mut next = Vec::new();
+            if s.server_head < 4 {
+                let mut n = s.clone();
+                n.server_head += 1;
+                if n.server_head >= 3 {
+                    n.server_floor = 2;
+                }
+                next.push(("ServerAdvanceAndJournalGC".into(), n));
+            }
+            if s.client_checkpoint < s.server_head {
+                let mut n = s.clone();
+                n.client_checkpoint = s.server_head;
+                let lbl = if s.client_checkpoint < s.server_floor {
+                    "Server410ResetAndAtomicRebuild"
+                } else {
+                    "ClientIncrementalCatchup"
+                };
+                next.push((lbl.into(), n));
+            }
+            next
+        },
+    );
+    vec![journal_live]
+}
+
+/// Replays a JSONL runtime trace log file (`--replay <trace.jsonl>`) against formal protocol safety invariants.
+pub fn replay_trace_jsonl_file(path: &Path) -> Result<TraceRefinementReport, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read trace file `{}`: {}", path.display(), e))?;
+    let mut events = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        let ev: TraceEvent = serde_json::from_str(trimmed)
+            .map_err(|e| format!("trace `{}` line {}: invalid TraceEvent JSON: {}", path.display(), idx + 1, e))?;
+        events.push(ev);
+    }
+    Ok(verify_runtime_trace(&events))
+}

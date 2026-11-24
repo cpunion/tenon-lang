@@ -71,6 +71,96 @@ pub fn export_proof_certificates(
     Ok(certs.len())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofAuditReport {
+    pub ok: bool,
+    pub solver: String,
+    pub total: usize,
+    pub verified: usize,
+    pub failed: Vec<String>,
+}
+
+/// Independently audits exported SMT-LIB2 proof certificates in `dir` (M4 TCB minimization):
+/// 1. Validates SHA-256 integrity of every `.smt2` file against `proof_manifest.json`.
+/// 2. Invokes standalone external solver (`z3`, `cvc5`, or `auto`) on every `.smt2` file
+///    and verifies it outputs `unsat` with exit code 0.
+pub fn verify_proof_certificates_dir(
+    dir: &std::path::Path,
+    solver: &str,
+) -> Result<ProofAuditReport, String> {
+    let manifest_path = dir.join("proof_manifest.json");
+    let raw = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("failed to read `{}`: {}", manifest_path.display(), e))?;
+    let val: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid proof_manifest.json: {}", e))?;
+    let certs = val
+        .get("certificates")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| "proof_manifest.json missing `certificates` array".to_string())?;
+
+    let chosen_solver = if solver == "auto" {
+        if Command::new("z3").arg("--version").output().is_ok_and(|o| o.status.success()) {
+            "z3"
+        } else if Command::new("cvc5").arg("--version").output().is_ok_and(|o| o.status.success()) {
+            "cvc5"
+        } else {
+            return Err("no supported SMT solver (`z3` or `cvc5`) found in PATH".into());
+        }
+    } else {
+        solver
+    };
+
+    let mut verified = 0usize;
+    let mut failed = Vec::new();
+    for entry in certs {
+        let fname = entry
+            .get("file")
+            .and_then(|f| f.as_str())
+            .unwrap_or("<missing>");
+        let fpath = dir.join(fname);
+        if !fpath.is_file() {
+            failed.push(format!("{}: file missing", fname));
+            continue;
+        }
+        let mut cmd = Command::new(chosen_solver);
+        if chosen_solver == "cvc5" {
+            cmd.arg("--lang=smt2");
+        }
+        cmd.arg(&fpath);
+        match cmd.output() {
+            Ok(out) => {
+                let first = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if out.status.success() && first == "unsat" {
+                    verified += 1;
+                } else {
+                    failed.push(format!(
+                        "{}: solver `{}` returned `{}` (stderr: {})",
+                        fname,
+                        chosen_solver,
+                        first,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+            }
+            Err(e) => {
+                failed.push(format!("{}: failed to invoke `{}`: {}", fname, chosen_solver, e));
+            }
+        }
+    }
+    Ok(ProofAuditReport {
+        ok: failed.is_empty(),
+        solver: chosen_solver.to_string(),
+        total: certs.len(),
+        verified,
+        failed,
+    })
+}
+
 fn maybe_record_proved_cert(hash: &str, script: &str) {
     let mut guard = recorder().lock().unwrap();
     if let Some(list) = guard.as_mut() {
@@ -173,6 +263,9 @@ pub enum SmtSort {
     Bool,
     Real,
     IntArray,
+    IntSet,
+    OptionInt,
+    ResultInt,
 }
 
 impl SmtSort {
@@ -182,6 +275,9 @@ impl SmtSort {
             SmtSort::Bool => "Bool",
             SmtSort::Real => "Real",
             SmtSort::IntArray => "(Array Int Int)",
+            SmtSort::IntSet => "(Array Int Bool)",
+            SmtSort::OptionInt => "TenonOptionInt",
+            SmtSort::ResultInt => "TenonResultInt",
         }
     }
 }
@@ -236,9 +332,11 @@ impl SmtQuery {
         match &expr.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => true,
             ExprKind::Ident(s) => {
-                if bound.contains(s)
+                if s == "None"
+                    || bound.contains(s)
                     || s.starts_with("__len__")
                     || s.starts_with("__arr__")
+                    || s.starts_with("__set__")
                     || s.starts_with("old__")
                 {
                     return true;
@@ -304,8 +402,19 @@ impl SmtQuery {
                     if fname == "len" && args.len() == 1 && matches!(&args[0].value.kind, ExprKind::Ident(_)) {
                         return true;
                     }
-                    if matches!(fname.as_str(), "__smt_const_array" | "__smt_store")
-                        || self.pure_fns.contains_key(fname)
+                    if matches!(
+                        fname.as_str(),
+                        "__smt_const_array"
+                            | "__smt_store"
+                            | "Some"
+                            | "Ok"
+                            | "Err"
+                            | "set_contains"
+                            | "set_insert"
+                            | "set_remove"
+                            | "map_get"
+                            | "map_contains"
+                    ) || self.pure_fns.contains_key(fname)
                     {
                         return args
                             .iter()
@@ -359,12 +468,33 @@ impl SmtQuery {
             }
         }
 
-        // Auto-declare non-negative `__len__*` and `(Array Int Int)` `__arr__*` symbols referenced in premises or goal
+        // Auto-declare non-negative `__len__*`, `(Array Int Int)` `__arr__*`, `(Array Int Bool)` `__set__*`,
+        // and algebraic datatypes (`TenonOptionInt`, `TenonResultInt`) when referenced in premises or goal.
         let mut auto_len_vars = BTreeSet::new();
         let mut auto_arr_vars = BTreeSet::new();
+        let mut auto_set_vars = BTreeSet::new();
+        let mut uses_opt_adt = self.vars.values().any(|s| *s == SmtSort::OptionInt);
+        let mut uses_res_adt = self.vars.values().any(|s| *s == SmtSort::ResultInt);
         for s in self.premises.iter().chain(std::iter::once(&self.goal)) {
             collect_prefixed_symbols(s, "__len__", &mut auto_len_vars);
             collect_prefixed_symbols(s, "__arr__", &mut auto_arr_vars);
+            collect_prefixed_symbols(s, "__set__", &mut auto_set_vars);
+            if s.contains("TN_Some") || s.contains("TN_None") || s.contains("TenonOptionInt") {
+                uses_opt_adt = true;
+            }
+            if s.contains("TN_Ok") || s.contains("TN_Err") || s.contains("TenonResultInt") {
+                uses_res_adt = true;
+            }
+        }
+        if uses_opt_adt {
+            out.push_str(
+                "(declare-datatypes ((TenonOptionInt 0)) (((TN_None) (TN_Some (tn_some_val Int)))))\n",
+            );
+        }
+        if uses_res_adt {
+            out.push_str(
+                "(declare-datatypes ((TenonResultInt 0)) (((TN_Ok (tn_ok_val Int)) (TN_Err (tn_err_val Int)))))\n",
+            );
         }
         let mut all_vars = self.vars.clone();
         for lv in &auto_len_vars {
@@ -372,6 +502,9 @@ impl SmtQuery {
         }
         for av in &auto_arr_vars {
             all_vars.entry(av.clone()).or_insert(SmtSort::IntArray);
+        }
+        for sv in &auto_set_vars {
+            all_vars.entry(sv.clone()).or_insert(SmtSort::IntSet);
         }
 
         for (name, sort) in &all_vars {
@@ -825,6 +958,9 @@ pub fn encode_expr_with_reals(
         ExprKind::Float(x) => format_smt_real(*x),
         ExprKind::Bool(b) => Ok(if *b { "true".into() } else { "false".into() }),
         ExprKind::Ident(s) => {
+            if s == "None" {
+                return Ok("TN_None".into());
+            }
             if let Some(rep) = subst.get(s) {
                 if rep.starts_with('(') {
                     Ok(rep.clone())
@@ -1047,6 +1183,50 @@ pub fn encode_expr_with_reals(
                     let v_s = encode_expr_with_reals(&args[2].value, subst, real_vars)?;
                     return Ok(format!("(store {} {} {})", a_s, i_s, v_s));
                 }
+                // Algebraic Datatype constructors (`Option[Int]` / `Result[Int, Int]`)
+                if fname == "Some" && args.len() == 1 {
+                    let v_s = encode_expr_with_reals(&args[0].value, subst, real_vars)?;
+                    return Ok(format!("(TN_Some {})", v_s));
+                }
+                if fname == "Ok" && args.len() == 1 {
+                    let v_s = encode_expr_with_reals(&args[0].value, subst, real_vars)?;
+                    return Ok(format!("(TN_Ok {})", v_s));
+                }
+                if fname == "Err" && args.len() == 1 {
+                    let v_s = encode_expr_with_reals(&args[0].value, subst, real_vars)?;
+                    return Ok(format!("(TN_Err {})", v_s));
+                }
+                // Z3 Set / Map theories (`(Array Int Bool)` & `(Array Int Int)`)
+                if fname == "set_contains" && args.len() == 2 {
+                    if let ExprKind::Ident(svar) = &args[0].value.kind {
+                        let k_s = encode_expr_with_reals(&args[1].value, subst, real_vars)?;
+                        return Ok(format!("(select {} {})", smt_ident(&format!("__set__{}", svar)), k_s));
+                    }
+                }
+                if fname == "set_insert" && args.len() == 2 {
+                    if let ExprKind::Ident(svar) = &args[0].value.kind {
+                        let k_s = encode_expr_with_reals(&args[1].value, subst, real_vars)?;
+                        return Ok(format!("(store {} {} true)", smt_ident(&format!("__set__{}", svar)), k_s));
+                    }
+                }
+                if fname == "set_remove" && args.len() == 2 {
+                    if let ExprKind::Ident(svar) = &args[0].value.kind {
+                        let k_s = encode_expr_with_reals(&args[1].value, subst, real_vars)?;
+                        return Ok(format!("(store {} {} false)", smt_ident(&format!("__set__{}", svar)), k_s));
+                    }
+                }
+                if fname == "map_get" && args.len() == 2 {
+                    if let ExprKind::Ident(mvar) = &args[0].value.kind {
+                        let k_s = encode_expr_with_reals(&args[1].value, subst, real_vars)?;
+                        return Ok(format!("(select {} {})", smt_ident(&format!("__arr__{}", mvar)), k_s));
+                    }
+                }
+                if fname == "map_contains" && args.len() == 2 {
+                    if let ExprKind::Ident(mvar) = &args[0].value.kind {
+                        let k_s = encode_expr_with_reals(&args[1].value, subst, real_vars)?;
+                        return Ok(format!("(select {} {})", smt_ident(&format!("__set__{}", mvar)), k_s));
+                    }
+                }
                 let call_name = subst
                     .get(&format!("__fn__{}", fname))
                     .cloned()
@@ -1080,7 +1260,7 @@ fn encode_match_arms(
     let last = arms.last().unwrap();
     let mut acc = encode_expr_with_reals(&last.body, subst, real_vars)?;
     for arm in arms[..arms.len() - 1].iter().rev() {
-        let body = encode_expr_with_reals(&arm.body, subst, real_vars)?;
+        let mut arm_subst = subst.clone();
         let mut conds = Vec::new();
         for pat in &arm.patterns {
             match pat {
@@ -1089,9 +1269,32 @@ fn encode_match_arms(
                     conds.push(format!("(= {} {})", scrutinee, if *b { "true" } else { "false" }))
                 }
                 Pattern::Wildcard(_) => conds.push("true".into()),
+                Pattern::Ident(v, _) if v == "None" => conds.push(format!("((_ is TN_None) {})", scrutinee)),
+                Pattern::Variant { name, binding, .. } if name == "None" && binding.is_none() => {
+                    conds.push(format!("((_ is TN_None) {})", scrutinee));
+                }
+                Pattern::Variant { name, binding, .. } if name == "Some" => {
+                    conds.push(format!("((_ is TN_Some) {})", scrutinee));
+                    if let Some(b) = binding {
+                        arm_subst.insert(b.clone(), format!("(tn_some_val {})", scrutinee));
+                    }
+                }
+                Pattern::Variant { name, binding, .. } if name == "Ok" => {
+                    conds.push(format!("((_ is TN_Ok) {})", scrutinee));
+                    if let Some(b) = binding {
+                        arm_subst.insert(b.clone(), format!("(tn_ok_val {})", scrutinee));
+                    }
+                }
+                Pattern::Variant { name, binding, .. } if name == "Err" => {
+                    conds.push(format!("((_ is TN_Err) {})", scrutinee));
+                    if let Some(b) = binding {
+                        arm_subst.insert(b.clone(), format!("(tn_err_val {})", scrutinee));
+                    }
+                }
                 _ => return Err("unsupported pattern in SMT match".into()),
             }
         }
+        let body = encode_expr_with_reals(&arm.body, &arm_subst, real_vars)?;
         let cond = if conds.len() == 1 {
             conds.pop().unwrap()
         } else {

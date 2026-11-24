@@ -5,6 +5,7 @@ pub mod lower_interfaces;
 pub use tenon_rt::perceus;
 pub mod wasm_client;
 pub mod wasm_general;
+pub mod wasm_llvm;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{

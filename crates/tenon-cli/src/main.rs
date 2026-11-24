@@ -44,6 +44,7 @@ async fn main() -> ExitCode {
         "agent" => cmd_agent(&args[2..]).await,
         "build" => cmd_build_aot(&args[2..]),
         "build-wasm" => cmd_build_wasm(&args[2..]),
+        "verify-proofs" => cmd_verify_proofs(&args[2..]),
         "pkg" => cmd_pkg(&args[2..]),
         "fmt" => cmd_fmt(&args[2..]),
         "lsp" => lsp::run_lsp_stdio(),
@@ -95,12 +96,17 @@ fn load_and_parse(path: &str) -> Result<tenon_syntax::Program, String> {
 fn cmd_check(args: &[String]) -> ExitCode {
     let mut file_opt: Option<&str> = None;
     let mut emit_proofs: Option<PathBuf> = None;
+    let mut emit_repro_test: Option<PathBuf> = None;
     let as_json = args.iter().any(|a| a == "--json");
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
             "--emit-proofs" if i + 1 < args.len() => {
                 emit_proofs = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-repro-test" if i + 1 < args.len() => {
+                emit_repro_test = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--json" => i += 1,
@@ -112,7 +118,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
     }
     let Some(file) = file_opt else {
-        eprintln!("usage: tenon check <file.tn> [--json] [--emit-proofs <dir>]");
+        eprintln!("usage: tenon check <file.tn> [--json] [--emit-proofs <dir>] [--emit-repro-test <out.tn>]");
         return ExitCode::from(2);
     };
 
@@ -137,6 +143,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 pdir.display()
             ),
             Err(e) => eprintln!("warning: failed to export proof certificates: {}", e),
+        }
+    }
+    if let Some(rpath) = emit_repro_test {
+        let repro = tenon_verify::emit_repro_test_from_diagnostics(file, &report.diagnostics);
+        if let Err(e) = fs::write(&rpath, repro) {
+            eprintln!("warning: failed to write repro test `{}`: {}", rpath.display(), e);
+        } else {
+            println!("Emitted counterexample regression test -> `{}`", rpath.display());
         }
     }
     if as_json {
@@ -620,6 +634,34 @@ fn cmd_modelcheck(args: &[String]) -> ExitCode {
         .windows(2)
         .find(|w| w[0] == "--export-tla")
         .map(|w| w[1].as_str());
+    let replay_trace = args
+        .windows(2)
+        .find(|w| w[0] == "--replay")
+        .map(|w| w[1].as_str());
+    if let Some(tpath) = replay_trace {
+        return match tenon_verify::replay_trace_jsonl_file(Path::new(tpath)) {
+            Ok(tr) => {
+                if as_json {
+                    println!("{}", serde_json::to_string_pretty(&tr).unwrap());
+                } else {
+                    println!(
+                        "Tenon Trace Refinement Replay (`{}`): {} ({} event(s) checked)",
+                        tpath,
+                        if tr.ok { "PASS" } else { "FAIL" },
+                        tr.events_checked
+                    );
+                    for v in &tr.violations {
+                        println!("  violation: {}", v);
+                    }
+                }
+                if tr.ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                ExitCode::from(1)
+            }
+        };
+    }
     // Optional `.tn` file argument (skipping flag values like `--export-tla <dir>`)
     let mut file_arg: Option<&str> = None;
     let mut skip_next = false;
@@ -628,7 +670,7 @@ fn cmd_modelcheck(args: &[String]) -> ExitCode {
             skip_next = false;
             continue;
         }
-        if a == "--export-tla" {
+        if a == "--export-tla" || a == "--replay" {
             skip_next = true;
             continue;
         }
@@ -1377,6 +1419,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     let mut emit_ts: Option<PathBuf> = None;
     let mut emit_swift: Option<PathBuf> = None;
     let mut emit_kotlin: Option<PathBuf> = None;
+    let mut emit_go: Option<PathBuf> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -1403,6 +1446,10 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             }
             "--emit-kotlin" if i + 1 < args.len() => {
                 emit_kotlin = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-go" if i + 1 < args.len() => {
+                emit_go = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--opt" if i + 1 < args.len() => {
@@ -1500,7 +1547,47 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         let _ = fs::write(p, tenon_codegen::bindings::emit_kotlin_bindings(&prog, "com.tenon.generated"));
         println!("Emitted Kotlin bindings -> `{}`", p.display());
     }
+    if let Some(p) = &emit_go {
+        let hdr = opts
+            .emit_header_path
+            .as_ref()
+            .and_then(|h| h.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "tenon.h".into());
+        let lib_stem = Path::new(&out_bin)
+            .file_stem()
+            .map(|s| s.to_string_lossy().trim_start_matches("lib").to_string())
+            .unwrap_or_else(|| "tenon".into());
+        let _ = fs::write(
+            p,
+            tenon_codegen::bindings::emit_go_cgo_bindings(&prog, "main", &hdr, &lib_stem),
+        );
+        println!("Emitted Go cgo bindings -> `{}`", p.display());
+    }
+    opts.apply_verified_mir(&report.mir);
     if opts.target_triple.as_deref() == Some("wasm32") {
+        if tenon_codegen::wasm_llvm::has_llvm_wasm32_toolchain() {
+            return match tenon_codegen::wasm_llvm::compile_program_to_wasm32_llvm(
+                &prog,
+                Path::new(&out_bin),
+                &opts,
+            ) {
+                Ok(art) => {
+                    println!(
+                        "Wasm32 (Full LLVM + Perceus) Built `{}` -> `{}` ({} bytes, {} proofs verified)",
+                        file,
+                        art.output_path,
+                        art.binary_bytes,
+                        report.proofs.len()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("Wasm32 LLVM build failed: {}", e);
+                    ExitCode::from(1)
+                }
+            };
+        }
         return match tenon_codegen::wasm_general::compile_program_to_wasm(&prog) {
             Ok(bytes) => {
                 if let Some(parent) = Path::new(&out_bin).parent() {
@@ -1520,7 +1607,6 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         };
     }
 
-    opts.apply_verified_mir(&report.mir);
     match tenon_codegen::llvm_aot::compile_with_options(&prog, Path::new(&out_bin), &opts) {
         Ok(art) => {
             let kind_str = match opts.output_kind {
@@ -1545,6 +1631,49 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("LLVM AOT build failed: {}", e);
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_verify_proofs(args: &[String]) -> ExitCode {
+    let mut dir_arg: Option<&str> = None;
+    let mut solver = "auto";
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--solver" if i + 1 < args.len() => {
+                solver = args[i + 1].as_str();
+                i += 2;
+            }
+            s if !s.starts_with('-') && dir_arg.is_none() => {
+                dir_arg = Some(s);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(dir) = dir_arg else {
+        eprintln!("usage: tenon verify-proofs <proof_dir> [--solver z3|cvc5|auto]");
+        return ExitCode::from(2);
+    };
+    match tenon_verify::verify_proof_certificates_dir(Path::new(dir), solver) {
+        Ok(rep) => {
+            println!(
+                "Tenon Independent Proof Auditor (`{}` via `{}`): {} ({}/{} certificates proved unsat)",
+                dir,
+                rep.solver,
+                if rep.ok { "PASS" } else { "FAIL" },
+                rep.verified,
+                rep.total
+            );
+            for f in &rep.failed {
+                eprintln!("  FAILED: {}", f);
+            }
+            if rep.ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
             ExitCode::from(1)
         }
     }

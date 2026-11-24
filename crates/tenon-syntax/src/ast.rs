@@ -240,6 +240,37 @@ pub struct FnDecl {
     pub span: Span,
 }
 
+impl FnDecl {
+    /// Returns effect polymorphism parameter names declared via `[..., effect E]` (ADR-0001 D04).
+    pub fn effect_params(&self) -> Vec<String> {
+        self.type_param_bounds
+            .iter()
+            .filter_map(|(k, bs)| {
+                if bs.iter().any(|b| b == "__effect__") {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Returns declared effect names from trailing `/ E, io, async` clause on the function signature.
+    pub fn declared_effects(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for a in &self.attrs {
+            if a.name == "__effects" {
+                for arg in &a.args {
+                    if let ExprKind::Str(s) | ExprKind::Ident(s) = &arg.value.kind {
+                        out.push(s.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExternFnDecl {
     pub attrs: Vec<Attr>,
