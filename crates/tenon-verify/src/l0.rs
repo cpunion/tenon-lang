@@ -245,6 +245,8 @@ impl AbsInt {
 pub struct L0Env {
     pub ints: BTreeMap<String, AbsInt>,
     pub bools: BTreeMap<String, bool>,
+    /// Closed floating-point interval `[min, max]` for fast L0 float refinement checking.
+    pub floats: BTreeMap<String, (f64, f64)>,
     /// Difference bounds `a - b <= c` stored as `(a, b) -> c`.
     pub diffs: BTreeMap<(String, String), i128>,
     /// Flow-sensitively assumed pure predicate calls (e.g. `is_safe_rel_path(p)`).
@@ -268,7 +270,112 @@ impl L0Env {
     }
 
     pub fn get_int(&self, name: &str) -> AbsInt {
-        self.ints.get(name).copied().unwrap_or_else(AbsInt::top)
+        if let Some(v) = self.ints.get(name) {
+            return *v;
+        }
+        if name.starts_with("__len__") {
+            return AbsInt {
+                interval: Interval {
+                    min: 0,
+                    max: i64::MAX as i128,
+                },
+                cong: Congruence::TOP,
+                non_zero: false,
+            };
+        }
+        AbsInt::top()
+    }
+
+    pub fn set_float(&mut self, name: impl Into<String>, lo: f64, hi: f64) {
+        if lo.is_finite() && hi.is_finite() && lo <= hi {
+            self.floats.insert(name.into(), (lo, hi));
+        }
+    }
+
+    pub fn eval_abs_float(&self, expr: &Expr, self_var: Option<&str>) -> Option<(f64, f64)> {
+        match &expr.kind {
+            ExprKind::Float(x) if x.is_finite() => Some((*x, *x)),
+            ExprKind::Int(n) => {
+                let f = *n as f64;
+                Some((f, f))
+            }
+            ExprKind::Ident(s) => {
+                let k = resolve_self(s, self_var);
+                self.floats.get(&k).copied()
+            }
+            ExprKind::Old(inner) => {
+                let k = expr_var_name(expr, self_var)?;
+                self.floats.get(&k).copied().or_else(|| self.eval_abs_float(inner, self_var))
+            }
+            ExprKind::Cast { expr: inner, .. } => self.eval_abs_float(inner, self_var),
+            ExprKind::Unary { op: UnOp::Neg, expr: inner } => {
+                let (lo, hi) = self.eval_abs_float(inner, self_var)?;
+                Some((-hi, -lo))
+            }
+            ExprKind::Binary { op, left, right } => {
+                let (l0, l1) = self.eval_abs_float(left, self_var)?;
+                let (r0, r1) = self.eval_abs_float(right, self_var)?;
+                match op {
+                    BinOp::Add => Some((l0 + r0, l1 + r1)),
+                    BinOp::Sub => Some((l0 - r1, l1 - r0)),
+                    BinOp::Mul => {
+                        let ps = [l0 * r0, l0 * r1, l1 * r0, l1 * r1];
+                        let mn = ps.iter().copied().fold(f64::INFINITY, f64::min);
+                        let mx = ps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        Some((mn, mx))
+                    }
+                    BinOp::Div if r0 > 0.0 || r1 < 0.0 => {
+                        let qs = [l0 / r0, l0 / r1, l1 / r0, l1 / r1];
+                        let mn = qs.iter().copied().fold(f64::INFINITY, f64::min);
+                        let mx = qs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        Some((mn, mx))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn assume_float_expr(&mut self, expr: &Expr, self_var: Option<&str>) {
+        match &expr.kind {
+            ExprKind::Binary { op: BinOp::And, left, right } => {
+                self.assume_float_expr(left, self_var);
+                self.assume_float_expr(right, self_var);
+            }
+            ExprKind::Binary { op, left, right } => {
+                if let (Some(v), Some((r0, r1))) = (
+                    expr_var_name(left, self_var),
+                    self.eval_abs_float(right, self_var),
+                ) {
+                    let (cur_lo, cur_hi) = self.floats.get(&v).copied().unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
+                    let (nlo, nhi) = match op {
+                        BinOp::Ge | BinOp::Gt => (cur_lo.max(r0), cur_hi),
+                        BinOp::Le | BinOp::Lt => (cur_lo, cur_hi.min(r1)),
+                        BinOp::Eq => (cur_lo.max(r0), cur_hi.min(r1)),
+                        _ => (cur_lo, cur_hi),
+                    };
+                    if nlo <= nhi {
+                        self.floats.insert(v, (nlo, nhi));
+                    }
+                } else if let (Some((l0, l1)), Some(v)) = (
+                    self.eval_abs_float(left, self_var),
+                    expr_var_name(right, self_var),
+                ) {
+                    let (cur_lo, cur_hi) = self.floats.get(&v).copied().unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
+                    let (nlo, nhi) = match op {
+                        BinOp::Le | BinOp::Lt => (cur_lo.max(l0), cur_hi),
+                        BinOp::Ge | BinOp::Gt => (cur_lo, cur_hi.min(l1)),
+                        BinOp::Eq => (cur_lo.max(l0), cur_hi.min(l1)),
+                        _ => (cur_lo, cur_hi),
+                    };
+                    if nlo <= nhi {
+                        self.floats.insert(v, (nlo, nhi));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Assume a predicate holds (for parameter refinements, `requires`, `if` guards, `assert`).
@@ -462,6 +569,29 @@ impl L0Env {
             ExprKind::Ident(s) => {
                 let key = resolve_self(s, self_var);
                 self.get_int(&key)
+            }
+            ExprKind::Old(_) => {
+                if let Some(k) = expr_var_name(expr, self_var) {
+                    self.get_int(&k)
+                } else {
+                    AbsInt::top()
+                }
+            }
+            ExprKind::Call { callee, args }
+                if matches!(&callee.kind, ExprKind::Ident(s) if s == "len") && args.len() == 1 =>
+            {
+                if let Some(k) = expr_var_name(expr, self_var) {
+                    self.get_int(&k)
+                } else {
+                    AbsInt {
+                        interval: Interval {
+                            min: 0,
+                            max: i64::MAX as i128,
+                        },
+                        cong: Congruence::TOP,
+                        non_zero: false,
+                    }
+                }
             }
             ExprKind::Field { target, field } => {
                 if let Some(base) = expr_var_name(target, self_var) {
@@ -1143,6 +1273,16 @@ fn expr_var_name(expr: &Expr, self_var: Option<&str>) -> Option<String> {
         ExprKind::Field { target, field } => {
             let base = expr_var_name(target, self_var)?;
             Some(format!("{}.{}", base, field))
+        }
+        ExprKind::Old(inner) => {
+            let base = expr_var_name(inner, self_var)?;
+            Some(format!("old__{}", base.replace('.', "__")))
+        }
+        ExprKind::Call { callee, args }
+            if matches!(&callee.kind, ExprKind::Ident(s) if s == "len") && args.len() == 1 =>
+        {
+            let target = expr_var_name(&args[0].value, self_var)?;
+            Some(format!("__len__{}", target.replace('.', "__")))
         }
         _ => None,
     }

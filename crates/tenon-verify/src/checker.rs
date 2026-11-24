@@ -27,6 +27,16 @@ pub struct Diagnostic {
     pub counterexample: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CastVerdict {
+    /// Statically proved `src <: dst` (zero runtime check, returns `T`).
+    Infallible,
+    /// Partial overlap: requires runtime check returning `Result[T, Text]`.
+    Fallible,
+    /// Provably disjoint (`src ∩ dst == ∅`): cast can never succeed (`E0416`).
+    Disjoint(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckReport {
     pub ok: bool,
@@ -34,6 +44,15 @@ pub struct CheckReport {
     pub diagnostics: Vec<Diagnostic>,
     pub sql_checks: BTreeMap<String, String>,
     pub manifest: Option<DistributedAppManifest>,
+    /// Byte offsets (`span.start`) of `target[index]` expressions statically proved in-bounds (`0 <= i < len(target)`).
+    #[serde(default)]
+    pub proved_safe_indices: BTreeSet<usize>,
+    /// Byte offsets (`span.start`) of `refine_cast[T](x)` / `x as? T` statically proved infallible (`S <: T`).
+    #[serde(default)]
+    pub infallible_casts: BTreeSet<usize>,
+    /// Resolved display type name for every `refine_cast[T](x)` call (`T` vs `Result[T, Text]`).
+    #[serde(default)]
+    pub refine_cast_types: BTreeMap<usize, String>,
 }
 
 struct BuiltinSig {
@@ -292,7 +311,21 @@ pub fn check_program(program: &Program) -> CheckReport {
         diagnostics: ctx.diagnostics,
         sql_checks,
         manifest,
+        proved_safe_indices: ctx.proved_safe_indices,
+        infallible_casts: ctx.infallible_casts,
+        refine_cast_types: ctx
+            .refine_cast_types
+            .into_iter()
+            .map(|(k, v)| (k, v.display_name()))
+            .collect(),
     }
+}
+
+/// Standalone refinement subsumption check between two types in `program` (used by `tenon-codegen`
+/// and `tenon lsp` for `refine_cast[T](x)` / `as?` lowering and hover).
+pub fn check_type_subsumption(program: &Program, src_ty: &TypeExpr, dst_ty: &TypeExpr) -> CastVerdict {
+    let ctx = CheckerCtx::new(program);
+    ctx.eval_type_subsumption(src_ty, dst_ty)
 }
 
 #[derive(Debug, Clone)]
@@ -323,9 +356,15 @@ struct CheckerCtx {
     cur_type_params: BTreeSet<String>,
     cur_type_param_bounds: BTreeMap<String, Vec<String>>,
     in_unsafe: bool,
+    in_ghost: bool,
+    ssa_counter: usize,
+    cur_real_vars: BTreeSet<String>,
     cur_file_id: u32,
     file_packages: Vec<u32>,
     test_file_ids: BTreeSet<u32>,
+    proved_safe_indices: BTreeSet<usize>,
+    infallible_casts: BTreeSet<usize>,
+    refine_cast_types: BTreeMap<usize, TypeExpr>,
     proofs: Vec<ProofRecord>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -408,6 +447,7 @@ fn iface_method_to_fn_decl(m: &InterfaceMethodDecl, self_ty: &TypeExpr) -> FnDec
         is_test: false,
         is_unsafe: false,
         is_comptime: false,
+        is_ghost: false,
         name: m.name.clone(),
         type_params: m.type_params.clone(),
         type_param_bounds: m.type_param_bounds.clone(),
@@ -613,7 +653,7 @@ impl CheckerCtx {
                 if !free.is_empty() || !crate::smt::can_encode_pure_fn(&f_inlined) {
                     continue;
                 }
-                if callees.iter().all(|c| c != name && smt_pure_fns.contains_key(c)) {
+                if callees.iter().all(|c| c == name || smt_pure_fns.contains_key(c)) {
                     smt_pure_fns.insert(name.clone(), f_inlined);
                     added = true;
                 }
@@ -645,9 +685,15 @@ impl CheckerCtx {
             cur_type_params: BTreeSet::new(),
             cur_type_param_bounds: BTreeMap::new(),
             in_unsafe: false,
+            in_ghost: false,
+            ssa_counter: 0,
+            cur_real_vars: BTreeSet::new(),
             cur_file_id: 0,
             file_packages: program.file_packages.clone(),
             test_file_ids: program.test_file_ids.iter().copied().collect(),
+            proved_safe_indices: BTreeSet::new(),
+            infallible_casts: BTreeSet::new(),
+            refine_cast_types: BTreeMap::new(),
             proofs: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -1470,20 +1516,22 @@ impl CheckerCtx {
 
     fn expr_smt_encodable(&self, expr: &Expr) -> bool {
         match &expr.kind {
-            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => true,
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => true,
+            ExprKind::Old(inner) => self.expr_smt_encodable(inner),
             ExprKind::Field { target, .. } => matches!(&target.kind, ExprKind::Ident(_)),
             ExprKind::Unary { expr: inner, .. } => self.expr_smt_encodable(inner),
             ExprKind::Binary { op, left, right } => {
-                !matches!(
-                    op,
-                    BinOp::Concat | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
-                ) && self.expr_smt_encodable(left)
+                !matches!(op, BinOp::Concat)
+                    && self.expr_smt_encodable(left)
                     && self.expr_smt_encodable(right)
             }
             ExprKind::Call { callee, args } => {
                 let ExprKind::Ident(fname) = &callee.kind else {
                     return false;
                 };
+                if fname == "len" && args.len() == 1 && matches!(&args[0].value.kind, ExprKind::Ident(_)) {
+                    return true;
+                }
                 self.smt_pure_fns.contains_key(fname)
                     && args.iter().all(|a| self.expr_smt_encodable(&a.value))
             }
@@ -1688,6 +1736,7 @@ impl CheckerCtx {
                 }
             }
             ExprKind::Cast { ty, .. } => ty.clone(),
+            ExprKind::TryCast { ty, .. } => generic_ty("Result", vec![ty.clone(), named_ty("Text")]),
             ExprKind::Unsafe(b) | ExprKind::Comptime(b) => {
                 if let Some(t) = &b.tail {
                     self.infer_expr_type_expected(t, expected, var_types)
@@ -1939,6 +1988,19 @@ impl CheckerCtx {
                                 "Channel",
                                 vec![type_args.first().cloned().unwrap_or_else(|| named_ty("Any"))],
                             );
+                        }
+                        if fname == "refine_cast" && args.len() == 1 {
+                            if let Some(cached) = self.refine_cast_types.get(&expr.span.start) {
+                                return cached.clone();
+                            }
+                            let dst_ty = type_args.first().cloned().unwrap_or_else(|| named_ty("Any"));
+                            let src_ty = self.infer_expr_type(&args[0].value, var_types);
+                            return match self.eval_type_subsumption(&src_ty, &dst_ty) {
+                                CastVerdict::Infallible => dst_ty,
+                                CastVerdict::Fallible | CastVerdict::Disjoint(_) => {
+                                    generic_ty("Result", vec![dst_ty, named_ty("Text")])
+                                }
+                            };
                         }
                         if let Some(fdecl) = self.all_fns.get(fname) {
                             if let Some(rt) = &fdecl.ret_ty {
@@ -2296,8 +2358,11 @@ impl CheckerCtx {
         let prev_tp = self.cur_type_params.clone();
         let prev_bounds = self.cur_type_param_bounds.clone();
         let prev_unsafe = self.in_unsafe;
+        let prev_ghost = self.in_ghost;
+        let prev_reals = std::mem::take(&mut self.cur_real_vars);
         let prev_file_id = self.cur_file_id;
         self.in_unsafe = f.is_unsafe;
+        self.in_ghost = f.is_ghost;
         if f.span.file_id != 0 {
             self.cur_file_id = f.span.file_id;
         }
@@ -2317,15 +2382,19 @@ impl CheckerCtx {
         let mut smt_int_vars: BTreeSet<String> = BTreeSet::new();
         let mut var_types: BTreeMap<String, TypeExpr> = BTreeMap::new();
         let mut mutable_vars: BTreeSet<String> = BTreeSet::new();
-        for (cname, (cdecl, iv, _)) in &self.consts {
+        for (cname, (cdecl, iv, fv)) in &self.consts {
             var_types.insert(cname.clone(), cdecl.ty.clone());
             if let Some(n) = iv {
                 env.set_int(cname, AbsInt::exact(*n as i128));
                 smt_int_vars.insert(cname.clone());
             }
+            if let Some(x) = fv {
+                env.set_float(cname, *x, *x);
+                self.cur_real_vars.insert(cname.clone());
+            }
         }
 
-        // 1. Register parameters, mutability, dyn object-safety, refinements & record invariants
+        // 1. Register parameters, mutability, dyn object-safety, refinements, `old(...)` snapshots & record invariants
         for p in &f.params {
             self.check_dyn_type_valid(&p.ty, p.span);
             var_types.insert(p.name.clone(), p.ty.clone());
@@ -2341,9 +2410,73 @@ impl CheckerCtx {
             );
             if let Some(pred) = &p.predicate {
                 env.assume_expr(pred, Some(&p.name));
+                if self.is_float_ty(&p.ty) {
+                    env.assume_float_expr(pred, Some(&p.name));
+                }
                 let mut subst = BTreeMap::new();
                 subst.insert("self".into(), p.name.clone());
                 smt_premises.push((pred.clone(), subst));
+            }
+            // Snapshot entry state `old__p` (and `old__p__field`) for `inout` parameters so `ensures` can prove `old(...)`!
+            if p.is_inout {
+                let old_k = format!("old__{}", p.name);
+                if self.is_int_type_name(&p.ty.display_name()) {
+                    let cur_abs = env.get_int(&p.name);
+                    env.set_int(old_k.clone(), cur_abs);
+                    env.diffs.insert((p.name.clone(), old_k.clone()), 0);
+                    env.diffs.insert((old_k.clone(), p.name.clone()), 0);
+                    smt_int_vars.insert(old_k.clone());
+                    smt_premises.push((
+                        Expr {
+                            kind: ExprKind::Binary {
+                                op: BinOp::Eq,
+                                left: Box::new(Expr { kind: ExprKind::Ident(old_k), span: p.span }),
+                                right: Box::new(Expr { kind: ExprKind::Ident(p.name.clone()), span: p.span }),
+                            },
+                            span: p.span,
+                        },
+                        BTreeMap::new(),
+                    ));
+                } else if self.is_float_ty(&p.ty) {
+                    if let Some((lo, hi)) = env.floats.get(&p.name).copied() {
+                        env.set_float(old_k.clone(), lo, hi);
+                    }
+                    self.cur_real_vars.insert(old_k.clone());
+                    smt_premises.push((
+                        Expr {
+                            kind: ExprKind::Binary {
+                                op: BinOp::Eq,
+                                left: Box::new(Expr { kind: ExprKind::Ident(old_k), span: p.span }),
+                                right: Box::new(Expr { kind: ExprKind::Ident(p.name.clone()), span: p.span }),
+                            },
+                            span: p.span,
+                        },
+                        BTreeMap::new(),
+                    ));
+                } else if let TypeExpr::Named { name: rname, .. } = self.resolve_base_type(&p.ty) {
+                    if let Some(rec) = self.records.get(&rname).cloned() {
+                        for fld in &rec.fields {
+                            let fk = format!("{}.{}", p.name, fld.name);
+                            let ok = format!("old__{}__{}", p.name, fld.name);
+                            if self.is_int_type_name(&fld.ty.display_name()) {
+                                let cur_abs = env.get_int(&fk);
+                                env.set_int(ok.clone(), cur_abs);
+                                smt_int_vars.insert(ok.clone());
+                                smt_premises.push((
+                                    Expr {
+                                        kind: ExprKind::Binary {
+                                            op: BinOp::Eq,
+                                            left: Box::new(Expr { kind: ExprKind::Ident(ok), span: p.span }),
+                                            right: Box::new(Expr { kind: ExprKind::Ident(fk), span: p.span }),
+                                        },
+                                        span: p.span,
+                                    },
+                                    BTreeMap::new(),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Some(rt) = &f.ret_ty {
@@ -2353,12 +2486,15 @@ impl CheckerCtx {
         // 2. Assume function `requires`
         for req in &f.requires {
             env.assume_expr(req, None);
+            env.assume_float_expr(req, None);
             smt_premises.push((req.clone(), BTreeMap::new()));
         }
 
         // 3. Static Effect, Purity & Memory Contract Checks (`async`, `pure`, `@no_heap_alloc`)
-        let no_heap = f.attrs.iter().any(|a| a.name == "no_heap_alloc");
-        self.check_block_effects(&f.body, f.is_async, f.is_pure, no_heap, &f.name, false);
+        if !f.is_ghost {
+            let no_heap = f.attrs.iter().any(|a| a.name == "no_heap_alloc");
+            self.check_block_effects(&f.body, f.is_async, f.is_pure, no_heap, &f.name, false);
+        }
 
         // 4. Walk statements & tail expression checking types, exhaustiveness, requires, div-by-zero, mutate & early returns
         let mut active_mutate: Option<String> = None;
@@ -2414,6 +2550,8 @@ impl CheckerCtx {
         self.cur_type_params = prev_tp;
         self.cur_type_param_bounds = prev_bounds;
         self.in_unsafe = prev_unsafe;
+        self.in_ghost = prev_ghost;
+        self.cur_real_vars = prev_reals;
         self.cur_file_id = prev_file_id;
     }
 
@@ -2442,6 +2580,9 @@ impl CheckerCtx {
                 }
                 Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
                     self.check_block_effects(body, in_async, in_pure, no_heap, fn_name, inside_block_on);
+                }
+                Stmt::Ghost { .. } => {
+                    // Ghost blocks are erased before codegen -> zero runtime effect or heap allocation!
                 }
                 Stmt::While { cond, body, .. } => {
                     self.check_expr_effects(cond, in_async, in_pure, no_heap, fn_name, inside_block_on);
@@ -2735,7 +2876,7 @@ impl CheckerCtx {
     }
 
     fn assume_type_facts(
-        &self,
+        &mut self,
         var_name: &str,
         ty: &TypeExpr,
         env: &mut L0Env,
@@ -2754,11 +2895,16 @@ impl CheckerCtx {
                             );
                         }
                     }
+                } else if sk.is_float() {
+                    self.cur_real_vars.insert(var_name.to_string());
                 }
             } else if let Some(alias) = self.type_aliases.get(name).cloned() {
                 self.assume_type_facts(var_name, &alias.base, env, smt_int_vars, smt_premises);
                 if let Some(pred) = &alias.predicate {
                     env.assume_expr(pred, Some(var_name));
+                    if self.is_float_ty(&alias.base) {
+                        env.assume_float_expr(pred, Some(var_name));
+                    }
                     let mut subst = BTreeMap::new();
                     subst.insert("self".into(), var_name.to_string());
                     smt_premises.push((pred.clone(), subst));
@@ -2963,6 +3109,76 @@ impl CheckerCtx {
                         non_zero: existing.non_zero || abs.non_zero,
                     };
                     env.set_int(name.clone(), refined);
+                    if self.is_float_ty(&effective_ty) {
+                        self.cur_real_vars.insert(name.clone());
+                        if let Some((lo, hi)) = env.eval_abs_float(value, None) {
+                            env.set_float(name.clone(), lo, hi);
+                        }
+                        if self.expr_smt_encodable(value) {
+                            let eq = Expr {
+                                kind: ExprKind::Binary {
+                                    op: BinOp::Eq,
+                                    left: Box::new(Expr { kind: ExprKind::Ident(name.clone()), span: *span }),
+                                    right: Box::new(value.clone()),
+                                },
+                                span: *span,
+                            };
+                            smt_premises.push((eq, BTreeMap::new()));
+                        }
+                    }
+                    // Track symbolic List / Bytes lengths `__len__<name>` for bounds-check elimination!
+                    match &value.kind {
+                        ExprKind::List(elems) => {
+                            let lk = format!("__len__{}", name);
+                            let n = elems.len() as i64;
+                            env.set_int(lk.clone(), AbsInt::exact(n as i128));
+                            smt_int_vars.insert(lk.clone());
+                            smt_premises.push((
+                                Expr {
+                                    kind: ExprKind::Binary {
+                                        op: BinOp::Eq,
+                                        left: Box::new(Expr { kind: ExprKind::Ident(lk), span: *span }),
+                                        right: Box::new(Expr { kind: ExprKind::Int(n), span: *span }),
+                                    },
+                                    span: *span,
+                                },
+                                BTreeMap::new(),
+                            ));
+                        }
+                        ExprKind::Call { callee, args }
+                            if matches!(&callee.kind, ExprKind::Ident(fnm) if fnm == "list_filled")
+                                && args.len() == 2 =>
+                        {
+                            let lk = format!("__len__{}", name);
+                            let n_abs = env.eval_abs_int(&args[0].value, None);
+                            let non_neg_iv = Interval {
+                                min: n_abs.interval.min.max(0),
+                                max: n_abs.interval.max.max(0),
+                            };
+                            env.set_int(lk.clone(), AbsInt::top().refine_interval(non_neg_iv));
+                            smt_int_vars.insert(lk.clone());
+                            if n_abs.interval.min >= 0 {
+                                if let ExprKind::Ident(nvar) = &args[0].value.kind {
+                                    env.diffs.insert((lk.clone(), nvar.clone()), 0);
+                                    env.diffs.insert((nvar.clone(), lk.clone()), 0);
+                                }
+                                if self.expr_smt_encodable(&args[0].value) {
+                                    smt_premises.push((
+                                        Expr {
+                                            kind: ExprKind::Binary {
+                                                op: BinOp::Eq,
+                                                left: Box::new(Expr { kind: ExprKind::Ident(lk), span: *span }),
+                                                right: Box::new(args[0].value.clone()),
+                                            },
+                                            span: *span,
+                                        },
+                                        BTreeMap::new(),
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                     if self.is_int_type_name(&effective_ty.display_name()) {
                         smt_int_vars.insert(name.clone());
                         if self.expr_smt_encodable(value) {
@@ -3022,7 +3238,7 @@ impl CheckerCtx {
                         }
                     }
                 }
-                Stmt::Assert { cond, .. } => {
+                Stmt::Assert { cond, span } => {
                     self.check_expr(
                         cond,
                         cur_fn,
@@ -3034,7 +3250,21 @@ impl CheckerCtx {
                         active_mutate,
                         saw_return,
                     );
+                    if self.in_ghost || cur_fn.is_ghost {
+                        self.check_predicate_obligation(
+                            cond,
+                            None,
+                            env,
+                            smt_int_vars,
+                            smt_premises,
+                            &format!("ghost assertion in `{}`", cur_fn.name),
+                            "E0434",
+                            "E0434",
+                            *span,
+                        );
+                    }
                     env.assume_expr(cond, None);
+                    env.assume_float_expr(cond, None);
                     smt_premises.push((cond.clone(), BTreeMap::new()));
                 }
                 Stmt::Assign {
@@ -3119,6 +3349,18 @@ impl CheckerCtx {
                                     }
                                 }
                             };
+                            if self.in_ghost && !cur_fn.is_ghost && var_types.contains_key(vname) {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0702".into(),
+                                    message: format!(
+                                        "ghost block cannot mutate runtime variable `{}`",
+                                        vname
+                                    ),
+                                    span: *span,
+                                    notes: vec!["ghost blocks are erased at compile time and may only assert/prove facts or bind ghost locals".into()],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
                             let new_abs = env.eval_abs_int(&new_expr, None);
                             env.set_int(vname.clone(), new_abs);
                             if let Some(expected_ty) = var_types.get(vname).cloned() {
@@ -3132,8 +3374,74 @@ impl CheckerCtx {
                                     *span,
                                 );
                             }
-                            // Remove stale equality premises referencing `vname`
-                            smt_premises.retain(|(p, _)| !expr_mentions_ident(p, vname));
+                            // Update tracked `__len__<vname>` on `xs = push(xs, v)`!
+                            if matches!(&new_expr.kind, ExprKind::Call { callee, args } if matches!(&callee.kind, ExprKind::Ident(fnm) if fnm == "push") && args.len() == 2 && matches!(&args[0].value.kind, ExprKind::Ident(s) if s == vname)) {
+                                let lk = format!("__len__{}", vname);
+                                let old_l = env.get_int(&lk);
+                                env.set_int(
+                                    lk.clone(),
+                                    AbsInt::top().refine_interval(old_l.interval.add(Interval::exact(1))),
+                                );
+                                let prev_l = format!("__ssa_{}_{}", lk, self.ssa_counter);
+                                self.ssa_counter += 1;
+                                smt_int_vars.insert(lk.clone());
+                                smt_int_vars.insert(prev_l.clone());
+                                rename_ident_in_premises(smt_premises, &lk, &prev_l);
+                                smt_premises.push((
+                                    Expr {
+                                        kind: ExprKind::Binary {
+                                            op: BinOp::Eq,
+                                            left: Box::new(Expr { kind: ExprKind::Ident(lk), span: *span }),
+                                            right: Box::new(Expr {
+                                                kind: ExprKind::Binary {
+                                                    op: BinOp::Add,
+                                                    left: Box::new(Expr { kind: ExprKind::Ident(prev_l), span: *span }),
+                                                    right: Box::new(Expr { kind: ExprKind::Int(1), span: *span }),
+                                                },
+                                                span: *span,
+                                            }),
+                                        },
+                                        span: *span,
+                                    },
+                                    BTreeMap::new(),
+                                ));
+                            } else if var_types
+                                .get(vname)
+                                .is_some_and(|t| self.is_int_type_name(&t.display_name()) || self.is_float_ty(t))
+                                && self.expr_smt_encodable(&new_expr)
+                            {
+                                // Sound SSA renaming in `smt_premises`: preserves `old(x)` & loop inductive relations!
+                                let prev_name = format!("__ssa_{}_{}", vname, self.ssa_counter);
+                                self.ssa_counter += 1;
+                                if var_types.get(vname).is_some_and(|t| self.is_float_ty(t)) {
+                                    self.cur_real_vars.insert(prev_name.clone());
+                                    if let Some((lo, hi)) = env.eval_abs_float(&new_expr, None) {
+                                        env.set_float(vname.clone(), lo, hi);
+                                    }
+                                } else {
+                                    smt_int_vars.insert(prev_name.clone());
+                                    smt_int_vars.insert(vname.clone());
+                                }
+                                let mut rhs_renamed = new_expr.clone();
+                                rename_ident_in_expr(&mut rhs_renamed, vname, &prev_name);
+                                rename_ident_in_premises(smt_premises, vname, &prev_name);
+                                env.diffs.retain(|(a, b), _| a != vname && b != vname);
+                                smt_premises.push((
+                                    Expr {
+                                        kind: ExprKind::Binary {
+                                            op: BinOp::Eq,
+                                            left: Box::new(Expr { kind: ExprKind::Ident(vname.clone()), span: *span }),
+                                            right: Box::new(rhs_renamed),
+                                        },
+                                        span: *span,
+                                    },
+                                    BTreeMap::new(),
+                                ));
+                            } else {
+                                // Fallback: drop stale premises mentioning `vname`
+                                env.diffs.retain(|(a, b), _| a != vname && b != vname);
+                                smt_premises.retain(|(p, _)| !expr_mentions_ident(p, vname));
+                            }
                         }
                         ExprKind::Field {
                             target: obj,
@@ -3235,6 +3543,29 @@ impl CheckerCtx {
                             }
                             let list_ty = self.resolve_base_type(&self.infer_expr_type(list_expr, var_types));
                             if let TypeExpr::Named { name: ln, args: la, .. } = list_ty {
+                                if (ln == "List" || ln == "Bytes")
+                                    && matches!(&list_expr.kind, ExprKind::Ident(_))
+                                {
+                                    if let ExprKind::Ident(lvar) = &list_expr.kind {
+                                        if let Some(tier) = self.try_prove_list_index_in_bounds(
+                                            lvar,
+                                            index,
+                                            env,
+                                            smt_int_vars,
+                                            smt_premises,
+                                        ) {
+                                            self.proved_safe_indices.insert(target.span.start);
+                                            self.proofs.push(ProofRecord {
+                                                obligation: format!(
+                                                    "in-bounds index write `{}[...]`",
+                                                    lvar
+                                                ),
+                                                tier,
+                                                span: target.span,
+                                            });
+                                        }
+                                    }
+                                }
                                 if ln == "List" && la.len() == 1 {
                                     let rhs_ty = self.infer_expr_type(value, var_types);
                                     if let TypeExpr::Dyn { interface, .. } = &la[0] {
@@ -3305,15 +3636,32 @@ impl CheckerCtx {
                 Stmt::While {
                     cond,
                     invariants,
+                    decreases,
                     body,
                     ..
                 } => {
-                    // Soundly widen variables mutated inside the loop before checking cond & body!
+                    // 1. Base Case: BEFORE widening loop-mutated variables, prove every `invariant` holds on loop entry!
+                    for inv in invariants {
+                        self.check_predicate_obligation(
+                            inv,
+                            None,
+                            env,
+                            smt_int_vars,
+                            smt_premises,
+                            &format!("while invariant (base case) in `{}`", cur_fn.name),
+                            "E0431",
+                            "E0431",
+                            inv.span,
+                        );
+                    }
+
+                    // 2. Soundly widen variables mutated inside the loop before checking cond & body!
                     let mut mutated = BTreeSet::new();
                     collect_mutated_vars_in_block(body, &mut mutated);
                     for mv in &mutated {
                         env.ints.remove(mv);
                         env.bools.remove(mv);
+                        env.floats.remove(mv);
                         env.diffs.retain(|(a, b), _| a != mv && b != mv);
                         smt_premises.retain(|(p, _)| !expr_mentions_ident(p, mv));
                         if let Some(mty) = var_types.get(mv).cloned() {
@@ -3331,6 +3679,8 @@ impl CheckerCtx {
                         active_mutate,
                         saw_return,
                     );
+
+                    // 3. Inductive Hypothesis: inside body, assume `invariants` AND `cond`.
                     let mut body_env = env.clone();
                     let mut body_vars = smt_int_vars.clone();
                     let mut body_premises = smt_premises.clone();
@@ -3340,8 +3690,51 @@ impl CheckerCtx {
                     body_premises.push((cond.clone(), BTreeMap::new()));
                     for inv in invariants {
                         body_env.assume_expr(inv, None);
+                        body_env.assume_float_expr(inv, None);
                         body_premises.push((inv.clone(), BTreeMap::new()));
                     }
+
+                    // 4. Termination (`decreases`): prove `measure >= 0` at body entry and snapshot `__dec_entry`.
+                    let dec_entry_name = if let Some(dec) = decreases {
+                        let ge0 = Expr {
+                            kind: ExprKind::Binary {
+                                op: BinOp::Ge,
+                                left: Box::new(dec.clone()),
+                                right: Box::new(Expr { kind: ExprKind::Int(0), span: dec.span }),
+                            },
+                            span: dec.span,
+                        };
+                        self.check_predicate_obligation(
+                            &ge0,
+                            None,
+                            &body_env,
+                            &body_vars,
+                            &body_premises,
+                            &format!("while `decreases` measure >= 0 in `{}`", cur_fn.name),
+                            "E0433",
+                            "E0433",
+                            dec.span,
+                        );
+                        let dname = format!("__dec_entry_{}", self.ssa_counter);
+                        self.ssa_counter += 1;
+                        body_vars.insert(dname.clone());
+                        body_premises.push((
+                            Expr {
+                                kind: ExprKind::Binary {
+                                    op: BinOp::Eq,
+                                    left: Box::new(Expr { kind: ExprKind::Ident(dname.clone()), span: dec.span }),
+                                    right: Box::new(dec.clone()),
+                                },
+                                span: dec.span,
+                            },
+                            BTreeMap::new(),
+                        ));
+                        Some(dname)
+                    } else {
+                        None
+                    };
+
+                    let mut body_saw_return = false;
                     let _ = self.check_block(
                         body,
                         cur_fn,
@@ -3351,8 +3744,78 @@ impl CheckerCtx {
                         &mut body_types,
                         &mut body_mut,
                         active_mutate,
-                        saw_return,
+                        &mut body_saw_return,
                     );
+
+                    // 5. Inductive Step & Termination Decrease at end of loop body!
+                    if !block_always_diverges(body) {
+                        for inv in invariants {
+                            self.check_predicate_obligation(
+                                inv,
+                                None,
+                                &body_env,
+                                &body_vars,
+                                &body_premises,
+                                &format!("while invariant (inductive step) in `{}`", cur_fn.name),
+                                "E0432",
+                                "E0432",
+                                inv.span,
+                            );
+                        }
+                        if let (Some(dec), Some(dname)) = (decreases, dec_entry_name) {
+                            let strictly_dec = Expr {
+                                kind: ExprKind::Binary {
+                                    op: BinOp::And,
+                                    left: Box::new(Expr {
+                                        kind: ExprKind::Binary {
+                                            op: BinOp::Ge,
+                                            left: Box::new(dec.clone()),
+                                            right: Box::new(Expr { kind: ExprKind::Int(0), span: dec.span }),
+                                        },
+                                        span: dec.span,
+                                    }),
+                                    right: Box::new(Expr {
+                                        kind: ExprKind::Binary {
+                                            op: BinOp::Lt,
+                                            left: Box::new(dec.clone()),
+                                            right: Box::new(Expr { kind: ExprKind::Ident(dname), span: dec.span }),
+                                        },
+                                        span: dec.span,
+                                    }),
+                                },
+                                span: dec.span,
+                            };
+                            self.check_predicate_obligation(
+                                &strictly_dec,
+                                None,
+                                &body_env,
+                                &body_vars,
+                                &body_premises,
+                                &format!("while `decreases` strictly decreases in `{}`", cur_fn.name),
+                                "E0433",
+                                "E0433",
+                                dec.span,
+                            );
+                        }
+                    }
+
+                    // 6. Post-Loop Exit Propagation: assume all proved `invariants`, plus `!cond` if no `break`!
+                    for inv in invariants {
+                        env.assume_expr(inv, None);
+                        env.assume_float_expr(inv, None);
+                        smt_premises.push((inv.clone(), BTreeMap::new()));
+                    }
+                    if !invariants.is_empty() && !block_contains_break(body) {
+                        let neg_cond = Expr {
+                            kind: ExprKind::Unary {
+                                op: UnOp::Not,
+                                expr: Box::new(cond.clone()),
+                            },
+                            span: cond.span,
+                        };
+                        env.assume_expr(&neg_cond, None);
+                        smt_premises.push((neg_cond, BTreeMap::new()));
+                    }
                 }
                 Stmt::Expr { expr, .. } => {
                     self.check_expr(
@@ -3829,6 +4292,27 @@ impl CheckerCtx {
                         active_mutate,
                         &mut d_sr,
                     );
+                }
+                Stmt::Ghost { body, .. } => {
+                    // Ghost verification block: prove assertions & invoke lemmas, propagate proved
+                    // facts back into the enclosing verification environment, zero runtime footprint!
+                    let prev_ghost = self.in_ghost;
+                    self.in_ghost = true;
+                    let mut g_types = var_types.clone();
+                    let mut g_mut = BTreeSet::new();
+                    let mut g_sr = false;
+                    let _ = self.check_block(
+                        body,
+                        cur_fn,
+                        env,
+                        smt_int_vars,
+                        smt_premises,
+                        &mut g_types,
+                        &mut g_mut,
+                        active_mutate,
+                        &mut g_sr,
+                    );
+                    self.in_ghost = prev_ghost;
                 }
                 Stmt::Break { .. } | Stmt::Continue { .. } => {}
             }
@@ -4487,9 +4971,82 @@ impl CheckerCtx {
                             dst_ty.display_name()
                         ),
                         span: expr.span,
-                        notes: vec!["`as` supports scalar, pointer, bool, and bitfield casts".into()],
+                        notes: vec!["`as` supports scalar, pointer, bool, refined alias, and bitfield casts".into()],
                         counterexample: BTreeMap::new(),
                     });
+                } else if let TypeExpr::Named { name: dst_name, .. } = ty {
+                    // If target is a refined type alias (e.g. `Range2to6`), `x as Range2to6` MUST be proved statically!
+                    if self.type_aliases.get(dst_name).and_then(|a| a.predicate.as_ref()).is_some() {
+                        match self.eval_refinement_cast(inner, ty, env, smt_int_vars, smt_premises) {
+                            CastVerdict::Infallible => {
+                                self.infallible_casts.insert(expr.span.start);
+                                self.proofs.push(ProofRecord {
+                                    obligation: format!("infallible refinement cast `as {}`", dst_name),
+                                    tier: ProofTier::L0Fast,
+                                    span: expr.span,
+                                });
+                            }
+                            CastVerdict::Disjoint(reason) => {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0416".into(),
+                                    message: format!(
+                                        "impossible cast to `{}`: source and target refinements are provably disjoint",
+                                        dst_name
+                                    ),
+                                    span: expr.span,
+                                    notes: vec![reason],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                            CastVerdict::Fallible => {
+                                self.check_expr_satisfies_type(
+                                    inner,
+                                    ty,
+                                    env,
+                                    smt_int_vars,
+                                    smt_premises,
+                                    &format!("cast `as {}` (use `as? {}` or `refine_cast[{}](...)` for fallible Result)", dst_name, dst_name, dst_name),
+                                    expr.span,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::TryCast { expr: inner, ty } => {
+                self.check_expr(
+                    inner,
+                    cur_fn,
+                    env,
+                    smt_int_vars,
+                    smt_premises,
+                    var_types,
+                    mutable_vars,
+                    active_mutate,
+                    saw_return,
+                );
+                match self.eval_refinement_cast(inner, ty, env, smt_int_vars, smt_premises) {
+                    CastVerdict::Infallible => {
+                        self.infallible_casts.insert(expr.span.start);
+                        self.proofs.push(ProofRecord {
+                            obligation: format!("`as? {}` proved infallible (check elided)", ty.display_name()),
+                            tier: ProofTier::L0Fast,
+                            span: expr.span,
+                        });
+                    }
+                    CastVerdict::Disjoint(reason) => {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0416".into(),
+                            message: format!(
+                                "impossible fallible cast `as? {}`: source and target refinements are provably disjoint",
+                                ty.display_name()
+                            ),
+                            span: expr.span,
+                            notes: vec![reason],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                    CastVerdict::Fallible => {}
                 }
             }
             ExprKind::Unsafe(blk) => {
@@ -4550,11 +5107,32 @@ impl CheckerCtx {
                             counterexample: BTreeMap::new(),
                         });
                     } else if idx_abs.interval.min >= 0 && idx_abs.interval.max < len as i128 {
+                        self.proved_safe_indices.insert(expr.span.start);
                         self.proofs.push(ProofRecord {
                             obligation: format!("array index in bounds 0..{} (elided)", len),
                             tier: ProofTier::L0Fast,
                             span: index.span,
                         });
+                    }
+                } else if matches!(&tty, TypeExpr::Named { name, .. } if name == "List" || name == "Bytes") {
+                    if let ExprKind::Ident(list_var) = &target.kind {
+                        if let Some(tier) = self.try_prove_list_index_in_bounds(
+                            list_var,
+                            index,
+                            env,
+                            smt_int_vars,
+                            smt_premises,
+                        ) {
+                            self.proved_safe_indices.insert(expr.span.start);
+                            self.proofs.push(ProofRecord {
+                                obligation: format!(
+                                    "list index `{}[...]` proved in bounds `0 <= idx < len({})` (bounds-check elided)",
+                                    list_var, list_var
+                                ),
+                                tier,
+                                span: index.span,
+                            });
+                        }
                     }
                 }
             }
@@ -5103,7 +5681,52 @@ impl CheckerCtx {
                     }
                     ExprKind::GenericInst { expr: inner, type_args } => {
                         if let ExprKind::Ident(fname) = &inner.kind {
-                            if let Some(fdecl) = self.all_fns.get(fname).cloned() {
+                            if fname == "refine_cast" && args.len() == 1 {
+                                let dst_ty = type_args.first().cloned().unwrap_or_else(|| named_ty("Any"));
+                                match self.eval_refinement_cast(
+                                    &args[0].value,
+                                    &dst_ty,
+                                    env,
+                                    smt_int_vars,
+                                    smt_premises,
+                                ) {
+                                    CastVerdict::Infallible => {
+                                        self.infallible_casts.insert(expr.span.start);
+                                        self.refine_cast_types.insert(expr.span.start, dst_ty.clone());
+                                        self.proofs.push(ProofRecord {
+                                            obligation: format!(
+                                                "refine_cast[{}] proved infallible (direct `{}`)",
+                                                dst_ty.display_name(),
+                                                dst_ty.display_name()
+                                            ),
+                                            tier: ProofTier::L0Fast,
+                                            span: expr.span,
+                                        });
+                                    }
+                                    CastVerdict::Fallible => {
+                                        self.refine_cast_types.insert(
+                                            expr.span.start,
+                                            generic_ty("Result", vec![dst_ty, named_ty("Text")]),
+                                        );
+                                    }
+                                    CastVerdict::Disjoint(reason) => {
+                                        self.refine_cast_types.insert(
+                                            expr.span.start,
+                                            generic_ty("Result", vec![dst_ty.clone(), named_ty("Text")]),
+                                        );
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0416".into(),
+                                            message: format!(
+                                                "impossible `refine_cast[{}]`: source and target refinements are provably disjoint",
+                                                dst_ty.display_name()
+                                            ),
+                                            span: expr.span,
+                                            notes: vec![reason],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    }
+                                }
+                            } else if let Some(fdecl) = self.all_fns.get(fname).cloned() {
                                 let mut tsubst = BTreeMap::new();
                                 for (tp, ta) in fdecl.type_params.iter().zip(type_args.iter()) {
                                     tsubst.insert(tp.clone(), ta.clone());
@@ -6019,7 +6642,12 @@ impl CheckerCtx {
             L0Result::Unknown => {
                 let mut q = SmtQuery::new(self.smt_pure_fns.clone());
                 for v in smt_int_vars {
-                    q.declare_int(v.clone());
+                    if !self.cur_real_vars.contains(v) {
+                        q.declare_int(v.clone());
+                    }
+                }
+                for rv in &self.cur_real_vars {
+                    q.declare_real(rv.clone());
                 }
                 let mut subst = BTreeMap::new();
                 if let Some(se) = self_val_expr {
@@ -6702,12 +7330,38 @@ impl CheckerCtx {
                 span,
             );
         }
-        for (v, pty) in mutated_inout_targets {
+        let mut inout_prev_map: BTreeMap<String, String> = BTreeMap::new();
+        for (v, pty) in &mutated_inout_targets {
             let prefix = format!("{}.", v);
-            env.ints.retain(|k, _| k != &v && !k.starts_with(&prefix));
-            env.bools.retain(|k, _| k != &v && !k.starts_with(&prefix));
-            smt_premises.retain(|(p, _)| !expr_mentions_ident(p, &v));
-            self.assume_type_facts(&v, &pty, env, smt_int_vars, smt_premises);
+            env.ints.retain(|k, _| k != v && !k.starts_with(&prefix));
+            env.bools.retain(|k, _| k != v && !k.starts_with(&prefix));
+            env.floats.retain(|k, _| k != v && !k.starts_with(&prefix));
+            env.diffs.retain(|(a, b), _| a != v && b != v);
+            let prev = format!("__ssa_{}_{}", v, self.ssa_counter);
+            self.ssa_counter += 1;
+            smt_int_vars.insert(prev.clone());
+            rename_ident_in_premises(smt_premises, v, &prev);
+            inout_prev_map.insert(v.clone(), prev);
+            self.assume_type_facts(v, pty, env, smt_int_vars, smt_premises);
+        }
+        // Inject instantiated `ensures` from `lemma`/`ghost fn` calls AND `inout` function calls!
+        if fdecl.is_ghost || !mutated_inout_targets.is_empty() {
+            for ens in &fdecl.ensures {
+                let mut inst = substitute_expr_idents(ens, &param_arg_map);
+                if !inout_prev_map.is_empty() {
+                    rewrite_old_to_prev_in_expr(&mut inst, &inout_prev_map);
+                }
+                env.assume_expr(&inst, None);
+                env.assume_float_expr(&inst, None);
+                smt_premises.push((inst, BTreeMap::new()));
+                if fdecl.is_ghost {
+                    self.proofs.push(ProofRecord {
+                        obligation: format!("lemma `{}` postcondition applied", fname),
+                        tier: ProofTier::L0Fast,
+                        span,
+                    });
+                }
+            }
         }
     }
 
@@ -6874,7 +7528,8 @@ impl CheckerCtx {
             is_async: false,
             is_test: false,
             is_unsafe: false,
-        is_comptime: false,
+            is_comptime: false,
+            is_ghost: false,
             name: "<lambda>".into(),
             type_params: vec![],
             type_param_bounds: BTreeMap::new(),
@@ -6976,7 +7631,7 @@ impl CheckerCtx {
             return;
         };
 
-        // Float refinement verification (L0 float constant / bound checker for e.g. `UnitFloat = Float where 0.0 <= self && self <= 1.0`)
+        // Float refinement verification: L0 constant -> L0 float interval -> L1 Z3 `Real`!
         if self.is_float_ty(&alias.base) {
             if let Some(fval) = eval_const_float(expr, &self.consts) {
                 match check_float_refinement_l0(pred, fval) {
@@ -7004,9 +7659,69 @@ impl CheckerCtx {
                     None => {}
                 }
             }
-            // If dynamic variable already has exact alias type, accept
-            if let ExprKind::Ident(_) = &expr.kind {
-                return;
+            // L0 symbolic float interval check (e.g. `(a + b) * 0.5` where `a, b in [0.0, 1.0]`)
+            if let Some((lo, hi)) = env.eval_abs_float(expr, None) {
+                if check_float_refinement_l0(pred, lo) == Some(true)
+                    && check_float_refinement_l0(pred, hi) == Some(true)
+                {
+                    self.proofs.push(ProofRecord {
+                        obligation: format!("{} satisfies float refinement `{}` (interval [{}, {}])", context, name, lo, hi),
+                        tier: ProofTier::L0Fast,
+                        span,
+                    });
+                    return;
+                }
+            }
+            // L1 Z3 `Real` symbolic proof for arbitrary float expressions!
+            if self.expr_smt_encodable(expr) {
+                let mut q = SmtQuery::new(self.smt_pure_fns.clone());
+                for v in smt_int_vars {
+                    if !self.cur_real_vars.contains(v) {
+                        q.declare_int(v.clone());
+                    }
+                }
+                for rv in &self.cur_real_vars {
+                    q.declare_real(rv.clone());
+                }
+                q.declare_real("__val");
+                for (p, s) in smt_premises {
+                    let _ = q.add_premise_expr(p, s);
+                }
+                let eq = Expr {
+                    kind: ExprKind::Binary {
+                        op: BinOp::Eq,
+                        left: Box::new(Expr { kind: ExprKind::Ident("__val".into()), span }),
+                        right: Box::new(expr.clone()),
+                    },
+                    span,
+                };
+                if q.add_premise_expr(&eq, &BTreeMap::new()).is_ok() {
+                    let mut subst = BTreeMap::new();
+                    subst.insert("self".into(), "__val".into());
+                    if q.set_goal_expr(pred, &subst).is_ok() {
+                        match q.solve() {
+                            SmtOutcome::Proved => {
+                                self.proofs.push(ProofRecord {
+                                    obligation: format!("{} satisfies float refinement `{}`", context, name),
+                                    tier: ProofTier::L1Smt,
+                                    span,
+                                });
+                                return;
+                            }
+                            SmtOutcome::Counterexample(ce) => {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0410".into(),
+                                    message: format!("{} may violate float refinement `{}`", context, name),
+                                    span,
+                                    notes: vec!["counterexample found by L1 SMT (Z3 Real)".into()],
+                                    counterexample: ce,
+                                });
+                                return;
+                            }
+                            SmtOutcome::Unknown(_) => {}
+                        }
+                    }
+                }
             }
             return;
         }
@@ -7052,7 +7767,12 @@ impl CheckerCtx {
             L0Result::Unknown => {
                 let mut q = SmtQuery::new(self.smt_pure_fns.clone());
                 for v in smt_int_vars {
-                    q.declare_int(v.clone());
+                    if !self.cur_real_vars.contains(v) {
+                        q.declare_int(v.clone());
+                    }
+                }
+                for rv in &self.cur_real_vars {
+                    q.declare_real(rv.clone());
                 }
                 q.declare_int("__val");
                 for (p, s) in smt_premises {
@@ -7155,9 +7875,18 @@ impl CheckerCtx {
 
         let mut q = SmtQuery::new(self.smt_pure_fns.clone());
         for v in smt_int_vars {
-            q.declare_int(v.clone());
+            if !self.cur_real_vars.contains(v) {
+                q.declare_int(v.clone());
+            }
         }
-        q.declare_int("result");
+        for rv in &self.cur_real_vars {
+            q.declare_real(rv.clone());
+        }
+        if f.ret_ty.as_ref().is_some_and(|rt| self.is_float_ty(rt)) {
+            q.declare_real("result");
+        } else {
+            q.declare_int("result");
+        }
         for (p, s) in smt_premises {
             let _ = q.add_premise_expr(p, s);
         }
@@ -7201,6 +7930,404 @@ impl CheckerCtx {
                 counterexample: BTreeMap::new(),
             }),
         }
+    }
+
+    fn try_prove_list_index_in_bounds(
+        &self,
+        list_var: &str,
+        index: &Expr,
+        env: &L0Env,
+        smt_int_vars: &BTreeSet<String>,
+        smt_premises: &[(Expr, BTreeMap<String, String>)],
+    ) -> Option<ProofTier> {
+        let len_expr = Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(Expr {
+                    kind: ExprKind::Ident("len".into()),
+                    span: index.span,
+                }),
+                args: vec![CallArg {
+                    name: None,
+                    value: Expr {
+                        kind: ExprKind::Ident(list_var.to_string()),
+                        span: index.span,
+                    },
+                }],
+            },
+            span: index.span,
+        };
+        let goal = Expr {
+            kind: ExprKind::Binary {
+                op: BinOp::And,
+                left: Box::new(Expr {
+                    kind: ExprKind::Binary {
+                        op: BinOp::Ge,
+                        left: Box::new(index.clone()),
+                        right: Box::new(Expr {
+                            kind: ExprKind::Int(0),
+                            span: index.span,
+                        }),
+                    },
+                    span: index.span,
+                }),
+                right: Box::new(Expr {
+                    kind: ExprKind::Binary {
+                        op: BinOp::Lt,
+                        left: Box::new(index.clone()),
+                        right: Box::new(len_expr),
+                    },
+                    span: index.span,
+                }),
+            },
+            span: index.span,
+        };
+        if env.check_predicate(&goal, None) == L0Result::Proved {
+            return Some(ProofTier::L0Fast);
+        }
+        if !self.expr_smt_encodable(index) {
+            return None;
+        }
+        let mut q = SmtQuery::new(self.smt_pure_fns.clone());
+        for v in smt_int_vars {
+            if !self.cur_real_vars.contains(v) {
+                q.declare_int(v.clone());
+            }
+        }
+        q.declare_int(format!("__len__{}", list_var));
+        for (p, s) in smt_premises {
+            let _ = q.add_premise_expr(p, s);
+        }
+        if q.set_goal_expr(&goal, &BTreeMap::new()).is_ok() && q.solve() == SmtOutcome::Proved {
+            return Some(ProofTier::L1Smt);
+        }
+        None
+    }
+
+    fn eval_type_subsumption(&self, src_ty: &TypeExpr, dst_ty: &TypeExpr) -> CastVerdict {
+        let sn = src_ty.display_name();
+        let dn = dst_ty.display_name();
+        if sn == dn {
+            return CastVerdict::Infallible;
+        }
+        let s_base = self.resolve_base_type(src_ty);
+        let d_base = self.resolve_base_type(dst_ty);
+        let dst_pred = if let TypeExpr::Named { name, .. } = dst_ty {
+            self.type_aliases.get(name).and_then(|a| a.predicate.clone())
+        } else {
+            None
+        };
+        let Some(pred) = dst_pred else {
+            // Unrefined target: check scalar widening
+            if s_base.display_name() == d_base.display_name() {
+                return CastVerdict::Infallible;
+            }
+            if let (Some(sk), Some(dk)) = (self.scalar_kind_of_ty(&s_base), self.scalar_kind_of_ty(&d_base)) {
+                if let (Some(s0), Some(s1), Some(d0), Some(d1)) =
+                    (sk.min_i128(), sk.max_i128(), dk.min_i128(), dk.max_i128())
+                {
+                    if s0 >= d0 && s1 <= d1 {
+                        return CastVerdict::Infallible;
+                    }
+                }
+            }
+            return CastVerdict::Fallible;
+        };
+
+        let mut env = L0Env {
+            pure_fns: self.pure_fns.clone(),
+            type_aliases: self.type_aliases.clone(),
+            ..Default::default()
+        };
+        let mut smt_int_vars = BTreeSet::new();
+        let mut smt_premises = Vec::new();
+        let mut tmp_reals = BTreeSet::new();
+        self.assume_type_facts_readonly("__src", src_ty, &mut env, &mut smt_int_vars, &mut tmp_reals, &mut smt_premises);
+
+        // 1. L0 fast subsumption & disjointness check
+        match env.check_predicate(&pred, Some("__src")) {
+            L0Result::Proved => return CastVerdict::Infallible,
+            L0Result::Disproved(reason) => return CastVerdict::Disjoint(reason),
+            L0Result::Unknown => {}
+        }
+        // 2. L1 Z3 subsumption: `P_src(__src) => P_dst(__src)`
+        let mut q = SmtQuery::new(self.smt_pure_fns.clone());
+        for v in &smt_int_vars {
+            if !tmp_reals.contains(v) {
+                q.declare_int(v.clone());
+            }
+        }
+        for rv in &tmp_reals {
+            q.declare_real(rv.clone());
+        }
+        if self.is_float_ty(&d_base) {
+            q.declare_real("__src");
+        } else {
+            q.declare_int("__src");
+        }
+        for (p, s) in &smt_premises {
+            let _ = q.add_premise_expr(p, s);
+        }
+        let mut subst = BTreeMap::new();
+        subst.insert("self".into(), "__src".into());
+        if q.set_goal_expr(&pred, &subst).is_ok() && q.solve() == SmtOutcome::Proved {
+            return CastVerdict::Infallible;
+        }
+        // 3. L1 Z3 disjointness: `P_src(__src) => !P_dst(__src)`
+        let neg_pred = Expr {
+            kind: ExprKind::Unary {
+                op: UnOp::Not,
+                expr: Box::new(pred),
+            },
+            span: Span::default(),
+        };
+        if q.set_goal_expr(&neg_pred, &subst).is_ok() && q.solve() == SmtOutcome::Proved {
+            return CastVerdict::Disjoint(format!(
+                "Z3 proved `{}` and `{}` have empty intersection",
+                sn, dn
+            ));
+        }
+        CastVerdict::Fallible
+    }
+
+    fn assume_type_facts_readonly(
+        &self,
+        var_name: &str,
+        ty: &TypeExpr,
+        env: &mut L0Env,
+        smt_int_vars: &mut BTreeSet<String>,
+        real_vars: &mut BTreeSet<String>,
+        smt_premises: &mut Vec<(Expr, BTreeMap<String, String>)>,
+    ) {
+        if let TypeExpr::Named { name, .. } = ty {
+            if let Some(sk) = ScalarKind::from_name(name) {
+                if sk.is_int() {
+                    smt_int_vars.insert(var_name.to_string());
+                    if let (Some(lo), Some(hi)) = (sk.min_i128(), sk.max_i128()) {
+                        if sk != ScalarKind::I64 {
+                            env.set_int(
+                                var_name,
+                                AbsInt::top().refine_interval(Interval { min: lo, max: hi }),
+                            );
+                        }
+                    }
+                } else if sk.is_float() {
+                    real_vars.insert(var_name.to_string());
+                }
+            } else if let Some(alias) = self.type_aliases.get(name) {
+                self.assume_type_facts_readonly(var_name, &alias.base, env, smt_int_vars, real_vars, smt_premises);
+                if let Some(pred) = &alias.predicate {
+                    env.assume_expr(pred, Some(var_name));
+                    if self.is_float_ty(&alias.base) {
+                        env.assume_float_expr(pred, Some(var_name));
+                    }
+                    let mut subst = BTreeMap::new();
+                    subst.insert("self".into(), var_name.to_string());
+                    smt_premises.push((pred.clone(), subst));
+                }
+            }
+        }
+    }
+
+    fn eval_refinement_cast(
+        &self,
+        inner: &Expr,
+        dst_ty: &TypeExpr,
+        env: &L0Env,
+        smt_int_vars: &BTreeSet<String>,
+        smt_premises: &[(Expr, BTreeMap<String, String>)],
+    ) -> CastVerdict {
+        let dst_pred = if let TypeExpr::Named { name, .. } = dst_ty {
+            self.type_aliases.get(name).and_then(|a| a.predicate.clone())
+        } else {
+            None
+        };
+        let Some(pred) = dst_pred else {
+            return CastVerdict::Infallible;
+        };
+        let mut check_env = env.clone();
+        let abs = env.eval_abs_int(inner, None);
+        check_env.set_int("__cast_v", abs);
+        if let Some((lo, hi)) = env.eval_abs_float(inner, None) {
+            check_env.set_float("__cast_v", lo, hi);
+        }
+        match check_env.check_predicate(&pred, Some("__cast_v")) {
+            L0Result::Proved => return CastVerdict::Infallible,
+            L0Result::Disproved(reason) => return CastVerdict::Disjoint(reason),
+            L0Result::Unknown => {}
+        }
+        if !self.expr_smt_encodable(inner) {
+            return CastVerdict::Fallible;
+        }
+        let mut q = SmtQuery::new(self.smt_pure_fns.clone());
+        for v in smt_int_vars {
+            if !self.cur_real_vars.contains(v) {
+                q.declare_int(v.clone());
+            }
+        }
+        for rv in &self.cur_real_vars {
+            q.declare_real(rv.clone());
+        }
+        let is_f = self.is_float_ty(dst_ty);
+        if is_f {
+            q.declare_real("__cast_v");
+        } else {
+            q.declare_int("__cast_v");
+        }
+        for (p, s) in smt_premises {
+            let _ = q.add_premise_expr(p, s);
+        }
+        let eq = Expr {
+            kind: ExprKind::Binary {
+                op: BinOp::Eq,
+                left: Box::new(Expr { kind: ExprKind::Ident("__cast_v".into()), span: inner.span }),
+                right: Box::new(inner.clone()),
+            },
+            span: inner.span,
+        };
+        if q.add_premise_expr(&eq, &BTreeMap::new()).is_err() {
+            return CastVerdict::Fallible;
+        }
+        let mut subst = BTreeMap::new();
+        subst.insert("self".into(), "__cast_v".into());
+        if q.set_goal_expr(&pred, &subst).is_ok() && q.solve() == SmtOutcome::Proved {
+            return CastVerdict::Infallible;
+        }
+        let neg_pred = Expr {
+            kind: ExprKind::Unary {
+                op: UnOp::Not,
+                expr: Box::new(pred),
+            },
+            span: inner.span,
+        };
+        if q.set_goal_expr(&neg_pred, &subst).is_ok() && q.solve() == SmtOutcome::Proved {
+            return CastVerdict::Disjoint(format!(
+                "Z3 proved value can never satisfy `{}` under current constraints",
+                dst_ty.display_name()
+            ));
+        }
+        CastVerdict::Fallible
+    }
+}
+
+fn rename_ident_in_premises(
+    premises: &mut Vec<(Expr, BTreeMap<String, String>)>,
+    old_name: &str,
+    new_name: &str,
+) {
+    for (p, subst) in premises.iter_mut() {
+        let mut touched = false;
+        for v in subst.values_mut() {
+            if v == old_name {
+                *v = new_name.to_string();
+                touched = true;
+            }
+        }
+        if !touched || expr_mentions_ident(p, old_name) {
+            rename_ident_in_expr(p, old_name, new_name);
+        }
+    }
+}
+
+fn rename_ident_in_expr(expr: &mut Expr, old_name: &str, new_name: &str) {
+    match &mut expr.kind {
+        ExprKind::Ident(s) => {
+            if s == old_name {
+                *s = new_name.to_string();
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            rename_ident_in_expr(left, old_name, new_name);
+            rename_ident_in_expr(right, old_name, new_name);
+        }
+        ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::TryCast { expr: inner, .. }
+        | ExprKind::Try(inner)
+        | ExprKind::Await(inner) => rename_ident_in_expr(inner, old_name, new_name),
+        // Do NOT rename inside `old(...)` — `old(x)` stays pinned to `old__x`!
+        ExprKind::Old(_) => {}
+        ExprKind::Call { callee, args } => {
+            if let ExprKind::Ident(fname) = &callee.kind {
+                if fname == "len" && args.len() == 1 {
+                    if let ExprKind::Ident(arg_v) = &args[0].value.kind {
+                        if format!("__len__{}", arg_v) == old_name {
+                            expr.kind = ExprKind::Ident(new_name.to_string());
+                            return;
+                        }
+                    }
+                }
+            }
+            for a in args {
+                rename_ident_in_expr(&mut a.value, old_name, new_name);
+            }
+        }
+        ExprKind::If { cond, then_block, else_branch } => {
+            rename_ident_in_expr(cond, old_name, new_name);
+            for s in &mut then_block.stmts {
+                if let Stmt::Expr { expr: e, .. } = s {
+                    rename_ident_in_expr(e, old_name, new_name);
+                }
+            }
+            if let Some(t) = &mut then_block.tail {
+                rename_ident_in_expr(t, old_name, new_name);
+            }
+            if let Some(eb) = else_branch {
+                rename_ident_in_expr(eb, old_name, new_name);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_old_to_prev_in_expr(expr: &mut Expr, old_map: &BTreeMap<String, String>) {
+    match &mut expr.kind {
+        ExprKind::Old(inner) => {
+            if let ExprKind::Ident(s) = &inner.kind {
+                if let Some(prev) = old_map.get(s) {
+                    expr.kind = ExprKind::Ident(prev.clone());
+                }
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            rewrite_old_to_prev_in_expr(left, old_map);
+            rewrite_old_to_prev_in_expr(right, old_map);
+        }
+        ExprKind::Unary { expr: inner, .. } | ExprKind::Cast { expr: inner, .. } => {
+            rewrite_old_to_prev_in_expr(inner, old_map);
+        }
+        ExprKind::Call { args, .. } => {
+            for a in args {
+                rewrite_old_to_prev_in_expr(&mut a.value, old_map);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn block_contains_break(blk: &Block) -> bool {
+    for s in &blk.stmts {
+        match s {
+            Stmt::Break { .. } => return true,
+            Stmt::Expr { expr, .. } => {
+                if expr_contains_break(expr) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    blk.tail.as_deref().is_some_and(expr_contains_break)
+}
+
+fn expr_contains_break(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::If { then_block, else_branch, .. } => {
+            block_contains_break(then_block)
+                || else_branch.as_deref().is_some_and(expr_contains_break)
+        }
+        ExprKind::Match { arms, .. } => arms.iter().any(|a| expr_contains_break(&a.body)),
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => block_contains_break(b),
+        _ => false,
     }
 }
 
@@ -7364,6 +8491,15 @@ fn substitute_expr_idents(expr: &Expr, map: &BTreeMap<String, Expr>) -> Expr {
         ExprKind::Unary { op, expr: inner } => ExprKind::Unary {
             op: *op,
             expr: Box::new(substitute_expr_idents(inner, map)),
+        },
+        ExprKind::Old(inner) => ExprKind::Old(Box::new(substitute_expr_idents(inner, map))),
+        ExprKind::Cast { expr: inner, ty } => ExprKind::Cast {
+            expr: Box::new(substitute_expr_idents(inner, map)),
+            ty: ty.clone(),
+        },
+        ExprKind::Index { target, index } => ExprKind::Index {
+            target: Box::new(substitute_expr_idents(target, map)),
+            index: Box::new(substitute_expr_idents(index, map)),
         },
         ExprKind::Call { callee, args } => ExprKind::Call {
             callee: callee.clone(),
@@ -7836,6 +8972,7 @@ fn collect_captured_idents_expr(
         | ExprKind::Field { target: e, .. }
         | ExprKind::TupleIndex { target: e, .. }
         | ExprKind::Cast { expr: e, .. }
+        | ExprKind::TryCast { expr: e, .. }
         | ExprKind::Try(e)
         | ExprKind::Await(e) => collect_captured_idents_expr(e, bound, out),
         ExprKind::Call { callee, args } => {
@@ -7905,7 +9042,7 @@ fn collect_captured_idents_block(
                 collect_captured_idents_expr(iter, bound, out);
                 collect_captured_idents_block(body, bound, out);
             }
-            Stmt::Defer { body, .. } | Stmt::Mutate { body, .. } => {
+            Stmt::Defer { body, .. } | Stmt::Mutate { body, .. } | Stmt::Ghost { body, .. } => {
                 collect_captured_idents_block(body, bound, out);
             }
             _ => {}

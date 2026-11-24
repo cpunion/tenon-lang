@@ -101,6 +101,10 @@ impl IncrementalDb {
     pub fn stats(&self) -> QueryStats {
         self.inner.lock().unwrap().stats.clone()
     }
+
+    pub fn vc_cache_entries(&self) -> usize {
+        crate::smt::vc_cache_len()
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

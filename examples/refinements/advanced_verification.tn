@@ -1,0 +1,183 @@
+// End-to-end verification showcase:
+// 1. Subtype-dependent static casting (`as`, `as?`, `refine_cast[T](x)`, `comptime if is_subtype[S, T]()`)
+// 2. Closed-loop `while` verification (`invariant` Base + Inductive Step + Exit Propagation + `decreases`)
+// 3. Proved in-bounds `List` reads & writes -> LLVM `@__tn_list_get_unchecked` / `@__tn_list_set_prim_unchecked`
+// 4. General `old(expr)` on `inout` parameters + caller postcondition injection
+// 5. Zero-overhead `lemma` and `ghost { ... }` blocks (verified statically, erased before codegen)
+// 6. Symbolic `Float` refinements (`SmtSort::Real`), BitVector bitwise proofs, and recursive `pure fn` fuel unrolling
+
+pub type Range3to5 = Int where self >= 3 && self <= 5
+pub type Range2to6 = Int where self >= 2 && self <= 6
+pub type Range2to4 = Int where self >= 2 && self <= 4
+pub type NonNeg    = Int where self >= 0
+pub type Mask8     = Int where self >= 0 && self <= 255
+pub type UnitFloat = Float where self >= 0.0 && self <= 1.0
+
+// --- 1. Refinement-Aware Static Casting ---
+
+// Widening: Range3to5 <: Range2to6 is statically proved (Z3).
+// Both `x as Range2to6` and `refine_cast[Range2to6](x)` return `Range2to6` directly (zero runtime check!).
+pub pure fn widen_via_refine_cast(x Range3to5) Range2to6 {
+    let direct Range2to6 = x as Range2to6
+    let widened = refine_cast[Range2to6](x)
+    let _ Range2to6 = widened
+    let _ = direct
+    widened
+}
+
+// Partial overlap: Range3to5 -> Range2to4 may fail when x == 5.
+// `refine_cast[Range2to4](x)` statically resolves its return type to `Result[Range2to4, Text]`.
+pub pure fn narrow_via_refine_cast(x Range3to5) Result[Range2to4, Text] {
+    refine_cast[Range2to4](x)
+}
+
+// Explicit fallible try-cast `as?` always returns `Result[T, Text]`.
+pub pure fn narrow_via_try_cast(x Range3to5) Result[Range2to4, Text] {
+    x as? Range2to4
+}
+
+// Flow-sensitive narrowing: inside `if x <= 4`, Z3 proves `x` satisfies `Range2to4` statically!
+pub pure fn flow_narrow(x Range3to5) Int {
+    if x <= 4 {
+        let safe Range2to4 = x as Range2to4
+        safe
+    } else {
+        0
+    }
+}
+
+// Compile-time subtype reflection
+pub pure fn comptime_subtype_flag() Int {
+    let a = comptime if is_subtype[Range3to5, Range2to6]() { 10 } else { 0 }
+    let b = comptime if is_subtype[Range3to5, Range2to4]() { 100 } else { 1 }
+    a + b
+}
+
+// --- 2. Closed-loop `while` (`invariant` + `decreases` + exit propagation) & Unchecked LLVM Indexing ---
+
+pub fn sum_and_double(n Int where self >= 1 && self <= 64) Int {
+    var xs List[Int] = list_filled(n, 0)
+    var i = 0
+    while i < n
+        invariant 0 <= i && i <= n
+        decreases n - i
+    {
+        xs[i] = i + 1
+        i += 1
+    }
+    ghost {
+        assert i == n
+    }
+
+    var acc = 0
+    var j = 0
+    while j < n
+        invariant 0 <= j && j <= n
+        decreases n - j
+    {
+        acc += xs[j]
+        j += 1
+    }
+    ghost {
+        assert j == n
+    }
+    acc
+}
+
+// --- 3. `inout` + General `old(expr)` ---
+
+pub fn bump(inout x NonNeg)
+    ensures x == old(x) + 1
+{
+    x += 1
+}
+
+// --- 4. Zero-overhead `lemma` & `ghost { ... }` ---
+
+lemma nonneg_product(a Int, b Int)
+    requires a >= 0 && b >= 0
+    ensures a * b >= 0
+{
+    assert a >= 0
+    assert b >= 0
+}
+
+// --- 5. Symbolic Float Refinement (`SmtSort::Real`) ---
+
+pub pure fn avg_unit(a UnitFloat, b UnitFloat) UnitFloat {
+    (a + b) / 2.0
+}
+
+// L0 interval alone widens `a * (1.0 - t) + b * t` to `[0.0, 2.0]`; Z3 `Real` proves `[0.0, 1.0]`!
+pub pure fn lerp_unit(a UnitFloat, b UnitFloat, t UnitFloat) UnitFloat {
+    (1.0 - t) * a + t * b
+}
+
+// --- 6. Bitwise BitVector Bridge & Recursive `pure fn` Fuel Unrolling ---
+
+pub pure fn mask_byte(x Int) Mask8 {
+    x & 255
+}
+
+pub pure fn tri(n Int) Int {
+    if n <= 0 { 0 } else { n + tri(n - 1) }
+}
+
+pub pure fn proved_tri3() Int
+    ensures result == 6
+{
+    tri(3)
+}
+
+pub fn main() Int {
+    let r3 Range3to5 = 3
+    let r5 Range3to5 = 5
+
+    // Infallible widening -> bare `Range2to6`
+    let w Range2to6 = widen_via_refine_cast(r5)
+
+    // Fallible narrowing -> `Result[Range2to4, Text]`
+    let ok_val = match narrow_via_refine_cast(r3) {
+        Ok(v) => v
+        Err(_) => 0
+    }
+    let err_flag = match narrow_via_refine_cast(r5) {
+        Ok(_) => 0
+        Err(_) => 1
+    }
+    let try_ok = match narrow_via_try_cast(r3) {
+        Ok(v) => v
+        Err(_) => 0
+    }
+
+    let fn_v = flow_narrow(r3)
+    let ct_v = comptime_subtype_flag()
+
+    // Verified while loop + unchecked LLVM list indexing: sum(1..=10) = 55
+    let s = sum_and_double(10)
+
+    // inout + old(x) postcondition propagation (statically proved in ghost block!)
+    var cnt NonNeg = 10
+    bump(cnt)
+    ghost {
+        assert cnt == 11
+    }
+
+    // Zero-overhead ghost/lemma witness
+    ghost {
+        nonneg_product(cnt, w)
+        assert cnt * w >= 0
+    }
+
+    // Symbolic Float refinement (L0 interval + L1 Z3 Real)
+    let mid UnitFloat = avg_unit(0.25, 0.75)
+    let lerped UnitFloat = lerp_unit(0.2, 0.8, 0.5)
+    let mid_ok = if mid == 0.5 && lerped == 0.5 { 1 } else { 0 }
+
+    // Bitwise mask & recursive pure fn
+    let m Mask8 = mask_byte(259)
+    let t3 = proved_tri3()
+
+    // 5 + 3 + 1 + 3 + 3 + 11 + 55 + 11 + 1 + 3 + 6 = 102
+    w + ok_val + err_flag + try_ok + fn_v + ct_v + s + cnt + mid_ok + m + t3
+}

@@ -302,6 +302,10 @@ fn subst_expr_types(expr: &Expr, subst: &BTreeMap<String, TypeExpr>) -> Expr {
             expr: Box::new(subst_expr_types(inner, subst)),
             ty: subst_type(ty, subst),
         },
+        ExprKind::TryCast { expr: inner, ty } => ExprKind::TryCast {
+            expr: Box::new(subst_expr_types(inner, subst)),
+            ty: subst_type(ty, subst),
+        },
         ExprKind::ArrayRepeat { value, len } => ExprKind::ArrayRepeat {
             value: Box::new(subst_expr_types(value, subst)),
             len: *len,
@@ -387,6 +391,10 @@ fn subst_block_types(blk: &Block, subst: &BTreeMap<String, TypeExpr>) -> Block {
                     body: subst_block_types(body, subst),
                     span: *span,
                 },
+                Stmt::Ghost { body, span } => Stmt::Ghost {
+                    body: subst_block_types(body, subst),
+                    span: *span,
+                },
                 Stmt::While {
                     cond,
                     invariants,
@@ -432,6 +440,10 @@ fn subst_fn_types(f: &FnDecl, subst: &BTreeMap<String, TypeExpr>) -> FnDecl {
 
 struct LowerCtx {
     alias_bases: BTreeMap<String, TypeExpr>,
+    alias_preds: BTreeMap<String, Expr>,
+    ghost_fns: BTreeSet<String>,
+    infallible_casts: BTreeSet<usize>,
+    orig_program: Program,
     records: BTreeMap<String, RecordDecl>,
     generic_records: BTreeMap<String, RecordDecl>,
     mono_records: Vec<RecordDecl>,
@@ -711,6 +723,9 @@ impl LowerCtx {
                 }
             }
             ExprKind::Cast { ty, .. } => ty.clone(),
+            ExprKind::TryCast { ty, .. } => {
+                generic_ty("Result", vec![ty.clone(), named_ty("Text")])
+            }
             ExprKind::Unsafe(b) => {
                 let mut local = var_types.clone();
                 self.infer_block_ty(b, &mut local)
@@ -1016,6 +1031,14 @@ impl LowerCtx {
                 }
                 ExprKind::GenericInst { expr: inner, type_args } => {
                     if let ExprKind::Ident(fname) = &inner.kind {
+                        if fname == "refine_cast" && type_args.len() == 1 && args.len() == 1 {
+                            let dst_ty = &type_args[0];
+                            let src_ty = self.infer_expr_ty(&args[0].value, var_types);
+                            if self.is_refinement_cast_infallible(&src_ty, dst_ty, expr.span) {
+                                return dst_ty.clone();
+                            }
+                            return generic_ty("Result", vec![dst_ty.clone(), named_ty("Text")]);
+                        }
                         if let Some(tmpl) = self.generic_templates.get(fname) {
                             if let Some(rt) = &tmpl.ret_ty {
                                 let subst = self.infer_generic_subst(tmpl, type_args, args, var_types);
@@ -1530,6 +1553,9 @@ impl LowerCtx {
                     if let Some(top) = self.defer_stack.last_mut() {
                         top.push(lowered_defer);
                     }
+                }
+                Stmt::Ghost { .. } => {
+                    // Ghost proof blocks are statically verified and erased at codegen (zero runtime overhead).
                 }
                 Stmt::Let {
                     name,
@@ -2428,10 +2454,15 @@ impl LowerCtx {
                     }
                     stmts.push(Stmt::Continue { span: *span });
                 }
-                Stmt::Expr { expr, span } => stmts.push(Stmt::Expr {
-                    expr: self.lower_expr(expr, var_types, ret_ty, None),
-                    span: *span,
-                }),
+                Stmt::Expr { expr, span } => {
+                    if self.is_ghost_call_expr(expr) {
+                        continue;
+                    }
+                    stmts.push(Stmt::Expr {
+                        expr: self.lower_expr(expr, var_types, ret_ty, None),
+                        span: *span,
+                    });
+                }
             }
         }
         let scope_defers = self.defer_stack.pop().unwrap_or_default();
@@ -2652,6 +2683,7 @@ impl LowerCtx {
             is_test: false,
             is_unsafe: false,
             is_comptime: false,
+            is_ghost: false,
             name: cname.clone(),
             type_params: vec![],
             type_param_bounds: BTreeMap::new(),
@@ -2795,6 +2827,41 @@ impl LowerCtx {
                 expr: Box::new(self.lower_expr(inner, var_types, ret_ty, None)),
                 ty: ty.clone(),
             },
+            ExprKind::TryCast { expr: inner, ty } => {
+                let src_ty = self.infer_expr_ty(inner, var_types);
+                let lv = self.lower_expr(inner, var_types, ret_ty, None);
+                if self.is_refinement_cast_infallible(&src_ty, ty, sp) {
+                    let cast_v = if self.resolve_alias(&src_ty).display_name()
+                        != self.resolve_alias(ty).display_name()
+                    {
+                        Expr {
+                            kind: ExprKind::Cast {
+                                expr: Box::new(lv),
+                                ty: ty.clone(),
+                            },
+                            span: sp,
+                        }
+                    } else {
+                        lv
+                    };
+                    return Expr {
+                        kind: ExprKind::Call {
+                            callee: Box::new(Expr {
+                                kind: ExprKind::Ident("Ok".into()),
+                                span: sp,
+                            }),
+                            args: vec![CallArg {
+                                name: None,
+                                value: cast_v,
+                            }],
+                        },
+                        span: sp,
+                    };
+                }
+                return self.lower_fallible_refinement_check(
+                    lv, &src_ty, ty, var_types, ret_ty, sp,
+                );
+            }
             ExprKind::ArrayRepeat { value, len } => {
                 let exp_elem = match expected_ty.map(|t| self.resolve_alias(t)) {
                     Some(TypeExpr::Array { elem, .. }) => Some(*elem),
@@ -3271,6 +3338,28 @@ impl LowerCtx {
                     // 1. Explicit generic call `decode[Order](raw)` or layout/ptr/chan intrinsics
                     ExprKind::GenericInst { expr: inner, type_args } => {
                         if let ExprKind::Ident(fname) = &inner.kind {
+                            if fname == "refine_cast" && type_args.len() == 1 && args.len() == 1 {
+                                let dst_ty = &type_args[0];
+                                let src_ty = self.infer_expr_ty(&args[0].value, var_types);
+                                let lv = self.lower_expr(&args[0].value, var_types, ret_ty, None);
+                                if self.is_refinement_cast_infallible(&src_ty, dst_ty, sp) {
+                                    if self.resolve_alias(&src_ty).display_name()
+                                        != self.resolve_alias(dst_ty).display_name()
+                                    {
+                                        return Expr {
+                                            kind: ExprKind::Cast {
+                                                expr: Box::new(lv),
+                                                ty: dst_ty.clone(),
+                                            },
+                                            span: sp,
+                                        };
+                                    }
+                                    return lv;
+                                }
+                                return self.lower_fallible_refinement_check(
+                                    lv, &src_ty, dst_ty, var_types, ret_ty, sp,
+                                );
+                            }
                             if fname == "size_of" && args.is_empty() {
                                 let sz = type_args
                                     .first()
@@ -4582,7 +4671,7 @@ impl LowerCtx {
                 let mut bv = var_types.clone();
                 self.rewrite_block_generic_records(b, &mut bv, expected_ty);
             }
-            ExprKind::Cast { expr, ty } => {
+            ExprKind::Cast { expr, ty } | ExprKind::TryCast { expr, ty } => {
                 self.rewrite_expr_generic_records(expr, var_types, None);
                 *ty = self.rewrite_generic_record_ty(ty);
             }
@@ -4608,6 +4697,299 @@ impl LowerCtx {
             a.value = self.maybe_box_dyn(v, &p.ty, &aty);
         }
     }
+
+    fn is_ghost_call_expr(&self, expr: &Expr) -> bool {
+        if let ExprKind::Call { callee, .. } = &expr.kind {
+            match &callee.kind {
+                ExprKind::Ident(fname) => return self.ghost_fns.contains(fname),
+                ExprKind::GenericInst { expr: inner, .. } => {
+                    if let ExprKind::Ident(fname) = &inner.kind {
+                        return self.ghost_fns.contains(fname);
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn collect_type_predicates(&self, ty: &TypeExpr) -> Vec<Expr> {
+        let mut preds = Vec::new();
+        let mut cur = ty.clone();
+        let mut guard = 0usize;
+        while guard < 16 {
+            guard += 1;
+            match cur {
+                TypeExpr::Named { ref name, .. } => {
+                    if let Some(p) = self.alias_preds.get(name) {
+                        preds.push(p.clone());
+                    }
+                    if let Some(base) = self.alias_bases.get(name) {
+                        cur = base.clone();
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        preds
+    }
+
+    fn is_refinement_cast_infallible(&self, src_ty: &TypeExpr, dst_ty: &TypeExpr, span: Span) -> bool {
+        if self.infallible_casts.contains(&span.start) {
+            return true;
+        }
+        matches!(
+            tenon_verify::check_type_subsumption(&self.orig_program, src_ty, dst_ty),
+            tenon_verify::CastVerdict::Infallible
+        )
+    }
+
+    fn lower_fallible_refinement_check(
+        &mut self,
+        lowered_val: Expr,
+        src_ty: &TypeExpr,
+        dst_ty: &TypeExpr,
+        var_types: &BTreeMap<String, TypeExpr>,
+        ret_ty: Option<&TypeExpr>,
+        sp: Span,
+    ) -> Expr {
+        let dst_base = self.resolve_alias(dst_ty);
+        let cast_val = if self.resolve_alias(src_ty).display_name() != dst_base.display_name() {
+            Expr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(lowered_val),
+                    ty: dst_base.clone(),
+                },
+                span: sp,
+            }
+        } else {
+            lowered_val
+        };
+        let preds = self.collect_type_predicates(dst_ty);
+        if preds.is_empty() {
+            return Expr {
+                kind: ExprKind::Call {
+                    callee: Box::new(Expr {
+                        kind: ExprKind::Ident("Ok".into()),
+                        span: sp,
+                    }),
+                    args: vec![CallArg {
+                        name: None,
+                        value: cast_val,
+                    }],
+                },
+                span: sp,
+            };
+        }
+        let tmp_name = format!("__rc_v_{}", self.fresh_id());
+        let mut combined: Option<Expr> = None;
+        for p in &preds {
+            let substituted = subst_self_in_expr(p, &tmp_name);
+            combined = Some(match combined {
+                None => substituted,
+                Some(acc) => Expr {
+                    kind: ExprKind::Binary {
+                        op: BinOp::And,
+                        left: Box::new(acc),
+                        right: Box::new(substituted),
+                    },
+                    span: sp,
+                },
+            });
+        }
+        let mut local_vt = var_types.clone();
+        local_vt.insert(tmp_name.clone(), dst_base.clone());
+        let lowered_cond = self.lower_expr(&combined.unwrap(), &local_vt, ret_ty, None);
+        Expr {
+            kind: ExprKind::Block(Block {
+                stmts: vec![Stmt::Let {
+                    name: tmp_name.clone(),
+                    ty: Some(dst_base),
+                    value: cast_val,
+                    is_mut: false,
+                    span: sp,
+                }],
+                tail: Some(Box::new(Expr {
+                    kind: ExprKind::If {
+                        cond: Box::new(lowered_cond),
+                        then_block: Block {
+                            stmts: vec![],
+                            tail: Some(Box::new(Expr {
+                                kind: ExprKind::Call {
+                                    callee: Box::new(Expr {
+                                        kind: ExprKind::Ident("Ok".into()),
+                                        span: sp,
+                                    }),
+                                    args: vec![CallArg {
+                                        name: None,
+                                        value: Expr {
+                                            kind: ExprKind::Ident(tmp_name),
+                                            span: sp,
+                                        },
+                                    }],
+                                },
+                                span: sp,
+                            })),
+                            span: sp,
+                        },
+                        else_branch: Some(Box::new(Expr {
+                            kind: ExprKind::Block(Block {
+                                stmts: vec![],
+                                tail: Some(Box::new(Expr {
+                                    kind: ExprKind::Call {
+                                        callee: Box::new(Expr {
+                                            kind: ExprKind::Ident("Err".into()),
+                                            span: sp,
+                                        }),
+                                        args: vec![CallArg {
+                                            name: None,
+                                            value: Expr {
+                                                kind: ExprKind::Str(format!(
+                                                    "refinement check failed for `{}`",
+                                                    dst_ty.display_name()
+                                                )),
+                                                span: sp,
+                                            },
+                                        }],
+                                    },
+                                    span: sp,
+                                })),
+                                span: sp,
+                            }),
+                            span: sp,
+                        })),
+                    },
+                    span: sp,
+                })),
+                span: sp,
+            }),
+            span: sp,
+        }
+    }
+}
+
+fn subst_self_in_expr(expr: &Expr, var: &str) -> Expr {
+    let kind = match &expr.kind {
+        ExprKind::Ident(s) if s == "self" => ExprKind::Ident(var.to_string()),
+        ExprKind::Binary { op, left, right } => ExprKind::Binary {
+            op: *op,
+            left: Box::new(subst_self_in_expr(left, var)),
+            right: Box::new(subst_self_in_expr(right, var)),
+        },
+        ExprKind::Unary { op, expr: inner } => ExprKind::Unary {
+            op: *op,
+            expr: Box::new(subst_self_in_expr(inner, var)),
+        },
+        ExprKind::Call { callee, args } => ExprKind::Call {
+            callee: Box::new(subst_self_in_expr(callee, var)),
+            args: args
+                .iter()
+                .map(|a| CallArg {
+                    name: a.name.clone(),
+                    value: subst_self_in_expr(&a.value, var),
+                })
+                .collect(),
+        },
+        ExprKind::Field { target, field } => ExprKind::Field {
+            target: Box::new(subst_self_in_expr(target, var)),
+            field: field.clone(),
+        },
+        ExprKind::Index { target, index } => ExprKind::Index {
+            target: Box::new(subst_self_in_expr(target, var)),
+            index: Box::new(subst_self_in_expr(index, var)),
+        },
+        ExprKind::Cast { expr: inner, ty } => ExprKind::Cast {
+            expr: Box::new(subst_self_in_expr(inner, var)),
+            ty: ty.clone(),
+        },
+        other => other.clone(),
+    };
+    Expr {
+        kind,
+        span: expr.span,
+    }
+}
+
+fn expr_uses_refinement_casts(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::TryCast { .. } => true,
+        ExprKind::Call { callee, args } => {
+            if let ExprKind::GenericInst { expr: inner, .. } = &callee.kind {
+                if matches!(&inner.kind, ExprKind::Ident(n) if n == "refine_cast") {
+                    return true;
+                }
+            }
+            expr_uses_refinement_casts(callee)
+                || args.iter().any(|a| expr_uses_refinement_casts(&a.value))
+        }
+        ExprKind::Binary { left, right, .. } | ExprKind::Range { start: left, end: right } => {
+            expr_uses_refinement_casts(left) || expr_uses_refinement_casts(right)
+        }
+        ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Field { target: inner, .. }
+        | ExprKind::TupleIndex { target: inner, .. }
+        | ExprKind::Try(inner)
+        | ExprKind::Await(inner)
+        | ExprKind::Old(inner)
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::ArrayRepeat { value: inner, .. }
+        | ExprKind::GenericInst { expr: inner, .. } => expr_uses_refinement_casts(inner),
+        ExprKind::Index { target, index } => {
+            expr_uses_refinement_casts(target) || expr_uses_refinement_casts(index)
+        }
+        ExprKind::RecordLit { fields, .. } => {
+            fields.iter().any(|(_, v)| expr_uses_refinement_casts(v))
+        }
+        ExprKind::List(es) | ExprKind::Tuple(es) => es.iter().any(expr_uses_refinement_casts),
+        ExprKind::If { cond, then_block, else_branch } => {
+            expr_uses_refinement_casts(cond)
+                || block_uses_refinement_casts(then_block)
+                || else_branch.as_deref().is_some_and(expr_uses_refinement_casts)
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            expr_uses_refinement_casts(scrutinee)
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().is_some_and(expr_uses_refinement_casts)
+                        || expr_uses_refinement_casts(&a.body)
+                })
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => block_uses_refinement_casts(b),
+        ExprKind::Lambda { body, .. } => expr_uses_refinement_casts(body),
+        _ => false,
+    }
+}
+
+fn block_uses_refinement_casts(b: &Block) -> bool {
+    b.stmts.iter().any(|s| match s {
+        Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => expr_uses_refinement_casts(value),
+        Stmt::Assign { target, value, .. } => {
+            expr_uses_refinement_casts(target) || expr_uses_refinement_casts(value)
+        }
+        Stmt::Return { value: Some(e), .. } | Stmt::Expr { expr: e, .. } => {
+            expr_uses_refinement_casts(e)
+        }
+        Stmt::Assert { cond, .. } => expr_uses_refinement_casts(cond),
+        Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } | Stmt::Ghost { body, .. } => {
+            block_uses_refinement_casts(body)
+        }
+        Stmt::While { cond, body, .. } => {
+            expr_uses_refinement_casts(cond) || block_uses_refinement_casts(body)
+        }
+        Stmt::For { iter, body, .. } => {
+            expr_uses_refinement_casts(iter) || block_uses_refinement_casts(body)
+        }
+        _ => false,
+    }) || b.tail.as_deref().is_some_and(expr_uses_refinement_casts)
+}
+
+fn program_uses_refinement_casts(p: &Program) -> bool {
+    p.items.iter().any(|it| match it {
+        Item::Fn(f) => block_uses_refinement_casts(&f.body),
+        Item::Impl(im) => im.methods.iter().any(|m| block_uses_refinement_casts(&m.body)),
+        _ => false,
+    })
 }
 
 fn collect_pattern_names(pat: &Pattern, out: &mut BTreeSet<String>) {
@@ -4712,6 +5094,7 @@ fn collect_free_vars_expr(expr: &Expr, bound: &BTreeSet<String>, free: &mut BTre
         | ExprKind::Await(inner)
         | ExprKind::Old(inner)
         | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::TryCast { expr: inner, .. }
         | ExprKind::ArrayRepeat { value: inner, .. }
         | ExprKind::GenericInst { expr: inner, .. } => {
             collect_free_vars_expr(inner, bound, free);
@@ -4802,8 +5185,17 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
 
     let layout = LayoutEngine::from_program(&expanded);
     let comptime_ctx = ComptimeContext::from_program(&expanded);
+    let infallible_casts = if program_uses_refinement_casts(&expanded) {
+        tenon_verify::check_program(&expanded).infallible_casts
+    } else {
+        BTreeSet::new()
+    };
     let mut ctx = LowerCtx {
         alias_bases: BTreeMap::new(),
+        alias_preds: BTreeMap::new(),
+        ghost_fns: BTreeSet::new(),
+        infallible_casts,
+        orig_program: expanded.clone(),
         records: BTreeMap::new(),
         generic_records: BTreeMap::new(),
         mono_records: Vec::new(),
@@ -4837,6 +5229,9 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
         match item {
             Item::TypeAlias(ta) => {
                 ctx.alias_bases.insert(ta.name.clone(), ta.base.clone());
+                if let Some(pred) = &ta.predicate {
+                    ctx.alias_preds.insert(ta.name.clone(), pred.clone());
+                }
             }
             Item::Record(r) => {
                 if r.type_params.is_empty() {
@@ -4877,7 +5272,9 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
                 ctx.interfaces.insert(iface.name.clone(), iface.clone());
             }
             Item::Fn(f) => {
-                if f.type_params.is_empty() {
+                if f.is_ghost {
+                    ctx.ghost_fns.insert(f.name.clone());
+                } else if f.type_params.is_empty() {
                     ctx.fn_sigs.insert(f.name.clone(), f.clone());
                 } else {
                     ctx.generic_templates.insert(f.name.clone(), f.clone());
@@ -4971,7 +5368,8 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
                                     is_pure: im.is_pure,
                                     is_async: im.is_async,
                                     is_unsafe: false,
-            is_comptime: false,
+                                    is_comptime: false,
+                                    is_ghost: false,
                                     is_test: false,
                                     name: mangled.clone(),
                                     type_params: imp.type_params.clone(),
@@ -5054,7 +5452,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
     for item in &expanded.items {
         match item {
             Item::Fn(f) => {
-                if f.type_params.is_empty() {
+                if !f.is_ghost && f.type_params.is_empty() {
                     final_items.push(Item::Fn(ctx.lower_fn(f)));
                 }
             }

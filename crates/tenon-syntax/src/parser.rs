@@ -431,6 +431,58 @@ impl Parser {
                     span,
                 })]);
             }
+            if kw == "ghost" {
+                return Ok(vec![Item::Fn(self.parse_fn(attrs, is_pub)?)]);
+            }
+            if kw == "lemma" {
+                let start = self.bump().span;
+                let (name, _) = self.expect_ident()?;
+                let (type_params, type_param_bounds) = self.parse_type_params_with_bounds()?;
+                let params = self.parse_params()?;
+                let ret_ty = if !matches!(
+                    self.peek_non_nl().kind,
+                    TokenKind::LBrace | TokenKind::Requires | TokenKind::Ensures
+                ) {
+                    Some(self.parse_type_expr()?)
+                } else {
+                    None
+                };
+                let mut requires = Vec::new();
+                let mut ensures = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if self.peek().kind == TokenKind::Requires {
+                        self.bump();
+                        requires.push(self.parse_expr()?);
+                    } else if self.peek().kind == TokenKind::Ensures {
+                        self.bump();
+                        ensures.push(self.parse_expr()?);
+                    } else {
+                        break;
+                    }
+                }
+                let body = self.parse_block()?;
+                let span = start.merge(body.span);
+                return Ok(vec![Item::Fn(FnDecl {
+                    attrs,
+                    is_pub,
+                    is_pure: true,
+                    is_async: false,
+                    is_test: false,
+                    is_unsafe: false,
+                    is_comptime: false,
+                    is_ghost: true,
+                    name,
+                    type_params,
+                    type_param_bounds,
+                    params,
+                    ret_ty,
+                    requires,
+                    ensures,
+                    body,
+                    span,
+                })]);
+            }
             if kw == "attr" {
                 let start = self.bump().span;
                 let (aname, name_span) = self.expect_ident()?;
@@ -1188,9 +1240,10 @@ impl Parser {
         let mut is_test = false;
         let mut is_unsafe = false;
         let mut is_comptime = false;
+        let mut is_ghost = false;
         loop {
             self.skip_newlines();
-            match self.peek().kind {
+            match &self.peek().kind {
                 TokenKind::Pure => {
                     self.bump();
                     is_pure = true;
@@ -1210,6 +1263,10 @@ impl Parser {
                 TokenKind::Comptime => {
                     self.bump();
                     is_comptime = true;
+                }
+                TokenKind::Ident(s) if s == "ghost" => {
+                    self.bump();
+                    is_ghost = true;
                 }
                 _ => break,
             }
@@ -1255,6 +1312,7 @@ impl Parser {
             is_test,
             is_unsafe,
             is_comptime,
+            is_ghost,
             name,
             type_params,
             type_param_bounds,
@@ -1433,6 +1491,7 @@ impl Parser {
                 is_test: false,
                 is_unsafe: false,
                 is_comptime: false,
+                is_ghost: false,
                 name: mname.clone(),
                 type_params: Vec::new(),
                 type_param_bounds: BTreeMap::new(),
@@ -2142,6 +2201,30 @@ impl Parser {
                     span: start.merge(end),
                 });
             }
+            if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "ghost")
+                && matches!(
+                    self.peek_ahead_non_nl(1).kind,
+                    TokenKind::LBrace | TokenKind::Let | TokenKind::Assert
+                )
+            {
+                let start = self.bump().span;
+                self.skip_newlines();
+                let body = if self.peek().kind == TokenKind::LBrace {
+                    self.parse_block()?
+                } else {
+                    let st = self.parse_stmt()?;
+                    let sspan = start.merge(self.peek().span);
+                    Block {
+                        stmts: vec![st],
+                        tail: None,
+                        span: sspan,
+                    }
+                };
+                let span = start.merge(body.span);
+                stmts.push(Stmt::Ghost { body, span });
+                self.eat_sep();
+                continue;
+            }
             if matches!(
                 self.peek().kind,
                 TokenKind::Let
@@ -2640,6 +2723,7 @@ impl Parser {
         let mut left = self.parse_unary()?;
         while self.peek().kind == TokenKind::As {
             self.bump();
+            let is_try = self.eat(&TokenKind::Question);
             let ty = self.parse_type_expr()?;
             let end = match &ty {
                 TypeExpr::Named { span, .. }
@@ -2650,9 +2734,16 @@ impl Parser {
             };
             let span = left.span.merge(end);
             left = Expr {
-                kind: ExprKind::Cast {
-                    expr: Box::new(left),
-                    ty,
+                kind: if is_try {
+                    ExprKind::TryCast {
+                        expr: Box::new(left),
+                        ty,
+                    }
+                } else {
+                    ExprKind::Cast {
+                        expr: Box::new(left),
+                        ty,
+                    }
                 },
                 span,
             };

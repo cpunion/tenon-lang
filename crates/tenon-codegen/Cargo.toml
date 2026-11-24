@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 tenon-syntax.workspace = true
 tenon-rt.workspace = true
+tenon-verify.workspace = true
 cranelift-codegen.workspace = true
 cranelift-frontend.workspace = true
 cranelift-jit.workspace = true

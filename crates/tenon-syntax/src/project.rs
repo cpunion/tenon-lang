@@ -1276,7 +1276,7 @@ fn rewrite_block_bindings(blk: &mut Block, bindings: &LocalBindings) {
             Stmt::Return { value: Some(e), .. }
             | Stmt::Assert { cond: e, .. }
             | Stmt::Expr { expr: e, .. } => rewrite_expr_bindings(e, bindings),
-            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } | Stmt::Ghost { body, .. } => {
                 rewrite_block_bindings(body, bindings)
             }
             Stmt::While { cond, body, .. } => {
@@ -1369,7 +1369,7 @@ fn rewrite_expr_bindings(expr: &mut Expr, bindings: &LocalBindings) {
         | ExprKind::TupleIndex { target: inner, .. } => {
             rewrite_expr_bindings(inner, bindings);
         }
-        ExprKind::Cast { expr: inner, ty } => {
+        ExprKind::Cast { expr: inner, ty } | ExprKind::TryCast { expr: inner, ty } => {
             rewrite_expr_bindings(inner, bindings);
             rewrite_type_bindings(ty, bindings);
         }

@@ -1749,6 +1749,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         match &expr.kind {
             ExprKind::Float(_) => Some(ScalarKind::F64),
             ExprKind::Cast { ty, .. } => scalar_kind_of_ty(ty, self.alias_bases),
+            ExprKind::TryCast { .. } => None,
             ExprKind::Unary { op: UnOp::Neg | UnOp::BitNot, expr: inner } => {
                 self.scalar_kind_of_expr(inner)
             }
@@ -2130,6 +2131,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 named_ty("Any")
             }
             ExprKind::Cast { ty, .. } => ty.clone(),
+            ExprKind::TryCast { ty, .. } => generic_ty("Result", vec![ty.clone(), named_ty("Text")]),
             ExprKind::ArrayRepeat { value, len } => TypeExpr::Array {
                 elem: Box::new(self.infer_expr_type_with(value, extra_vars)),
                 len: *len,
@@ -3279,7 +3281,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         self.flush_temps(&temps);
                     }
                 }
-                Stmt::LetTuple { .. } | Stmt::For { .. } | Stmt::Defer { .. } => {}
+                Stmt::LetTuple { .. } | Stmt::For { .. } | Stmt::Defer { .. } | Stmt::Ghost { .. } => {}
             }
         }
 
@@ -4045,7 +4047,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.flush_temps(&temps);
                 Ok(res)
             }
-            ExprKind::Cast { expr: inner, ty } => {
+            ExprKind::Cast { expr: inner, ty } | ExprKind::TryCast { expr: inner, ty } => {
                 if let ExprKind::Float(x) = &inner.kind {
                     if is_f32_type_expr(ty, self.alias_bases) {
                         return Ok(self.builder.ins().iconst(types::I64, (*x as f32).to_bits() as i64));

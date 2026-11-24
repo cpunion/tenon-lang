@@ -299,6 +299,55 @@ impl ComptimeContext {
         out
     }
 
+    /// Compile-time refinement subtype check `is_subtype[S, T]()`:
+    /// returns `true` when `S == T`, or `T` is the unconstrained base of `S`,
+    /// or both `S` and `T` have statically bounded integer intervals with `[S.min, S.max] ⊆ [T.min, T.max]`.
+    fn is_refinement_subtype(&self, src: &TypeExpr, dst: &TypeExpr) -> bool {
+        let sn = src.display_name();
+        let dn = dst.display_name();
+        if sn == dn {
+            return true;
+        }
+        let s_alias = self.aliases.get(&sn);
+        let d_alias = self.aliases.get(&dn);
+        let s_base = s_alias
+            .map(|a| a.base.display_name())
+            .unwrap_or_else(|| sn.clone());
+        let d_base = d_alias
+            .map(|a| a.base.display_name())
+            .unwrap_or_else(|| dn.clone());
+        if s_base != d_base {
+            // Check exact-width scalar widening (e.g. UInt8 <: UInt16 <: UInt32 <: UInt64)
+            if let (Some(sk), Some(dk)) = (
+                crate::layout::ScalarKind::from_name(&s_base),
+                crate::layout::ScalarKind::from_name(&d_base),
+            ) {
+                if let (Some(smin), Some(smax), Some(dmin), Some(dmax)) =
+                    (sk.min_i128(), sk.max_i128(), dk.min_i128(), dk.max_i128())
+                {
+                    if smin >= dmin && smax <= dmax && d_alias.and_then(|a| a.predicate.as_ref()).is_none() {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        // Target has no refinement predicate -> widening to base always holds!
+        let Some(d_pred) = d_alias.and_then(|a| a.predicate.as_ref()) else {
+            return true;
+        };
+        let Some(s_pred) = s_alias.and_then(|a| a.predicate.as_ref()) else {
+            return false;
+        };
+        if let (Some((smin, smax)), Some((dmin, dmax))) = (
+            extract_simple_int_bounds(s_pred),
+            extract_simple_int_bounds(d_pred),
+        ) {
+            return smin >= dmin && smax <= dmax;
+        }
+        false
+    }
+
     fn annotated_fns_of_program(&self, target_attr: &str) -> Vec<CtVal> {
         let mut out = Vec::new();
         for f in &self.all_fns_ordered {
@@ -606,7 +655,7 @@ fn expand_block(
                 let _ = span;
                 new_stmts.push(s);
             }
-            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } | Stmt::Ghost { body, .. } => {
                 expand_block(ctx, body, type_params, var_types, depth)?;
                 new_stmts.push(s);
             }
@@ -789,6 +838,7 @@ fn expand_expr(
         | ExprKind::Old(inner)
         | ExprKind::Try(inner)
         | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::TryCast { expr: inner, .. }
         | ExprKind::ArrayRepeat { value: inner, .. }
         | ExprKind::Field { target: inner, .. }
         | ExprKind::TupleIndex { target: inner, .. }
@@ -1163,7 +1213,7 @@ impl<'a> Evaluator<'a> {
                 Stmt::Mutate { body, .. } => {
                     last = self.eval_block_env(body, env)?;
                 }
-                Stmt::Defer { .. } => {}
+                Stmt::Defer { .. } | Stmt::Ghost { .. } => {}
             }
         }
         if let Some(tail) = &blk.tail {
@@ -1429,6 +1479,10 @@ impl<'a> Evaluator<'a> {
                         "implements" if type_args.len() == 2 => {
                             let iface = type_args[1].display_name();
                             return Ok(CtVal::Bool(self.ctx.type_implements(ty, &iface)));
+                        }
+                        "is_subtype" if type_args.len() == 2 => {
+                            let sub = self.ctx.is_refinement_subtype(ty, &type_args[1]);
+                            return Ok(CtVal::Bool(sub));
                         }
                         _ => {}
                     }
@@ -1854,7 +1908,9 @@ fn block_mentions_type_params(blk: &Block, tps: &BTreeSet<String>) -> bool {
         Stmt::For { iter, body, .. } => {
             expr_mentions_type_params(iter, tps) || block_mentions_type_params(body, tps)
         }
-        Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => block_mentions_type_params(body, tps),
+        Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } | Stmt::Ghost { body, .. } => {
+            block_mentions_type_params(body, tps)
+        }
         _ => false,
     }) || blk
         .tail
@@ -1887,7 +1943,7 @@ fn expr_mentions_type_params(expr: &Expr, tps: &BTreeSet<String>) -> bool {
         | ExprKind::Await(inner)
         | ExprKind::Try(inner)
         | ExprKind::Old(inner) => expr_mentions_type_params(inner, tps),
-        ExprKind::Cast { expr: inner, ty } => {
+        ExprKind::Cast { expr: inner, ty } | ExprKind::TryCast { expr: inner, ty } => {
             expr_mentions_type_params(inner, tps) || type_mentions_type_params(ty, tps)
         }
         ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Comptime(b) => {
@@ -1925,6 +1981,7 @@ fn subst_expr_params(expr: &mut Expr, subst: &BTreeMap<String, Expr>) {
         | ExprKind::Old(inner)
         | ExprKind::Try(inner)
         | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::TryCast { expr: inner, .. }
         | ExprKind::ArrayRepeat { value: inner, .. }
         | ExprKind::Field { target: inner, .. }
         | ExprKind::TupleIndex { target: inner, .. }
@@ -2006,7 +2063,9 @@ fn subst_block_params(blk: &mut Block, subst: &BTreeMap<String, Expr>) {
                 subst_expr_params(iter, subst);
                 subst_block_params(body, subst);
             }
-            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => subst_block_params(body, subst),
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } | Stmt::Ghost { body, .. } => {
+                subst_block_params(body, subst)
+            }
             _ => {}
         }
     }
@@ -2036,7 +2095,7 @@ fn subst_ctval_in_block(blk: &mut Block, binding: &str, val: &CtVal) {
                 subst_ctval_in_expr(iter, binding, val);
                 subst_ctval_in_block(body, binding, val);
             }
-            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } | Stmt::Ghost { body, .. } => {
                 subst_ctval_in_block(body, binding, val)
             }
             _ => {}
@@ -2103,6 +2162,7 @@ fn subst_ctval_in_expr(expr: &mut Expr, binding: &str, val: &CtVal) {
         | ExprKind::Old(inner)
         | ExprKind::Try(inner)
         | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::TryCast { expr: inner, .. }
         | ExprKind::ArrayRepeat { value: inner, .. }
         | ExprKind::Field { target: inner, .. }
         | ExprKind::TupleIndex { target: inner, .. }
@@ -2186,6 +2246,12 @@ fn quick_infer_expr_ty(
         }
         ExprKind::RecordLit { name, .. } => mk(name),
         ExprKind::Cast { ty, .. } => ty.clone(),
+        ExprKind::TryCast { ty, .. } => TypeExpr::Named {
+            name: "Result".into(),
+            version: None,
+            args: vec![ty.clone(), mk("Text")],
+            span: expr.span,
+        },
         ExprKind::List(es) => {
             let et = es
                 .first()
@@ -2215,6 +2281,69 @@ fn quick_infer_expr_ty(
             mk("Any")
         }
         _ => mk("Any"),
+    }
+}
+
+fn extract_simple_int_bounds(pred: &Expr) -> Option<(i128, i128)> {
+    let mut lo = i128::MIN / 2;
+    let mut hi = i128::MAX / 2;
+    fn visit(e: &Expr, lo: &mut i128, hi: &mut i128) -> bool {
+        match &e.kind {
+            ExprKind::Binary { op: BinOp::And, left, right } => {
+                visit(left, lo, hi) && visit(right, lo, hi)
+            }
+            ExprKind::Binary { op, left, right } => {
+                let const_val = |x: &Expr| -> Option<i128> {
+                    match &x.kind {
+                        ExprKind::Int(n) => Some(*n as i128),
+                        ExprKind::Unary { op: UnOp::Neg, expr } => match &expr.kind {
+                            ExprKind::Int(n) => Some(-(*n as i128)),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                };
+                let is_self = |x: &Expr| matches!(&x.kind, ExprKind::Ident(s) if s == "self");
+                if is_self(left) {
+                    if let Some(c) = const_val(right) {
+                        match op {
+                            BinOp::Ge => *lo = (*lo).max(c),
+                            BinOp::Gt => *lo = (*lo).max(c + 1),
+                            BinOp::Le => *hi = (*hi).min(c),
+                            BinOp::Lt => *hi = (*hi).min(c - 1),
+                            BinOp::Eq => {
+                                *lo = (*lo).max(c);
+                                *hi = (*hi).min(c);
+                            }
+                            _ => return false,
+                        }
+                        return true;
+                    }
+                } else if is_self(right) {
+                    if let Some(c) = const_val(left) {
+                        match op {
+                            BinOp::Le => *lo = (*lo).max(c),
+                            BinOp::Lt => *lo = (*lo).max(c + 1),
+                            BinOp::Ge => *hi = (*hi).min(c),
+                            BinOp::Gt => *hi = (*hi).min(c - 1),
+                            BinOp::Eq => {
+                                *lo = (*lo).max(c);
+                                *hi = (*hi).min(c);
+                            }
+                            _ => return false,
+                        }
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+    if visit(pred, &mut lo, &mut hi) && lo <= hi {
+        Some((lo, hi))
+    } else {
+        None
     }
 }
 
@@ -2269,6 +2398,9 @@ fn format_expr_src(expr: &Expr) -> String {
         }
         ExprKind::Cast { expr: inner, ty } => {
             format!("({} as {})", format_expr_src(inner), ty.display_name())
+        }
+        ExprKind::TryCast { expr: inner, ty } => {
+            format!("({} as? {})", format_expr_src(inner), ty.display_name())
         }
         ExprKind::RecordLit { name, fields, .. } => {
             let fs: Vec<String> = fields

@@ -89,7 +89,7 @@
         },
         {
           "name": "keyword.declaration.tenon",
-          "match": "\\b(fn|pure|comptime|macro|attr|record|enum|interface|impl|type|const|union|bitfield|import|as|extern|evolution|protocol|stream|view|subscriber|test|let|var)\\b"
+          "match": "\\b(fn|pure|comptime|macro|attr|record|enum|interface|impl|type|const|union|bitfield|import|as|extern|evolution|protocol|stream|view|subscriber|test|let|var|lemma|ghost)\\b"
         },
         {
           "name": "storage.modifier.tenon",
@@ -97,7 +97,7 @@
         },
         {
           "name": "keyword.other.contract.tenon",
-          "match": "\\b(where|requires|ensures|invariant|result)\\b"
+          "match": "\\b(where|requires|ensures|invariant|decreases|result|old)\\b"
         },
         {
           "name": "constant.language.tenon",

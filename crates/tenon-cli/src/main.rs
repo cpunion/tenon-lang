@@ -1363,6 +1363,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    opts.proved_safe_indices = report.proved_safe_indices.clone();
     match tenon_codegen::llvm_aot::compile_with_options(&prog, Path::new(&out_bin), &opts) {
         Ok(art) => {
             let kind_str = match opts.output_kind {
@@ -1371,7 +1372,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 tenon_codegen::llvm_aot::OutputKind::SharedLib => "shared library",
             };
             println!(
-                "LLVM AOT Built `{}` -> `{}` ({} bytes {}, {} bytes LLVM IR, opt={}, debug={}, {} proofs verified)",
+                "LLVM AOT Built `{}` -> `{}` ({} bytes {}, {} bytes LLVM IR, opt={}, debug={}, {} proofs verified, {} bounds checks eliminated)",
                 file,
                 art.output_path,
                 art.binary_bytes,
@@ -1379,7 +1380,8 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 art.llvm_ir_bytes,
                 art.opt_level,
                 opts.debug_info,
-                report.proofs.len()
+                report.proofs.len(),
+                report.proved_safe_indices.len()
             );
             ExitCode::SUCCESS
         }

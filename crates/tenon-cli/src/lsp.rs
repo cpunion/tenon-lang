@@ -500,6 +500,37 @@ impl LspServer {
             }
         }
 
+        // Subtype-dependent `refine_cast[T](x)` hover with statically resolved return type
+        if tok.qual_prefix.is_none() && tok.word == "refine_cast" {
+            if let Some(rep) = report {
+                let line_start: usize = doc
+                    .text
+                    .split_inclusive('\n')
+                    .take(line as usize)
+                    .map(|s| s.len())
+                    .sum();
+                let line_end = line_start
+                    + doc.text[line_start..]
+                        .split('\n')
+                        .next()
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                let cursor_off = line_start + ch as usize;
+                if let Some((_, resolved_ty)) = rep
+                    .refine_cast_types
+                    .iter()
+                    .filter(|(off, _)| **off >= line_start && **off <= line_end)
+                    .min_by_key(|(off, _)| (**off as isize - cursor_off as isize).abs())
+                {
+                    let md = format!(
+                        "```tenon\nrefine_cast -> {}\n```\n\nSubtype-dependent refinement cast statically resolved by `tenon-verify` (L0 + Z3 SMT).",
+                        resolved_ty
+                    );
+                    return json!({ "contents": { "kind": "markdown", "value": md } });
+                }
+            }
+        }
+
         // Builtin / primitive hover fallback
         if tok.qual_prefix.is_none() {
             if let Some(md) = builtin_hover(&tok.word) {
@@ -1479,11 +1510,25 @@ fn format_fn_sig(f: &FnDecl) -> String {
     if f.is_async {
         s.push_str("async ");
     }
-    if f.is_pure {
-        s.push_str("pure ");
+    if f.is_ghost {
+        if !f.is_pure && f.ret_ty.is_none() {
+            s.push_str("lemma ");
+            s.push_str(&f.name);
+        } else {
+            s.push_str("ghost ");
+            if f.is_pure {
+                s.push_str("pure ");
+            }
+            s.push_str("fn ");
+            s.push_str(&f.name);
+        }
+    } else {
+        if f.is_pure {
+            s.push_str("pure ");
+        }
+        s.push_str("fn ");
+        s.push_str(&f.name);
     }
-    s.push_str("fn ");
-    s.push_str(&f.name);
     if !f.type_params.is_empty() {
         s.push('[');
         s.push_str(&f.type_params.join(", "));
@@ -1882,6 +1927,12 @@ fn builtin_hover(word: &str) -> Option<String> {
         "size_of" => "`size_of[T]() USize`: Compile-time byte size of type `T`.",
         "align_of" => "`align_of[T]() USize`: Compile-time byte alignment of type `T`.",
         "offset_of" => "`offset_of(T, \"field\") USize`: Compile-time byte offset of field in `@repr(C)`/`@packed` record.",
+        "refine_cast" => "`refine_cast[T](x)`: Subtype-dependent refinement cast — returns `T` (zero-cost) when `S <: T` is proved, `Result[T, Text]` when `S ∩ T ≠ ∅`, or compile error `E0416` when disjoint.",
+        "is_subtype" => "`is_subtype[S, T]() Bool`: Compile-time predicate (in `comptime if`) testing whether refinement type `S` statically implies `T`.",
+        "ghost" => "`ghost { ... }` / `ghost fn`: Statically verified proof code erased completely before codegen (zero runtime overhead).",
+        "lemma" => "`lemma name(...) requires ... ensures ... { ... }`: Zero-overhead proof lemma whose `ensures` facts are injected into callers.",
+        "old" => "`old(expr)`: Refers to the pre-state value of an `inout` parameter or field inside `ensures` postconditions.",
+        "decreases" => "`decreases expr`: Loop termination variant proved `>= 0` and strictly decreasing on every `while` iteration (`E0433`).",
         _ => return None,
     };
     Some(desc.to_string())
@@ -2055,5 +2106,66 @@ pub fn bad_call() Int {
         let comps = comp_resp["result"].as_array().unwrap();
         assert!(comps.iter().any(|c| c["label"] == json!("double_port")));
         assert!(comps.iter().any(|c| c["label"] == json!("Float32x4")));
+    }
+
+    #[test]
+    fn lsp_hover_resolves_subtype_dependent_refine_cast_return_types() {
+        let src = r#"pub type Range3to5 = Int where self >= 3 && self <= 5
+pub type Range2to6 = Int where self >= 2 && self <= 6
+pub type Range2to4 = Int where self >= 2 && self <= 4
+
+pub pure fn demo(r Range3to5) Int {
+    let a = refine_cast[Range2to6](r)
+    let b = refine_cast[Range2to4](r)
+    let _ = b
+    a
+}
+"#;
+        let uri = "file:///tmp/tenon_lsp_refine_cast.tn";
+        let mut input = Vec::new();
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": uri, "languageId": "tenon", "version": 1, "text": src } }
+        })));
+        // Line 5: `    let a = refine_cast[Range2to6](r)` -> hover on `refine_cast` (col 15)
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "textDocument/hover",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 5, "character": 15 } }
+        })));
+        // Line 6: `    let b = refine_cast[Range2to4](r)` -> hover on `refine_cast` (col 15)
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "textDocument/hover",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 6, "character": 15 } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": null
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "method": "exit", "params": null
+        })));
+
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        let mut server = LspServer::new();
+        assert!(server.run_loop(&mut reader, &mut output));
+
+        let msgs = read_all_messages(&output);
+        let h_widen = msgs.iter().find(|m| m.get("id") == Some(&json!(2))).unwrap();
+        let md_widen = h_widen["result"]["contents"]["value"].as_str().unwrap();
+        assert!(
+            md_widen.contains("refine_cast -> Range2to6"),
+            "expected widening hover `Range2to6`, got: {}",
+            md_widen
+        );
+        let h_narrow = msgs.iter().find(|m| m.get("id") == Some(&json!(3))).unwrap();
+        let md_narrow = h_narrow["result"]["contents"]["value"].as_str().unwrap();
+        assert!(
+            md_narrow.contains("refine_cast -> Result[Range2to4, Text]"),
+            "expected narrowing hover `Result[Range2to4, Text]`, got: {}",
+            md_narrow
+        );
     }
 }

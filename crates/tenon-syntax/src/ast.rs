@@ -226,6 +226,8 @@ pub struct FnDecl {
     pub is_unsafe: bool,
     #[serde(default)]
     pub is_comptime: bool,
+    #[serde(default)]
+    pub is_ghost: bool,
     pub name: String,
     pub type_params: Vec<String>,
     #[serde(default)]
@@ -564,6 +566,10 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    Ghost {
+        body: Block,
+        span: Span,
+    },
     Expr {
         expr: Expr,
         span: Span,
@@ -648,6 +654,10 @@ pub enum ExprKind {
         len: usize,
     },
     Cast {
+        expr: Box<Expr>,
+        ty: TypeExpr,
+    },
+    TryCast {
         expr: Box<Expr>,
         ty: TypeExpr,
     },

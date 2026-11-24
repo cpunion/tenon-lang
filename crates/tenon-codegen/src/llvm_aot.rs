@@ -38,6 +38,8 @@ pub struct BuildOptions {
     pub link_libs: Vec<String>,
     pub link_dirs: Vec<String>,
     pub extra_c_sources: Vec<PathBuf>,
+    /// Span start offsets of `List`/`Bytes` index reads/writes statically proved in-bounds (`0 <= i < len(xs)`) by `tenon-verify`.
+    pub proved_safe_indices: BTreeSet<usize>,
 }
 
 impl Default for BuildOptions {
@@ -51,6 +53,7 @@ impl Default for BuildOptions {
             link_libs: Vec::new(),
             link_dirs: Vec::new(),
             extra_c_sources: Vec::new(),
+            proved_safe_indices: BTreeSet::new(),
         }
     }
 }
@@ -1190,7 +1193,7 @@ pub fn compile_with_options(
         fs::write(hpath, header).map_err(|e| e.to_string())?;
     }
 
-    let ir = emit_llvm_ir_with_options(program, opts.debug_info)?;
+    let ir = emit_llvm_ir_with_build_options(program, opts)?;
     let pid = std::process::id();
     let seq = AOT_TMP_SEQ.fetch_add(1, Ordering::SeqCst);
     let tmp_ll = std::env::temp_dir().join(format!("tenon_aot_{}_{}.ll", pid, seq));
@@ -1549,6 +1552,24 @@ oob:
   ret i64 0
 }
 
+define internal i64 @__tn_list_get_unchecked(i64 %p, i64 %idx) alwaysinline {
+entry:
+  %obj = inttoptr i64 %p to ptr
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
+  %v = load i64, ptr %fp, align 8, !tbaa !10
+  ret i64 %v
+}
+
+define internal void @__tn_list_set_prim_unchecked(i64 %p, i64 %idx, i64 %val) alwaysinline {
+entry:
+  %obj = inttoptr i64 %p to ptr
+  %base = getelementptr inbounds i8, ptr %obj, i64 40
+  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
+  store i64 %val, ptr %fp, align 8, !tbaa !10
+  ret void
+}
+
 define internal void @__tn_list_set_prim(i64 %p, i64 %idx, i64 %val) alwaysinline {
 entry:
   %nz = icmp ne i64 %p, 0
@@ -1832,10 +1853,21 @@ fn emit_export_wrapper(
 }
 
 pub fn emit_llvm_ir(program: &Program) -> Result<String, String> {
-    emit_llvm_ir_with_options(program, false)
+    emit_llvm_ir_with_build_options(program, &BuildOptions::default())
 }
 
 pub fn emit_llvm_ir_with_options(program: &Program, debug_info: bool) -> Result<String, String> {
+    let mut opts = BuildOptions::default();
+    opts.debug_info = debug_info;
+    emit_llvm_ir_with_build_options(program, &opts)
+}
+
+pub fn emit_llvm_ir_with_build_options(
+    program: &Program,
+    opts: &BuildOptions,
+) -> Result<String, String> {
+    let debug_info = opts.debug_info;
+    let proved_safe_indices = &opts.proved_safe_indices;
     let prepared = prepare_program_for_codegen(program);
     let program = &prepared.program;
     let layout_engine = LayoutEngine::from_program(program);
@@ -2123,6 +2155,7 @@ pub fn emit_llvm_ir_with_options(program: &Program, debug_info: bool) -> Result<
             &extern_fns,
             dyn_interfaces,
             &vtable_ifaces,
+            proved_safe_indices,
             &mut string_globals,
             &mut string_intern,
             &mut unit_enum_tags,
@@ -2156,6 +2189,7 @@ pub fn emit_llvm_ir_with_options(program: &Program, debug_info: bool) -> Result<
             &extern_fns,
             dyn_interfaces,
             &vtable_ifaces,
+            proved_safe_indices,
             &mut string_globals,
             &mut string_intern,
             &mut unit_enum_tags,
@@ -2182,6 +2216,7 @@ pub fn emit_llvm_ir_with_options(program: &Program, debug_info: bool) -> Result<
             &extern_fns,
             dyn_interfaces,
             &vtable_ifaces,
+            proved_safe_indices,
             &mut string_globals,
             &mut string_intern,
             &mut unit_enum_tags,
@@ -2431,6 +2466,7 @@ struct LlvmFnGen<'a> {
     extern_fns: &'a BTreeMap<String, ExternFnDecl>,
     dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
     vtable_ifaces: &'a BTreeMap<String, String>,
+    proved_safe_indices: &'a BTreeSet<usize>,
     string_globals: &'a mut Vec<(String, String)>,
     string_intern: &'a mut BTreeMap<String, String>,
     unit_enum_tags: &'a mut BTreeSet<i64>,
@@ -2473,6 +2509,7 @@ impl<'a> LlvmFnGen<'a> {
         extern_fns: &'a BTreeMap<String, ExternFnDecl>,
         dyn_interfaces: &'a BTreeMap<String, DynInterfaceLayout>,
         vtable_ifaces: &'a BTreeMap<String, String>,
+        proved_safe_indices: &'a BTreeSet<usize>,
         string_globals: &'a mut Vec<(String, String)>,
         string_intern: &'a mut BTreeMap<String, String>,
         unit_enum_tags: &'a mut BTreeSet<i64>,
@@ -2494,6 +2531,7 @@ impl<'a> LlvmFnGen<'a> {
             extern_fns,
             dyn_interfaces,
             vtable_ifaces,
+            proved_safe_indices,
             string_globals,
             string_intern,
             unit_enum_tags,
@@ -2694,6 +2732,7 @@ impl<'a> LlvmFnGen<'a> {
         match &expr.kind {
             ExprKind::Float(_) => Some(ScalarKind::F64),
             ExprKind::Cast { ty, .. } => scalar_kind_of_ty(ty, self.alias_bases),
+            ExprKind::TryCast { .. } => None,
             ExprKind::Unary { op: UnOp::Neg | UnOp::BitNot, expr: inner } => {
                 self.scalar_kind_of_expr(inner)
             }
@@ -3705,6 +3744,7 @@ impl<'a> LlvmFnGen<'a> {
                 named_ty("Any")
             }
             ExprKind::Cast { ty, .. } => ty.clone(),
+            ExprKind::TryCast { ty, .. } => generic_ty("Result", vec![ty.clone(), named_ty("Text")]),
             ExprKind::ArrayRepeat { value, len } => TypeExpr::Array {
                 elem: Box::new(self.infer_expr_type_with(value, extra_vars)),
                 len: *len,
@@ -5101,7 +5141,11 @@ impl<'a> LlvmFnGen<'a> {
                                             uniq_list, RC_MASK_ALL as i64
                                         ));
                                     }
-                                    let getter = if is_always_uniq {
+                                    let is_proved_safe =
+                                        self.proved_safe_indices.contains(&target.span.start);
+                                    let getter = if is_proved_safe {
+                                        "@__tn_list_get_unchecked"
+                                    } else if is_always_uniq {
                                         "@__tn_list_get_nonnull"
                                     } else {
                                         "@__tn_list_get"
@@ -5122,14 +5166,26 @@ impl<'a> LlvmFnGen<'a> {
                                         self.emit_compound_op(&ce, &rhs, *op, is_flt, sk)
                                     };
                                     let setter = if *op != AssignOp::Set {
-                                        if is_always_uniq { "@__tn_list_set_prim_nonnull" } else { "@__tn_list_set_prim" }
+                                        if is_proved_safe {
+                                            "@__tn_list_set_prim_unchecked"
+                                        } else if is_always_uniq {
+                                            "@__tn_list_set_prim_nonnull"
+                                        } else {
+                                            "@__tn_list_set_prim"
+                                        }
                                     } else if elem_is_rc {
                                         "@__tn_list_set_rc"
                                     } else if elem_ty
                                         .as_ref()
                                         .is_some_and(|et| et.display_name() != "Any")
                                     {
-                                        if is_always_uniq { "@__tn_list_set_prim_nonnull" } else { "@__tn_list_set_prim" }
+                                        if is_proved_safe {
+                                            "@__tn_list_set_prim_unchecked"
+                                        } else if is_always_uniq {
+                                            "@__tn_list_set_prim_nonnull"
+                                        } else {
+                                            "@__tn_list_set_prim"
+                                        }
                                     } else {
                                         "@tenon_rc_set_field"
                                     };
@@ -5346,7 +5402,7 @@ impl<'a> LlvmFnGen<'a> {
                         self.flush_temps(&temps);
                     }
                 }
-                Stmt::LetTuple { .. } | Stmt::For { .. } | Stmt::Defer { .. } => {}
+                Stmt::LetTuple { .. } | Stmt::For { .. } | Stmt::Defer { .. } | Stmt::Ghost { .. } => {}
             }
         }
 
@@ -5665,11 +5721,18 @@ impl<'a> LlvmFnGen<'a> {
                     }
                     return Ok(val);
                 }
+                let is_proved_safe = self.proved_safe_indices.contains(&expr.span.start);
                 let is_nonnull = matches!(&target.kind, ExprKind::Ident(n) if self.always_unique_vars.contains(n));
                 let t = self.lower_expr_borrowed(target, temps)?;
                 let i = self.lower_expr_borrowed(index, temps)?;
                 let res = self.fresh_tmp();
-                let getter = if is_nonnull { "@__tn_list_get_nonnull" } else { "@__tn_list_get" };
+                let getter = if is_proved_safe {
+                    "@__tn_list_get_unchecked"
+                } else if is_nonnull {
+                    "@__tn_list_get_nonnull"
+                } else {
+                    "@__tn_list_get"
+                };
                 self.code.push_str(&format!(
                     "  {} = call i64 {}(i64 {}, i64 {})\n",
                     res, getter, t, i
@@ -6227,7 +6290,7 @@ impl<'a> LlvmFnGen<'a> {
                 self.flush_temps(&temps);
                 Ok(res)
             }
-            ExprKind::Cast { expr: inner, ty } => {
+            ExprKind::Cast { expr: inner, ty } | ExprKind::TryCast { expr: inner, ty } => {
                 if let ExprKind::Float(x) = &inner.kind {
                     if is_f32_type_expr(ty, self.alias_bases) {
                         return Ok(((*x as f32).to_bits() as i64).to_string());
@@ -7602,7 +7665,7 @@ fn stmt_keeps_unique(stmt: &Stmt, name: &str) -> bool {
         }
         Stmt::Expr { expr, .. } => expr_keeps_unique(expr, name),
         Stmt::Break { .. } | Stmt::Continue { .. } => true,
-        Stmt::Defer { body, .. } => block_keeps_unique(body, name),
+        Stmt::Defer { body, .. } | Stmt::Ghost { body, .. } => block_keeps_unique(body, name),
         Stmt::LetTuple { .. } | Stmt::For { .. } => false,
     }
 }
@@ -7673,6 +7736,7 @@ fn expr_keeps_unique(expr: &Expr, name: &str) -> bool {
         }
         ExprKind::Block(blk) | ExprKind::Unsafe(blk) => block_keeps_unique(blk, name),
         ExprKind::Cast { expr: e, .. }
+        | ExprKind::TryCast { expr: e, .. }
         | ExprKind::ArrayRepeat { value: e, .. }
         | ExprKind::Await(e) => expr_keeps_unique(e, name),
         _ => false,
@@ -8401,6 +8465,62 @@ pub fn main() Int {
             "web_app AOT failed: stdout={} stderr={}",
             out2,
             String::from_utf8_lossy(&run2.stderr)
+        );
+    }
+
+    #[test]
+    fn llvm_aot_advanced_verification_unchecked_indexing_ghost_erasure_and_zero_leaks() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let adv_path = repo_root.join("examples/refinements/advanced_verification.tn");
+        let prog = tenon_syntax::load_program_with_imports(&adv_path)
+            .expect("advanced_verification.tn must load");
+        let rep = tenon_verify::check_program(&prog);
+        assert!(
+            rep.ok,
+            "advanced_verification.tn must pass verification: {:?}",
+            rep.diagnostics
+        );
+        assert!(
+            rep.proved_safe_indices.len() >= 2,
+            "expected >= 2 proved in-bounds indices, got {:?}",
+            rep.proved_safe_indices
+        );
+
+        let pid = std::process::id();
+        let bin = std::env::temp_dir().join(format!("tenon_llvm_adv_ver_{}", pid));
+        let ir_path = std::env::temp_dir().join(format!("tenon_llvm_adv_ver_{}.ll", pid));
+        let opts = BuildOptions {
+            opt_level: "O3".into(),
+            emit_ll_path: Some(ir_path.clone()),
+            proved_safe_indices: rep.proved_safe_indices.clone(),
+            ..Default::default()
+        };
+        compile_with_options(&prog, &bin, &opts).expect("advanced_verification LLVM AOT build");
+        let ir = fs::read_to_string(&ir_path).unwrap();
+        let _ = fs::remove_file(&ir_path);
+        assert!(
+            ir.contains("call i64 @__tn_list_get_unchecked("),
+            "expected @__tn_list_get_unchecked call in LLVM IR"
+        );
+        assert!(
+            ir.contains("call void @__tn_list_set_prim_unchecked("),
+            "expected @__tn_list_set_prim_unchecked call in LLVM IR"
+        );
+        assert!(
+            !ir.contains("nonneg_product"),
+            "ghost lemma `nonneg_product` must be completely erased from LLVM IR"
+        );
+
+        let run = Command::new(&bin).output().unwrap();
+        let _ = fs::remove_file(&bin);
+        let out = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success()
+                && out.contains("main() => 102")
+                && out.contains("live_objects=0"),
+            "advanced_verification AOT failed: stdout={} stderr={}",
+            out,
+            String::from_utf8_lossy(&run.stderr)
         );
     }
 }

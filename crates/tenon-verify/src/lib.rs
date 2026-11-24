@@ -6,7 +6,10 @@ pub mod modelcheck;
 pub mod smt;
 pub mod sync_solver;
 
-pub use checker::{CheckReport, Diagnostic, ProofRecord, ProofTier, check_program};
+pub use checker::{
+    CastVerdict, CheckReport, Diagnostic, ProofRecord, ProofTier, check_program,
+    check_type_subsumption,
+};
 pub use db::{IncrementalDb, QueryStats};
 pub use evolve::{CompatVerdict, EvolutionReport, check_evolution};
 pub use modelcheck::{
@@ -1157,6 +1160,219 @@ pub fn spawn_raw_ptr() Int {
             rep_send.diagnostics.iter().any(|d| d.code == "E0810"),
             "expected E0810 on capturing raw MutPtr across thread_start, got {:?}",
             rep_send.diagnostics
+        );
+    }
+
+    #[test]
+    fn verifies_while_invariants_decreases_and_exit_propagation() {
+        // Positive: Base Case + Inductive Step + decreases + exit propagation + list bounds elimination
+        let good = parse(r#"
+pub fn sum_verified(n Int where self >= 1 && self <= 32) Int {
+    var xs List[Int] = list_filled(n, 1)
+    var i = 0
+    var acc = 0
+    while i < n
+        invariant 0 <= i && i <= n
+        decreases n - i
+    {
+        xs[i] = i
+        acc += xs[i]
+        i += 1
+    }
+    ghost {
+        assert i == n
+    }
+    acc
+}
+"#)
+        .unwrap();
+        let rep = check_program(&good);
+        assert!(rep.ok, "valid while verification failed: {:?}", rep.diagnostics);
+        assert!(
+            rep.proved_safe_indices.len() >= 2,
+            "expected >= 2 proved safe indices (write + read), got {:?}",
+            rep.proved_safe_indices
+        );
+
+        // Negative 1: Bad Base Case (`i = -1` violates `0 <= i`) -> E0431
+        let bad_base = parse(r#"
+pub fn bad_base(n Int where self >= 1) Int {
+    var i = -1
+    while i < n
+        invariant 0 <= i && i <= n
+    {
+        i += 1
+    }
+    i
+}
+"#)
+        .unwrap();
+        let r_base = check_program(&bad_base);
+        assert!(!r_base.ok);
+        assert!(
+            r_base.diagnostics.iter().any(|d| d.code == "E0431"),
+            "expected E0431 for bad while invariant base case, got {:?}",
+            r_base.diagnostics
+        );
+
+        // Negative 2: Bad Inductive Step (`i += 2` violates `i <= n`) -> E0432
+        let bad_step = parse(r#"
+pub fn bad_step(n Int where self >= 1) Int {
+    var i = 0
+    while i < n
+        invariant 0 <= i && i <= n
+    {
+        i += 2
+    }
+    i
+}
+"#)
+        .unwrap();
+        let r_step = check_program(&bad_step);
+        assert!(!r_step.ok);
+        assert!(
+            r_step.diagnostics.iter().any(|d| d.code == "E0432"),
+            "expected E0432 for bad while invariant inductive step, got {:?}",
+            r_step.diagnostics
+        );
+
+        // Negative 3: Non-decreasing `decreases` (`i += 0`) -> E0433
+        let bad_dec = parse(r#"
+pub fn bad_dec(n Int where self >= 1) Int {
+    var i = 0
+    while i < n
+        invariant 0 <= i && i <= n
+        decreases n - i
+    {
+        i += 0
+    }
+    i
+}
+"#)
+        .unwrap();
+        let r_dec = check_program(&bad_dec);
+        assert!(!r_dec.ok);
+        assert!(
+            r_dec.diagnostics.iter().any(|d| d.code == "E0433"),
+            "expected E0433 for non-decreasing while decreases clause, got {:?}",
+            r_dec.diagnostics
+        );
+    }
+
+    #[test]
+    fn verifies_inout_old_ghost_lemma_float_real_bitvec_and_recursive_fuel() {
+        let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        let adv_path = ws_root.join("examples/refinements/advanced_verification.tn");
+        let prog = tenon_syntax::load_program_with_imports(&adv_path).unwrap();
+        let db = IncrementalDb::new();
+        db.set_file("advanced_verification.tn", std::fs::read_to_string(&adv_path).unwrap());
+        let rep = db.check_file("advanced_verification.tn").unwrap();
+        assert!(rep.ok, "advanced_verification.tn failed: {:?}", rep.diagnostics);
+        assert!(rep.proved_safe_indices.len() >= 2);
+        assert!(db.vc_cache_entries() > 0, "expected persistent VC cache entries > 0");
+        let _ = prog;
+
+        // Negative controls:
+        // 1. Wrong `old(x)` postcondition -> V1004
+        // 2. Runtime mutation inside `ghost { ... }` -> E0702
+        // 3. Unsound `ghost { assert ... }` -> E0434
+        // 4. Symbolic Float refinement violation (`a + b` can be 2.0 > 1.0) -> E0410 with Z3 counterexample
+        let bad = parse(r#"
+pub type UnitFloat = Float where self >= 0.0 && self <= 1.0
+
+pub fn bad_bump(inout x Int)
+    ensures x == old(x) + 2
+{
+    x += 1
+}
+
+pub fn bad_ghost() Int {
+    var x = 1
+    ghost {
+        x += 1
+        assert 1 == 2
+    }
+    x
+}
+
+pub pure fn bad_float_sum(a UnitFloat, b UnitFloat) UnitFloat {
+    a + b
+}
+"#)
+        .unwrap();
+        let r_bad = check_program(&bad);
+        assert!(!r_bad.ok);
+        let codes: Vec<&str> = r_bad.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"V1004"), "expected V1004 for bad old(x) ensures, got {:?}", codes);
+        assert!(codes.contains(&"E0702"), "expected E0702 for ghost runtime mutation, got {:?}", codes);
+        assert!(codes.contains(&"E0434"), "expected E0434 for unsound ghost assert, got {:?}", codes);
+        assert!(codes.contains(&"E0410"), "expected E0410 for UnitFloat sum > 1.0, got {:?}", codes);
+    }
+
+    #[test]
+    fn verifies_refinement_casts_as_try_cast_refine_cast_and_is_subtype() {
+        let good = parse(r#"
+pub type Range3to5 = Int where self >= 3 && self <= 5
+pub type Range2to6 = Int where self >= 2 && self <= 6
+pub type Range2to4 = Int where self >= 2 && self <= 4
+
+pub pure fn ok_casts(x Range3to5) Int {
+    let w1 Range2to6 = x as Range2to6
+    let w2 = refine_cast[Range2to6](x)
+    let _ Range2to6 = w2
+    let n1 Result[Range2to4, Text] = refine_cast[Range2to4](x)
+    let n2 Result[Range2to4, Text] = x as? Range2to4
+    let sub = comptime if is_subtype[Range3to5, Range2to6]() { 1 } else { 0 }
+    let v1 = match n1 { Ok(v) => v  Err(_) => 0 }
+    let v2 = match n2 { Ok(v) => v  Err(_) => 0 }
+    w1 + w2 + v1 + v2 + sub
+}
+"#)
+        .unwrap();
+        let rep = check_program(&good);
+        assert!(rep.ok, "valid refinement casts failed: {:?}", rep.diagnostics);
+        let rc_vals: Vec<&str> = rep.refine_cast_types.values().map(|s| s.as_str()).collect();
+        assert!(rc_vals.contains(&"Range2to6"), "expected Range2to6 in refine_cast_types: {:?}", rc_vals);
+        assert!(
+            rc_vals.contains(&"Result[Range2to4, Text]"),
+            "expected Result[Range2to4, Text] in refine_cast_types: {:?}",
+            rc_vals
+        );
+
+        // Negative controls:
+        // 1. Narrowing `Range3to5 as Range2to4` without `as?` or `refine_cast` -> E0410
+        // 2. Disjoint `Range3to5 -> Range10to20` rejected with E0416 on `as`, `as?`, and `refine_cast`!
+        let bad = parse(r#"
+pub type Range3to5   = Int where self >= 3 && self <= 5
+pub type Range2to4   = Int where self >= 2 && self <= 4
+pub type Range10to20 = Int where self >= 10 && self <= 20
+
+pub pure fn bad_casts(x Range3to5) Int {
+    let a Range2to4 = x as Range2to4
+    let b Range10to20 = x as Range10to20
+    let c = x as? Range10to20
+    let d = refine_cast[Range10to20](x)
+    let _ = c
+    let _ = d
+    a + b
+}
+"#)
+        .unwrap();
+        let r_bad = check_program(&bad);
+        assert!(!r_bad.ok);
+        assert!(
+            r_bad.diagnostics.iter().any(|d| d.code == "E0410"),
+            "expected E0410 for narrowing Range3to5 as Range2to4, got {:?}",
+            r_bad.diagnostics
+        );
+        let e0416_count = r_bad.diagnostics.iter().filter(|d| d.code == "E0416").count();
+        assert!(
+            e0416_count >= 3,
+            "expected >= 3 E0416 diagnostics for disjoint Range3to5 -> Range10to20 casts, got {:?}",
+            r_bad.diagnostics
         );
     }
 }
