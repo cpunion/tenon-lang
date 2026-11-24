@@ -681,6 +681,10 @@ pub fn bad_index_assign() Int {
             "04_hashmap.tn",
             "05_json.tn",
             "06_dyn_dispatch.tn",
+            "07_simd_dot.tn",
+            "08_packet_codec.tn",
+            "09_mpmc_threads.tn",
+            "http_rps_bench.tn",
         ];
         for f in files {
             let path = bench_dir.join(f);
@@ -1097,6 +1101,62 @@ pub fn bad_systems() Int {
             vis_codes.contains(&"E0105"),
             "expected E0105 on cross-module private call, got {:?}",
             vis_rep.diagnostics
+        );
+    }
+
+    #[test]
+    fn enforces_package_visibility_test_isolation_and_thread_send() {
+        // 1. Two files in the SAME package (file_packages[1] == file_packages[2] == 1):
+        //    private helper call is ALLOWED!
+        let mut same_pkg = parse("fn pkg_secret() Int { 9 }").unwrap();
+        for it in &mut same_pkg.items {
+            if let tenon_syntax::Item::Fn(f) = it {
+                f.span.file_id = 1;
+            }
+        }
+        let mut sibling = parse("pub fn main() Int { pkg_secret() }").unwrap();
+        for it in &mut sibling.items {
+            if let tenon_syntax::Item::Fn(f) = it {
+                f.span.file_id = 2;
+            }
+        }
+        same_pkg.items.extend(sibling.items);
+        same_pkg.file_packages = vec![0, 1, 1];
+        let rep_same = check_program(&same_pkg);
+        assert!(
+            rep_same.ok,
+            "same-package private call must succeed, got {:?}",
+            rep_same.diagnostics
+        );
+
+        // 2. Production file (file_id 2) calling helper defined in `*_test.tn` (file_id 1):
+        //    MUST be rejected with E0107!
+        same_pkg.test_file_ids = vec![1];
+        let rep_iso = check_program(&same_pkg);
+        assert!(!rep_iso.ok);
+        assert!(
+            rep_iso.diagnostics.iter().any(|d| d.code == "E0107"),
+            "expected E0107 for production calling test-only helper, got {:?}",
+            rep_iso.diagnostics
+        );
+
+        // 3. MVS Send check (E0810): capturing raw `MutPtr` in `thread_spawn` outside `unsafe` MUST fail!
+        let bad_send = parse(r#"
+pub fn spawn_raw_ptr() Int {
+    let p = null_ptr[Int32]()
+    let t = thread_spawn(|| {
+        if ptr_is_null(p) { 1 } else { 0 }
+    })
+    thread_join(t)
+}
+"#)
+        .unwrap();
+        let rep_send = check_program(&bad_send);
+        assert!(!rep_send.ok);
+        assert!(
+            rep_send.diagnostics.iter().any(|d| d.code == "E0810"),
+            "expected E0810 on capturing raw MutPtr across thread_start, got {:?}",
+            rep_send.diagnostics
         );
     }
 }

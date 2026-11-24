@@ -1,0 +1,7 @@
+pub pure fn tag_label(prefix Text, body Text) Text {
+    prefix ++ ":" ++ body
+}
+
+pub pure fn shout(s Text) Text {
+    s ++ "!"
+}

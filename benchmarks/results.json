@@ -7,7 +7,7 @@
     "go": "go version go1.27.3 darwin/arm64",
     "tenon": "Tenon LLVM 22 -O3 ThinLTO AOT (tenon)",
     "warmup": 1,
-    "reps": 7,
+    "reps": 5,
     "metric": "process CPU time (os.wait4 ru_utime + ru_stime, ms), interleaved rounds"
   },
   "benchmarks": [
@@ -17,63 +17,55 @@
       "checksum": "102334155",
       "results": {
         "c": {
-          "cpu_median_ms": 184.37,
-          "cpu_min_ms": 182.05,
-          "wall_median_ms": 188.46,
+          "cpu_median_ms": 184.0,
+          "cpu_min_ms": 182.86,
+          "wall_median_ms": 185.62,
           "size_kb": 32.7,
           "cpu_samples_ms": [
-            186.53,
-            184.53,
-            182.05,
-            185.34,
-            184.37,
-            182.18,
-            184.0
+            185.09,
+            182.86,
+            188.0,
+            184.0,
+            183.14
           ]
         },
         "rust": {
-          "cpu_median_ms": 182.02,
-          "cpu_min_ms": 180.02,
-          "wall_median_ms": 184.0,
+          "cpu_median_ms": 181.34,
+          "cpu_min_ms": 179.36,
+          "wall_median_ms": 183.8,
           "size_kb": 461.1,
           "cpu_samples_ms": [
-            182.48,
-            182.68,
+            184.69,
+            179.36,
+            181.34,
             181.5,
-            182.02,
-            182.08,
-            180.04,
-            180.02
+            180.5
           ]
         },
         "go": {
-          "cpu_median_ms": 239.66,
-          "cpu_min_ms": 236.26,
-          "wall_median_ms": 241.45,
+          "cpu_median_ms": 239.91,
+          "cpu_min_ms": 239.24,
+          "wall_median_ms": 241.43,
           "size_kb": 2372.8,
           "cpu_samples_ms": [
-            238.02,
-            238.28,
-            244.47,
-            244.63,
-            236.26,
-            240.19,
-            239.66
+            239.91,
+            240.01,
+            242.49,
+            239.38,
+            239.24
           ]
         },
         "tenon": {
-          "cpu_median_ms": 176.78,
-          "cpu_min_ms": 174.32,
-          "wall_median_ms": 178.61,
+          "cpu_median_ms": 178.22,
+          "cpu_min_ms": 175.09,
+          "wall_median_ms": 179.8,
           "size_kb": 33.1,
           "cpu_samples_ms": [
-            178.31,
-            175.54,
-            174.32,
-            178.01,
-            181.04,
-            176.78,
-            176.34
+            175.33,
+            179.01,
+            178.22,
+            175.09,
+            179.36
           ]
         }
       }
@@ -84,63 +76,55 @@
       "checksum": "4378771939937074704",
       "results": {
         "c": {
-          "cpu_median_ms": 66.1,
-          "cpu_min_ms": 64.92,
-          "wall_median_ms": 67.66,
+          "cpu_median_ms": 66.2,
+          "cpu_min_ms": 65.54,
+          "wall_median_ms": 68.28,
           "size_kb": 32.7,
           "cpu_samples_ms": [
-            66.4,
-            65.26,
-            66.51,
-            65.53,
-            66.1,
-            64.92,
-            66.88
+            67.55,
+            65.63,
+            66.2,
+            65.54,
+            66.92
           ]
         },
         "rust": {
-          "cpu_median_ms": 66.77,
-          "cpu_min_ms": 66.05,
-          "wall_median_ms": 68.57,
+          "cpu_median_ms": 66.6,
+          "cpu_min_ms": 65.03,
+          "wall_median_ms": 68.23,
           "size_kb": 460.7,
           "cpu_samples_ms": [
-            67.52,
-            66.68,
-            66.95,
-            68.38,
-            66.77,
-            66.05,
-            66.48
+            65.48,
+            66.6,
+            67.76,
+            65.03,
+            67.64
           ]
         },
         "go": {
-          "cpu_median_ms": 93.69,
-          "cpu_min_ms": 93.11,
-          "wall_median_ms": 96.17,
+          "cpu_median_ms": 92.77,
+          "cpu_min_ms": 92.36,
+          "wall_median_ms": 94.34,
           "size_kb": 2372.8,
           "cpu_samples_ms": [
-            93.91,
-            98.63,
-            93.69,
-            93.4,
-            93.62,
-            93.11,
-            94.68
+            92.77,
+            93.77,
+            92.36,
+            92.94,
+            92.57
           ]
         },
         "tenon": {
-          "cpu_median_ms": 66.49,
-          "cpu_min_ms": 65.8,
-          "wall_median_ms": 67.9,
+          "cpu_median_ms": 66.68,
+          "cpu_min_ms": 65.27,
+          "wall_median_ms": 68.3,
           "size_kb": 33.1,
           "cpu_samples_ms": [
-            66.49,
-            66.78,
-            66.51,
-            66.51,
-            66.13,
-            65.8,
-            66.15
+            66.09,
+            66.68,
+            65.27,
+            66.92,
+            67.49
           ]
         }
       }
@@ -151,63 +135,55 @@
       "checksum": "392490",
       "results": {
         "c": {
-          "cpu_median_ms": 8.27,
-          "cpu_min_ms": 8.01,
-          "wall_median_ms": 9.77,
+          "cpu_median_ms": 8.44,
+          "cpu_min_ms": 8.26,
+          "wall_median_ms": 10.28,
           "size_kb": 32.8,
           "cpu_samples_ms": [
+            8.78,
+            8.26,
+            8.44,
             8.27,
-            8.3,
-            8.38,
-            8.08,
-            8.39,
-            8.13,
-            8.01
+            8.52
           ]
         },
         "rust": {
-          "cpu_median_ms": 8.35,
-          "cpu_min_ms": 8.25,
-          "wall_median_ms": 9.96,
+          "cpu_median_ms": 8.54,
+          "cpu_min_ms": 8.37,
+          "wall_median_ms": 10.26,
           "size_kb": 477.3,
           "cpu_samples_ms": [
+            8.54,
+            8.37,
             8.4,
-            8.35,
-            8.25,
-            8.34,
-            8.46,
-            8.32,
-            8.59
+            8.99,
+            8.56
           ]
         },
         "go": {
-          "cpu_median_ms": 13.58,
-          "cpu_min_ms": 13.57,
-          "wall_median_ms": 14.47,
+          "cpu_median_ms": 13.64,
+          "cpu_min_ms": 13.49,
+          "wall_median_ms": 14.87,
           "size_kb": 2372.8,
           "cpu_samples_ms": [
-            13.58,
-            13.57,
-            13.58,
-            13.58,
-            13.57,
-            13.67,
-            14.64
+            13.64,
+            13.54,
+            13.49,
+            13.91,
+            13.86
           ]
         },
         "tenon": {
-          "cpu_median_ms": 8.92,
-          "cpu_min_ms": 8.8,
-          "wall_median_ms": 10.41,
+          "cpu_median_ms": 9.05,
+          "cpu_min_ms": 8.71,
+          "wall_median_ms": 10.61,
           "size_kb": 33.4,
           "cpu_samples_ms": [
-            9.02,
-            9.09,
-            8.8,
-            8.92,
-            9.08,
-            8.84,
-            8.88
+            8.91,
+            9.23,
+            8.71,
+            10.49,
+            9.05
           ]
         }
       }
@@ -218,63 +194,55 @@
       "checksum": "708334",
       "results": {
         "c": {
-          "cpu_median_ms": 16.2,
-          "cpu_min_ms": 15.9,
-          "wall_median_ms": 18.37,
+          "cpu_median_ms": 16.09,
+          "cpu_min_ms": 15.48,
+          "wall_median_ms": 17.84,
           "size_kb": 33.1,
           "cpu_samples_ms": [
-            15.96,
-            16.94,
-            16.04,
-            16.83,
-            15.9,
-            16.2,
-            16.43
+            16.09,
+            16.21,
+            15.95,
+            15.48,
+            16.25
           ]
         },
         "rust": {
-          "cpu_median_ms": 16.37,
-          "cpu_min_ms": 14.73,
-          "wall_median_ms": 18.82,
+          "cpu_median_ms": 15.0,
+          "cpu_min_ms": 14.92,
+          "wall_median_ms": 16.76,
           "size_kb": 480.8,
           "cpu_samples_ms": [
-            15.3,
-            16.37,
-            19.98,
-            16.16,
-            14.73,
-            17.24,
-            17.94
+            15.0,
+            16.89,
+            15.67,
+            15.0,
+            14.92
           ]
         },
         "go": {
-          "cpu_median_ms": 16.89,
-          "cpu_min_ms": 15.66,
-          "wall_median_ms": 16.61,
+          "cpu_median_ms": 16.3,
+          "cpu_min_ms": 15.6,
+          "wall_median_ms": 15.0,
           "size_kb": 2373.1,
           "cpu_samples_ms": [
-            16.89,
-            15.66,
-            20.34,
-            17.92,
-            15.98,
-            16.93,
-            16.46
+            16.3,
+            16.39,
+            17.1,
+            15.6,
+            16.25
           ]
         },
         "tenon": {
-          "cpu_median_ms": 16.12,
-          "cpu_min_ms": 15.66,
-          "wall_median_ms": 18.02,
-          "size_kb": 34.3,
+          "cpu_median_ms": 15.75,
+          "cpu_min_ms": 15.54,
+          "wall_median_ms": 17.46,
+          "size_kb": 34.4,
           "cpu_samples_ms": [
-            15.66,
-            16.12,
-            19.71,
-            16.43,
-            16.17,
-            15.78,
-            16.03
+            16.98,
+            15.54,
+            15.75,
+            15.79,
+            15.7
           ]
         }
       }
@@ -285,63 +253,55 @@
       "checksum": "483984",
       "results": {
         "c": {
-          "cpu_median_ms": 6.2,
-          "cpu_min_ms": 6.02,
-          "wall_median_ms": 7.63,
+          "cpu_median_ms": 6.47,
+          "cpu_min_ms": 6.17,
+          "wall_median_ms": 8.14,
           "size_kb": 33.2,
           "cpu_samples_ms": [
-            6.58,
-            6.02,
-            6.63,
-            6.12,
-            6.43,
-            6.2,
-            6.12
+            6.47,
+            6.17,
+            6.49,
+            6.56,
+            6.46
           ]
         },
         "rust": {
-          "cpu_median_ms": 6.25,
-          "cpu_min_ms": 6.03,
-          "wall_median_ms": 7.55,
+          "cpu_median_ms": 6.49,
+          "cpu_min_ms": 6.19,
+          "wall_median_ms": 8.21,
           "size_kb": 479.4,
           "cpu_samples_ms": [
-            6.38,
-            6.03,
-            6.09,
-            6.25,
-            6.1,
-            6.32,
-            6.36
+            6.86,
+            6.19,
+            6.49,
+            6.65,
+            6.27
           ]
         },
         "go": {
-          "cpu_median_ms": 15.03,
-          "cpu_min_ms": 14.79,
-          "wall_median_ms": 15.62,
+          "cpu_median_ms": 15.78,
+          "cpu_min_ms": 14.87,
+          "wall_median_ms": 16.63,
           "size_kb": 3679.3,
           "cpu_samples_ms": [
-            14.79,
-            14.82,
-            15.01,
-            15.3,
-            15.34,
-            15.03,
-            15.48
+            16.43,
+            14.87,
+            15.13,
+            16.05,
+            15.78
           ]
         },
         "tenon": {
-          "cpu_median_ms": 6.11,
-          "cpu_min_ms": 5.92,
-          "wall_median_ms": 7.56,
-          "size_kb": 50.6,
+          "cpu_median_ms": 6.31,
+          "cpu_min_ms": 6.07,
+          "wall_median_ms": 7.91,
+          "size_kb": 51.0,
           "cpu_samples_ms": [
-            5.97,
+            6.35,
+            6.14,
             6.07,
-            6.43,
-            5.92,
-            6.11,
-            6.24,
-            6.38
+            6.67,
+            6.31
           ]
         }
       }
@@ -352,63 +312,232 @@
       "checksum": "840988148304462647",
       "results": {
         "c": {
-          "cpu_median_ms": 5.45,
-          "cpu_min_ms": 5.25,
-          "wall_median_ms": 6.74,
+          "cpu_median_ms": 5.57,
+          "cpu_min_ms": 5.35,
+          "wall_median_ms": 6.9,
           "size_kb": 32.9,
           "cpu_samples_ms": [
+            5.7,
             5.57,
-            5.45,
-            5.54,
-            5.29,
+            5.7,
             5.35,
-            5.25,
             5.5
           ]
         },
         "rust": {
-          "cpu_median_ms": 5.62,
-          "cpu_min_ms": 5.38,
-          "wall_median_ms": 6.99,
+          "cpu_median_ms": 5.86,
+          "cpu_min_ms": 5.61,
+          "wall_median_ms": 7.37,
           "size_kb": 461.9,
           "cpu_samples_ms": [
-            5.62,
-            5.38,
-            5.55,
-            6.03,
-            5.71,
-            5.66,
-            5.57
+            5.88,
+            5.86,
+            5.61,
+            5.92,
+            5.79
           ]
         },
         "go": {
-          "cpu_median_ms": 7.73,
-          "cpu_min_ms": 7.56,
-          "wall_median_ms": 9.11,
+          "cpu_median_ms": 7.85,
+          "cpu_min_ms": 7.72,
+          "wall_median_ms": 9.16,
           "size_kb": 2373.3,
           "cpu_samples_ms": [
-            7.73,
-            7.94,
-            7.56,
-            7.62,
-            7.96,
-            8.0,
-            7.68
+            7.85,
+            7.9,
+            8.01,
+            7.72,
+            7.78
           ]
         },
         "tenon": {
-          "cpu_median_ms": 5.43,
-          "cpu_min_ms": 5.33,
-          "wall_median_ms": 6.78,
+          "cpu_median_ms": 5.51,
+          "cpu_min_ms": 5.46,
+          "wall_median_ms": 6.91,
           "size_kb": 33.7,
           "cpu_samples_ms": [
-            5.57,
+            5.51,
             5.46,
-            5.43,
-            5.62,
-            5.34,
-            5.4,
-            5.33
+            5.69,
+            5.46,
+            5.64
+          ]
+        }
+      }
+    },
+    {
+      "name": "07_simd_dot",
+      "desc": "51.2M 4-wide SIMD Float64x4 dot products",
+      "checksum": "11520000000",
+      "results": {
+        "c": {
+          "cpu_median_ms": 37.17,
+          "cpu_min_ms": 36.84,
+          "wall_median_ms": 38.87,
+          "size_kb": 32.7,
+          "cpu_samples_ms": [
+            37.17,
+            38.14,
+            37.22,
+            36.99,
+            36.84
+          ]
+        },
+        "rust": {
+          "cpu_median_ms": 38.67,
+          "cpu_min_ms": 37.9,
+          "wall_median_ms": 40.23,
+          "size_kb": 461.2,
+          "cpu_samples_ms": [
+            38.67,
+            39.25,
+            38.75,
+            37.95,
+            37.9
+          ]
+        },
+        "go": {
+          "cpu_median_ms": 38.86,
+          "cpu_min_ms": 38.41,
+          "wall_median_ms": 40.56,
+          "size_kb": 2372.8,
+          "cpu_samples_ms": [
+            40.26,
+            38.86,
+            38.41,
+            38.52,
+            39.13
+          ]
+        },
+        "tenon": {
+          "cpu_median_ms": 78.11,
+          "cpu_min_ms": 74.46,
+          "wall_median_ms": 79.93,
+          "size_kb": 33.6,
+          "cpu_samples_ms": [
+            79.42,
+            76.11,
+            80.17,
+            74.46,
+            78.11
+          ]
+        }
+      }
+    },
+    {
+      "name": "08_packet_codec",
+      "desc": "20M @packed + bitfield binary frame codec",
+      "checksum": "3935987352753430774",
+      "results": {
+        "c": {
+          "cpu_median_ms": 38.06,
+          "cpu_min_ms": 37.64,
+          "wall_median_ms": 39.64,
+          "size_kb": 32.7,
+          "cpu_samples_ms": [
+            37.64,
+            38.06,
+            38.26,
+            37.87,
+            38.68
+          ]
+        },
+        "rust": {
+          "cpu_median_ms": 38.16,
+          "cpu_min_ms": 37.88,
+          "wall_median_ms": 39.77,
+          "size_kb": 460.7,
+          "cpu_samples_ms": [
+            38.64,
+            38.16,
+            37.88,
+            38.01,
+            38.46
+          ]
+        },
+        "go": {
+          "cpu_median_ms": 28.59,
+          "cpu_min_ms": 28.01,
+          "wall_median_ms": 30.05,
+          "size_kb": 2372.8,
+          "cpu_samples_ms": [
+            28.59,
+            28.68,
+            28.01,
+            28.05,
+            28.65
+          ]
+        },
+        "tenon": {
+          "cpu_median_ms": 38.13,
+          "cpu_min_ms": 37.77,
+          "wall_median_ms": 39.7,
+          "size_kb": 33.7,
+          "cpu_samples_ms": [
+            39.07,
+            37.77,
+            38.11,
+            38.17,
+            38.13
+          ]
+        }
+      }
+    },
+    {
+      "name": "09_mpmc_threads",
+      "desc": "4-thread parallel compute + MPMC channel",
+      "checksum": "7190949260404137825",
+      "results": {
+        "c": {
+          "cpu_median_ms": 66.41,
+          "cpu_min_ms": 65.57,
+          "wall_median_ms": 19.62,
+          "size_kb": 32.9,
+          "cpu_samples_ms": [
+            65.57,
+            69.94,
+            66.41,
+            65.95,
+            67.16
+          ]
+        },
+        "rust": {
+          "cpu_median_ms": 66.25,
+          "cpu_min_ms": 66.12,
+          "wall_median_ms": 20.22,
+          "size_kb": 557.6,
+          "cpu_samples_ms": [
+            66.25,
+            68.71,
+            66.12,
+            67.08,
+            66.2
+          ]
+        },
+        "go": {
+          "cpu_median_ms": 93.7,
+          "cpu_min_ms": 92.12,
+          "wall_median_ms": 27.13,
+          "size_kb": 2372.9,
+          "cpu_samples_ms": [
+            92.12,
+            93.54,
+            93.71,
+            93.7,
+            94.9
+          ]
+        },
+        "tenon": {
+          "cpu_median_ms": 66.08,
+          "cpu_min_ms": 65.85,
+          "wall_median_ms": 19.63,
+          "size_kb": 34.6,
+          "cpu_samples_ms": [
+            65.85,
+            66.17,
+            66.08,
+            66.02,
+            67.03
           ]
         }
       }

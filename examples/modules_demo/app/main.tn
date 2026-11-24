@@ -1,0 +1,106 @@
+// Demonstrates all 3 modern import styles + comptime + typed macros + reflection!
+
+// 1. Go-style package import: use `vec.Vec2`, `vec.dot(...)`, `vec.UNIT_SCALE`
+import mathlib.vec
+// 2. Selective braced import with local rename
+import demo.util.strings.{tag_label, shout as loud}
+// 3. Wildcard import
+import std.text.text.*
+
+// Pure function runnable BOTH at compile time and runtime
+pure fn ct_fib(n Int) Int {
+    if n < 2 {
+        n
+    } else {
+        ct_fib(n - 1) + ct_fib(n - 2)
+    }
+}
+
+// Declarative macro
+macro double_plus(x, y) {
+    (x + x) + y
+}
+
+// Loom-style typed generator macro inspecting inferred argument TypeInfo!
+comptime fn smart_bump(types List[TypeInfo]) Text {
+    if types[0].kind == "Int" {
+        "$0 + 100"
+    } else {
+        "$0"
+    }
+}
+
+// Top-level comptime code generation!
+comptime {
+    """
+    pub pure fn generated_magic() Int {
+        777
+    }
+    """
+}
+
+// Generic function with `comptime if` (unselected branch imposes zero constraints on T!)
+pub fn describe_kind[T](val T) Text {
+    comptime if T == Int {
+        "int:" ++ int_to_text(val)
+    } else {
+        comptime if T == Text {
+            "text:" ++ val
+        } else {
+            "other"
+        }
+    }
+}
+
+// Private helper shared with `main_test.tn` in the same package
+fn app_secret_offset() Int {
+    comptime if config("mode") == "fast" {
+        42
+    } else {
+        undefined_slow_path()
+    }
+}
+
+pub fn main() Int {
+    // Go-style qualified type, record literal, function, and constant
+    let a vec.Vec2 = vec.Vec2 { x = 3, y = 4 }
+    let b = vec.Vec2 { x = 1, y = 2 }
+    let c = vec.vec_add(a, b)
+    assert c.x == 4 && c.y == 6
+    assert vec.dot(a, b) == 11
+    assert vec.UNIT_SCALE == 10
+
+    // Selective + renamed + wildcard imports
+    assert tag_label("ok", loud("tenon")) == "ok:tenon!"
+    assert "hello world".contains("world")
+
+    // Compile-time execution + top-level codegen + declarative & typed macros
+    let fib10 = comptime { ct_fib(10) }
+    assert fib10 == 55
+    assert generated_magic() == 777
+    assert double_plus!(5, 7) == 17
+    let n = 23
+    assert smart_bump!(n) == 123
+
+    // Generic comptime-if specialization
+    assert describe_kind(9) == "int:9"
+    assert describe_kind("hi") == "text:hi"
+
+    // Compile-time reflection + `comptime for` unrolling over struct fields!
+    assert type_name[vec.Vec2]() == "Vec2"
+    assert type_kind[vec.Vec2]() == "Record"
+    assert field_count[vec.Vec2]() == 2
+    assert has_field[vec.Vec2]("x")
+    assert !has_field[vec.Vec2]("z")
+
+    var field_sum = 0
+    var field_names_joined = ""
+    comptime for f in fields_of[vec.Vec2]() {
+        field_sum += get_field(c, f)
+        field_names_joined = field_names_joined ++ f.name
+    }
+    assert field_sum == 10
+    assert field_names_joined == "xy"
+
+    fib10 + app_secret_offset() + field_sum
+}

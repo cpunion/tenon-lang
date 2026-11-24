@@ -1,0 +1,67 @@
+// Live Loopback HTTP/1.1 Keep-Alive Throughput Benchmark (std/net/http.tn + kqueue + 4 workers)
+import "../../std/net/http.tn"
+
+pub fn bench_handler(req HttpRequest) HttpResponse {
+    if req.path == "/ping" {
+        return http_text(200, "pong")
+    }
+    http_text(404, "not found")
+}
+
+pub fn run_client_burst(host Text, count Int) Int {
+    var conn = match http_connect(host) {
+        Ok(c) => c
+        Err(_) => { return 0 }
+    }
+    var ok = 0
+    var i = 0
+    while i < count {
+        match conn.get("/ping") {
+            Ok(r) => {
+                if r.status == 200 {
+                    ok += 1
+                }
+            }
+            Err(_) => { break }
+        }
+        i += 1
+    }
+    conn.close()
+    ok
+}
+
+pub fn main() Int {
+    let port_box = atomic_new(0)
+    let stop_flag = atomic_new(0)
+    let per_worker = 1000
+
+    let srv_thread = thread_start(|| {
+        http_serve_reactor("127.0.0.1:0", 4, port_box, stop_flag, |req| bench_handler(req))
+    })
+
+    var port = 0
+    while port == 0 {
+        port = port_box.load(ORDER_SEQ_CST)
+        if port == 0 {
+            thread_sleep_ms(2)
+        }
+    }
+    let host = f"127.0.0.1:{int_to_text(port)}"
+
+    let t0 = time_now_ns()
+    let c0 = thread_start(|| { run_client_burst(host, per_worker) })
+    let c1 = thread_start(|| { run_client_burst(host, per_worker) })
+    let c2 = thread_start(|| { run_client_burst(host, per_worker) })
+    let c3 = thread_start(|| { run_client_burst(host, per_worker) })
+
+    let ok_total = c0.join() + c1.join() + c2.join() + c3.join()
+    let elapsed_ns = time_now_ns() - t0
+
+    stop_flag.store(1, ORDER_SEQ_CST)
+    let _ = srv_thread.join()
+
+    let elapsed_ms = if elapsed_ns / 1000000 > 0 { elapsed_ns / 1000000 } else { 1 }
+    let rps = (ok_total * 1000000000) / (if elapsed_ns > 0 { elapsed_ns } else { 1 })
+    let _ = sys_write_stdout("HTTP/1.1 Keep-Alive 4-worker loopback: ok=" ++ int_to_text(ok_total) ++ " elapsed_ms=" ++ int_to_text(elapsed_ms) ++ " rps=" ++ int_to_text(rps) ++ "\n")
+    if ok_total == per_worker * 4 { 0 } else { 1 }
+}

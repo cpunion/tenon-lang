@@ -1,3 +1,5 @@
+mod lsp;
+
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -13,7 +15,7 @@ use tenon_dist::run_distributed_qualification;
 use tenon_dist::server::{serve_http, serve_http_with_options};
 use tenon_dist::sync_kernel::UniversalSyncKernel;
 use tenon_dist::worker::{http_rpc, run_external_worker};
-use tenon_syntax::{Item, load_program_with_imports};
+use tenon_syntax::{Item, discover_test_packages, load_program_for_test, load_program_with_imports};
 use tenon_verify::{
     ProofTier, check_evolution, check_program, check_program_protocols, export_program_tla_specs,
     export_tla_specs, run_all_protocol_checks, verify_runtime_trace,
@@ -43,6 +45,7 @@ async fn main() -> ExitCode {
         "build" => cmd_build_aot(&args[2..]),
         "build-wasm" => cmd_build_wasm(&args[2..]),
         "fmt" => cmd_fmt(&args[2..]),
+        "lsp" => lsp::run_lsp_stdio(),
         "-h" | "--help" | "help" => {
             print_usage();
             ExitCode::SUCCESS
@@ -62,7 +65,8 @@ fn print_usage() {
 USAGE:
   tenon check <file.tn> [--json]                  Run L0 + L1 (Z3) Fail-Closed verification & Protocol Solver
   tenon run <file.tn>                             Verify and execute `main()` via Cranelift native JIT
-  tenon test <file.tn>                            Verify and run all `test fn` functions via Cranelift JIT
+  tenon test [file.tn|pkg_dir] [--filter <substr>] [-r|--recursive] [--no-leak-check]
+                                                  Verify and run `test fn` tests with per-test Perceus zero-leak checks
   tenon evolve check <v1.tn> <v2.tn> [--json]     Verify schema evolution compatibility & bidirectional lenses
   tenon modelcheck [file.tn] [--export-tla <dir>] [--json]
                                                   Run L2-b protocol model checker (built-in or .tn AST)
@@ -78,7 +82,8 @@ USAGE:
   tenon build <file.tn> -o <out> [--opt O0|O2|O3] [--lib static|shared] [--emit-header <h>] [--emit-llvm <ll>] [-g|--debug] [-l <lib>] [-L <dir>] [--c-src <file.c>]
                                                   Verify (Fail-Closed) & AOT-compile to native binary / C static or shared library via LLVM
   tenon build-wasm <app.tn> [-o <out.wasm>]       Compile declarative .tn view/pacing directly to binary WebAssembly client store
-  tenon fmt <file.tn> [--check]                   Format Tenon source file with canonical indentation & spacing"#
+  tenon fmt <file.tn> [--check]                   Format Tenon source file with canonical indentation & spacing
+  tenon lsp                                       Run Language Server Protocol (JSON-RPC 2.0 over stdio) for VS Code / editors"#
     );
 }
 
@@ -278,55 +283,185 @@ fn cmd_run(args: &[String]) -> ExitCode {
 }
 
 fn cmd_test(args: &[String]) -> ExitCode {
-    let Some(file) = args.first() else {
-        eprintln!("usage: tenon test <file.tn>");
-        return ExitCode::from(2);
-    };
-    let prog = match load_and_parse(file) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return ExitCode::from(1);
-        }
-    };
-    let report = check_program(&prog);
-    if !report.ok {
-        eprintln!("FAIL-CLOSED: verification failed for `{}`.", file);
-        for d in &report.diagnostics {
-            eprintln!("  error[{}] line {}: {}", d.code, d.span.line, d.message);
-        }
-        return ExitCode::from(1);
-    }
-    let jit = match JitProgram::compile(&prog) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("codegen error: {}", e);
-            return ExitCode::from(1);
-        }
-    };
-    let test_fns: Vec<String> = prog
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Fn(f) if f.is_test => Some(f.name.clone()),
-            _ => None,
-        })
-        .collect();
-    if test_fns.is_empty() {
-        println!("No `test fn` items found in `{}`.", file);
-        return ExitCode::SUCCESS;
-    }
-    let mut all_ok = true;
-    for name in &test_fns {
-        match jit.call_0(name) {
-            Ok(_) => println!("  test {} ... ok", name),
-            Err(e) => {
-                eprintln!("  test {} ... FAILED ({})", name, e);
-                all_ok = false;
+    let mut target: Option<String> = None;
+    let mut filter = String::new();
+    let mut recursive = false;
+    let mut check_leaks = true;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-r" | "--recursive" => {
+                recursive = true;
+                i += 1;
+            }
+            "--filter" | "-f" => {
+                if i + 1 < args.len() {
+                    filter = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    eprintln!("error: `--filter` requires a pattern argument");
+                    return ExitCode::from(2);
+                }
+            }
+            "--no-leak-check" => {
+                check_leaks = false;
+                i += 1;
+            }
+            s if s.starts_with("--filter=") => {
+                filter = s["--filter=".len()..].to_string();
+                i += 1;
+            }
+            "./..." => {
+                recursive = true;
+                target = Some(".".into());
+                i += 1;
+            }
+            other if !other.starts_with('-') => {
+                if let Some(prefix) = other.strip_suffix("/...") {
+                    recursive = true;
+                    target = Some(if prefix.is_empty() { ".".into() } else { prefix.into() });
+                } else {
+                    target = Some(other.to_string());
+                }
+                i += 1;
+            }
+            other => {
+                eprintln!("unknown option `{}` for `tenon test`", other);
+                eprintln!("usage: tenon test [file.tn|pkg_dir] [--filter <substr>] [-r|--recursive]");
+                return ExitCode::from(2);
             }
         }
     }
-    if all_ok {
+
+    let root_str = target.unwrap_or_else(|| ".".to_string());
+    let root_path = Path::new(&root_str);
+    let packages: Vec<PathBuf> = if recursive {
+        match discover_test_packages(root_path) {
+            Ok(ps) if !ps.is_empty() => ps,
+            Ok(_) => {
+                eprintln!("No Tenon packages found under `{}`.", root_str);
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        vec![root_path.to_path_buf()]
+    };
+
+    let mut total_passed = 0usize;
+    let mut total_failed = 0usize;
+    let mut total_filtered = 0usize;
+
+    for pkg in &packages {
+        let prog = match load_program_for_test(pkg) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("FAIL `{}`: {}", pkg.display(), e);
+                total_failed += 1;
+                continue;
+            }
+        };
+        let report = check_program(&prog);
+        if !report.ok {
+            eprintln!("FAIL-CLOSED: verification failed for `{}`.", pkg.display());
+            for d in &report.diagnostics {
+                let fname = prog
+                    .source_files
+                    .get(d.span.file_id as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("<input>");
+                eprintln!(
+                    "  error[{}] {}:{}:{}: {}",
+                    d.code, fname, d.span.line, d.span.col, d.message
+                );
+            }
+            total_failed += 1;
+            continue;
+        }
+
+        let all_tests: Vec<String> = prog
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Fn(f) if f.is_test => Some(f.name.clone()),
+                _ => None,
+            })
+            .collect();
+        if all_tests.is_empty() {
+            if !recursive {
+                println!("No `test fn` items found in `{}`.", pkg.display());
+            }
+            continue;
+        }
+
+        let selected: Vec<String> = all_tests
+            .iter()
+            .filter(|n| filter.is_empty() || n.contains(&filter))
+            .cloned()
+            .collect();
+        total_filtered += all_tests.len() - selected.len();
+        if selected.is_empty() {
+            continue;
+        }
+
+        let jit = match JitProgram::compile(&prog) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("FAIL `{}` codegen error: {}", pkg.display(), e);
+                total_failed += selected.len();
+                continue;
+            }
+        };
+
+        println!(
+            "running {} test(s) in `{}` ({} proofs verified)",
+            selected.len(),
+            pkg.display(),
+            report.proofs.len()
+        );
+        for name in &selected {
+            let t0 = std::time::Instant::now();
+            tenon_codegen::perceus::reset_stats();
+            match jit.call_0(name) {
+                Ok(_) => {
+                    let elapsed = t0.elapsed();
+                    let st = tenon_codegen::perceus::snapshot_stats();
+                    if check_leaks && st.live_objects != 0 {
+                        eprintln!(
+                            "  test {} ... FAILED (Perceus memory leak: live_objects={})",
+                            name, st.live_objects
+                        );
+                        total_failed += 1;
+                    } else {
+                        println!(
+                            "  test {} ... ok ({:.2}ms, allocs={}, live=0)",
+                            name,
+                            elapsed.as_secs_f64() * 1000.0,
+                            st.total_allocs
+                        );
+                        total_passed += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  test {} ... FAILED ({})", name, e);
+                    total_failed += 1;
+                }
+            }
+        }
+    }
+
+    println!(
+        "\ntest result: {}. {} passed; {} failed; {} filtered out",
+        if total_failed == 0 { "ok" } else { "FAILED" },
+        total_passed,
+        total_failed,
+        total_filtered
+    );
+    if total_failed == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

@@ -1,0 +1,9 @@
+[module]
+name = "demo"
+version = "0.1.0"
+
+[configuration]
+mode = "fast"
+
+[dependencies.mathlib]
+path = "mathlib"

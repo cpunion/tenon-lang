@@ -262,6 +262,42 @@ fn subst_expr_types(expr: &Expr, subst: &BTreeMap<String, TypeExpr>) -> Expr {
         },
         ExprKind::Block(b) => ExprKind::Block(subst_block_types(b, subst)),
         ExprKind::Unsafe(b) => ExprKind::Unsafe(subst_block_types(b, subst)),
+        ExprKind::Comptime(b) => ExprKind::Comptime(subst_block_types(b, subst)),
+        ExprKind::ComptimeIf {
+            cond,
+            then_block,
+            else_branch,
+        } => ExprKind::ComptimeIf {
+            cond: Box::new(subst_expr_types(cond, subst)),
+            then_block: subst_block_types(then_block, subst),
+            else_branch: else_branch
+                .as_ref()
+                .map(|e| Box::new(subst_expr_types(e, subst))),
+        },
+        ExprKind::ComptimeFor {
+            binding,
+            iter,
+            body,
+        } => ExprKind::ComptimeFor {
+            binding: binding.clone(),
+            iter: Box::new(subst_expr_types(iter, subst)),
+            body: subst_block_types(body, subst),
+        },
+        ExprKind::MacroCall { name, args } => ExprKind::MacroCall {
+            name: name.clone(),
+            args: args.iter().map(|a| subst_expr_types(a, subst)).collect(),
+        },
+        ExprKind::TypeImplements { ty, interface } => ExprKind::TypeImplements {
+            ty: subst_type(ty, subst),
+            interface: interface.clone(),
+        },
+        ExprKind::Ident(s) => {
+            if let Some(rep) = subst.get(s) {
+                ExprKind::Ident(type_head_name(rep))
+            } else {
+                ExprKind::Ident(s.clone())
+            }
+        }
         ExprKind::Cast { expr: inner, ty } => ExprKind::Cast {
             expr: Box::new(subst_expr_types(inner, subst)),
             ty: subst_type(ty, subst),
@@ -430,6 +466,8 @@ struct LowerCtx {
     next_tmp_id: usize,
     /// Interface dynamic layouts
     dyn_interfaces: BTreeMap<String, DynInterfaceLayout>,
+    /// Comptime & reflection context for evaluating generic `comptime if` / `comptime for` on monomorphization
+    comptime_ctx: ComptimeContext,
 }
 
 impl LowerCtx {
@@ -984,6 +1022,59 @@ impl LowerCtx {
                                 return subst_type(rt, &subst);
                             }
                         }
+                    } else if let ExprKind::Field { target, field } = &inner.kind {
+                        if let ExprKind::Ident(tname) = &target.kind {
+                            if !var_types.contains_key(tname) && self.is_known_type(tname) {
+                                if let Some(mname) = self.lookup_concrete_method(tname, field) {
+                                    if let Some(tmpl) = self.generic_templates.get(&mname) {
+                                        if let Some(rt) = &tmpl.ret_ty {
+                                            let subst = self.infer_generic_subst(tmpl, type_args, args, var_types);
+                                            return subst_type(rt, &subst);
+                                        }
+                                    }
+                                    if let Some(sig) = self.fn_sigs.get(&mname) {
+                                        return sig.ret_ty.clone().unwrap_or_else(|| named_ty("Any"));
+                                    }
+                                }
+                            }
+                        }
+                        let rty = self.infer_expr_ty(target, var_types);
+                        let rbase = self.resolve_alias(&rty);
+                        if let TypeExpr::Named { name, args: rargs, .. } = &rbase {
+                            let lookup_name = if let TypeExpr::Named { name: orig, .. } = &rty {
+                                if self.lookup_concrete_method(orig, field).is_some() {
+                                    orig.clone()
+                                } else {
+                                    name.clone()
+                                }
+                            } else {
+                                name.clone()
+                            };
+                            if let Some(mname) = self.lookup_concrete_method(&lookup_name, field) {
+                                if let Some(tmpl) = self.generic_templates.get(&mname) {
+                                    if let Some(rt) = &tmpl.ret_ty {
+                                        let mut explicit_targs = rargs.clone();
+                                        explicit_targs.extend(type_args.iter().cloned());
+                                        let mut full_args = Vec::with_capacity(args.len() + 1);
+                                        full_args.push(CallArg {
+                                            name: None,
+                                            value: (**target).clone(),
+                                        });
+                                        full_args.extend(args.iter().cloned());
+                                        let subst = self.infer_generic_subst(
+                                            tmpl,
+                                            &explicit_targs,
+                                            &full_args,
+                                            var_types,
+                                        );
+                                        return subst_type(rt, &subst);
+                                    }
+                                }
+                                if let Some(sig) = self.fn_sigs.get(&mname) {
+                                    return sig.ret_ty.clone().unwrap_or_else(|| named_ty("Any"));
+                                }
+                            }
+                        }
                     }
                     named_ty("Any")
                 }
@@ -1359,6 +1450,7 @@ impl LowerCtx {
             spec.name = mono_name.clone();
             spec.type_params.clear();
             spec.type_param_bounds.clear();
+            let _ = eval_comptime_in_fn(&self.comptime_ctx, &mut spec);
             self.fn_sigs.insert(mono_name.clone(), spec.clone());
             self.mono_queue.push_back(spec);
         }
@@ -2559,6 +2651,7 @@ impl LowerCtx {
             is_async: false,
             is_test: false,
             is_unsafe: false,
+            is_comptime: false,
             name: cname.clone(),
             type_params: vec![],
             type_param_bounds: BTreeMap::new(),
@@ -3272,6 +3365,143 @@ impl LowerCtx {
                                                 span: callee.span,
                                             }),
                                             args: lowered_args,
+                                        },
+                                        span: sp,
+                                    };
+                                }
+                            }
+                        } else if let ExprKind::Field { target, field } = &inner.kind {
+                            // 1a. Associated generic method `Type.method[T](args)`
+                            if let ExprKind::Ident(tname) = &target.kind {
+                                if !var_types.contains_key(tname) && self.is_known_type(tname) {
+                                    if let Some(mname) = self.lookup_concrete_method(tname, field) {
+                                        let (final_fn, mut lowered_args) =
+                                            if let Some(tmpl) = self.generic_templates.get(&mname).cloned() {
+                                                let mut subst = BTreeMap::new();
+                                                for (tp, ta) in tmpl.type_params.iter().zip(type_args.iter()) {
+                                                    if ta.display_name() != "Any" {
+                                                        subst.insert(tp.clone(), ta.clone());
+                                                    }
+                                                }
+                                                let ptys: Vec<TypeExpr> = tmpl.params.iter().map(|p| p.ty.clone()).collect();
+                                                let largs = self.lower_args_two_pass(
+                                                    args,
+                                                    &ptys,
+                                                    &tmpl.type_params,
+                                                    &mut subst,
+                                                    var_types,
+                                                    ret_ty,
+                                                );
+                                                if let (Some(rt), Some(exp)) = (&tmpl.ret_ty, expected_ty) {
+                                                    self.unify_type_params(rt, exp, &tmpl.type_params, &mut subst);
+                                                }
+                                                (self.ensure_monomorphized(&mname, &subst).unwrap_or(mname), largs)
+                                            } else {
+                                                let ptys: Vec<TypeExpr> = self
+                                                    .fn_sigs
+                                                    .get(&mname)
+                                                    .map(|s| s.params.iter().map(|p| p.ty.clone()).collect())
+                                                    .unwrap_or_default();
+                                                let mut es = BTreeMap::new();
+                                                let largs = self.lower_args_two_pass(args, &ptys, &[], &mut es, var_types, ret_ty);
+                                                (mname, largs)
+                                            };
+                                        self.box_call_args(&final_fn, &mut lowered_args, var_types);
+                                        return Expr {
+                                            kind: ExprKind::Call {
+                                                callee: Box::new(Expr {
+                                                    kind: ExprKind::Ident(final_fn),
+                                                    span: callee.span,
+                                                }),
+                                                args: lowered_args,
+                                            },
+                                            span: sp,
+                                        };
+                                    }
+                                }
+                            }
+                            // 1b. Receiver generic method `ctx.json_body[T](args)`
+                            let lowered_target = self.lower_expr(target, var_types, ret_ty, None);
+                            let recv_ty = self.infer_expr_ty(target, var_types);
+                            let recv_base = self.resolve_alias(&recv_ty);
+                            if let TypeExpr::Named { name, args: rargs, .. } = &recv_base {
+                                let lookup_name = if let TypeExpr::Named { name: orig, .. } = &recv_ty {
+                                    if self.lookup_concrete_method(orig, field).is_some() {
+                                        orig.clone()
+                                    } else {
+                                        name.clone()
+                                    }
+                                } else {
+                                    name.clone()
+                                };
+                                if let Some(mname) = self.lookup_concrete_method(&lookup_name, field) {
+                                    let (final_fn, lowered_args) =
+                                        if let Some(tmpl) = self.generic_templates.get(&mname).cloned() {
+                                            let mut subst = BTreeMap::new();
+                                            for (tp, ra) in tmpl.type_params.iter().zip(rargs.iter()) {
+                                                if ra.display_name() != "Any" {
+                                                    subst.insert(tp.clone(), ra.clone());
+                                                }
+                                            }
+                                            if let Some(self_p) = tmpl.params.first() {
+                                                self.unify_type_params(&self_p.ty, &recv_base, &tmpl.type_params, &mut subst);
+                                            }
+                                            let unbound_tps: Vec<String> = tmpl
+                                                .type_params
+                                                .iter()
+                                                .filter(|tp| !subst.contains_key(*tp))
+                                                .cloned()
+                                                .collect();
+                                            for (tp, ta) in unbound_tps.iter().zip(type_args.iter()) {
+                                                if ta.display_name() != "Any" {
+                                                    subst.insert(tp.clone(), ta.clone());
+                                                }
+                                            }
+                                            let explicit_ptys: Vec<TypeExpr> =
+                                                tmpl.params.iter().skip(1).map(|p| p.ty.clone()).collect();
+                                            let largs = self.lower_args_two_pass(
+                                                args,
+                                                &explicit_ptys,
+                                                &tmpl.type_params,
+                                                &mut subst,
+                                                var_types,
+                                                ret_ty,
+                                            );
+                                            if let (Some(rt), Some(exp)) = (&tmpl.ret_ty, expected_ty) {
+                                                self.unify_type_params(rt, exp, &tmpl.type_params, &mut subst);
+                                            }
+                                            (self.ensure_monomorphized(&mname, &subst).unwrap_or(mname), largs)
+                                        } else {
+                                            let explicit_ptys: Vec<TypeExpr> = self
+                                                .fn_sigs
+                                                .get(&mname)
+                                                .map(|s| s.params.iter().skip(1).map(|p| p.ty.clone()).collect())
+                                                .unwrap_or_default();
+                                            let mut es = BTreeMap::new();
+                                            let largs = self.lower_args_two_pass(
+                                                args,
+                                                &explicit_ptys,
+                                                &[],
+                                                &mut es,
+                                                var_types,
+                                                ret_ty,
+                                            );
+                                            (mname, largs)
+                                        };
+                                    let mut full_args = Vec::with_capacity(lowered_args.len() + 1);
+                                    full_args.push(CallArg {
+                                        name: None,
+                                        value: lowered_target,
+                                    });
+                                    full_args.extend(lowered_args);
+                                    self.box_call_args(&final_fn, &mut full_args, var_types);
+                                    return Expr {
+                                        kind: ExprKind::Call {
+                                            callee: Box::new(Expr {
+                                                kind: ExprKind::Ident(final_fn),
+                                                span: callee.span,
+                                            }),
+                                            args: full_args,
                                         },
                                         span: sp,
                                     };
@@ -4571,6 +4801,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
     }
 
     let layout = LayoutEngine::from_program(&expanded);
+    let comptime_ctx = ComptimeContext::from_program(&expanded);
     let mut ctx = LowerCtx {
         alias_bases: BTreeMap::new(),
         records: BTreeMap::new(),
@@ -4598,6 +4829,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
         next_tmp_id: 0,
         dyn_interfaces: BTreeMap::new(),
         defer_stack: Vec::new(),
+        comptime_ctx,
     };
 
     // Pass 1: collect types, interfaces, unions, bitfields, externs, consts, and top-level fns
@@ -4739,6 +4971,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
                                     is_pure: im.is_pure,
                                     is_async: im.is_async,
                                     is_unsafe: false,
+            is_comptime: false,
                                     is_test: false,
                                     name: mangled.clone(),
                                     type_params: imp.type_params.clone(),
@@ -4917,6 +5150,9 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
         program: Program {
             items: final_items,
             source_files: expanded.source_files,
+            file_packages: expanded.file_packages,
+            test_file_ids: expanded.test_file_ids,
+            build_config: expanded.build_config,
         },
         vtables,
         dyn_interfaces: ctx.dyn_interfaces,

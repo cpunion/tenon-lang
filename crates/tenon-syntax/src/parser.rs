@@ -6,21 +6,82 @@ use std::collections::BTreeMap;
 pub fn parse(src: &str) -> Result<Program, ParseError> {
     let mut prog = parse_with_file_id(src, 0)?;
     crate::eval_cfg_attrs(&mut prog);
+    crate::comptime::expand_comptime_and_macros(&mut prog).map_err(|message| ParseError {
+        message,
+        span: Span::default(),
+    })?;
     Ok(prog)
 }
 
 pub fn parse_with_file_id(src: &str, file_id: u32) -> Result<Program, ParseError> {
     let tokens = lex_with_file_id(src, file_id)?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        no_struct_lit: false,
+    };
     parser.parse_program()
+}
+
+pub fn parse_expr_str(src: &str, file_id: u32) -> Result<Expr, ParseError> {
+    let tokens = lex_with_file_id(src, file_id)?;
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        no_struct_lit: false,
+    };
+    parser.skip_newlines();
+    parser.parse_expr()
+}
+
+fn expr_to_dotted_name(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Ident(s) => Some(s.clone()),
+        ExprKind::Field { target, field } => {
+            let mut prefix = expr_to_dotted_name(target)?;
+            prefix.push('.');
+            prefix.push_str(field);
+            Some(prefix)
+        }
+        _ => None,
+    }
+}
+
+fn expr_to_type_expr(expr: &Expr) -> Option<TypeExpr> {
+    if let Some(name) = expr_to_dotted_name(expr) {
+        return Some(TypeExpr::Named {
+            name,
+            version: None,
+            args: Vec::new(),
+            span: expr.span,
+        });
+    }
+    if let ExprKind::GenericInst { expr: inner, type_args } = &expr.kind {
+        let name = expr_to_dotted_name(inner)?;
+        return Some(TypeExpr::Named {
+            name,
+            version: None,
+            args: type_args.clone(),
+            span: expr.span,
+        });
+    }
+    None
 }
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    no_struct_lit: bool,
 }
 
 impl Parser {
+    fn parse_expr_no_struct_lit(&mut self) -> Result<Expr, ParseError> {
+        let prev = self.no_struct_lit;
+        self.no_struct_lit = true;
+        let res = self.parse_expr();
+        self.no_struct_lit = prev;
+        res
+    }
     fn peek(&self) -> &Token {
         &self.tokens[self.pos.min(self.tokens.len() - 1)]
     }
@@ -160,6 +221,9 @@ impl Parser {
         Ok(Program {
             items,
             source_files: Vec::new(),
+            file_packages: Vec::new(),
+            test_file_ids: Vec::new(),
+            build_config: BTreeMap::new(),
         })
     }
 
@@ -234,18 +298,163 @@ impl Parser {
                     None
                 };
                 return Ok(vec![Item::Import {
-                    path,
+                    path: path.clone(),
                     alias,
+                    kind: Some(ImportKind::FilePath(path)),
                     span: start.merge(end),
                 }]);
             }
-            return Err(ParseError {
-                message: format!("expected string path after `import`, found {:?}", tok.kind),
-                span: tok.span,
-            });
+            // Go-style / glob / selective dotted import:
+            //   import pkg.subpkg [as alias]
+            //   import pkg.subpkg.*
+            //   import pkg.subpkg.{Type1, Type2 as T2, fn1}
+            let (first_seg, mut end) = self.expect_ident()?;
+            let mut segments = vec![first_seg];
+            while self.peek().kind == TokenKind::Dot {
+                self.bump();
+                if self.peek().kind == TokenKind::Star {
+                    let sspan = self.bump().span;
+                    let path = format!("{}.*", segments.join("."));
+                    return Ok(vec![Item::Import {
+                        path,
+                        alias: None,
+                        kind: Some(ImportKind::Glob(segments)),
+                        span: start.merge(sspan),
+                    }]);
+                }
+                if self.peek().kind == TokenKind::LBrace {
+                    self.bump();
+                    let mut names = Vec::new();
+                    loop {
+                        self.skip_newlines();
+                        if self.peek().kind == TokenKind::RBrace {
+                            end = self.bump().span;
+                            break;
+                        }
+                        let (iname, ispan) = self.expect_ident()?;
+                        let mut item_end = ispan;
+                        let item_alias = if self.peek().kind == TokenKind::As {
+                            self.bump();
+                            let (al, aspan) = self.expect_ident()?;
+                            item_end = aspan;
+                            Some(al)
+                        } else {
+                            None
+                        };
+                        names.push(ImportNamed {
+                            name: iname,
+                            alias: item_alias,
+                            span: ispan.merge(item_end),
+                        });
+                        if !self.eat(&TokenKind::Comma) {
+                            self.skip_newlines();
+                            end = self.expect(TokenKind::RBrace)?.span;
+                            break;
+                        }
+                    }
+                    let path = segments.join(".");
+                    return Ok(vec![Item::Import {
+                        path,
+                        alias: None,
+                        kind: Some(ImportKind::Selective { segments, names }),
+                        span: start.merge(end),
+                    }]);
+                }
+                let (seg, sspan) = self.expect_ident()?;
+                segments.push(seg);
+                end = sspan;
+            }
+            let alias = if self.peek().kind == TokenKind::As {
+                self.bump();
+                let (a, aspan) = self.expect_ident()?;
+                end = aspan;
+                Some(a)
+            } else {
+                None
+            };
+            let path = segments.join(".");
+            return Ok(vec![Item::Import {
+                path,
+                alias,
+                kind: Some(ImportKind::Package(segments)),
+                span: start.merge(end),
+            }]);
+        }
+        if self.peek().kind == TokenKind::Comptime
+            && self.peek_ahead_non_nl(1).kind == TokenKind::LBrace
+        {
+            self.bump();
+            let blk = self.parse_block()?;
+            return Ok(vec![Item::ComptimeBlock(blk)]);
         }
         let is_pub = self.eat(&TokenKind::Pub);
         self.skip_newlines();
+        if let TokenKind::Ident(ref kw) = self.peek().kind {
+            if kw == "macro" {
+                let start = self.bump().span;
+                let (mname, _) = self.expect_ident()?;
+                self.expect(TokenKind::LParen)?;
+                let mut params = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if self.peek().kind == TokenKind::RParen {
+                        self.bump();
+                        break;
+                    }
+                    let (p, _) = self.expect_ident()?;
+                    params.push(p);
+                    if !self.eat(&TokenKind::Comma) {
+                        self.expect(TokenKind::RParen)?;
+                        break;
+                    }
+                }
+                self.skip_newlines();
+                let body = if self.peek().kind == TokenKind::LBrace {
+                    let blk = self.parse_block()?;
+                    let bspan = blk.span;
+                    Expr {
+                        kind: ExprKind::Block(blk),
+                        span: bspan,
+                    }
+                } else {
+                    self.expect(TokenKind::FatArrow)?;
+                    self.parse_expr()?
+                };
+                let span = start.merge(body.span);
+                return Ok(vec![Item::Macro(MacroDecl {
+                    attrs,
+                    is_pub,
+                    name: mname,
+                    params,
+                    body,
+                    span,
+                })]);
+            }
+        }
+        // Top-level macro invocation: `name!(arg1, arg2)`
+        if matches!(self.peek().kind, TokenKind::Ident(_))
+            && self.peek_ahead_non_nl(1).kind == TokenKind::Bang
+        {
+            let (mname, start) = self.expect_ident()?;
+            self.expect(TokenKind::Bang)?;
+            self.expect(TokenKind::LParen)?;
+            let mut args = Vec::new();
+            let end = loop {
+                self.skip_newlines();
+                if self.peek().kind == TokenKind::RParen {
+                    break self.bump().span;
+                }
+                args.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break self.expect(TokenKind::RParen)?.span;
+                }
+            };
+            return Ok(vec![Item::MacroCall {
+                name: mname,
+                args,
+                span: start.merge(end),
+            }]);
+        }
         match self.peek().kind {
             TokenKind::Distinct | TokenKind::Type => {
                 Ok(vec![Item::TypeAlias(self.parse_type_alias(attrs, is_pub)?)])
@@ -262,6 +471,7 @@ impl Parser {
             | TokenKind::Async
             | TokenKind::Test
             | TokenKind::Unsafe
+            | TokenKind::Comptime
             | TokenKind::Fn => Ok(vec![Item::Fn(self.parse_fn(attrs, is_pub)?)]),
             TokenKind::Evolution => Ok(vec![Item::Evolution(self.parse_evolution(attrs)?)]),
             TokenKind::LockLattice => Ok(vec![Item::LockLattice(self.parse_lock_lattice(is_pub)?)]),
@@ -939,6 +1149,7 @@ impl Parser {
         let mut is_async = false;
         let mut is_test = false;
         let mut is_unsafe = false;
+        let mut is_comptime = false;
         loop {
             self.skip_newlines();
             match self.peek().kind {
@@ -957,6 +1168,10 @@ impl Parser {
                 TokenKind::Unsafe => {
                     self.bump();
                     is_unsafe = true;
+                }
+                TokenKind::Comptime => {
+                    self.bump();
+                    is_comptime = true;
                 }
                 _ => break,
             }
@@ -1001,6 +1216,7 @@ impl Parser {
             is_async,
             is_test,
             is_unsafe,
+            is_comptime,
             name,
             type_params,
             type_param_bounds,
@@ -1178,6 +1394,7 @@ impl Parser {
                 is_async: false,
                 is_test: false,
                 is_unsafe: false,
+                is_comptime: false,
                 name: mname.clone(),
                 type_params: Vec::new(),
                 type_param_bounds: BTreeMap::new(),
@@ -1813,8 +2030,15 @@ impl Parser {
                 }
             }
         }
-        let (name, start) = self.expect_ident()?;
+        let (mut name, start) = self.expect_ident()?;
         let mut end = start;
+        while self.peek().kind == TokenKind::Dot {
+            self.bump();
+            let (seg, sspan) = self.expect_ident()?;
+            name.push('.');
+            name.push_str(&seg);
+            end = sspan;
+        }
         let version = if self.peek().kind == TokenKind::At {
             self.bump();
             let (v, vspan) = self.expect_ident()?;
@@ -2263,6 +2487,21 @@ impl Parser {
 
     fn parse_cmp(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_shift()?;
+        // Contextual `T implements InterfaceName` for `comptime if`
+        if matches!(&self.peek().kind, TokenKind::Ident(kw) if kw == "implements") {
+            if let Some(ty) = expr_to_type_expr(&left) {
+                self.bump();
+                let (iface, ispan) = self.expect_ident()?;
+                let span = left.span.merge(ispan);
+                return Ok(Expr {
+                    kind: ExprKind::TypeImplements {
+                        ty,
+                        interface: iface,
+                    },
+                    span,
+                });
+            }
+        }
         while let Some(op) = match self.peek().kind {
             TokenKind::EqEq => Some(BinOp::Eq),
             TokenKind::BangEq => Some(BinOp::Ne),
@@ -2451,6 +2690,30 @@ impl Parser {
                         span,
                     };
                 }
+                TokenKind::Bang if self.peek_ahead_non_nl(1).kind == TokenKind::LParen => {
+                    if let Some(mname) = expr_to_dotted_name(&expr) {
+                        self.bump(); // `!`
+                        self.bump(); // `(`
+                        let mut args = Vec::new();
+                        let end = loop {
+                            self.skip_newlines();
+                            if self.peek().kind == TokenKind::RParen {
+                                break self.bump().span;
+                            }
+                            args.push(self.parse_expr()?);
+                            if !self.eat(&TokenKind::Comma) {
+                                break self.expect(TokenKind::RParen)?.span;
+                            }
+                        };
+                        let span = expr.span.merge(end);
+                        expr = Expr {
+                            kind: ExprKind::MacroCall { name: mname, args },
+                            span,
+                        };
+                        continue;
+                    }
+                    break;
+                }
                 TokenKind::Dot => {
                     self.bump();
                     if self.peek().kind == TokenKind::Await {
@@ -2476,6 +2739,35 @@ impl Parser {
                     }
                     let (field, fspan) = self.expect_ident()?;
                     let span = expr.span.merge(fspan);
+                    // Qualified record literal: `subpkg.Point { x = 1, y = 2 }`
+                    let is_upper = field.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+                    if !self.no_struct_lit && is_upper && self.peek().kind == TokenKind::LBrace {
+                        if let Some(prefix) = expr_to_dotted_name(&expr) {
+                            let full_name = format!("{}.{}", prefix, field);
+                            self.bump(); // `{`
+                            let mut fields = Vec::new();
+                            let end = loop {
+                                self.skip_newlines();
+                                if self.peek().kind == TokenKind::RBrace {
+                                    break self.bump().span;
+                                }
+                                let (fname, _) = self.expect_ident()?;
+                                self.expect(TokenKind::Eq)?;
+                                let fval = self.parse_expr()?;
+                                fields.push((fname, fval));
+                                self.eat_sep();
+                            };
+                            expr = Expr {
+                                kind: ExprKind::RecordLit {
+                                    name: full_name,
+                                    version: None,
+                                    fields,
+                                },
+                                span: expr.span.merge(end),
+                            };
+                            continue;
+                        }
+                    }
                     expr = Expr {
                         kind: ExprKind::Field {
                             target: Box::new(expr),
@@ -2770,7 +3062,7 @@ impl Parser {
             }
             TokenKind::If => {
                 self.bump();
-                let cond = self.parse_expr()?;
+                let cond = self.parse_expr_no_struct_lit()?;
                 let then_block = self.parse_block()?;
                 let saved_pos = self.pos;
                 let else_branch = if self.eat(&TokenKind::Else) {
@@ -2804,7 +3096,7 @@ impl Parser {
             }
             TokenKind::Match => {
                 self.bump();
-                let scrutinee = self.parse_expr()?;
+                let scrutinee = self.parse_expr_no_struct_lit()?;
                 self.expect(TokenKind::LBrace)?;
                 let mut arms = Vec::new();
                 loop {
@@ -2939,6 +3231,66 @@ impl Parser {
                     });
                 }
             }
+            TokenKind::Comptime => {
+                let start = self.bump().span;
+                self.skip_newlines();
+                if self.peek().kind == TokenKind::If {
+                    self.bump();
+                    let cond = self.parse_expr_no_struct_lit()?;
+                    let then_block = self.parse_block()?;
+                    let saved_pos = self.pos;
+                    let else_branch = if self.eat(&TokenKind::Else) {
+                        self.skip_newlines();
+                        if self.peek().kind == TokenKind::If || self.peek().kind == TokenKind::Comptime {
+                            Some(Box::new(self.parse_primary()?))
+                        } else {
+                            let blk = self.parse_block()?;
+                            let bspan = blk.span;
+                            Some(Box::new(Expr {
+                                kind: ExprKind::Block(blk),
+                                span: bspan,
+                            }))
+                        }
+                    } else {
+                        self.pos = saved_pos;
+                        None
+                    };
+                    let end = else_branch
+                        .as_ref()
+                        .map(|e| e.span)
+                        .unwrap_or(then_block.span);
+                    Ok(Expr {
+                        kind: ExprKind::ComptimeIf {
+                            cond: Box::new(cond),
+                            then_block,
+                            else_branch,
+                        },
+                        span: start.merge(end),
+                    })
+                } else if self.peek().kind == TokenKind::For {
+                    self.bump();
+                    let (binding, _) = self.expect_ident()?;
+                    self.expect(TokenKind::In)?;
+                    let iter = self.parse_expr_no_struct_lit()?;
+                    let body = self.parse_block()?;
+                    let end = body.span;
+                    Ok(Expr {
+                        kind: ExprKind::ComptimeFor {
+                            binding,
+                            iter: Box::new(iter),
+                            body,
+                        },
+                        span: start.merge(end),
+                    })
+                } else {
+                    let blk = self.parse_block()?;
+                    let span = start.merge(blk.span);
+                    Ok(Expr {
+                        kind: ExprKind::Comptime(blk),
+                        span,
+                    })
+                }
+            }
             TokenKind::Unsafe => {
                 let start = self.bump().span;
                 let blk = self.parse_block()?;
@@ -2966,7 +3318,7 @@ impl Parser {
                     None
                 };
                 let is_upper = s.chars().next().is_some_and(|c| c.is_ascii_uppercase());
-                if is_upper && self.peek().kind == TokenKind::LBrace {
+                if !self.no_struct_lit && is_upper && self.peek().kind == TokenKind::LBrace {
                     self.bump();
                     let mut fields = Vec::new();
                     loop {
@@ -3168,6 +3520,7 @@ impl Parser {
                 let mut sub_parser = Parser {
                     tokens: inner_toks,
                     pos: 0,
+                    no_struct_lit: false,
                 };
                 let inner_expr = sub_parser.parse_expr().map_err(|e| ParseError {
                     message: format!("invalid expression in f-string: {}", e.message),

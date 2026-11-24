@@ -1,0 +1,6 @@
+[module]
+name = "webapp"
+version = "0.1.0"
+
+[configuration]
+env = "production"

@@ -7,6 +7,49 @@ pub struct Program {
     pub items: Vec<Item>,
     #[serde(default)]
     pub source_files: Vec<String>,
+    /// Maps `file_id` (index into `source_files`) -> `package_id`.
+    /// Files within the same directory package share the same `package_id`.
+    #[serde(default)]
+    pub file_packages: Vec<u32>,
+    /// File IDs that came from `*_test.tn` files (production files may never depend on them).
+    #[serde(default)]
+    pub test_file_ids: Vec<u32>,
+    /// `[configuration]` key-value map from `tenon.toml` for compile-time queries.
+    #[serde(default)]
+    pub build_config: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportNamed {
+    pub name: String,
+    #[serde(default)]
+    pub alias: Option<String>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ImportKind {
+    /// Legacy string path: `import "std/text/text.tn" [as t]`
+    FilePath(String),
+    /// Go-style dotted import: `import pkg.subpkg [as alias]` (or item import `import pkg.subpkg.Item`)
+    Package(Vec<String>),
+    /// Wildcard import: `import pkg.subpkg.*`
+    Glob(Vec<String>),
+    /// Selective import: `import pkg.subpkg.{Type1, Type2 as T2, fn1}`
+    Selective {
+        segments: Vec<String>,
+        names: Vec<ImportNamed>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MacroDecl {
+    pub attrs: Vec<Attr>,
+    pub is_pub: bool,
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Expr,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -28,6 +71,15 @@ pub enum Item {
         path: String,
         #[serde(default)]
         alias: Option<String>,
+        #[serde(default)]
+        kind: Option<ImportKind>,
+        span: Span,
+    },
+    Macro(MacroDecl),
+    ComptimeBlock(Block),
+    MacroCall {
+        name: String,
+        args: Vec<Expr>,
         span: Span,
     },
     TypeAlias(TypeAliasDecl),
@@ -159,6 +211,8 @@ pub struct FnDecl {
     pub is_test: bool,
     #[serde(default)]
     pub is_unsafe: bool,
+    #[serde(default)]
+    pub is_comptime: bool,
     pub name: String,
     pub type_params: Vec<String>,
     #[serde(default)]
@@ -585,6 +639,25 @@ pub enum ExprKind {
         ty: TypeExpr,
     },
     Unsafe(Block),
+    Comptime(Block),
+    ComptimeIf {
+        cond: Box<Expr>,
+        then_block: Block,
+        else_branch: Option<Box<Expr>>,
+    },
+    ComptimeFor {
+        binding: String,
+        iter: Box<Expr>,
+        body: Block,
+    },
+    MacroCall {
+        name: String,
+        args: Vec<Expr>,
+    },
+    TypeImplements {
+        ty: TypeExpr,
+        interface: String,
+    },
     If {
         cond: Box<Expr>,
         then_block: Block,

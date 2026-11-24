@@ -1,0 +1,803 @@
+// std/net/http.tn — High-Performance HTTP/1.1 Server & Client
+// Built directly on non-blocking TCP sockets, OS `kqueue`/`epoll` Reactor,
+// multi-worker OS thread pool, O(n) TextBuilder, Keep-Alive & Chunked encoding,
+// with zero Perceus memory leaks (`live_objects == 0`).
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+import "std/text/builder.tn"
+import "std/sync/sync.tn"
+import "std/net/reactor.tn"
+
+pub record HttpHeader {
+    name  Text
+    value Text
+}
+
+pub record HttpRequest {
+    method     Text
+    target     Text
+    path       Text
+    query      Text
+    headers    List[HttpHeader]
+    body       Text
+    keep_alive Bool
+}
+
+pub record HttpResponse {
+    status     Int
+    reason     Text
+    headers    List[HttpHeader]
+    body       Text
+    keep_alive Bool
+}
+
+pub pure fn http_status_reason(code Int) Text {
+    match code {
+        200 => "OK"
+        201 => "Created"
+        204 => "No Content"
+        301 => "Moved Permanently"
+        302 => "Found"
+        304 => "Not Modified"
+        400 => "Bad Request"
+        401 => "Unauthorized"
+        403 => "Forbidden"
+        404 => "Not Found"
+        405 => "Method Not Allowed"
+        409 => "Conflict"
+        422 => "Unprocessable Entity"
+        429 => "Too Many Requests"
+        500 => "Internal Server Error"
+        502 => "Bad Gateway"
+        503 => "Service Unavailable"
+        _ => "OK"
+    }
+}
+
+pub pure fn http_response(status Int, content_type Text, body Text) HttpResponse {
+    HttpResponse {
+        status = status
+        reason = http_status_reason(status)
+        headers = [HttpHeader { name = "Content-Type", value = content_type }]
+        body = body
+        keep_alive = true
+    }
+}
+
+pub pure fn http_ok(body Text) HttpResponse {
+    http_response(200, "text/plain; charset=utf-8", body)
+}
+
+pub pure fn http_json(status Int, body Text) HttpResponse {
+    http_response(status, "application/json", body)
+}
+
+pub pure fn http_text(status Int, body Text) HttpResponse {
+    http_response(status, "text/plain; charset=utf-8", body)
+}
+
+pub pure fn http_not_found(msg Text) HttpResponse {
+    http_json(404, "{\"error\":\"" ++ msg ++ "\"}")
+}
+
+pub pure fn http_bad_request(msg Text) HttpResponse {
+    http_json(400, "{\"error\":\"" ++ msg ++ "\"}")
+}
+
+pure fn ascii_lower_byte(b Int) Int {
+    if b >= 65 && b <= 90 {
+        b + 32
+    } else {
+        b
+    }
+}
+
+pub pure fn ascii_eq_ignore_case(a Text, b Text) Bool {
+    let n = len(a)
+    if n != len(b) {
+        return false
+    }
+    var i = 0
+    while i < n {
+        if ascii_lower_byte(byte_at(a, i)) != ascii_lower_byte(byte_at(b, i)) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+impl HttpRequest {
+    pub pure fn header(self, name Text) Option[Text] {
+        var i = 0
+        while i < len(self.headers) {
+            let h = self.headers[i]
+            if ascii_eq_ignore_case(h.name, name) {
+                return Some(h.value)
+            }
+            i += 1
+        }
+        None
+    }
+
+    pub pure fn query_param(self, key Text) Option[Text] {
+        if len(self.query) == 0 {
+            return None
+        }
+        let q = self.query
+        let qlen = len(q)
+        var pos = 0
+        while pos < qlen {
+            var amp = pos
+            while amp < qlen && byte_at(q, amp) != 38 {
+                amp += 1
+            }
+            var eq = pos
+            while eq < amp && byte_at(q, eq) != 61 {
+                eq += 1
+            }
+            let k = str_slice(q, pos, eq)
+            if k == key {
+                if eq < amp {
+                    return Some(str_slice(q, eq + 1, amp))
+                } else {
+                    return Some("")
+                }
+            }
+            pos = amp + 1
+        }
+        None
+    }
+}
+
+impl HttpResponse {
+    pub pure fn with_header(self, name Text, value Text) HttpResponse {
+        var hs = self.headers
+        hs = push(hs, HttpHeader { name = name, value = value })
+        HttpResponse {
+            status = self.status
+            reason = self.reason
+            headers = hs
+            body = self.body
+            keep_alive = self.keep_alive
+        }
+    }
+
+    pub pure fn header(self, name Text) Option[Text] {
+        var i = 0
+        while i < len(self.headers) {
+            let h = self.headers[i]
+            if ascii_eq_ignore_case(h.name, name) {
+                return Some(h.value)
+            }
+            i += 1
+        }
+        None
+    }
+}
+
+pure fn find_crlf(s Text, from Int) Int {
+    let n = len(s)
+    var i = from
+    while i + 1 < n {
+        if byte_at(s, i) == 13 && byte_at(s, i + 1) == 10 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+pure fn find_header_end(s Text) Int {
+    let n = len(s)
+    var i = 0
+    while i + 3 < n {
+        if byte_at(s, i) == 13 && byte_at(s, i + 1) == 10 && byte_at(s, i + 2) == 13 && byte_at(s, i + 3) == 10 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+pure fn parse_decimal_int(s Text) Int {
+    let n = len(s)
+    var i = 0
+    while i < n && (byte_at(s, i) == 32 || byte_at(s, i) == 9) {
+        i += 1
+    }
+    var acc = 0
+    while i < n {
+        let b = byte_at(s, i)
+        if b >= 48 && b <= 57 {
+            acc = acc * 10 + (b - 48)
+            i += 1
+        } else {
+            break
+        }
+    }
+    acc
+}
+
+pure fn parse_hex_int(s Text) Int {
+    let n = len(s)
+    var i = 0
+    while i < n && (byte_at(s, i) == 32 || byte_at(s, i) == 9) {
+        i += 1
+    }
+    var acc = 0
+    while i < n {
+        let b = byte_at(s, i)
+        if b >= 48 && b <= 57 {
+            acc = acc * 16 + (b - 48)
+        } else if b >= 65 && b <= 70 {
+            acc = acc * 16 + (b - 55)
+        } else if b >= 97 && b <= 102 {
+            acc = acc * 16 + (b - 87)
+        } else {
+            break
+        }
+        i += 1
+    }
+    acc
+}
+
+pure fn trim_ascii(s Text) Text {
+    let n = len(s)
+    var a = 0
+    while a < n && (byte_at(s, a) == 32 || byte_at(s, a) == 9 || byte_at(s, a) == 13) {
+        a += 1
+    }
+    var b = n
+    while b > a && (byte_at(s, b - 1) == 32 || byte_at(s, b - 1) == 9 || byte_at(s, b - 1) == 13) {
+        b -= 1
+    }
+    str_slice(s, a, b)
+}
+
+pure fn decode_chunked_body(raw Text, start Int) Option[(Text, Int)] {
+    let n = len(raw)
+    var pos = start
+    var tb = TextBuilder.new()
+    while true {
+        let line_end = find_crlf(raw, pos)
+        if line_end < 0 {
+            let _ = tb.finish()
+            return None
+        }
+        let sz_line = str_slice(raw, pos, line_end)
+        let chunk_sz = parse_hex_int(sz_line)
+        let data_start = line_end + 2
+        if chunk_sz == 0 {
+            if data_start + 2 > n {
+                let _ = tb.finish()
+                return None
+            }
+            return Some((tb.finish(), data_start + 2))
+        }
+        if data_start + chunk_sz + 2 > n {
+            let _ = tb.finish()
+            return None
+        }
+        tb.push_str(str_slice(raw, data_start, data_start + chunk_sz))
+        pos = data_start + chunk_sz + 2
+    }
+    None
+}
+
+// Parse one HTTP/1.1 request from buffer. Returns `Some((req, bytes_consumed))` when complete, `None` if more bytes needed.
+pub pure fn parse_http_request(raw Text) Option[(HttpRequest, Int)] {
+    let hend = find_header_end(raw)
+    if hend < 0 {
+        return None
+    }
+    let line0_end = find_crlf(raw, 0)
+    if line0_end < 0 || line0_end > hend {
+        return None
+    }
+    // Parse request line: `METHOD TARGET HTTP/1.x`
+    var sp1 = 0
+    while sp1 < line0_end && byte_at(raw, sp1) != 32 {
+        sp1 += 1
+    }
+    if sp1 >= line0_end {
+        return None
+    }
+    var sp2 = sp1 + 1
+    while sp2 < line0_end && byte_at(raw, sp2) != 32 {
+        sp2 += 1
+    }
+    let method = str_slice(raw, 0, sp1)
+    let target = str_slice(raw, sp1 + 1, sp2)
+    let version = if sp2 + 1 < line0_end {
+        str_slice(raw, sp2 + 1, line0_end)
+    } else {
+        "HTTP/1.1"
+    }
+
+    // Split target into path and query (`?` == 63)
+    var qidx = 0
+    let tlen = len(target)
+    while qidx < tlen && byte_at(target, qidx) != 63 {
+        qidx += 1
+    }
+    let path = str_slice(target, 0, qidx)
+    let query = if qidx + 1 < tlen {
+        str_slice(target, qidx + 1, tlen)
+    } else {
+        ""
+    }
+
+    // Parse headers
+    var headers List[HttpHeader] = []
+    var content_len = 0
+    var is_chunked = false
+    var keep_alive = version != "HTTP/1.0"
+    var pos = line0_end + 2
+    while pos < hend {
+        let nl = find_crlf(raw, pos)
+        let lend = if nl < 0 || nl > hend { hend } else { nl }
+        var colon = pos
+        while colon < lend && byte_at(raw, colon) != 58 {
+            colon += 1
+        }
+        if colon < lend {
+            let hname = trim_ascii(str_slice(raw, pos, colon))
+            let hval = trim_ascii(str_slice(raw, colon + 1, lend))
+            if ascii_eq_ignore_case(hname, "content-length") {
+                content_len = parse_decimal_int(hval)
+            } else if ascii_eq_ignore_case(hname, "transfer-encoding") {
+                if ascii_eq_ignore_case(hval, "chunked") {
+                    is_chunked = true
+                }
+            } else if ascii_eq_ignore_case(hname, "connection") {
+                if ascii_eq_ignore_case(hval, "close") {
+                    keep_alive = false
+                } else if ascii_eq_ignore_case(hval, "keep-alive") {
+                    keep_alive = true
+                }
+            }
+            headers = push(headers, HttpHeader { name = hname, value = hval })
+        }
+        pos = lend + 2
+    }
+
+    let body_start = hend + 4
+    if is_chunked {
+        match decode_chunked_body(raw, body_start) {
+            Some((body, consumed)) => {
+                let req = HttpRequest {
+                    method = method
+                    target = target
+                    path = path
+                    query = query
+                    headers = headers
+                    body = body
+                    keep_alive = keep_alive
+                }
+                return Some((req, consumed))
+            }
+            None => { return None }
+        }
+    }
+    let total_need = body_start + content_len
+    if len(raw) < total_need {
+        return None
+    }
+    let body = if content_len > 0 {
+        str_slice(raw, body_start, total_need)
+    } else {
+        ""
+    }
+    let req = HttpRequest {
+        method = method
+        target = target
+        path = path
+        query = query
+        headers = headers
+        body = body
+        keep_alive = keep_alive
+    }
+    Some((req, total_need))
+}
+
+pub pure fn encode_http_response(res HttpResponse) Text {
+    var tb = TextBuilder.new()
+    tb.push_str("HTTP/1.1 ")
+    tb.push_str(int_to_text(res.status))
+    tb.push_str(" ")
+    tb.push_str(res.reason)
+    tb.push_str("\r\n")
+    var has_cl = false
+    var has_conn = false
+    var i = 0
+    while i < len(res.headers) {
+        let h = res.headers[i]
+        if ascii_eq_ignore_case(h.name, "content-length") {
+            has_cl = true
+        } else if ascii_eq_ignore_case(h.name, "connection") {
+            has_conn = true
+        }
+        tb.push_str(h.name)
+        tb.push_str(": ")
+        tb.push_str(h.value)
+        tb.push_str("\r\n")
+        i += 1
+    }
+    if !has_cl {
+        tb.push_str("Content-Length: ")
+        tb.push_str(int_to_text(len(res.body)))
+        tb.push_str("\r\n")
+    }
+    if !has_conn {
+        if res.keep_alive {
+            tb.push_str("Connection: keep-alive\r\n")
+        } else {
+            tb.push_str("Connection: close\r\n")
+        }
+    }
+    tb.push_str("\r\n")
+    if len(res.body) > 0 {
+        tb.push_str(res.body)
+    }
+    tb.finish()
+}
+
+pub pure fn encode_http_request(
+    method Text,
+    host Text,
+    target Text,
+    headers List[HttpHeader],
+    body Text,
+    keep_alive Bool
+) Text {
+    var tb = TextBuilder.new()
+    tb.push_str(method)
+    tb.push_str(" ")
+    tb.push_str(target)
+    tb.push_str(" HTTP/1.1\r\nHost: ")
+    tb.push_str(host)
+    tb.push_str("\r\n")
+    var i = 0
+    while i < len(headers) {
+        let h = headers[i]
+        tb.push_str(h.name)
+        tb.push_str(": ")
+        tb.push_str(h.value)
+        tb.push_str("\r\n")
+        i += 1
+    }
+    if len(body) > 0 {
+        tb.push_str("Content-Length: ")
+        tb.push_str(int_to_text(len(body)))
+        tb.push_str("\r\n")
+    }
+    if keep_alive {
+        tb.push_str("Connection: keep-alive\r\n\r\n")
+    } else {
+        tb.push_str("Connection: close\r\n\r\n")
+    }
+    if len(body) > 0 {
+        tb.push_str(body)
+    }
+    tb.finish()
+}
+
+pub pure fn parse_http_response(raw Text) Option[(HttpResponse, Int)] {
+    let hend = find_header_end(raw)
+    if hend < 0 {
+        return None
+    }
+    let line0_end = find_crlf(raw, 0)
+    if line0_end < 0 || line0_end > hend {
+        return None
+    }
+    // Status line: `HTTP/1.1 200 OK`
+    var sp1 = 0
+    while sp1 < line0_end && byte_at(raw, sp1) != 32 {
+        sp1 += 1
+    }
+    var sp2 = sp1 + 1
+    while sp2 < line0_end && byte_at(raw, sp2) != 32 {
+        sp2 += 1
+    }
+    let status = parse_decimal_int(str_slice(raw, sp1 + 1, sp2))
+    let reason = if sp2 + 1 < line0_end {
+        str_slice(raw, sp2 + 1, line0_end)
+    } else {
+        http_status_reason(status)
+    }
+
+    var headers List[HttpHeader] = []
+    var content_len = 0
+    var has_cl = false
+    var is_chunked = false
+    var keep_alive = true
+    var pos = line0_end + 2
+    while pos < hend {
+        let nl = find_crlf(raw, pos)
+        let lend = if nl < 0 || nl > hend { hend } else { nl }
+        var colon = pos
+        while colon < lend && byte_at(raw, colon) != 58 {
+            colon += 1
+        }
+        if colon < lend {
+            let hname = trim_ascii(str_slice(raw, pos, colon))
+            let hval = trim_ascii(str_slice(raw, colon + 1, lend))
+            if ascii_eq_ignore_case(hname, "content-length") {
+                content_len = parse_decimal_int(hval)
+                has_cl = true
+            } else if ascii_eq_ignore_case(hname, "transfer-encoding") {
+                if ascii_eq_ignore_case(hval, "chunked") {
+                    is_chunked = true
+                }
+            } else if ascii_eq_ignore_case(hname, "connection") {
+                if ascii_eq_ignore_case(hval, "close") {
+                    keep_alive = false
+                }
+            }
+            headers = push(headers, HttpHeader { name = hname, value = hval })
+        }
+        pos = lend + 2
+    }
+
+    let body_start = hend + 4
+    if is_chunked {
+        match decode_chunked_body(raw, body_start) {
+            Some((body, consumed)) => {
+                return Some((HttpResponse {
+                    status = status
+                    reason = reason
+                    headers = headers
+                    body = body
+                    keep_alive = keep_alive
+                }, consumed))
+            }
+            None => { return None }
+        }
+    }
+    if has_cl {
+        let total = body_start + content_len
+        if len(raw) < total {
+            return None
+        }
+        let body = if content_len > 0 {
+            str_slice(raw, body_start, total)
+        } else {
+            ""
+        }
+        return Some((HttpResponse {
+            status = status
+            reason = reason
+            headers = headers
+            body = body
+            keep_alive = keep_alive
+        }, total))
+    }
+    let body = str_slice(raw, body_start, len(raw))
+    Some((HttpResponse {
+        status = status
+        reason = reason
+        headers = headers
+        body = body
+        keep_alive = keep_alive
+    }, len(raw)))
+}
+
+// =========================================================================
+// High-Performance Keep-Alive HTTP/1.1 Connection & Multi-Worker Server
+// =========================================================================
+
+pub fn http_serve_conn(fd Int, handler fn(HttpRequest) HttpResponse, max_requests Int) Int {
+    let _ = net_set_nodelay(fd, true)
+    var buf = ""
+    var served = 0
+    var alive = true
+    while alive && (max_requests <= 0 || served < max_requests) {
+        let parsed = parse_http_request(buf)
+        match parsed {
+            Some((req, consumed)) => {
+                let req_ka = req.keep_alive
+                var res = handler(req)
+                if !req_ka {
+                    res = HttpResponse {
+                        status = res.status
+                        reason = res.reason
+                        headers = res.headers
+                        body = res.body
+                        keep_alive = false
+                    }
+                }
+                let wire = encode_http_response(res)
+                let wn = net_write_text(fd, wire)
+                served += 1
+                if wn < 0 || !res.keep_alive {
+                    alive = false
+                } else {
+                    if consumed < len(buf) {
+                        buf = str_slice(buf, consumed, len(buf))
+                    } else {
+                        buf = ""
+                    }
+                }
+            }
+            None => {
+                let chunk = net_read_text(fd, 16384)
+                if len(chunk) == 0 {
+                    alive = false
+                } else {
+                    buf = buf ++ chunk
+                }
+            }
+        }
+    }
+    let _ = net_close(fd)
+    served
+}
+
+/// Bind an HTTP/1.1 server on `addr` (e.g. `"127.0.0.1:0"`), write bound port into `port_out`,
+/// accept connections via OS `kqueue`/`epoll` Reactor, and dispatch persistent Keep-Alive
+/// connections across `workers` OS threads until `stop != 0`.
+pub fn http_serve_reactor(
+    addr Text,
+    workers Int,
+    port_out AtomicInt,
+    stop AtomicInt,
+    handler fn(HttpRequest) HttpResponse
+) Int {
+    let lfd = net_tcp_listen(addr)
+    if lfd < 0 {
+        port_out.store(-1, ORDER_SEQ_CST)
+        return -1
+    }
+    let port = net_tcp_local_port(lfd)
+    let _ = net_set_nonblocking(lfd, true)
+    let rfd = reactor_new()
+    let _ = reactor_add(rfd, lfd, EVENT_READ, 1)
+
+    let conn_ch Channel[Int] = chan_new()
+    let total_reqs = atomic_new(0)
+    let nworkers = if workers < 1 { 1 } else { workers }
+    var threads List[Thread] = []
+    var wi = 0
+    while wi < nworkers {
+        let th = thread_start(|| {
+            var count = 0
+            var running = true
+            while running {
+                match conn_ch.recv() {
+                    Some(cfd) => {
+                        let n = http_serve_conn(cfd, handler, 0)
+                        count += n
+                    }
+                    None => {
+                        running = false
+                    }
+                }
+            }
+            total_reqs.fetch_add(count, ORDER_SEQ_CST)
+            count
+        })
+        threads = push(threads, th)
+        wi += 1
+    }
+
+    // Signal callers that the server is listening and workers are ready!
+    port_out.store(port, ORDER_SEQ_CST)
+
+    while stop.load(ORDER_SEQ_CST) == 0 {
+        let evs = reactor_wait(rfd, 15, 64)
+        var ei = 0
+        while ei < len(evs) {
+            // Drain all pending incoming connections on the non-blocking listener
+            var accepting = true
+            while accepting {
+                let cfd = net_tcp_accept(lfd)
+                if cfd >= 0 {
+                    let _ = net_set_nonblocking(cfd, false)
+                    let _ = conn_ch.send(cfd)
+                } else {
+                    accepting = false
+                }
+            }
+            ei += 1
+        }
+    }
+
+    conn_ch.close()
+    var ti = 0
+    while ti < len(threads) {
+        let _ = threads[ti].join()
+        ti += 1
+    }
+    let _ = reactor_del(rfd, lfd)
+    let _ = reactor_close(rfd)
+    let _ = net_close(lfd)
+    total_reqs.load(ORDER_SEQ_CST)
+}
+
+// =========================================================================
+// High-Performance HTTP/1.1 Client (Persistent Keep-Alive + One-Shot Helpers)
+// =========================================================================
+
+pub record HttpConn {
+    fd   Int
+    host Text
+    buf  Text
+}
+
+pub fn http_connect(host_port Text) Result[HttpConn, Text] {
+    let fd = net_tcp_connect(host_port)
+    if fd < 0 {
+        Err("failed to connect to " ++ host_port)
+    } else {
+        let _ = net_set_nodelay(fd, true)
+        Ok(HttpConn { fd = fd, host = host_port, buf = "" })
+    }
+}
+
+impl HttpConn {
+    pub fn send_request(
+        inout self,
+        method Text,
+        target Text,
+        headers List[HttpHeader],
+        body Text,
+        keep_alive Bool
+    ) Result[HttpResponse, Text] {
+        let wire = encode_http_request(method, self.host, target, headers, body, keep_alive)
+        let wn = net_write_text(self.fd, wire)
+        if wn < 0 {
+            return Err("write failed")
+        }
+        while true {
+            match parse_http_response(self.buf) {
+                Some((res, consumed)) => {
+                    if consumed < len(self.buf) {
+                        self.buf = str_slice(self.buf, consumed, len(self.buf))
+                    } else {
+                        self.buf = ""
+                    }
+                    return Ok(res)
+                }
+                None => {
+                    let chunk = net_read_text(self.fd, 16384)
+                    if len(chunk) == 0 {
+                        return Err("unexpected EOF while reading HTTP response")
+                    }
+                    self.buf = self.buf ++ chunk
+                }
+            }
+        }
+        Err("unreachable")
+    }
+
+    pub fn get(inout self, target Text) Result[HttpResponse, Text] {
+        self.send_request("GET", target, [], "", true)
+    }
+
+    pub fn post(inout self, target Text, content_type Text, body Text) Result[HttpResponse, Text] {
+        let hs = [HttpHeader { name = "Content-Type", value = content_type }]
+        self.send_request("POST", target, hs, body, true)
+    }
+
+    pub fn close(self) {
+        let _ = net_close(self.fd)
+    }
+}
+
+pub fn http_get(host_port Text, target Text) Result[HttpResponse, Text] {
+    var conn = http_connect(host_port)?
+    let res = conn.send_request("GET", target, [], "", false)
+    conn.close()
+    res
+}
+
+pub fn http_post(host_port Text, target Text, content_type Text, body Text) Result[HttpResponse, Text] {
+    var conn = http_connect(host_port)?
+    let hs = [HttpHeader { name = "Content-Type", value = content_type }]
+    let res = conn.send_request("POST", target, hs, body, false)
+    conn.close()
+    res
+}

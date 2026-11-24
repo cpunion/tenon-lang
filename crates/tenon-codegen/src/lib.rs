@@ -156,9 +156,21 @@ pub(crate) const CORE_SYSCALLS: &[CoreSyscallSpec] = &[
     CoreSyscallSpec { tenon_name: "net_tcp_accept", c_symbol: "tenon_net_tcp_accept", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     CoreSyscallSpec { tenon_name: "net_tcp_connect", c_symbol: "tenon_net_tcp_connect", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     CoreSyscallSpec { tenon_name: "net_set_nonblocking", c_symbol: "tenon_net_set_nonblocking", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "net_set_nodelay", c_symbol: "tenon_net_set_nodelay", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "net_last_would_block", c_symbol: "tenon_net_last_would_block", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
     CoreSyscallSpec { tenon_name: "net_read", c_symbol: "tenon_net_read", arity: 2, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
+    CoreSyscallSpec { tenon_name: "net_read_text", c_symbol: "tenon_net_read_text", arity: 2, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
     CoreSyscallSpec { tenon_name: "net_write", c_symbol: "tenon_net_write", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "net_write_text", c_symbol: "tenon_net_write_text", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     CoreSyscallSpec { tenon_name: "net_close", c_symbol: "tenon_net_close", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    // 8b. OS Event Reactor (kqueue/epoll) & Monotonic Clock
+    CoreSyscallSpec { tenon_name: "reactor_new", c_symbol: "tenon_reactor_new", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "reactor_add", c_symbol: "tenon_reactor_add", arity: 4, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "reactor_del", c_symbol: "tenon_reactor_del", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "reactor_wait", c_symbol: "tenon_reactor_wait", arity: 3, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "List[Int]" },
+    CoreSyscallSpec { tenon_name: "reactor_close", c_symbol: "tenon_reactor_close", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "time_now_ms", c_symbol: "tenon_time_now_ms", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "time_now_ns", c_symbol: "tenon_time_now_ns", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     // 9. S3 SIMD vector operations
     CoreSyscallSpec { tenon_name: "simd_f32x4_new", c_symbol: "tenon_simd_f32x4_new", arity: 4, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Float32x4" },
     CoreSyscallSpec { tenon_name: "simd_f32x4_splat", c_symbol: "tenon_simd_f32x4_splat", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Float32x4" },
@@ -494,9 +506,20 @@ impl JitProgram {
         jit_builder.symbol("tenon_net_tcp_accept", systems::tenon_net_tcp_accept as *const u8);
         jit_builder.symbol("tenon_net_tcp_connect", systems::tenon_net_tcp_connect as *const u8);
         jit_builder.symbol("tenon_net_set_nonblocking", systems::tenon_net_set_nonblocking as *const u8);
+        jit_builder.symbol("tenon_net_set_nodelay", systems::tenon_net_set_nodelay as *const u8);
+        jit_builder.symbol("tenon_net_last_would_block", systems::tenon_net_last_would_block as *const u8);
         jit_builder.symbol("tenon_net_read", systems::tenon_net_read as *const u8);
+        jit_builder.symbol("tenon_net_read_text", systems::tenon_net_read_text as *const u8);
         jit_builder.symbol("tenon_net_write", systems::tenon_net_write as *const u8);
+        jit_builder.symbol("tenon_net_write_text", systems::tenon_net_write_text as *const u8);
         jit_builder.symbol("tenon_net_close", systems::tenon_net_close as *const u8);
+        jit_builder.symbol("tenon_reactor_new", systems::tenon_reactor_new as *const u8);
+        jit_builder.symbol("tenon_reactor_add", systems::tenon_reactor_add as *const u8);
+        jit_builder.symbol("tenon_reactor_del", systems::tenon_reactor_del as *const u8);
+        jit_builder.symbol("tenon_reactor_wait", systems::tenon_reactor_wait as *const u8);
+        jit_builder.symbol("tenon_reactor_close", systems::tenon_reactor_close as *const u8);
+        jit_builder.symbol("tenon_time_now_ms", systems::tenon_time_now_ms as *const u8);
+        jit_builder.symbol("tenon_time_now_ns", systems::tenon_time_now_ns as *const u8);
         jit_builder.symbol("tenon_simd_f32x4_new", systems::tenon_simd_f32x4_new as *const u8);
         jit_builder.symbol("tenon_simd_f32x4_splat", systems::tenon_simd_f32x4_splat as *const u8);
         jit_builder.symbol("tenon_simd_f32x4_lane", systems::tenon_simd_f32x4_lane as *const u8);

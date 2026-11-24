@@ -182,9 +182,21 @@ const BUILTIN_SIGS: &[BuiltinSig] = &[
     BuiltinSig { name: "net_tcp_accept", arity: 1, is_pure: false, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
     BuiltinSig { name: "net_tcp_connect", arity: 1, is_pure: false, allocates: false, param_types: &["Text"], ret_type: "Int" },
     BuiltinSig { name: "net_set_nonblocking", arity: 2, is_pure: false, allocates: false, param_types: &["AnyInt", "Bool"], ret_type: "Bool" },
+    BuiltinSig { name: "net_set_nodelay", arity: 2, is_pure: false, allocates: false, param_types: &["AnyInt", "Bool"], ret_type: "Bool" },
+    BuiltinSig { name: "net_last_would_block", arity: 0, is_pure: false, allocates: false, param_types: &[], ret_type: "Bool" },
     BuiltinSig { name: "net_read", arity: 2, is_pure: false, allocates: true, param_types: &["AnyInt", "AnyInt"], ret_type: "Bytes" },
+    BuiltinSig { name: "net_read_text", arity: 2, is_pure: false, allocates: true, param_types: &["AnyInt", "AnyInt"], ret_type: "Text" },
     BuiltinSig { name: "net_write", arity: 2, is_pure: false, allocates: false, param_types: &["AnyInt", "Any"], ret_type: "Int" },
+    BuiltinSig { name: "net_write_text", arity: 2, is_pure: false, allocates: false, param_types: &["AnyInt", "Text"], ret_type: "Int" },
     BuiltinSig { name: "net_close", arity: 1, is_pure: false, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
+    // OS Event Reactor (kqueue/epoll) & Monotonic Clock
+    BuiltinSig { name: "reactor_new", arity: 0, is_pure: false, allocates: false, param_types: &[], ret_type: "Int" },
+    BuiltinSig { name: "reactor_add", arity: 4, is_pure: false, allocates: false, param_types: &["AnyInt", "AnyInt", "AnyInt", "AnyInt"], ret_type: "Bool" },
+    BuiltinSig { name: "reactor_del", arity: 2, is_pure: false, allocates: false, param_types: &["AnyInt", "AnyInt"], ret_type: "Bool" },
+    BuiltinSig { name: "reactor_wait", arity: 3, is_pure: false, allocates: true, param_types: &["AnyInt", "AnyInt", "AnyInt"], ret_type: "List[Int]" },
+    BuiltinSig { name: "reactor_close", arity: 1, is_pure: false, allocates: false, param_types: &["AnyInt"], ret_type: "Int" },
+    BuiltinSig { name: "time_now_ms", arity: 0, is_pure: false, allocates: false, param_types: &[], ret_type: "Int" },
+    BuiltinSig { name: "time_now_ns", arity: 0, is_pure: false, allocates: false, param_types: &[], ret_type: "Int" },
     // S3: SIMD vector primitives
     BuiltinSig { name: "simd_f32x4_new", arity: 4, is_pure: true, allocates: false, param_types: &["Float32", "Float32", "Float32", "Float32"], ret_type: "Float32x4" },
     BuiltinSig { name: "simd_f32x4_splat", arity: 1, is_pure: true, allocates: false, param_types: &["Float32"], ret_type: "Float32x4" },
@@ -312,6 +324,8 @@ struct CheckerCtx {
     cur_type_param_bounds: BTreeMap<String, Vec<String>>,
     in_unsafe: bool,
     cur_file_id: u32,
+    file_packages: Vec<u32>,
+    test_file_ids: BTreeSet<u32>,
     proofs: Vec<ProofRecord>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -393,6 +407,7 @@ fn iface_method_to_fn_decl(m: &InterfaceMethodDecl, self_ty: &TypeExpr) -> FnDec
         is_async: m.is_async,
         is_test: false,
         is_unsafe: false,
+        is_comptime: false,
         name: m.name.clone(),
         type_params: m.type_params.clone(),
         type_param_bounds: m.type_param_bounds.clone(),
@@ -566,6 +581,13 @@ impl CheckerCtx {
             }
             false
         };
+        let mut consts: BTreeMap<String, (ConstDecl, Option<i64>, Option<f64>)> = BTreeMap::new();
+        for c in raw_consts {
+            let iv = eval_const_int(&c.value, &consts, &layout);
+            let fv = eval_const_float(&c.value, &consts);
+            consts.insert(c.name.clone(), (c, iv, fv));
+        }
+
         let mut smt_pure_fns: BTreeMap<String, FnDecl> = BTreeMap::new();
         loop {
             let mut added = false;
@@ -575,25 +597,30 @@ impl CheckerCtx {
                 }
                 let ret_ok = f.ret_ty.as_ref().is_some_and(&is_scalar_smt_ty);
                 let params_ok = f.params.iter().all(|p| is_scalar_smt_ty(&p.ty));
-                if !ret_ok || !params_ok || !crate::smt::can_encode_pure_fn(f) {
+                if !ret_ok || !params_ok {
                     continue;
                 }
-                let callees = crate::smt::pure_fn_callees(f);
+                let mut f_inlined = f.clone();
+                inline_int_consts_in_block(&mut f_inlined.body, &consts);
+                let mut bound: BTreeSet<String> = f_inlined.params.iter().map(|p| p.name.clone()).collect();
+                let mut free = BTreeSet::new();
+                collect_captured_idents_block(&f_inlined.body, &mut bound, &mut free);
+                // Ignore pure fn calls when checking unbound identifiers
+                let callees = crate::smt::pure_fn_callees(&f_inlined);
+                for c in &callees {
+                    free.remove(c);
+                }
+                if !free.is_empty() || !crate::smt::can_encode_pure_fn(&f_inlined) {
+                    continue;
+                }
                 if callees.iter().all(|c| c != name && smt_pure_fns.contains_key(c)) {
-                    smt_pure_fns.insert(name.clone(), f.clone());
+                    smt_pure_fns.insert(name.clone(), f_inlined);
                     added = true;
                 }
             }
             if !added {
                 break;
             }
-        }
-
-        let mut consts: BTreeMap<String, (ConstDecl, Option<i64>, Option<f64>)> = BTreeMap::new();
-        for c in raw_consts {
-            let iv = eval_const_int(&c.value, &consts, &layout);
-            let fv = eval_const_float(&c.value, &consts);
-            consts.insert(c.name.clone(), (c, iv, fv));
         }
 
         Self {
@@ -619,9 +646,20 @@ impl CheckerCtx {
             cur_type_param_bounds: BTreeMap::new(),
             in_unsafe: false,
             cur_file_id: 0,
+            file_packages: program.file_packages.clone(),
+            test_file_ids: program.test_file_ids.iter().copied().collect(),
             proofs: Vec::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    fn same_package(&self, file_a: u32, file_b: u32) -> bool {
+        if file_a == 0 || file_b == 0 || file_a == file_b {
+            return true;
+        }
+        let pa = self.file_packages.get(file_a as usize).copied().unwrap_or(0);
+        let pb = self.file_packages.get(file_b as usize).copied().unwrap_or(0);
+        pa != 0 && pa == pb
     }
 
     fn check_all(&mut self, program: &Program) {
@@ -1590,13 +1628,32 @@ impl CheckerCtx {
                 }
             }
             ExprKind::Cast { ty, .. } => ty.clone(),
-            ExprKind::Unsafe(b) => {
+            ExprKind::Unsafe(b) | ExprKind::Comptime(b) => {
                 if let Some(t) = &b.tail {
                     self.infer_expr_type_expected(t, expected, var_types)
                 } else {
                     named_ty("Any")
                 }
             }
+            ExprKind::ComptimeIf { then_block, else_branch, .. } => {
+                if let Some(exp) = expected {
+                    return exp.clone();
+                }
+                if let Some(t) = &then_block.tail {
+                    let tt = self.infer_expr_type_expected(t, expected, var_types);
+                    if tt.display_name() != "Any" {
+                        return tt;
+                    }
+                }
+                if let Some(eb) = else_branch {
+                    return self.infer_expr_type_expected(eb, expected, var_types);
+                }
+                named_ty("Any")
+            }
+            ExprKind::ComptimeFor { .. } | ExprKind::MacroCall { .. } => {
+                expected.cloned().unwrap_or_else(|| named_ty("Any"))
+            }
+            ExprKind::TypeImplements { .. } => named_ty("Bool"),
             ExprKind::Tuple(elems) => TypeExpr::Tuple(
                 elems.iter().map(|e| self.infer_expr_type(e, var_types)).collect(),
                 expr.span,
@@ -1832,6 +1889,44 @@ impl CheckerCtx {
                                 return subst_type_expr(rt, &subst);
                             }
                         }
+                    } else if let ExprKind::Field { target, field } = &inner.kind {
+                        if let ExprKind::Ident(tname) = &target.kind {
+                            if !var_types.contains_key(tname) {
+                                if let Some(m) = self.resolve_assoc_method_sig(tname, field) {
+                                    let mut subst = BTreeMap::new();
+                                    for (tp, ta) in m.type_params.iter().zip(type_args.iter()) {
+                                        subst.insert(tp.clone(), ta.clone());
+                                    }
+                                    let mut pre = m.clone();
+                                    for p in &mut pre.params {
+                                        p.ty = subst_type_expr(&p.ty, &subst);
+                                    }
+                                    if let Some(rt) = &pre.ret_ty {
+                                        pre.ret_ty = Some(subst_type_expr(rt, &subst));
+                                    }
+                                    pre.type_params.retain(|tp| !subst.contains_key(tp));
+                                    let inst = self.instantiate_assoc_method_from_args(&pre, args, var_types);
+                                    return inst.ret_ty.unwrap_or_else(|| named_ty("Any"));
+                                }
+                            }
+                        }
+                        let recv_ty = self.infer_expr_type(target, var_types);
+                        if let Some(m) = self.resolve_method_sig(&recv_ty, field) {
+                            let mut subst = BTreeMap::new();
+                            for (tp, ta) in m.type_params.iter().zip(type_args.iter()) {
+                                subst.insert(tp.clone(), ta.clone());
+                            }
+                            let mut pre = m.clone();
+                            for p in &mut pre.params {
+                                p.ty = subst_type_expr(&p.ty, &subst);
+                            }
+                            if let Some(rt) = &pre.ret_ty {
+                                pre.ret_ty = Some(subst_type_expr(rt, &subst));
+                            }
+                            pre.type_params.retain(|tp| !subst.contains_key(tp));
+                            let inst = self.instantiate_method_from_args(&pre, true, args, var_types);
+                            return inst.ret_ty.unwrap_or_else(|| named_ty("Any"));
+                        }
                     }
                     named_ty("Any")
                 }
@@ -1941,6 +2036,8 @@ impl CheckerCtx {
                     if let Some(b) = lookup_builtin(fname) {
                         return if b.ret_type == "List[Any]" {
                             generic_ty("List", vec![named_ty("Any")])
+                        } else if b.ret_type == "List[Int]" {
+                            generic_ty("List", vec![named_ty("Int")])
                         } else if b.ret_type == "Option[Any]" {
                             generic_ty("Option", vec![named_ty("Any")])
                         } else if b.ret_type == "Result[Any, Any]" {
@@ -4993,6 +5090,139 @@ impl CheckerCtx {
                                 );
                                 lambdas_checked = true;
                             }
+                        } else if let ExprKind::Field { target, field } = &inner.kind {
+                            let mut handled_assoc = false;
+                            if let ExprKind::Ident(tname) = &target.kind {
+                                if !var_types.contains_key(tname) {
+                                    if let Some(mdecl) = self.resolve_assoc_method_sig(tname, field) {
+                                        let mut tsubst = BTreeMap::new();
+                                        for (tp, ta) in mdecl.type_params.iter().zip(type_args.iter()) {
+                                            tsubst.insert(tp.clone(), ta.clone());
+                                            if let Some(bounds) = mdecl.type_param_bounds.get(tp) {
+                                                for b in bounds {
+                                                    if !self.type_implements(ta, b) {
+                                                        self.diagnostics.push(Diagnostic {
+                                                            code: "E0505".into(),
+                                                            message: format!(
+                                                                "type `{}` does not satisfy interface bound `{}` for type parameter `{}` of `{}.{}`",
+                                                                ta.display_name(),
+                                                                b,
+                                                                tp,
+                                                                tname,
+                                                                field
+                                                            ),
+                                                            span: expr.span,
+                                                            notes: vec![format!("add `impl {} for {} {{ ... }}`", b, ta.display_name())],
+                                                            counterexample: BTreeMap::new(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let mut pre = mdecl.clone();
+                                        for p in &mut pre.params {
+                                            p.ty = subst_type_expr(&p.ty, &tsubst);
+                                        }
+                                        if let Some(rt) = &pre.ret_ty {
+                                            pre.ret_ty = Some(subst_type_expr(rt, &tsubst));
+                                        }
+                                        pre.type_params.retain(|tp| !tsubst.contains_key(tp));
+                                        let inst = self.instantiate_assoc_method_from_args(&pre, args, var_types);
+                                        self.check_method_call_contract(
+                                            &format!("{}.{}", tname, field),
+                                            &inst,
+                                            None,
+                                            args,
+                                            cur_fn,
+                                            env,
+                                            smt_int_vars,
+                                            smt_premises,
+                                            var_types,
+                                            mutable_vars,
+                                            active_mutate,
+                                            expr.span,
+                                        );
+                                        lambdas_checked = true;
+                                        handled_assoc = true;
+                                    }
+                                }
+                            }
+                            if !handled_assoc {
+                                self.check_expr(
+                                    target,
+                                    cur_fn,
+                                    env,
+                                    smt_int_vars,
+                                    smt_premises,
+                                    var_types,
+                                    mutable_vars,
+                                    active_mutate,
+                                    saw_return,
+                                );
+                                let recv_ty = self.infer_expr_type(target, var_types);
+                                if let Some(mdecl) = self.resolve_method_sig(&recv_ty, field) {
+                                    let mut tsubst = BTreeMap::new();
+                                    for (tp, ta) in mdecl.type_params.iter().zip(type_args.iter()) {
+                                        tsubst.insert(tp.clone(), ta.clone());
+                                        if let Some(bounds) = mdecl.type_param_bounds.get(tp) {
+                                            for b in bounds {
+                                                if !self.type_implements(ta, b) {
+                                                    self.diagnostics.push(Diagnostic {
+                                                        code: "E0505".into(),
+                                                        message: format!(
+                                                            "type `{}` does not satisfy interface bound `{}` for type parameter `{}` of `{}.{}`",
+                                                            ta.display_name(),
+                                                            b,
+                                                            tp,
+                                                            recv_ty.display_name(),
+                                                            field
+                                                        ),
+                                                        span: expr.span,
+                                                        notes: vec![format!("add `impl {} for {} {{ ... }}`", b, ta.display_name())],
+                                                        counterexample: BTreeMap::new(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let mut pre = mdecl.clone();
+                                    for p in &mut pre.params {
+                                        p.ty = subst_type_expr(&p.ty, &tsubst);
+                                    }
+                                    if let Some(rt) = &pre.ret_ty {
+                                        pre.ret_ty = Some(subst_type_expr(rt, &tsubst));
+                                    }
+                                    pre.type_params.retain(|tp| !tsubst.contains_key(tp));
+                                    let inst = self.instantiate_method_from_args(&pre, true, args, var_types);
+                                    self.check_method_call_contract(
+                                        &format!("{}.{}", recv_ty.display_name(), field),
+                                        &inst,
+                                        Some(target),
+                                        args,
+                                        cur_fn,
+                                        env,
+                                        smt_int_vars,
+                                        smt_premises,
+                                        var_types,
+                                        mutable_vars,
+                                        active_mutate,
+                                        expr.span,
+                                    );
+                                    lambdas_checked = true;
+                                } else if recv_ty.display_name() != "Any" {
+                                    self.diagnostics.push(Diagnostic {
+                                        code: "E0207".into(),
+                                        message: format!(
+                                            "unknown method `{}` on type `{}`",
+                                            field,
+                                            recv_ty.display_name()
+                                        ),
+                                        span: expr.span,
+                                        notes: vec![],
+                                        counterexample: BTreeMap::new(),
+                                    });
+                                }
+                            }
                         }
                     }
                     ExprKind::Ident(fname) => {
@@ -5041,22 +5271,67 @@ impl CheckerCtx {
                                     counterexample: BTreeMap::new(),
                                 });
                             }
-                            if self.cur_file_id != 0
-                                && fdecl.span.file_id != 0
-                                && self.cur_file_id != fdecl.span.file_id
+                            if !self.same_package(self.cur_file_id, fdecl.span.file_id)
                                 && !fdecl.is_pub
                                 && !fdecl.name.starts_with("__")
                             {
                                 self.diagnostics.push(Diagnostic {
                                     code: "E0105".into(),
                                     message: format!(
-                                        "private function `{}` cannot be accessed outside its defining module",
+                                        "private function `{}` cannot be accessed outside its defining package",
                                         fname
                                     ),
                                     span: expr.span,
                                     notes: vec![format!("mark `pub fn {}` to export it", fname)],
                                     counterexample: BTreeMap::new(),
                                 });
+                            }
+                            if self.cur_file_id != 0
+                                && !self.test_file_ids.contains(&self.cur_file_id)
+                                && self.test_file_ids.contains(&fdecl.span.file_id)
+                            {
+                                self.diagnostics.push(Diagnostic {
+                                    code: "E0107".into(),
+                                    message: format!(
+                                        "production code cannot depend on test-only function `{}`",
+                                        fname
+                                    ),
+                                    span: expr.span,
+                                    notes: vec!["move shared helpers out of `*_test.tn` into a production file".into()],
+                                    counterexample: BTreeMap::new(),
+                                });
+                            }
+                            // MVS Send thread-safety boundary check on `thread_start(|| { ... })`
+                            if fname == "thread_start" && !self.in_unsafe {
+                                if let Some(arg0) = args.first() {
+                                    if let ExprKind::Lambda { params: lps, body: lbody, .. } = &arg0.value.kind {
+                                        let mut bound: BTreeSet<String> = lps.iter().map(|p| p.name.clone()).collect();
+                                        let mut captured = BTreeSet::new();
+                                        collect_captured_idents_expr(lbody, &mut bound, &mut captured);
+                                        for cap in captured {
+                                            if let Some(cty) = var_types.get(&cap) {
+                                                let base = self.resolve_base_type(cty);
+                                                if matches!(
+                                                    &base,
+                                                    TypeExpr::Named { name, .. }
+                                                        if matches!(name.as_str(), "Ptr" | "MutPtr" | "CStr")
+                                                ) {
+                                                    self.diagnostics.push(Diagnostic {
+                                                        code: "E0810".into(),
+                                                        message: format!(
+                                                            "cannot capture non-Send raw pointer `{}` (`{}`) across OS thread boundary outside `unsafe`",
+                                                            cap,
+                                                            cty.display_name()
+                                                        ),
+                                                        span: arg0.value.span,
+                                                        notes: vec!["use `AtomicInt`, `Mutex[T]`, `Channel[T]`, or value types for thread-safe sharing".into()],
+                                                        counterexample: BTreeMap::new(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             self.check_direct_fn_call(
                                 fname,
@@ -5126,6 +5401,37 @@ impl CheckerCtx {
                         } else if let Some(vi) = self.enum_variants.get(fname).cloned() {
                             self.check_variant_ctor_args(fname, &vi, args, var_types, expr.span);
                         } else if let Some(b) = lookup_builtin(fname) {
+                            if fname == "thread_spawn" && !self.in_unsafe {
+                                if let Some(arg0) = args.first() {
+                                    if let ExprKind::Lambda { params: lps, body: lbody, .. } = &arg0.value.kind {
+                                        let mut bound: BTreeSet<String> = lps.iter().map(|p| p.name.clone()).collect();
+                                        let mut captured = BTreeSet::new();
+                                        collect_captured_idents_expr(lbody, &mut bound, &mut captured);
+                                        for cap in captured {
+                                            if let Some(cty) = var_types.get(&cap) {
+                                                let base = self.resolve_base_type(cty);
+                                                if matches!(
+                                                    &base,
+                                                    TypeExpr::Named { name, .. }
+                                                        if matches!(name.as_str(), "Ptr" | "MutPtr" | "CStr")
+                                                ) {
+                                                    self.diagnostics.push(Diagnostic {
+                                                        code: "E0810".into(),
+                                                        message: format!(
+                                                            "cannot capture non-Send raw pointer `{}` (`{}`) across OS thread boundary outside `unsafe`",
+                                                            cap,
+                                                            cty.display_name()
+                                                        ),
+                                                        span: arg0.value.span,
+                                                        notes: vec!["MVS value types (`Int`/`Float`/`Text`/`Bytes`/`Record`/`List`/`Map`) and `AtomicInt`/`Mutex`/`Channel` are `Send`; raw pointers require `unsafe`".into()],
+                                                        counterexample: BTreeMap::new(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if is_unsafe_builtin(fname) && !self.in_unsafe {
                                 self.diagnostics.push(Diagnostic {
                                     code: "E0800".into(),
@@ -6508,6 +6814,7 @@ impl CheckerCtx {
             is_async: false,
             is_test: false,
             is_unsafe: false,
+        is_comptime: false,
             name: "<lambda>".into(),
             type_params: vec![],
             type_param_bounds: BTreeMap::new(),
@@ -7447,5 +7754,166 @@ fn is_untyped_float_expr(expr: &Expr) -> bool {
             expr: inner,
         } => is_untyped_float_expr(inner),
         _ => false,
+    }
+}
+
+fn collect_captured_idents_expr(
+    expr: &Expr,
+    bound: &mut BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::Ident(s) => {
+            if !bound.contains(s) {
+                out.insert(s.clone());
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_captured_idents_expr(left, bound, out);
+            collect_captured_idents_expr(right, bound, out);
+        }
+        ExprKind::Unary { expr: e, .. }
+        | ExprKind::Field { target: e, .. }
+        | ExprKind::TupleIndex { target: e, .. }
+        | ExprKind::Cast { expr: e, .. }
+        | ExprKind::Try(e)
+        | ExprKind::Await(e) => collect_captured_idents_expr(e, bound, out),
+        ExprKind::Call { callee, args } => {
+            collect_captured_idents_expr(callee, bound, out);
+            for a in args {
+                collect_captured_idents_expr(&a.value, bound, out);
+            }
+        }
+        ExprKind::Index { target, index } => {
+            collect_captured_idents_expr(target, bound, out);
+            collect_captured_idents_expr(index, bound, out);
+        }
+        ExprKind::List(es) | ExprKind::Tuple(es) => {
+            for e in es {
+                collect_captured_idents_expr(e, bound, out);
+            }
+        }
+        ExprKind::RecordLit { fields, .. } => {
+            for (_, v) in fields {
+                collect_captured_idents_expr(v, bound, out);
+            }
+        }
+        ExprKind::If { cond, then_block, else_branch } => {
+            collect_captured_idents_expr(cond, bound, out);
+            collect_captured_idents_block(then_block, bound, out);
+            if let Some(eb) = else_branch {
+                collect_captured_idents_expr(eb, bound, out);
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => collect_captured_idents_block(b, bound, out),
+        ExprKind::Match { scrutinee, arms } => {
+            collect_captured_idents_expr(scrutinee, bound, out);
+            for arm in arms {
+                collect_captured_idents_expr(&arm.body, bound, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_captured_idents_block(
+    blk: &Block,
+    bound: &mut BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    let saved = bound.clone();
+    for s in &blk.stmts {
+        match s {
+            Stmt::Let { name, value, .. } => {
+                collect_captured_idents_expr(value, bound, out);
+                bound.insert(name.clone());
+            }
+            Stmt::Assign { target, value, .. } => {
+                collect_captured_idents_expr(target, bound, out);
+                collect_captured_idents_expr(value, bound, out);
+            }
+            Stmt::Expr { expr, .. }
+            | Stmt::Assert { cond: expr, .. }
+            | Stmt::Return { value: Some(expr), .. } => {
+                collect_captured_idents_expr(expr, bound, out);
+            }
+            Stmt::While { cond, body, .. } => {
+                collect_captured_idents_expr(cond, bound, out);
+                collect_captured_idents_block(body, bound, out);
+            }
+            Stmt::For { iter, body, .. } => {
+                collect_captured_idents_expr(iter, bound, out);
+                collect_captured_idents_block(body, bound, out);
+            }
+            Stmt::Defer { body, .. } | Stmt::Mutate { body, .. } => {
+                collect_captured_idents_block(body, bound, out);
+            }
+            _ => {}
+        }
+    }
+    if let Some(t) = &blk.tail {
+        collect_captured_idents_expr(t, bound, out);
+    }
+    *bound = saved;
+}
+
+fn inline_int_consts_in_block(
+    blk: &mut Block,
+    consts: &BTreeMap<String, (ConstDecl, Option<i64>, Option<f64>)>,
+) {
+    for s in &mut blk.stmts {
+        match s {
+            Stmt::Let { value, .. } => inline_int_consts_in_expr(value, consts),
+            Stmt::Return { value: Some(e), .. } | Stmt::Expr { expr: e, .. } => {
+                inline_int_consts_in_expr(e, consts)
+            }
+            _ => {}
+        }
+    }
+    if let Some(t) = &mut blk.tail {
+        inline_int_consts_in_expr(t, consts);
+    }
+}
+
+fn inline_int_consts_in_expr(
+    expr: &mut Expr,
+    consts: &BTreeMap<String, (ConstDecl, Option<i64>, Option<f64>)>,
+) {
+    if let ExprKind::Ident(name) = &expr.kind {
+        if let Some((_, Some(iv), _)) = consts.get(name) {
+            expr.kind = ExprKind::Int(*iv);
+            return;
+        }
+    }
+    match &mut expr.kind {
+        ExprKind::Binary { left, right, .. } => {
+            inline_int_consts_in_expr(left, consts);
+            inline_int_consts_in_expr(right, consts);
+        }
+        ExprKind::Unary { expr: e, .. } => inline_int_consts_in_expr(e, consts),
+        ExprKind::Call { args, .. } => {
+            for a in args {
+                inline_int_consts_in_expr(&mut a.value, consts);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_branch,
+        } => {
+            inline_int_consts_in_expr(cond, consts);
+            inline_int_consts_in_block(then_block, consts);
+            if let Some(eb) = else_branch {
+                inline_int_consts_in_expr(eb, consts);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            inline_int_consts_in_expr(scrutinee, consts);
+            for a in arms {
+                inline_int_consts_in_expr(&mut a.body, consts);
+            }
+        }
+        ExprKind::Block(b) => inline_int_consts_in_block(b, consts),
+        _ => {}
     }
 }

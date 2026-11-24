@@ -675,12 +675,36 @@ int64_t tenon_chan_close(int64_t ch_ptr) {
 "#;
 
 pub(crate) const TENON_AOT_NET_C: &str = r#"
-/* ===== Tenon POSIX Non-Blocking TCP Sockets ===== */
+/* ===== Tenon POSIX Non-Blocking TCP Sockets, kqueue/epoll Reactor & Clock ===== */
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/event.h>
+#elif defined(__linux__)
+#include <sys/epoll.h>
+#endif
+
+static _Thread_local int tenon_last_eagain = 0;
+
+int64_t tenon_time_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+
+int64_t tenon_time_now_ms(void) {
+    return tenon_time_now_ns() / 1000000LL;
+}
+
+int64_t tenon_net_last_would_block(void) {
+    return tenon_last_eagain ? 1 : 0;
+}
 
 static int tenon_parse_ipv4_port(int64_t addr_text, struct sockaddr_in* sa) {
     if (addr_text == 0) return 0;
@@ -715,7 +739,10 @@ int64_t tenon_net_tcp_listen(int64_t addr_text) {
     if (fd < 0) return -1;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0 || listen(fd, 128) < 0) {
+#ifdef SO_REUSEPORT
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
+    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0 || listen(fd, 1024) < 0) {
         close(fd);
         return -1;
     }
@@ -731,9 +758,16 @@ int64_t tenon_net_tcp_local_port(int64_t fd) {
 }
 
 int64_t tenon_net_tcp_accept(int64_t fd) {
+    tenon_last_eagain = 0;
     if (fd < 0) return -1;
     int cfd = accept((int)fd, NULL, NULL);
-    return cfd < 0 ? -1 : (int64_t)cfd;
+    if (cfd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) tenon_last_eagain = 1;
+        return -1;
+    }
+    int one = 1;
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    return (int64_t)cfd;
 }
 
 int64_t tenon_net_tcp_connect(int64_t addr_text) {
@@ -745,6 +779,8 @@ int64_t tenon_net_tcp_connect(int64_t addr_text) {
         close(fd);
         return -1;
     }
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     return (int64_t)fd;
 }
 
@@ -757,20 +793,50 @@ int64_t tenon_net_set_nonblocking(int64_t fd, int64_t nb) {
     return fcntl((int)fd, F_SETFL, flags) == 0 ? 1 : 0;
 }
 
+int64_t tenon_net_set_nodelay(int64_t fd, int64_t nd) {
+    if (fd < 0) return 0;
+    int val = nd ? 1 : 0;
+    return setsockopt((int)fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)) == 0 ? 1 : 0;
+}
+
 int64_t tenon_net_read(int64_t fd, int64_t max_bytes) {
+    tenon_last_eagain = 0;
     if (fd < 0 || max_bytes <= 0) return tenon_bytes_new(0);
     size_t cap = (size_t)(max_bytes > 1048576 ? 1048576 : max_bytes);
-    uint8_t* tmp = (uint8_t*)malloc(cap);
+    uint8_t stack_buf[4096];
+    uint8_t* tmp = cap <= sizeof(stack_buf) ? stack_buf : (uint8_t*)malloc(cap);
     ssize_t n = recv((int)fd, tmp, cap, 0);
     if (n <= 0) {
-        free(tmp);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) tenon_last_eagain = 1;
+        if (tmp != stack_buf) free(tmp);
         return tenon_bytes_new(0);
     }
     int64_t words = ((int64_t)n + 7) / 8;
     if (words < 1) words = 1;
     TenonObj* obj = tenon_rc_alloc_raw(10, (int64_t)n, words);
     memcpy(obj->fields, tmp, (size_t)n);
-    free(tmp);
+    if (tmp != stack_buf) free(tmp);
+    return (int64_t)(uintptr_t)obj;
+}
+
+int64_t tenon_net_read_text(int64_t fd, int64_t max_bytes) {
+    tenon_last_eagain = 0;
+    if (fd < 0 || max_bytes <= 0) return tenon_text_new(0, 0);
+    size_t cap = (size_t)(max_bytes > 1048576 ? 1048576 : max_bytes);
+    uint8_t stack_buf[8192];
+    uint8_t* tmp = cap <= sizeof(stack_buf) ? stack_buf : (uint8_t*)malloc(cap);
+    ssize_t n = recv((int)fd, tmp, cap, 0);
+    if (n <= 0) {
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) tenon_last_eagain = 1;
+        if (tmp != stack_buf) free(tmp);
+        return tenon_text_new(0, 0);
+    }
+    int64_t words = ((int64_t)n + 1 + 7) / 8;
+    if (words < 1) words = 1;
+    TenonObj* obj = tenon_rc_alloc_raw(4, (int64_t)n, words);
+    memcpy(obj->fields, tmp, (size_t)n);
+    ((char*)obj->fields)[n] = '\0';
+    if (tmp != stack_buf) free(tmp);
     return (int64_t)(uintptr_t)obj;
 }
 
@@ -778,12 +844,128 @@ int64_t tenon_net_write(int64_t fd, int64_t bytes_obj) {
     if (fd < 0 || bytes_obj == 0) return -1;
     TenonObj* hdr = (TenonObj*)(uintptr_t)bytes_obj;
     if (hdr->len <= 0) return 0;
-    ssize_t n = send((int)fd, (const void*)hdr->fields, (size_t)hdr->len, 0);
-    return n < 0 ? -1 : (int64_t)n;
+    const uint8_t* p = (const uint8_t*)hdr->fields;
+    size_t rem = (size_t)hdr->len;
+    size_t total = 0;
+    while (rem > 0) {
+        ssize_t n = send((int)fd, p + total, rem, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return total > 0 ? (int64_t)total : -1;
+        }
+        if (n == 0) break;
+        total += (size_t)n;
+        rem -= (size_t)n;
+    }
+    return (int64_t)total;
+}
+
+int64_t tenon_net_write_text(int64_t fd, int64_t text_obj) {
+    return tenon_net_write(fd, text_obj);
 }
 
 int64_t tenon_net_close(int64_t fd) {
     if (fd >= 0) close((int)fd);
+    return 0;
+}
+
+/* ===== OS Event Reactor (kqueue / epoll) ===== */
+int64_t tenon_reactor_new(void) {
+#ifdef __APPLE__
+    return (int64_t)kqueue();
+#elif defined(__linux__)
+    return (int64_t)epoll_create1(EPOLL_CLOEXEC);
+#else
+    return -1;
+#endif
+}
+
+int64_t tenon_reactor_add(int64_t rfd, int64_t fd, int64_t mask, int64_t token) {
+    if (rfd < 0 || fd < 0) return 0;
+#ifdef __APPLE__
+    struct kevent ch[2];
+    int n = 0;
+    if (mask & 1) {
+        EV_SET(&ch[n], (uintptr_t)fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, (void*)(uintptr_t)token);
+        n++;
+    }
+    if (mask & 2) {
+        EV_SET(&ch[n], (uintptr_t)fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, (void*)(uintptr_t)token);
+        n++;
+    }
+    if (n == 0) return 1;
+    return kevent((int)rfd, ch, n, NULL, 0, NULL) >= 0 ? 1 : 0;
+#elif defined(__linux__)
+    struct epoll_event ev;
+    ev.events = ((mask & 1) ? EPOLLIN : 0) | ((mask & 2) ? EPOLLOUT : 0);
+    ev.data.u64 = (uint64_t)token;
+    return epoll_ctl((int)rfd, EPOLL_CTL_ADD, (int)fd, &ev) == 0 ? 1 : 0;
+#else
+    (void)mask; (void)token;
+    return 0;
+#endif
+}
+
+int64_t tenon_reactor_del(int64_t rfd, int64_t fd) {
+    if (rfd < 0 || fd < 0) return 0;
+#ifdef __APPLE__
+    struct kevent ch[2];
+    EV_SET(&ch[0], (uintptr_t)fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    EV_SET(&ch[1], (uintptr_t)fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+    kevent((int)rfd, ch, 2, NULL, 0, NULL);
+    return 1;
+#elif defined(__linux__)
+    epoll_ctl((int)rfd, EPOLL_CTL_DEL, (int)fd, NULL);
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int64_t tenon_reactor_wait(int64_t rfd, int64_t timeout_ms, int64_t max_events) {
+    int cap = (int)(max_events < 1 ? 1 : (max_events > 1024 ? 1024 : max_events));
+#ifdef __APPLE__
+    struct kevent evs[1024];
+    struct timespec ts;
+    struct timespec* tsp = NULL;
+    if (timeout_ms >= 0) {
+        ts.tv_sec = (time_t)(timeout_ms / 1000);
+        ts.tv_nsec = (long)((timeout_ms % 1000) * 1000000L);
+        tsp = &ts;
+    }
+    int n = kevent((int)rfd, NULL, 0, evs, cap, tsp);
+    if (n < 0) n = 0;
+    TenonObj* list = tenon_rc_alloc_raw(5, (int64_t)n, (int64_t)(n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) {
+        int64_t rev = 0;
+        if (evs[i].filter == EVFILT_READ) rev |= 1;
+        if (evs[i].filter == EVFILT_WRITE) rev |= 2;
+        if (evs[i].flags & (EV_EOF | EV_ERROR)) rev |= 4;
+        int64_t tok = (int64_t)(uintptr_t)evs[i].udata;
+        list->fields[i] = (tok << 8) | rev;
+    }
+    return (int64_t)(uintptr_t)list;
+#elif defined(__linux__)
+    struct epoll_event evs[1024];
+    int n = epoll_wait((int)rfd, evs, cap, (int)timeout_ms);
+    if (n < 0) n = 0;
+    TenonObj* list = tenon_rc_alloc_raw(5, (int64_t)n, (int64_t)(n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) {
+        int64_t rev = 0;
+        if (evs[i].events & EPOLLIN) rev |= 1;
+        if (evs[i].events & EPOLLOUT) rev |= 2;
+        if (evs[i].events & (EPOLLHUP | EPOLLERR)) rev |= 4;
+        list->fields[i] = ((int64_t)evs[i].data.u64 << 8) | rev;
+    }
+    return (int64_t)(uintptr_t)list;
+#else
+    (void)rfd; (void)timeout_ms; (void)cap;
+    return (int64_t)(uintptr_t)tenon_rc_alloc_raw(5, 0, 1);
+#endif
+}
+
+int64_t tenon_reactor_close(int64_t rfd) {
+    if (rfd >= 0) close((int)rfd);
     return 0;
 }
 "#;

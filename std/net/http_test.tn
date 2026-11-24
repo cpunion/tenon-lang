@@ -1,0 +1,114 @@
+// Colocated tests for OS `kqueue`/`epoll` Reactor + HTTP/1.1 Server & Client!
+
+test fn http_parser_chunked_and_query_params() {
+    let raw = "POST /items?limit=25&tag=fast HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+    let parsed = parse_http_request(raw)
+    match parsed {
+        Some((req, consumed)) => {
+            assert consumed == len(raw)
+            assert req.method == "POST"
+            assert req.path == "/items"
+            assert req.body == "hello world"
+            assert match req.query_param("limit") { Some(v) => v == "25" None => false }
+            assert match req.query_param("tag") { Some(v) => v == "fast" None => false }
+            assert match req.header("host") { Some(v) => v == "localhost" None => false }
+        }
+        None => { assert false }
+    }
+}
+
+test fn os_reactor_kqueue_readiness_loopback() {
+    let lfd = net_tcp_listen("127.0.0.1:0")
+    assert lfd >= 0
+    let port = net_tcp_local_port(lfd)
+    assert port > 0
+    let _ = net_set_nonblocking(lfd, true)
+    let r = match reactor_open() {
+        Ok(x) => x
+        Err(_) => {
+            assert false
+            Reactor { fd = -1 }
+        }
+    }
+    assert r.register(lfd, EVENT_READ, 42)
+    let addr = f"127.0.0.1:{int_to_text(port)}"
+    let cfd = net_tcp_connect(addr)
+    assert cfd >= 0
+    let evs = r.wait(500, 8)
+    assert len(evs) >= 1
+    assert event_token(evs[0]) == 42
+    assert event_is_readable(evs[0])
+    let sfd = net_tcp_accept(lfd)
+    assert sfd >= 0
+    let _ = net_close(sfd)
+    let _ = net_close(cfd)
+    let _ = r.unregister(lfd)
+    r.close()
+    let _ = net_close(lfd)
+}
+
+test fn http_reactor_server_and_keepalive_client_zero_leaks() {
+    let port_box = atomic_new(0)
+    let stop_flag = atomic_new(0)
+
+    let srv = thread_start(|| {
+        http_serve_reactor("127.0.0.1:0", 2, port_box, stop_flag, |req| {
+            if req.path == "/ping" {
+                http_ok("pong")
+            } else if req.method == "POST" && req.path == "/echo" {
+                http_json(201, "{\"echo\":\"" ++ req.body ++ "\"}")
+            } else {
+                http_not_found("missing")
+            }
+        })
+    })
+
+    // Wait for server socket bind
+    var port = 0
+    while port == 0 {
+        port = port_box.load(ORDER_SEQ_CST)
+        if port == 0 {
+            thread_sleep_ms(2)
+        }
+    }
+    assert port > 0
+    let host = f"127.0.0.1:{int_to_text(port)}"
+
+    // 1. Persistent Keep-Alive client sending 10 requests over a single TCP connection!
+    var conn = match http_connect(host) {
+        Ok(c) => c
+        Err(_) => {
+            assert false
+            HttpConn { fd = -1, host = "", buf = "" }
+        }
+    }
+    var k = 0
+    while k < 10 {
+        match conn.get("/ping") {
+            Ok(res) => {
+                assert res.status == 200
+                assert res.body == "pong"
+            }
+            Err(_) => { assert false }
+        }
+        k += 1
+    }
+    conn.close()
+
+    // 2. One-shot POST + 404 check
+    match http_post(host, "/echo", "text/plain", "tenon_http") {
+        Ok(res) => {
+            assert res.status == 201
+            assert res.body == "{\"echo\":\"tenon_http\"}"
+        }
+        Err(_) => { assert false }
+    }
+    match http_get(host, "/nope") {
+        Ok(res) => { assert res.status == 404 }
+        Err(_) => { assert false }
+    }
+
+    stop_flag.store(1, ORDER_SEQ_CST)
+    let served = srv.join()
+    assert served == 12
+}

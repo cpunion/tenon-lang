@@ -1,0 +1,173 @@
+// Complete Metaprogramming-Powered Tenon Web App
+// Demonstrates:
+//   - Go-style / wildcard / selective module imports (`tenon.toml`)
+//   - Declarative `@get` / `@post` route annotations compiled via `mount_annotated_routes!()`
+//   - Automatic OpenAPI 3.1 spec generation at `/openapi.json`
+//   - Typed JSON body extraction + Tenon refinement boundary validation (`UserAge in 0..=150`)
+//   - Composable CORS + Timing + Security Headers middleware
+//   - Multi-worker `kqueue`/`epoll` Keep-Alive HTTP/1.1 engine with zero Perceus memory leaks!
+
+import std.web.app.*
+import webapp.models.user.{UserId, UserAge, CreateUserReq, UserDto}
+
+@get("/health")
+pub fn health_handler(ctx Context) HttpResponse {
+    let mode = comptime { config("env") }
+    ctx.json_raw(200, "{\"status\":\"ok\",\"env\":\"" ++ mode ++ "\"}")
+}
+
+@get("/users/:id")
+pub fn get_user_handler(ctx Context) HttpResponse {
+    match ctx.param_int("id") {
+        Some(raw_id) => {
+            if raw_id <= 0 {
+                ctx.bad_request("user id must be positive")
+            } else {
+                let uid UserId = raw_id
+                let dto = UserDto { id = uid, name = "alice", age = 30 }
+                ctx.json(200, dto)
+            }
+        }
+        None => ctx.bad_request("invalid user id")
+    }
+}
+
+@post("/users")
+pub fn create_user_handler(ctx Context) HttpResponse {
+    match ctx.json_body[CreateUserReq]() {
+        Ok(req) => {
+            // Inside handler, `req.age` is statically verified to satisfy `0 <= age <= 150`!
+            let created = UserDto { id = 101, name = req.name, age = req.age }
+            ctx.json(201, created)
+        }
+        Err(e) => ctx.bad_request("validation failed: " ++ e.message)
+    }
+}
+
+@get("/files/*filepath")
+pub fn files_handler(ctx Context) HttpResponse {
+    let fp = match ctx.param("filepath") {
+        Some(p) => p
+        None => ""
+    }
+    ctx.text(200, "file:" ++ fp)
+}
+
+// Compile-time metaprogramming macro scans all @get/@post handlers above and emits
+// `mount_routes(app)` and `generated_openapi_json()` with zero runtime reflection!
+mount_annotated_routes!()
+
+pub fn build_app() WebApp {
+    mount_routes(web_app_new())
+        .use_mw(cors_middleware("*"))
+        .use_mw(security_headers_middleware())
+        .use_mw(timing_middleware())
+}
+
+pub fn main() Int {
+    let app = build_app()
+    let port_box = atomic_new(0)
+    let stop_flag = atomic_new(0)
+
+    let srv = thread_start(|| {
+        app.serve("127.0.0.1:0", 2, port_box, stop_flag)
+    })
+
+    var port = 0
+    while port == 0 {
+        port = port_box.load(ORDER_SEQ_CST)
+        if port == 0 {
+            thread_sleep_ms(2)
+        }
+    }
+    assert port > 0
+    let host = f"127.0.0.1:{int_to_text(port)}"
+
+    // Persistent Keep-Alive client verifying all routes, middleware, refinements & OpenAPI!
+    var conn = match http_connect(host) {
+        Ok(c) => c
+        Err(_) => {
+            assert false
+            HttpConn { fd = -1, host = "", buf = "" }
+        }
+    }
+
+    // 1. GET /health + verify CORS, Security & Timing middleware headers
+    match conn.get("/health") {
+        Ok(r) => {
+            assert r.status == 200
+            assert r.body.contains("\"status\":\"ok\"")
+            assert r.body.contains("\"env\":\"production\"")
+            assert match r.header("Access-Control-Allow-Origin") { Some(v) => v == "*" None => false }
+            assert match r.header("X-Content-Type-Options") { Some(v) => v == "nosniff" None => false }
+            assert match r.header("X-Response-Time-Us") { Some(_) => true None => false }
+        }
+        Err(_) => { assert false }
+    }
+
+    // 2. GET /users/42 (path parameter + UserId refinement)
+    match conn.get("/users/42") {
+        Ok(r) => {
+            assert r.status == 200
+            assert r.body.contains("\"id\":42")
+            assert r.body.contains("\"name\":\"alice\"")
+        }
+        Err(_) => { assert false }
+    }
+
+    // 3. POST /users with valid JSON payload -> 201 Created
+    match conn.post("/users", "application/json", "{\"name\":\"bob\",\"age\":28}") {
+        Ok(r) => {
+            assert r.status == 201
+            assert r.body.contains("\"id\":101")
+            assert r.body.contains("\"name\":\"bob\"")
+            assert r.body.contains("\"age\":28")
+        }
+        Err(_) => { assert false }
+    }
+
+    // 4. POST /users with refinement violation (`age = 200 > 150`) -> 400 Bad Request automatically!
+    match conn.post("/users", "application/json", "{\"name\":\"bad\",\"age\":200}") {
+        Ok(r) => {
+            assert r.status == 400
+            assert r.body.contains("validation failed")
+        }
+        Err(_) => { assert false }
+    }
+
+    // 5. Wildcard route `/files/*filepath`
+    match conn.get("/files/assets/logo.png") {
+        Ok(r) => {
+            assert r.status == 200
+            assert r.body == "file:assets/logo.png"
+        }
+        Err(_) => { assert false }
+    }
+
+    // 6. Auto-generated OpenAPI 3.1 endpoint `/openapi.json`
+    match conn.get("/openapi.json") {
+        Ok(r) => {
+            assert r.status == 200
+            assert r.body.contains("\"openapi\":\"3.1.0\"")
+            assert r.body.contains("GET /users/:id")
+            assert r.body.contains("POST /users")
+        }
+        Err(_) => { assert false }
+    }
+
+    // 7. 405 Method Not Allowed & 404 Not Found
+    match conn.post("/health", "text/plain", "") {
+        Ok(r) => { assert r.status == 405 }
+        Err(_) => { assert false }
+    }
+    match conn.get("/unknown") {
+        Ok(r) => { assert r.status == 404 }
+        Err(_) => { assert false }
+    }
+
+    conn.close()
+    stop_flag.store(1, ORDER_SEQ_CST)
+    let served = srv.join()
+    assert served == 8
+    200
+}

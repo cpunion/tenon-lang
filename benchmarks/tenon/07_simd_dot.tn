@@ -1,0 +1,39 @@
+// Benchmark 07: 51.2M 4-wide SIMD Float64x4 dot products (204.8M FP64 MACs)
+pub fn main() Int {
+    let n = 1024
+    let reps = 50000
+    var a = list_filled(n, simd_f64x4_splat(0.0))
+    var b = list_filled(n, simd_f64x4_splat(0.0))
+
+    var i = 0
+    while i < n {
+        let a0 = (((i + 1) & 15) as Float) * 0.25
+        let a1 = (((i + 3) & 15) as Float) * 0.25
+        let a2 = (((i + 5) & 15) as Float) * 0.25
+        let a3 = (((i + 7) & 15) as Float) * 0.25
+        a[i] = simd_f64x4_new(a0, a1, a2, a3)
+
+        let b0 = (((i * 3 + 2) & 15) as Float) * 0.25
+        let b1 = (((i * 3 + 4) & 15) as Float) * 0.25
+        let b2 = (((i * 3 + 6) & 15) as Float) * 0.25
+        let b3 = (((i * 3 + 8) & 15) as Float) * 0.25
+        b[i] = simd_f64x4_new(b0, b1, b2, b3)
+        i += 1
+    }
+
+    var total = 0.0
+    var r = 0
+    while r < reps {
+        var j = 0
+        while j < n {
+            let k = (j + r) & 1023
+            total = total + simd_f64x4_dot(a[j], b[k])
+            j += 1
+        }
+        r += 1
+    }
+
+    let checksum = (total * 16.0) as Int
+    let _ = print_int(checksum)
+    0
+}

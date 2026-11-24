@@ -35,6 +35,9 @@ BENCHMARKS = [
     ("04_hashmap", "50k String HashMap (set/upd/get/del)"),
     ("05_json", "5k Nested JSON parse+access+stringify"),
     ("06_dyn_dispatch", "5M Dynamic interface vtable calls"),
+    ("07_simd_dot", "51.2M 4-wide SIMD Float64x4 dot products"),
+    ("08_packet_codec", "20M @packed + bitfield binary frame codec"),
+    ("09_mpmc_threads", "4-thread parallel compute + MPMC channel"),
 ]
 
 LANGS = ["c", "rust", "go", "tenon"]

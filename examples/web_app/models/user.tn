@@ -1,0 +1,19 @@
+// Domain models with Tenon refinement types + automatic JSON / JsonSchema derivation!
+import "std/core/types.tn"
+import "std/encoding/json.tn"
+
+pub type UserId = Int where self > 0
+pub type UserAge = Int where 0 <= self && self <= 150
+
+@derive(ToJson, FromJson, JsonSchema)
+pub record CreateUserReq {
+    name Text
+    age  UserAge
+}
+
+@derive(ToJson, FromJson, JsonSchema)
+pub record UserDto {
+    id   UserId
+    name Text
+    age  UserAge
+}

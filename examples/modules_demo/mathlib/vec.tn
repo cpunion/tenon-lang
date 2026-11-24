@@ -1,0 +1,22 @@
+pub const UNIT_SCALE Int = 10
+
+pub record Vec2 {
+    x Int
+    y Int
+}
+
+pure fn internal_scale(v Int) Int {
+    v * UNIT_SCALE
+}
+
+pub pure fn vec_add(a Vec2, b Vec2) Vec2 {
+    Vec2 { x = a.x + b.x, y = a.y + b.y }
+}
+
+pub pure fn dot(a Vec2, b Vec2) Int {
+    a.x * b.x + a.y * b.y
+}
+
+pub pure fn scaled_dot(a Vec2, b Vec2) Int {
+    internal_scale(dot(a, b))
+}

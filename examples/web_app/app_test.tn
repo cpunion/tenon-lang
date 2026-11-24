@@ -1,0 +1,17 @@
+test fn router_matches_static_param_and_wildcard() {
+    let m1 = match_route_pattern("/users/:id/posts/:pid", "/users/42/posts/9")
+    assert m1.matched && len(m1.params) == 2
+    assert m1.params[0].name == "id" && m1.params[0].value == "42"
+    assert m1.params[1].name == "pid" && m1.params[1].value == "9"
+
+    let m2 = match_route_pattern("/files/*path", "/files/a/b/c.txt")
+    assert m2.matched && len(m2.params) == 1
+    assert m2.params[0].name == "path" && m2.params[0].value == "a/b/c.txt"
+
+    let m3 = match_route_pattern("/users/:id", "/orders/42")
+    assert !m3.matched
+}
+
+test fn web_app_end_to_end_live_http_and_openapi() {
+    assert main() == 200
+}

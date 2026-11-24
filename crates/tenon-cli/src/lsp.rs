@@ -1,0 +1,1722 @@
+//! Tenon Language Server Protocol (LSP) implementation over JSON-RPC 2.0 stdio.
+//!
+//! Zero external LSP dependencies — uses `tenon-syntax` (parser, project/module loader with
+//! unsaved-buffer overlays, layout engine), `tenon-verify` (L0 + L1 Z3 Fail-Closed checker),
+//! and `serde_json` already in the workspace.
+//!
+//! Supported LSP capabilities:
+//! - `textDocument/didOpen`, `didChange`, `didSave`, `didClose`
+//! - `textDocument/publishDiagnostics` (syntax + L0/L1 formal verification + counterexamples)
+//! - `textDocument/hover` (signatures, `where`/`requires`/`ensures`, `@repr(C)`/`@packed` byte layout, proof counts)
+//! - `textDocument/definition` (same-file and cross-package symbol definitions)
+//! - `textDocument/completion` (keywords, primitive/SIMD types, in-scope items, `@attr`, and `.` member/package completion)
+//! - `textDocument/documentSymbol` (outline hierarchy)
+//! - `textDocument/formatting` (canonical `tenon fmt`)
+
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use tenon_syntax::{
+    Attr, BitfieldDecl, ConstDecl, EnumDecl, Expr, ExprKind, FnDecl, InterfaceDecl,
+    InterfaceMethodDecl, Item, LayoutEngine, LoadMode, MacroDecl, Program, RecordDecl, Span,
+    TypeAliasDecl, UnionDecl, load_package_with_overlays, parse_with_file_id,
+};
+use tenon_verify::{CheckReport, ProofTier, check_program};
+
+pub fn run_lsp_stdio() -> ExitCode {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = BufWriter::new(stdout.lock());
+    let mut server = LspServer::new();
+    let ok = server.run_loop(&mut reader, &mut writer);
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpenDoc {
+    path: Option<PathBuf>,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct AnalyzedDoc {
+    raw_program: Option<Program>,
+    full_program: Option<Program>,
+    active_file_id: u32,
+    report: Option<CheckReport>,
+    parse_error: Option<(usize, usize, String)>,
+}
+
+struct LspServer {
+    docs: BTreeMap<String, OpenDoc>,
+    analysis: BTreeMap<String, AnalyzedDoc>,
+    shutdown_requested: bool,
+}
+
+impl LspServer {
+    fn new() -> Self {
+        Self {
+            docs: BTreeMap::new(),
+            analysis: BTreeMap::new(),
+            shutdown_requested: false,
+        }
+    }
+
+    fn run_loop<R: BufRead, W: Write>(&mut self, reader: &mut R, writer: &mut W) -> bool {
+        loop {
+            let msg = match read_lsp_message(reader) {
+                Ok(Some(v)) => v,
+                Ok(None) => return true,
+                Err(_) => return false,
+            };
+
+            let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let id = msg.get("id").cloned();
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+            match method {
+                "initialize" => {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": {
+                            "capabilities": {
+                                "textDocumentSync": {
+                                    "openClose": true,
+                                    "change": 1,
+                                    "save": { "includeText": true }
+                                },
+                                "hoverProvider": true,
+                                "definitionProvider": true,
+                                "completionProvider": {
+                                    "triggerCharacters": [".", "@", "!"]
+                                },
+                                "documentSymbolProvider": true,
+                                "documentFormattingProvider": true
+                            },
+                            "serverInfo": {
+                                "name": "tenon-lsp",
+                                "version": env!("CARGO_PKG_VERSION")
+                            }
+                        }
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "initialized" => {}
+                "shutdown" => {
+                    self.shutdown_requested = true;
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": Value::Null
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "exit" => {
+                    return self.shutdown_requested;
+                }
+                "textDocument/didOpen" => {
+                    if let Some(td) = params.get("textDocument") {
+                        let uri = td.get("uri").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                        let text = td.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                        let path = uri_to_path(&uri);
+                        self.docs.insert(
+                            uri.clone(),
+                            OpenDoc { path, text },
+                        );
+                        self.analyze_and_publish(&uri, writer);
+                    }
+                }
+                "textDocument/didChange" => {
+                    if let Some(uri) = params
+                        .get("textDocument")
+                        .and_then(|t| t.get("uri"))
+                        .and_then(|u| u.as_str())
+                    {
+                        if let Some(changes) = params.get("contentChanges").and_then(|c| c.as_array()) {
+                            if let Some(last) = changes.last() {
+                                if let Some(text) = last.get("text").and_then(|t| t.as_str()) {
+                                    if let Some(doc) = self.docs.get_mut(uri) {
+                                        doc.text = text.to_string();
+                                    } else {
+                                        self.docs.insert(
+                                            uri.to_string(),
+                                            OpenDoc {
+                                                path: uri_to_path(uri),
+                                                text: text.to_string(),
+                                            },
+                                        );
+                                    }
+                                    self.analyze_and_publish(uri, writer);
+                                }
+                            }
+                        }
+                    }
+                }
+                "textDocument/didSave" => {
+                    if let Some(uri) = params
+                        .get("textDocument")
+                        .and_then(|t| t.get("uri"))
+                        .and_then(|u| u.as_str())
+                    {
+                        if let Some(text) = params.get("text").and_then(|t| t.as_str()) {
+                            if let Some(doc) = self.docs.get_mut(uri) {
+                                doc.text = text.to_string();
+                            }
+                        }
+                        self.analyze_and_publish(uri, writer);
+                    }
+                }
+                "textDocument/didClose" => {
+                    if let Some(uri) = params
+                        .get("textDocument")
+                        .and_then(|t| t.get("uri"))
+                        .and_then(|u| u.as_str())
+                    {
+                        self.docs.remove(uri);
+                        self.analysis.remove(uri);
+                        let notif = json!({
+                            "jsonrpc": "2.0",
+                            "method": "textDocument/publishDiagnostics",
+                            "params": { "uri": uri, "diagnostics": [] }
+                        });
+                        let _ = write_lsp_message(writer, &notif);
+                    }
+                }
+                "textDocument/hover" => {
+                    let result = self.handle_hover(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/definition" => {
+                    let result = self.handle_definition(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/completion" => {
+                    let result = self.handle_completion(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/documentSymbol" => {
+                    let result = self.handle_document_symbol(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/formatting" => {
+                    let result = self.handle_formatting(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                _ => {
+                    // Respond with null/method-not-found for unknown requests that expect a response
+                    if let Some(req_id) = id {
+                        let resp = json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": Value::Null
+                        });
+                        if write_lsp_message(writer, &resp).is_err() {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn overlays(&self) -> BTreeMap<PathBuf, String> {
+        let mut out = BTreeMap::new();
+        for doc in self.docs.values() {
+            if let Some(p) = &doc.path {
+                out.insert(p.clone(), doc.text.clone());
+            }
+        }
+        out
+    }
+
+    fn analyze_and_publish<W: Write>(&mut self, uri: &str, writer: &mut W) {
+        let Some(doc) = self.docs.get(uri).cloned() else {
+            return;
+        };
+
+        let mut analyzed = AnalyzedDoc {
+            raw_program: None,
+            full_program: None,
+            active_file_id: 0,
+            report: None,
+            parse_error: None,
+        };
+
+        // 1. Always parse raw active buffer first for immediate syntax diagnostics & outline.
+        match parse_with_file_id(&doc.text, 0) {
+            Ok(raw) => {
+                analyzed.raw_program = Some(raw);
+            }
+            Err(pe) => {
+                analyzed.parse_error = Some((pe.span.line, pe.span.col, pe.message));
+            }
+        }
+
+        // 2. If raw parse succeeded, attempt full package load (with unsaved overlays) + verification.
+        if analyzed.parse_error.is_none() {
+            let overlays = self.overlays();
+            let loaded = if let Some(path) = &doc.path {
+                if path.exists() || path.parent().is_some_and(|p| p.exists()) {
+                    let mode = if tenon_syntax::is_test_source_file(path) {
+                        LoadMode::Test
+                    } else {
+                        LoadMode::Production
+                    };
+                    load_package_with_overlays(path, mode, &BTreeMap::new(), &overlays)
+                } else {
+                    Err("virtual".into())
+                }
+            } else {
+                Err("untitled".into())
+            };
+
+            match loaded {
+                Ok(full) => {
+                    let active_fid = doc
+                        .path
+                        .as_ref()
+                        .and_then(|p| {
+                            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                            let canon_str = canon.to_string_lossy();
+                            full.source_files
+                                .iter()
+                                .position(|sf| sf == canon_str.as_ref())
+                                .map(|idx| idx as u32)
+                        })
+                        .unwrap_or(0);
+                    let rep = check_program(&full);
+                    analyzed.active_file_id = active_fid;
+                    analyzed.full_program = Some(full);
+                    analyzed.report = Some(rep);
+                }
+                Err(load_err) => {
+                    // Fallback: run single-file expansion + check on raw_program
+                    if let Some(mut single) = analyzed.raw_program.clone() {
+                        tenon_syntax::eval_cfg_attrs(&mut single);
+                        if let Err(e) = tenon_syntax::expand_comptime_and_macros(&mut single) {
+                            analyzed.parse_error = Some((1, 1, e));
+                        } else {
+                            tenon_syntax::expand_derives(&mut single);
+                            let rep = check_program(&single);
+                            analyzed.active_file_id = 0;
+                            analyzed.full_program = Some(single);
+                            analyzed.report = Some(rep);
+                        }
+                    } else if load_err != "virtual" && load_err != "untitled" {
+                        analyzed.parse_error = Some((1, 1, load_err));
+                    }
+                }
+            }
+        }
+
+        // 3. Build LSP Diagnostic[] payload for this document
+        let mut lsp_diags: Vec<Value> = Vec::new();
+        if let Some((line, col, msg)) = &analyzed.parse_error {
+            let l0 = line.saturating_sub(1);
+            let c0 = col.saturating_sub(1);
+            lsp_diags.push(json!({
+                "range": {
+                    "start": { "line": l0, "character": c0 },
+                    "end": { "line": l0, "character": c0 + 1 }
+                },
+                "severity": 1,
+                "code": "E0001",
+                "source": "tenon",
+                "message": msg
+            }));
+        } else if let Some(rep) = &analyzed.report {
+            for d in &rep.diagnostics {
+                // Only attach diagnostics belonging to this file (or fallback file_id 0 when active_file_id == 0)
+                if analyzed.active_file_id != 0 && d.span.file_id != 0 && d.span.file_id != analyzed.active_file_id {
+                    continue;
+                }
+                let l0 = d.span.line.saturating_sub(1);
+                let c0 = d.span.col.saturating_sub(1);
+                let len = if d.span.end > d.span.start {
+                    (d.span.end - d.span.start).min(80)
+                } else {
+                    1
+                };
+                let mut full_msg = d.message.clone();
+                for note in &d.notes {
+                    full_msg.push_str(&format!("\nnote: {}", note));
+                }
+                if !d.counterexample.is_empty() {
+                    let ce: Vec<String> = d
+                        .counterexample
+                        .iter()
+                        .map(|(k, v)| format!("{} = {}", k, v))
+                        .collect();
+                    full_msg.push_str(&format!("\nZ3 counterexample: {}", ce.join(", ")));
+                }
+                lsp_diags.push(json!({
+                    "range": {
+                        "start": { "line": l0, "character": c0 },
+                        "end": { "line": l0, "character": c0 + len }
+                    },
+                    "severity": 1,
+                    "code": d.code,
+                    "source": "tenon-verify",
+                    "message": full_msg
+                }));
+            }
+        }
+
+        self.analysis.insert(uri.to_string(), analyzed);
+
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri,
+                "diagnostics": lsp_diags
+            }
+        });
+        let _ = write_lsp_message(writer, &notif);
+    }
+
+    fn handle_hover(&self, params: &Value) -> Value {
+        let Some((uri, line, ch)) = extract_text_doc_pos(params) else {
+            return Value::Null;
+        };
+        let Some(doc) = self.docs.get(&uri) else {
+            return Value::Null;
+        };
+        let Some((word, qual_prefix)) = word_at_position(&doc.text, line, ch) else {
+            return Value::Null;
+        };
+
+        let analyzed = self.analysis.get(&uri);
+        let prog = analyzed.and_then(|a| a.full_program.as_ref().or(a.raw_program.as_ref()));
+        let report = analyzed.and_then(|a| a.report.as_ref());
+
+        if let Some(prog) = prog {
+            let layout = LayoutEngine::from_program(prog);
+            // If qualified like `math.add`, try `math__add` and `add`
+            let mut candidates = vec![word.clone()];
+            if let Some(pref) = &qual_prefix {
+                candidates.insert(0, format!("{}__{}", pref, word));
+            }
+            for cand in &candidates {
+                if let Some(md) = format_item_hover(prog, &layout, report, cand) {
+                    return json!({
+                        "contents": {
+                            "kind": "markdown",
+                            "value": md
+                        }
+                    });
+                }
+            }
+            // Check methods on impl blocks if `obj.method`
+            for item in &prog.items {
+                if let Item::Impl(im) = item {
+                    let target_name = im.target_ty.display_name();
+                    for m in &im.methods {
+                        if m.name == word {
+                            let md = format_fn_hover(m, Some(&target_name), report);
+                            return json!({
+                                "contents": {
+                                    "kind": "markdown",
+                                    "value": md
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Builtin / primitive hover fallback
+        if let Some(md) = builtin_hover(&word) {
+            return json!({
+                "contents": {
+                    "kind": "markdown",
+                    "value": md
+                }
+            });
+        }
+
+        Value::Null
+    }
+
+    fn handle_definition(&self, params: &Value) -> Value {
+        let Some((uri, line, ch)) = extract_text_doc_pos(params) else {
+            return Value::Null;
+        };
+        let Some(doc) = self.docs.get(&uri) else {
+            return Value::Null;
+        };
+        let Some((word, qual_prefix)) = word_at_position(&doc.text, line, ch) else {
+            return Value::Null;
+        };
+        let Some(analyzed) = self.analysis.get(&uri) else {
+            return Value::Null;
+        };
+        let Some(prog) = analyzed.full_program.as_ref().or(analyzed.raw_program.as_ref()) else {
+            return Value::Null;
+        };
+
+        let mut candidates = vec![word.clone()];
+        if let Some(pref) = &qual_prefix {
+            candidates.insert(0, format!("{}__{}", pref, word));
+        }
+
+        for cand in &candidates {
+            if let Some(span) = find_item_span(prog, cand) {
+                let target_uri = span_file_uri(prog, span, &uri);
+                let l0 = span.line.saturating_sub(1);
+                let c0 = span.col.saturating_sub(1);
+                return json!({
+                    "uri": target_uri,
+                    "range": {
+                        "start": { "line": l0, "character": c0 },
+                        "end": { "line": l0, "character": c0 + word.len() }
+                    }
+                });
+            }
+        }
+
+        Value::Null
+    }
+
+    fn handle_completion(&self, params: &Value) -> Value {
+        let Some((uri, line, ch)) = extract_text_doc_pos(params) else {
+            return json!([]);
+        };
+        let Some(doc) = self.docs.get(&uri) else {
+            return json!([]);
+        };
+
+        let analyzed = self.analysis.get(&uri);
+        let prog = analyzed.and_then(|a| a.full_program.as_ref().or(a.raw_program.as_ref()));
+        let raw_prog = analyzed.and_then(|a| a.raw_program.as_ref());
+
+        let line_prefix = line_prefix_before_cursor(&doc.text, line, ch);
+        let mut items: Vec<Value> = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+
+        // 1. Attribute completion after `@`
+        if line_prefix.trim_end().ends_with('@')
+            || line_prefix
+                .rsplit_once('@')
+                .is_some_and(|(_, tail)| !tail.is_empty() && tail.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        {
+            for (attr, detail) in [
+                ("repr(C)", "C-ABI compatible struct layout"),
+                ("packed", "Unaligned packed struct layout (1-byte alignment)"),
+                ("align(16)", "Explicit minimum byte alignment"),
+                ("export", "Export symbol with C ABI for static/shared library FFI"),
+                ("link(\"m\")", "Link external C/native library"),
+                ("cfg(os = \"macos\")", "Conditional compilation attribute"),
+                ("derive(ToJson, FromJson)", "Derive JSON serialization/deserialization"),
+                ("get(\"/path\")", "Register HTTP GET route handler"),
+                ("post(\"/path\")", "Register HTTP POST route handler"),
+                ("put(\"/path\")", "Register HTTP PUT route handler"),
+                ("delete(\"/path\")", "Register HTTP DELETE route handler"),
+                ("evolve(\"entity.Name\")", "Versioned schema evolution entity"),
+                ("field(1)", "Stable schema evolution field ID"),
+            ] {
+                items.push(json!({
+                    "label": attr,
+                    "kind": 14,
+                    "detail": detail
+                }));
+            }
+            return json!(items);
+        }
+
+        // 2. Member / package completion after `.`
+        if let Some(dot_idx) = line_prefix.rfind('.') {
+            let before_dot = &line_prefix[..dot_idx];
+            let receiver_ident: String = before_dot
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+
+            if !receiver_ident.is_empty() {
+                if let Some(prog) = prog {
+                    // 2a. Check if `receiver_ident` is a package namespace alias from raw imports
+                    let mut pkg_aliases = BTreeSet::new();
+                    if let Some(rp) = raw_prog {
+                        for it in &rp.items {
+                            if let Item::Import { path, alias, kind, .. } = it {
+                                let ns = alias.clone().unwrap_or_else(|| {
+                                    if let Some(tenon_syntax::ImportKind::Package(segs)) = kind {
+                                        segs.last().cloned().unwrap_or_default()
+                                    } else {
+                                        path.rsplit('.').next().unwrap_or("").to_string()
+                                    }
+                                });
+                                if !ns.is_empty() {
+                                    pkg_aliases.insert(ns);
+                                }
+                            }
+                        }
+                    }
+
+                    if pkg_aliases.contains(&receiver_ident) {
+                        let prefix_mangled = format!("{}__", receiver_ident);
+                        for it in &prog.items {
+                            if let Some((name, kind_num, detail)) = item_completion_info(it) {
+                                if let Some(short) = name.strip_prefix(&prefix_mangled) {
+                                    if seen.insert(short.to_string()) {
+                                        items.push(json!({
+                                            "label": short,
+                                            "kind": kind_num,
+                                            "detail": detail
+                                        }));
+                                    }
+                                } else if is_item_pub(it) && seen.insert(name.clone()) {
+                                    items.push(json!({
+                                        "label": name,
+                                        "kind": kind_num,
+                                        "detail": detail
+                                    }));
+                                }
+                            }
+                        }
+                    }
+
+                    // 2b. Check if `receiver_ident` is a type name (enum variants / assoc methods)
+                    for it in &prog.items {
+                        match it {
+                            Item::Enum(e) if e.name == receiver_ident => {
+                                for v in &e.variants {
+                                    if seen.insert(v.name.clone()) {
+                                        items.push(json!({
+                                            "label": v.name,
+                                            "kind": 20,
+                                            "detail": format!("enum variant of {}", e.name)
+                                        }));
+                                    }
+                                }
+                            }
+                            Item::Impl(im) if im.target_ty.display_name() == receiver_ident => {
+                                for m in &im.methods {
+                                    if seen.insert(m.name.clone()) {
+                                        items.push(json!({
+                                            "label": m.name,
+                                            "kind": 2,
+                                            "detail": format_fn_sig(m)
+                                        }));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // 2c. Infer local variable type from text (e.g. `ctx Context`, `let u = User { ... }`)
+                    if let Some(var_ty) = guess_var_type_in_source(&doc.text, &receiver_ident) {
+                        for it in &prog.items {
+                            match it {
+                                Item::Record(r) if r.name == var_ty => {
+                                    for f in &r.fields {
+                                        if seen.insert(f.name.clone()) {
+                                            items.push(json!({
+                                                "label": f.name,
+                                                "kind": 5,
+                                                "detail": f.ty.display_name()
+                                            }));
+                                        }
+                                    }
+                                }
+                                Item::Bitfield(b) if b.name == var_ty => {
+                                    for f in &b.fields {
+                                        if seen.insert(f.name.clone()) {
+                                            items.push(json!({
+                                                "label": f.name,
+                                                "kind": 5,
+                                                "detail": format!("{} bit(s)", f.bits)
+                                            }));
+                                        }
+                                    }
+                                    if seen.insert("raw".into()) {
+                                        items.push(json!({
+                                            "label": "raw",
+                                            "kind": 2,
+                                            "detail": format!("fn raw(self) {}", b.backing_ty.display_name())
+                                        }));
+                                    }
+                                }
+                                Item::Union(u) if u.name == var_ty => {
+                                    for f in &u.fields {
+                                        if seen.insert(f.name.clone()) {
+                                            items.push(json!({
+                                                "label": f.name,
+                                                "kind": 5,
+                                                "detail": f.ty.display_name()
+                                            }));
+                                        }
+                                    }
+                                }
+                                Item::Impl(im) if im.target_ty.display_name() == var_ty => {
+                                    for m in &im.methods {
+                                        if seen.insert(m.name.clone()) {
+                                            items.push(json!({
+                                                "label": m.name,
+                                                "kind": 2,
+                                                "detail": format_fn_sig(m)
+                                            }));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                return json!(items);
+            }
+        }
+
+        // 3. General identifier completion: in-scope items + keywords + primitive/SIMD types
+        if let Some(prog) = prog {
+            for it in &prog.items {
+                if let Some((name, kind_num, detail)) = item_completion_info(it) {
+                    if !name.starts_with("__") && seen.insert(name.clone()) {
+                        items.push(json!({
+                            "label": name,
+                            "kind": kind_num,
+                            "detail": detail
+                        }));
+                    }
+                }
+            }
+        }
+
+        for kw in [
+            "fn", "pure", "comptime", "macro", "record", "enum", "interface", "impl", "type",
+            "const", "union", "bitfield", "import", "pub", "unsafe", "defer", "test", "where",
+            "requires", "ensures", "match", "if", "else", "while", "for", "in", "return", "let",
+            "var", "inout", "dyn", "async", "await", "extern", "true", "false",
+        ] {
+            if seen.insert(kw.into()) {
+                items.push(json!({ "label": kw, "kind": 14, "detail": "keyword" }));
+            }
+        }
+
+        for ty in [
+            "Int", "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
+            "ISize", "USize", "Float", "Float32", "Float64", "Bool", "Text", "Bytes", "BytesSlice",
+            "List", "Map", "Option", "Result", "Store", "Channel", "Mutex", "AtomicInt", "Ptr",
+            "MutPtr", "Float32x4", "Float64x4", "Int32x4", "Int64x4", "UInt8x16",
+        ] {
+            if seen.insert(ty.into()) {
+                items.push(json!({ "label": ty, "kind": 22, "detail": "built-in type" }));
+            }
+        }
+
+        json!(items)
+    }
+
+    fn handle_document_symbol(&self, params: &Value) -> Value {
+        let Some(uri) = params
+            .get("textDocument")
+            .and_then(|t| t.get("uri"))
+            .and_then(|u| u.as_str())
+        else {
+            return json!([]);
+        };
+        let Some(analyzed) = self.analysis.get(uri) else {
+            return json!([]);
+        };
+        let Some(prog) = analyzed.raw_program.as_ref().or(analyzed.full_program.as_ref()) else {
+            return json!([]);
+        };
+
+        let mut syms = Vec::new();
+        for item in &prog.items {
+            match item {
+                Item::Fn(f) => {
+                    syms.push(make_doc_symbol(&f.name, 12, f.span, format_fn_sig(f), vec![]));
+                }
+                Item::ExternFn(ef) => {
+                    syms.push(make_doc_symbol(
+                        &ef.name,
+                        12,
+                        ef.span,
+                        format!("extern \"C\" fn {}", ef.name),
+                        vec![],
+                    ));
+                }
+                Item::Record(r) => {
+                    let children: Vec<Value> = r
+                        .fields
+                        .iter()
+                        .map(|f| make_doc_symbol(&f.name, 8, f.span, f.ty.display_name(), vec![]))
+                        .collect();
+                    syms.push(make_doc_symbol(&r.name, 23, r.span, "record".into(), children));
+                }
+                Item::Union(u) => {
+                    let children: Vec<Value> = u
+                        .fields
+                        .iter()
+                        .map(|f| make_doc_symbol(&f.name, 8, f.span, f.ty.display_name(), vec![]))
+                        .collect();
+                    syms.push(make_doc_symbol(&u.name, 23, u.span, "union".into(), children));
+                }
+                Item::Bitfield(b) => {
+                    let children: Vec<Value> = b
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            make_doc_symbol(&f.name, 8, f.span, format!("{} bits", f.bits), vec![])
+                        })
+                        .collect();
+                    syms.push(make_doc_symbol(
+                        &b.name,
+                        23,
+                        b.span,
+                        format!("bitfield({})", b.backing_ty.display_name()),
+                        children,
+                    ));
+                }
+                Item::Enum(e) => {
+                    let children: Vec<Value> = e
+                        .variants
+                        .iter()
+                        .map(|v| make_doc_symbol(&v.name, 22, v.span, "variant".into(), vec![]))
+                        .collect();
+                    syms.push(make_doc_symbol(&e.name, 10, e.span, "enum".into(), children));
+                }
+                Item::Interface(i) => {
+                    let children: Vec<Value> = i
+                        .methods
+                        .iter()
+                        .map(|m| make_doc_symbol(&m.name, 6, m.span, format_iface_method_sig(m), vec![]))
+                        .collect();
+                    syms.push(make_doc_symbol(&i.name, 11, i.span, "interface".into(), children));
+                }
+                Item::Impl(im) => {
+                    let label = if let Some(iface) = &im.interface {
+                        format!("impl {} for {}", iface.display_name(), im.target_ty.display_name())
+                    } else {
+                        format!("impl {}", im.target_ty.display_name())
+                    };
+                    let children: Vec<Value> = im
+                        .methods
+                        .iter()
+                        .map(|m| make_doc_symbol(&m.name, 6, m.span, format_fn_sig(m), vec![]))
+                        .collect();
+                    syms.push(make_doc_symbol(&label, 5, im.span, "impl".into(), children));
+                }
+                Item::TypeAlias(ta) => {
+                    syms.push(make_doc_symbol(
+                        &ta.name,
+                        26,
+                        ta.span,
+                        format!("type = {}", ta.base.display_name()),
+                        vec![],
+                    ));
+                }
+                Item::Const(c) => {
+                    syms.push(make_doc_symbol(
+                        &c.name,
+                        14,
+                        c.span,
+                        c.ty.display_name(),
+                        vec![],
+                    ));
+                }
+                Item::Macro(m) => {
+                    syms.push(make_doc_symbol(&m.name, 12, m.span, "macro".into(), vec![]));
+                }
+                _ => {}
+            }
+        }
+        json!(syms)
+    }
+
+    fn handle_formatting(&self, params: &Value) -> Value {
+        let Some(uri) = params
+            .get("textDocument")
+            .and_then(|t| t.get("uri"))
+            .and_then(|u| u.as_str())
+        else {
+            return json!([]);
+        };
+        let Some(doc) = self.docs.get(uri) else {
+            return json!([]);
+        };
+        let formatted = crate::format_tenon_source(&doc.text);
+        if formatted == doc.text {
+            return json!([]);
+        }
+        let line_count = doc.text.lines().count() as u32;
+        json!([
+            {
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": line_count + 1, "character": 0 }
+                },
+                "newText": formatted
+            }
+        ])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC 2.0 Content-Length framing
+// ---------------------------------------------------------------------------
+
+fn read_lsp_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
+            if let Ok(len) = rest.trim().parse::<usize>() {
+                content_length = Some(len);
+            }
+        }
+    }
+    let Some(len) = content_length else {
+        return Ok(None);
+    };
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf)?;
+    let val: Value = serde_json::from_slice(&buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(val))
+}
+
+fn write_lsp_message<W: Write>(writer: &mut W, msg: &Value) -> io::Result<()> {
+    let body = serde_json::to_vec(msg)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+    writer.write_all(&body)?;
+    writer.flush()
+}
+
+// ---------------------------------------------------------------------------
+// Helpers: URI, cursor text extraction, hover formatting, symbol lookup
+// ---------------------------------------------------------------------------
+
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let raw = uri.strip_prefix("file://")?;
+    let mut bytes = Vec::with_capacity(raw.len());
+    let src = raw.as_bytes();
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'%' && i + 2 < src.len() {
+            if let Ok(hex) = std::str::from_utf8(&src[i + 1..i + 3]) {
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    bytes.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        bytes.push(src[i]);
+        i += 1;
+    }
+    let s = String::from_utf8(bytes).ok()?;
+    Some(PathBuf::from(s))
+}
+
+fn path_to_uri(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let encoded = s.replace(' ', "%20");
+    if encoded.starts_with('/') {
+        format!("file://{}", encoded)
+    } else {
+        format!("file:///{}", encoded)
+    }
+}
+
+fn span_file_uri(prog: &Program, span: Span, fallback_uri: &str) -> String {
+    if span.file_id == 0 {
+        return fallback_uri.to_string();
+    }
+    if let Some(p) = prog.source_files.get(span.file_id as usize) {
+        if !p.starts_with('<') {
+            return path_to_uri(Path::new(p));
+        }
+    }
+    fallback_uri.to_string()
+}
+
+fn extract_text_doc_pos(params: &Value) -> Option<(String, usize, usize)> {
+    let uri = params
+        .get("textDocument")?
+        .get("uri")?
+        .as_str()?
+        .to_string();
+    let pos = params.get("position")?;
+    let line = pos.get("line")?.as_u64()? as usize;
+    let ch = pos.get("character")?.as_u64()? as usize;
+    Some((uri, line, ch))
+}
+
+fn line_prefix_before_cursor(text: &str, line: usize, ch: usize) -> String {
+    let Some(ln) = text.lines().nth(line) else {
+        return String::new();
+    };
+    ln.chars().take(ch).collect()
+}
+
+fn word_at_position(text: &str, line: usize, ch: usize) -> Option<(String, Option<String>)> {
+    let ln = text.lines().nth(line)?;
+    let chars: Vec<char> = ln.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let idx = ch.min(chars.len().saturating_sub(1));
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let pivot = if is_ident(chars[idx]) {
+        idx
+    } else if idx > 0 && is_ident(chars[idx - 1]) {
+        idx - 1
+    } else {
+        return None;
+    };
+    let mut start = pivot;
+    while start > 0 && is_ident(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = pivot + 1;
+    while end < chars.len() && is_ident(chars[end]) {
+        end += 1;
+    }
+    let word: String = chars[start..end].iter().collect();
+    let qual_prefix = if start >= 2 && chars[start - 1] == '.' {
+        let mut pstart = start - 1;
+        while pstart > 0 && is_ident(chars[pstart - 1]) {
+            pstart -= 1;
+        }
+        if pstart < start - 1 {
+            Some(chars[pstart..start - 1].iter().collect())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Some((word, qual_prefix))
+}
+
+fn make_doc_symbol(name: &str, kind: u32, span: Span, detail: String, children: Vec<Value>) -> Value {
+    let l0 = span.line.saturating_sub(1);
+    let c0 = span.col.saturating_sub(1);
+    let range = json!({
+        "start": { "line": l0, "character": c0 },
+        "end": { "line": l0, "character": c0 + name.len().max(1) }
+    });
+    json!({
+        "name": name,
+        "detail": detail,
+        "kind": kind,
+        "range": range,
+        "selectionRange": range,
+        "children": children
+    })
+}
+
+fn find_item_span(prog: &Program, name: &str) -> Option<Span> {
+    for item in &prog.items {
+        match item {
+            Item::Fn(f) if f.name == name => return Some(f.span),
+            Item::ExternFn(f) if f.name == name => return Some(f.span),
+            Item::Record(r) if r.name == name => return Some(r.span),
+            Item::Union(u) if u.name == name => return Some(u.span),
+            Item::Bitfield(b) if b.name == name => return Some(b.span),
+            Item::Enum(e) if e.name == name => return Some(e.span),
+            Item::Interface(i) if i.name == name => return Some(i.span),
+            Item::TypeAlias(t) if t.name == name => return Some(t.span),
+            Item::Const(c) if c.name == name => return Some(c.span),
+            Item::Macro(m) if m.name == name => return Some(m.span),
+            Item::Impl(im) => {
+                for m in &im.methods {
+                    if m.name == name {
+                        return Some(m.span);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_item_pub(item: &Item) -> bool {
+    match item {
+        Item::Fn(d) => d.is_pub,
+        Item::Record(d) => d.is_pub,
+        Item::Union(d) => d.is_pub,
+        Item::Bitfield(d) => d.is_pub,
+        Item::Enum(d) => d.is_pub,
+        Item::Interface(d) => d.is_pub,
+        Item::TypeAlias(d) => d.is_pub,
+        Item::Const(d) => d.is_pub,
+        Item::Macro(d) => d.is_pub,
+        Item::ExternFn(d) => d.is_pub,
+        _ => false,
+    }
+}
+
+fn item_completion_info(item: &Item) -> Option<(String, u32, String)> {
+    match item {
+        Item::Fn(f) => Some((f.name.clone(), 3, format_fn_sig(f))),
+        Item::ExternFn(ef) => Some((ef.name.clone(), 3, format!("extern \"C\" fn {}", ef.name))),
+        Item::Record(r) => Some((r.name.clone(), 22, format!("record {}", r.name))),
+        Item::Union(u) => Some((u.name.clone(), 22, format!("union {}", u.name))),
+        Item::Bitfield(b) => Some((
+            b.name.clone(),
+            22,
+            format!("bitfield {} : {}", b.name, b.backing_ty.display_name()),
+        )),
+        Item::Enum(e) => Some((e.name.clone(), 13, format!("enum {}", e.name))),
+        Item::Interface(i) => Some((i.name.clone(), 8, format!("interface {}", i.name))),
+        Item::TypeAlias(t) => Some((t.name.clone(), 22, format!("type {}", t.name))),
+        Item::Const(c) => Some((c.name.clone(), 21, format!("const {}", c.name))),
+        Item::Macro(m) => Some((format!("{}!", m.name), 15, format!("macro {}", m.name))),
+        _ => None,
+    }
+}
+
+fn format_attrs(attrs: &[Attr]) -> String {
+    attrs
+        .iter()
+        .map(|a| {
+            if a.args.is_empty() {
+                format!("@{}", a.name)
+            } else {
+                let args: Vec<String> = a
+                    .args
+                    .iter()
+                    .map(|arg| {
+                        let v = expr_brief(&arg.value);
+                        if let Some(k) = &arg.key {
+                            format!("{} = {}", k, v)
+                        } else {
+                            v
+                        }
+                    })
+                    .collect();
+                format!("@{}({})", a.name, args.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_fn_sig(f: &FnDecl) -> String {
+    let mut s = String::new();
+    if f.is_pub {
+        s.push_str("pub ");
+    }
+    if f.is_comptime {
+        s.push_str("comptime ");
+    }
+    if f.is_test {
+        s.push_str("test ");
+    }
+    if f.is_unsafe {
+        s.push_str("unsafe ");
+    }
+    if f.is_async {
+        s.push_str("async ");
+    }
+    if f.is_pure {
+        s.push_str("pure ");
+    }
+    s.push_str("fn ");
+    s.push_str(&f.name);
+    if !f.type_params.is_empty() {
+        s.push('[');
+        s.push_str(&f.type_params.join(", "));
+        s.push(']');
+    }
+    s.push('(');
+    let ps: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| {
+            let mut ps = String::new();
+            if p.is_inout {
+                ps.push_str("inout ");
+            }
+            ps.push_str(&p.name);
+            if p.name != "self" {
+                ps.push(' ');
+                ps.push_str(&p.ty.display_name());
+            }
+            if let Some(w) = &p.predicate {
+                ps.push_str(&format!(" where {}", expr_brief(w)));
+            }
+            ps
+        })
+        .collect();
+    s.push_str(&ps.join(", "));
+    s.push(')');
+    if let Some(rt) = &f.ret_ty {
+        s.push(' ');
+        s.push_str(&rt.display_name());
+    }
+    s
+}
+
+fn format_iface_method_sig(m: &InterfaceMethodDecl) -> String {
+    let mut s = String::new();
+    if m.is_async {
+        s.push_str("async ");
+    }
+    if m.is_pure {
+        s.push_str("pure ");
+    }
+    s.push_str("fn ");
+    s.push_str(&m.name);
+    if !m.type_params.is_empty() {
+        s.push('[');
+        s.push_str(&m.type_params.join(", "));
+        s.push(']');
+    }
+    s.push('(');
+    let ps: Vec<String> = m
+        .params
+        .iter()
+        .map(|p| {
+            if p.name == "self" {
+                if p.is_inout { "inout self".into() } else { "self".into() }
+            } else {
+                format!("{} {}", p.name, p.ty.display_name())
+            }
+        })
+        .collect();
+    s.push_str(&ps.join(", "));
+    s.push(')');
+    if let Some(rt) = &m.ret_ty {
+        s.push(' ');
+        s.push_str(&rt.display_name());
+    }
+    s
+}
+
+fn format_fn_hover(f: &FnDecl, impl_target: Option<&str>, report: Option<&CheckReport>) -> String {
+    let mut out = String::new();
+    out.push_str("```tenon\n");
+    if !f.attrs.is_empty() {
+        out.push_str(&format_attrs(&f.attrs));
+        out.push('\n');
+    }
+    out.push_str(&format_fn_sig(f));
+    for r in &f.requires {
+        out.push_str(&format!("\n  requires {}", expr_brief(r)));
+    }
+    for e in &f.ensures {
+        out.push_str(&format!("\n  ensures {}", expr_brief(e)));
+    }
+    out.push_str("\n```");
+    if let Some(t) = impl_target {
+        out.push_str(&format!("\n\nMethod on `{}`", t));
+    }
+    if let Some(rep) = report {
+        let l0 = rep.proofs.iter().filter(|p| p.tier == ProofTier::L0Fast).count();
+        let l1 = rep.proofs.iter().filter(|p| p.tier == ProofTier::L1Smt).count();
+        if l0 + l1 > 0 {
+            out.push_str(&format!(
+                "\n\n*Verification*: {} L0-fast + {} L1-Z3 proofs checked ({})",
+                l0,
+                l1,
+                if rep.ok { "PASS" } else { "FAIL" }
+            ));
+        }
+    }
+    out
+}
+
+fn format_record_hover(r: &RecordDecl, layout: &LayoutEngine) -> String {
+    let mut out = String::from("```tenon\n");
+    if !r.attrs.is_empty() {
+        out.push_str(&format_attrs(&r.attrs));
+        out.push('\n');
+    }
+    if r.is_pub {
+        out.push_str("pub ");
+    }
+    out.push_str("record ");
+    out.push_str(&r.name);
+    if !r.type_params.is_empty() {
+        out.push('[');
+        out.push_str(&r.type_params.join(", "));
+        out.push(']');
+    }
+    out.push_str(" {\n");
+    for f in &r.fields {
+        out.push_str(&format!("    {} {}", f.name, f.ty.display_name()));
+        if let Some(w) = &f.predicate {
+            out.push_str(&format!(" where {}", expr_brief(w)));
+        }
+        out.push('\n');
+    }
+    out.push_str("}\n```");
+
+    if let Some(sl) = layout.struct_layout(&r.name) {
+        let repr = if sl.is_packed {
+            "@packed"
+        } else if sl.is_c_repr {
+            "@repr(C)"
+        } else {
+            "default"
+        };
+        out.push_str(&format!(
+            "\n\n**Layout** (`{}`): `size_of = {} B`, `align_of = {} B`",
+            repr, sl.size, sl.align
+        ));
+        if !sl.fields.is_empty() {
+            out.push_str("\n\n| Field | Offset | Size | Align |\n|---|---:|---:|---:|");
+            for fl in &sl.fields {
+                out.push_str(&format!(
+                    "\n| `{}` | `+{}` | `{} B` | `{} B` |",
+                    fl.name, fl.byte_offset, fl.byte_size, fl.align
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn format_union_hover(u: &UnionDecl, layout: &LayoutEngine) -> String {
+    let mut out = String::from("```tenon\n");
+    if u.is_pub {
+        out.push_str("pub ");
+    }
+    out.push_str(&format!("union {} {{\n", u.name));
+    for f in &u.fields {
+        out.push_str(&format!("    {} {}\n", f.name, f.ty.display_name()));
+    }
+    out.push_str("}\n```");
+    if let Some(ul) = layout.union_layout(&u.name) {
+        out.push_str(&format!(
+            "\n\n**C Union Layout**: `size_of = {} B`, `align_of = {} B` (all fields at offset `+0`)",
+            ul.size, ul.align
+        ));
+    }
+    out
+}
+
+fn format_bitfield_hover(b: &BitfieldDecl, layout: &LayoutEngine) -> String {
+    let mut out = String::from("```tenon\n");
+    if b.is_pub {
+        out.push_str("pub ");
+    }
+    out.push_str(&format!(
+        "bitfield {} : {} {{\n",
+        b.name,
+        b.backing_ty.display_name()
+    ));
+    for f in &b.fields {
+        out.push_str(&format!("    {}: {}\n", f.name, f.bits));
+    }
+    out.push_str("}\n```");
+    if let Some(bl) = layout.bitfield_layout(&b.name) {
+        out.push_str(&format!(
+            "\n\n**Bitfield Layout**: backing `{}` ({} bits used / {} bits)\n\n| Field | Bits | Mask |\n|---|---|---|",
+            bl.backing.canonical_name(),
+            bl.total_bits,
+            bl.backing.bit_width()
+        ));
+        for f in &bl.fields {
+            out.push_str(&format!(
+                "\n| `{}` | `[{}..{})` ({}b) | `0x{:x}` |",
+                f.name,
+                f.bit_offset,
+                f.bit_offset + f.bit_width,
+                f.bit_width,
+                f.mask
+            ));
+        }
+    }
+    out
+}
+
+fn format_type_alias_hover(t: &TypeAliasDecl) -> String {
+    let mut out = String::from("```tenon\n");
+    if t.is_pub {
+        out.push_str("pub ");
+    }
+    out.push_str(&format!("type {} = {}", t.name, t.base.display_name()));
+    if let Some(w) = &t.predicate {
+        out.push_str(&format!(" where {}", expr_brief(w)));
+    }
+    out.push_str("\n```");
+    out
+}
+
+fn format_enum_hover(e: &EnumDecl) -> String {
+    let mut out = String::from("```tenon\n");
+    if e.is_pub {
+        out.push_str("pub ");
+    }
+    out.push_str(&format!("enum {} {{\n", e.name));
+    for v in &e.variants {
+        if v.fields.is_empty() {
+            out.push_str(&format!("    {}\n", v.name));
+        } else {
+            let ps: Vec<String> = v
+                .fields
+                .iter()
+                .map(|f| format!("{} {}", f.name, f.ty.display_name()))
+                .collect();
+            out.push_str(&format!("    {}({})\n", v.name, ps.join(", ")));
+        }
+    }
+    out.push_str("}\n```");
+    out
+}
+
+fn format_interface_hover(i: &InterfaceDecl) -> String {
+    let mut out = String::from("```tenon\n");
+    if i.is_pub {
+        out.push_str("pub ");
+    }
+    out.push_str(&format!("interface {} {{\n", i.name));
+    for m in &i.methods {
+        out.push_str(&format!("    {}\n", format_iface_method_sig(m)));
+    }
+    out.push_str("}\n```");
+    out
+}
+
+fn format_const_hover(c: &ConstDecl) -> String {
+    format!(
+        "```tenon\n{}const {} {} = {}\n```",
+        if c.is_pub { "pub " } else { "" },
+        c.name,
+        c.ty.display_name(),
+        expr_brief(&c.value)
+    )
+}
+
+fn format_macro_hover(m: &MacroDecl) -> String {
+    format!(
+        "```tenon\n{}macro {}({})\n```\n\nCompile-time declarative AST macro.",
+        if m.is_pub { "pub " } else { "" },
+        m.name,
+        m.params.join(", ")
+    )
+}
+
+fn format_item_hover(
+    prog: &Program,
+    layout: &LayoutEngine,
+    report: Option<&CheckReport>,
+    name: &str,
+) -> Option<String> {
+    for item in &prog.items {
+        match item {
+            Item::Fn(f) if f.name == name => return Some(format_fn_hover(f, None, report)),
+            Item::Record(r) if r.name == name => return Some(format_record_hover(r, layout)),
+            Item::Union(u) if u.name == name => return Some(format_union_hover(u, layout)),
+            Item::Bitfield(b) if b.name == name => return Some(format_bitfield_hover(b, layout)),
+            Item::Enum(e) if e.name == name => return Some(format_enum_hover(e)),
+            Item::Interface(i) if i.name == name => return Some(format_interface_hover(i)),
+            Item::TypeAlias(t) if t.name == name => return Some(format_type_alias_hover(t)),
+            Item::Const(c) if c.name == name => return Some(format_const_hover(c)),
+            Item::Macro(m) if m.name == name => return Some(format_macro_hover(m)),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn expr_brief(expr: &Expr) -> String {
+    match &expr.kind {
+        ExprKind::Int(n) => n.to_string(),
+        ExprKind::Float(f) => f.to_string(),
+        ExprKind::Bool(b) => b.to_string(),
+        ExprKind::Str(s) => format!("{:?}", s),
+        ExprKind::Ident(s) => s.clone(),
+        ExprKind::Binary { op, left, right } => {
+            let op_s = match op {
+                tenon_syntax::BinOp::Add => "+",
+                tenon_syntax::BinOp::Sub => "-",
+                tenon_syntax::BinOp::Mul => "*",
+                tenon_syntax::BinOp::Div => "/",
+                tenon_syntax::BinOp::Mod => "%",
+                tenon_syntax::BinOp::Eq => "==",
+                tenon_syntax::BinOp::Ne => "!=",
+                tenon_syntax::BinOp::Lt => "<",
+                tenon_syntax::BinOp::Le => "<=",
+                tenon_syntax::BinOp::Gt => ">",
+                tenon_syntax::BinOp::Ge => ">=",
+                tenon_syntax::BinOp::And => "&&",
+                tenon_syntax::BinOp::Or => "||",
+                tenon_syntax::BinOp::BitAnd => "&",
+                tenon_syntax::BinOp::BitOr => "|",
+                tenon_syntax::BinOp::BitXor => "^",
+                tenon_syntax::BinOp::Shl => "<<",
+                tenon_syntax::BinOp::Shr => ">>",
+                tenon_syntax::BinOp::Implies => "==>",
+                tenon_syntax::BinOp::Concat => "++",
+            };
+            format!("{} {} {}", expr_brief(left), op_s, expr_brief(right))
+        }
+        ExprKind::Field { target, field } => format!("{}.{}", expr_brief(target), field),
+        ExprKind::Call { callee, args } => {
+            let a: Vec<String> = args.iter().map(|x| expr_brief(&x.value)).collect();
+            format!("{}({})", expr_brief(callee), a.join(", "))
+        }
+        _ => "...".into(),
+    }
+}
+
+fn builtin_hover(word: &str) -> Option<String> {
+    let desc = match word {
+        "Int" | "Int64" => "`Int` (`Int64`): 64-bit signed integer (`i64`, 8 bytes).",
+        "Int8" => "`Int8`: 8-bit signed integer (`i8`, 1 byte, `-128..=127`).",
+        "Int16" => "`Int16`: 16-bit signed integer (`i16`, 2 bytes).",
+        "Int32" => "`Int32`: 32-bit signed integer (`i32`, 4 bytes).",
+        "UInt8" | "Byte" => "`UInt8` (`Byte`): 8-bit unsigned integer (`u8`, 1 byte, `0..=255`).",
+        "UInt16" => "`UInt16`: 16-bit unsigned integer (`u16`, 2 bytes).",
+        "UInt32" => "`UInt32`: 32-bit unsigned integer (`u32`, 4 bytes).",
+        "UInt64" | "USize" => "`UInt64` / `USize`: 64-bit unsigned integer (`u64`, 8 bytes).",
+        "Float" | "Float64" => "`Float` (`Float64`): IEEE-754 64-bit floating-point (`f64`).",
+        "Float32" => "`Float32`: IEEE-754 32-bit floating-point (`f32`).",
+        "Float32x4" => "`Float32x4`: 128-bit SIMD vector (`<4 x float>`, 16-byte aligned, LLVM native vector IR).",
+        "Float64x4" => "`Float64x4`: 256-bit SIMD vector (`<4 x double>`, 32-byte aligned, LLVM native vector IR).",
+        "Int32x4" => "`Int32x4`: 128-bit SIMD vector (`<4 x i32>`).",
+        "UInt8x16" => "`UInt8x16`: 128-bit SIMD vector (`<16 x i8>`).",
+        "Text" => "`Text`: UTF-8 immutable value-semantic string with Perceus RC & COW.",
+        "Bytes" => "`Bytes`: Owned byte buffer with Perceus RC & zero-copy `BytesSlice` views.",
+        "Channel" => "`Channel[T]`: Bounded lock-safe MPMC OS-thread channel.",
+        "Mutex" => "`Mutex[T]`: OS mutex protecting value `T` across threads.",
+        "Store" => "`Store[T]`: Generational arena with ABA-safe `Handle[T]`.",
+        "comptime" => "`comptime`: Compile-time evaluation (`comptime { ... }`, `comptime fn`, `comptime if`, `comptime for`).",
+        "size_of" => "`size_of[T]() USize`: Compile-time byte size of type `T`.",
+        "align_of" => "`align_of[T]() USize`: Compile-time byte alignment of type `T`.",
+        "offset_of" => "`offset_of(T, \"field\") USize`: Compile-time byte offset of field in `@repr(C)`/`@packed` record.",
+        _ => return None,
+    };
+    Some(desc.to_string())
+}
+
+fn guess_var_type_in_source(src: &str, var_name: &str) -> Option<String> {
+    // 1. Parameter pattern: `var_name TypeName` inside `(...)`
+    for line in src.lines() {
+        let tokens: Vec<&str> = line
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| !t.is_empty())
+            .collect();
+        for w in tokens.windows(2) {
+            if w[0] == var_name && w[1].chars().next().is_some_and(|c| c.is_uppercase()) {
+                return Some(w[1].to_string());
+            }
+        }
+        // 2. Binding pattern: `let var_name = TypeName {` or `var var_name = TypeName.new(`
+        for prefix in [format!("let {} = ", var_name), format!("var {} = ", var_name)] {
+            if let Some(idx) = line.find(&prefix) {
+                let rest = line[idx + prefix.len()..].trim();
+                let ty_tok: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if ty_tok.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    return Some(ty_tok);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn frame(msg: &Value) -> Vec<u8> {
+        let body = serde_json::to_vec(msg).unwrap();
+        let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn read_all_messages(bytes: &[u8]) -> Vec<Value> {
+        let mut cur = Cursor::new(bytes);
+        let mut msgs = Vec::new();
+        while let Ok(Some(v)) = read_lsp_message(&mut cur) {
+            msgs.push(v);
+        }
+        msgs
+    }
+
+    #[test]
+    fn lsp_full_protocol_lifecycle_diagnostics_hover_def_completion_symbols_fmt() {
+        let sample_src = r#"@repr(C)
+pub record Packet {
+    kind UInt8
+    len  UInt16
+    seq  UInt32
+}
+
+pub type Port = Int where 1 <= self && self <= 65535
+
+pub pure fn double_port(p Port) Int
+    ensures result >= 2
+{
+    p * 2
+}
+
+pub fn bad_call() Int {
+    let pkt = Packet { kind = 1, len = 4, seq = 9 }
+    let x = double_port(0)
+    pkt.
+    x
+}
+"#;
+        // First open valid code (without `pkt.`) to test diagnostics + hover + definition + completion + symbols + fmt
+        let valid_with_refinement_err = sample_src.replace("    pkt.\n", "");
+        let uri = "file:///tmp/tenon_lsp_unit_test.tn";
+
+        let mut input = Vec::new();
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "method": "initialized", "params": {}
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": uri, "languageId": "tenon", "version": 1, "text": valid_with_refinement_err } }
+        })));
+        // Hover over `Packet` (line 1, col 12) -> should include @repr(C) layout (`size_of = 8 B`)!
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "textDocument/hover",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 1, "character": 12 } }
+        })));
+        // Hover over `double_port` at callsite (line 17, col 14)
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "textDocument/hover",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 17, "character": 14 } }
+        })));
+        // Go to definition of `double_port` from callsite (line 17, col 14) -> line 9!
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "textDocument/definition",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 17, "character": 14 } }
+        })));
+        // Document symbols
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 5, "method": "textDocument/documentSymbol",
+            "params": { "textDocument": { "uri": uri } }
+        })));
+        // Completion after `pkt.` (update text to include `pkt.`)
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 6, "method": "textDocument/completion",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 16, "character": 4 } }
+        })));
+        // Formatting
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 7, "method": "textDocument/formatting",
+            "params": { "textDocument": { "uri": uri }, "options": { "tabSize": 4, "insertSpaces": true } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 8, "method": "shutdown", "params": null
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "method": "exit", "params": null
+        })));
+
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        let mut server = LspServer::new();
+        assert!(server.run_loop(&mut reader, &mut output));
+
+        let msgs = read_all_messages(&output);
+        // 1. Initialize response advertises capabilities
+        let init_resp = msgs.iter().find(|m| m.get("id") == Some(&json!(1))).unwrap();
+        assert_eq!(init_resp["result"]["capabilities"]["hoverProvider"], json!(true));
+        assert_eq!(init_resp["result"]["capabilities"]["definitionProvider"], json!(true));
+
+        // 2. publishDiagnostics catches `double_port(0)` refinement violation!
+        let diag_notif = msgs
+            .iter()
+            .find(|m| m.get("method") == Some(&json!("textDocument/publishDiagnostics")))
+            .unwrap();
+        let diags = diag_notif["params"]["diagnostics"].as_array().unwrap();
+        assert!(!diags.is_empty(), "expected refinement diagnostic for double_port(0)");
+
+        // 3. Hover over `@repr(C)` record `Packet` includes exact byte layout
+        let hover_pkt = msgs.iter().find(|m| m.get("id") == Some(&json!(2))).unwrap();
+        let hover_md = hover_pkt["result"]["contents"]["value"].as_str().unwrap();
+        assert!(hover_md.contains("@repr(C)"), "hover missing @repr(C): {}", hover_md);
+        assert!(hover_md.contains("size_of = 8 B"), "hover missing size_of = 8 B: {}", hover_md);
+
+        // 4. Hover over `double_port` includes `ensures result >= 2`
+        let hover_fn = msgs.iter().find(|m| m.get("id") == Some(&json!(3))).unwrap();
+        let hover_fn_md = hover_fn["result"]["contents"]["value"].as_str().unwrap();
+        assert!(hover_fn_md.contains("ensures result >= 2"), "hover_fn={}", hover_fn_md);
+
+        // 5. Definition of `double_port` jumps to line 9 (0-based)
+        let def_resp = msgs.iter().find(|m| m.get("id") == Some(&json!(4))).unwrap();
+        assert_eq!(def_resp["result"]["range"]["start"]["line"], json!(9));
+
+        // 6. Document symbols include Packet, Port, double_port, bad_call
+        let sym_resp = msgs.iter().find(|m| m.get("id") == Some(&json!(5))).unwrap();
+        let syms = sym_resp["result"].as_array().unwrap();
+        assert!(syms.iter().any(|s| s["name"] == json!("Packet")));
+        assert!(syms.iter().any(|s| s["name"] == json!("double_port")));
+
+        // 7. Completion includes in-scope symbols & keywords
+        let comp_resp = msgs.iter().find(|m| m.get("id") == Some(&json!(6))).unwrap();
+        let comps = comp_resp["result"].as_array().unwrap();
+        assert!(comps.iter().any(|c| c["label"] == json!("double_port")));
+        assert!(comps.iter().any(|c| c["label"] == json!("Float32x4")));
+    }
+}

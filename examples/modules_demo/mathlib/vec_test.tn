@@ -1,0 +1,9 @@
+// Colocated test file: has full access to private `internal_scale` in the same package!
+
+test fn private_internal_scale_and_dot() {
+    assert internal_scale(4) == 40
+    let a = Vec2 { x = 3, y = 4 }
+    let b = Vec2 { x = 2, y = 5 }
+    assert dot(a, b) == 26
+    assert scaled_dot(a, b) == 260
+}

@@ -1,0 +1,54 @@
+// Benchmark 09: 4-Thread Parallel SplitMix64 (4 x 25M = 100M iters) + MPMC Channel Aggregation
+@no_heap_alloc
+pub pure fn worker_mix(seed Int, iters Int) Int {
+    var x = seed
+    var acc = 0
+    var i = 0
+    while i < iters {
+        x = (x + 1140071481932319848) & 9223372036854775807
+        var z = x
+        z = ((z ^ (z >> 30)) * 490278349) & 9223372036854775807
+        z = ((z ^ (z >> 27)) * 16777619) & 9223372036854775807
+        z = z ^ (z >> 31)
+        acc = (acc ^ z) & 9223372036854775807
+        i += 1
+    }
+    acc
+}
+
+pub fn main() Int {
+    let ch = chan_new[Int]()
+    let iters = 25000000
+    let t0 = thread_spawn(|| {
+        let _ = chan_send(ch, worker_mix(100000007, iters))
+        0
+    })
+    let t1 = thread_spawn(|| {
+        let _ = chan_send(ch, worker_mix(200000033, iters))
+        0
+    })
+    let t2 = thread_spawn(|| {
+        let _ = chan_send(ch, worker_mix(300000007, iters))
+        0
+    })
+    let t3 = thread_spawn(|| {
+        let _ = chan_send(ch, worker_mix(400000009, iters))
+        0
+    })
+
+    var total = 0
+    var k = 0
+    while k < 4 {
+        match chan_recv(ch) {
+            Some(v) => { total = (total ^ v) & 9223372036854775807 }
+            None => {}
+        }
+        k += 1
+    }
+    let _ = thread_join(t0)
+    let _ = thread_join(t1)
+    let _ = thread_join(t2)
+    let _ = thread_join(t3)
+    let _ = print_int(total)
+    0
+}

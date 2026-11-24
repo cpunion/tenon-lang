@@ -1,0 +1,78 @@
+{
+  "name": "tenon-language",
+  "displayName": "Tenon",
+  "description": "Tenon language support: syntax highlighting, L0/L1 formal verification diagnostics, @repr(C) byte layout hover, go-to-definition, completion, outline, and formatting via `tenon lsp`.",
+  "version": "0.1.0",
+  "publisher": "cpunion",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cpunion/tenon-lang",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters",
+    "Linters"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./client.js",
+  "activationEvents": [
+    "onLanguage:tenon"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "tenon",
+        "aliases": [
+          "Tenon",
+          "tenon"
+        ],
+        "extensions": [
+          ".tn"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "tenon",
+        "scopeName": "source.tenon",
+        "path": "./syntaxes/tenon.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Tenon",
+      "properties": {
+        "tenon.executable": {
+          "type": "string",
+          "default": "tenon",
+          "scope": "resource",
+          "description": "Path to the `tenon` compiler executable (runs `tenon lsp`)."
+        },
+        "tenon.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces communication between VS Code and `tenon lsp`."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "node --check client.js",
+    "test": "node --check client.js && node --test test/smoke.test.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

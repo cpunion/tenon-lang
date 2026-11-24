@@ -1,0 +1,56 @@
+// std/net/reactor.tn — High-Performance OS Event Reactor (`kqueue` on macOS/BSD, `epoll` on Linux)
+
+pub const EVENT_READ  Int = 1
+pub const EVENT_WRITE Int = 2
+pub const EVENT_EOF   Int = 4
+
+pub record Reactor {
+    fd Int
+}
+
+pub fn reactor_open() Result[Reactor, Text] {
+    let fd = reactor_new()
+    if fd < 0 {
+        Err("failed to create OS reactor (kqueue/epoll)")
+    } else {
+        Ok(Reactor { fd = fd })
+    }
+}
+
+pub pure fn event_token(packed Int) Int {
+    packed >> 8
+}
+
+pub pure fn event_flags(packed Int) Int {
+    packed & 255
+}
+
+pub pure fn event_is_readable(packed Int) Bool {
+    (packed & EVENT_READ) != 0
+}
+
+pub pure fn event_is_writable(packed Int) Bool {
+    (packed & EVENT_WRITE) != 0
+}
+
+pub pure fn event_is_eof(packed Int) Bool {
+    (packed & EVENT_EOF) != 0
+}
+
+impl Reactor {
+    pub fn register(self, sock_fd Int, events Int, token Int) Bool {
+        reactor_add(self.fd, sock_fd, events, token)
+    }
+
+    pub fn unregister(self, sock_fd Int) Bool {
+        reactor_del(self.fd, sock_fd)
+    }
+
+    pub fn wait(self, timeout_ms Int, max_events Int) List[Int] {
+        reactor_wait(self.fd, timeout_ms, max_events)
+    }
+
+    pub fn close(self) {
+        let _ = reactor_close(self.fd)
+    }
+}

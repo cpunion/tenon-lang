@@ -8,19 +8,23 @@
 //! - Dynamic `dlsym` lookup for JIT `extern "C"` calls
 
 use crate::perceus::{
-    ObjHeader, TAG_ATOMIC, TAG_BYTES, TAG_CHANNEL, TAG_CSTRUCT, TAG_MUTEX, TAG_NONE, TAG_SIMD,
-    TAG_SLICE, TAG_SOME, fields_ptr, make_text, make_text_bytes, read_text, read_text_bytes,
-    tenon_rc_alloc, tenon_rc_dec, tenon_rc_ensure_unique, tenon_rc_inc, tenon_rc_set_rc_mask,
+    ObjHeader, TAG_ATOMIC, TAG_BYTES, TAG_CHANNEL, TAG_CSTRUCT, TAG_LIST, TAG_MUTEX, TAG_NONE,
+    TAG_SIMD, TAG_SLICE, TAG_SOME, TAG_TEXT, fields_ptr, make_text, make_text_bytes, read_text,
+    read_text_bytes, tenon_rc_alloc, tenon_rc_dec, tenon_rc_ensure_unique, tenon_rc_inc,
+    tenon_rc_set_rc_mask,
 };
 use std::alloc::{Layout, alloc, dealloc};
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // =========================================================================
 // 0. Dynamic C Symbol Lookup (for Cranelift JIT `extern "C"` interop)
@@ -1074,8 +1078,13 @@ pub extern "C" fn tenon_net_tcp_local_port(handle: i64) -> i64 {
     }
 }
 
+thread_local! {
+    static LAST_WOULD_BLOCK: Cell<bool> = const { Cell::new(false) };
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn tenon_net_tcp_accept(listener_handle: i64) -> i64 {
+    LAST_WOULD_BLOCK.with(|c| c.set(false));
     let cloned = {
         let tbl = net_table().lock().unwrap();
         match tbl.get(&listener_handle) {
@@ -1088,11 +1097,17 @@ pub extern "C" fn tenon_net_tcp_accept(listener_handle: i64) -> i64 {
     };
     match l.accept() {
         Ok((stream, _)) => {
+            let _ = stream.set_nodelay(true);
             let id = NEXT_NET_ID.fetch_add(1, Ordering::SeqCst);
             net_table().lock().unwrap().insert(id, NetHandle::Stream(stream));
             id
         }
-        Err(_) => -1,
+        Err(e) => {
+            if e.kind() == ErrorKind::WouldBlock {
+                LAST_WOULD_BLOCK.with(|c| c.set(true));
+            }
+            -1
+        }
     }
 }
 
@@ -1101,6 +1116,7 @@ pub extern "C" fn tenon_net_tcp_connect(addr_text: i64) -> i64 {
     let addr = read_text(addr_text);
     match TcpStream::connect(&addr) {
         Ok(s) => {
+            let _ = s.set_nodelay(true);
             let id = NEXT_NET_ID.fetch_add(1, Ordering::SeqCst);
             net_table().lock().unwrap().insert(id, NetHandle::Stream(s));
             id
@@ -1122,7 +1138,23 @@ pub extern "C" fn tenon_net_set_nonblocking(handle: i64, nonblocking: i64) -> i6
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn tenon_net_set_nodelay(handle: i64, nodelay: i64) -> i64 {
+    let tbl = net_table().lock().unwrap();
+    let res = match tbl.get(&handle) {
+        Some(NetHandle::Stream(s)) => s.set_nodelay(nodelay != 0),
+        _ => return 0,
+    };
+    if res.is_ok() { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_net_last_would_block() -> i64 {
+    if LAST_WOULD_BLOCK.with(|c| c.get()) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_net_read(stream_handle: i64, max_bytes: i64) -> i64 {
+    LAST_WOULD_BLOCK.with(|c| c.set(false));
     let cloned = {
         let tbl = net_table().lock().unwrap();
         match tbl.get(&stream_handle) {
@@ -1147,7 +1179,49 @@ pub extern "C" fn tenon_net_read(stream_handle: i64, max_bytes: i64) -> i64 {
             }
             obj as i64
         }
-        Err(_) => tenon_bytes_new(0),
+        Err(e) => {
+            if e.kind() == ErrorKind::WouldBlock {
+                LAST_WOULD_BLOCK.with(|c| c.set(true));
+            }
+            tenon_bytes_new(0)
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_net_read_text(stream_handle: i64, max_bytes: i64) -> i64 {
+    LAST_WOULD_BLOCK.with(|c| c.set(false));
+    let cloned = {
+        let tbl = net_table().lock().unwrap();
+        match tbl.get(&stream_handle) {
+            Some(NetHandle::Stream(s)) => s.try_clone().ok(),
+            _ => None,
+        }
+    };
+    let Some(mut s) = cloned else {
+        return make_text("");
+    };
+    let cap = max_bytes.clamp(1, 1024 * 1024) as usize;
+    let mut buf = vec![0u8; cap];
+    match s.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let words = (n + 1).div_ceil(8).max(1);
+            let obj = tenon_rc_alloc(TAG_TEXT, words as i64) as *mut ObjHeader;
+            unsafe {
+                (*obj).len = n;
+                let dst = fields_ptr(obj) as *mut u8;
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n);
+                *dst.add(n) = 0;
+            }
+            obj as i64
+        }
+        Ok(_) => make_text(""),
+        Err(e) => {
+            if e.kind() == ErrorKind::WouldBlock {
+                LAST_WOULD_BLOCK.with(|c| c.set(true));
+            }
+            make_text("")
+        }
     }
 }
 
@@ -1164,16 +1238,265 @@ pub extern "C" fn tenon_net_write(stream_handle: i64, bytes_obj: i64) -> i64 {
         return -1;
     };
     let data = read_text_bytes(bytes_obj);
-    match s.write(data) {
-        Ok(n) => n as i64,
+    match s.write_all(data) {
+        Ok(()) => data.len() as i64,
         Err(_) => -1,
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_net_write_text(stream_handle: i64, text_obj: i64) -> i64 {
+    tenon_net_write(stream_handle, text_obj)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn tenon_net_close(handle: i64) -> i64 {
     net_table().lock().unwrap().remove(&handle);
     0
+}
+
+// =========================================================================
+// 5b. OS Event Reactor (kqueue on macOS/BSD, epoll on Linux) & Monotonic Clock
+// =========================================================================
+
+fn mono_origin() -> &'static Instant {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_time_now_ms() -> i64 {
+    mono_origin().elapsed().as_millis() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_time_now_ns() -> i64 {
+    mono_origin().elapsed().as_nanos() as i64
+}
+
+#[cfg(unix)]
+fn handle_to_raw_fd(handle: i64) -> Option<i32> {
+    let tbl = net_table().lock().unwrap();
+    match tbl.get(&handle) {
+        Some(NetHandle::Listener(l)) => Some(l.as_raw_fd()),
+        Some(NetHandle::Stream(s)) => Some(s.as_raw_fd()),
+        None => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod os_reactor {
+    use super::*;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct KEvent {
+        ident: usize,
+        filter: i16,
+        flags: u16,
+        fflags: u32,
+        data: isize,
+        udata: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: isize,
+        tv_nsec: isize,
+    }
+
+    const EVFILT_READ: i16 = -1;
+    const EVFILT_WRITE: i16 = -2;
+    const EV_ADD: u16 = 0x0001;
+    const EV_DELETE: u16 = 0x0002;
+    const EV_ENABLE: u16 = 0x0004;
+    const EV_EOF: u16 = 0x8000;
+    const EV_ERROR: u16 = 0x4000;
+
+    unsafe extern "C" {
+        fn kqueue() -> i32;
+        fn kevent(
+            kq: i32,
+            changelist: *const KEvent,
+            nchanges: i32,
+            eventlist: *mut KEvent,
+            nevents: i32,
+            timeout: *const Timespec,
+        ) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+
+    pub fn new() -> i64 {
+        unsafe { kqueue() as i64 }
+    }
+
+    pub fn register(rfd: i64, handle: i64, mask: i64, token: i64) -> i64 {
+        let Some(fd) = handle_to_raw_fd(handle) else {
+            return 0;
+        };
+        let mut changes = [KEvent::default(); 2];
+        let mut n = 0usize;
+        if (mask & 1) != 0 {
+            changes[n] = KEvent {
+                ident: fd as usize,
+                filter: EVFILT_READ,
+                flags: EV_ADD | EV_ENABLE,
+                fflags: 0,
+                data: 0,
+                udata: token as usize as *mut c_void,
+            };
+            n += 1;
+        }
+        if (mask & 2) != 0 {
+            changes[n] = KEvent {
+                ident: fd as usize,
+                filter: EVFILT_WRITE,
+                flags: EV_ADD | EV_ENABLE,
+                fflags: 0,
+                data: 0,
+                udata: token as usize as *mut c_void,
+            };
+            n += 1;
+        }
+        if n == 0 {
+            return 1;
+        }
+        let rc = unsafe {
+            kevent(
+                rfd as i32,
+                changes.as_ptr(),
+                n as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if rc >= 0 { 1 } else { 0 }
+    }
+
+    pub fn remove(rfd: i64, handle: i64) -> i64 {
+        let Some(fd) = handle_to_raw_fd(handle) else {
+            return 0;
+        };
+        let changes = [
+            KEvent {
+                ident: fd as usize,
+                filter: EVFILT_READ,
+                flags: EV_DELETE,
+                ..Default::default()
+            },
+            KEvent {
+                ident: fd as usize,
+                filter: EVFILT_WRITE,
+                flags: EV_DELETE,
+                ..Default::default()
+            },
+        ];
+        unsafe {
+            let _ = kevent(
+                rfd as i32,
+                changes.as_ptr(),
+                2,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            );
+        }
+        1
+    }
+
+    pub fn wait(rfd: i64, timeout_ms: i64, max_events: i64) -> i64 {
+        let cap = max_events.clamp(1, 1024) as usize;
+        let mut evs = vec![KEvent::default(); cap];
+        let ts = if timeout_ms >= 0 {
+            Some(Timespec {
+                tv_sec: (timeout_ms / 1000) as isize,
+                tv_nsec: ((timeout_ms % 1000) * 1_000_000) as isize,
+            })
+        } else {
+            None
+        };
+        let n = unsafe {
+            kevent(
+                rfd as i32,
+                std::ptr::null(),
+                0,
+                evs.as_mut_ptr(),
+                cap as i32,
+                ts.as_ref().map(|t| t as *const Timespec).unwrap_or(std::ptr::null()),
+            )
+        };
+        let count = n.max(0) as usize;
+        let list = tenon_rc_alloc(TAG_LIST, count as i64) as *mut ObjHeader;
+        unsafe {
+            let fp = fields_ptr(list);
+            for i in 0..count {
+                let ev = evs[i];
+                let mut rev: i64 = 0;
+                if ev.filter == EVFILT_READ {
+                    rev |= 1;
+                }
+                if ev.filter == EVFILT_WRITE {
+                    rev |= 2;
+                }
+                if (ev.flags & (EV_EOF | EV_ERROR)) != 0 {
+                    rev |= 4;
+                }
+                let tok = ev.udata as usize as i64;
+                *fp.add(i) = (tok << 8) | rev;
+            }
+        }
+        list as i64
+    }
+
+    pub fn close_fd(rfd: i64) -> i64 {
+        if rfd >= 0 {
+            unsafe {
+                let _ = close(rfd as i32);
+            }
+        }
+        0
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod os_reactor {
+    use super::*;
+    pub fn new() -> i64 { 0 }
+    pub fn register(_rfd: i64, _handle: i64, _mask: i64, _token: i64) -> i64 { 1 }
+    pub fn remove(_rfd: i64, _handle: i64) -> i64 { 1 }
+    pub fn wait(_rfd: i64, timeout_ms: i64, _max_events: i64) -> i64 {
+        if timeout_ms > 0 {
+            thread::sleep(Duration::from_millis(timeout_ms as u64));
+        }
+        tenon_rc_alloc(TAG_LIST, 0)
+    }
+    pub fn close_fd(_rfd: i64) -> i64 { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_reactor_new() -> i64 {
+    os_reactor::new()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_reactor_add(rfd: i64, handle: i64, mask: i64, token: i64) -> i64 {
+    os_reactor::register(rfd, handle, mask, token)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_reactor_del(rfd: i64, handle: i64) -> i64 {
+    os_reactor::remove(rfd, handle)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_reactor_wait(rfd: i64, timeout_ms: i64, max_events: i64) -> i64 {
+    os_reactor::wait(rfd, timeout_ms, max_events)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_reactor_close(rfd: i64) -> i64 {
+    os_reactor::close_fd(rfd)
 }
 
 // =========================================================================

@@ -1140,6 +1140,8 @@ fn ir_uses_sync_runtime(ir: &str) -> bool {
 
 fn ir_uses_net_runtime(ir: &str) -> bool {
     ir.contains("call i64 @tenon_net_")
+        || ir.contains("call i64 @tenon_reactor_")
+        || ir.contains("call i64 @tenon_time_")
 }
 
 fn ir_uses_systems_core(ir: &str) -> bool {
@@ -1473,6 +1475,14 @@ do:
   br label %done
 done:
   ret void
+}
+
+define internal i64 @__tn_cstruct_data_ptr(i64 %p) alwaysinline nounwind willreturn memory(none) {
+entry:
+  %is0 = icmp eq i64 %p, 0
+  %d = add i64 %p, 40
+  %res = select i1 %is0, i64 0, i64 %d
+  ret i64 %res
 }
 
 define internal i64 @__tn_slot_get(i64 %p, i64 %idx) alwaysinline {
@@ -2762,7 +2772,7 @@ impl<'a> LlvmFnGen<'a> {
             let dst_i = self.fresh_tmp();
             let dst_p = self.fresh_tmp();
             self.code.push_str(&format!(
-                "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  call void @llvm.memcpy.p0.p0.i64(ptr {}, ptr {}, i64 {}, i1 false)\n",
+                "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  call void @llvm.memcpy.p0.p0.i64(ptr {}, ptr {}, i64 {}, i1 false)\n",
                 obj, sz, dst_i, obj, dst_p, dst_i, dst_p, ptr, sz
             ));
             return Ok(obj);
@@ -2825,7 +2835,7 @@ impl<'a> LlvmFnGen<'a> {
             let src_i = self.fresh_tmp();
             let src_p = self.fresh_tmp();
             self.code.push_str(&format!(
-                "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  call void @llvm.memcpy.p0.p0.i64(ptr {}, ptr {}, i64 {}, i1 false)\n",
+                "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  call void @llvm.memcpy.p0.p0.i64(ptr {}, ptr {}, i64 {}, i1 false)\n",
                 src_i, val_i64, src_p, src_i, ptr, src_p, sz
             ));
             return Ok(());
@@ -3083,7 +3093,7 @@ impl<'a> LlvmFnGen<'a> {
             let di = cg.fresh_tmp();
             let dp = cg.fresh_tmp();
             cg.code.push_str(&format!(
-                "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n",
+                "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n",
                 obj, bytes, di, obj, dp, di
             ));
             (obj, dp)
@@ -3093,7 +3103,7 @@ impl<'a> LlvmFnGen<'a> {
             let dp = cg.fresh_tmp();
             let v = cg.fresh_tmp();
             cg.code.push_str(&format!(
-                "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  {} = load {}, ptr {}, align 8\n",
+                "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  {} = load {}, ptr {}, align 8\n",
                 di, h, dp, di, v, vty, dp
             ));
             v
@@ -3229,12 +3239,17 @@ impl<'a> LlvmFnGen<'a> {
                 let va = load_vec(self, &ah, "<4 x float>");
                 let vb = load_vec(self, &bh, "<4 x float>");
                 let prod = self.fresh_tmp();
+                let lo = self.fresh_tmp();
+                let hi = self.fresh_tmp();
+                let p2 = self.fresh_tmp();
+                let e0 = self.fresh_tmp();
+                let e1 = self.fresh_tmp();
                 let sum = self.fresh_tmp();
                 let b = self.fresh_tmp();
                 let z = self.fresh_tmp();
                 self.code.push_str(&format!(
-                    "  {} = fmul <4 x float> {}, {}\n  {} = call float @llvm.vector.reduce.fadd.v4f32(float -0.0, <4 x float> {})\n  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
-                    prod, va, vb, sum, prod, b, sum, z, b
+                    "  {} = fmul <4 x float> {}, {}\n  {} = shufflevector <4 x float> {}, <4 x float> poison, <2 x i32> <i32 0, i32 1>\n  {} = shufflevector <4 x float> {}, <4 x float> poison, <2 x i32> <i32 2, i32 3>\n  {} = fadd <2 x float> {}, {}\n  {} = extractelement <2 x float> {}, i32 0\n  {} = extractelement <2 x float> {}, i32 1\n  {} = fadd float {}, {}\n  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                    prod, va, vb, lo, prod, hi, prod, p2, lo, hi, e0, p2, e1, p2, sum, e0, e1, b, sum, z, b
                 ));
                 z
             }
@@ -3360,11 +3375,16 @@ impl<'a> LlvmFnGen<'a> {
                 let va = load_vec(self, &ah, "<4 x double>");
                 let vb = load_vec(self, &bh, "<4 x double>");
                 let prod = self.fresh_tmp();
+                let lo = self.fresh_tmp();
+                let hi = self.fresh_tmp();
+                let p2 = self.fresh_tmp();
+                let e0 = self.fresh_tmp();
+                let e1 = self.fresh_tmp();
                 let sum = self.fresh_tmp();
                 let b = self.fresh_tmp();
                 self.code.push_str(&format!(
-                    "  {} = fmul <4 x double> {}, {}\n  {} = call double @llvm.vector.reduce.fadd.v4f64(double -0.0, <4 x double> {})\n  {} = bitcast double {} to i64\n",
-                    prod, va, vb, sum, prod, b, sum
+                    "  {} = fmul <4 x double> {}, {}\n  {} = shufflevector <4 x double> {}, <4 x double> poison, <2 x i32> <i32 0, i32 1>\n  {} = shufflevector <4 x double> {}, <4 x double> poison, <2 x i32> <i32 2, i32 3>\n  {} = fadd <2 x double> {}, {}\n  {} = extractelement <2 x double> {}, i32 0\n  {} = extractelement <2 x double> {}, i32 1\n  {} = fadd double {}, {}\n  {} = bitcast double {} to i64\n",
+                    prod, va, vb, lo, prod, hi, prod, p2, lo, hi, e0, p2, e1, p2, sum, e0, e1, b, sum
                 ));
                 b
             }
@@ -3571,7 +3591,7 @@ impl<'a> LlvmFnGen<'a> {
                 let ep = self.fresh_tmp();
                 let b8 = self.fresh_tmp();
                 self.code.push_str(&format!(
-                    "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 {}\n  {} = trunc i64 {} to i8\n  store i8 {}, ptr {}, align 1\n",
+                    "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 {}\n  {} = trunc i64 {} to i8\n  store i8 {}, ptr {}, align 1\n",
                     uniq, vh, di, uniq, dp, di, ep, dp, idx, b8, val, b8, ep
                 ));
                 uniq
@@ -4751,7 +4771,7 @@ impl<'a> LlvmFnGen<'a> {
                                 let ep = self.fresh_tmp();
                                 let b8 = self.fresh_tmp();
                                 self.code.push_str(&format!(
-                                    "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 {}\n  {} = trunc i64 {} to i8\n  store i8 {}, ptr {}, align 1\n",
+                                    "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 {}\n  {} = trunc i64 {} to i8\n  store i8 {}, ptr {}, align 1\n",
                                     uniq, vh, di, uniq, dp, di, ep, dp, idx, b8, val, b8, ep
                                 ));
                                 self.flush_temps(&temps);
@@ -4888,7 +4908,7 @@ impl<'a> LlvmFnGen<'a> {
                                 }
                                 let base = self.fresh_tmp();
                                 self.code.push_str(&format!(
-                                    "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                                    "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n",
                                     base, uniq
                                 ));
                                 let sk = scalar_kind_of_ty(&cfl.ty, self.alias_bases);
@@ -5019,7 +5039,7 @@ impl<'a> LlvmFnGen<'a> {
                                     let boff = self.fresh_tmp();
                                     let eptr = self.fresh_tmp();
                                     self.code.push_str(&format!(
-                                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
+                                        "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
                                         base, uniq_arr, boff, idx_v, stride, eptr, base, boff
                                     ));
                                     let sk = scalar_kind_of_ty(&elem_ty, self.alias_bases);
@@ -5430,7 +5450,7 @@ impl<'a> LlvmFnGen<'a> {
                     let obj = self.lower_expr_borrowed(target, &mut temps)?;
                     let base = self.fresh_tmp();
                     self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                        "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n",
                         base, obj
                     ));
                     let val = self.emit_mem_load(&base, cfl.byte_offset as i64, &cfl.ty, false)?;
@@ -5466,7 +5486,7 @@ impl<'a> LlvmFnGen<'a> {
                     let boff = self.fresh_tmp();
                     let eptr = self.fresh_tmp();
                     self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
+                        "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
                         base, t, boff, i, stride, eptr, base, boff
                     ));
                     let res = self.emit_mem_load(&eptr, 0, &elem_ty, false)?;
@@ -5609,7 +5629,7 @@ impl<'a> LlvmFnGen<'a> {
                     let obj = self.lower_expr_borrowed(target, temps)?;
                     let base = self.fresh_tmp();
                     self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                        "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n",
                         base, obj
                     ));
                     let val = self.emit_mem_load(&base, cfl.byte_offset as i64, &cfl.ty, false)?;
@@ -5636,7 +5656,7 @@ impl<'a> LlvmFnGen<'a> {
                     let boff = self.fresh_tmp();
                     let eptr = self.fresh_tmp();
                     self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
+                        "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n  {} = mul i64 {}, {}\n  {} = add i64 {}, {}\n",
                         base, t, boff, i, stride, eptr, base, boff
                     ));
                     let val = self.emit_mem_load(&eptr, 0, &elem_ty, false)?;
@@ -6091,7 +6111,7 @@ impl<'a> LlvmFnGen<'a> {
                     let obj = self.fresh_tmp();
                     let base = self.fresh_tmp();
                     self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                        "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n",
                         obj, c_lay.size, base, obj
                     ));
                     for (fname, fexpr) in fields {
@@ -6155,7 +6175,7 @@ impl<'a> LlvmFnGen<'a> {
                     let obj = self.fresh_tmp();
                     let base = self.fresh_tmp();
                     self.code.push_str(&format!(
-                        "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                        "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n",
                         obj, total_bytes, base, obj
                     ));
                     let mut temps = Vec::new();
@@ -6226,7 +6246,7 @@ impl<'a> LlvmFnGen<'a> {
                         let obj = self.fresh_tmp();
                         let base = self.fresh_tmp();
                         self.code.push_str(&format!(
-                            "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                            "  {} = call i64 @tenon_cstruct_alloc(i64 {})\n  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n",
                             obj, total_bytes, base, obj
                         ));
                         for (idx, e) in elems.iter().enumerate() {
@@ -7096,7 +7116,7 @@ impl<'a> LlvmFnGen<'a> {
                                         ));
                                     }
                                     self.code.push_str(&format!(
-                                        "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                                        "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n",
                                         dp, uniq
                                     ));
                                     return Ok(dp);
@@ -7106,7 +7126,7 @@ impl<'a> LlvmFnGen<'a> {
                             let v = self.lower_expr_borrowed(arg, &mut temps)?;
                             let dp = self.fresh_tmp();
                             self.code.push_str(&format!(
-                                "  {} = call i64 @tenon_cstruct_data_ptr(i64 {})\n",
+                                "  {} = call i64 @__tn_cstruct_data_ptr(i64 {})\n",
                                 dp, v
                             ));
                             self.flush_temps(&temps);
@@ -8332,6 +8352,55 @@ pub fn main() Int {
             "DWARF -g binary failed: stdout={} stderr={}",
             stdout,
             String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    #[test]
+    fn llvm_aot_web_app_and_modules_demo_zero_leaks() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let pid = std::process::id();
+
+        let o3 = BuildOptions {
+            opt_level: "O3".into(),
+            ..Default::default()
+        };
+
+        // 1. Multi-package modules_demo/app (Go/glob/selective imports + comptime + typed macros)
+        let mod_prog = tenon_syntax::load_package(
+            &repo_root.join("examples/modules_demo/app"),
+            tenon_syntax::LoadMode::Production,
+        )
+        .expect("modules_demo/app must load");
+        let mod_bin = std::env::temp_dir().join(format!("tenon_llvm_mod_{}", pid));
+        compile_with_options(&mod_prog, &mod_bin, &o3).expect("modules_demo LLVM AOT build");
+        let run1 = Command::new(&mod_bin).output().unwrap();
+        let _ = fs::remove_file(&mod_bin);
+        let out1 = String::from_utf8_lossy(&run1.stdout);
+        assert!(
+            run1.status.success() && out1.contains("main() => 107"),
+            "modules_demo AOT failed: stdout={} stderr={}",
+            out1,
+            String::from_utf8_lossy(&run1.stderr)
+        );
+
+        // 2. Metaprogramming Web Framework (examples/web_app: kqueue + HTTP/1.1 Keep-Alive + @get/@post + OpenAPI + JSON refinement)
+        let web_prog = tenon_syntax::load_package(
+            &repo_root.join("examples/web_app"),
+            tenon_syntax::LoadMode::Production,
+        )
+        .expect("examples/web_app must load");
+        let web_bin = std::env::temp_dir().join(format!("tenon_llvm_web_{}", pid));
+        compile_with_options(&web_prog, &web_bin, &o3).expect("examples/web_app LLVM AOT build");
+        let run2 = Command::new(&web_bin).output().unwrap();
+        let _ = fs::remove_file(&web_bin);
+        let out2 = String::from_utf8_lossy(&run2.stdout);
+        assert!(
+            run2.status.success()
+                && out2.contains("main() => 200")
+                && out2.contains("live_objects=0"),
+            "web_app AOT failed: stdout={} stderr={}",
+            out2,
+            String::from_utf8_lossy(&run2.stderr)
         );
     }
 }

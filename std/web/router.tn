@@ -1,0 +1,177 @@
+// std/web/router.tn — Fast Segmented HTTP Router & Typed Request Context
+// Supports static segments (`/health`), named params (`/users/:id`), and wildcards (`/files/*path`).
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+import "std/encoding/json.tn"
+import "std/net/http.tn"
+
+pub record RouteParam {
+    name  Text
+    value Text
+}
+
+pub record RouteMatch {
+    matched Bool
+    params  List[RouteParam]
+}
+
+pure fn split_path_segments(path Text) List[Text] {
+    var segs List[Text] = []
+    let n = len(path)
+    var i = 0
+    while i < n {
+        while i < n && byte_at(path, i) == 47 {
+            i += 1
+        }
+        if i >= n {
+            break
+        }
+        var j = i
+        while j < n && byte_at(path, j) != 47 {
+            j += 1
+        }
+        segs = push(segs, str_slice(path, i, j))
+        i = j
+    }
+    segs
+}
+
+pure fn join_from(segs List[Text], start Int) Text {
+    var out = ""
+    var i = start
+    while i < len(segs) {
+        if i > start {
+            out = out ++ "/"
+        }
+        out = out ++ segs[i]
+        i += 1
+    }
+    out
+}
+
+pub pure fn match_route_pattern(pattern Text, path Text) RouteMatch {
+    let psegs = split_path_segments(pattern)
+    let tsegs = split_path_segments(path)
+    var params List[RouteParam] = []
+    var i = 0
+    while i < len(psegs) {
+        let ps = psegs[i]
+        if len(ps) > 0 && byte_at(ps, 0) == 42 {
+            // Wildcard `*name` captures the rest of the path
+            let pname = str_slice(ps, 1, len(ps))
+            let rest = join_from(tsegs, i)
+            params = push(params, RouteParam { name = pname, value = rest })
+            return RouteMatch { matched = true, params = params }
+        }
+        if i >= len(tsegs) {
+            return RouteMatch { matched = false, params = [] }
+        }
+        let ts = tsegs[i]
+        if len(ps) > 0 && byte_at(ps, 0) == 58 {
+            // Named parameter `:id`
+            let pname = str_slice(ps, 1, len(ps))
+            params = push(params, RouteParam { name = pname, value = ts })
+        } else if ps != ts {
+            return RouteMatch { matched = false, params = [] }
+        }
+        i += 1
+    }
+    if len(tsegs) != len(psegs) {
+        return RouteMatch { matched = false, params = [] }
+    }
+    RouteMatch { matched = true, params = params }
+}
+
+pub record Context {
+    req    HttpRequest
+    params List[RouteParam]
+}
+
+pure fn parse_signed_int_opt(s Text) Option[Int] {
+    let n = len(s)
+    if n == 0 {
+        return None
+    }
+    var i = 0
+    var neg = false
+    if byte_at(s, 0) == 45 {
+        neg = true
+        i = 1
+        if n == 1 {
+            return None
+        }
+    }
+    var acc = 0
+    while i < n {
+        let b = byte_at(s, i)
+        if b < 48 || b > 57 {
+            return None
+        }
+        acc = acc * 10 + (b - 48)
+        i += 1
+    }
+    if neg { Some(-acc) } else { Some(acc) }
+}
+
+impl Context {
+    pub pure fn param(self, name Text) Option[Text] {
+        var i = 0
+        while i < len(self.params) {
+            let p = self.params[i]
+            if p.name == name {
+                return Some(p.value)
+            }
+            i += 1
+        }
+        None
+    }
+
+    pub pure fn param_int(self, name Text) Option[Int] {
+        match self.param(name) {
+            Some(s) => parse_signed_int_opt(s)
+            None => None
+        }
+    }
+
+    pub pure fn query(self, key Text) Option[Text] {
+        self.req.query_param(key)
+    }
+
+    pub pure fn header(self, name Text) Option[Text] {
+        self.req.header(name)
+    }
+
+    pub pure fn body(self) Text {
+        self.req.body
+    }
+
+    pub pure fn json_body[T FromJson](self) Result[T, JsonError] {
+        let jv = json_parse(self.req.body)?
+        T.from_json(jv)
+    }
+
+    pub pure fn ok(self, body Text) HttpResponse {
+        http_ok(body)
+    }
+
+    pub pure fn text(self, status Int, body Text) HttpResponse {
+        http_text(status, body)
+    }
+
+    pub pure fn json_raw(self, status Int, raw Text) HttpResponse {
+        http_json(status, raw)
+    }
+
+    pub pure fn json[T ToJson](self, status Int, val T) HttpResponse {
+        http_json(status, json_stringify(val.to_json()))
+    }
+
+    pub pure fn bad_request(self, msg Text) HttpResponse {
+        http_bad_request(msg)
+    }
+
+    pub pure fn not_found(self, msg Text) HttpResponse {
+        http_not_found(msg)
+    }
+}

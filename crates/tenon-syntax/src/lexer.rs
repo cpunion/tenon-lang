@@ -203,6 +203,56 @@ pub fn lex_with_file_id(src: &str, file_id: u32) -> Result<Vec<Token>, ParseErro
                 let start = i;
                 let sline = line;
                 let scol = col;
+                // Triple-quoted multiline string literal: `""" ... """`
+                if i + 2 < bytes.len() && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                    i += 3;
+                    col += 3;
+                    if i < bytes.len() && bytes[i] == b'\r' {
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] == b'\n' {
+                        i += 1;
+                        line += 1;
+                        col = 1;
+                    }
+                    let mut raw: Vec<u8> = Vec::new();
+                    let mut closed = false;
+                    while i < bytes.len() {
+                        if i + 2 < bytes.len()
+                            && bytes[i] == b'"'
+                            && bytes[i + 1] == b'"'
+                            && bytes[i + 2] == b'"'
+                        {
+                            i += 3;
+                            col += 3;
+                            closed = true;
+                            break;
+                        }
+                        let b = bytes[i];
+                        if b == b'\n' {
+                            line += 1;
+                            col = 1;
+                        } else {
+                            col += 1;
+                        }
+                        raw.push(b);
+                        i += 1;
+                    }
+                    if !closed {
+                        return Err(ParseError {
+                            message: "unterminated triple-quoted string literal".into(),
+                            span: mk_span(start, i, sline, scol),
+                        });
+                    }
+                    let s = String::from_utf8_lossy(&raw).into_owned();
+                    let trimmed = s.strip_suffix('\n').unwrap_or(&s);
+                    let dedented = dedent_multiline(trimmed);
+                    tokens.push(Token {
+                        kind: TokenKind::Str(dedented),
+                        span: mk_span(start, i, sline, scol),
+                    });
+                    continue;
+                }
                 i += 1;
                 col += 1;
                 let mut raw: Vec<u8> = Vec::new();
@@ -623,4 +673,26 @@ pub fn lex_with_file_id(src: &str, file_id: u32) -> Result<Vec<Token>, ParseErro
         span: mk_span(i, i, line, col),
     });
     Ok(tokens)
+}
+
+fn dedent_multiline(s: &str) -> String {
+    let min_indent = s
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.bytes().take_while(|&b| b == b' ' || b == b'\t').count())
+        .min()
+        .unwrap_or(0);
+    if min_indent == 0 {
+        return s.to_string();
+    }
+    s.lines()
+        .map(|l| {
+            if l.len() >= min_indent && l.bytes().take(min_indent).all(|b| b == b' ' || b == b'\t') {
+                &l[min_indent..]
+            } else {
+                l.trim_start()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

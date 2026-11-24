@@ -1,0 +1,42 @@
+// Benchmark 08: 20M @packed + bitfield binary network frame encode/decode
+pub bitfield FrameCtrl : UInt16 {
+    ver   : 4
+    kind  : 4
+    flags : 8
+}
+
+@packed
+pub record FrameHdr {
+    ctrl        UInt16
+    seq         UInt32
+    payload_len UInt16
+}
+
+pub fn run_codec(iters Int) Int {
+    var hdr = FrameHdr { ctrl = 0, seq = 0, payload_len = 0 }
+    var s = 987654321
+    var acc = 0
+    var i = 0
+    while i < iters {
+        s = (s + 1140071481932319848) & 9223372036854775807
+        let fc = FrameCtrl {
+            ver = (s & 15) as UInt16,
+            kind = ((s >> 4) & 15) as UInt16,
+            flags = ((s >> 8) & 255) as UInt16
+        }
+        hdr.ctrl = fc.raw()
+        hdr.seq = ((s >> 16) & 4294967295) as UInt32
+        hdr.payload_len = ((s >> 48) & 65535) as UInt16
+        let dec = FrameCtrl.from_raw(hdr.ctrl)
+        let mixed = ((dec.ver as Int) << 24) ^ ((dec.kind as Int) << 16) ^ ((dec.flags as Int) << 8) ^ (hdr.seq as Int) ^ (hdr.payload_len as Int)
+        acc = ((acc ^ mixed) * 16777619) & 9223372036854775807
+        i += 1
+    }
+    acc
+}
+
+pub fn main() Int {
+    let ans = run_codec(20000000)
+    let _ = print_int(ans)
+    0
+}

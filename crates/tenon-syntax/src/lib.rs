@@ -1,19 +1,24 @@
 pub mod ast;
+pub mod comptime;
 pub mod derive;
 pub mod layout;
 pub mod lexer;
 pub mod parser;
+pub mod project;
 pub mod span;
 
 pub use ast::*;
+pub use comptime::{ComptimeContext, eval_comptime_in_fn, expand_comptime_and_macros};
 pub use derive::expand_derives;
 pub use layout::*;
-pub use parser::{parse, parse_with_file_id};
+pub use parser::{parse, parse_expr_str, parse_with_file_id};
+pub use project::{
+    DepSpec, LoadMode, TenonManifest, discover_test_packages, find_enclosing_manifest,
+    is_test_source_file, load_package, load_package_with_config, load_package_with_overlays,
+};
 pub use span::{ParseError, Span};
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Evaluate `@cfg(...)` conditional compilation attributes and drop disabled items.
 pub fn eval_cfg_attrs(program: &mut Program) {
@@ -34,7 +39,11 @@ pub fn eval_cfg_attrs(program: &mut Program) {
             Item::Stream(d) => &d.attrs,
             Item::View(d) => &d.attrs,
             Item::Subscriber(d) => &d.attrs,
-            Item::Import { .. } | Item::LockLattice(_) => return true,
+            Item::Macro(d) => &d.attrs,
+            Item::Import { .. }
+            | Item::LockLattice(_)
+            | Item::ComptimeBlock(_)
+            | Item::MacroCall { .. } => return true,
         };
         attrs.iter().filter(|a| a.name == "cfg").all(eval_cfg_attr)
     });
@@ -130,283 +139,23 @@ fn eval_cfg_attr(attr: &Attr) -> bool {
     true
 }
 
-/// Load a `.tn` source file and recursively resolve all `import "path.tn" [as alias]` declarations
-/// in topological order with cycle-safe deduplication, then evaluate `@cfg` and expand `@derive(...)` macros.
+/// Load a `.tn` source file or package directory and recursively resolve all imports
+/// (`import "path.tn"`, `import pkg.subpkg [as alias]`, `import pkg.subpkg.*`,
+/// `import pkg.subpkg.{A, B as C}`), then evaluate `@cfg`, expand `comptime`/macros, and `@derive(...)`.
 pub fn load_program_with_imports(entry: &Path) -> Result<Program, String> {
-    let mut visited = BTreeSet::new();
-    let mut module_exports: BTreeMap<PathBuf, (String, BTreeSet<String>)> = BTreeMap::new();
-    let mut source_files = vec!["<inline>".to_string()];
-    let mut items = Vec::new();
-    load_module_recursive(
-        entry,
-        &mut visited,
-        &mut module_exports,
-        &mut source_files,
-        &mut items,
-    )?;
-    let mut prog = Program {
-        items,
-        source_files,
-    };
-    eval_cfg_attrs(&mut prog);
-    expand_derives(&mut prog);
-    Ok(prog)
+    load_package(entry, LoadMode::Production)
 }
 
-fn resolve_import_path(current_file: &Path, import_rel: &str) -> Result<PathBuf, String> {
-    let rel = Path::new(import_rel);
-    if rel.is_absolute() && rel.exists() {
-        return Ok(rel.to_path_buf());
-    }
-    let parent = current_file.parent().unwrap_or_else(|| Path::new("."));
-    let direct = parent.join(rel);
-    if direct.exists() {
-        return Ok(direct);
-    }
-    // Walk up ancestor directories so `import "std/text.tn"` resolves from any example/subdir
-    let mut cur = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-    for _ in 0..8 {
-        let cand = cur.join(rel);
-        if cand.exists() {
-            return Ok(cand);
-        }
-        if !cur.pop() {
-            break;
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let cand = cwd.join(rel);
-        if cand.exists() {
-            return Ok(cand);
-        }
-    }
-    Err(format!(
-        "cannot resolve import `{}` from `{}`",
-        import_rel,
-        current_file.display()
-    ))
-}
-
-fn load_module_recursive(
-    file: &Path,
-    visited: &mut BTreeSet<PathBuf>,
-    module_exports: &mut BTreeMap<PathBuf, (String, BTreeSet<String>)>,
-    source_files: &mut Vec<String>,
-    out_items: &mut Vec<Item>,
-) -> Result<(), String> {
-    let canon = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-    if !visited.insert(canon.clone()) {
-        return Ok(());
-    }
-    let file_id = source_files.len() as u32;
-    source_files.push(canon.to_string_lossy().into_owned());
-    let src = fs::read_to_string(&canon)
-        .map_err(|e| format!("failed to read `{}`: {}", file.display(), e))?;
-    let prog = parse_with_file_id(&src, file_id).map_err(|e| format!("{}: {}", file.display(), e))?;
-
-    let mut local_aliases: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
-    let mut local_items = Vec::new();
-    let mut exported_fns = BTreeSet::new();
-
-    for item in prog.items {
-        match item {
-            Item::Import { path, alias, .. } => {
-                let target = resolve_import_path(&canon, &path)?;
-                let target_canon = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
-                load_module_recursive(&target, visited, module_exports, source_files, out_items)?;
-                if let Some(a) = alias {
-                    if let Some(exp) = module_exports.get(&target_canon) {
-                        local_aliases.insert(a, exp.clone());
-                    }
-                }
-            }
-            other => {
-                match &other {
-                    Item::Fn(f) => {
-                        exported_fns.insert(f.name.clone());
-                    }
-                    Item::ExternFn(ef) => {
-                        exported_fns.insert(ef.name.clone());
-                    }
-                    Item::Const(c) => {
-                        exported_fns.insert(c.name.clone());
-                    }
-                    _ => {}
-                }
-                local_items.push(other);
-            }
-        }
-    }
-
-    let stem = canon
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
-    module_exports.insert(canon, (stem, exported_fns));
-
-    if !local_aliases.is_empty() {
-        for item in &mut local_items {
-            rewrite_item_aliases(item, &local_aliases);
-        }
-    }
-    out_items.extend(local_items);
-    Ok(())
-}
-
-fn rewrite_item_aliases(item: &mut Item, aliases: &BTreeMap<String, (String, BTreeSet<String>)>) {
-    match item {
-        Item::Fn(f) => rewrite_fn_aliases(f, aliases),
-        Item::Impl(imp) => {
-            for m in &mut imp.methods {
-                rewrite_fn_aliases(m, aliases);
-            }
-        }
-        Item::Interface(iface) => {
-            for m in &mut iface.methods {
-                if let Some(b) = &mut m.default_body {
-                    rewrite_block_aliases(b, aliases);
-                }
-            }
-        }
-        Item::Record(r) => {
-            for m in &mut r.methods {
-                rewrite_fn_aliases(m, aliases);
-            }
-        }
-        Item::Const(c) => rewrite_expr_aliases(&mut c.value, aliases),
-        _ => {}
-    }
-}
-
-fn rewrite_fn_aliases(f: &mut FnDecl, aliases: &BTreeMap<String, (String, BTreeSet<String>)>) {
-    for r in &mut f.requires {
-        rewrite_expr_aliases(r, aliases);
-    }
-    for e in &mut f.ensures {
-        rewrite_expr_aliases(e, aliases);
-    }
-    rewrite_block_aliases(&mut f.body, aliases);
-}
-
-fn rewrite_block_aliases(blk: &mut Block, aliases: &BTreeMap<String, (String, BTreeSet<String>)>) {
-    for s in &mut blk.stmts {
-        match s {
-            Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => {
-                rewrite_expr_aliases(value, aliases)
-            }
-            Stmt::Assign { target, value, .. } => {
-                rewrite_expr_aliases(target, aliases);
-                rewrite_expr_aliases(value, aliases);
-            }
-            Stmt::Return { value: Some(e), .. }
-            | Stmt::Assert { cond: e, .. }
-            | Stmt::Expr { expr: e, .. } => rewrite_expr_aliases(e, aliases),
-            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
-                rewrite_block_aliases(body, aliases)
-            }
-            Stmt::While { cond, body, .. } => {
-                rewrite_expr_aliases(cond, aliases);
-                rewrite_block_aliases(body, aliases);
-            }
-            Stmt::For { iter, body, .. } => {
-                rewrite_expr_aliases(iter, aliases);
-                rewrite_block_aliases(body, aliases);
-            }
-            _ => {}
-        }
-    }
-    if let Some(t) = &mut blk.tail {
-        rewrite_expr_aliases(t, aliases);
-    }
-}
-
-fn rewrite_expr_aliases(expr: &mut Expr, aliases: &BTreeMap<String, (String, BTreeSet<String>)>) {
-    match &mut expr.kind {
-        ExprKind::Field { target, field } => {
-            if let ExprKind::Ident(m) = &target.kind {
-                if let Some((stem, exports)) = aliases.get(m) {
-                    if exports.contains(field.as_str()) {
-                        let resolved = field.clone();
-                        expr.kind = ExprKind::Ident(resolved);
-                        return;
-                    }
-                    let prefixed = format!("{}_{}", stem, field);
-                    if exports.contains(&prefixed) {
-                        expr.kind = ExprKind::Ident(prefixed);
-                        return;
-                    }
-                }
-            }
-            rewrite_expr_aliases(target, aliases);
-        }
-        ExprKind::GenericInst { expr: inner, .. } => rewrite_expr_aliases(inner, aliases),
-        ExprKind::Call { callee, args } => {
-            rewrite_expr_aliases(callee, aliases);
-            for a in args {
-                rewrite_expr_aliases(&mut a.value, aliases);
-            }
-        }
-        ExprKind::Binary { left, right, .. } => {
-            rewrite_expr_aliases(left, aliases);
-            rewrite_expr_aliases(right, aliases);
-        }
-        ExprKind::Unary { expr: inner, .. }
-        | ExprKind::Await(inner)
-        | ExprKind::Old(inner)
-        | ExprKind::Try(inner)
-        | ExprKind::Cast { expr: inner, .. }
-        | ExprKind::ArrayRepeat { value: inner, .. }
-        | ExprKind::TupleIndex { target: inner, .. } => {
-            rewrite_expr_aliases(inner, aliases);
-        }
-        ExprKind::Range { start, end } => {
-            rewrite_expr_aliases(start, aliases);
-            rewrite_expr_aliases(end, aliases);
-        }
-        ExprKind::Lambda { body, .. } => rewrite_expr_aliases(body, aliases),
-        ExprKind::Index { target, index } => {
-            rewrite_expr_aliases(target, aliases);
-            rewrite_expr_aliases(index, aliases);
-        }
-        ExprKind::RecordLit { fields, .. } => {
-            for (_, v) in fields {
-                rewrite_expr_aliases(v, aliases);
-            }
-        }
-        ExprKind::Tuple(es) | ExprKind::List(es) => {
-            for e in es {
-                rewrite_expr_aliases(e, aliases);
-            }
-        }
-        ExprKind::If {
-            cond,
-            then_block,
-            else_branch,
-        } => {
-            rewrite_expr_aliases(cond, aliases);
-            rewrite_block_aliases(then_block, aliases);
-            if let Some(eb) = else_branch {
-                rewrite_expr_aliases(eb, aliases);
-            }
-        }
-        ExprKind::Match { scrutinee, arms } => {
-            rewrite_expr_aliases(scrutinee, aliases);
-            for a in arms {
-                if let Some(g) = &mut a.guard {
-                    rewrite_expr_aliases(g, aliases);
-                }
-                rewrite_expr_aliases(&mut a.body, aliases);
-            }
-        }
-        ExprKind::Block(b) | ExprKind::Unsafe(b) => rewrite_block_aliases(b, aliases),
-        _ => {}
-    }
+/// Load a `.tn` source file or package directory in test mode (including `*_test.tn` and `test fn`
+/// for the root package while loading imported dependencies in production mode).
+pub fn load_program_for_test(entry: &Path) -> Result<Program, String> {
+    load_package(entry, LoadMode::Test)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn parses_date_and_refinements() {
@@ -605,5 +354,83 @@ pub unsafe fn demo(p Ptr[UInt8]) Int {
         assert_eq!(bf.fields[2].name, "syn");
         assert_eq!(bf.fields[2].bit_offset, 7);
         assert_eq!(bf.fields[2].mask, 1);
+    }
+
+    #[test]
+    fn parses_and_expands_comptime_macros_and_reflection() {
+        let src = r#"
+pub record User {
+    id   Int
+    name Text
+}
+
+pub macro double_val(x) {
+    (x + x)
+}
+
+comptime fn gen_const(name Text, val Int) Text {
+    "pub const " ++ name ++ " Int = " ++ int_to_text(val)
+}
+
+gen_const!("MAGIC_NUM", 42)
+
+comptime {
+    "pub pure fn comptime_generated() Int { " ++ int_to_text(field_count[User]()) ++ " }"
+}
+
+@get("/ping")
+pub fn ping() Int { 200 }
+
+pub fn main() Int {
+    let a = comptime { 20 + 1 }
+    let b = double_val!(a)
+    let c = comptime if has_field[User]("name") { 1 } else { 0 }
+    let r = comptime { len(routes_of()) }
+    b + c + r + MAGIC_NUM + comptime_generated()
+}
+"#;
+        let mut prog = parse(src).expect("comptime/macro syntax must parse");
+        expand_comptime_and_macros(&mut prog).expect("comptime expansion must succeed");
+        assert!(
+            prog.items.iter().any(|i| matches!(i, Item::Const(c) if c.name == "MAGIC_NUM")),
+            "typed generator macro must emit MAGIC_NUM const"
+        );
+        assert!(
+            prog.items.iter().any(|i| matches!(i, Item::Fn(f) if f.name == "comptime_generated")),
+            "top-level comptime block must emit comptime_generated fn"
+        );
+        assert!(
+            !prog.items.iter().any(|i| matches!(i, Item::Fn(f) if f.is_comptime)),
+            "comptime-only generator fns must be stripped after expansion"
+        );
+    }
+
+    #[test]
+    fn loads_directory_packages_and_discovers_tests() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("examples/modules_demo");
+        let pkgs = discover_test_packages(&root).expect("discover_test_packages must succeed");
+        // `mathlib/` has its own `tenon.toml` (nested module boundary), so root discovers `app` and `util`
+        assert_eq!(pkgs.len(), 2, "expected app & util packages under root boundary; got {:?}", pkgs);
+        let nested_pkgs = discover_test_packages(&root.join("mathlib"))
+            .expect("nested mathlib module discovery must succeed");
+        assert_eq!(nested_pkgs.len(), 1, "expected mathlib package; got {:?}", nested_pkgs);
+
+        let prod = load_package(&root.join("app"), LoadMode::Production)
+            .expect("production load of modules_demo/app must succeed");
+        assert!(
+            !prod.items.iter().any(|i| matches!(i, Item::Fn(f) if f.is_test)),
+            "production mode must strip inline test fns"
+        );
+        assert!(prod.items.iter().any(|i| matches!(i, Item::Fn(f) if f.name == "main")));
+
+        let test_prog = load_package(&root.join("mathlib"), LoadMode::Test)
+            .expect("test load of modules_demo/mathlib must succeed");
+        assert!(!test_prog.test_file_ids.is_empty(), "mathlib_test.tn must be marked as test file");
+        assert!(
+            test_prog.items.iter().any(|i| matches!(i, Item::Fn(f) if f.is_test)),
+            "test mode must load test fn items"
+        );
     }
 }

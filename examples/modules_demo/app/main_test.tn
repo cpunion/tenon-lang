@@ -1,0 +1,9 @@
+test fn app_integration_and_private_helper() {
+    assert app_secret_offset() == 42
+    assert main() == 107
+}
+
+test fn comptime_matches_runtime() {
+    let ct = comptime { ct_fib(10) }
+    assert ct == ct_fib(10)
+}

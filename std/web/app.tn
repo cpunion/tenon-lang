@@ -1,0 +1,141 @@
+// std/web/app.tn — Metaprogramming-Powered High-Performance Tenon Web Framework
+// Combines compile-time route scanning (`@get`, `@post`, `@put`, `@delete`, `@patch` via `routes_of()`),
+// automatic OpenAPI 3.1 spec generation, composable middleware, refined-type JSON extraction,
+// and the multi-worker `kqueue`/`epoll` Keep-Alive HTTP/1.1 engine.
+
+import "std/net/http.tn"
+import "std/web/router.tn"
+import "std/web/middleware.tn"
+
+pub record RouteEntry {
+    method  Text
+    path    Text
+    handler Handler
+}
+
+pub record WebApp {
+    routes       List[RouteEntry]
+    middlewares  List[Middleware]
+    openapi_json Text
+}
+
+pub pure fn web_app_new() WebApp {
+    WebApp {
+        routes = []
+        middlewares = []
+        openapi_json = ""
+    }
+}
+
+impl WebApp {
+    pub pure fn route(self, method Text, path Text, handler Handler) WebApp {
+        var rs = self.routes
+        rs = push(rs, RouteEntry { method = method, path = path, handler = handler })
+        WebApp {
+            routes = rs
+            middlewares = self.middlewares
+            openapi_json = self.openapi_json
+        }
+    }
+
+    pub pure fn get(self, path Text, handler Handler) WebApp {
+        self.route("GET", path, handler)
+    }
+
+    pub pure fn post(self, path Text, handler Handler) WebApp {
+        self.route("POST", path, handler)
+    }
+
+    pub pure fn put(self, path Text, handler Handler) WebApp {
+        self.route("PUT", path, handler)
+    }
+
+    pub pure fn delete(self, path Text, handler Handler) WebApp {
+        self.route("DELETE", path, handler)
+    }
+
+    pub pure fn use_mw(self, mw Middleware) WebApp {
+        var mws = self.middlewares
+        mws = push(mws, mw)
+        WebApp {
+            routes = self.routes
+            middlewares = mws
+            openapi_json = self.openapi_json
+        }
+    }
+
+    pub pure fn with_openapi(self, spec_json Text) WebApp {
+        WebApp {
+            routes = self.routes
+            middlewares = self.middlewares
+            openapi_json = spec_json
+        }
+    }
+
+    pub pure fn dispatch_core(self, ctx Context) HttpResponse {
+        if len(self.openapi_json) > 0 && ctx.req.method == "GET" && ctx.req.path == "/openapi.json" {
+            return http_json(200, self.openapi_json)
+        }
+        var path_matched_other_method = false
+        var i = 0
+        while i < len(self.routes) {
+            let rt = self.routes[i]
+            let m = match_route_pattern(rt.path, ctx.req.path)
+            if m.matched {
+                if rt.method == ctx.req.method {
+                    let bound = Context { req = ctx.req, params = m.params }
+                    let h = rt.handler
+                    return h(bound)
+                } else {
+                    path_matched_other_method = true
+                }
+            }
+            i += 1
+        }
+        if path_matched_other_method {
+            http_json(405, "{\"error\":\"method not allowed\"}")
+        } else {
+            http_not_found("route not found")
+        }
+    }
+
+    pub pure fn into_handler(self) fn(HttpRequest) HttpResponse {
+        let app = self
+        let core Handler = |ctx| app.dispatch_core(ctx)
+        let pipeline = compose_middlewares(app.middlewares, core)
+        |req| {
+            let ctx = Context { req = req, params = [] }
+            pipeline(ctx)
+        }
+    }
+
+    pub fn serve(self, addr Text, workers Int, port_out AtomicInt, stop AtomicInt) Int {
+        let h = self.into_handler()
+        http_serve_reactor(addr, workers, port_out, stop, h)
+    }
+}
+
+/// Compile-time metaprogramming generator macro!
+/// Scans ALL `@get`/`@post`/`@put`/`@delete`/`@patch` annotated handler functions in the project
+/// via `routes_of()` and generates:
+///   1. `pub pure fn mount_routes(app WebApp) WebApp` (zero-reflection compiled router wiring)
+///   2. `pub pure fn generated_openapi_json() Text` (compile-time OpenAPI 3.1 specification!)
+pub comptime fn mount_annotated_routes() Text {
+    let rs = routes_of()
+    var mount_body = "    var out = app\n"
+    var spec = "{\\\"openapi\\\":\\\"3.1.0\\\",\\\"info\\\":{\\\"title\\\":\\\"Tenon Web API\\\",\\\"version\\\":\\\"1.0.0\\\"},\\\"paths\\\":{"
+    var i = 0
+    while i < len(rs) {
+        let r = rs[i]
+        mount_body = mount_body ++ "    out = out.route(\"" ++ r.method ++ "\", \"" ++ r.path ++ "\", |ctx| " ++ r.handler ++ "(ctx))\n"
+        if i > 0 {
+            spec = spec ++ ","
+        }
+        spec = spec ++ "\\\"" ++ r.method ++ " " ++ r.path ++ "\\\":{\\\"operationId\\\":\\\"" ++ r.handler ++ "\\\"}"
+        i += 1
+    }
+    spec = spec ++ "}}"
+    let fn_openapi = "pub pure fn generated_openapi_json() Text {\n    \"" ++ spec ++ "\"\n}\n\n"
+    let fn_mount = "pub fn mount_routes(app WebApp) WebApp {\n" ++ mount_body ++ "    out.with_openapi(generated_openapi_json())\n}\n"
+    fn_openapi ++ fn_mount
+}

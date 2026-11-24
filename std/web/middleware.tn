@@ -1,0 +1,53 @@
+// std/web/middleware.tn — Composable Middleware Pipeline for Tenon Web Framework
+
+import "std/net/http.tn"
+import "std/web/router.tn"
+
+pub type Handler = fn(Context) HttpResponse
+pub type Middleware = fn(Context, fn(Context) HttpResponse) HttpResponse
+
+pub pure fn cors_middleware(origin Text) Middleware {
+    |ctx, next| {
+        if ctx.req.method == "OPTIONS" {
+            http_text(204, "")
+                .with_header("Access-Control-Allow-Origin", origin)
+                .with_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+                .with_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        } else {
+            let res = next(ctx)
+            res
+                .with_header("Access-Control-Allow-Origin", origin)
+                .with_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+        }
+    }
+}
+
+pub fn timing_middleware() Middleware {
+    |ctx, next| {
+        let t0 = time_now_ns()
+        let res = next(ctx)
+        let dt_us = (time_now_ns() - t0) / 1000
+        res.with_header("X-Response-Time-Us", int_to_text(dt_us))
+    }
+}
+
+pub pure fn security_headers_middleware() Middleware {
+    |ctx, next| {
+        let res = next(ctx)
+        res
+            .with_header("X-Content-Type-Options", "nosniff")
+            .with_header("X-Frame-Options", "DENY")
+    }
+}
+
+pub pure fn compose_middlewares(mws List[Middleware], core Handler) Handler {
+    var chain = core
+    var i = len(mws) - 1
+    while i >= 0 {
+        let mw = mws[i]
+        let prev = chain
+        chain = |ctx| mw(ctx, prev)
+        i -= 1
+    }
+    chain
+}
