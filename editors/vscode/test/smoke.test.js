@@ -138,6 +138,42 @@ test('real `tenon lsp` process handles initialize, diagnostics, hover, definitio
     const hoverResp = await hoverP;
     assert.ok(hoverResp.result.contents.value.includes('@post("/users")'), 'hover should display @post("/users")');
 
+    // Hover over `@get` attribute -> attribute doc, NOT List.get
+    const getAttrLine = text.split('\n').findIndex((l) => l.includes('@get("/health")'));
+    const attrHoverP = rpc.waitFor((m) => m.id === 30);
+    rpc.send({
+      jsonrpc: '2.0',
+      id: 30,
+      method: 'textDocument/hover',
+      params: { textDocument: { uri }, position: { line: getAttrLine, character: 2 } },
+    });
+    const attrHoverResp = await attrHoverP;
+    assert.ok(attrHoverResp.result.contents.value.includes('HTTP `GET` route handler attribute'));
+
+    // Go to definition on `@get` MUST return null (must NOT jump to std/core/ops.tn List.get!)
+    const attrDefP = rpc.waitFor((m) => m.id === 31);
+    rpc.send({
+      jsonrpc: '2.0',
+      id: 31,
+      method: 'textDocument/definition',
+      params: { textDocument: { uri }, position: { line: getAttrLine, character: 2 } },
+    });
+    const attrDefResp = await attrDefP;
+    assert.equal(attrDefResp.result, null, 'definition on @get must not jump to List.get');
+
+    // Go to definition on `conn.get("/health")` MUST jump to HttpConn.get in std/net/http.tn!
+    const connGetLine = text.split('\n').findIndex((l) => l.includes('conn.get("/health")'));
+    const connGetCol = text.split('\n')[connGetLine].indexOf('conn.get') + 6;
+    const connDefP = rpc.waitFor((m) => m.id === 32);
+    rpc.send({
+      jsonrpc: '2.0',
+      id: 32,
+      method: 'textDocument/definition',
+      params: { textDocument: { uri }, position: { line: connGetLine, character: connGetCol } },
+    });
+    const connDefResp = await connDefP;
+    assert.ok(connDefResp.result && connDefResp.result.uri.endsWith('/std/net/http.tn'), `expected std/net/http.tn, got ${JSON.stringify(connDefResp.result)}`);
+
     // Completion
     const compP = rpc.waitFor((m) => m.id === 4);
     rpc.send({

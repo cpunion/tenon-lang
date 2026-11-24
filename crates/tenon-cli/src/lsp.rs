@@ -429,9 +429,28 @@ impl LspServer {
         let Some(doc) = self.docs.get(&uri) else {
             return Value::Null;
         };
-        let Some((word, qual_prefix)) = word_at_position(&doc.text, line, ch) else {
+        let Some(tok) = word_at_position(&doc.text, line, ch) else {
             return Value::Null;
         };
+        if tok.is_string_lit {
+            return Value::Null;
+        }
+        if tok.is_attr {
+            if let Some(md) = attribute_hover(&tok.word) {
+                return json!({
+                    "contents": {
+                        "kind": "markdown",
+                        "value": md
+                    }
+                });
+            }
+            return json!({
+                "contents": {
+                    "kind": "markdown",
+                    "value": format!("```tenon\n@{}\n```\n\nCompile-time metadata attribute.", tok.word)
+                }
+            });
+        }
 
         let analyzed = self.analysis.get(&uri);
         let prog = analyzed.and_then(|a| a.full_program.as_ref().or(a.raw_program.as_ref()));
@@ -439,48 +458,52 @@ impl LspServer {
 
         if let Some(prog) = prog {
             let layout = LayoutEngine::from_program(prog);
-            // If qualified like `math.add`, try `math__add` and `add`
-            let mut candidates = vec![word.clone()];
-            if let Some(pref) = &qual_prefix {
-                candidates.insert(0, format!("{}__{}", pref, word));
-            }
-            for cand in &candidates {
-                if let Some(md) = format_item_hover(prog, &layout, report, cand) {
-                    return json!({
-                        "contents": {
-                            "kind": "markdown",
-                            "value": md
-                        }
-                    });
+            if let Some(pref) = &tok.qual_prefix {
+                // 1. Qualified package symbol (`math.add` -> `math__add`)
+                let mangled = format!("{}__{}", pref, tok.word);
+                if let Some(md) = format_item_hover(prog, &layout, report, &mangled) {
+                    return json!({ "contents": { "kind": "markdown", "value": md } });
                 }
-            }
-            // Check methods on impl blocks if `obj.method`
-            for item in &prog.items {
-                if let Item::Impl(im) = item {
-                    let target_name = im.target_ty.display_name();
-                    for m in &im.methods {
-                        if m.name == word {
-                            let md = format_fn_hover(m, Some(&target_name), report);
-                            return json!({
-                                "contents": {
-                                    "kind": "markdown",
-                                    "value": md
-                                }
-                            });
+                // 2. Receiver type member (`ctx.json_raw`, `conn.get`, `HttpResponse.text`)
+                let recv_ty = infer_receiver_type(&doc.text, pref, prog);
+                if let Some(rty) = &recv_ty {
+                    if let Some(md) = format_member_hover(prog, rty, &tok.word, report) {
+                        return json!({ "contents": { "kind": "markdown", "value": md } });
+                    }
+                }
+                // 3. Fallback: package symbol without prefix mangling, or any impl method matching name
+                if let Some(md) = format_item_hover(prog, &layout, report, &tok.word) {
+                    return json!({ "contents": { "kind": "markdown", "value": md } });
+                }
+                for item in &prog.items {
+                    if let Item::Impl(im) = item {
+                        let target_name = im.target_ty.display_name();
+                        for m in &im.methods {
+                            if m.name == tok.word {
+                                let md = format_fn_hover(m, Some(&target_name), report);
+                                return json!({ "contents": { "kind": "markdown", "value": md } });
+                            }
                         }
                     }
+                }
+            } else {
+                // Unqualified symbol: only match top-level items (never unrelated impl methods)
+                if let Some(md) = format_item_hover(prog, &layout, report, &tok.word) {
+                    return json!({ "contents": { "kind": "markdown", "value": md } });
                 }
             }
         }
 
         // Builtin / primitive hover fallback
-        if let Some(md) = builtin_hover(&word) {
-            return json!({
-                "contents": {
-                    "kind": "markdown",
-                    "value": md
-                }
-            });
+        if tok.qual_prefix.is_none() {
+            if let Some(md) = builtin_hover(&tok.word) {
+                return json!({
+                    "contents": {
+                        "kind": "markdown",
+                        "value": md
+                    }
+                });
+            }
         }
 
         Value::Null
@@ -493,9 +516,13 @@ impl LspServer {
         let Some(doc) = self.docs.get(&uri) else {
             return Value::Null;
         };
-        let Some((word, qual_prefix)) = word_at_position(&doc.text, line, ch) else {
+        let Some(tok) = word_at_position(&doc.text, line, ch) else {
             return Value::Null;
         };
+        // Attributes (`@get`, `@repr`, `@derive`, ...) and string literals are not symbol references
+        if tok.is_attr || tok.is_string_lit {
+            return Value::Null;
+        }
         let Some(analyzed) = self.analysis.get(&uri) else {
             return Value::Null;
         };
@@ -503,24 +530,33 @@ impl LspServer {
             return Value::Null;
         };
 
-        let mut candidates = vec![word.clone()];
-        if let Some(pref) = &qual_prefix {
-            candidates.insert(0, format!("{}__{}", pref, word));
-        }
+        let found_span = if let Some(pref) = &tok.qual_prefix {
+            let mangled = format!("{}__{}", pref, tok.word);
+            let recv_ty = infer_receiver_type(&doc.text, pref, prog);
+            find_top_level_item_span(prog, &mangled)
+                .or_else(|| {
+                    recv_ty
+                        .as_deref()
+                        .and_then(|rty| find_member_span(prog, rty, &tok.word))
+                })
+                .or_else(|| find_any_impl_method_span(prog, &tok.word))
+                .or_else(|| find_top_level_item_span(prog, &tok.word))
+        } else {
+            // Unqualified symbol: only jump to top-level declarations (never unrelated impl methods)
+            find_top_level_item_span(prog, &tok.word)
+        };
 
-        for cand in &candidates {
-            if let Some(span) = find_item_span(prog, cand) {
-                let target_uri = span_file_uri(prog, span, &uri);
-                let l0 = span.line.saturating_sub(1);
-                let c0 = span.col.saturating_sub(1);
-                return json!({
-                    "uri": target_uri,
-                    "range": {
-                        "start": { "line": l0, "character": c0 },
-                        "end": { "line": l0, "character": c0 + word.len() }
-                    }
-                });
-            }
+        if let Some(span) = found_span {
+            let target_uri = span_file_uri(prog, span, &uri);
+            let l0 = span.line.saturating_sub(1);
+            let c0 = span.col.saturating_sub(1);
+            return json!({
+                "uri": target_uri,
+                "range": {
+                    "start": { "line": l0, "character": c0 },
+                    "end": { "line": l0, "character": c0 + tok.word.len() }
+                }
+            });
         }
 
         Value::Null
@@ -1014,7 +1050,15 @@ fn line_prefix_before_cursor(text: &str, line: usize, ch: usize) -> String {
     ln.chars().take(ch).collect()
 }
 
-fn word_at_position(text: &str, line: usize, ch: usize) -> Option<(String, Option<String>)> {
+#[derive(Debug, Clone)]
+struct CursorToken {
+    word: String,
+    qual_prefix: Option<String>,
+    is_attr: bool,
+    is_string_lit: bool,
+}
+
+fn word_at_position(text: &str, line: usize, ch: usize) -> Option<CursorToken> {
     let ln = text.lines().nth(line)?;
     let chars: Vec<char> = ln.chars().collect();
     if chars.is_empty() {
@@ -1038,7 +1082,23 @@ fn word_at_position(text: &str, line: usize, ch: usize) -> Option<(String, Optio
         end += 1;
     }
     let word: String = chars[start..end].iter().collect();
-    let qual_prefix = if start >= 2 && chars[start - 1] == '.' {
+
+    // Check whether cursor is inside a string literal on this line
+    let mut in_str = false;
+    let mut i = 0;
+    while i < start {
+        if chars[i] == '\\' && in_str {
+            i += 2;
+            continue;
+        }
+        if chars[i] == '"' {
+            in_str = !in_str;
+        }
+        i += 1;
+    }
+
+    let is_attr = !in_str && start > 0 && chars[start - 1] == '@';
+    let qual_prefix = if !in_str && !is_attr && start >= 2 && chars[start - 1] == '.' {
         let mut pstart = start - 1;
         while pstart > 0 && is_ident(chars[pstart - 1]) {
             pstart -= 1;
@@ -1051,7 +1111,12 @@ fn word_at_position(text: &str, line: usize, ch: usize) -> Option<(String, Optio
     } else {
         None
     };
-    Some((word, qual_prefix))
+    Some(CursorToken {
+        word,
+        qual_prefix,
+        is_attr,
+        is_string_lit: in_str,
+    })
 }
 
 fn make_doc_symbol(name: &str, kind: u32, span: Span, detail: String, children: Vec<Value>) -> Value {
@@ -1071,7 +1136,7 @@ fn make_doc_symbol(name: &str, kind: u32, span: Span, detail: String, children: 
     })
 }
 
-fn find_item_span(prog: &Program, name: &str) -> Option<Span> {
+fn find_top_level_item_span(prog: &Program, name: &str) -> Option<Span> {
     for item in &prog.items {
         match item {
             Item::Fn(f) if f.name == name => return Some(f.span),
@@ -1084,14 +1149,196 @@ fn find_item_span(prog: &Program, name: &str) -> Option<Span> {
             Item::TypeAlias(t) if t.name == name => return Some(t.span),
             Item::Const(c) if c.name == name => return Some(c.span),
             Item::Macro(m) if m.name == name => return Some(m.span),
-            Item::Impl(im) => {
+            _ => {}
+        }
+    }
+    None
+}
+
+fn type_head_base(display: &str) -> &str {
+    display.split('[').next().unwrap_or(display).trim()
+}
+
+fn find_member_span(prog: &Program, receiver_ty: &str, member: &str) -> Option<Span> {
+    let base = type_head_base(receiver_ty);
+    for item in &prog.items {
+        match item {
+            Item::Impl(im) if type_head_base(&im.target_ty.display_name()) == base => {
                 for m in &im.methods {
-                    if m.name == name {
+                    if m.name == member {
                         return Some(m.span);
                     }
                 }
             }
+            Item::Record(r) if r.name == base => {
+                for f in &r.fields {
+                    if f.name == member {
+                        return Some(f.span);
+                    }
+                }
+            }
+            Item::Union(u) if u.name == base => {
+                for f in &u.fields {
+                    if f.name == member {
+                        return Some(f.span);
+                    }
+                }
+            }
+            Item::Bitfield(b) if b.name == base => {
+                for f in &b.fields {
+                    if f.name == member {
+                        return Some(f.span);
+                    }
+                }
+            }
+            Item::Enum(e) if e.name == base => {
+                for v in &e.variants {
+                    if v.name == member {
+                        return Some(v.span);
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+    None
+}
+
+fn find_any_impl_method_span(prog: &Program, member: &str) -> Option<Span> {
+    for item in &prog.items {
+        if let Item::Impl(im) = item {
+            for m in &im.methods {
+                if m.name == member {
+                    return Some(m.span);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn format_member_hover(
+    prog: &Program,
+    receiver_ty: &str,
+    member: &str,
+    report: Option<&CheckReport>,
+) -> Option<String> {
+    let base = type_head_base(receiver_ty);
+    for item in &prog.items {
+        match item {
+            Item::Impl(im) if type_head_base(&im.target_ty.display_name()) == base => {
+                for m in &im.methods {
+                    if m.name == member {
+                        return Some(format_fn_hover(m, Some(&im.target_ty.display_name()), report));
+                    }
+                }
+            }
+            Item::Record(r) if r.name == base => {
+                for f in &r.fields {
+                    if f.name == member {
+                        let pred = f
+                            .predicate
+                            .as_ref()
+                            .map(|w| format!(" where {}", expr_brief(w)))
+                            .unwrap_or_default();
+                        return Some(format!(
+                            "```tenon\n{}.{} {}{}\n```\n\nField of record `{}`.",
+                            r.name,
+                            f.name,
+                            f.ty.display_name(),
+                            pred,
+                            r.name
+                        ));
+                    }
+                }
+            }
+            Item::Bitfield(b) if b.name == base => {
+                for f in &b.fields {
+                    if f.name == member {
+                        return Some(format!(
+                            "```tenon\n{}.{}: {} bits\n```\n\nField of bitfield `{}` (`{}`).",
+                            b.name,
+                            f.name,
+                            f.bits,
+                            b.name,
+                            b.backing_ty.display_name()
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn attribute_hover(name: &str) -> Option<String> {
+    let desc = match name {
+        "get" => "```tenon\n@get(\"/path\")\n```\n\nHTTP `GET` route handler attribute. Discovered at compile time by `routes_of()` and `mount_annotated_routes!()` with zero runtime reflection.",
+        "post" => "```tenon\n@post(\"/path\")\n```\n\nHTTP `POST` route handler attribute. Discovered at compile time by `routes_of()` and `mount_annotated_routes!()`.",
+        "put" => "```tenon\n@put(\"/path\")\n```\n\nHTTP `PUT` route handler attribute. Discovered at compile time by `routes_of()` and `mount_annotated_routes!()`.",
+        "delete" => "```tenon\n@delete(\"/path\")\n```\n\nHTTP `DELETE` route handler attribute. Discovered at compile time by `routes_of()` and `mount_annotated_routes!()`.",
+        "repr" => "```tenon\n@repr(C)\n```\n\nC-ABI compatible record memory layout for FFI and deterministic byte offsets (`size_of`, `align_of`, `offset_of`).",
+        "packed" => "```tenon\n@packed\n```\n\nUnaligned packed struct layout (`align = 1`, zero inter-field padding).",
+        "align" => "```tenon\n@align(N)\n```\n\nExplicit minimum power-of-two byte alignment for a record or union.",
+        "export" => "```tenon\n@export\n```\n\nExport function with C ABI symbol name for `--lib static|shared` and `--emit-header`.",
+        "link" => "```tenon\n@link(\"libname\")\n```\n\nLink an external C/native library for `extern \"C\"` declarations.",
+        "cfg" => "```tenon\n@cfg(os = \"macos\")\n```\n\nCompile-time conditional compilation predicate (`os`, `arch`, `family`, `target_pointer_width`, `not(...)`).",
+        "derive" => "```tenon\n@derive(Eq, Hash, ToJson, FromJson, JsonSchema)\n```\n\nCompile-time interface derivation with automatic refinement-preserving validation.",
+        "evolve" => "```tenon\n@evolve(\"namespace.Entity\")\n```\n\nMarks a record for versioned schema evolution and SMT compatibility verification (`tenon evolve check`).",
+        "field" => "```tenon\n@field(N)\n```\n\nOptional explicit stable wire/storage field ID for `@evolve` records.",
+        "no_heap_alloc" => "```tenon\n@no_heap_alloc\n```\n\nCompile-time contract guaranteeing the function performs zero heap allocations (`E0701`).",
+        _ => return None,
+    };
+    Some(desc.to_string())
+}
+
+fn infer_receiver_type(src: &str, receiver: &str, prog: &Program) -> Option<String> {
+    // 1. Direct type name (e.g. `HttpResponse.text`, `Option.Some`)
+    if receiver.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return Some(receiver.to_string());
+    }
+    // 2. Direct parameter / literal annotation from source text
+    if let Some(ty) = guess_var_type_in_source(src, receiver) {
+        return Some(ty);
+    }
+    // 3. Infer from function call initializer: `let app = build_app()` or `var conn = match http_connect(...) { ... }`
+    for line in src.lines() {
+        for pat in [
+            format!("let {} = ", receiver),
+            format!("var {} = ", receiver),
+        ] {
+            if let Some(idx) = line.find(&pat) {
+                let mut rest = line[idx + pat.len()..].trim();
+                let is_match = if let Some(after) = rest.strip_prefix("match ") {
+                    rest = after.trim();
+                    true
+                } else {
+                    false
+                };
+                let callee: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !callee.is_empty() {
+                    for it in &prog.items {
+                        if let Item::Fn(f) = it {
+                            if f.name == callee {
+                                if let Some(rt) = &f.ret_ty {
+                                    if is_match {
+                                        if let tenon_syntax::TypeExpr::Named { name, args, .. } = rt {
+                                            if (name == "Result" || name == "Option") && !args.is_empty() {
+                                                return Some(args[0].display_name());
+                                            }
+                                        }
+                                    }
+                                    return Some(rt.display_name());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     None
