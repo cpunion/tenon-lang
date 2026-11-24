@@ -3132,6 +3132,8 @@ pub fn main() Int {
         assert_eq!(jit.call_0("main").unwrap(), 37);
     }
 
+    static PERCEUS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn perceus_records_parse_mutate_cow_and_zero_leaks() {
         let src = r#"
@@ -3199,6 +3201,7 @@ pub fn main() Int {
     ok_day + b.day + xs[3]
 }
 "#;
+        let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         perceus::reset_stats();
         let prog = parse(src).unwrap();
         let jit = JitProgram::compile(&prog).unwrap();
@@ -3245,6 +3248,7 @@ pub fn main() Int {
     block_on(pipeline(7))
 }
 "#;
+        let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         perceus::reset_stats();
         let prog = parse(src).unwrap();
         let jit = JitProgram::compile(&prog).unwrap();
@@ -3315,6 +3319,7 @@ pub fn main() Int {
     m
 }
 "#;
+        let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         perceus::reset_stats();
         let prog = parse(src).unwrap();
         let jit = JitProgram::compile(&prog).unwrap();
@@ -3396,6 +3401,7 @@ pub fn main() Int {
     99
 }
 "#;
+        let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         perceus::reset_stats();
         let prog = parse(src).unwrap();
         let jit = JitProgram::compile(&prog).unwrap();
@@ -3484,6 +3490,7 @@ pub fn main() Int {
     v1
 }
 "#;
+        let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         perceus::reset_stats();
         let prog = parse(src).unwrap();
         let jit = JitProgram::compile(&prog).unwrap();
@@ -3559,6 +3566,7 @@ pub fn main() Int {
     42
 }
 "#;
+        let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         perceus::reset_stats();
         let prog = parse(src).unwrap();
         let jit = JitProgram::compile(&prog).unwrap();
@@ -3613,6 +3621,7 @@ pub fn main() Int {
     tbl.slots[1]
 }
 "#;
+        let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         perceus::reset_stats();
         let prog = parse(src).unwrap();
         let jit = JitProgram::compile(&prog).unwrap();

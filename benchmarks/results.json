@@ -1,0 +1,417 @@
+{
+  "meta": {
+    "machine": "arm64",
+    "system": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "c": "Homebrew clang version 22.1.8",
+    "rust": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "go": "go version go1.27.3 darwin/arm64",
+    "tenon": "Tenon LLVM 22 -O3 ThinLTO AOT (tenon)",
+    "warmup": 1,
+    "reps": 7,
+    "metric": "process CPU time (os.wait4 ru_utime + ru_stime, ms), interleaved rounds"
+  },
+  "benchmarks": [
+    {
+      "name": "01_fib",
+      "desc": "Recursive fib(40)",
+      "checksum": "102334155",
+      "results": {
+        "c": {
+          "cpu_median_ms": 187.28,
+          "cpu_min_ms": 184.52,
+          "wall_median_ms": 189.13,
+          "size_kb": 32.7,
+          "cpu_samples_ms": [
+            187.32,
+            192.77,
+            189.91,
+            187.28,
+            186.44,
+            185.54,
+            184.52
+          ]
+        },
+        "rust": {
+          "cpu_median_ms": 185.11,
+          "cpu_min_ms": 182.28,
+          "wall_median_ms": 186.81,
+          "size_kb": 461.1,
+          "cpu_samples_ms": [
+            185.47,
+            187.65,
+            185.11,
+            183.44,
+            185.7,
+            184.12,
+            182.28
+          ]
+        },
+        "go": {
+          "cpu_median_ms": 239.66,
+          "cpu_min_ms": 238.7,
+          "wall_median_ms": 241.59,
+          "size_kb": 2372.8,
+          "cpu_samples_ms": [
+            245.19,
+            245.93,
+            250.47,
+            238.7,
+            239.58,
+            239.66,
+            238.89
+          ]
+        },
+        "tenon": {
+          "cpu_median_ms": 187.19,
+          "cpu_min_ms": 184.52,
+          "wall_median_ms": 189.52,
+          "size_kb": 33.1,
+          "cpu_samples_ms": [
+            187.19,
+            188.47,
+            186.21,
+            184.52,
+            186.98,
+            188.96,
+            191.8
+          ]
+        }
+      }
+    },
+    {
+      "name": "02_compute_loop",
+      "desc": "100M SplitMix64 scalar/bitwise loop",
+      "checksum": "4378771939937074704",
+      "results": {
+        "c": {
+          "cpu_median_ms": 66.63,
+          "cpu_min_ms": 65.74,
+          "wall_median_ms": 68.51,
+          "size_kb": 32.7,
+          "cpu_samples_ms": [
+            65.74,
+            65.91,
+            65.99,
+            66.84,
+            66.63,
+            67.6,
+            67.72
+          ]
+        },
+        "rust": {
+          "cpu_median_ms": 67.37,
+          "cpu_min_ms": 66.4,
+          "wall_median_ms": 69.87,
+          "size_kb": 460.7,
+          "cpu_samples_ms": [
+            66.4,
+            66.62,
+            67.98,
+            67.23,
+            67.37,
+            68.76,
+            68.39
+          ]
+        },
+        "go": {
+          "cpu_median_ms": 94.22,
+          "cpu_min_ms": 92.68,
+          "wall_median_ms": 95.25,
+          "size_kb": 2372.8,
+          "cpu_samples_ms": [
+            93.46,
+            93.4,
+            94.22,
+            94.61,
+            92.68,
+            96.49,
+            96.43
+          ]
+        },
+        "tenon": {
+          "cpu_median_ms": 67.01,
+          "cpu_min_ms": 65.73,
+          "wall_median_ms": 68.69,
+          "size_kb": 33.1,
+          "cpu_samples_ms": [
+            66.52,
+            65.73,
+            65.81,
+            68.47,
+            67.4,
+            67.44,
+            67.01
+          ]
+        }
+      }
+    },
+    {
+      "name": "03_sieve",
+      "desc": "Sieve of Eratosthenes (1M x 5)",
+      "checksum": "392490",
+      "results": {
+        "c": {
+          "cpu_median_ms": 8.22,
+          "cpu_min_ms": 8.19,
+          "wall_median_ms": 9.88,
+          "size_kb": 32.8,
+          "cpu_samples_ms": [
+            8.22,
+            8.19,
+            8.23,
+            8.2,
+            8.42,
+            8.23,
+            8.21
+          ]
+        },
+        "rust": {
+          "cpu_median_ms": 8.41,
+          "cpu_min_ms": 8.32,
+          "wall_median_ms": 10.06,
+          "size_kb": 477.3,
+          "cpu_samples_ms": [
+            8.41,
+            8.63,
+            8.66,
+            8.82,
+            8.35,
+            8.32,
+            8.37
+          ]
+        },
+        "go": {
+          "cpu_median_ms": 13.51,
+          "cpu_min_ms": 13.15,
+          "wall_median_ms": 14.36,
+          "size_kb": 2372.8,
+          "cpu_samples_ms": [
+            13.89,
+            13.65,
+            13.74,
+            13.51,
+            13.46,
+            13.38,
+            13.15
+          ]
+        },
+        "tenon": {
+          "cpu_median_ms": 19.97,
+          "cpu_min_ms": 19.77,
+          "wall_median_ms": 21.58,
+          "size_kb": 33.6,
+          "cpu_samples_ms": [
+            20.53,
+            19.97,
+            19.85,
+            20.52,
+            19.87,
+            20.01,
+            19.77
+          ]
+        }
+      }
+    },
+    {
+      "name": "04_hashmap",
+      "desc": "50k String HashMap (set/upd/get/del)",
+      "checksum": "708334",
+      "results": {
+        "c": {
+          "cpu_median_ms": 16.32,
+          "cpu_min_ms": 15.26,
+          "wall_median_ms": 18.03,
+          "size_kb": 33.1,
+          "cpu_samples_ms": [
+            16.92,
+            15.26,
+            16.6,
+            16.41,
+            15.85,
+            16.14,
+            16.32
+          ]
+        },
+        "rust": {
+          "cpu_median_ms": 15.01,
+          "cpu_min_ms": 14.49,
+          "wall_median_ms": 16.96,
+          "size_kb": 480.8,
+          "cpu_samples_ms": [
+            15.87,
+            14.95,
+            15.88,
+            14.49,
+            15.01,
+            14.54,
+            15.46
+          ]
+        },
+        "go": {
+          "cpu_median_ms": 16.47,
+          "cpu_min_ms": 15.77,
+          "wall_median_ms": 15.26,
+          "size_kb": 2373.1,
+          "cpu_samples_ms": [
+            16.96,
+            15.77,
+            16.47,
+            15.87,
+            15.99,
+            16.99,
+            17.04
+          ]
+        },
+        "tenon": {
+          "cpu_median_ms": 27.59,
+          "cpu_min_ms": 27.17,
+          "wall_median_ms": 29.18,
+          "size_kb": 34.6,
+          "cpu_samples_ms": [
+            28.69,
+            28.58,
+            27.37,
+            27.6,
+            27.49,
+            27.59,
+            27.17
+          ]
+        }
+      }
+    },
+    {
+      "name": "05_json",
+      "desc": "5k Nested JSON parse+access+stringify",
+      "checksum": "483984",
+      "results": {
+        "c": {
+          "cpu_median_ms": 6.57,
+          "cpu_min_ms": 6.03,
+          "wall_median_ms": 8.16,
+          "size_kb": 33.2,
+          "cpu_samples_ms": [
+            6.85,
+            6.38,
+            6.84,
+            6.66,
+            6.54,
+            6.03,
+            6.57
+          ]
+        },
+        "rust": {
+          "cpu_median_ms": 6.54,
+          "cpu_min_ms": 6.12,
+          "wall_median_ms": 8.11,
+          "size_kb": 479.4,
+          "cpu_samples_ms": [
+            6.68,
+            6.42,
+            6.54,
+            6.36,
+            6.12,
+            6.74,
+            6.69
+          ]
+        },
+        "go": {
+          "cpu_median_ms": 15.72,
+          "cpu_min_ms": 15.19,
+          "wall_median_ms": 16.48,
+          "size_kb": 3679.3,
+          "cpu_samples_ms": [
+            15.19,
+            15.44,
+            16.76,
+            16.0,
+            16.02,
+            15.51,
+            15.72
+          ]
+        },
+        "tenon": {
+          "cpu_median_ms": 19.89,
+          "cpu_min_ms": 19.07,
+          "wall_median_ms": 21.66,
+          "size_kb": 50.9,
+          "cpu_samples_ms": [
+            19.07,
+            20.44,
+            19.52,
+            20.08,
+            20.52,
+            19.78,
+            19.89
+          ]
+        }
+      }
+    },
+    {
+      "name": "06_dyn_dispatch",
+      "desc": "5M Dynamic interface vtable calls",
+      "checksum": "840988148304462647",
+      "results": {
+        "c": {
+          "cpu_median_ms": 5.74,
+          "cpu_min_ms": 5.64,
+          "wall_median_ms": 7.16,
+          "size_kb": 32.9,
+          "cpu_samples_ms": [
+            5.76,
+            5.64,
+            5.71,
+            5.76,
+            5.74,
+            5.67,
+            5.87
+          ]
+        },
+        "rust": {
+          "cpu_median_ms": 5.84,
+          "cpu_min_ms": 5.68,
+          "wall_median_ms": 7.44,
+          "size_kb": 461.9,
+          "cpu_samples_ms": [
+            5.75,
+            6.03,
+            6.18,
+            5.84,
+            5.94,
+            5.68,
+            5.83
+          ]
+        },
+        "go": {
+          "cpu_median_ms": 7.95,
+          "cpu_min_ms": 7.56,
+          "wall_median_ms": 9.2,
+          "size_kb": 2373.3,
+          "cpu_samples_ms": [
+            7.93,
+            8.14,
+            7.98,
+            8.14,
+            7.69,
+            7.95,
+            7.56
+          ]
+        },
+        "tenon": {
+          "cpu_median_ms": 19.92,
+          "cpu_min_ms": 19.43,
+          "wall_median_ms": 21.49,
+          "size_kb": 34.0,
+          "cpu_samples_ms": [
+            20.31,
+            20.49,
+            19.8,
+            19.84,
+            19.43,
+            19.92,
+            20.71
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+// Benchmark 03: Sieve of Eratosthenes (N = 1,000,000 x 5 reps) — dense array read + in-place write
+pub pure fn sieve_count(limit Int) Int {
+    var flags = list_filled(limit + 1, 1)
+    flags[0] = 0
+    flags[1] = 0
+    var p = 2
+    while p * p <= limit {
+        if flags[p] == 1 {
+            var m = p * p
+            while m <= limit {
+                flags[m] = 0
+                m += p
+            }
+        }
+        p += 1
+    }
+    var count = 0
+    var i = 2
+    while i <= limit {
+        count += flags[i]
+        i += 1
+    }
+    count
+}
+
+pub fn main() Int {
+    var total = 0
+    var r = 0
+    while r < 5 {
+        total += sieve_count(1000000)
+        r += 1
+    }
+    let _ = print_int(total)
+    0
+}

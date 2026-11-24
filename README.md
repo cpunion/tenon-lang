@@ -11,7 +11,7 @@
 前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）、`z3`、LLVM `clang`（已验证 LLVM 22.1.8；可选 `node` 验证编译出的 `.wasm`）。
 
 ```bash
-# 1. 全工作区 33 项自动化测试（含 interface/impl/静态单态化/dyn 虚表零泄漏、OOP List.push/set/pop/索引赋值 COW、O(1) 哈希表、Liskov 契约检查、版本优先 @evolve、Perceus/rc_mask 零泄漏、无栈 async、LLVM 22 AOT + tenon-rt 链接、V8 Wasm、OpenAI SSE + Webhook、Fabric Sandbox + 410 Reset）
+# 1. 全工作区 34 项自动化测试（含 interface/impl/静态单态化/dyn 虚表零泄漏、OOP List.push/set/pop/索引赋值 COW、O(1) 哈希表、benchmarks 编译证明回归、Liskov 契约检查、版本优先 @evolve、Perceus/rc_mask 零泄漏、无栈 async、LLVM 22 AOT + tenon-rt 链接、V8 Wasm、OpenAI SSE + Webhook、Fabric Sandbox + 410 Reset）
 cargo test --workspace
 
 # 2. 精化类型别名复用（Year/Month/Odd/Even/Amount）+ 跨字段 Date + Cranelift 原生执行
@@ -55,6 +55,10 @@ TENON_MODEL=luna ./target/tenon_agent
 # 8. 启动交互式 Web UI（自动加载 /tenon_client_store.wasm；可选环境变量对接真实 OpenAI 兼容 LLM 与 Webhook 渠道）
 # TENON_LLM_BASE_URL=http://127.0.0.1:11434 TENON_LLM_MODEL=qwen2.5 TENON_CHANNEL_WEBHOOK_URL=http://127.0.0.1:9000 \
 cargo run --bin tenon -- serve examples/dast_os_kernel/kernel_v2.tn --addr 127.0.0.1:8787
+
+# 9. 多语言性能基准与编译回归套件（C / Rust / Go / Tenon LLVM 22 -O3 ThinLTO AOT；详见 benchmarks/README.md）
+python3 benchmarks/run.py --check-only                                   # 编译 + 证明 + 跨语言校验和回归
+python3 benchmarks/run.py --warmup 1 --reps 7 --save benchmarks/results.json
 ```
 
 ### 四层分层架构（极简核心 → 4 层纯 Tenon 标准库 → 应用层 SDK & CLI Agent）

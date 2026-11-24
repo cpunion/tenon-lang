@@ -5,3 +5,4 @@ Cargo.lock
 *.sqlite-shm
 .DS_Store
 .tenon-cache/
+benchmarks/bin/

@@ -1,0 +1,39 @@
+// Benchmark 05: 5,000x Nested JSON Parse + Field Access + Rebuild + Stringify
+// Pure-Tenon `std/encoding/json.tn` (recursive-descent `JsonValue` ADT + O(n) `TextBuilder`)
+
+import "std/core/types.tn"
+import "std/core/ops.tn"
+import "std/text/text.tn"
+import "std/encoding/json.tn" as json
+
+pub fn main() Int {
+    let sample = "{\"type\":\"response.output_item.done\",\"ok\":true,\"seq\":42,\"nums\":[10,20,30,40,50],\"item\":{\"id\":\"fc_123\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/main.tn\\\",\\\"content\\\":\\\"line1\\\\nline2 \\\\u4f60\\\\u597d\\\"}\"}}"
+    var checksum = 0
+    var i = 0
+    while i < 5000 {
+        match json.parse(sample) {
+            Ok(ev) => {
+                let t = ev.get_str("type").unwrap_or("")
+                let seq = ev.get_int("seq").unwrap_or(0)
+                let num2 = match ev.get("nums") {
+                    Some(arr) => match arr.at(2) {
+                        Some(v) => v.as_int().unwrap_or(0)
+                        None => 0
+                    }
+                    None => 0
+                }
+                let built = JsonValue.object()
+                    .set("type", JStr(t))
+                    .set("seq", JInt(seq + i))
+                    .set("pick", JInt(num2))
+                    .set("ok", JBool(true))
+                let out = built.stringify()
+                checksum += out.len() + num2
+            }
+            Err(_) => { return 1 }
+        }
+        i += 1
+    }
+    let _ = print_int(checksum)
+    0
+}

@@ -85,10 +85,8 @@ int64_t tenon_rt_print_int(int64_t v) {
     return v;
 }
 
-int64_t tenon_rc_alloc(int64_t tag, int64_t len) {
-    int64_t lu = len < 0 ? 0 : len;
-    int64_t cap = lu < 1 ? 1 : lu;
-    TenonObj* obj = (TenonObj*)calloc(1, sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
+static inline TenonObj* tenon_rc_alloc_raw(int64_t tag, int64_t lu, int64_t cap) {
+    TenonObj* obj = (TenonObj*)malloc(sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
     if (!obj) abort();
     obj->rc = 1;
     obj->tag = tag;
@@ -97,6 +95,14 @@ int64_t tenon_rc_alloc(int64_t tag, int64_t len) {
     obj->rc_mask = 0;
     g_live++;
     g_allocs++;
+    return obj;
+}
+
+int64_t tenon_rc_alloc(int64_t tag, int64_t len) {
+    int64_t lu = len < 0 ? 0 : len;
+    int64_t cap = lu < 1 ? 1 : lu;
+    TenonObj* obj = tenon_rc_alloc_raw(tag, lu, cap);
+    memset(obj->fields, 0, (size_t)cap * sizeof(int64_t));
     return (int64_t)(uintptr_t)obj;
 }
 
@@ -107,70 +113,91 @@ void tenon_rc_set_rc_mask(int64_t ptr, int64_t mask) {
 
 int64_t tenon_rc_inc(int64_t ptr) {
     if (ptr == 0) return 0;
-    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    obj->rc++;
+    ((TenonObj*)(uintptr_t)ptr)->rc++;
     return ptr;
 }
 
-void tenon_rc_dec(int64_t ptr) {
-    if (ptr == 0) return;
-    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    obj->rc--;
-    if (obj->rc <= 0) {
-        if (obj->rc_mask == UINT64_MAX) {
-            for (int64_t i = 0; i < obj->len; i++) {
-                if (obj->fields[i] != 0) tenon_rc_dec(obj->fields[i]);
-            }
-        } else if (obj->rc_mask != 0) {
-            int64_t n = obj->len < 64 ? obj->len : 64;
-            for (int64_t i = 0; i < n; i++) {
-                if ((obj->rc_mask & (1ULL << i)) && obj->fields[i] != 0) {
-                    tenon_rc_dec(obj->fields[i]);
-                }
+void tenon_rc_dec(int64_t ptr);
+
+__attribute__((noinline))
+static void tenon_rc_free_slow(TenonObj* obj) {
+    uint64_t mask = obj->rc_mask;
+    if (mask == UINT64_MAX) {
+        for (int64_t i = 0; i < obj->len; i++) {
+            if (obj->fields[i] != 0) tenon_rc_dec(obj->fields[i]);
+        }
+    } else if (mask != 0) {
+        int64_t n = obj->len < 64 ? obj->len : 64;
+        for (int64_t i = 0; i < n; i++) {
+            if ((mask & (1ULL << i)) && obj->fields[i] != 0) {
+                tenon_rc_dec(obj->fields[i]);
             }
         }
-        g_live--;
-        free(obj);
     }
+    g_live--;
+    free(obj);
+}
+
+void tenon_rc_dec(int64_t ptr) {
+    if (__builtin_expect(ptr == 0, 0)) return;
+    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
+    if (__builtin_expect(--obj->rc <= 0, 0)) {
+        tenon_rc_free_slow(obj);
+    }
+}
+
+__attribute__((noinline))
+static int64_t tenon_rc_cow_clone_slow(TenonObj* obj) {
+    g_cow++;
+    int64_t cap = obj->len < 1 ? 1 : obj->len;
+    TenonObj* fresh = tenon_rc_alloc_raw(obj->tag, obj->len, cap);
+    uint64_t mask = obj->rc_mask;
+    fresh->rc_mask = mask;
+    memcpy(fresh->fields, obj->fields, (size_t)obj->len * sizeof(int64_t));
+    if (mask == UINT64_MAX) {
+        for (int64_t i = 0; i < obj->len; i++) {
+            if (obj->fields[i] != 0) tenon_rc_inc(obj->fields[i]);
+        }
+    } else if (mask != 0) {
+        int64_t n = obj->len < 64 ? obj->len : 64;
+        for (int64_t i = 0; i < n; i++) {
+            if ((mask & (1ULL << i)) && obj->fields[i] != 0) {
+                tenon_rc_inc(obj->fields[i]);
+            }
+        }
+    }
+    tenon_rc_dec((int64_t)(uintptr_t)obj);
+    return (int64_t)(uintptr_t)fresh;
 }
 
 int64_t tenon_rc_ensure_unique(int64_t ptr) {
-    if (ptr == 0) return 0;
+    if (__builtin_expect(ptr == 0, 0)) return 0;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    if (obj->rc == 1) {
-        g_reuse++;
+    if (__builtin_expect(obj->rc == 1, 1)) {
         return ptr;
     }
-    g_cow++;
-    int64_t fresh_p = tenon_rc_alloc(obj->tag, obj->len);
-    TenonObj* fresh = (TenonObj*)(uintptr_t)fresh_p;
-    fresh->rc_mask = obj->rc_mask;
-    for (int64_t i = 0; i < obj->len; i++) {
-        fresh->fields[i] = obj->fields[i];
-        int is_rc = (obj->rc_mask == UINT64_MAX) || (i < 64 && (obj->rc_mask & (1ULL << i)));
-        if (is_rc && obj->fields[i] != 0) {
-            tenon_rc_inc(obj->fields[i]);
-        }
-    }
-    tenon_rc_dec(ptr);
-    return fresh_p;
+    return tenon_rc_cow_clone_slow(obj);
 }
 
 int64_t tenon_rc_get_field(int64_t ptr, int64_t idx) {
-    if (ptr == 0 || idx < 0) return 0;
+    if (__builtin_expect(ptr == 0 || idx < 0, 0)) return 0;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    if (idx >= obj->len) return 0;
+    if (__builtin_expect(idx >= obj->len, 0)) return 0;
     return obj->fields[idx];
 }
 
 void tenon_rc_set_field(int64_t ptr, int64_t idx, int64_t val) {
-    if (ptr == 0 || idx < 0) return;
+    if (__builtin_expect(ptr == 0 || idx < 0, 0)) return;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    if (idx < obj->len) {
+    if (__builtin_expect(idx < obj->len, 1)) {
+        uint64_t mask = obj->rc_mask;
+        if (__builtin_expect(mask == 0, 1)) {
+            obj->fields[idx] = val;
+            return;
+        }
         int64_t old = obj->fields[idx];
         obj->fields[idx] = val;
-        int is_rc = (obj->rc_mask == UINT64_MAX) || (idx < 64 && (obj->rc_mask & (1ULL << idx)));
-        if (is_rc && old != 0) {
+        if ((mask == UINT64_MAX || (idx < 64 && (mask & (1ULL << idx)))) && old != 0) {
             tenon_rc_dec(old);
         }
     }
@@ -198,13 +225,11 @@ int64_t tenon_text_new(int64_t data_ptr, int64_t byte_len) {
     int64_t blen = byte_len < 0 ? 0 : byte_len;
     int64_t words = (blen + 7) / 8;
     if (words < 1) words = 1;
-    int64_t p = tenon_rc_alloc(5, words);
-    TenonObj* obj = (TenonObj*)(uintptr_t)p;
-    obj->len = blen;
+    TenonObj* obj = tenon_rc_alloc_raw(5, blen, words);
     if (blen > 0 && data_ptr != 0) {
         memcpy((void*)obj->fields, (const void*)(uintptr_t)data_ptr, (size_t)blen);
     }
-    return p;
+    return (int64_t)(uintptr_t)obj;
 }
 
 int64_t tenon_text_eq(int64_t a, int64_t b) {
@@ -214,6 +239,113 @@ int64_t tenon_text_eq(int64_t a, int64_t b) {
     TenonObj* hb = (TenonObj*)(uintptr_t)b;
     if (ha->len != hb->len) return 0;
     return memcmp((const void*)ha->fields, (const void*)hb->fields, (size_t)ha->len) == 0 ? 1 : 0;
+}
+
+int64_t tenon_byte_at(int64_t s, int64_t idx) {
+    if (s == 0 || idx < 0) return -1;
+    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
+    if (idx >= hdr->len) return -1;
+    return (int64_t)((const uint8_t*)hdr->fields)[idx];
+}
+
+int64_t tenon_str_slice(int64_t s, int64_t start, int64_t end) {
+    if (s == 0) return tenon_text_new(0, 0);
+    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
+    int64_t len = hdr->len;
+    int64_t st = start < 0 ? 0 : (start > len ? len : start);
+    int64_t en = end < 0 ? 0 : (end > len ? len : end);
+    if (st >= en) return tenon_text_new(0, 0);
+    const uint8_t* base = (const uint8_t*)hdr->fields;
+    return tenon_text_new((int64_t)(uintptr_t)(base + st), en - st);
+}
+
+int64_t tenon_byte_to_text(int64_t b) {
+    uint8_t ch = (uint8_t)(b & 0xFF);
+    return tenon_text_new((int64_t)(uintptr_t)&ch, 1);
+}
+
+int64_t tenon_str_concat(int64_t a, int64_t b) {
+    int64_t la = a ? ((TenonObj*)(uintptr_t)a)->len : 0;
+    int64_t lb = b ? ((TenonObj*)(uintptr_t)b)->len : 0;
+    int64_t total = la + lb;
+    int64_t words = (total + 7) / 8;
+    if (words < 1) words = 1;
+    TenonObj* obj = tenon_rc_alloc_raw(5, total, words);
+    uint8_t* dst = (uint8_t*)obj->fields;
+    if (la > 0) memcpy(dst, (const void*)((TenonObj*)(uintptr_t)a)->fields, (size_t)la);
+    if (lb > 0) memcpy(dst + la, (const void*)((TenonObj*)(uintptr_t)b)->fields, (size_t)lb);
+    return (int64_t)(uintptr_t)obj;
+}
+
+typedef struct {
+    uint8_t* data;
+    size_t len;
+    size_t cap;
+    uint8_t inline_buf[128];
+} TenonBuf;
+
+static TenonBuf* g_buf_cache = NULL;
+
+int64_t tenon_buf_new(void) {
+    TenonBuf* b;
+    if (g_buf_cache) {
+        b = g_buf_cache;
+        g_buf_cache = NULL;
+    } else {
+        b = (TenonBuf*)malloc(sizeof(TenonBuf));
+    }
+    b->data = b->inline_buf;
+    b->cap = sizeof(b->inline_buf);
+    b->len = 0;
+    return (int64_t)(uintptr_t)b;
+}
+
+__attribute__((noinline))
+static void tenon_buf_grow(TenonBuf* b, size_t need) {
+    size_t nc = b->cap * 2;
+    while (nc < need) nc *= 2;
+    if (b->data == b->inline_buf) {
+        uint8_t* heap = (uint8_t*)malloc(nc);
+        if (b->len > 0) memcpy(heap, b->inline_buf, b->len);
+        b->data = heap;
+    } else {
+        b->data = (uint8_t*)realloc(b->data, nc);
+    }
+    b->cap = nc;
+}
+
+int64_t tenon_buf_push_str(int64_t h, int64_t s) {
+    if (__builtin_expect(h == 0 || s == 0, 0)) return 0;
+    TenonBuf* b = (TenonBuf*)(uintptr_t)h;
+    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
+    size_t n = (size_t)hdr->len;
+    if (n > 0) {
+        if (__builtin_expect(b->len + n > b->cap, 0)) tenon_buf_grow(b, b->len + n);
+        memcpy(b->data + b->len, (const void*)hdr->fields, n);
+        b->len += n;
+    }
+    return (int64_t)b->len;
+}
+
+int64_t tenon_buf_push_byte(int64_t h, int64_t byte_val) {
+    if (__builtin_expect(h == 0, 0)) return 0;
+    TenonBuf* b = (TenonBuf*)(uintptr_t)h;
+    if (__builtin_expect(b->len + 1 > b->cap, 0)) tenon_buf_grow(b, b->len + 1);
+    b->data[b->len++] = (uint8_t)(byte_val & 0xFF);
+    return (int64_t)b->len;
+}
+
+int64_t tenon_buf_finish(int64_t h) {
+    if (__builtin_expect(h == 0, 0)) return tenon_text_new(0, 0);
+    TenonBuf* b = (TenonBuf*)(uintptr_t)h;
+    int64_t res = tenon_text_new((int64_t)(uintptr_t)b->data, (int64_t)b->len);
+    if (b->data != b->inline_buf) free(b->data);
+    if (!g_buf_cache) {
+        g_buf_cache = b;
+    } else {
+        free(b);
+    }
+    return res;
 }
 
 int64_t tenon_list_push(int64_t ptr, int64_t val) {
@@ -257,9 +389,8 @@ int64_t tenon_list_push(int64_t ptr, int64_t val) {
 
 int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc) {
     int64_t n = len < 0 ? 0 : len;
-    int64_t fp = tenon_rc_alloc(4, n);
-    TenonObj* fresh = (TenonObj*)(uintptr_t)fp;
-    fresh->len = n;
+    int64_t cap = n < 1 ? 1 : n;
+    TenonObj* fresh = tenon_rc_alloc_raw(4, n, cap);
     if (elem_is_rc != 0) {
         fresh->rc_mask = UINT64_MAX;
     }
@@ -269,7 +400,7 @@ int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc) {
             tenon_rc_inc(init_val);
         }
     }
-    return fp;
+    return (int64_t)(uintptr_t)fresh;
 }
 
 int64_t tenon_list_pop_shrink(int64_t ptr) {
@@ -360,10 +491,7 @@ int main(void) {
 "#;
 
 fn ir_uses_tenon_rt_syscalls(ir: &str) -> bool {
-    ir.contains("call i64 @tenon_byte_")
-        || ir.contains("call i64 @tenon_str_")
-        || ir.contains("call i64 @tenon_buf_")
-        || ir.contains("call i64 @tenon_sys_")
+    ir.contains("call i64 @tenon_sys_")
 }
 
 fn find_or_build_tenon_rt_staticlib() -> Result<PathBuf, String> {
@@ -453,8 +581,11 @@ pub fn compile_to_native_binary(
     };
 
     let mut cmd = Command::new("clang");
+    cmd.arg(opt_flag);
+    if !needs_full_rt && opt_flag == "-O3" {
+        cmd.arg("-flto=thin");
+    }
     cmd.args([
-        opt_flag,
         "-Wno-override-module",
         tmp_ll.to_str().unwrap(),
         tmp_rt.to_str().unwrap(),

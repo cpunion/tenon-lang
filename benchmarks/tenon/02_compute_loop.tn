@@ -1,0 +1,23 @@
+// Benchmark 02: 100M tight scalar + bitwise SplitMix64 mixing loop (`@no_heap_alloc`)
+@no_heap_alloc
+pub pure fn compute_mix(iters Int) Int {
+    var x = 123456789
+    var acc = 0
+    var i = 0
+    while i < iters {
+        x = (x + 1140071481932319848) & 9223372036854775807
+        var z = x
+        z = ((z ^ (z >> 30)) * 490278349) & 9223372036854775807
+        z = ((z ^ (z >> 27)) * 16777619) & 9223372036854775807
+        z = z ^ (z >> 31)
+        acc = (acc ^ z) & 9223372036854775807
+        i += 1
+    }
+    acc
+}
+
+pub fn main() Int {
+    let ans = compute_mix(100000000)
+    let _ = print_int(ans)
+    0
+}

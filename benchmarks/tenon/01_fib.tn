@@ -1,0 +1,14 @@
+// Benchmark 01: Recursive Fibonacci — pure scalar compute & call convention
+@no_heap_alloc
+pub pure fn fib(n Int) Int {
+    if n <= 1 {
+        return n
+    }
+    fib(n - 1) + fib(n - 2)
+}
+
+pub fn main() Int {
+    let ans = fib(40)
+    let _ = print_int(ans)
+    0
+}

@@ -1,0 +1,51 @@
+// Benchmark 06: 5,000,000 Dynamic Interface Vtable Dispatches (`List[dyn Op]`)
+
+pub interface Op {
+    pure fn apply(self, x Int) Int
+}
+
+pub record AddOp   { k Int }
+pub record XorOp   { k Int }
+pub record MulOp   { k Int }
+pub record ShiftOp { k Int }
+
+impl Op for AddOp {
+    pub pure fn apply(self, x Int) Int {
+        (x + self.k) & 9223372036854775807
+    }
+}
+
+impl Op for XorOp {
+    pub pure fn apply(self, x Int) Int {
+        (x ^ self.k) & 9223372036854775807
+    }
+}
+
+impl Op for MulOp {
+    pub pure fn apply(self, x Int) Int {
+        (x * self.k) & 9223372036854775807
+    }
+}
+
+impl Op for ShiftOp {
+    pub pure fn apply(self, x Int) Int {
+        (x ^ (x >> self.k)) & 9223372036854775807
+    }
+}
+
+pub fn main() Int {
+    var ops List[dyn Op] = []
+    ops = push(ops, AddOp { k = 17 })
+    ops = push(ops, XorOp { k = 2654435761 })
+    ops = push(ops, MulOp { k = 16777619 })
+    ops = push(ops, ShiftOp { k = 13 })
+
+    var acc = 1234567
+    var i = 0
+    while i < 5000000 {
+        acc = ops[i & 3].apply(acc)
+        i += 1
+    }
+    let _ = print_int(acc)
+    0
+}

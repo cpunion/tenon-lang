@@ -666,4 +666,32 @@ pub fn bad_index_assign() Int {
         assert!(codes.contains(&"E0205"), "expected E0205 on mismatched element type, got {:?}", codes);
         assert!(codes.contains(&"E0505"), "expected E0505 on non-Item into List[dyn Item], got {:?}", codes);
     }
+
+    #[test]
+    fn benchmarks_tenon_compile_and_verify_regression() {
+        let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        let bench_dir = ws_root.join("benchmarks/tenon");
+        let files = [
+            "01_fib.tn",
+            "02_compute_loop.tn",
+            "03_sieve.tn",
+            "04_hashmap.tn",
+            "05_json.tn",
+            "06_dyn_dispatch.tn",
+        ];
+        for f in files {
+            let path = bench_dir.join(f);
+            let prog = tenon_syntax::load_program_with_imports(&path)
+                .unwrap_or_else(|e| panic!("failed to load benchmark `{}`: {}", f, e));
+            let rep = check_program(&prog);
+            assert!(
+                rep.ok,
+                "benchmark `{}` failed static verification: {:?}",
+                f, rep.diagnostics
+            );
+        }
+    }
 }

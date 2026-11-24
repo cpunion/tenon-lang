@@ -14,22 +14,23 @@ pub pure fn int_to_text(n Int) Text {
     if n == 0 {
         return "0"
     }
-    var neg = false
+    let b = buf_new()
     var v = n
     if v < 0 {
-        neg = true
+        let _ = buf_push_byte(b, 45)
         v = -v
     }
-    var rev = ""
-    while v > 0 {
-        let d = v % 10
-        rev = byte_to_text(48 + d) ++ rev
-        v = v / 10
+    var div = 1
+    while div <= v / 10 {
+        div = div * 10
     }
-    if neg {
-        return "-" ++ rev
+    while div > 0 {
+        let d = v / div
+        let _ = buf_push_byte(b, 48 + d)
+        v = v - d * div
+        div = div / 10
     }
-    rev
+    buf_finish(b)
 }
 
 impl Int {
