@@ -7,8 +7,30 @@ pub interface Display {
     pure fn display(self) Text
 }
 
+pub interface Eq {
+    pure fn eq(self, other Self) Bool
+}
+
 pub interface Hash {
     pure fn hash(self) NonNegative
+}
+
+impl Eq for Int {
+    pub pure fn eq(self, other Int) Bool {
+        self == other
+    }
+}
+
+impl Eq for Bool {
+    pub pure fn eq(self, other Bool) Bool {
+        self == other
+    }
+}
+
+impl Eq for Text {
+    pub pure fn eq(self, other Text) Bool {
+        self == other
+    }
 }
 
 pub interface Writer {

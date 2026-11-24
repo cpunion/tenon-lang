@@ -3633,4 +3633,104 @@ pub fn main() Int {
             st
         );
     }
+
+    #[test]
+    fn generic_record_monomorph_custom_key_map_zero_leaks() {
+        let src = r#"
+pub interface Eq {
+    pure fn eq(self, other Self) Bool
+}
+
+pub interface Hash {
+    pure fn hash(self) Int
+}
+
+impl Eq for Int {
+    pub pure fn eq(self, other Int) Bool { self == other }
+}
+
+impl Hash for Int {
+    pub pure fn hash(self) Int { self & 9223372036854775807 }
+}
+
+pub record PointKey {
+    x Int
+    y Int
+}
+
+impl Eq for PointKey {
+    pub pure fn eq(self, other PointKey) Bool { self.x == other.x && self.y == other.y }
+}
+
+impl Hash for PointKey {
+    pub pure fn hash(self) Int { ((self.x * 31) ^ self.y) & 9223372036854775807 }
+}
+
+pub record MiniMap[K Hash + Eq, V] {
+    keys List[K]
+    vals List[V]
+}
+
+impl[K Hash + Eq, V] MiniMap[K, V] {
+    pub pure fn new() MiniMap[K, V] {
+        let ek List[K] = []
+        let ev List[V] = []
+        MiniMap { keys = ek, vals = ev }
+    }
+
+    pub pure fn put(inout self, k K, v V) {
+        var i = 0
+        while i < len(self.keys) {
+            if self.keys[i].eq(k) {
+                self.vals[i] = v
+                return
+            }
+            i += 1
+        }
+        self.keys = push(self.keys, k)
+        self.vals = push(self.vals, v)
+    }
+
+    pub pure fn get_or(self, k K, fallback V) V {
+        let _ = k.hash()
+        var i = 0
+        while i < len(self.keys) {
+            if self.keys[i].eq(k) {
+                return self.vals[i]
+            }
+            i += 1
+        }
+        fallback
+    }
+}
+
+pub fn main() Int {
+    var m1 = MiniMap[PointKey, Text].new()
+    let p1 = PointKey { x = 1, y = 2 }
+    let p2 = PointKey { x = 3, y = 4 }
+    m1.put(p1, "alpha")
+    m1.put(p2, "beta")
+    m1.put(PointKey { x = 1, y = 2 }, "gamma")
+    assert m1.get_or(PointKey { x = 1, y = 2 }, "") == "gamma"
+    assert m1.get_or(PointKey { x = 3, y = 4 }, "") == "beta"
+
+    var m2 MiniMap[Int, Int] = MiniMap.new()
+    m2.put(10, 100)
+    m2.put(20, 200)
+    assert m2.get_or(10, 0) + m2.get_or(20, 0) == 300
+    len(m1.keys) * 100 + m2.get_or(20, 0)
+}
+"#;
+        let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        perceus::reset_stats();
+        let prog = parse(src).unwrap();
+        let jit = JitProgram::compile(&prog).unwrap();
+        assert_eq!(jit.call_0("main").unwrap(), 400);
+        let st = perceus::snapshot_stats();
+        assert_eq!(
+            st.live_objects, 0,
+            "generic record monomorphization across RC and primitive keys/vals must leave 0 leaks, got {:?}",
+            st
+        );
+    }
 }

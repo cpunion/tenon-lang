@@ -17,63 +17,63 @@
       "checksum": "102334155",
       "results": {
         "c": {
-          "cpu_median_ms": 184.49,
-          "cpu_min_ms": 180.76,
-          "wall_median_ms": 186.38,
+          "cpu_median_ms": 184.37,
+          "cpu_min_ms": 182.05,
+          "wall_median_ms": 188.46,
           "size_kb": 32.7,
           "cpu_samples_ms": [
-            180.76,
-            185.39,
-            184.49,
-            185.95,
-            183.33,
-            183.46,
-            186.05
+            186.53,
+            184.53,
+            182.05,
+            185.34,
+            184.37,
+            182.18,
+            184.0
           ]
         },
         "rust": {
-          "cpu_median_ms": 182.15,
-          "cpu_min_ms": 181.16,
-          "wall_median_ms": 183.86,
+          "cpu_median_ms": 182.02,
+          "cpu_min_ms": 180.02,
+          "wall_median_ms": 184.0,
           "size_kb": 461.1,
           "cpu_samples_ms": [
-            184.02,
-            181.16,
-            181.6,
-            182.15,
-            181.3,
-            183.28,
-            185.0
+            182.48,
+            182.68,
+            181.5,
+            182.02,
+            182.08,
+            180.04,
+            180.02
           ]
         },
         "go": {
-          "cpu_median_ms": 237.28,
-          "cpu_min_ms": 233.97,
-          "wall_median_ms": 239.02,
+          "cpu_median_ms": 239.66,
+          "cpu_min_ms": 236.26,
+          "wall_median_ms": 241.45,
           "size_kb": 2372.8,
           "cpu_samples_ms": [
-            236.59,
-            233.97,
-            238.58,
-            238.8,
-            236.02,
-            240.05,
-            237.28
+            238.02,
+            238.28,
+            244.47,
+            244.63,
+            236.26,
+            240.19,
+            239.66
           ]
         },
         "tenon": {
-          "cpu_median_ms": 174.95,
-          "cpu_min_ms": 172.47,
-          "wall_median_ms": 176.58,
+          "cpu_median_ms": 176.78,
+          "cpu_min_ms": 174.32,
+          "wall_median_ms": 178.61,
           "size_kb": 33.1,
           "cpu_samples_ms": [
-            176.53,
-            174.62,
-            175.08,
-            174.51,
-            172.47,
-            174.95,
-            175.3
+            178.31,
+            175.54,
+            174.32,
+            178.01,
+            181.04,
+            176.78,
+            176.34
           ]
         }
       }
@@ -84,63 +84,63 @@
       "checksum": "4378771939937074704",
       "results": {
         "c": {
-          "cpu_median_ms": 65.82,
-          "cpu_min_ms": 65.23,
-          "wall_median_ms": 67.67,
+          "cpu_median_ms": 66.1,
+          "cpu_min_ms": 64.92,
+          "wall_median_ms": 67.66,
           "size_kb": 32.7,
           "cpu_samples_ms": [
-            65.97,
-            67.03,
-            65.82,
-            65.41,
-            65.23,
-            65.56,
-            65.97
+            66.4,
+            65.26,
+            66.51,
+            65.53,
+            66.1,
+            64.92,
+            66.88
           ]
         },
         "rust": {
-          "cpu_median_ms": 66.26,
-          "cpu_min_ms": 65.46,
-          "wall_median_ms": 67.79,
+          "cpu_median_ms": 66.77,
+          "cpu_min_ms": 66.05,
+          "wall_median_ms": 68.57,
           "size_kb": 460.7,
           "cpu_samples_ms": [
-            65.86,
-            66.29,
-            66.26,
-            66.13,
-            65.46,
-            66.43,
-            67.2
+            67.52,
+            66.68,
+            66.95,
+            68.38,
+            66.77,
+            66.05,
+            66.48
           ]
         },
         "go": {
-          "cpu_median_ms": 92.71,
-          "cpu_min_ms": 91.87,
-          "wall_median_ms": 94.09,
+          "cpu_median_ms": 93.69,
+          "cpu_min_ms": 93.11,
+          "wall_median_ms": 96.17,
           "size_kb": 2372.8,
           "cpu_samples_ms": [
-            93.19,
-            91.87,
-            91.94,
-            92.71,
-            94.16,
+            93.91,
+            98.63,
+            93.69,
             93.4,
-            92.42
+            93.62,
+            93.11,
+            94.68
           ]
         },
         "tenon": {
-          "cpu_median_ms": 66.32,
-          "cpu_min_ms": 65.37,
-          "wall_median_ms": 67.85,
+          "cpu_median_ms": 66.49,
+          "cpu_min_ms": 65.8,
+          "wall_median_ms": 67.9,
           "size_kb": 33.1,
           "cpu_samples_ms": [
-            66.69,
-            65.37,
-            66.32,
-            65.88,
-            66.68,
-            65.69,
-            67.17
+            66.49,
+            66.78,
+            66.51,
+            66.51,
+            66.13,
+            65.8,
+            66.15
           ]
         }
       }
@@ -151,63 +151,63 @@
       "checksum": "392490",
       "results": {
         "c": {
-          "cpu_median_ms": 8.13,
-          "cpu_min_ms": 7.97,
-          "wall_median_ms": 9.59,
+          "cpu_median_ms": 8.27,
+          "cpu_min_ms": 8.01,
+          "wall_median_ms": 9.77,
           "size_kb": 32.8,
           "cpu_samples_ms": [
-            8.2,
-            8.29,
+            8.27,
+            8.3,
+            8.38,
+            8.08,
+            8.39,
             8.13,
-            8.05,
-            8.14,
-            7.97,
-            7.99
+            8.01
           ]
         },
         "rust": {
-          "cpu_median_ms": 8.34,
-          "cpu_min_ms": 8.02,
-          "wall_median_ms": 9.98,
+          "cpu_median_ms": 8.35,
+          "cpu_min_ms": 8.25,
+          "wall_median_ms": 9.96,
           "size_kb": 477.3,
           "cpu_samples_ms": [
-            8.23,
-            8.34,
-            8.55,
-            8.25,
             8.4,
-            8.59,
-            8.02
+            8.35,
+            8.25,
+            8.34,
+            8.46,
+            8.32,
+            8.59
           ]
         },
         "go": {
-          "cpu_median_ms": 13.51,
-          "cpu_min_ms": 12.8,
-          "wall_median_ms": 14.18,
+          "cpu_median_ms": 13.58,
+          "cpu_min_ms": 13.57,
+          "wall_median_ms": 14.47,
           "size_kb": 2372.8,
           "cpu_samples_ms": [
-            13.62,
-            13.51,
-            12.8,
-            13.5,
-            13.31,
-            13.68,
-            13.53
+            13.58,
+            13.57,
+            13.58,
+            13.58,
+            13.57,
+            13.67,
+            14.64
           ]
         },
         "tenon": {
-          "cpu_median_ms": 8.9,
-          "cpu_min_ms": 8.69,
-          "wall_median_ms": 10.47,
+          "cpu_median_ms": 8.92,
+          "cpu_min_ms": 8.8,
+          "wall_median_ms": 10.41,
           "size_kb": 33.4,
           "cpu_samples_ms": [
-            8.97,
-            8.9,
+            9.02,
+            9.09,
             8.8,
-            8.81,
-            8.69,
-            8.96,
-            8.9
+            8.92,
+            9.08,
+            8.84,
+            8.88
           ]
         }
       }
@@ -218,63 +218,63 @@
       "checksum": "708334",
       "results": {
         "c": {
-          "cpu_median_ms": 15.78,
-          "cpu_min_ms": 15.71,
-          "wall_median_ms": 17.43,
+          "cpu_median_ms": 16.2,
+          "cpu_min_ms": 15.9,
+          "wall_median_ms": 18.37,
           "size_kb": 33.1,
           "cpu_samples_ms": [
-            16.82,
-            16.61,
-            15.71,
-            16.32,
-            15.76,
-            15.77,
-            15.78
+            15.96,
+            16.94,
+            16.04,
+            16.83,
+            15.9,
+            16.2,
+            16.43
           ]
         },
         "rust": {
-          "cpu_median_ms": 15.17,
-          "cpu_min_ms": 14.7,
-          "wall_median_ms": 16.98,
+          "cpu_median_ms": 16.37,
+          "cpu_min_ms": 14.73,
+          "wall_median_ms": 18.82,
           "size_kb": 480.8,
           "cpu_samples_ms": [
-            15.59,
-            15.56,
-            15.17,
-            15.1,
-            15.19,
-            14.7,
-            14.91
+            15.3,
+            16.37,
+            19.98,
+            16.16,
+            14.73,
+            17.24,
+            17.94
           ]
         },
         "go": {
-          "cpu_median_ms": 16.27,
-          "cpu_min_ms": 15.73,
-          "wall_median_ms": 14.77,
+          "cpu_median_ms": 16.89,
+          "cpu_min_ms": 15.66,
+          "wall_median_ms": 16.61,
           "size_kb": 2373.1,
           "cpu_samples_ms": [
-            15.73,
-            16.27,
-            16.38,
-            16.43,
-            15.92,
-            16.27,
-            15.86
+            16.89,
+            15.66,
+            20.34,
+            17.92,
+            15.98,
+            16.93,
+            16.46
           ]
         },
         "tenon": {
-          "cpu_median_ms": 16.24,
-          "cpu_min_ms": 15.93,
-          "wall_median_ms": 17.91,
-          "size_kb": 34.2,
+          "cpu_median_ms": 16.12,
+          "cpu_min_ms": 15.66,
+          "wall_median_ms": 18.02,
+          "size_kb": 34.3,
           "cpu_samples_ms": [
+            15.66,
             16.12,
-            15.93,
-            16.45,
-            16.24,
-            16.46,
-            16.02,
-            16.65
+            19.71,
+            16.43,
+            16.17,
+            15.78,
+            16.03
           ]
         }
       }
@@ -285,62 +285,62 @@
       "checksum": "483984",
       "results": {
         "c": {
-          "cpu_median_ms": 6.42,
-          "cpu_min_ms": 6.09,
-          "wall_median_ms": 7.8,
+          "cpu_median_ms": 6.2,
+          "cpu_min_ms": 6.02,
+          "wall_median_ms": 7.63,
           "size_kb": 33.2,
           "cpu_samples_ms": [
-            6.09,
-            6.42,
-            6.52,
-            6.77,
-            6.25,
-            6.64,
-            6.37
+            6.58,
+            6.02,
+            6.63,
+            6.12,
+            6.43,
+            6.2,
+            6.12
           ]
         },
         "rust": {
-          "cpu_median_ms": 6.3,
-          "cpu_min_ms": 6.11,
-          "wall_median_ms": 7.78,
+          "cpu_median_ms": 6.25,
+          "cpu_min_ms": 6.03,
+          "wall_median_ms": 7.55,
           "size_kb": 479.4,
           "cpu_samples_ms": [
-            6.31,
-            6.11,
-            6.3,
-            6.39,
-            6.13,
-            6.33,
-            6.21
+            6.38,
+            6.03,
+            6.09,
+            6.25,
+            6.1,
+            6.32,
+            6.36
           ]
         },
         "go": {
-          "cpu_median_ms": 15.23,
-          "cpu_min_ms": 14.88,
-          "wall_median_ms": 15.7,
+          "cpu_median_ms": 15.03,
+          "cpu_min_ms": 14.79,
+          "wall_median_ms": 15.62,
           "size_kb": 3679.3,
           "cpu_samples_ms": [
-            15.21,
-            14.88,
-            15.58,
-            15.08,
-            15.25,
-            15.23,
-            15.25
+            14.79,
+            14.82,
+            15.01,
+            15.3,
+            15.34,
+            15.03,
+            15.48
           ]
         },
         "tenon": {
           "cpu_median_ms": 6.11,
-          "cpu_min_ms": 6.04,
-          "wall_median_ms": 7.67,
+          "cpu_min_ms": 5.92,
+          "wall_median_ms": 7.56,
           "size_kb": 50.6,
           "cpu_samples_ms": [
-            6.22,
-            6.06,
-            6.27,
+            5.97,
+            6.07,
+            6.43,
+            5.92,
             6.11,
-            6.09,
-            6.04,
+            6.24,
             6.38
           ]
         }
@@ -352,63 +352,63 @@
       "checksum": "840988148304462647",
       "results": {
         "c": {
-          "cpu_median_ms": 5.37,
-          "cpu_min_ms": 5.23,
-          "wall_median_ms": 6.64,
+          "cpu_median_ms": 5.45,
+          "cpu_min_ms": 5.25,
+          "wall_median_ms": 6.74,
           "size_kb": 32.9,
           "cpu_samples_ms": [
-            5.39,
-            5.3,
+            5.57,
+            5.45,
+            5.54,
+            5.29,
             5.35,
-            5.23,
-            5.37,
-            5.53,
+            5.25,
             5.5
           ]
         },
         "rust": {
-          "cpu_median_ms": 5.59,
-          "cpu_min_ms": 5.39,
-          "wall_median_ms": 6.96,
+          "cpu_median_ms": 5.62,
+          "cpu_min_ms": 5.38,
+          "wall_median_ms": 6.99,
           "size_kb": 461.9,
           "cpu_samples_ms": [
+            5.62,
+            5.38,
+            5.55,
+            6.03,
             5.71,
-            5.7,
-            5.64,
-            5.46,
-            5.59,
-            5.56,
-            5.39
+            5.66,
+            5.57
           ]
         },
         "go": {
-          "cpu_median_ms": 7.66,
-          "cpu_min_ms": 7.42,
-          "wall_median_ms": 8.93,
+          "cpu_median_ms": 7.73,
+          "cpu_min_ms": 7.56,
+          "wall_median_ms": 9.11,
           "size_kb": 2373.3,
           "cpu_samples_ms": [
-            7.61,
-            7.78,
-            7.42,
-            7.68,
-            7.66,
-            7.59,
-            7.8
+            7.73,
+            7.94,
+            7.56,
+            7.62,
+            7.96,
+            8.0,
+            7.68
           ]
         },
         "tenon": {
-          "cpu_median_ms": 5.36,
-          "cpu_min_ms": 5.26,
-          "wall_median_ms": 6.72,
+          "cpu_median_ms": 5.43,
+          "cpu_min_ms": 5.33,
+          "wall_median_ms": 6.78,
           "size_kb": 33.7,
           "cpu_samples_ms": [
-            5.36,
-            5.38,
-            5.33,
-            5.26,
-            5.66,
-            5.45,
-            5.34
+            5.57,
+            5.46,
+            5.43,
+            5.62,
+            5.34,
+            5.4,
+            5.33
           ]
         }
       }

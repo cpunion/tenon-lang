@@ -694,4 +694,61 @@ pub fn bad_index_assign() Int {
             );
         }
     }
+
+    #[test]
+    fn enforces_generic_record_interface_bounds() {
+        let src = r#"
+pub interface Eq {
+    pure fn eq(self, other Self) Bool
+}
+
+pub interface Hash {
+    pure fn hash(self) Int
+}
+
+pub record GoodKey { id Int }
+impl Eq for GoodKey {
+    pub pure fn eq(self, other GoodKey) Bool { self.id == other.id }
+}
+impl Hash for GoodKey {
+    pub pure fn hash(self) Int { self.id }
+}
+
+pub record BadKey { id Int }
+
+pub record BoxMap[K Hash + Eq, V] {
+    ks List[K]
+    vs List[V]
+}
+
+impl[K Hash + Eq, V] BoxMap[K, V] {
+    pub pure fn new() BoxMap[K, V] {
+        let ek List[K] = []
+        let ev List[V] = []
+        BoxMap { ks = ek, vs = ev }
+    }
+}
+
+pub fn ok_usage() Int {
+    let m1 = BoxMap[GoodKey, Int].new()
+    let m2 BoxMap[GoodKey, Int] = BoxMap.new()
+    m1.ks.len() + m2.vs.len()
+}
+
+pub fn bad_usage() Int {
+    let bad1 = BoxMap[BadKey, Int].new()
+    let bad2 BoxMap[BadKey, Int] = BoxMap.new()
+    bad1.ks.len() + bad2.vs.len()
+}
+"#;
+        let prog = parse(src).unwrap();
+        let rep = check_program(&prog);
+        assert!(!rep.ok, "expected E0505 for BadKey missing Hash + Eq");
+        let e0505_count = rep.diagnostics.iter().filter(|d| d.code == "E0505").count();
+        assert!(
+            e0505_count >= 4,
+            "expected E0505 for both Hash and Eq on both bad1 and bad2, got {:?}",
+            rep.diagnostics
+        );
+    }
 }

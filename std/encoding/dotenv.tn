@@ -1,17 +1,17 @@
 // Tenon Standard Library — Layer 2: std/encoding/dotenv.tn
-// Pure `.env` parser returning structured `TextMap` (`Dotenv.parse` & aliased `dotenv.parse`).
+// Pure `.env` parser returning structured `Map[Text, Text]` (`Dotenv.parse` & aliased `dotenv.parse`).
 
 import "std/core/types.tn"
 import "std/text/text.tn"
 import "std/collections/map.tn"
 
 pub record Dotenv {
-    entries TextMap
+    entries Map[Text, Text]
 }
 
 impl Dotenv {
-    pub pure fn parse(content Text) TextMap {
-        var out = TextMap.new()
+    pub pure fn parse(content Text) Map[Text, Text] {
+        var out = Map[Text, Text].new()
         let n = content.len()
         var pos = 0
         while pos < n {
@@ -54,7 +54,7 @@ impl Dotenv {
     }
 }
 
-pub pure fn dotenv_parse(content Text) TextMap {
+pub pure fn dotenv_parse(content Text) Map[Text, Text] {
     Dotenv.parse(content)
 }
 

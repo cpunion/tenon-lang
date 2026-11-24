@@ -27,14 +27,14 @@ python3 benchmarks/run.py --only 04_hashmap 05_json
 
 | Benchmark | 负载说明 | C (`-O3`) | Rust (`-O3`) | Go (`1.27`) | Tenon (`-O3`) | Tenon/C | Tenon/Go | Tenon 体积 | Checksum |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `01_fib` | 递归 `fib(40)`（`@no_heap_alloc`） | 184.49 ms | 182.15 ms | 237.28 ms | **174.95 ms** | **0.95x** | **0.74x** | 33.1 KB | `102334155` |
-| `02_compute_loop` | 1 亿次 SplitMix64 标量/位运算循环 | 65.82 ms | 66.26 ms | 92.71 ms | **66.32 ms** | **1.01x** | **0.72x** | 33.1 KB | `4378771939937074704` |
-| `03_sieve` | 埃拉托斯特尼筛（1M × 5 次，原地数组写） | 8.13 ms | 8.34 ms | 13.51 ms | **8.90 ms** | **1.09x** | **0.66x** | 33.4 KB | `392490` |
-| `04_hashmap` | 50k 字符串 HashMap 增/改/查/删 25k/复查 | 15.78 ms | 15.17 ms | 16.27 ms | **16.24 ms** | **1.03x** | **1.00x** | 34.2 KB | `708334` |
-| `05_json` | 5,000 次嵌套 JSON 解析/取字段/重建/序列化 | 6.42 ms | 6.30 ms | 15.23 ms | **6.11 ms** | **0.95x** | **0.40x** | 50.6 KB | `483984` |
-| `06_dyn_dispatch` | 500 万次异构 `dyn Op` 虚表动态分发 | 5.37 ms | 5.59 ms | 7.66 ms | **5.36 ms** | **1.00x** | **0.70x** | 33.7 KB | `840988148304462647` |
+| `01_fib` | 递归 `fib(40)`（`@no_heap_alloc`） | 184.37 ms | 182.02 ms | 239.66 ms | **176.78 ms** | **0.96x** | **0.74x** | 33.1 KB | `102334155` |
+| `02_compute_loop` | 1 亿次 SplitMix64 标量/位运算循环 | 66.10 ms | 66.77 ms | 93.69 ms | **66.49 ms** | **1.01x** | **0.71x** | 33.1 KB | `4378771939937074704` |
+| `03_sieve` | 埃拉托斯特尼筛（1M × 5 次，原地数组写） | 8.27 ms | 8.35 ms | 13.58 ms | **8.92 ms** | **1.08x** | **0.66x** | 33.4 KB | `392490` |
+| `04_hashmap` | 50k 字符串泛型 `Map[Text, Text]` 增/改/查/删 25k/复查 | 16.20 ms | 16.37 ms | 16.89 ms | **16.12 ms** | **1.00x** | **0.95x** | 34.3 KB | `708334` |
+| `05_json` | 5,000 次嵌套 JSON 解析/取字段/重建/序列化 | 6.20 ms | 6.25 ms | 15.03 ms | **6.11 ms** | **0.99x** | **0.41x** | 50.6 KB | `483984` |
+| `06_dyn_dispatch` | 500 万次异构 `dyn Op` 虚表动态分发 | 5.45 ms | 5.62 ms | 7.73 ms | **5.43 ms** | **1.00x** | **0.70x** | 33.7 KB | `840988148304462647` |
 
-**几何平均（6 项汇总）**：**`1.004x` C (`-O3`)**、**`0.69x` Go（比 Go 快 ~45%）**，全部 6 项在 L0/L1 静态证明通过且 Perceus `live_objects == 0` 严格零泄漏下运行。
+**几何平均（6 项汇总）**：**`1.006x` C (`-O3`)**、**`0.68x` Go（比 Go 快 ~47%）**，其中 5 项达到 `<= 1.01x C` 并全面领先 Rust/Go，全部 6 项在 L0/L1 静态证明通过且 Perceus `live_objects == 0` 严格零泄漏下运行。
 
 ### 二进制体积对比（含带 OS / HTTPS-SSE 的完整应用）
 - **C (`-O3`)**：32.7–33.2 KB
@@ -48,5 +48,5 @@ python3 benchmarks/run.py --only 04_hashmap 05_json
 1. **模块内 `alwaysinline` LLVM IR 辅助函数 + TBAA 别名元数据 + `internal` 链接**：将 Perceus `rc_inc`/`rc_dec`/`ensure_unique`、记录字段读/写、`dyn` 虚表槽位读取、列表索引、`byte_at`、`buf_push_byte` 与 `memcmp` 文本比较全部内联至同一 `.ll` 模块，并为对象头字段（`rc`/`tag`/`len`/`rc_mask`）与载荷区（`fields[]`）注入独立 `!tbaa` 树，使 `06_dyn_dispatch` 从 `19.92ms` 降至 **`5.36ms`（1.00x C）**。
 2. **静态唯一性数据流分析 + `list_filled` 长度后置条件（`@llvm.assume`）**：对函数内未发生别名的局部唯一对象跳过每次写入的 `ensure_unique` 与判空，并向 LLVM 声明 `list_filled(n, v)` 返回列表长度恒等于 `max(n, 0)`，解锁内层循环边界检查消除与 ARM64 NEON 自动向量化，将 `03_sieve` 从 `19.97ms` 降至 **`8.90ms`（1.09x C，领先 Go 34%）**。
 3. **只读永生常量（`rc = -1`）与小对象 LIFO Freelist**：字符串字面量与无载荷枚举变体（`None`、`JNull` 等）直接下沉到 `.rodata` 零分配常量（LLVM 在编译期彻底折叠其 `rc_inc`/`rc_dec`）；AOT 运行时为 `cap <= 8` 的小对象提供 L1 热缓存 LIFO Freelist（仍严格维护 `g_live == 0` 泄漏断言）。
-4. **高质量纯 Tenon 标准库**：`std/collections/map.tn` 采用 SoA 紧凑开放寻址布局（`keys`/`vals`/`hashes` 平行存储，零 `Entry` 包装分配与二次解引用），`std/text/text.tn` 的 `int_to_text` 用常量除 10 位打包消除全部硬件 `sdiv`，`std/encoding/json.tn` 采用零中间装箱游标解析 + `JsonValue.put(inout self, ...)` 零 COW 原地构建，使 `04_hashmap` 达到 **`1.03x C`**、`05_json` 从 `19.89ms` 降至 **`6.11ms`（0.95x C，领先 C/Rust 并比 Go 快 2.49×）**。
+4. **高质量纯 Tenon 标准库**：`std/collections/map.tn` 提供真泛型单态化 `Map[K Hash + Eq, V]`（SoA 平行数组 `keys`/`vals`/`hashes` + O(1) swap-remove + 零条目拷贝 `rehash`），`std/text/text.tn` 的 `int_to_text` 用常量除 10 位打包消除全部硬件 `sdiv`，`std/encoding/json.tn` 采用零中间装箱游标解析 + `JsonValue.put(inout self, ...)` 零 COW 原地构建，使泛型 `04_hashmap` 达到 **`1.00x C`（16.12ms，快于 C/Rust/Go）**、`05_json` 达到 **`0.99x C`（6.11ms，比 Go 快 2.46×）**。
 5. **零依赖 `tenon-rt` 与按需轻量 AOT C 运行时**：彻底移除 `tenon-rt` 的 `tokio`/`reqwest`/`futures-util` 依赖（`Cargo.toml` 0 第三方依赖，编译耗时 `0.31s`），JIT 通过 Rust `#[link(name = "curl")]` FFI、AOT 通过按需注入的自包含 C POSIX + `<curl/curl.h>` 运行时实现流式 HTTP/SSE，彻底消除 25.8 MB 静态库链接膨胀。

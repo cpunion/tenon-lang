@@ -3,7 +3,7 @@
 //   - Layer 0 (`std/core/types`, `std/core/ops`): refined primitives, `List[T]` OOP methods
 //     (`push`/`len`/`get`/`first`/`last`/`clear`), `Option`/`Result` methods, `Display`/`Writer`
 //   - Layer 1 (`std/text/text`, `std/text/builder`, `std/collections/map`):
-//     `Text` & `Int` OOP methods, O(n) `TextBuilder.new()`, COW `TextMap.new()` (`set`/`with`/`clear`)
+//     `Text` & `Int` OOP methods, O(n) `TextBuilder.new()`, COW generic `Map[K, V].new()` (`set`/`with`/`clear`)
 //   - Layer 2 (`std/encoding/json`, `std/encoding/dotenv`): `JsonValue.object()` / `JsonValue.parse()`,
 //     `@derive(ToJson, FromJson, JsonSchema)` with refined `SafeRelPath` & `Positive` boundary proofs
 //   - Layer 3 (`std/os/*`): `SafeRelPath.parse()`, `Path.join()`, `MemFs.new()` / `OsFs.new()`,
@@ -96,7 +96,7 @@ pub fn main() Int {
     assert items[1].display() == "true"
     assert items[2].display() == "hello"
 
-    // 2. Layer 1: `Text` & `Int` OOP methods, `TextMap.new()`, `TextBuilder.new()`
+    // 2. Layer 1: `Text` & `Int` OOP methods, generic `Map[K, V]`, `TextBuilder.new()`
     let r = SliceRange { start = 0, end = 5 }
     assert "tenon-lang".len() == 10
     assert "tenon-lang".slice(0, 5) == "tenon"
@@ -115,7 +115,7 @@ pub fn main() Int {
     assert "12x".parse_int().is_err()
     assert div_exact(21, 3) == 7
 
-    var m = TextMap.new()
+    var m = Map[Text, Text].new()
     m.set("lang", "tenon")
     m.set("ver", "3")
     m.set("ver", "3.1")
@@ -132,8 +132,25 @@ pub fn main() Int {
     m.clear()
     assert m.is_empty()
 
-    // High-scale O(1) HashMap stress test: 2000 inserts, updates, deletes, tombstone compaction & lookups!
-    var big = TextMap.with_capacity(16)
+    // Generic monomorphization across distinct concrete `(K, V)` pairs (`Map[Text, Int]` and `Map[Int, Text]`)
+    var scores Map[Text, Int] = Map.new()
+    scores.set("alice", 95)
+    scores.set("bob", 88)
+    scores.set("alice", 99)
+    assert scores.len() == 2
+    assert scores.get("alice").unwrap_or(0) == 99
+    assert scores.remove("bob").unwrap_or(0) == 88
+    assert scores.len() == 1
+
+    var by_id = Map[Int, Text].with_capacity(8)
+    by_id.set(1, "one")
+    by_id.set(42, "answer")
+    assert by_id.get(42).unwrap_or("") == "answer"
+    assert by_id.remove(1).unwrap_or("") == "one"
+    assert by_id.len() == 1
+
+    // High-scale O(1) HashMap stress test: 2000 inserts, updates, swap-removes, tombstone compaction & lookups!
+    var big = Map[Text, Text].with_capacity(16)
     var k = 0
     while k < 2000 {
         let ks = "k_" ++ k.to_text()
@@ -146,7 +163,7 @@ pub fn main() Int {
     assert big.get("k_1999").unwrap_or("") == "v_1999"
     assert big.get("missing_key").is_none()
 
-    // Overwrite & delete half to exercise in-place update + tombstone compaction
+    // Overwrite & delete half to exercise in-place update + O(1) swap-remove + tombstone compaction
     var d = 0
     while d < 1000 {
         assert big.remove("k_" ++ d.to_text()).is_some()
@@ -159,8 +176,8 @@ pub fn main() Int {
     assert big.get("k_1500").unwrap_or("") == "updated_1500"
     let ks_live = big.keys()
     assert ks_live.len() == 1000
-    assert ks_live[0] == "k_1000"
-    assert ks_live[999] == "k_1999"
+    assert big.has(ks_live[0])
+    assert big.has(ks_live[999])
 
     // Static `[W Writer]` + Dynamic `dyn Writer` (with default method `write_line`!)
     var tb = TextBuilder.new()
@@ -261,7 +278,7 @@ pub fn main() Int {
     }
     assert ev_rt == "hello"
 
-    // 5. Layer 2: `Dotenv.parse` & aliased `dotenv.parse` returning `TextMap`
+    // 5. Layer 2: `Dotenv.parse` & aliased `dotenv.parse` returning `Map[Text, Text]`
     let env_map = dotenv.parse("# c\nexport FOO = \"bar_baz\"\nA=1\n")
     assert env_map.get("FOO").unwrap_or("") == "bar_baz"
     assert env_map.get("MISSING").is_none()

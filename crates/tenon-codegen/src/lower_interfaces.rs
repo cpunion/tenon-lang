@@ -312,6 +312,8 @@ fn subst_fn_types(f: &FnDecl, subst: &BTreeMap<String, TypeExpr>) -> FnDecl {
 struct LowerCtx {
     alias_bases: BTreeMap<String, TypeExpr>,
     records: BTreeMap<String, RecordDecl>,
+    generic_records: BTreeMap<String, RecordDecl>,
+    mono_records: Vec<RecordDecl>,
     enum_names: BTreeSet<String>,
     enum_variants: BTreeMap<String, (String, Vec<TypeExpr>)>,
     interfaces: BTreeMap<String, InterfaceDecl>,
@@ -356,6 +358,7 @@ impl LowerCtx {
             TypeExpr::Named { name, .. } => {
                 matches!(name.as_str(), "Text" | "List" | "Option" | "Result")
                     || self.records.contains_key(&name)
+                    || self.generic_records.contains_key(&name)
                     || self.enum_names.contains(&name)
             }
             TypeExpr::Tuple(_, _) => true,
@@ -364,6 +367,7 @@ impl LowerCtx {
 
     fn is_known_type(&self, name: &str) -> bool {
         self.records.contains_key(name)
+            || self.generic_records.contains_key(name)
             || self.enum_names.contains(name)
             || self.alias_bases.contains_key(name)
             || matches!(
@@ -389,7 +393,24 @@ impl LowerCtx {
                 }
                 named_ty("Any")
             }
-            ExprKind::RecordLit { name, .. } => named_ty(name),
+            ExprKind::RecordLit { name, fields, .. } => {
+                if let Some(rec) = self.generic_records.get(name) {
+                    let mut subst = BTreeMap::new();
+                    for (fname, fval) in fields {
+                        if let Some(fd) = rec.fields.iter().find(|f| f.name == *fname) {
+                            let aty = self.infer_expr_ty(fval, var_types);
+                            self.unify_type_params(&fd.ty, &aty, &rec.type_params, &mut subst);
+                        }
+                    }
+                    let targs: Vec<TypeExpr> = rec
+                        .type_params
+                        .iter()
+                        .map(|tp| subst.get(tp).cloned().unwrap_or_else(|| named_ty("Any")))
+                        .collect();
+                    return generic_ty(name, targs);
+                }
+                named_ty(name)
+            }
             ExprKind::List(es) => {
                 if let Some(first) = es.first() {
                     generic_ty("List", vec![self.infer_expr_ty(first, var_types)])
@@ -412,9 +433,20 @@ impl LowerCtx {
                     }
                 }
                 let t = self.resolve_alias(&self.infer_expr_ty(target, var_types));
-                if let TypeExpr::Named { name: rname, .. } = t {
-                    if let Some(rec) = self.records.get(&rname) {
+                if let TypeExpr::Named { name: rname, args: rargs, .. } = t {
+                    if let Some(rec) = self
+                        .records
+                        .get(&rname)
+                        .or_else(|| self.generic_records.get(&rname))
+                    {
                         if let Some(fl) = rec.fields.iter().find(|f| f.name == *field) {
+                            if !rec.type_params.is_empty() && !rargs.is_empty() {
+                                let mut fsubst = BTreeMap::new();
+                                for (tp, ra) in rec.type_params.iter().zip(rargs.iter()) {
+                                    fsubst.insert(tp.clone(), ra.clone());
+                                }
+                                return subst_type(&fl.ty, &fsubst);
+                            }
                             return fl.ty.clone();
                         }
                     }
@@ -515,6 +547,23 @@ impl LowerCtx {
                     named_ty("Any")
                 }
                 ExprKind::Field { target, field } => {
+                    if let ExprKind::GenericInst { expr: inner, type_args } = &target.kind {
+                        if let ExprKind::Ident(tname) = &inner.kind {
+                            if !var_types.contains_key(tname) && self.is_known_type(tname) {
+                                if let Some(mname) = self.lookup_concrete_method(tname, field) {
+                                    if let Some(tmpl) = self.generic_templates.get(&mname) {
+                                        if let Some(rt) = &tmpl.ret_ty {
+                                            let subst = self.infer_generic_subst(tmpl, type_args, args, var_types);
+                                            return subst_type(rt, &subst);
+                                        }
+                                    }
+                                    if let Some(sig) = self.fn_sigs.get(&mname) {
+                                        return sig.ret_ty.clone().unwrap_or_else(|| named_ty("Any"));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if field == "parse" {
                         if let ExprKind::Ident(rname) = &target.kind {
                             if self.records.contains_key(rname)
@@ -825,7 +874,7 @@ impl LowerCtx {
                     is_mut,
                     span,
                 } => {
-                    let mut lv = self.lower_expr(value, var_types, ret_ty);
+                    let mut lv = self.lower_expr(value, var_types, ret_ty, ty.as_ref());
                     let inferred = self.infer_expr_ty(&lv, var_types);
                     let eff_ty = if let Some(t) = ty {
                         lv = self.maybe_box_dyn(lv, t, &inferred);
@@ -848,8 +897,14 @@ impl LowerCtx {
                     value,
                     span,
                 } => {
-                    let lt = self.lower_expr(target, var_types, ret_ty);
-                    let mut lv = self.lower_expr(value, var_types, ret_ty);
+                    let lt = self.lower_expr(target, var_types, ret_ty, None);
+                    let target_exp = self.infer_expr_ty(&lt, var_types);
+                    let exp_opt = if target_exp.display_name() != "Any" {
+                        Some(&target_exp)
+                    } else {
+                        None
+                    };
+                    let mut lv = self.lower_expr(value, var_types, ret_ty, exp_opt);
                     match &lt.kind {
                         ExprKind::Ident(vname) => {
                             if let Some(tty) = var_types.get(vname).cloned() {
@@ -877,7 +932,7 @@ impl LowerCtx {
                 }
                 Stmt::Return { value, span } => {
                     let lv = value.as_ref().map(|e| {
-                        let le = self.lower_expr(e, var_types, ret_ty);
+                        let le = self.lower_expr(e, var_types, ret_ty, ret_ty);
                         if let Some(rt) = ret_ty {
                             let aty = self.infer_expr_ty(&le, var_types);
                             self.maybe_box_dyn(le, rt, &aty)
@@ -891,7 +946,7 @@ impl LowerCtx {
                     });
                 }
                 Stmt::Assert { cond, span } => stmts.push(Stmt::Assert {
-                    cond: self.lower_expr(cond, var_types, ret_ty),
+                    cond: self.lower_expr(cond, var_types, ret_ty, None),
                     span: *span,
                 }),
                 Stmt::Mutate { target, body, span } => stmts.push(Stmt::Mutate {
@@ -906,21 +961,21 @@ impl LowerCtx {
                     body,
                     span,
                 } => stmts.push(Stmt::While {
-                    cond: self.lower_expr(cond, var_types, ret_ty),
+                    cond: self.lower_expr(cond, var_types, ret_ty, None),
                     invariants: invariants.clone(),
                     decreases: decreases.clone(),
                     body: self.lower_block(body, var_types, ret_ty),
                     span: *span,
                 }),
                 Stmt::Expr { expr, span } => stmts.push(Stmt::Expr {
-                    expr: self.lower_expr(expr, var_types, ret_ty),
+                    expr: self.lower_expr(expr, var_types, ret_ty, None),
                     span: *span,
                 }),
                 other => stmts.push(other.clone()),
             }
         }
         let tail = blk.tail.as_ref().map(|t| {
-            let lt = self.lower_expr(t, var_types, ret_ty);
+            let lt = self.lower_expr(t, var_types, ret_ty, ret_ty);
             let boxed = if let Some(rt) = ret_ty {
                 let aty = self.infer_expr_ty(&lt, var_types);
                 self.maybe_box_dyn(lt, rt, &aty)
@@ -942,41 +997,63 @@ impl LowerCtx {
         expr: &Expr,
         var_types: &BTreeMap<String, TypeExpr>,
         ret_ty: Option<&TypeExpr>,
+        expected_ty: Option<&TypeExpr>,
     ) -> Expr {
         let sp = expr.span;
         let kind = match &expr.kind {
             ExprKind::Binary { op, left, right } => ExprKind::Binary {
                 op: *op,
-                left: Box::new(self.lower_expr(left, var_types, ret_ty)),
-                right: Box::new(self.lower_expr(right, var_types, ret_ty)),
+                left: Box::new(self.lower_expr(left, var_types, ret_ty, None)),
+                right: Box::new(self.lower_expr(right, var_types, ret_ty, None)),
             },
             ExprKind::Unary { op, expr: inner } => ExprKind::Unary {
                 op: *op,
-                expr: Box::new(self.lower_expr(inner, var_types, ret_ty)),
+                expr: Box::new(self.lower_expr(inner, var_types, ret_ty, None)),
             },
             ExprKind::Field { target, field } => ExprKind::Field {
-                target: Box::new(self.lower_expr(target, var_types, ret_ty)),
+                target: Box::new(self.lower_expr(target, var_types, ret_ty, None)),
                 field: field.clone(),
             },
             ExprKind::Index { target, index } => ExprKind::Index {
-                target: Box::new(self.lower_expr(target, var_types, ret_ty)),
-                index: Box::new(self.lower_expr(index, var_types, ret_ty)),
+                target: Box::new(self.lower_expr(target, var_types, ret_ty, None)),
+                index: Box::new(self.lower_expr(index, var_types, ret_ty, None)),
             },
             ExprKind::RecordLit {
                 name,
                 version,
                 fields,
             } => {
-                let rec_opt = self.records.get(name).cloned();
+                let rec_opt = self
+                    .records
+                    .get(name)
+                    .or_else(|| self.generic_records.get(name))
+                    .cloned();
+                let mut rec_subst = BTreeMap::new();
+                if let (Some(rec), Some(TypeExpr::Named { name: en, args: ea, .. })) =
+                    (&rec_opt, expected_ty)
+                {
+                    if en == name && !rec.type_params.is_empty() {
+                        for (tp, ta) in rec.type_params.iter().zip(ea.iter()) {
+                            rec_subst.insert(tp.clone(), ta.clone());
+                        }
+                    }
+                }
                 let new_fields = fields
                     .iter()
                     .map(|(k, v)| {
-                        let mut lv = self.lower_expr(v, var_types, ret_ty);
-                        if let Some(rec) = &rec_opt {
-                            if let Some(fd) = rec.fields.iter().find(|f| f.name == *k) {
-                                let aty = self.infer_expr_ty(&lv, var_types);
-                                lv = self.maybe_box_dyn(lv, &fd.ty, &aty);
-                            }
+                        let f_expected = rec_opt.as_ref().and_then(|rec| {
+                            rec.fields.iter().find(|f| f.name == *k).map(|fd| {
+                                if rec_subst.is_empty() {
+                                    fd.ty.clone()
+                                } else {
+                                    subst_type(&fd.ty, &rec_subst)
+                                }
+                            })
+                        });
+                        let mut lv = self.lower_expr(v, var_types, ret_ty, f_expected.as_ref());
+                        if let Some(fty) = &f_expected {
+                            let aty = self.infer_expr_ty(&lv, var_types);
+                            lv = self.maybe_box_dyn(lv, fty, &aty);
                         }
                         (k.clone(), lv)
                     })
@@ -989,12 +1066,12 @@ impl LowerCtx {
             }
             ExprKind::Tuple(es) => ExprKind::Tuple(
                 es.iter()
-                    .map(|e| self.lower_expr(e, var_types, ret_ty))
+                    .map(|e| self.lower_expr(e, var_types, ret_ty, None))
                     .collect(),
             ),
             ExprKind::List(es) => ExprKind::List(
                 es.iter()
-                    .map(|e| self.lower_expr(e, var_types, ret_ty))
+                    .map(|e| self.lower_expr(e, var_types, ret_ty, None))
                     .collect(),
             ),
             ExprKind::If {
@@ -1002,12 +1079,12 @@ impl LowerCtx {
                 then_block,
                 else_branch,
             } => {
-                let lc = self.lower_expr(cond, var_types, ret_ty);
+                let lc = self.lower_expr(cond, var_types, ret_ty, None);
                 let mut tv = var_types.clone();
-                let lt = self.lower_block(then_block, &mut tv, None);
+                let lt = self.lower_block(then_block, &mut tv, expected_ty);
                 let le = else_branch
                     .as_ref()
-                    .map(|eb| Box::new(self.lower_expr(eb, var_types, ret_ty)));
+                    .map(|eb| Box::new(self.lower_expr(eb, var_types, ret_ty, expected_ty)));
                 ExprKind::If {
                     cond: Box::new(lc),
                     then_block: lt,
@@ -1015,7 +1092,7 @@ impl LowerCtx {
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
-                let ls = self.lower_expr(scrutinee, var_types, ret_ty);
+                let ls = self.lower_expr(scrutinee, var_types, ret_ty, None);
                 let st = self.infer_expr_ty(&ls, var_types);
                 let mut new_arms = Vec::with_capacity(arms.len());
                 for arm in arms {
@@ -1024,8 +1101,8 @@ impl LowerCtx {
                     let lg = arm
                         .guard
                         .as_ref()
-                        .map(|g| self.lower_expr(g, &av, ret_ty));
-                    let lb = self.lower_expr(&arm.body, &av, ret_ty);
+                        .map(|g| self.lower_expr(g, &av, ret_ty, None));
+                    let lb = self.lower_expr(&arm.body, &av, ret_ty, expected_ty);
                     new_arms.push(MatchArm {
                         patterns: arm.patterns.clone(),
                         guard: lg,
@@ -1040,17 +1117,17 @@ impl LowerCtx {
             }
             ExprKind::Block(b) => {
                 let mut lv = var_types.clone();
-                ExprKind::Block(self.lower_block(b, &mut lv, None))
+                ExprKind::Block(self.lower_block(b, &mut lv, expected_ty))
             }
             ExprKind::Await(inner) => {
-                ExprKind::Await(Box::new(self.lower_expr(inner, var_types, ret_ty)))
+                ExprKind::Await(Box::new(self.lower_expr(inner, var_types, ret_ty, None)))
             }
             ExprKind::Call { callee, args } => {
                 let mut lowered_args: Vec<CallArg> = args
                     .iter()
                     .map(|a| CallArg {
                         name: a.name.clone(),
-                        value: self.lower_expr(&a.value, var_types, ret_ty),
+                        value: self.lower_expr(&a.value, var_types, ret_ty, None),
                     })
                     .collect();
 
@@ -1132,6 +1209,34 @@ impl LowerCtx {
                                 }
                             }
                         }
+                        if let ExprKind::GenericInst { expr: inner, type_args } = &target.kind {
+                            if let ExprKind::Ident(tname) = &inner.kind {
+                                if !var_types.contains_key(tname) && self.is_known_type(tname) {
+                                    if let Some(mname) = self.lookup_concrete_method(tname, field) {
+                                        let final_fn = if let Some(tmpl) = self.generic_templates.get(&mname).cloned() {
+                                            let mut subst = self.infer_generic_subst(&tmpl, type_args, &lowered_args, var_types);
+                                            if let (Some(rt), Some(exp)) = (&tmpl.ret_ty, expected_ty) {
+                                                self.unify_type_params(rt, exp, &tmpl.type_params, &mut subst);
+                                            }
+                                            self.ensure_monomorphized(&mname, &subst).unwrap_or(mname)
+                                        } else {
+                                            mname
+                                        };
+                                        self.box_call_args(&final_fn, &mut lowered_args, var_types);
+                                        return Expr {
+                                            kind: ExprKind::Call {
+                                                callee: Box::new(Expr {
+                                                    kind: ExprKind::Ident(final_fn),
+                                                    span: callee.span,
+                                                }),
+                                                args: lowered_args,
+                                            },
+                                            span: sp,
+                                        };
+                                    }
+                                }
+                            }
+                        }
                         if let ExprKind::Ident(ename) = &target.kind {
                             if self.enum_variants.contains_key(&format!("{}.{}", ename, field)) {
                                 return Expr {
@@ -1145,7 +1250,10 @@ impl LowerCtx {
                             if !var_types.contains_key(ename) && self.is_known_type(ename) {
                                 if let Some(mname) = self.lookup_concrete_method(ename, field) {
                                     let final_fn = if let Some(tmpl) = self.generic_templates.get(&mname).cloned() {
-                                        let subst = self.infer_generic_subst(&tmpl, &[], &lowered_args, var_types);
+                                        let mut subst = self.infer_generic_subst(&tmpl, &[], &lowered_args, var_types);
+                                        if let (Some(rt), Some(exp)) = (&tmpl.ret_ty, expected_ty) {
+                                            self.unify_type_params(rt, exp, &tmpl.type_params, &mut subst);
+                                        }
                                         self.ensure_monomorphized(&mname, &subst).unwrap_or(mname)
                                     } else {
                                         mname
@@ -1165,7 +1273,7 @@ impl LowerCtx {
                             }
                         }
 
-                        let lowered_target = self.lower_expr(target, var_types, ret_ty);
+                        let lowered_target = self.lower_expr(target, var_types, ret_ty, None);
                         let recv_ty = self.infer_expr_ty(&lowered_target, var_types);
                         let recv_base = self.resolve_alias(&recv_ty);
 
@@ -1268,6 +1376,232 @@ impl LowerCtx {
         Expr { kind, span: sp }
     }
 
+    fn ensure_record_monomorphized(&mut self, base_name: &str, type_args: &[TypeExpr]) -> String {
+        let resolved_args: Vec<TypeExpr> = type_args
+            .iter()
+            .map(|a| self.rewrite_generic_record_ty(a))
+            .collect();
+        let mono_name = mangle_ty(&generic_ty(base_name, resolved_args.clone()));
+        if !self.records.contains_key(&mono_name) {
+            if let Some(tmpl) = self.generic_records.get(base_name).cloned() {
+                let mut subst = BTreeMap::new();
+                for (tp, ta) in tmpl.type_params.iter().zip(resolved_args.iter()) {
+                    subst.insert(tp.clone(), ta.clone());
+                }
+                let mut spec = tmpl;
+                spec.name = mono_name.clone();
+                spec.type_params.clear();
+                spec.type_param_bounds.clear();
+                for f in &mut spec.fields {
+                    let st = subst_type(&f.ty, &subst);
+                    f.ty = self.rewrite_generic_record_ty(&st);
+                }
+                self.records.insert(mono_name.clone(), spec.clone());
+                self.mono_records.push(spec);
+            }
+        }
+        mono_name
+    }
+
+    fn rewrite_generic_record_ty(&mut self, ty: &TypeExpr) -> TypeExpr {
+        match ty {
+            TypeExpr::Named {
+                name,
+                version,
+                args,
+                span,
+            } => {
+                if self.generic_records.contains_key(name) && !args.is_empty() {
+                    let mono_name = self.ensure_record_monomorphized(name, args);
+                    return TypeExpr::Named {
+                        name: mono_name,
+                        version: version.clone(),
+                        args: Vec::new(),
+                        span: *span,
+                    };
+                }
+                TypeExpr::Named {
+                    name: name.clone(),
+                    version: version.clone(),
+                    args: args.iter().map(|a| self.rewrite_generic_record_ty(a)).collect(),
+                    span: *span,
+                }
+            }
+            TypeExpr::Dyn {
+                interface,
+                args,
+                span,
+            } => TypeExpr::Dyn {
+                interface: interface.clone(),
+                args: args.iter().map(|a| self.rewrite_generic_record_ty(a)).collect(),
+                span: *span,
+            },
+            TypeExpr::Tuple(es, span) => TypeExpr::Tuple(
+                es.iter().map(|e| self.rewrite_generic_record_ty(e)).collect(),
+                *span,
+            ),
+        }
+    }
+
+    fn rewrite_block_generic_records(
+        &mut self,
+        blk: &mut Block,
+        var_types: &mut BTreeMap<String, TypeExpr>,
+        ret_ty: Option<&TypeExpr>,
+    ) {
+        let saved = var_types.clone();
+        for stmt in &mut blk.stmts {
+            match stmt {
+                Stmt::Let { name, ty, value, .. } => {
+                    self.rewrite_expr_generic_records(value, var_types, ty.as_ref());
+                    let eff = ty
+                        .clone()
+                        .unwrap_or_else(|| self.infer_expr_ty(value, var_types));
+                    var_types.insert(name.clone(), eff);
+                    if let Some(t) = ty {
+                        *t = self.rewrite_generic_record_ty(t);
+                    }
+                }
+                Stmt::Assign { target, value, .. } => {
+                    self.rewrite_expr_generic_records(target, var_types, None);
+                    let tty = self.infer_expr_ty(target, var_types);
+                    let exp = if tty.display_name() != "Any" { Some(&tty) } else { None };
+                    self.rewrite_expr_generic_records(value, var_types, exp);
+                }
+                Stmt::Return { value: Some(v), .. } => {
+                    self.rewrite_expr_generic_records(v, var_types, ret_ty);
+                }
+                Stmt::Assert { cond, .. } => {
+                    self.rewrite_expr_generic_records(cond, var_types, None);
+                }
+                Stmt::Mutate { body, .. } => {
+                    self.rewrite_block_generic_records(body, var_types, ret_ty);
+                }
+                Stmt::While { cond, body, .. } => {
+                    self.rewrite_expr_generic_records(cond, var_types, None);
+                    self.rewrite_block_generic_records(body, var_types, ret_ty);
+                }
+                Stmt::Expr { expr, .. } => {
+                    self.rewrite_expr_generic_records(expr, var_types, None);
+                }
+                _ => {}
+            }
+        }
+        if let Some(t) = &mut blk.tail {
+            self.rewrite_expr_generic_records(t, var_types, ret_ty);
+        }
+        *var_types = saved;
+    }
+
+    fn rewrite_expr_generic_records(
+        &mut self,
+        expr: &mut Expr,
+        var_types: &BTreeMap<String, TypeExpr>,
+        expected_ty: Option<&TypeExpr>,
+    ) {
+        match &mut expr.kind {
+            ExprKind::RecordLit { name, fields, .. } => {
+                if let Some(tmpl) = self.generic_records.get(name.as_str()).cloned() {
+                    let mut subst = BTreeMap::new();
+                    if let Some(TypeExpr::Named { name: en, args: ea, .. }) = expected_ty {
+                        if en == name {
+                            for (tp, ta) in tmpl.type_params.iter().zip(ea.iter()) {
+                                if ta.display_name() != "Any" {
+                                    subst.insert(tp.clone(), ta.clone());
+                                }
+                            }
+                        }
+                    }
+                    for (fname, fval) in fields.iter() {
+                        if let Some(fd) = tmpl.fields.iter().find(|f| f.name == *fname) {
+                            let aty = self.infer_expr_ty(fval, var_types);
+                            self.unify_type_params(&fd.ty, &aty, &tmpl.type_params, &mut subst);
+                        }
+                    }
+                    let concrete_args: Vec<TypeExpr> = tmpl
+                        .type_params
+                        .iter()
+                        .map(|tp| subst.get(tp).cloned().unwrap_or_else(|| named_ty("Int")))
+                        .collect();
+                    for (fname, fval) in fields.iter_mut() {
+                        let f_exp = tmpl
+                            .fields
+                            .iter()
+                            .find(|f| f.name == *fname)
+                            .map(|fd| subst_type(&fd.ty, &subst));
+                        self.rewrite_expr_generic_records(fval, var_types, f_exp.as_ref());
+                    }
+                    *name = self.ensure_record_monomorphized(name, &concrete_args);
+                } else {
+                    let rec_opt = self.records.get(name.as_str()).cloned();
+                    for (fname, fval) in fields.iter_mut() {
+                        let f_exp = rec_opt
+                            .as_ref()
+                            .and_then(|r| r.fields.iter().find(|f| f.name == *fname))
+                            .map(|fd| fd.ty.clone());
+                        self.rewrite_expr_generic_records(fval, var_types, f_exp.as_ref());
+                    }
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.rewrite_expr_generic_records(left, var_types, None);
+                self.rewrite_expr_generic_records(right, var_types, None);
+            }
+            ExprKind::Unary { expr: inner, .. }
+            | ExprKind::Await(inner)
+            | ExprKind::Old(inner) => {
+                self.rewrite_expr_generic_records(inner, var_types, None);
+            }
+            ExprKind::Field { target, .. } => {
+                self.rewrite_expr_generic_records(target, var_types, None);
+            }
+            ExprKind::Index { target, index } => {
+                self.rewrite_expr_generic_records(target, var_types, None);
+                self.rewrite_expr_generic_records(index, var_types, None);
+            }
+            ExprKind::Call { callee, args } => {
+                self.rewrite_expr_generic_records(callee, var_types, None);
+                for a in args {
+                    self.rewrite_expr_generic_records(&mut a.value, var_types, None);
+                }
+            }
+            ExprKind::Tuple(es) | ExprKind::List(es) => {
+                for e in es {
+                    self.rewrite_expr_generic_records(e, var_types, None);
+                }
+            }
+            ExprKind::If {
+                cond,
+                then_block,
+                else_branch,
+            } => {
+                self.rewrite_expr_generic_records(cond, var_types, None);
+                let mut tv = var_types.clone();
+                self.rewrite_block_generic_records(then_block, &mut tv, expected_ty);
+                if let Some(eb) = else_branch {
+                    self.rewrite_expr_generic_records(eb, var_types, expected_ty);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.rewrite_expr_generic_records(scrutinee, var_types, None);
+                let st = self.infer_expr_ty(scrutinee, var_types);
+                for arm in arms {
+                    let mut av = var_types.clone();
+                    self.bind_arm_vars(&st, arm, &mut av);
+                    if let Some(g) = &mut arm.guard {
+                        self.rewrite_expr_generic_records(g, &av, None);
+                    }
+                    self.rewrite_expr_generic_records(&mut arm.body, &av, expected_ty);
+                }
+            }
+            ExprKind::Block(b) => {
+                let mut bv = var_types.clone();
+                self.rewrite_block_generic_records(b, &mut bv, expected_ty);
+            }
+            _ => {}
+        }
+    }
+
     fn box_call_args(
         &self,
         fname: &str,
@@ -1316,6 +1650,8 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
     let mut ctx = LowerCtx {
         alias_bases: BTreeMap::new(),
         records: BTreeMap::new(),
+        generic_records: BTreeMap::new(),
+        mono_records: Vec::new(),
         enum_names: BTreeSet::new(),
         enum_variants: BTreeMap::new(),
         interfaces: BTreeMap::new(),
@@ -1336,7 +1672,11 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
                 ctx.alias_bases.insert(ta.name.clone(), ta.base.clone());
             }
             Item::Record(r) => {
-                ctx.records.insert(r.name.clone(), r.clone());
+                if r.type_params.is_empty() {
+                    ctx.records.insert(r.name.clone(), r.clone());
+                } else {
+                    ctx.generic_records.insert(r.name.clone(), r.clone());
+                }
             }
             Item::Enum(e) => {
                 ctx.enum_names.insert(e.name.clone());
@@ -1525,6 +1865,56 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
     }
     while let Some(mono_f) = ctx.mono_queue.pop_front() {
         final_items.push(Item::Fn(ctx.lower_fn(&mono_f)));
+    }
+
+    // Pass 4: Monomorphize all concrete generic record types (e.g. `Map[Text, Text]` -> `Map__Text_Text`)
+    // and rewrite generic `RecordLit` / `TypeExpr` references so Cranelift JIT & LLVM AOT see concrete layouts!
+    if !ctx.generic_records.is_empty() {
+        let mut rewritten_items: Vec<Item> = Vec::with_capacity(final_items.len());
+        for mut item in final_items {
+            match &mut item {
+                Item::Record(r) => {
+                    if !r.type_params.is_empty() {
+                        continue;
+                    }
+                    for f in &mut r.fields {
+                        f.ty = ctx.rewrite_generic_record_ty(&f.ty);
+                    }
+                }
+                Item::Enum(e) => {
+                    for v in &mut e.variants {
+                        for f in &mut v.fields {
+                            f.ty = ctx.rewrite_generic_record_ty(&f.ty);
+                        }
+                    }
+                }
+                Item::TypeAlias(ta) => {
+                    ta.base = ctx.rewrite_generic_record_ty(&ta.base);
+                }
+                Item::Fn(f) => {
+                    let mut vt = BTreeMap::new();
+                    for p in &f.params {
+                        vt.insert(p.name.clone(), p.ty.clone());
+                    }
+                    let orig_ret = f.ret_ty.clone();
+                    ctx.rewrite_block_generic_records(&mut f.body, &mut vt, orig_ret.as_ref());
+                    for p in &mut f.params {
+                        p.ty = ctx.rewrite_generic_record_ty(&p.ty);
+                    }
+                    if let Some(rt) = &mut f.ret_ty {
+                        *rt = ctx.rewrite_generic_record_ty(rt);
+                    }
+                }
+                _ => {}
+            }
+            rewritten_items.push(item);
+        }
+        let mut out_items: Vec<Item> = Vec::with_capacity(rewritten_items.len() + ctx.mono_records.len());
+        for mr in ctx.mono_records.drain(..) {
+            out_items.push(Item::Record(mr));
+        }
+        out_items.extend(rewritten_items);
+        final_items = out_items;
     }
 
     PreparedProgram {

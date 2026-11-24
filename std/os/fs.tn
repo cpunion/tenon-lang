@@ -62,12 +62,12 @@ impl FileSystem for OsFs {
 
 /// Pure in-memory `FileSystem` implementation (ideal for deterministic tests & sandboxes!).
 pub record MemFs {
-    files TextMap
+    files Map[Text, Text]
 }
 
 impl MemFs {
     pub pure fn new() MemFs {
-        MemFs { files = TextMap.new() }
+        MemFs { files = Map.new() }
     }
 }
 

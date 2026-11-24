@@ -515,7 +515,7 @@ impl Parser {
     fn parse_record(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Result<RecordDecl, ParseError> {
         let start = self.expect(TokenKind::Record)?.span;
         let (name, _) = self.expect_ident()?;
-        let type_params = self.parse_type_params()?;
+        let (type_params, type_param_bounds) = self.parse_type_params_with_bounds()?;
         self.expect(TokenKind::LBrace)?;
         let mut fields = Vec::new();
         let mut where_clauses = Vec::new();
@@ -530,6 +530,7 @@ impl Parser {
                     is_pub,
                     name,
                     type_params,
+                    type_param_bounds,
                     fields,
                     where_clauses,
                     invariants,
@@ -905,6 +906,7 @@ impl Parser {
                             is_pub: false,
                             name: aname,
                             type_params: Vec::new(),
+                            type_param_bounds: BTreeMap::new(),
                             fields,
                             where_clauses: Vec::new(),
                             invariants: Vec::new(),
@@ -2080,7 +2082,14 @@ impl Parser {
                                 break;
                             }
                         }
-                        if valid && self.peek().kind == TokenKind::LParen {
+                        let is_type_head = matches!(
+                            &expr.kind,
+                            ExprKind::Ident(s) if s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                        );
+                        if valid
+                            && (self.peek().kind == TokenKind::LParen
+                                || (is_type_head && self.peek().kind == TokenKind::Dot))
+                        {
                             ok_generic = true;
                         }
                     }

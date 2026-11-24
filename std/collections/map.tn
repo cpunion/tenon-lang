@@ -1,28 +1,23 @@
 // Tenon Standard Library — Layer 1: std/collections/map.tn
-// High-performance O(1) amortized Compact Open-Addressing Hash Map (Python 3.7+ dict / Rust IndexMap layout):
+// High-performance generic O(1) amortized Compact Open-Addressing Hash Map `Map[K Hash + Eq, V]`:
+//   - Monomorphized per concrete `(K, V)` pair with exact Perceus `rc_mask` (zero boxing, zero dispatch overhead)
 //   - Power-of-2 bucket index table (`& mask`, zero modulo), max 70% load factor
-//   - Cached 63-bit FNV-1a + SplitMix avalanche hashes (skips string compare on collision & zero re-hash on grow)
-//   - Deterministic insertion order (`keys()`, `values()`)
-//   - O(1) in-place `set`/`remove` via Perceus unique reuse (`rc == 1`) + automatic MVS COW on shared copies (`with`)
-//   - Tombstone compaction on delete/insert churn + Z3-verified `NonNegative` count/used invariants!
+//   - Dense SoA storage (`keys: List[K]`, `vals: List[V]`, `hashes: List[Int]`) with O(1) swap-remove
+//   - Zero entry copying on `rehash`, O(1) COW `keys()` / `values()`, O(1) in-place `set` / `remove` via Perceus `rc == 1`
+//   - Z3-verified `NonNegative` `count` / `used` invariants!
 
 import "std/core/types.tn"
 import "std/core/ops.tn"
 import "std/text/text.tn"
 
-pub record TextMapEntry {
-    key Text
-    val Text
-}
-
-pub record TextMap {
-    /// Open-addressing power-of-2 hash index table: -1 = empty, -2 = tombstone, >= 0 = entry index
+pub record Map[K Hash + Eq, V] {
+    /// Open-addressing power-of-2 hash index table: -1 = empty, -2 = tombstone, >= 0 = dense slot index
     buckets List[Int]
-    /// Dense SoA insertion-ordered key storage (zero per-entry wrapper allocation or pointer chase)
-    keys    List[Text]
-    /// Dense SoA insertion-ordered value storage parallel to `keys`
-    vals    List[Text]
-    /// Cached 63-bit hashes parallel to `keys`/`vals` (-1 = deleted tombstone entry)
+    /// Dense SoA key storage (always `keys.len() == count`)
+    keys    List[K]
+    /// Dense SoA value storage parallel to `keys`
+    vals    List[V]
+    /// Cached 63-bit hashes parallel to `keys` / `vals`
     hashes  List[Int]
     /// Number of live key/value pairs
     count   NonNegative
@@ -44,13 +39,13 @@ pub pure fn map_next_pow2_cap(min_cap NonNegative) Positive
     cap
 }
 
-impl TextMap {
-    pub pure fn new() TextMap {
+impl[K Hash + Eq, V] Map[K, V] {
+    pub pure fn new() Map[K, V] {
         let empty_buckets List[Int] = []
-        let empty_keys List[Text] = []
-        let empty_vals List[Text] = []
+        let empty_keys List[K] = []
+        let empty_vals List[V] = []
         let empty_hashes List[Int] = []
-        TextMap {
+        Map {
             buckets = empty_buckets,
             keys = empty_keys,
             vals = empty_vals,
@@ -61,13 +56,13 @@ impl TextMap {
     }
 
     /// Pre-allocates enough power-of-2 buckets for `expected_items` at <= 70% load factor (zero rehashes).
-    pub pure fn with_capacity(expected_items NonNegative) TextMap {
+    pub pure fn with_capacity(expected_items NonNegative) Map[K, V] {
         let needed = clamp_non_neg((expected_items * 10) / 7 + 1)
         let cap = map_next_pow2_cap(needed)
-        let empty_keys List[Text] = []
-        let empty_vals List[Text] = []
+        let empty_keys List[K] = []
+        let empty_vals List[V] = []
         let empty_hashes List[Int] = []
-        TextMap {
+        Map {
             buckets = List.filled(cap, -1),
             keys = empty_keys,
             vals = empty_vals,
@@ -89,7 +84,7 @@ impl TextMap {
         self.buckets.len()
     }
 
-    pub pure fn get(self, key Text) Option[Text] {
+    pub pure fn get(self, key K) Option[V] {
         let cap = self.buckets.len()
         if self.count == 0 || cap == 0 {
             return None
@@ -103,7 +98,7 @@ impl TextMap {
             if idx == -1 {
                 return None
             }
-            if idx >= 0 && self.hashes[idx] == h && self.keys[idx] == key {
+            if idx >= 0 && self.hashes[idx] == h && self.keys[idx].eq(key) {
                 return Some(self.vals[idx])
             }
             slot = (slot + 1) & mask
@@ -112,7 +107,7 @@ impl TextMap {
         None
     }
 
-    pub pure fn has(self, key Text) Bool {
+    pub pure fn has(self, key K) Bool {
         self.get(key).is_some()
     }
 
@@ -120,39 +115,25 @@ impl TextMap {
         let cap = map_next_pow2_cap(target_cap)
         let mask = cap - 1
         var new_buckets = List.filled(cap, -1)
-        var new_keys List[Text] = []
-        var new_vals List[Text] = []
-        var new_hashes List[Int] = []
-        var live = 0
+        let total = self.hashes.len()
         var i = 0
-        let total = self.keys.len()
         while i < total {
-            let h = self.hashes[i]
-            if h >= 0 {
-                var slot = h & mask
-                while new_buckets[slot] != -1 {
-                    slot = (slot + 1) & mask
-                }
-                new_buckets[slot] = live
-                new_keys.push(self.keys[i])
-                new_vals.push(self.vals[i])
-                new_hashes.push(h)
-                live += 1
+            var slot = self.hashes[i] & mask
+            while new_buckets[slot] != -1 {
+                slot = (slot + 1) & mask
             }
+            new_buckets[slot] = i
             i += 1
         }
-        let live_ok = clamp_non_neg(live)
+        let live_ok = clamp_non_neg(total)
         mutate self {
             self.buckets = new_buckets
-            self.keys = new_keys
-            self.vals = new_vals
-            self.hashes = new_hashes
             self.count = live_ok
             self.used = live_ok
         }
     }
 
-    pub pure fn set(inout self, key Text, val Text) {
+    pub pure fn set(inout self, key K, val V) {
         let cur_cap = self.buckets.len()
         if cur_cap == 0 {
             self.rehash(8)
@@ -194,7 +175,7 @@ impl TextMap {
                 if first_tombstone < 0 {
                     first_tombstone = slot
                 }
-            } else if self.hashes[idx] == h && self.keys[idx] == key {
+            } else if self.hashes[idx] == h && self.keys[idx].eq(key) {
                 self.vals[idx] = val
                 return
             }
@@ -203,13 +184,14 @@ impl TextMap {
         }
     }
 
-    pub pure fn with(self, key Text, val Text) TextMap {
+    pub pure fn with(self, key K, val V) Map[K, V] {
         var next = self
         next.set(key, val)
         next
     }
 
-    pub pure fn remove(inout self, key Text) Option[Text] {
+    /// O(1) swap-remove: moves the last dense entry into the freed slot, updates its bucket, and pops the tail.
+    pub pure fn remove(inout self, key K) Option[V] {
         let cap = self.buckets.len()
         if self.count == 0 || cap == 0 {
             return None
@@ -223,12 +205,29 @@ impl TextMap {
             if idx == -1 {
                 return None
             }
-            if idx >= 0 && self.hashes[idx] == h && self.keys[idx] == key {
+            if idx >= 0 && self.hashes[idx] == h && self.keys[idx].eq(key) {
                 let old_val = self.vals[idx]
+                let last_idx = self.keys.len() - 1
                 self.buckets[slot] = -2
-                self.hashes[idx] = -1
-                self.keys[idx] = ""
-                self.vals[idx] = ""
+                if idx != last_idx {
+                    let last_h = self.hashes[last_idx]
+                    self.keys[idx] = self.keys[last_idx]
+                    self.vals[idx] = self.vals[last_idx]
+                    self.hashes[idx] = last_h
+                    var b = last_h & mask
+                    var bp = 0
+                    while bp < cap {
+                        if self.buckets[b] == last_idx {
+                            self.buckets[b] = idx
+                            break
+                        }
+                        b = (b + 1) & mask
+                        bp += 1
+                    }
+                }
+                let _ = self.keys.pop()
+                let _ = self.vals.pop()
+                let _ = self.hashes.pop()
                 if self.count > 0 {
                     mutate self {
                         self.count -= 1
@@ -242,36 +241,18 @@ impl TextMap {
         None
     }
 
-    pub pure fn keys(self) List[Text] {
-        var out List[Text] = []
-        var i = 0
-        let total = self.keys.len()
-        while i < total {
-            if self.hashes[i] >= 0 {
-                out.push(self.keys[i])
-            }
-            i += 1
-        }
-        out
+    pub pure fn keys(self) List[K] {
+        self.keys
     }
 
-    pub pure fn values(self) List[Text] {
-        var out List[Text] = []
-        var i = 0
-        let total = self.vals.len()
-        while i < total {
-            if self.hashes[i] >= 0 {
-                out.push(self.vals[i])
-            }
-            i += 1
-        }
-        out
+    pub pure fn values(self) List[V] {
+        self.vals
     }
 
     pub pure fn clear(inout self) {
         let empty_buckets List[Int] = []
-        let empty_keys List[Text] = []
-        let empty_vals List[Text] = []
+        let empty_keys List[K] = []
+        let empty_vals List[V] = []
         let empty_hashes List[Int] = []
         mutate self {
             self.buckets = empty_buckets

@@ -2,7 +2,7 @@
 //
 // Layered OOP architecture:
 //   1. Minimal Language Core (`tenon-rt`: Perceus RC/COW/vtable + 24 byte/buffer/OS/HTTP syscalls)
-//   2. 4-Layer OOP Pure-Tenon Stdlib (`List.push`, `TextBuilder.new`, `TextMap.new`, `JsonValue`, `Env`, `OsFs`, `HttpStream`)
+//   2. 4-Layer OOP Pure-Tenon Stdlib (`List.push`, `TextBuilder.new`, `Map[K, V].new`, `JsonValue`, `Env`, `OsFs`, `HttpStream`)
 //   3. Decoupled Application SDK (`examples/agent/lib/{llm,tools}.tn`): `dyn LlmProvider`, `ToolRegistry` (`List[dyn Tool]`),
 //      `@derive(FromJson, JsonSchema)` + `SafeRelPath`
 //   4. Formally verified `AgentLease` (Z3 `mutate`), `@no_heap_alloc`, `lock_lattice`, and `protocol state_machine`!

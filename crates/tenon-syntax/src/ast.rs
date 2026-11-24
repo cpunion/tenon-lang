@@ -104,6 +104,8 @@ pub struct RecordDecl {
     pub is_pub: bool,
     pub name: String,
     pub type_params: Vec<String>,
+    #[serde(default)]
+    pub type_param_bounds: BTreeMap<String, Vec<String>>,
     pub fields: Vec<FieldDecl>,
     pub where_clauses: Vec<Expr>,
     pub invariants: Vec<NamedExpr>,

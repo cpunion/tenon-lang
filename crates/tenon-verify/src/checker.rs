@@ -342,6 +342,12 @@ impl CheckerCtx {
                                 sub.type_params.push(tp.clone());
                             }
                         }
+                        for (tp, bs) in &imp.type_param_bounds {
+                            sub.type_param_bounds
+                                .entry(tp.clone())
+                                .or_default()
+                                .extend(bs.iter().cloned());
+                        }
                         inherent_methods.insert((tname.clone(), m.name.clone()), sub);
                     }
                 }
@@ -651,8 +657,8 @@ impl CheckerCtx {
             let aty = self.infer_expr_type(&a.value, var_types);
             unify(&p.ty, &aty, &m.type_params, &mut subst);
         }
-        if subst.is_empty() {
-            return m.clone();
+        for tp in &m.type_params {
+            subst.entry(tp.clone()).or_insert_with(|| named_ty("Any"));
         }
         let mut out = m.clone();
         for p in &mut out.params {
@@ -662,6 +668,39 @@ impl CheckerCtx {
             out.ret_ty = Some(subst_type_expr(rt, &subst));
         }
         out
+    }
+
+    fn check_type_bounds(&mut self, ty: &TypeExpr, span: Span) {
+        if let TypeExpr::Named { name, args, .. } = ty {
+            if let Some(rec) = self.records.get(name).cloned() {
+                for (tp, ta) in rec.type_params.iter().zip(args.iter()) {
+                    if ta.display_name() != "Any" && !self.cur_type_params.contains(&ta.display_name()) {
+                        if let Some(bounds) = rec.type_param_bounds.get(tp) {
+                            for b in bounds {
+                                if !self.type_implements(ta, b) {
+                                    self.diagnostics.push(Diagnostic {
+                                        code: "E0505".into(),
+                                        message: format!(
+                                            "type `{}` does not satisfy interface bound `{}` for type parameter `{}` of `{}`",
+                                            ta.display_name(),
+                                            b,
+                                            tp,
+                                            name
+                                        ),
+                                        span,
+                                        notes: vec![format!("add `impl {} for {} {{ ... }}`", b, ta.display_name())],
+                                        counterexample: BTreeMap::new(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for a in args {
+                self.check_type_bounds(a, span);
+            }
+        }
     }
 
     fn is_known_type_name(&self, name: &str) -> bool {
@@ -990,7 +1029,51 @@ impl CheckerCtx {
                 }
                 named_ty("Any")
             }
-            ExprKind::RecordLit { name, .. } => named_ty(name),
+            ExprKind::RecordLit { name, fields, .. } => {
+                if let Some(rec) = self.records.get(name) {
+                    if !rec.type_params.is_empty() {
+                        let mut subst = BTreeMap::new();
+                        fn unify_rec(
+                            pat: &TypeExpr,
+                            actual: &TypeExpr,
+                            tps: &[String],
+                            subst: &mut BTreeMap<String, TypeExpr>,
+                        ) {
+                            match (pat, actual) {
+                                (TypeExpr::Named { name, args, .. }, _)
+                                    if args.is_empty() && tps.contains(name) =>
+                                {
+                                    if actual.display_name() != "Any" {
+                                        subst.entry(name.clone()).or_insert_with(|| actual.clone());
+                                    }
+                                }
+                                (
+                                    TypeExpr::Named { name: pn, args: pa, .. },
+                                    TypeExpr::Named { name: an, args: aa, .. },
+                                ) if pn == an && pa.len() == aa.len() => {
+                                    for (x, y) in pa.iter().zip(aa.iter()) {
+                                        unify_rec(x, y, tps, subst);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        for (fname, fval) in fields {
+                            if let Some(fd) = rec.fields.iter().find(|f| f.name == *fname) {
+                                let aty = self.infer_expr_type(fval, var_types);
+                                unify_rec(&fd.ty, &aty, &rec.type_params, &mut subst);
+                            }
+                        }
+                        let targs: Vec<TypeExpr> = rec
+                            .type_params
+                            .iter()
+                            .map(|tp| subst.get(tp).cloned().unwrap_or_else(|| named_ty("Any")))
+                            .collect();
+                        return generic_ty(name, targs);
+                    }
+                }
+                named_ty(name)
+            }
             ExprKind::List(elems) => {
                 if let Some(first) = elems.first() {
                     generic_ty("List", vec![self.infer_expr_type(first, var_types)])
@@ -1027,9 +1110,16 @@ impl CheckerCtx {
                     }
                 }
                 let t = self.resolve_base_type(&self.infer_expr_type(target, var_types));
-                if let TypeExpr::Named { name: rname, .. } = t {
+                if let TypeExpr::Named { name: rname, args: rargs, .. } = t {
                     if let Some(rec) = self.records.get(&rname) {
                         if let Some(f) = rec.fields.iter().find(|f| f.name == *field) {
+                            if !rec.type_params.is_empty() && !rargs.is_empty() {
+                                let mut fsubst = BTreeMap::new();
+                                for (tp, ra) in rec.type_params.iter().zip(rargs.iter()) {
+                                    fsubst.insert(tp.clone(), ra.clone());
+                                }
+                                return subst_type_expr(&f.ty, &fsubst);
+                            }
                             return f.ty.clone();
                         }
                     }
@@ -1056,6 +1146,17 @@ impl CheckerCtx {
                     named_ty("Any")
                 }
                 ExprKind::Field { target, field } => {
+                    if let ExprKind::GenericInst { expr: inner, type_args } = &target.kind {
+                        if let ExprKind::Ident(tname) = &inner.kind {
+                            if !var_types.contains_key(tname) && self.is_known_type_name(tname) {
+                                if let Some(m) = self.resolve_assoc_method_sig(tname, field) {
+                                    let inst0 = self.instantiate_container_method(&m, tname, type_args);
+                                    let inst = self.instantiate_assoc_method_from_args(&inst0, args, var_types);
+                                    return inst.ret_ty.unwrap_or_else(|| named_ty("Any"));
+                                }
+                            }
+                        }
+                    }
                     if let ExprKind::Ident(ename) = &target.kind {
                         if let Some(vi) = self.enum_variants.get(&format!("{}.{}", ename, field)) {
                             return named_ty(&vi.enum_name);
@@ -1706,6 +1807,7 @@ impl CheckerCtx {
                     let inferred = self.infer_expr_type(value, var_types);
                     let effective_ty = if let Some(t) = ty {
                         self.check_dyn_type_valid(t, *span);
+                        self.check_type_bounds(t, *span);
                         if let TypeExpr::Dyn { interface, .. } = t {
                             if !self.type_implements(&inferred, interface) {
                                 self.diagnostics.push(Diagnostic {
@@ -2010,7 +2112,7 @@ impl CheckerCtx {
                                 }
                                 let is_inside_mutate = active_mutate.as_deref() == Some(var.as_str());
                                 if let Some(ty) = var_types.get(var).cloned() {
-                                    let rec_name = ty.display_name();
+                                    let rec_name = type_head_name(&self.resolve_base_type(&ty));
                                     if let Some(rec) = self.records.get(&rec_name).cloned() {
                                         let has_cross_inv = !rec.where_clauses.is_empty()
                                             || rec.fields.iter().any(|f| {
@@ -2152,7 +2254,7 @@ impl CheckerCtx {
                     *active_mutate = prev;
 
                     if let Some(ty) = var_types.get(target).cloned() {
-                        let rec_name = ty.display_name();
+                        let rec_name = type_head_name(&self.resolve_base_type(&ty));
                         if let Some(rec) = self.records.get(&rec_name).cloned() {
                             self.verify_record_invariants_after_mutate(
                                 target,
@@ -2677,20 +2779,59 @@ impl CheckerCtx {
                     );
                 }
                 if let Some(rec) = self.records.get(name).cloned() {
+                    let mut rsubst = BTreeMap::new();
+                    if !rec.type_params.is_empty() {
+                        fn unify_lit(
+                            pat: &TypeExpr,
+                            actual: &TypeExpr,
+                            tps: &[String],
+                            subst: &mut BTreeMap<String, TypeExpr>,
+                        ) {
+                            match (pat, actual) {
+                                (TypeExpr::Named { name, args, .. }, _)
+                                    if args.is_empty() && tps.contains(name) =>
+                                {
+                                    if actual.display_name() != "Any" {
+                                        subst.entry(name.clone()).or_insert_with(|| actual.clone());
+                                    }
+                                }
+                                (
+                                    TypeExpr::Named { name: pn, args: pa, .. },
+                                    TypeExpr::Named { name: an, args: aa, .. },
+                                ) if pn == an && pa.len() == aa.len() => {
+                                    for (x, y) in pa.iter().zip(aa.iter()) {
+                                        unify_lit(x, y, tps, subst);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        for (fname, fval) in fields {
+                            if let Some(fdecl) = rec.fields.iter().find(|f| f.name == *fname) {
+                                let aty = self.infer_expr_type(fval, var_types);
+                                unify_lit(&fdecl.ty, &aty, &rec.type_params, &mut rsubst);
+                            }
+                        }
+                    }
                     // Check unknown & missing required fields + field type compatibility!
                     let provided_names: BTreeSet<&str> =
                         fields.iter().map(|(n, _)| n.as_str()).collect();
                     for (fname, fval) in fields {
                         if let Some(fdecl) = rec.fields.iter().find(|f| f.name == *fname) {
+                            let expected_fty = if rsubst.is_empty() {
+                                fdecl.ty.clone()
+                            } else {
+                                subst_type_expr(&fdecl.ty, &rsubst)
+                            };
                             let actual_ty = self.infer_expr_type(fval, var_types);
-                            if !self.types_compatible(&fdecl.ty, &actual_ty) {
+                            if !self.types_compatible(&expected_fty, &actual_ty) {
                                 self.diagnostics.push(Diagnostic {
                                     code: "E0205".into(),
                                     message: format!(
                                         "field `{}` of `{}` expects `{}`, found `{}`",
                                         fname,
                                         rec.name,
-                                        fdecl.ty.display_name(),
+                                        expected_fty.display_name(),
                                         actual_ty.display_name()
                                     ),
                                     span: fval.span,
@@ -2790,6 +2931,66 @@ impl CheckerCtx {
                                                 field,
                                                 vi.payload_tys.len(),
                                                 args.len()
+                                            ),
+                                            span: expr.span,
+                                            notes: vec![],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    }
+                                }
+                            }
+                        } else if let ExprKind::GenericInst { expr: inner, type_args } = &target.kind {
+                            if let ExprKind::Ident(tname) = &inner.kind {
+                                if !var_types.contains_key(tname) && self.is_known_type_name(tname) {
+                                    let inst_ty = generic_ty(tname, type_args.clone());
+                                    self.check_type_bounds(&inst_ty, expr.span);
+                                    if let Some(mdecl) = self.resolve_assoc_method_sig(tname, field) {
+                                        for (tp, ta) in mdecl.type_params.iter().zip(type_args.iter()) {
+                                            if ta.display_name() != "Any" && !self.cur_type_params.contains(&ta.display_name()) {
+                                                if let Some(bounds) = mdecl.type_param_bounds.get(tp) {
+                                                    for b in bounds {
+                                                        if !self.type_implements(ta, b) {
+                                                            self.diagnostics.push(Diagnostic {
+                                                                code: "E0505".into(),
+                                                                message: format!(
+                                                                    "type `{}` does not satisfy interface bound `{}` for type parameter `{}` of `{}.{}`",
+                                                                    ta.display_name(),
+                                                                    b,
+                                                                    tp,
+                                                                    tname,
+                                                                    field
+                                                                ),
+                                                                span: expr.span,
+                                                                notes: vec![format!("add `impl {} for {} {{ ... }}`", b, ta.display_name())],
+                                                                counterexample: BTreeMap::new(),
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let inst0 = self.instantiate_container_method(&mdecl, tname, type_args);
+                                        let inst = self.instantiate_assoc_method_from_args(&inst0, args, var_types);
+                                        self.check_method_call_contract(
+                                            &format!("{}.{}", inst_ty.display_name(), field),
+                                            &inst,
+                                            None,
+                                            args,
+                                            cur_fn,
+                                            env,
+                                            smt_int_vars,
+                                            smt_premises,
+                                            var_types,
+                                            mutable_vars,
+                                            active_mutate,
+                                            expr.span,
+                                        );
+                                    } else {
+                                        self.diagnostics.push(Diagnostic {
+                                            code: "E0207".into(),
+                                            message: format!(
+                                                "unknown associated method `{}` on type `{}`",
+                                                field, tname
                                             ),
                                             span: expr.span,
                                             notes: vec![],
