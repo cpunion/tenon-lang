@@ -286,7 +286,7 @@ pub(crate) fn is_text_type_expr(ty: &TypeExpr, aliases: &BTreeMap<String, TypeEx
 pub(crate) fn is_float_type_expr(ty: &TypeExpr, aliases: &BTreeMap<String, TypeExpr>) -> bool {
     matches!(
         resolve_alias_ty(ty, aliases),
-        TypeExpr::Named { name, .. } if matches!(name.as_str(), "Float" | "Float64" | "Float32")
+        TypeExpr::Named { name, .. } if matches!(name.as_str(), "Float" | "Float64" | "Float32" | "Float16" | "BFloat16")
     )
 }
 
@@ -363,6 +363,10 @@ struct RtFuncs {
     raw_memcpy: FuncId,
     volatile_read: FuncId,
     volatile_write: FuncId,
+    f64_to_f16: FuncId,
+    f16_to_f64: FuncId,
+    f64_to_bf16: FuncId,
+    bf16_to_f64: FuncId,
 }
 
 pub struct JitProgram {
@@ -507,6 +511,10 @@ impl JitProgram {
         jit_builder.symbol("tenon_raw_memcmp", systems::tenon_raw_memcmp as *const u8);
         jit_builder.symbol("tenon_volatile_read", systems::tenon_volatile_read as *const u8);
         jit_builder.symbol("tenon_volatile_write", systems::tenon_volatile_write as *const u8);
+        jit_builder.symbol("tenon_f64_to_f16", systems::tenon_f64_to_f16 as *const u8);
+        jit_builder.symbol("tenon_f16_to_f64", systems::tenon_f16_to_f64 as *const u8);
+        jit_builder.symbol("tenon_f64_to_bf16", systems::tenon_f64_to_bf16 as *const u8);
+        jit_builder.symbol("tenon_bf16_to_f64", systems::tenon_bf16_to_f64 as *const u8);
         jit_builder.symbol("tenon_thread_spawn", systems::tenon_thread_spawn as *const u8);
         jit_builder.symbol("tenon_thread_join", systems::tenon_thread_join as *const u8);
         jit_builder.symbol("tenon_thread_sleep_ms", systems::tenon_thread_sleep_ms as *const u8);
@@ -1426,6 +1434,10 @@ fn declare_runtime_funcs(module: &mut JITModule) -> Result<RtFuncs, String> {
         raw_memcpy: declare_sig(module, "tenon_raw_memcpy", 3, true)?,
         volatile_read: declare_sig(module, "tenon_volatile_read", 2, true)?,
         volatile_write: declare_sig(module, "tenon_volatile_write", 3, true)?,
+        f64_to_f16: declare_sig(module, "tenon_f64_to_f16", 1, true)?,
+        f16_to_f64: declare_sig(module, "tenon_f16_to_f64", 1, true)?,
+        f64_to_bf16: declare_sig(module, "tenon_f64_to_bf16", 1, true)?,
+        bf16_to_f64: declare_sig(module, "tenon_bf16_to_f64", 1, true)?,
     })
 }
 
@@ -1433,7 +1445,7 @@ fn c_abi_clif_type(ty: &TypeExpr, aliases: &BTreeMap<String, TypeExpr>) -> Type 
     match resolve_alias_ty(ty, aliases) {
         TypeExpr::Named { name, .. } => match ScalarKind::from_name(&name) {
             Some(ScalarKind::I8 | ScalarKind::U8) => types::I8,
-            Some(ScalarKind::I16 | ScalarKind::U16) => types::I16,
+            Some(ScalarKind::I16 | ScalarKind::U16 | ScalarKind::F16 | ScalarKind::BF16) => types::I16,
             Some(ScalarKind::I32 | ScalarKind::U32) => types::I32,
             Some(ScalarKind::F32) => types::F32,
             Some(ScalarKind::F64) => types::F64,
@@ -1833,7 +1845,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let t = self.builder.ins().ireduce(types::I32, val);
                 self.builder.ins().uextend(types::I64, t)
             }
-            ScalarKind::I64 | ScalarKind::U64 | ScalarKind::F32 | ScalarKind::F64 => val,
+            ScalarKind::I64 | ScalarKind::U64 | ScalarKind::F16 | ScalarKind::BF16 | ScalarKind::F32 | ScalarKind::F64 => val,
         }
     }
 
@@ -1872,7 +1884,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 Some(ScalarKind::I8) => -1,
                 Some(ScalarKind::U8) => 1,
                 Some(ScalarKind::I16) => -2,
-                Some(ScalarKind::U16) => 2,
+                Some(ScalarKind::U16 | ScalarKind::F16 | ScalarKind::BF16) => 2,
                 Some(ScalarKind::I32) => -4,
                 Some(ScalarKind::U32 | ScalarKind::F32) => 4,
                 None if matches!(&resolved, TypeExpr::Named { name, .. } if name == "Bool") => 1,
@@ -1895,7 +1907,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let v = self.builder.ins().load(types::I16, flags, base_ptr, byte_off);
                 self.builder.ins().sextend(types::I64, v)
             }
-            Some(ScalarKind::U16) => {
+            Some(ScalarKind::U16 | ScalarKind::F16 | ScalarKind::BF16) => {
                 let v = self.builder.ins().load(types::I16, flags, base_ptr, byte_off);
                 self.builder.ins().uextend(types::I64, v)
             }
@@ -1949,7 +1961,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
             };
             let w: i64 = match sk {
                 Some(ScalarKind::I8 | ScalarKind::U8) => 1,
-                Some(ScalarKind::I16 | ScalarKind::U16) => 2,
+                Some(ScalarKind::I16 | ScalarKind::U16 | ScalarKind::F16 | ScalarKind::BF16) => 2,
                 Some(ScalarKind::I32 | ScalarKind::U32 | ScalarKind::F32) => 4,
                 None if matches!(&resolved, TypeExpr::Named { name, .. } if name == "Bool") => 1,
                 _ => 8,
@@ -1965,7 +1977,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let t = self.builder.ins().ireduce(types::I8, val);
                 self.builder.ins().store(flags, t, base_ptr, byte_off);
             }
-            Some(ScalarKind::I16 | ScalarKind::U16) => {
+            Some(ScalarKind::I16 | ScalarKind::U16 | ScalarKind::F16 | ScalarKind::BF16) => {
                 let t = self.builder.ins().ireduce(types::I16, val);
                 self.builder.ins().store(flags, t, base_ptr, byte_off);
             }
@@ -1997,6 +2009,94 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
 
         match (src_sk, dst_sk) {
+            (Some(ScalarKind::F16), Some(ScalarKind::F16))
+            | (Some(ScalarKind::BF16), Some(ScalarKind::BF16)) => val,
+            (Some(ScalarKind::F16), Some(ScalarKind::F64)) => {
+                self.call_rt_1(self.rt.f16_to_f64, val)
+            }
+            (Some(ScalarKind::BF16), Some(ScalarKind::F64)) => {
+                self.call_rt_1(self.rt.bf16_to_f64, val)
+            }
+            (Some(ScalarKind::F64), Some(ScalarKind::F16)) => {
+                self.call_rt_1(self.rt.f64_to_f16, val)
+            }
+            (Some(ScalarKind::F64), Some(ScalarKind::BF16)) => {
+                self.call_rt_1(self.rt.f64_to_bf16, val)
+            }
+            (Some(ScalarKind::F16), Some(ScalarKind::F32)) => {
+                let d64 = self.call_rt_1(self.rt.f16_to_f64, val);
+                let f64v = self.builder.ins().bitcast(types::F64, MemFlags::new(), d64);
+                let f32v = self.builder.ins().fdemote(types::F32, f64v);
+                let i32v = self.builder.ins().bitcast(types::I32, MemFlags::new(), f32v);
+                self.builder.ins().uextend(types::I64, i32v)
+            }
+            (Some(ScalarKind::BF16), Some(ScalarKind::F32)) => {
+                let d64 = self.call_rt_1(self.rt.bf16_to_f64, val);
+                let f64v = self.builder.ins().bitcast(types::F64, MemFlags::new(), d64);
+                let f32v = self.builder.ins().fdemote(types::F32, f64v);
+                let i32v = self.builder.ins().bitcast(types::I32, MemFlags::new(), f32v);
+                self.builder.ins().uextend(types::I64, i32v)
+            }
+            (Some(ScalarKind::F32), Some(ScalarKind::F16)) => {
+                let i32v = self.builder.ins().ireduce(types::I32, val);
+                let f32v = self.builder.ins().bitcast(types::F32, MemFlags::new(), i32v);
+                let f64v = self.builder.ins().fpromote(types::F64, f32v);
+                let d64 = self.builder.ins().bitcast(types::I64, MemFlags::new(), f64v);
+                self.call_rt_1(self.rt.f64_to_f16, d64)
+            }
+            (Some(ScalarKind::F32), Some(ScalarKind::BF16)) => {
+                let i32v = self.builder.ins().ireduce(types::I32, val);
+                let f32v = self.builder.ins().bitcast(types::F32, MemFlags::new(), i32v);
+                let f64v = self.builder.ins().fpromote(types::F64, f32v);
+                let d64 = self.builder.ins().bitcast(types::I64, MemFlags::new(), f64v);
+                self.call_rt_1(self.rt.f64_to_bf16, d64)
+            }
+            (Some(ScalarKind::F16), Some(ScalarKind::BF16)) => {
+                let d64 = self.call_rt_1(self.rt.f16_to_f64, val);
+                self.call_rt_1(self.rt.f64_to_bf16, d64)
+            }
+            (Some(ScalarKind::BF16), Some(ScalarKind::F16)) => {
+                let d64 = self.call_rt_1(self.rt.bf16_to_f64, val);
+                self.call_rt_1(self.rt.f64_to_f16, d64)
+            }
+            (Some(ScalarKind::F16), Some(dk)) if dk.is_int() => {
+                let d64 = self.call_rt_1(self.rt.f16_to_f64, val);
+                let f64v = self.builder.ins().bitcast(types::F64, MemFlags::new(), d64);
+                let iv = if dk.is_unsigned() {
+                    self.builder.ins().fcvt_to_uint_sat(types::I64, f64v)
+                } else {
+                    self.builder.ins().fcvt_to_sint_sat(types::I64, f64v)
+                };
+                self.normalize_scalar(iv, dk)
+            }
+            (Some(ScalarKind::BF16), Some(dk)) if dk.is_int() => {
+                let d64 = self.call_rt_1(self.rt.bf16_to_f64, val);
+                let f64v = self.builder.ins().bitcast(types::F64, MemFlags::new(), d64);
+                let iv = if dk.is_unsigned() {
+                    self.builder.ins().fcvt_to_uint_sat(types::I64, f64v)
+                } else {
+                    self.builder.ins().fcvt_to_sint_sat(types::I64, f64v)
+                };
+                self.normalize_scalar(iv, dk)
+            }
+            (sk, Some(ScalarKind::F16)) if sk != Some(ScalarKind::F16) => {
+                let f64v = if sk.is_some_and(|k| k.is_unsigned()) {
+                    self.builder.ins().fcvt_from_uint(types::F64, val)
+                } else {
+                    self.builder.ins().fcvt_from_sint(types::F64, val)
+                };
+                let d64 = self.builder.ins().bitcast(types::I64, MemFlags::new(), f64v);
+                self.call_rt_1(self.rt.f64_to_f16, d64)
+            }
+            (sk, Some(ScalarKind::BF16)) if sk != Some(ScalarKind::BF16) => {
+                let f64v = if sk.is_some_and(|k| k.is_unsigned()) {
+                    self.builder.ins().fcvt_from_uint(types::F64, val)
+                } else {
+                    self.builder.ins().fcvt_from_sint(types::F64, val)
+                };
+                let d64 = self.builder.ins().bitcast(types::I64, MemFlags::new(), f64v);
+                self.call_rt_1(self.rt.f64_to_bf16, d64)
+            }
             (Some(ScalarKind::F64), Some(ScalarKind::F32)) => {
                 let f64v = self.builder.ins().bitcast(types::F64, MemFlags::new(), val);
                 let f32v = self.builder.ins().fdemote(types::F32, f64v);
@@ -2065,7 +2165,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let pb = resolve_alias_ty(pt, self.alias_bases);
                 match scalar_kind_of_ty(&pb, self.alias_bases) {
                     Some(ScalarKind::I8 | ScalarKind::U8) => self.builder.ins().ireduce(types::I8, raw),
-                    Some(ScalarKind::I16 | ScalarKind::U16) => self.builder.ins().ireduce(types::I16, raw),
+                    Some(ScalarKind::I16 | ScalarKind::U16 | ScalarKind::F16 | ScalarKind::BF16) => self.builder.ins().ireduce(types::I16, raw),
                     Some(ScalarKind::I32 | ScalarKind::U32) => self.builder.ins().ireduce(types::I32, raw),
                     Some(ScalarKind::F32) => {
                         let i32v = self.builder.ins().ireduce(types::I32, raw);
@@ -2092,7 +2192,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 Some(ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I32) => {
                     self.builder.ins().sextend(types::I64, rval)
                 }
-                Some(ScalarKind::U8 | ScalarKind::U16 | ScalarKind::U32) => {
+                Some(ScalarKind::U8 | ScalarKind::U16 | ScalarKind::U32 | ScalarKind::F16 | ScalarKind::BF16) => {
                     self.builder.ins().uextend(types::I64, rval)
                 }
                 Some(ScalarKind::F32) => {
@@ -2654,6 +2754,26 @@ impl<'a, 'b> FnLower<'a, 'b> {
         is_float: bool,
         sk: Option<ScalarKind>,
     ) -> Value {
+        if matches!(sk, Some(ScalarKind::F16 | ScalarKind::BF16)) {
+            let (to_f64, from_f64) = if sk == Some(ScalarKind::F16) {
+                (self.rt.f16_to_f64, self.rt.f64_to_f16)
+            } else {
+                (self.rt.bf16_to_f64, self.rt.f64_to_bf16)
+            };
+            let c64 = self.call_rt_1(to_f64, cur);
+            let r64 = self.call_rt_1(to_f64, rhs);
+            let cf = self.builder.ins().bitcast(types::F64, MemFlags::new(), c64);
+            let rf = self.builder.ins().bitcast(types::F64, MemFlags::new(), r64);
+            let res = match op {
+                AssignOp::AddSet => self.builder.ins().fadd(cf, rf),
+                AssignOp::SubSet => self.builder.ins().fsub(cf, rf),
+                AssignOp::MulSet => self.builder.ins().fmul(cf, rf),
+                AssignOp::DivSet => self.builder.ins().fdiv(cf, rf),
+                _ => rf,
+            };
+            let o64 = self.builder.ins().bitcast(types::I64, MemFlags::new(), res);
+            return self.call_rt_1(from_f64, o64);
+        }
         if sk == Some(ScalarKind::F32) {
             let c32 = self.builder.ins().ireduce(types::I32, cur);
             let r32 = self.builder.ins().ireduce(types::I32, rhs);
@@ -4162,7 +4282,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 self.flush_temps(&temps);
                 match op {
                     UnOp::Neg => {
-                        if sk == Some(ScalarKind::F32) {
+                        if matches!(sk, Some(ScalarKind::F16 | ScalarKind::BF16)) {
+                            let mask = self.builder.ins().iconst(types::I64, 0x8000);
+                            Ok(self.builder.ins().bxor(v, mask))
+                        } else if sk == Some(ScalarKind::F32) {
                             let i32v = self.builder.ins().ireduce(types::I32, v);
                             let fv = self.builder.ins().bitcast(types::F32, MemFlags::new(), i32v);
                             let neg = self.builder.ins().fneg(fv);
@@ -4265,6 +4388,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let eff_sk = match (lk, rk) {
                     (Some(ScalarKind::I64), Some(k)) if k != ScalarKind::I64 && matches!(left.kind, ExprKind::Int(_)) => Some(k),
                     (Some(ScalarKind::F32), _) | (_, Some(ScalarKind::F32)) => Some(ScalarKind::F32),
+                    (Some(ScalarKind::F16), _) | (_, Some(ScalarKind::F16)) => Some(ScalarKind::F16),
+                    (Some(ScalarKind::BF16), _) | (_, Some(ScalarKind::BF16)) => Some(ScalarKind::BF16),
                     (Some(k), _) => Some(k),
                     (None, k) => k,
                 };
@@ -4288,6 +4413,65 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     return Ok(self.builder.ins().uextend(types::I64, ne));
                 }
                 self.flush_temps(&temps);
+                if matches!(eff_sk, Some(ScalarKind::F16 | ScalarKind::BF16)) {
+                    let (to_f64, from_f64) = if eff_sk == Some(ScalarKind::F16) {
+                        (self.rt.f16_to_f64, self.rt.f64_to_f16)
+                    } else {
+                        (self.rt.bf16_to_f64, self.rt.f64_to_bf16)
+                    };
+                    let l64 = self.call_rt_1(to_f64, l);
+                    let r64 = self.call_rt_1(to_f64, r);
+                    let lf = self.builder.ins().bitcast(types::F64, MemFlags::new(), l64);
+                    let rf = self.builder.ins().bitcast(types::F64, MemFlags::new(), r64);
+                    let v = match op {
+                        BinOp::Add => {
+                            let fv = self.builder.ins().fadd(lf, rf);
+                            let b64 = self.builder.ins().bitcast(types::I64, MemFlags::new(), fv);
+                            self.call_rt_1(from_f64, b64)
+                        }
+                        BinOp::Sub => {
+                            let fv = self.builder.ins().fsub(lf, rf);
+                            let b64 = self.builder.ins().bitcast(types::I64, MemFlags::new(), fv);
+                            self.call_rt_1(from_f64, b64)
+                        }
+                        BinOp::Mul => {
+                            let fv = self.builder.ins().fmul(lf, rf);
+                            let b64 = self.builder.ins().bitcast(types::I64, MemFlags::new(), fv);
+                            self.call_rt_1(from_f64, b64)
+                        }
+                        BinOp::Div => {
+                            let fv = self.builder.ins().fdiv(lf, rf);
+                            let b64 = self.builder.ins().bitcast(types::I64, MemFlags::new(), fv);
+                            self.call_rt_1(from_f64, b64)
+                        }
+                        BinOp::Eq => {
+                            let c = self.builder.ins().fcmp(FloatCC::Equal, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        BinOp::Ne => {
+                            let c = self.builder.ins().fcmp(FloatCC::NotEqual, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        BinOp::Lt => {
+                            let c = self.builder.ins().fcmp(FloatCC::LessThan, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        BinOp::Le => {
+                            let c = self.builder.ins().fcmp(FloatCC::LessThanOrEqual, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        BinOp::Gt => {
+                            let c = self.builder.ins().fcmp(FloatCC::GreaterThan, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        BinOp::Ge => {
+                            let c = self.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, lf, rf);
+                            self.builder.ins().uextend(types::I64, c)
+                        }
+                        other => return Err(format!("unsupported float16/bfloat16 op {:?} in codegen", other)),
+                    };
+                    return Ok(v);
+                }
                 if eff_sk == Some(ScalarKind::F32) {
                     let l32 = self.builder.ins().ireduce(types::I32, l);
                     let r32 = self.builder.ins().ireduce(types::I32, r);

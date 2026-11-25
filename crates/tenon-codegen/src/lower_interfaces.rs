@@ -493,6 +493,10 @@ impl LowerCtx {
         let mut cur = ty.clone();
         for _ in 0..8 {
             if let TypeExpr::Named { name, args, .. } = &cur {
+                if let Some(ta) = self.type_aliases.get(name) {
+                    cur = instantiate_alias_base(ta, args);
+                    continue;
+                }
                 if args.is_empty() {
                     if let Some(base) = self.alias_bases.get(name) {
                         cur = base.clone();
@@ -508,7 +512,7 @@ impl LowerCtx {
     fn is_float_ty(&self, ty: &TypeExpr) -> bool {
         matches!(
             self.resolve_alias(ty),
-            TypeExpr::Named { ref name, .. } if matches!(name.as_str(), "Float" | "Float64" | "Float32")
+            TypeExpr::Named { ref name, .. } if matches!(name.as_str(), "Float" | "Float64" | "Float32" | "Float16" | "BFloat16")
         )
     }
 
@@ -616,7 +620,13 @@ impl LowerCtx {
                     let targs: Vec<TypeExpr> = rec
                         .type_params
                         .iter()
-                        .map(|tp| subst.get(tp).cloned().unwrap_or_else(|| named_ty("Any")))
+                        .map(|tp| {
+                            subst
+                                .get(tp)
+                                .cloned()
+                                .or_else(|| rec.type_param_defaults.get(tp).cloned())
+                                .unwrap_or_else(|| named_ty("Any"))
+                        })
                         .collect();
                     return generic_ty(name, targs);
                 }
@@ -1418,10 +1428,43 @@ impl LowerCtx {
         type_params: &[String],
         subst: &mut BTreeMap<String, TypeExpr>,
     ) {
-        match (pat, actual) {
+        let mut act = self.resolve_alias(actual);
+        if let TypeExpr::Named { name, args, version, span } = &act {
+            if let Some(rec) = self.generic_records.get(name) {
+                if !rec.type_params.is_empty()
+                    && (args.len() < rec.type_params.len()
+                        || args.iter().any(|a| a.as_named_arg().is_some()))
+                {
+                    let (bindings, _) = resolve_type_args(
+                        &rec.type_params,
+                        &rec.type_param_defaults,
+                        None,
+                        args,
+                    );
+                    let filled: Vec<TypeExpr> = rec
+                        .type_params
+                        .iter()
+                        .map(|tp| bindings.get(tp).cloned().unwrap_or_else(|| named_ty("Any")))
+                        .collect();
+                    act = TypeExpr::Named {
+                        name: name.clone(),
+                        version: version.clone(),
+                        args: filled,
+                        span: *span,
+                    };
+                }
+            }
+        }
+        let pat_res = match pat {
+            TypeExpr::Named { name, args, .. } if args.is_empty() && type_params.contains(name) => {
+                pat.clone()
+            }
+            _ => self.resolve_alias(pat),
+        };
+        match (&pat_res, &act) {
             (TypeExpr::Named { name, args, .. }, _) if args.is_empty() && type_params.contains(name) => {
-                if actual.display_name() != "Any" {
-                    subst.entry(name.clone()).or_insert_with(|| actual.clone());
+                if act.display_name() != "Any" {
+                    subst.entry(name.clone()).or_insert_with(|| act.clone());
                 }
             }
             (
@@ -4194,6 +4237,7 @@ impl LowerCtx {
                     name: mono_name.clone(),
                     type_params: Vec::new(),
                     type_param_bounds: BTreeMap::new(),
+                    type_param_defaults: BTreeMap::new(),
                     variants: Vec::new(),
                     span: tmpl.span,
                 };
@@ -4240,6 +4284,7 @@ impl LowerCtx {
                     name: mono_name.clone(),
                     type_params: Vec::new(),
                     type_param_bounds: BTreeMap::new(),
+                    type_param_defaults: BTreeMap::new(),
                     fields: Vec::new(),
                     where_clauses: Vec::new(),
                     invariants: Vec::new(),
@@ -4270,6 +4315,12 @@ impl LowerCtx {
                 args,
                 span,
             } => {
+                if let Some(ta) = self.type_aliases.get(name).cloned() {
+                    if !ta.type_params.is_empty() {
+                        let inst = instantiate_alias_base(&ta, args);
+                        return self.rewrite_generic_record_ty(&inst);
+                    }
+                }
                 if let Some(bl) = self.bitfields.get(name) {
                     return TypeExpr::Named {
                         name: bl.backing.canonical_name().to_string(),
@@ -4278,23 +4329,49 @@ impl LowerCtx {
                         span: *span,
                     };
                 }
-                if self.generic_records.contains_key(name) && !args.is_empty() {
-                    let mono_name = self.ensure_record_monomorphized(name, args);
-                    return TypeExpr::Named {
-                        name: mono_name,
-                        version: version.clone(),
-                        args: Vec::new(),
-                        span: *span,
-                    };
+                if let Some(rec) = self.generic_records.get(name).cloned() {
+                    if !args.is_empty() || !rec.type_param_defaults.is_empty() {
+                        let (bindings, _) = resolve_type_args(
+                            &rec.type_params,
+                            &rec.type_param_defaults,
+                            None,
+                            args,
+                        );
+                        let filled: Vec<TypeExpr> = rec
+                            .type_params
+                            .iter()
+                            .map(|tp| bindings.get(tp).cloned().unwrap_or_else(|| named_ty("Any")))
+                            .collect();
+                        let mono_name = self.ensure_record_monomorphized(name, &filled);
+                        return TypeExpr::Named {
+                            name: mono_name,
+                            version: version.clone(),
+                            args: Vec::new(),
+                            span: *span,
+                        };
+                    }
                 }
-                if self.generic_enums.contains_key(name) && !args.is_empty() {
-                    let mono_name = self.ensure_enum_monomorphized(name, args);
-                    return TypeExpr::Named {
-                        name: mono_name,
-                        version: version.clone(),
-                        args: Vec::new(),
-                        span: *span,
-                    };
+                if let Some(en) = self.generic_enums.get(name).cloned() {
+                    if !args.is_empty() || !en.type_param_defaults.is_empty() {
+                        let (bindings, _) = resolve_type_args(
+                            &en.type_params,
+                            &en.type_param_defaults,
+                            None,
+                            args,
+                        );
+                        let filled: Vec<TypeExpr> = en
+                            .type_params
+                            .iter()
+                            .map(|tp| bindings.get(tp).cloned().unwrap_or_else(|| named_ty("Any")))
+                            .collect();
+                        let mono_name = self.ensure_enum_monomorphized(name, &filled);
+                        return TypeExpr::Named {
+                            name: mono_name,
+                            version: version.clone(),
+                            args: Vec::new(),
+                            span: *span,
+                        };
+                    }
                 }
                 TypeExpr::Named {
                     name: name.clone(),
@@ -4451,11 +4528,20 @@ impl LowerCtx {
             ExprKind::RecordLit { name, fields, .. } => {
                 if let Some(tmpl) = self.generic_records.get(name.as_str()).cloned() {
                     let mut subst = BTreeMap::new();
-                    if let Some(TypeExpr::Named { name: en, args: ea, .. }) = expected_ty {
-                        if en == name {
-                            for (tp, ta) in tmpl.type_params.iter().zip(ea.iter()) {
-                                if ta.display_name() != "Any" {
-                                    subst.insert(tp.clone(), ta.clone());
+                    if let Some(exp) = expected_ty {
+                        let resolved_exp = self.resolve_alias(exp);
+                        if let TypeExpr::Named { name: en, args: ea, .. } = &resolved_exp {
+                            if en == name {
+                                let (eb, _) = resolve_type_args(
+                                    &tmpl.type_params,
+                                    &tmpl.type_param_defaults,
+                                    None,
+                                    ea,
+                                );
+                                for (k, v) in eb {
+                                    if v.display_name() != "Any" {
+                                        subst.insert(k, v);
+                                    }
                                 }
                             }
                         }
@@ -4469,7 +4555,13 @@ impl LowerCtx {
                     let concrete_args: Vec<TypeExpr> = tmpl
                         .type_params
                         .iter()
-                        .map(|tp| subst.get(tp).cloned().unwrap_or_else(|| named_ty("Int")))
+                        .map(|tp| {
+                            subst
+                                .get(tp)
+                                .cloned()
+                                .or_else(|| tmpl.type_param_defaults.get(tp).cloned())
+                                .unwrap_or_else(|| named_ty("Int"))
+                        })
                         .collect();
                     for (fname, fval) in fields.iter_mut() {
                         let f_exp = tmpl
@@ -5477,6 +5569,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
     if !ctx.generic_records.is_empty()
         || !ctx.generic_enums.is_empty()
         || !ctx.bitfields.is_empty()
+        || ctx.type_aliases.values().any(|t| !t.type_params.is_empty())
     {
         let mut rewritten_items: Vec<Item> = Vec::with_capacity(final_items.len());
         for mut item in final_items {
@@ -5513,7 +5606,9 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
                     }
                 }
                 Item::TypeAlias(ta) => {
-                    ta.base = ctx.rewrite_generic_record_ty(&ta.base);
+                    if ta.type_params.is_empty() {
+                        ta.base = ctx.rewrite_generic_record_ty(&ta.base);
+                    }
                 }
                 Item::Fn(f) => {
                     let mut vt = BTreeMap::new();

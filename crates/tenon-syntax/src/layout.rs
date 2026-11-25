@@ -17,6 +17,8 @@ pub enum ScalarKind {
     U16,
     U32,
     U64,
+    F16,
+    BF16,
     F32,
     F64,
 }
@@ -32,6 +34,8 @@ impl ScalarKind {
             "UInt16" => Some(Self::U16),
             "UInt32" | "CUInt" => Some(Self::U32),
             "UInt64" | "USize" | "CSize" => Some(Self::U64),
+            "Float16" => Some(Self::F16),
+            "BFloat16" => Some(Self::BF16),
             "Float32" => Some(Self::F32),
             "Float" | "Float64" => Some(Self::F64),
             _ => None,
@@ -43,7 +47,7 @@ impl ScalarKind {
     }
 
     pub fn is_float(self) -> bool {
-        matches!(self, Self::F32 | Self::F64)
+        matches!(self, Self::F16 | Self::BF16 | Self::F32 | Self::F64)
     }
 
     pub fn is_signed(self) -> bool {
@@ -57,7 +61,7 @@ impl ScalarKind {
     pub fn bit_width(self) -> u32 {
         match self {
             Self::I8 | Self::U8 => 8,
-            Self::I16 | Self::U16 => 16,
+            Self::I16 | Self::U16 | Self::F16 | Self::BF16 => 16,
             Self::I32 | Self::U32 | Self::F32 => 32,
             Self::I64 | Self::U64 | Self::F64 => 64,
         }
@@ -78,7 +82,7 @@ impl ScalarKind {
             Self::I32 => Some(i32::MIN as i128),
             Self::I64 => Some(i64::MIN as i128),
             Self::U8 | Self::U16 | Self::U32 | Self::U64 => Some(0),
-            Self::F32 | Self::F64 => None,
+            Self::F16 | Self::BF16 | Self::F32 | Self::F64 => None,
         }
     }
 
@@ -92,14 +96,14 @@ impl ScalarKind {
             Self::U16 => Some(u16::MAX as i128),
             Self::U32 => Some(u32::MAX as i128),
             Self::U64 => Some(u64::MAX as i128),
-            Self::F32 | Self::F64 => None,
+            Self::F16 | Self::BF16 | Self::F32 | Self::F64 => None,
         }
     }
 
     pub fn mask_u64(self) -> u64 {
         match self {
             Self::I8 | Self::U8 => 0xFF,
-            Self::I16 | Self::U16 => 0xFFFF,
+            Self::I16 | Self::U16 | Self::F16 | Self::BF16 => 0xFFFF,
             Self::I32 | Self::U32 | Self::F32 => 0xFFFF_FFFF,
             Self::I64 | Self::U64 | Self::F64 => u64::MAX,
         }
@@ -111,6 +115,8 @@ impl ScalarKind {
             Self::I16 | Self::U16 => "i16",
             Self::I32 | Self::U32 => "i32",
             Self::I64 | Self::U64 => "i64",
+            Self::F16 => "half",
+            Self::BF16 => "bfloat",
             Self::F32 => "float",
             Self::F64 => "double",
         }
@@ -123,7 +129,7 @@ impl ScalarKind {
             Self::I32 => "int32_t",
             Self::I64 => "int64_t",
             Self::U8 => "uint8_t",
-            Self::U16 => "uint16_t",
+            Self::U16 | Self::F16 | Self::BF16 => "uint16_t",
             Self::U32 => "uint32_t",
             Self::U64 => "uint64_t",
             Self::F32 => "float",
@@ -141,6 +147,8 @@ impl ScalarKind {
             Self::U16 => "UInt16",
             Self::U32 => "UInt32",
             Self::U64 => "UInt64",
+            Self::F16 => "Float16",
+            Self::BF16 => "BFloat16",
             Self::F32 => "Float32",
             Self::F64 => "Float",
         }

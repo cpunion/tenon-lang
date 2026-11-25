@@ -1,0 +1,117 @@
+// examples/dogfood/metal_fp16_tensor_demo.tn — Mixed-Precision FP16 Metal GPU GEMM & Variadic N-D Tensors
+//
+// Zero-glue single-binary Apple Silicon Metal demo:
+//   1. Keyword-named optional DType generics: `Matrix[4, 8, DType = Float16]` (2-byte unboxed flat `List[Float16]`)
+//   2. Variadic dependent-shape tensors: `Tensor[1, 1, 2, 3, 4, DType = Float16]` -> `Tensor[6, 4, DType = Float16]`
+//      (rank = 5 -> 2 and element conservation `1*1*2*3*4 == 6*4 == 24` statically proved by L0/Z3!)
+//   3. Single-source `@kernel` compiled to Apple Metal MSL with native `device const half*` buffers
+//      (50% VRAM bandwidth!), FP32 accumulation, and embedded shader source via `gpu_embedded_msl()`
+//   4. `@linear` leak-free Metal VRAM & pipeline lifecycles + Perceus `live_objects == 0`!
+//
+// Run (zero --c-src, zero --emit-msl needed!):
+//   ./target/release/tenon build examples/dogfood/metal_fp16_tensor_demo.tn -o /tmp/metal_fp16 && /tmp/metal_fp16
+
+import "std/core/types.tn"
+import "std/os/io.tn"
+import "std/text/text.tn"
+import "std/gpu/tensor.tn"
+import "std/gpu/metal/gpu.tn"
+
+/// Single-source Mixed-Precision FP16 GEMM kernel (`device const half*` -> FP32 accum -> `device float*`).
+@kernel(workgroup_size = (8, 8, 1))
+fn gemm_fp16_mixed(
+    a List[Float16],
+    b List[Float16],
+    inout out List[Float32],
+    params List[UInt32],
+) {
+    let row = gpu_global_id_y()
+    let col = gpu_global_id_x()
+    let m = params[0] as Int
+    let n = params[1] as Int
+    let k = params[2] as Int
+    if row < m && col < n {
+        var acc Float32 = 0.0 as Float32
+        var p = 0
+        while p < k {
+            let av = a[row * k + p] as Float32
+            let bv = b[p * n + col] as Float32
+            acc = acc + av * bv
+            p += 1
+        }
+        out[row * n + col] = acc
+    }
+}
+
+pure fn reshape_activations(
+    t Tensor[1, 1, 2, 3, 4, DType = Float16],
+) Tensor[6, 4, DType = Float16] {
+    nd_reshape(t, [6, 4])
+}
+
+fn main() Int {
+    println("=== Tenon Mixed-Precision FP16 Metal GPU + Variadic Tensor[...Shape, DType] Demo ===")
+    if !gpu_init() {
+        println("ERROR: Metal GPU unavailable")
+        return 1
+    }
+    println("Metal Device: " ++ gpu_device_name())
+
+    // 1. Variadic 5D FP16 activation tensor: Tensor[1, 1, 2, 3, 4, DType = Float16]
+    //    Compile-time verified reshape -> Tensor[6, 4, DType = Float16] (1*1*2*3*4 == 6*4 == 24)
+    var act_vals List[Float16] = list_filled(24, 0.0 as Float16)
+    var idx = 0
+    while idx < 24 {
+        let v = ((idx % 4) + 1) as Float16
+        act_vals[idx] = v
+        idx += 1
+    }
+    let act_5d Tensor[1, 1, 2, 3, 4, DType = Float16] = nd_tensor_from_data([1, 1, 2, 3, 4], act_vals)
+    let act_2d Tensor[6, 4, DType = Float16] = reshape_activations(act_5d)
+    let a_mat Matrix[6, 4, DType = Float16] = tensor2d_of(6, 4, act_2d.data)
+
+    // 2. Weight Matrix[4, 4, DType = Float16] = 2.0 * I_4 (in 2-byte IEEE-754 binary16!)
+    var w_vals List[Float16] = list_filled(16, 0.0 as Float16)
+    w_vals[0] = 2.0 as Float16
+    w_vals[5] = 2.0 as Float16
+    w_vals[10] = 2.0 as Float16
+    w_vals[15] = 2.0 as Float16
+    let w_mat Matrix[4, 4, DType = Float16] = tensor2d_of(4, 4, w_vals)
+
+    // 3. Upload true 2-byte flat Float16 buffers directly to Apple Silicon Metal GPU (50% VRAM!)
+    var buf_a = GpuBuffer.from_f16_list(a_mat.data)
+    var buf_b = GpuBuffer.from_f16_list(w_mat.data)
+    var buf_out = GpuBuffer.uninit(6 * 4 * 4)
+    let dims List[UInt32] = [6 as UInt32, 4 as UInt32, 4 as UInt32, 0 as UInt32]
+    var buf_params = GpuBuffer.from_u32_list(dims)
+
+    println("Uploaded Matrix[6, 4, DType = Float16]: " ++ int_to_text(buf_a.byte_len) ++ " bytes (2 bytes/elem!)")
+    println("Uploaded Matrix[4, 4, DType = Float16]: " ++ int_to_text(buf_b.byte_len) ++ " bytes (2 bytes/elem!)")
+
+    let msl = gpu_embedded_msl()
+    var pipe = GpuComputePipeline.compile_msl(msl, "gemm_fp16_mixed")
+    let ok = pipe.dispatch4(buf_a, buf_b, buf_out, buf_params, 4, 6, 1)
+    assert ok
+
+    var out_f32 List[Float32] = list_filled(24, 0.0 as Float32)
+    let _ = buf_out.read_into_f32(out_f32)
+
+    // Verify exact FP16 * FP16 -> FP32 results: row r has [1,2,3,4] * 2*I_4 = [2, 4, 6, 8]!
+    let c0 = float_to_int(out_f32[0] as Float)
+    let c1 = float_to_int(out_f32[1] as Float)
+    let c2 = float_to_int(out_f32[2] as Float)
+    let c3 = float_to_int(out_f32[3] as Float)
+    let c23 = float_to_int(out_f32[23] as Float)
+    println("Metal FP16 GEMM Row 0: [" ++ int_to_text(c0) ++ ", " ++ int_to_text(c1) ++ ", " ++ int_to_text(c2) ++ ", " ++ int_to_text(c3) ++ "] (last=" ++ int_to_text(c23) ++ ")")
+    assert c0 == 2 && c1 == 4 && c2 == 6 && c3 == 8 && c23 == 8
+
+    // Deterministic `@linear` resource teardown
+    pipe.destroy()
+    buf_a.destroy()
+    buf_b.destroy()
+    buf_out.destroy()
+    buf_params.destroy()
+
+    println("PASS: Native Apple Metal `half` (Float16) GEMM + Verified 5D->2D Tensor Reshape succeeded!")
+    0
+}

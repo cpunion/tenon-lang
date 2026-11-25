@@ -1,8 +1,20 @@
-// std/gpu/tensor.tn — Dependent-Shape Tensor Primitives & Static Dimension Proofs
+// std/gpu/tensor.tn — Dependent-Shape Tensor Primitives, Optional DType & Variadic Shape Packs
 //
-// Matrix dimensions (`rows`, `cols`) and backing data lengths (`len(data) == rows * cols`)
-// are verified at compile time via L0/Z3 contracts. Passing mismatched shapes to `tensor2d_matmul`
-// or `tensor2d_add_relu` is rejected BEFORE execution with a Z3 counterexample!
+// Supports:
+//   - Optional & keyword-named element DType:
+//       `Matrix[4, 8]`                   (defaults to Float32)
+//       `Matrix[4, 8, Float16]`          (positional IEEE-754 half precision, 2B/elem)
+//       `Matrix[4, 8, DType = Float16]`  (keyword-named DType)
+//       `Matrix[4, 8, DType = BFloat16]` (keyword-named brain-float16, 2B/elem)
+//   - Variadic N-dimensional compile-time shape packs:
+//       `Tensor[4]`
+//       `Tensor[4, 8]`
+//       `Tensor[2, 16, 64, DType = Float16]`
+//       `Tensor[1, 1, 2, 3, 4]`          (rank = 5, numel = 1*1*2*3*4 = 24 proved at compile time!)
+//       `Shape[1, 1, 2, 3, 4]`
+//
+// All shape dimensions, backing lengths (`len(data) == R * C` / `prod(Shape)`), and element DTypes
+// are verified at compile time via L0/Z3 contracts before execution.
 
 import "std/core/types.tn"
 
@@ -14,15 +26,33 @@ pub record MatMulParams {
     _pad UInt32
 }
 
-pub record Tensor2D {
+/// 2D dense tensor parameterized by optional element `DType` (defaults to `Float32`).
+/// Backwards-compatible: bare `Tensor2D` resolves directly to `Tensor2D[Float32]`.
+pub record Tensor2D[DType = Float32] {
     rows Positive
     cols Positive
-    data List[Float32]
+    data List[DType]
 }
 
-/// Const-Generic Dependent-Shape Matrix Type Alias (`Matrix[R, C]`):
-/// Encodes exact row/column dimensions & backing length right in the type signature!
-pub type Matrix[R Int, C Int] = Tensor2D where self.rows == R && self.cols == C && len(self.data) == R * C
+/// Const-Generic Dependent-Shape Matrix Type Alias (`Matrix[R, C]` / `Matrix[R, C, DType = Float16]`):
+/// Encodes exact row/column dimensions, backing length, and element DType right in the type signature!
+pub type Matrix[R Int, C Int, DType = Float32] =
+    Tensor2D[DType] where self.rows == R && self.cols == C && len(self.data) == R * C
+
+/// General N-dimensional dense tensor parameterized by optional element `DType` (defaults to `Float32`).
+pub record NdTensor[DType = Float32] {
+    shape List[Positive]
+    data  List[DType]
+}
+
+/// Variadic Dependent-Shape Tensor (`Tensor[4]`, `Tensor[4, 8]`, `Tensor[1, 1, 2, 3, 4, DType = Float16]`):
+/// Statically verifies rank (`len(self.shape) == len(Shape)`), exact element count
+/// (`len(self.data) == prod(Shape)`), and element `DType` at compile time!
+pub type Tensor[...Shape Int, DType = Float32] =
+    NdTensor[DType] where len(self.shape) == len(Shape) && len(self.data) == prod(Shape)
+
+/// Variadic Dependent-Rank Shape descriptor (`Shape[4]`, `Shape[1, 1, 2, 3, 4]`).
+pub type Shape[...Dims Int] = List[Positive] where len(self) == len(Dims)
 
 pub pure fn tensor2d_zeros(
     r Int where 1 <= self && self <= 4096,
@@ -45,6 +75,122 @@ pub pure fn tensor2d_from_data(
     ensures result.rows == r && result.cols == c && len(result.data) == r * c
 {
     Tensor2D { rows = r, cols = c, data = data }
+}
+
+/// Polymorphic 2D tensor constructor for any element DType (`Float16`, `BFloat16`, `Float32`, `Float64`).
+pub pure fn tensor2d_of[DType](
+    r Int where 1 <= self && self <= 4096,
+    c Int where 1 <= self && self <= 4096,
+    data List[DType],
+) Tensor2D[DType]
+    requires len(data) == r * c
+    ensures result.rows == r && result.cols == c && len(result.data) == r * c
+{
+    Tensor2D { rows = r, cols = c, data = data }
+}
+
+pub pure fn tensor2d_zeros_f16(
+    r Int where 1 <= self && self <= 4096,
+    c Int where 1 <= self && self <= 4096,
+) Tensor2D[DType = Float16]
+    ensures result.rows == r && result.cols == c && len(result.data) == r * c
+{
+    let n = r * c
+    let zero Float16 = 0.0 as Float16
+    let data List[Float16] = list_filled(n, zero)
+    Tensor2D { rows = r, cols = c, data = data }
+}
+
+pub pure fn tensor2d_zeros_bf16(
+    r Int where 1 <= self && self <= 4096,
+    c Int where 1 <= self && self <= 4096,
+) Tensor2D[DType = BFloat16]
+    ensures result.rows == r && result.cols == c && len(result.data) == r * c
+{
+    let n = r * c
+    let zero BFloat16 = 0.0 as BFloat16
+    let data List[BFloat16] = list_filled(n, zero)
+    Tensor2D { rows = r, cols = c, data = data }
+}
+
+/// Converts a `Tensor2D[Float32]` to compact 2-byte `Tensor2D[Float16]` (half RAM/VRAM!).
+pub pure fn tensor2d_to_f16(a Tensor2D) Tensor2D[DType = Float16]
+    requires a.rows <= 4096 && a.cols <= 4096
+    requires len(a.data) == a.rows * a.cols
+    ensures result.rows == a.rows && result.cols == a.cols && len(result.data) == a.rows * a.cols
+{
+    let total = a.rows * a.cols
+    let z Float16 = 0.0 as Float16
+    var out List[Float16] = list_filled(total, z)
+    var i = 0
+    while i < total {
+        out[i] = a.data[i] as Float16
+        i += 1
+    }
+    Tensor2D { rows = a.rows, cols = a.cols, data = out }
+}
+
+/// Upcasts a `Tensor2D[Float16]` back to `Tensor2D[Float32]`.
+pub pure fn tensor2d_f16_to_f32(a Tensor2D[DType = Float16]) Tensor2D
+    requires a.rows <= 4096 && a.cols <= 4096
+    requires len(a.data) == a.rows * a.cols
+    ensures result.rows == a.rows && result.cols == a.cols && len(result.data) == a.rows * a.cols
+{
+    let total = a.rows * a.cols
+    let z Float32 = 0.0 as Float32
+    var out List[Float32] = list_filled(total, z)
+    var i = 0
+    while i < total {
+        out[i] = a.data[i] as Float32
+        i += 1
+    }
+    Tensor2D { rows = a.rows, cols = a.cols, data = out }
+}
+
+/// Verified N-dimensional tensor constructor preserving exact rank and element count.
+pub pure fn nd_tensor_from_data[DType](
+    shape List[Positive],
+    data List[DType],
+) NdTensor[DType]
+    ensures len(result.shape) == len(shape) && len(result.data) == len(data)
+{
+    NdTensor { shape = shape, data = data }
+}
+
+/// Zero-initialized N-dimensional `Float32` tensor with verified rank & element count.
+pub pure fn nd_tensor_zeros(
+    shape List[Positive],
+    total Int where 1 <= self && self <= 16777216,
+) NdTensor
+    ensures len(result.shape) == len(shape) && len(result.data) == total
+{
+    let z Float32 = 0.0 as Float32
+    let data List[Float32] = list_filled(total, z)
+    NdTensor { shape = shape, data = data }
+}
+
+/// Zero-initialized N-dimensional `Float16` tensor (2 bytes/elem) with verified rank & element count.
+pub pure fn nd_tensor_zeros_f16(
+    shape List[Positive],
+    total Int where 1 <= self && self <= 16777216,
+) NdTensor[DType = Float16]
+    ensures len(result.shape) == len(shape) && len(result.data) == total
+{
+    let z Float16 = 0.0 as Float16
+    let data List[Float16] = list_filled(total, z)
+    NdTensor { shape = shape, data = data }
+}
+
+/// Zero-copy-friendly verified N-D reshape: preserves backing element count (`len(result.data) == len(t.data)`),
+/// so `let r Tensor[6, 4] = nd_reshape(t, [6, 4])` proves `prod([1,1,2,3,4]) == prod([6,4])` (`24 == 24`)
+/// at compile time and rejects `Tensor[5, 5]` (`24 != 25`) with a Z3 counterexample!
+pub pure fn nd_reshape[DType](
+    t NdTensor[DType],
+    new_shape List[Positive],
+) NdTensor[DType]
+    ensures len(result.shape) == len(new_shape) && len(result.data) == len(t.data)
+{
+    NdTensor { shape = new_shape, data = t.data }
 }
 
 /// Verified Matrix Multiplication `C[M, N] = A[M, K] * B[K, N]`.

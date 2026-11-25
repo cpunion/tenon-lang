@@ -1,4 +1,5 @@
-// std/gpu/tensor_test.tn — Colocated Tests for Verified Dependent-Shape Tensors & FiniteFloat
+// std/gpu/tensor_test.tn — Colocated Tests for Verified Dependent-Shape Tensors,
+// Keyword Optional DTypes (`Float16` / `BFloat16` / `Float32`), and Variadic Shape Packs!
 import "std/core/types.tn"
 import "std/gpu/tensor.tn"
 
@@ -6,13 +7,29 @@ pure fn safe_flex_ratio(w NonNegFloat, count FiniteFloat where self > 0.0) Finit
     w / count
 }
 
+pure fn check_fp16_matrix(m Matrix[2, 3, DType = Float16]) Float32 {
+    (m.data[0] + m.data[5]) as Float32
+}
+
+pure fn check_bf16_matrix(m Matrix[2, 3, DType = BFloat16]) Float32 {
+    (m.data[0] + m.data[5]) as Float32
+}
+
+pure fn reshape_5d_to_2d(t Tensor[1, 1, 2, 3, 4]) Tensor[6, 4] {
+    nd_reshape(t, [6, 4])
+}
+
+pure fn reshape_5d_f16_to_3d(t Tensor[1, 1, 2, 3, 4, DType = Float16]) Tensor[2, 3, 4, DType = Float16] {
+    nd_reshape(t, [2, 3, 4])
+}
+
 test fn test_tensor2d_matmul_and_add_relu_verified() {
-    // A: 2x3, B: 3x2 -> C: 2x2
+    // A: 2x3, B: 3x2 -> C: 2x2 (default DType = Float32)
     let a_data List[Float32] = [1.0 as Float32, 2.0 as Float32, 3.0 as Float32, 4.0 as Float32, 5.0 as Float32, 6.0 as Float32]
     let b_data List[Float32] = [7.0 as Float32, 8.0 as Float32, 9.0 as Float32, 10.0 as Float32, 11.0 as Float32, 12.0 as Float32]
-    let a = tensor2d_from_data(2, 3, a_data)
-    let b = tensor2d_from_data(3, 2, b_data)
-    let c = tensor2d_matmul(a, b)
+    let a Matrix[2, 3] = tensor2d_from_data(2, 3, a_data)
+    let b Matrix[3, 2, DType = Float32] = tensor2d_from_data(3, 2, b_data)
+    let c Matrix[2, 2] = tensor2d_matmul(a, b)
     assert c.rows == 2 && c.cols == 2 && len(c.data) == 4
     // [1*7+2*9+3*11, 1*8+2*10+3*12] = [58, 64]
     // [4*7+5*9+6*11, 4*8+5*10+6*12] = [139, 154]
@@ -34,4 +51,49 @@ test fn test_tensor2d_matmul_and_add_relu_verified() {
     let ratio = safe_flex_ratio(120.0, 3.0)
     assert is_finite(ratio)
     assert float_to_int(ratio) == 40
+}
+
+test fn test_matrix_optional_fp16_and_bf16() {
+    let h_data List[Float16] = [
+        1.5 as Float16, 2.0 as Float16, 3.0 as Float16,
+        4.0 as Float16, 5.0 as Float16, 6.5 as Float16,
+    ]
+    let hm Matrix[2, 3, DType = Float16] = tensor2d_of(2, 3, h_data)
+    assert hm.rows == 2 && hm.cols == 3 && len(hm.data) == 6
+    let hsum = check_fp16_matrix(hm)
+    assert float_to_int(hsum as Float) == 8
+
+    // Roundtrip Float16 -> Float32 -> Float16
+    let f32m Matrix[2, 3] = tensor2d_f16_to_f32(hm)
+    let back Matrix[2, 3, Float16] = tensor2d_to_f16(f32m)
+    assert float_to_int((back.data[0] + back.data[5]) as Float) == 8
+
+    // BFloat16 matrix
+    let b_data List[BFloat16] = [
+        2.0 as BFloat16, 0.0 as BFloat16, 0.0 as BFloat16,
+        0.0 as BFloat16, 0.0 as BFloat16, 10.0 as BFloat16,
+    ]
+    let bm Matrix[2, 3, DType = BFloat16] = tensor2d_of(2, 3, b_data)
+    let bsum = check_bf16_matrix(bm)
+    assert float_to_int(bsum as Float) == 12
+}
+
+test fn test_variadic_nd_tensor_and_verified_reshape() {
+    // 1D Tensor[4]
+    let v1 Tensor[4] = nd_tensor_zeros([4], 4)
+    assert len(v1.shape) == 1 && len(v1.data) == 4
+
+    // 2D Tensor[4, 8]
+    let v2 Tensor[4, 8] = nd_tensor_zeros([4, 8], 32)
+    assert len(v2.shape) == 2 && len(v2.data) == 32
+
+    // 5D Tensor[1, 1, 2, 3, 4] -> verified reshape to Tensor[6, 4] (24 == 24 proved at compile time!)
+    let t5 Tensor[1, 1, 2, 3, 4] = nd_tensor_zeros([1, 1, 2, 3, 4], 24)
+    let t2 Tensor[6, 4] = reshape_5d_to_2d(t5)
+    assert len(t2.shape) == 2 && len(t2.data) == 24
+
+    // 5D Float16 Tensor[1, 1, 2, 3, 4, DType = Float16] -> Tensor[2, 3, 4, DType = Float16]
+    let h5 Tensor[1, 1, 2, 3, 4, DType = Float16] = nd_tensor_zeros_f16([1, 1, 2, 3, 4], 24)
+    let h3 Tensor[2, 3, 4, DType = Float16] = reshape_5d_f16_to_3d(h5)
+    assert len(h3.shape) == 3 && len(h3.data) == 24
 }

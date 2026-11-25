@@ -102,6 +102,20 @@ impl GpuBuffer {
         GpuBuffer { handle = h, byte_len = nbytes }
     }
 
+    /// Uploads a flat unboxed 2-byte `List[Float16]` directly to GPU VRAM (half memory bandwidth!).
+    pub fn from_f16_list(xs List[Float16]) GpuBuffer {
+        let nbytes = len(xs) * 2
+        let h = unsafe { tn_metal_buf_create(list_data_ptr(xs), nbytes) }
+        GpuBuffer { handle = h, byte_len = nbytes }
+    }
+
+    /// Uploads a flat unboxed 2-byte `List[BFloat16]` directly to GPU VRAM (half memory bandwidth!).
+    pub fn from_bf16_list(xs List[BFloat16]) GpuBuffer {
+        let nbytes = len(xs) * 2
+        let h = unsafe { tn_metal_buf_create(list_data_ptr(xs), nbytes) }
+        GpuBuffer { handle = h, byte_len = nbytes }
+    }
+
     pub fn from_u32_list(xs List[UInt32]) GpuBuffer {
         let nbytes = len(xs) * 4
         let h = unsafe { tn_metal_buf_create(list_data_ptr(xs), nbytes) }
@@ -122,6 +136,12 @@ impl GpuBuffer {
     /// Borrows `self` (`inout self`) and reads GPU compute results back into `out`.
     pub fn read_into_f32(inout self, inout out List[Float32]) Int {
         let nbytes = len(out) * 4
+        unsafe { tn_metal_buf_read(self.handle, list_data_ptr(out), nbytes) }
+    }
+
+    /// Borrows `self` (`inout self`) and reads 2-byte `Float16` GPU results back into `out`.
+    pub fn read_into_f16(inout self, inout out List[Float16]) Int {
+        let nbytes = len(out) * 2
         unsafe { tn_metal_buf_read(self.handle, list_data_ptr(out), nbytes) }
     }
 

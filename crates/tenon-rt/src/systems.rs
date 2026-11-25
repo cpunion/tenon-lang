@@ -693,6 +693,127 @@ pub extern "C" fn tenon_volatile_write(ptr: i64, val: i64, width: i64) -> i64 {
 }
 
 // =========================================================================
+// 3b. Exact IEEE-754 Float16 (binary16) & BFloat16 scalar conversions
+// =========================================================================
+
+#[inline]
+pub fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x007F_FFFF;
+    if exp == 255 {
+        if frac == 0 {
+            return sign | 0x7C00;
+        }
+        return sign | 0x7E00 | ((frac >> 13) as u16);
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return sign | 0x7C00;
+    }
+    if new_exp <= 0 {
+        if new_exp < -10 {
+            return sign;
+        }
+        let mant = (frac | 0x0080_0000) >> (1 - new_exp);
+        let round_bit = 1u32 << 12;
+        let half = mant >> 13;
+        let rem = mant & 0x1FFF;
+        let rounded = if rem > round_bit || (rem == round_bit && (half & 1) != 0) {
+            half + 1
+        } else {
+            half
+        };
+        return sign | (rounded as u16);
+    }
+    let round_bit = 1u32 << 12;
+    let rem = frac & 0x1FFF;
+    let mut h_mant = frac >> 13;
+    let mut h_exp = new_exp as u32;
+    if rem > round_bit || (rem == round_bit && (h_mant & 1) != 0) {
+        h_mant += 1;
+        if h_mant == 0x400 {
+            h_mant = 0;
+            h_exp += 1;
+            if h_exp >= 31 {
+                return sign | 0x7C00;
+            }
+        }
+    }
+    sign | ((h_exp as u16) << 10) | (h_mant as u16)
+}
+
+#[inline]
+pub fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = ((h as u32) & 0x8000) << 16;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let frac = (h & 0x03FF) as u32;
+    if exp == 0 {
+        if frac == 0 {
+            return f32::from_bits(sign);
+        }
+        let mut f = frac;
+        let mut e: i32 = -14;
+        while (f & 0x0400) == 0 {
+            f <<= 1;
+            e -= 1;
+        }
+        f &= 0x03FF;
+        let f32_exp = ((e + 127) as u32) << 23;
+        return f32::from_bits(sign | f32_exp | (f << 13));
+    }
+    if exp == 31 {
+        if frac == 0 {
+            return f32::from_bits(sign | 0x7F80_0000);
+        }
+        return f32::from_bits(sign | 0x7FC0_0000 | (frac << 13));
+    }
+    let f32_exp = (exp + 127 - 15) << 23;
+    f32::from_bits(sign | f32_exp | (frac << 13))
+}
+
+#[inline]
+pub fn f32_to_bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
+        return ((bits >> 16) | 0x0040) as u16;
+    }
+    let lsb = (bits >> 16) & 1;
+    let rounding_bias = 0x7FFF + lsb;
+    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
+}
+
+#[inline]
+pub fn bf16_bits_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_f64_to_f16(bits: i64) -> i64 {
+    let v = f64::from_bits(bits as u64) as f32;
+    f32_to_f16_bits(v) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_f16_to_f64(bits: i64) -> i64 {
+    let v = f16_bits_to_f32((bits & 0xFFFF) as u16) as f64;
+    v.to_bits() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_f64_to_bf16(bits: i64) -> i64 {
+    let v = f64::from_bits(bits as u64) as f32;
+    f32_to_bf16_bits(v) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_bf16_to_f64(bits: i64) -> i64 {
+    let v = bf16_bits_to_f32((bits & 0xFFFF) as u16) as f64;
+    v.to_bits() as i64
+}
+
+// =========================================================================
 // 4. Real OS Multi-Threading, Explicit-Ordering Atomics, Mutex & Channel
 // =========================================================================
 

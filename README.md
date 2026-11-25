@@ -42,7 +42,8 @@ cargo build --release --bin tenon
 ./target/release/tenon check examples/showcase/tenon_torch_studio.tn --profile-proofs
 ./target/release/tenon check examples/showcase/language_tour.tn && ./target/release/tenon run examples/showcase/language_tour.tn
 
-# (F) 零胶水声明式 GPU 分块矩阵乘 & 256×256 Apple Silicon Metal GPU 加速基准（无需 `--emit-msl` / `--c-src`！）
+# (F) 零胶水声明式 GPU 分块矩阵乘、混合精度 FP16 (`Matrix[R, C, DType = Float16]` + 变长维度 `Tensor[1, 1, 2, 3, 4]`) & 256×256 Apple Silicon Metal GPU 加速基准（无需 `--emit-msl` / `--c-src`！）
+./target/release/tenon build examples/dogfood/metal_fp16_tensor_demo.tn -o /tmp/metal_fp16 && /tmp/metal_fp16
 ./target/release/tenon build examples/dogfood/metal_tiled_matmul_demo.tn -o /tmp/metal_tiled && /tmp/metal_tiled
 ./target/release/tenon build benchmarks/tenon/gpu_matmul_bench.tn -o /tmp/gpu_matmul_bench && /tmp/gpu_matmul_bench
 
@@ -52,7 +53,7 @@ cargo build --release --bin tenon
 # (H) 脚手架模板一键创建项目（支持 cli / lib / web / gpui / openui-web / tui / gpu）
 ./target/release/tenon new /tmp/my_gpu_app --template gpu
 
-# 1. 全工作区自动化测试（77 项全量回归；macOS 默认通过 real clang 原生链接校验 + LLVM 22 `lli` 并行执行，全量约 3 秒全绿；设置 `TENON_TEST_NATIVE_EXEC=1` 可切回逐二进制直接执行）
+# 1. 全工作区自动化测试（78 项全量回归；macOS 默认通过 real clang 原生链接校验 + LLVM 22 `lli` 并行执行，全量约 3 秒全绿；设置 `TENON_TEST_NATIVE_EXEC=1` 可切回逐二进制直接执行）
 cargo test --workspace
 
 # 2. 精化类型别名复用 + 高阶形式化验证闭环 + 独立证明导出与审计 + 可执行反例转测试

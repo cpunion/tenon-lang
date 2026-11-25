@@ -2476,4 +2476,83 @@ pub pure fn chained_mlp_dims(a Matrix[2, 3], b Matrix[3, 4], c Matrix[4, 2]) Int
             "expected broken 3-matrix chain ([2,3]*[3,5]*[4,2]) to fail static verification!"
         );
     }
+
+    #[test]
+    fn verifies_keyword_optional_dtype_and_variadic_tensor_shapes() {
+        let base = r#"
+pub type Positive = Int where self >= 1
+pub record Tensor2D[DType = Float32] {
+    rows Positive
+    cols Positive
+    data List[DType]
+}
+pub type Matrix[R Int, C Int, DType = Float32] =
+    Tensor2D[DType] where self.rows == R && self.cols == C && len(self.data) == R * C
+
+pub record NdTensor[DType = Float32] {
+    shape List[Positive]
+    data  List[DType]
+}
+pub type Tensor[...Shape Int, DType = Float32] =
+    NdTensor[DType] where len(self.shape) == len(Shape) && len(self.data) == prod(Shape)
+
+pub pure fn nd_reshape[DType](t NdTensor[DType], new_shape List[Positive]) NdTensor[DType]
+    ensures len(result.shape) == len(new_shape) && len(result.data) == len(t.data)
+{
+    NdTensor { shape = new_shape, data = t.data }
+}
+
+pub pure fn take_f32(m Matrix[4, 8]) Int { m.rows }
+pub pure fn take_f16(m Matrix[4, 8, DType = Float16]) Int { m.rows }
+pub pure fn take_bf16(m Matrix[4, 8, DType = BFloat16]) Int { m.rows }
+pub pure fn take_1d(t Tensor[4]) Int { len(t.data) }
+pub pure fn take_2d(t Tensor[4, 8]) Int { len(t.data) }
+
+pub pure fn reshape_ok(t Tensor[1, 1, 2, 3, 4]) Tensor[6, 4] {
+    nd_reshape(t, [6, 4])
+}
+
+pub pure fn reshape_ok_f16(t Tensor[1, 1, 2, 3, 4, DType = Float16]) Tensor[2, 3, 4, DType = Float16] {
+    nd_reshape(t, [2, 3, 4])
+}
+
+pub pure fn accept_default_and_named(a Matrix[4, 8], b Matrix[4, 8, Float32], c Matrix[4, 8, DType = Float32]) Int {
+    take_f32(a) + take_f32(b) + take_f32(c)
+}
+
+pub pure fn accept_fp16_pos_and_named(a Matrix[4, 8, Float16], b Matrix[4, 8, DType = Float16]) Int {
+    take_f16(a) + take_f16(b)
+}
+"#;
+        let rep = check_program(&parse(base).unwrap());
+        assert!(
+            rep.ok,
+            "expected keyword optional DType & variadic Tensor shapes to verify: {:?}",
+            rep.diagnostics
+        );
+
+        // Negative control 1: Passing `Matrix[4, 8, DType = Float16]` into `Matrix[4, 8]` (Float32) must fail E0205!
+        let bad_dtype = format!(
+            "{}\npub pure fn bad_dtype_mix(m Matrix[4, 8, DType = Float16]) Int {{ take_f32(m) }}\n",
+            base
+        );
+        let rep_dtype = check_program(&parse(&bad_dtype).unwrap());
+        assert!(
+            !rep_dtype.ok && rep_dtype.diagnostics.iter().any(|d| d.code == "E0205"),
+            "expected E0205 for Float16 vs Float32 matrix mismatch, got {:?}",
+            rep_dtype.diagnostics
+        );
+
+        // Negative control 2: `Tensor[1, 1, 2, 3, 4]` (24 elems) reshaped to `Tensor[5, 5]` (25 elems) must fail E0410!
+        let bad_reshape = format!(
+            "{}\npub pure fn reshape_bad(t Tensor[1, 1, 2, 3, 4]) Tensor[5, 5] {{ nd_reshape(t, [5, 5]) }}\n",
+            base
+        );
+        let rep_reshape = check_program(&parse(&bad_reshape).unwrap());
+        assert!(
+            !rep_reshape.ok && rep_reshape.diagnostics.iter().any(|d| d.code == "E0410"),
+            "expected E0410 for 24 != 25 variadic Tensor reshape, got {:?}",
+            rep_reshape.diagnostics
+        );
+    }
 }

@@ -164,6 +164,10 @@ pub struct TypeAliasDecl {
     pub is_distinct: bool,
     pub name: String,
     pub type_params: Vec<String>,
+    #[serde(default)]
+    pub type_param_defaults: BTreeMap<String, TypeExpr>,
+    #[serde(default)]
+    pub variadic_param: Option<String>,
     pub base: TypeExpr,
     pub predicate: Option<Expr>,
     pub span: Span,
@@ -177,6 +181,8 @@ pub struct RecordDecl {
     pub type_params: Vec<String>,
     #[serde(default)]
     pub type_param_bounds: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub type_param_defaults: BTreeMap<String, TypeExpr>,
     pub fields: Vec<FieldDecl>,
     pub where_clauses: Vec<Expr>,
     pub invariants: Vec<NamedExpr>,
@@ -203,6 +209,8 @@ pub struct EnumDecl {
     pub type_params: Vec<String>,
     #[serde(default)]
     pub type_param_bounds: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub type_param_defaults: BTreeMap<String, TypeExpr>,
     pub variants: Vec<VariantDecl>,
     pub span: Span,
 }
@@ -460,7 +468,32 @@ pub enum TypeExpr {
 }
 
 impl TypeExpr {
+    /// Constructs a keyword-named type argument (e.g. `DType = Float16` in `Matrix[4, 8, DType = Float16]`).
+    pub fn named_arg(key: String, value: TypeExpr, span: Span) -> Self {
+        TypeExpr::Named {
+            name: format!("__named__:{}", key),
+            version: None,
+            args: vec![value],
+            span,
+        }
+    }
+
+    /// Extracts `(key, value)` if this `TypeExpr` is a keyword-named type argument (`DType = Float16`).
+    pub fn as_named_arg(&self) -> Option<(&str, &TypeExpr)> {
+        if let TypeExpr::Named { name, args, .. } = self {
+            if let Some(key) = name.strip_prefix("__named__:") {
+                if args.len() == 1 {
+                    return Some((key, &args[0]));
+                }
+            }
+        }
+        None
+    }
+
     pub fn display_name(&self) -> String {
+        if let Some((k, v)) = self.as_named_arg() {
+            return format!("{} = {}", k, v.display_name());
+        }
         match self {
             TypeExpr::Named {
                 name,
@@ -834,55 +867,270 @@ pub enum UnOp {
     BitNot,
 }
 
-/// Instantiates const/value parameters on a parameterized refinement `TypeAliasDecl`
-/// (e.g. `type Range[LO Int, HI Int] = Int where self >= LO && self <= HI` instantiated with `Range[3, 5]`).
-pub fn instantiate_alias_predicate(ta: &TypeAliasDecl, args: &[TypeExpr]) -> Option<Expr> {
-    let pred = ta.predicate.as_ref()?;
-    if ta.type_params.is_empty() || ta.type_params.len() != args.len() {
-        return Some(pred.clone());
+/// Resolves positional, keyword-named (`DType = Float16`), default (`DType = Float32`),
+/// and variadic const-pack (`...Shape Int`) type arguments into `(param_bindings, variadic_pack)`.
+pub fn resolve_type_args(
+    type_params: &[String],
+    defaults: &BTreeMap<String, TypeExpr>,
+    variadic_param: Option<&str>,
+    raw_args: &[TypeExpr],
+) -> (BTreeMap<String, TypeExpr>, Vec<TypeExpr>) {
+    let mut bindings: BTreeMap<String, TypeExpr> = BTreeMap::new();
+    let mut positional: Vec<TypeExpr> = Vec::new();
+    for arg in raw_args {
+        if let Some((k, v)) = arg.as_named_arg() {
+            bindings.insert(k.to_string(), v.clone());
+        } else {
+            positional.push(arg.clone());
+        }
     }
-    let mut const_map: BTreeMap<String, Expr> = BTreeMap::new();
-    for (tp, arg) in ta.type_params.iter().zip(args.iter()) {
-        if let TypeExpr::Named {
-            name,
-            args: inner,
-            span,
-            ..
-        } = arg
-        {
-            if inner.is_empty() {
-                if let Ok(iv) = name.parse::<i64>() {
-                    const_map.insert(
-                        tp.clone(),
-                        Expr {
-                            kind: ExprKind::Int(iv),
-                            span: *span,
-                        },
-                    );
-                } else if let Ok(fv) = name.parse::<f64>() {
-                    const_map.insert(
-                        tp.clone(),
-                        Expr {
-                            kind: ExprKind::Float(fv),
-                            span: *span,
-                        },
-                    );
-                } else if !name.is_empty() && name != tp {
-                    const_map.insert(
-                        tp.clone(),
-                        Expr {
-                            kind: ExprKind::Ident(name.clone()),
-                            span: *span,
-                        },
-                    );
+    let mut variadic_pack: Vec<TypeExpr> = Vec::new();
+    if let Some(vp) = variadic_param {
+        let vp_idx = type_params.iter().position(|p| p == vp).unwrap_or(0);
+        let mut pos_iter = positional.into_iter();
+        // Bind fixed parameters appearing before `...vp`
+        for p in type_params.iter().take(vp_idx) {
+            if !bindings.contains_key(p) {
+                if let Some(a) = pos_iter.next() {
+                    bindings.insert(p.clone(), a);
+                }
+            }
+        }
+        // Remaining positional arguments form the variadic pack (e.g. `Tensor[1, 1, 2, 3, 4]`)
+        variadic_pack.extend(pos_iter);
+    } else {
+        let mut pos_iter = positional.into_iter();
+        for p in type_params {
+            if !bindings.contains_key(p) {
+                if let Some(a) = pos_iter.next() {
+                    bindings.insert(p.clone(), a);
                 }
             }
         }
     }
+    // Fill any omitted parameters from defaults (`DType = Float32`)
+    for p in type_params {
+        if variadic_param != Some(p.as_str()) && !bindings.contains_key(p) {
+            if let Some(def) = defaults.get(p) {
+                bindings.insert(p.clone(), def.clone());
+            }
+        }
+    }
+    (bindings, variadic_pack)
+}
+
+/// Recursively substitutes type parameters inside a `TypeExpr` (e.g. `Tensor2D[DType]` -> `Tensor2D[Float16]`).
+pub fn instantiate_type_expr(ty: &TypeExpr, subst: &BTreeMap<String, TypeExpr>) -> TypeExpr {
+    if subst.is_empty() {
+        return ty.clone();
+    }
+    if let Some((k, v)) = ty.as_named_arg() {
+        let span = match ty {
+            TypeExpr::Named { span, .. } => *span,
+            _ => Span::default(),
+        };
+        return TypeExpr::named_arg(k.to_string(), instantiate_type_expr(v, subst), span);
+    }
+    match ty {
+        TypeExpr::Named { name, version, args, span } => {
+            if args.is_empty() && version.is_none() {
+                if let Some(rep) = subst.get(name) {
+                    return rep.clone();
+                }
+            }
+            TypeExpr::Named {
+                name: name.clone(),
+                version: version.clone(),
+                args: args.iter().map(|a| instantiate_type_expr(a, subst)).collect(),
+                span: *span,
+            }
+        }
+        TypeExpr::Dyn { interface, args, span } => TypeExpr::Dyn {
+            interface: interface.clone(),
+            args: args.iter().map(|a| instantiate_type_expr(a, subst)).collect(),
+            span: *span,
+        },
+        TypeExpr::Tuple(es, span) => {
+            TypeExpr::Tuple(es.iter().map(|e| instantiate_type_expr(e, subst)).collect(), *span)
+        }
+        TypeExpr::Fn { params, ret, span } => TypeExpr::Fn {
+            params: params.iter().map(|p| instantiate_type_expr(p, subst)).collect(),
+            ret: ret.as_ref().map(|r| Box::new(instantiate_type_expr(r, subst))),
+            span: *span,
+        },
+        TypeExpr::Array { elem, len, span } => TypeExpr::Array {
+            elem: Box::new(instantiate_type_expr(elem, subst)),
+            len: *len,
+            span: *span,
+        },
+    }
+}
+
+/// Instantiates the base type of a `TypeAliasDecl` using positional, keyword-named, and default arguments
+/// (e.g. `Matrix[4, 8]` -> `Tensor2D[Float32]`, `Matrix[4, 8, DType = Float16]` -> `Tensor2D[Float16]`).
+pub fn instantiate_alias_base(ta: &TypeAliasDecl, raw_args: &[TypeExpr]) -> TypeExpr {
+    if ta.type_params.is_empty() {
+        return ta.base.clone();
+    }
+    let (bindings, _) = resolve_type_args(
+        &ta.type_params,
+        &ta.type_param_defaults,
+        ta.variadic_param.as_deref(),
+        raw_args,
+    );
+    instantiate_type_expr(&ta.base, &bindings)
+}
+
+fn type_arg_to_const_expr(arg: &TypeExpr) -> Option<Expr> {
+    if let TypeExpr::Named { name, args: inner, span, .. } = arg {
+        if inner.is_empty() {
+            if let Ok(iv) = name.parse::<i64>() {
+                return Some(Expr { kind: ExprKind::Int(iv), span: *span });
+            } else if let Ok(fv) = name.parse::<f64>() {
+                return Some(Expr { kind: ExprKind::Float(fv), span: *span });
+            } else if !name.is_empty() {
+                return Some(Expr { kind: ExprKind::Ident(name.clone()), span: *span });
+            }
+        }
+    }
+    None
+}
+
+/// Instantiates const/value parameters & variadic dimension packs (`...Shape Int`) on a parameterized
+/// refinement `TypeAliasDecl` (e.g. `Matrix[4, 8, DType = Float16]`, `Tensor[1, 1, 2, 3, 4]`).
+pub fn instantiate_alias_predicate(ta: &TypeAliasDecl, args: &[TypeExpr]) -> Option<Expr> {
+    let pred = ta.predicate.as_ref()?;
+    if ta.type_params.is_empty() {
+        return Some(pred.clone());
+    }
+    let (bindings, variadic_pack) = resolve_type_args(
+        &ta.type_params,
+        &ta.type_param_defaults,
+        ta.variadic_param.as_deref(),
+        args,
+    );
+    let mut const_map: BTreeMap<String, Expr> = BTreeMap::new();
+    for (tp, arg) in &bindings {
+        if let Some(ce) = type_arg_to_const_expr(arg) {
+            if !matches!(&ce.kind, ExprKind::Ident(s) if s == tp) {
+                const_map.insert(tp.clone(), ce);
+            }
+        }
+    }
+    let mut out = pred.clone();
+    if let Some(vp) = &ta.variadic_param {
+        let pack_exprs: Vec<Expr> = variadic_pack
+            .iter()
+            .filter_map(type_arg_to_const_expr)
+            .collect();
+        out = subst_variadic_pack_in_expr(&out, vp, &pack_exprs);
+    }
     if const_map.is_empty() {
-        Some(pred.clone())
+        Some(out)
     } else {
-        Some(subst_const_idents_in_expr(pred, &const_map))
+        Some(subst_const_idents_in_expr(&out, &const_map))
+    }
+}
+
+fn subst_variadic_pack_in_expr(expr: &Expr, pack_name: &str, pack: &[Expr]) -> Expr {
+    let sp = expr.span;
+    match &expr.kind {
+        // `len(Shape)` -> constant rank `Int(pack.len())`
+        ExprKind::Call { callee, args }
+            if args.len() == 1
+                && matches!(&callee.kind, ExprKind::Ident(f) if f == "len")
+                && matches!(&args[0].value.kind, ExprKind::Ident(s) if s == pack_name) =>
+        {
+            Expr { kind: ExprKind::Int(pack.len() as i64), span: sp }
+        }
+        // `prod(Shape)` -> folded integer product (or symbolic `d0 * d1 * ...` product!)
+        ExprKind::Call { callee, args }
+            if args.len() == 1
+                && matches!(&callee.kind, ExprKind::Ident(f) if f == "prod")
+                && matches!(&args[0].value.kind, ExprKind::Ident(s) if s == pack_name) =>
+        {
+            if pack.is_empty() {
+                return Expr { kind: ExprKind::Int(1), span: sp };
+            }
+            let all_ints: Option<i64> = pack.iter().try_fold(1i64, |acc, e| match e.kind {
+                ExprKind::Int(n) => acc.checked_mul(n),
+                _ => None,
+            });
+            if let Some(p) = all_ints {
+                return Expr { kind: ExprKind::Int(p), span: sp };
+            }
+            let mut acc = pack[0].clone();
+            for item in &pack[1..] {
+                acc = Expr {
+                    kind: ExprKind::Binary {
+                        op: BinOp::Mul,
+                        left: Box::new(acc),
+                        right: Box::new(item.clone()),
+                    },
+                    span: sp,
+                };
+            }
+            acc
+        }
+        // `Shape[i]` with constant index -> `pack[i]`
+        ExprKind::Index { target, index }
+            if matches!(&target.kind, ExprKind::Ident(s) if s == pack_name) =>
+        {
+            if let ExprKind::Int(idx) = index.kind {
+                if idx >= 0 && (idx as usize) < pack.len() {
+                    return pack[idx as usize].clone();
+                }
+            }
+            expr.clone()
+        }
+        // `Shape` as a list literal `[d0, d1, ...]`
+        ExprKind::Ident(s) if s == pack_name => Expr {
+            kind: ExprKind::List(pack.to_vec()),
+            span: sp,
+        },
+        ExprKind::Binary { op, left, right } => Expr {
+            kind: ExprKind::Binary {
+                op: *op,
+                left: Box::new(subst_variadic_pack_in_expr(left, pack_name, pack)),
+                right: Box::new(subst_variadic_pack_in_expr(right, pack_name, pack)),
+            },
+            span: sp,
+        },
+        ExprKind::Unary { op, expr: e } => Expr {
+            kind: ExprKind::Unary {
+                op: *op,
+                expr: Box::new(subst_variadic_pack_in_expr(e, pack_name, pack)),
+            },
+            span: sp,
+        },
+        ExprKind::Call { callee, args } => Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(subst_variadic_pack_in_expr(callee, pack_name, pack)),
+                args: args
+                    .iter()
+                    .map(|a| CallArg {
+                        name: a.name.clone(),
+                        value: subst_variadic_pack_in_expr(&a.value, pack_name, pack),
+                    })
+                    .collect(),
+            },
+            span: sp,
+        },
+        ExprKind::Field { target, field } => Expr {
+            kind: ExprKind::Field {
+                target: Box::new(subst_variadic_pack_in_expr(target, pack_name, pack)),
+                field: field.clone(),
+            },
+            span: sp,
+        },
+        ExprKind::Index { target, index } => Expr {
+            kind: ExprKind::Index {
+                target: Box::new(subst_variadic_pack_in_expr(target, pack_name, pack)),
+                index: Box::new(subst_variadic_pack_in_expr(index, pack_name, pack)),
+            },
+            span: sp,
+        },
+        _ => expr.clone(),
     }
 }
 

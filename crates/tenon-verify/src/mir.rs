@@ -72,7 +72,9 @@ pub fn scalar_int_bounds(sk: Option<ScalarKind>) -> (i128, i128) {
         Some(ScalarKind::U16) => (0, u16::MAX as i128),
         Some(ScalarKind::U32) => (0, u32::MAX as i128),
         Some(ScalarKind::U64) => (0, u64::MAX as i128),
-        Some(ScalarKind::F32) | Some(ScalarKind::F64) => (i64::MIN as i128, i64::MAX as i128),
+        Some(ScalarKind::F16) | Some(ScalarKind::BF16) | Some(ScalarKind::F32) | Some(ScalarKind::F64) => {
+            (i64::MIN as i128, i64::MAX as i128)
+        }
     }
 }
 

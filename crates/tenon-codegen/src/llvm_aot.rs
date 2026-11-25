@@ -811,7 +811,7 @@ fn llvm_c_abi_type(ty: &TypeExpr, aliases: &BTreeMap<String, TypeExpr>) -> &'sta
     match resolve_alias_ty(ty, aliases) {
         TypeExpr::Named { name, .. } => match ScalarKind::from_name(&name) {
             Some(ScalarKind::I8 | ScalarKind::U8) => "i8",
-            Some(ScalarKind::I16 | ScalarKind::U16) => "i16",
+            Some(ScalarKind::I16 | ScalarKind::U16 | ScalarKind::F16 | ScalarKind::BF16) => "i16",
             Some(ScalarKind::I32 | ScalarKind::U32) => "i32",
             Some(ScalarKind::I64 | ScalarKind::U64) => "i64",
             Some(ScalarKind::F32) => "float",
@@ -1896,7 +1896,7 @@ impl<'a> LlvmFnGen<'a> {
                 ));
                 ex
             }
-            ScalarKind::I64 | ScalarKind::U64 | ScalarKind::F32 | ScalarKind::F64 => val.to_string(),
+            ScalarKind::I64 | ScalarKind::U64 | ScalarKind::F16 | ScalarKind::BF16 | ScalarKind::F32 | ScalarKind::F64 => val.to_string(),
         }
     }
 
@@ -1938,7 +1938,7 @@ impl<'a> LlvmFnGen<'a> {
             Some(ScalarKind::I8) => ("i8", Some("sext")),
             Some(ScalarKind::U8) => ("i8", Some("zext")),
             Some(ScalarKind::I16) => ("i16", Some("sext")),
-            Some(ScalarKind::U16) => ("i16", Some("zext")),
+            Some(ScalarKind::U16 | ScalarKind::F16 | ScalarKind::BF16) => ("i16", Some("zext")),
             Some(ScalarKind::I32) => ("i32", Some("sext")),
             Some(ScalarKind::U32 | ScalarKind::F32) => ("i32", Some("zext")),
             None if matches!(&resolved, TypeExpr::Named { name, .. } if name == "Bool") => {
@@ -1999,7 +1999,7 @@ impl<'a> LlvmFnGen<'a> {
         let sk = scalar_kind_of_ty(&resolved, self.alias_bases);
         let ity = match sk {
             Some(ScalarKind::I8 | ScalarKind::U8) => "i8",
-            Some(ScalarKind::I16 | ScalarKind::U16) => "i16",
+            Some(ScalarKind::I16 | ScalarKind::U16 | ScalarKind::F16 | ScalarKind::BF16) => "i16",
             Some(ScalarKind::I32 | ScalarKind::U32 | ScalarKind::F32) => "i32",
             None if matches!(&resolved, TypeExpr::Named { name, .. } if name == "Bool") => "i8",
             _ => "i64",
@@ -2019,6 +2019,56 @@ impl<'a> LlvmFnGen<'a> {
         Ok(())
     }
 
+    fn emit_f16_to_float(&mut self, val_i64: &str) -> String {
+        let t = self.fresh_tmp();
+        let h = self.fresh_tmp();
+        let f = self.fresh_tmp();
+        self.code.push_str(&format!(
+            "  {} = trunc i64 {} to i16\n  {} = bitcast i16 {} to half\n  {} = fpext half {} to float\n",
+            t, val_i64, h, t, f, h
+        ));
+        f
+    }
+
+    fn emit_float_to_f16(&mut self, val_f32: &str) -> String {
+        let h = self.fresh_tmp();
+        let b = self.fresh_tmp();
+        let z = self.fresh_tmp();
+        self.code.push_str(&format!(
+            "  {} = fptrunc float {} to half\n  {} = bitcast half {} to i16\n  {} = zext i16 {} to i64\n",
+            h, val_f32, b, h, z, b
+        ));
+        z
+    }
+
+    fn emit_bf16_to_float(&mut self, val_i64: &str) -> String {
+        let t = self.fresh_tmp();
+        let z = self.fresh_tmp();
+        let s = self.fresh_tmp();
+        let f = self.fresh_tmp();
+        self.code.push_str(&format!(
+            "  {} = trunc i64 {} to i16\n  {} = zext i16 {} to i32\n  {} = shl i32 {}, 16\n  {} = bitcast i32 {} to float\n",
+            t, val_i64, z, t, s, z, f, s
+        ));
+        f
+    }
+
+    fn emit_float_to_bf16(&mut self, val_f32: &str) -> String {
+        let b = self.fresh_tmp();
+        let hi = self.fresh_tmp();
+        let lsb = self.fresh_tmp();
+        let bias = self.fresh_tmp();
+        let rnd = self.fresh_tmp();
+        let sh = self.fresh_tmp();
+        let m = self.fresh_tmp();
+        let z = self.fresh_tmp();
+        self.code.push_str(&format!(
+            "  {} = bitcast float {} to i32\n  {} = lshr i32 {}, 16\n  {} = and i32 {}, 1\n  {} = add i32 {}, 32767\n  {} = add i32 {}, {}\n  {} = lshr i32 {}, 16\n  {} = and i32 {}, 65535\n  {} = zext i32 {} to i64\n",
+            b, val_f32, hi, b, lsb, hi, bias, lsb, rnd, b, bias, sh, rnd, m, sh, z, m
+        ));
+        z
+    }
+
     fn emit_cast(&mut self, val: &str, src_ty: &TypeExpr, dst_ty: &TypeExpr) -> String {
         let src_base = resolve_alias_ty(src_ty, self.alias_bases);
         let dst_base = resolve_alias_ty(dst_ty, self.alias_bases);
@@ -2035,6 +2085,118 @@ impl<'a> LlvmFnGen<'a> {
             return z;
         }
         match (src_sk, dst_sk) {
+            (Some(ScalarKind::F16), Some(ScalarKind::F16))
+            | (Some(ScalarKind::BF16), Some(ScalarKind::BF16)) => val.to_string(),
+            (Some(ScalarKind::F16), Some(ScalarKind::F32)) => {
+                let f = self.emit_f16_to_float(val);
+                let b = self.fresh_tmp();
+                let z = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                    b, f, z, b
+                ));
+                z
+            }
+            (Some(ScalarKind::BF16), Some(ScalarKind::F32)) => {
+                let f = self.emit_bf16_to_float(val);
+                let b = self.fresh_tmp();
+                let z = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = bitcast float {} to i32\n  {} = zext i32 {} to i64\n",
+                    b, f, z, b
+                ));
+                z
+            }
+            (Some(ScalarKind::F16), Some(ScalarKind::F64)) => {
+                let f = self.emit_f16_to_float(val);
+                let d = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = fpext float {} to double\n  {} = bitcast double {} to i64\n",
+                    d, f, b, d
+                ));
+                b
+            }
+            (Some(ScalarKind::BF16), Some(ScalarKind::F64)) => {
+                let f = self.emit_bf16_to_float(val);
+                let d = self.fresh_tmp();
+                let b = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = fpext float {} to double\n  {} = bitcast double {} to i64\n",
+                    d, f, b, d
+                ));
+                b
+            }
+            (Some(ScalarKind::F64), Some(ScalarKind::F16)) => {
+                let d = self.fresh_tmp();
+                let f = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = bitcast i64 {} to double\n  {} = fptrunc double {} to float\n",
+                    d, val, f, d
+                ));
+                self.emit_float_to_f16(&f)
+            }
+            (Some(ScalarKind::F64), Some(ScalarKind::BF16)) => {
+                let d = self.fresh_tmp();
+                let f = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = bitcast i64 {} to double\n  {} = fptrunc double {} to float\n",
+                    d, val, f, d
+                ));
+                self.emit_float_to_bf16(&f)
+            }
+            (Some(ScalarKind::F32), Some(ScalarKind::F16)) => {
+                let t = self.fresh_tmp();
+                let f = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n",
+                    t, val, f, t
+                ));
+                self.emit_float_to_f16(&f)
+            }
+            (Some(ScalarKind::F32), Some(ScalarKind::BF16)) => {
+                let t = self.fresh_tmp();
+                let f = self.fresh_tmp();
+                self.code.push_str(&format!(
+                    "  {} = trunc i64 {} to i32\n  {} = bitcast i32 {} to float\n",
+                    t, val, f, t
+                ));
+                self.emit_float_to_bf16(&f)
+            }
+            (Some(ScalarKind::F16), Some(ScalarKind::BF16)) => {
+                let f = self.emit_f16_to_float(val);
+                self.emit_float_to_bf16(&f)
+            }
+            (Some(ScalarKind::BF16), Some(ScalarKind::F16)) => {
+                let f = self.emit_bf16_to_float(val);
+                self.emit_float_to_f16(&f)
+            }
+            (Some(ScalarKind::F16), Some(dk)) if dk.is_int() => {
+                let f = self.emit_f16_to_float(val);
+                let i = self.fresh_tmp();
+                let op = if dk.is_unsigned() { "fptoui" } else { "fptosi" };
+                self.code.push_str(&format!("  {} = {} float {} to i64\n", i, op, f));
+                self.normalize_scalar(&i, dk)
+            }
+            (Some(ScalarKind::BF16), Some(dk)) if dk.is_int() => {
+                let f = self.emit_bf16_to_float(val);
+                let i = self.fresh_tmp();
+                let op = if dk.is_unsigned() { "fptoui" } else { "fptosi" };
+                self.code.push_str(&format!("  {} = {} float {} to i64\n", i, op, f));
+                self.normalize_scalar(&i, dk)
+            }
+            (sk, Some(ScalarKind::F16)) if sk != Some(ScalarKind::F16) => {
+                let f = self.fresh_tmp();
+                let op = if sk.is_some_and(|k| k.is_unsigned()) { "uitofp" } else { "sitofp" };
+                self.code.push_str(&format!("  {} = {} i64 {} to float\n", f, op, val));
+                self.emit_float_to_f16(&f)
+            }
+            (sk, Some(ScalarKind::BF16)) if sk != Some(ScalarKind::BF16) => {
+                let f = self.fresh_tmp();
+                let op = if sk.is_some_and(|k| k.is_unsigned()) { "uitofp" } else { "sitofp" };
+                self.code.push_str(&format!("  {} = {} i64 {} to float\n", f, op, val));
+                self.emit_float_to_bf16(&f)
+            }
             (Some(ScalarKind::F64), Some(ScalarKind::F32)) => {
                 let d = self.fresh_tmp();
                 let f = self.fresh_tmp();
@@ -2237,6 +2399,104 @@ impl<'a> LlvmFnGen<'a> {
     fn flat_simd_list_info(&self, ty: &TypeExpr) -> Option<(&'static str, usize, i64)> {
         let elem = self.list_elem_ty(ty)?;
         self.simd_elem_info(&elem)
+    }
+
+    /// Returns `Some(is_signed)` if `ty` is a compact 2-byte scalar list
+    /// (`List[Float16]`, `List[BFloat16]`, `List[Int16]`, `List[UInt16]`, stored flat with tag 20, 2 bytes/elem).
+    fn flat_scalar2_list_info(&self, ty: &TypeExpr) -> Option<bool> {
+        let elem = self.list_elem_ty(ty)?;
+        self.scalar2_elem_info(&elem)
+    }
+
+    fn scalar2_elem_info(&self, ty: &TypeExpr) -> Option<bool> {
+        match resolve_alias_ty(ty, self.alias_bases) {
+            TypeExpr::Named { name, .. } => match name.as_str() {
+                "Int16" => Some(true),
+                "UInt16" | "Float16" | "BFloat16" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn emit_flat_scalar2_load(
+        &mut self,
+        list_val: &str,
+        idx_val: &str,
+        is_signed: bool,
+        is_safe: bool,
+    ) -> String {
+        let ext = if is_signed { "sext" } else { "zext" };
+        if is_safe {
+            let base = self.fresh_tmp();
+            let data = self.fresh_tmp();
+            let ep = self.fresh_tmp();
+            let v16 = self.fresh_tmp();
+            let res = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds i16, ptr {}, i64 {}\n  {} = load i16, ptr {}, align 2, !tbaa !7\n  {} = {} i16 {} to i64\n",
+                base, list_val, data, base, ep, data, idx_val, v16, ep, res, ext, v16
+            ));
+            res
+        } else {
+            self.slot_id += 1;
+            let rslot = format!("%fs2_{}", self.slot_id);
+            self.entry_allocas.push_str(&format!("  {} = alloca i64, align 8\n", rslot));
+            let chk_l = self.fresh_lbl("fs2_chk");
+            let ok_l = self.fresh_lbl("fs2_ok");
+            let oob_l = self.fresh_lbl("fs2_oob");
+            let end_l = self.fresh_lbl("fs2_end");
+            let nz = self.fresh_tmp();
+            let base = self.fresh_tmp();
+            let lp = self.fresh_tmp();
+            let len_v = self.fresh_tmp();
+            let in_b = self.fresh_tmp();
+            let data = self.fresh_tmp();
+            let ep = self.fresh_tmp();
+            let v16 = self.fresh_tmp();
+            let v64 = self.fresh_tmp();
+            let out = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 16\n  {} = load i64, ptr {}, align 8, !tbaa !8\n  {} = icmp ult i64 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds i16, ptr {}, i64 {}\n  {} = load i16, ptr {}, align 2, !tbaa !7\n  {} = {} i16 {} to i64\n  store i64 {}, ptr {}, align 8\n  br label %{}\n{}:\n  store i64 0, ptr {}, align 8\n  br label %{}\n{}:\n  {} = load i64, ptr {}, align 8\n",
+                nz, list_val, nz, chk_l, oob_l,
+                chk_l, base, list_val, lp, base, len_v, lp, in_b, idx_val, len_v, in_b, ok_l, oob_l,
+                ok_l, data, base, ep, data, idx_val, v16, ep, v64, ext, v16, v64, rslot, end_l,
+                oob_l, rslot, end_l,
+                end_l, out, rslot
+            ));
+            out
+        }
+    }
+
+    fn emit_flat_scalar2_store(
+        &mut self,
+        list_val: &str,
+        idx_val: &str,
+        val_i64: &str,
+        is_safe: bool,
+    ) {
+        let v16 = self.fresh_tmp();
+        self.code.push_str(&format!("  {} = trunc i64 {} to i16\n", v16, val_i64));
+        let base = self.fresh_tmp();
+        let data = self.fresh_tmp();
+        let ep = self.fresh_tmp();
+        if is_safe {
+            self.code.push_str(&format!(
+                "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds i16, ptr {}, i64 {}\n  store i16 {}, ptr {}, align 2, !tbaa !7\n",
+                base, list_val, data, base, ep, data, idx_val, v16, ep
+            ));
+        } else {
+            let ok_l = self.fresh_lbl("fs2s_ok");
+            let end_l = self.fresh_lbl("fs2s_end");
+            let lp = self.fresh_tmp();
+            let len_v = self.fresh_tmp();
+            let in_b = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 16\n  {} = load i64, ptr {}, align 8, !tbaa !8\n  {} = icmp ult i64 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds i16, ptr {}, i64 {}\n  store i16 {}, ptr {}, align 2, !tbaa !7\n  br label %{}\n{}:\n",
+                base, list_val, lp, base, len_v, lp, in_b, idx_val, len_v, in_b, ok_l, end_l,
+                ok_l, data, base, ep, data, idx_val, v16, ep, end_l, end_l
+            ));
+        }
     }
 
     /// Returns `Some(is_signed)` if `ty` is a compact 4-byte scalar list
@@ -3660,6 +3920,21 @@ impl<'a> LlvmFnGen<'a> {
         is_float: bool,
         sk: Option<ScalarKind>,
     ) -> String {
+        if matches!(sk, Some(ScalarKind::F16 | ScalarKind::BF16)) {
+            let fop = match op {
+                AssignOp::AddSet => "fadd",
+                AssignOp::SubSet => "fsub",
+                AssignOp::MulSet => "fmul",
+                AssignOp::DivSet => "fdiv",
+                _ => return rhs.to_string(),
+            };
+            let is_f16 = sk == Some(ScalarKind::F16);
+            let cf = if is_f16 { self.emit_f16_to_float(cur) } else { self.emit_bf16_to_float(cur) };
+            let rf = if is_f16 { self.emit_f16_to_float(rhs) } else { self.emit_bf16_to_float(rhs) };
+            let fres = self.fresh_tmp();
+            self.code.push_str(&format!("  {} = {} float {}, {}\n", fres, fop, cf, rf));
+            return if is_f16 { self.emit_float_to_f16(&fres) } else { self.emit_float_to_bf16(&fres) };
+        }
         if sk == Some(ScalarKind::F32) {
             let fop = match op {
                 AssignOp::AddSet => "fadd",
@@ -4289,6 +4564,26 @@ impl<'a> LlvmFnGen<'a> {
                                 res
                             } else if target_ty
                                 .as_ref()
+                                .and_then(|t| self.flat_scalar2_list_info(t))
+                                .or_else(|| self.scalar2_elem_info(&self.infer_expr_type(&args[1].value)))
+                                .is_some()
+                            {
+                                let xs_val = self.load_ident_val(name)?;
+                                let mut temps = Vec::new();
+                                let vv = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                                let v16 = self.fresh_tmp();
+                                self.slot_id += 1;
+                                let vslot = format!("%fs2push_{}", self.slot_id);
+                                self.entry_allocas.push_str(&format!("  {} = alloca i16, align 2\n", vslot));
+                                let res = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = trunc i64 {} to i16\n  store i16 {}, ptr {}, align 2\n  {} = call i64 @tenon_flat_list_push(i64 {}, i64 2, ptr {})\n",
+                                    v16, vv, v16, vslot, res, xs_val, vslot
+                                ));
+                                self.flush_temps(&temps);
+                                res
+                            } else if target_ty
+                                .as_ref()
                                 .and_then(|t| self.flat_scalar4_list_info(t))
                                 .or_else(|| self.scalar4_elem_info(&self.infer_expr_type(&args[1].value)))
                                 .is_some()
@@ -4694,6 +4989,54 @@ impl<'a> LlvmFnGen<'a> {
                                             ok_l, data, base, ep, vec_ty, data, idx_v, vec_ty, vv, ep, end_l, end_l
                                         ));
                                     }
+                                    self.flush_temps(&temps);
+                                } else if let Some(is_signed) = self
+                                    .var_types
+                                    .get(vname)
+                                    .and_then(|t| self.flat_scalar2_list_info(t))
+                                {
+                                    let elem_ty = self
+                                        .var_types
+                                        .get(vname)
+                                        .and_then(|t| self.list_elem_ty(t));
+                                    let mut temps = Vec::new();
+                                    let rhs = self.lower_expr_borrowed(value, &mut temps)?;
+                                    let cur_list = self.load_ident_val(vname)?;
+                                    let is_always_uniq = self.always_unique_vars.contains(vname);
+                                    let uniq_list = if is_always_uniq {
+                                        cur_list
+                                    } else {
+                                        let u = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
+                                            u, cur_list
+                                        ));
+                                        let vslot = self.var_ptrs[vname].clone();
+                                        if self.inout_vars.contains(vname) {
+                                            let ai = self.fresh_tmp();
+                                            let ap = self.fresh_tmp();
+                                            self.code.push_str(&format!(
+                                                "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                                ai, vslot, ap, ai, u, ap
+                                            ));
+                                        } else {
+                                            self.code.push_str(&format!(
+                                                "  store i64 {}, ptr {}\n",
+                                                u, vslot
+                                            ));
+                                        }
+                                        u
+                                    };
+                                    let is_safe = self.proved_safe_indices.contains(&target.span.start);
+                                    let final_v = if *op == AssignOp::Set {
+                                        rhs
+                                    } else {
+                                        let cur = self.emit_flat_scalar2_load(&uniq_list, &idx_v, is_signed, is_safe);
+                                        let sk = elem_ty.as_ref().and_then(|t| scalar_kind_of_ty(t, self.alias_bases));
+                                        let is_flt = elem_ty.as_ref().is_some_and(|t| is_float_type_expr(t, self.alias_bases));
+                                        self.emit_compound_op(&cur, &rhs, *op, is_flt, sk)
+                                    };
+                                    self.emit_flat_scalar2_store(&uniq_list, &idx_v, &final_v, is_safe);
                                     self.flush_temps(&temps);
                                 } else if let Some(is_signed) = self
                                     .var_types
@@ -5227,6 +5570,15 @@ impl<'a> LlvmFnGen<'a> {
                     self.flush_temps(&temps);
                     return Ok(obj);
                 }
+                if let Some(is_signed) = self.flat_scalar2_list_info(&target_ty) {
+                    let mut temps = Vec::new();
+                    let t = self.lower_expr_borrowed(target, &mut temps)?;
+                    let i = self.lower_expr_borrowed(index, &mut temps)?;
+                    let is_safe = self.proved_safe_indices.contains(&expr.span.start);
+                    let res = self.emit_flat_scalar2_load(&t, &i, is_signed, is_safe);
+                    self.flush_temps(&temps);
+                    return Ok(res);
+                }
                 if let Some(is_signed) = self.flat_scalar4_list_info(&target_ty) {
                     let mut temps = Vec::new();
                     let t = self.lower_expr_borrowed(target, &mut temps)?;
@@ -5419,6 +5771,12 @@ impl<'a> LlvmFnGen<'a> {
                     ));
                     temps.push(obj.clone());
                     return Ok(obj);
+                }
+                if let Some(is_signed) = self.flat_scalar2_list_info(&target_ty) {
+                    let t = self.lower_expr_borrowed(target, temps)?;
+                    let i = self.lower_expr_borrowed(index, temps)?;
+                    let is_safe = self.proved_safe_indices.contains(&expr.span.start);
+                    return Ok(self.emit_flat_scalar2_load(&t, &i, is_signed, is_safe));
                 }
                 if let Some(is_signed) = self.flat_scalar4_list_info(&target_ty) {
                     let t = self.lower_expr_borrowed(target, temps)?;
@@ -6058,6 +6416,36 @@ impl<'a> LlvmFnGen<'a> {
                     return Ok(obj);
                 }
                 if expected_ty
+                    .and_then(|t| self.flat_scalar2_list_info(t))
+                    .or_else(|| elems.first().and_then(|e| self.scalar2_elem_info(&self.infer_expr_type(e))))
+                    .is_some()
+                {
+                    let obj = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_flat_list_filled(i64 {}, i64 2, ptr null)\n",
+                        obj,
+                        elems.len()
+                    ));
+                    let base = self.fresh_tmp();
+                    let data = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n",
+                        base, obj, data, base
+                    ));
+                    for (idx, e) in elems.iter().enumerate() {
+                        let mut temps = Vec::new();
+                        let vv = self.lower_expr_borrowed(e, &mut temps)?;
+                        let v16 = self.fresh_tmp();
+                        let ep = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = trunc i64 {} to i16\n  {} = getelementptr inbounds i16, ptr {}, i64 {}\n  store i16 {}, ptr {}, align 2, !tbaa !7\n",
+                            v16, vv, ep, data, idx, v16, ep
+                        ));
+                        self.flush_temps(&temps);
+                    }
+                    return Ok(obj);
+                }
+                if expected_ty
                     .and_then(|t| self.flat_scalar4_list_info(t))
                     .or_else(|| elems.first().and_then(|e| self.scalar4_elem_info(&self.infer_expr_type(e))))
                     .is_some()
@@ -6170,7 +6558,9 @@ impl<'a> LlvmFnGen<'a> {
                 let r = self.fresh_tmp();
                 match op {
                     UnOp::Neg => {
-                        if sk == Some(ScalarKind::F32) {
+                        if matches!(sk, Some(ScalarKind::F16 | ScalarKind::BF16)) {
+                            self.code.push_str(&format!("  {} = xor i64 {}, 32768\n", r, v));
+                        } else if sk == Some(ScalarKind::F32) {
                             let t32 = self.fresh_tmp();
                             let fv = self.fresh_tmp();
                             let nf = self.fresh_tmp();
@@ -6286,6 +6676,8 @@ impl<'a> LlvmFnGen<'a> {
                 let eff_sk = match (lk, rk) {
                     (Some(ScalarKind::I64), Some(k)) if k != ScalarKind::I64 && matches!(left.kind, ExprKind::Int(_)) => Some(k),
                     (Some(ScalarKind::F32), _) | (_, Some(ScalarKind::F32)) => Some(ScalarKind::F32),
+                    (Some(ScalarKind::F16), _) | (_, Some(ScalarKind::F16)) => Some(ScalarKind::F16),
+                    (Some(ScalarKind::BF16), _) | (_, Some(ScalarKind::BF16)) => Some(ScalarKind::BF16),
                     (Some(k), _) => Some(k),
                     (None, k) => k,
                 };
@@ -6321,6 +6713,49 @@ impl<'a> LlvmFnGen<'a> {
                     return Ok(res);
                 }
                 self.flush_temps(&temps);
+                if matches!(eff_sk, Some(ScalarKind::F16 | ScalarKind::BF16)) {
+                    let is_f16 = eff_sk == Some(ScalarKind::F16);
+                    let lf = if is_f16 { self.emit_f16_to_float(&l) } else { self.emit_bf16_to_float(&l) };
+                    let rf = if is_f16 { self.emit_f16_to_float(&r) } else { self.emit_bf16_to_float(&r) };
+                    match op {
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                            let fop = match op {
+                                BinOp::Add => "fadd",
+                                BinOp::Sub => "fsub",
+                                BinOp::Mul => "fmul",
+                                BinOp::Div => "fdiv",
+                                _ => unreachable!(),
+                            };
+                            let fres = self.fresh_tmp();
+                            self.code.push_str(&format!("  {} = {} float {}, {}\n", fres, fop, lf, rf));
+                            let out = if is_f16 {
+                                self.emit_float_to_f16(&fres)
+                            } else {
+                                self.emit_float_to_bf16(&fres)
+                            };
+                            return Ok(out);
+                        }
+                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                            let pred = match op {
+                                BinOp::Eq => "oeq",
+                                BinOp::Ne => "une",
+                                BinOp::Lt => "olt",
+                                BinOp::Le => "ole",
+                                BinOp::Gt => "ogt",
+                                BinOp::Ge => "oge",
+                                _ => unreachable!(),
+                            };
+                            let c = self.fresh_tmp();
+                            let res = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = fcmp {} float {}, {}\n  {} = zext i1 {} to i64\n",
+                                c, pred, lf, rf, res, c
+                            ));
+                            return Ok(res);
+                        }
+                        other => return Err(format!("unsupported float16/bfloat16 op {:?} in LLVM codegen", other)),
+                    }
+                }
                 if eff_sk == Some(ScalarKind::F32) {
                     let l32 = self.fresh_tmp();
                     let r32 = self.fresh_tmp();
@@ -7098,6 +7533,27 @@ impl<'a> LlvmFnGen<'a> {
                             return Ok(res);
                         }
                         if self
+                            .flat_scalar2_list_info(&xs_ty)
+                            .or_else(|| expected_ty.and_then(|t| self.flat_scalar2_list_info(t)))
+                            .or_else(|| self.scalar2_elem_info(&self.infer_expr_type(&args[1].value)))
+                            .is_some()
+                        {
+                            let xs = self.lower_expr_owned(&args[0].value, expected_ty)?;
+                            let mut temps = Vec::new();
+                            let vv = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                            let v16 = self.fresh_tmp();
+                            self.slot_id += 1;
+                            let vslot = format!("%fs2push_{}", self.slot_id);
+                            self.entry_allocas.push_str(&format!("  {} = alloca i16, align 2\n", vslot));
+                            let res = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = trunc i64 {} to i16\n  store i16 {}, ptr {}, align 2\n  {} = call i64 @tenon_flat_list_push(i64 {}, i64 2, ptr {})\n",
+                                v16, vv, v16, vslot, res, xs, vslot
+                            ));
+                            self.flush_temps(&temps);
+                            return Ok(res);
+                        }
+                        if self
                             .flat_scalar4_list_info(&xs_ty)
                             .or_else(|| expected_ty.and_then(|t| self.flat_scalar4_list_info(t)))
                             .or_else(|| self.scalar4_elem_info(&self.infer_expr_type(&args[1].value)))
@@ -7177,6 +7633,26 @@ impl<'a> LlvmFnGen<'a> {
                                 lf_len, lf_lp,
                                 lf_eq, lf_len, lf_exp,
                                 lf_eq
+                            ));
+                            self.flush_temps(&temps);
+                            return Ok(res);
+                        }
+                        if expected_ty
+                            .and_then(|t| self.flat_scalar2_list_info(t))
+                            .or_else(|| self.scalar2_elem_info(&self.infer_expr_type(&args[1].value)))
+                            .is_some()
+                        {
+                            let mut temps = Vec::new();
+                            let count_v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                            let vv = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                            let v16 = self.fresh_tmp();
+                            self.slot_id += 1;
+                            let islot = format!("%fs2fill_{}", self.slot_id);
+                            self.entry_allocas.push_str(&format!("  {} = alloca i16, align 2\n", islot));
+                            let res = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = trunc i64 {} to i16\n  store i16 {}, ptr {}, align 2\n  {} = call i64 @tenon_flat_list_filled(i64 {}, i64 2, ptr {})\n",
+                                v16, vv, v16, islot, res, count_v, islot
                             ));
                             self.flush_temps(&temps);
                             return Ok(res);

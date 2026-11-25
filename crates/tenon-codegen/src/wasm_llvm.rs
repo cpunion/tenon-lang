@@ -204,8 +204,8 @@ int64_t tenon_rc_ensure_unique(int64_t ptr) {
         tenon_rc_dec(ptr);
         return (int64_t)(uintptr_t)fresh;
     }
-    if (obj->tag == 17 || obj->tag == 18 || obj->tag == 19) {
-        int64_t eb = (obj->tag == 19) ? 4 : ((obj->tag == 17) ? 16 : 32);
+    if (obj->tag == 17 || obj->tag == 18 || obj->tag == 19 || obj->tag == 20) {
+        int64_t eb = (obj->tag == 20) ? 2 : ((obj->tag == 19) ? 4 : ((obj->tag == 17) ? 16 : 32));
         int64_t total_bytes = obj->len * eb;
         int64_t words = (total_bytes + 7) / 8;
         if (words < 2) words = 2;
@@ -404,7 +404,7 @@ int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc) {
 
 int64_t tenon_flat_list_filled(int64_t len, int64_t elem_bytes, const void* init_ptr) {
     int64_t n = len < 0 ? 0 : len;
-    int64_t tag = (elem_bytes == 16) ? 17 : 18;
+    int64_t tag = (elem_bytes == 2) ? 20 : ((elem_bytes == 4) ? 19 : ((elem_bytes == 16) ? 17 : 18));
     int64_t total_bytes = n * elem_bytes;
     int64_t words = (total_bytes + 7) / 8;
     if (words < 4) words = 4;
@@ -417,7 +417,7 @@ int64_t tenon_flat_list_filled(int64_t len, int64_t elem_bytes, const void* init
 
 int64_t tenon_flat_list_push(int64_t ptr, int64_t elem_bytes, const void* val_ptr) {
     if (ptr == 0) return tenon_flat_list_filled(1, elem_bytes, val_ptr);
-    int64_t tag = (elem_bytes == 16) ? 17 : 18;
+    int64_t tag = (elem_bytes == 2) ? 20 : ((elem_bytes == 4) ? 19 : ((elem_bytes == 16) ? 17 : 18));
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
     int64_t old_len = obj->len;
     int64_t cap_elems = (obj->cap * 8) / elem_bytes;

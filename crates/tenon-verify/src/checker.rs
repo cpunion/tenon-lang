@@ -1162,17 +1162,23 @@ impl CheckerCtx {
     }
 
     fn unify_type_pattern(
+        &self,
         pat: &TypeExpr,
         actual: &TypeExpr,
         tps: &[String],
         subst: &mut BTreeMap<String, TypeExpr>,
     ) {
-        match (pat, actual) {
+        let act = self.resolve_base_type(actual);
+        let pat_res = match pat {
+            TypeExpr::Named { name, args, .. } if args.is_empty() && tps.contains(name) => pat.clone(),
+            _ => self.resolve_base_type(pat),
+        };
+        match (&pat_res, &act) {
             (TypeExpr::Named { name, args, .. }, _)
                 if args.is_empty() && tps.contains(name) =>
             {
-                if actual.display_name() != "Any" {
-                    subst.entry(name.clone()).or_insert_with(|| actual.clone());
+                if act.display_name() != "Any" {
+                    subst.entry(name.clone()).or_insert_with(|| act.clone());
                 }
             }
             (
@@ -1180,12 +1186,12 @@ impl CheckerCtx {
                 TypeExpr::Named { name: an, args: aa, .. },
             ) if pn == an && pa.len() == aa.len() => {
                 for (x, y) in pa.iter().zip(aa.iter()) {
-                    Self::unify_type_pattern(x, y, tps, subst);
+                    self.unify_type_pattern(x, y, tps, subst);
                 }
             }
             (TypeExpr::Tuple(pe, _), TypeExpr::Tuple(ae, _)) if pe.len() == ae.len() => {
                 for (x, y) in pe.iter().zip(ae.iter()) {
-                    Self::unify_type_pattern(x, y, tps, subst);
+                    self.unify_type_pattern(x, y, tps, subst);
                 }
             }
             (
@@ -1193,10 +1199,10 @@ impl CheckerCtx {
                 TypeExpr::Fn { params: ap, ret: ar, .. },
             ) if pp.len() == ap.len() => {
                 for (x, y) in pp.iter().zip(ap.iter()) {
-                    Self::unify_type_pattern(x, y, tps, subst);
+                    self.unify_type_pattern(x, y, tps, subst);
                 }
                 if let (Some(pr_ty), Some(ar_ty)) = (pr, ar) {
-                    Self::unify_type_pattern(pr_ty, ar_ty, tps, subst);
+                    self.unify_type_pattern(pr_ty, ar_ty, tps, subst);
                 }
             }
             _ => {}
@@ -1223,7 +1229,7 @@ impl CheckerCtx {
         for (p, a) in explicit_params.iter().zip(args.iter()) {
             if !matches!(a.value.kind, ExprKind::Lambda { .. }) {
                 let aty = self.infer_expr_type(&a.value, var_types);
-                Self::unify_type_pattern(&p.ty, &aty, &m.type_params, &mut subst);
+                self.unify_type_pattern(&p.ty, &aty, &m.type_params, &mut subst);
             }
         }
         // Pass 2: unify lambda arguments using expected parameter types after substituting Pass 1!
@@ -1231,7 +1237,7 @@ impl CheckerCtx {
             if matches!(a.value.kind, ExprKind::Lambda { .. }) {
                 let expected_pty = subst_type_expr(&p.ty, &subst);
                 let aty = self.infer_expr_type_expected(&a.value, Some(&expected_pty), var_types);
-                Self::unify_type_pattern(&p.ty, &aty, &m.type_params, &mut subst);
+                self.unify_type_pattern(&p.ty, &aty, &m.type_params, &mut subst);
             }
         }
         for tp in &m.type_params {
@@ -1578,9 +1584,68 @@ impl CheckerCtx {
     }
 
     fn resolve_base_type(&self, ty: &TypeExpr) -> TypeExpr {
-        if let TypeExpr::Named { name, .. } = ty {
+        if let TypeExpr::Named { name, args, version, span } = ty {
             if let Some(alias) = self.type_aliases.get(name) {
-                return self.resolve_base_type(&alias.base);
+                let instantiated = instantiate_alias_base(alias, args);
+                return self.resolve_base_type(&instantiated);
+            }
+            if let Some(rec) = self.records.get(name) {
+                if !rec.type_params.is_empty()
+                    && (args.len() < rec.type_params.len()
+                        || args.iter().any(|a| a.as_named_arg().is_some()))
+                {
+                    let (bindings, _) = resolve_type_args(
+                        &rec.type_params,
+                        &rec.type_param_defaults,
+                        None,
+                        args,
+                    );
+                    let filled: Vec<TypeExpr> = rec
+                        .type_params
+                        .iter()
+                        .map(|tp| {
+                            bindings
+                                .get(tp)
+                                .map(|t| self.resolve_base_type(t))
+                                .unwrap_or_else(|| named_ty("Any"))
+                        })
+                        .collect();
+                    return TypeExpr::Named {
+                        name: name.clone(),
+                        version: version.clone(),
+                        args: filled,
+                        span: *span,
+                    };
+                }
+            }
+            if let Some(en) = self.enums.get(name) {
+                if !en.type_params.is_empty()
+                    && (args.len() < en.type_params.len()
+                        || args.iter().any(|a| a.as_named_arg().is_some()))
+                {
+                    let (bindings, _) = resolve_type_args(
+                        &en.type_params,
+                        &en.type_param_defaults,
+                        None,
+                        args,
+                    );
+                    let filled: Vec<TypeExpr> = en
+                        .type_params
+                        .iter()
+                        .map(|tp| {
+                            bindings
+                                .get(tp)
+                                .map(|t| self.resolve_base_type(t))
+                                .unwrap_or_else(|| named_ty("Any"))
+                        })
+                        .collect();
+                    return TypeExpr::Named {
+                        name: name.clone(),
+                        version: version.clone(),
+                        args: filled,
+                        span: *span,
+                    };
+                }
             }
         }
         ty.clone()
@@ -1810,16 +1875,39 @@ impl CheckerCtx {
                 if let Some(rec) = self.records.get(name) {
                     if !rec.type_params.is_empty() {
                         let mut subst = BTreeMap::new();
+                        if let Some(exp) = expected {
+                            if let TypeExpr::Named { name: en, args: ea, .. } = self.resolve_base_type(exp) {
+                                if en == *name {
+                                    let (eb, _) = resolve_type_args(
+                                        &rec.type_params,
+                                        &rec.type_param_defaults,
+                                        None,
+                                        &ea,
+                                    );
+                                    for (k, v) in eb {
+                                        if v.display_name() != "Any" {
+                                            subst.insert(k, v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         for (fname, fval) in fields {
                             if let Some(fd) = rec.fields.iter().find(|f| f.name == *fname) {
                                 let aty = self.infer_expr_type(fval, var_types);
-                                Self::unify_type_pattern(&fd.ty, &aty, &rec.type_params, &mut subst);
+                                self.unify_type_pattern(&fd.ty, &aty, &rec.type_params, &mut subst);
                             }
                         }
                         let targs: Vec<TypeExpr> = rec
                             .type_params
                             .iter()
-                            .map(|tp| subst.get(tp).cloned().unwrap_or_else(|| named_ty("Any")))
+                            .map(|tp| {
+                                subst
+                                    .get(tp)
+                                    .cloned()
+                                    .or_else(|| rec.type_param_defaults.get(tp).cloned())
+                                    .unwrap_or_else(|| named_ty("Any"))
+                            })
                             .collect();
                         return generic_ty(name, targs);
                     }
@@ -2361,7 +2449,7 @@ impl CheckerCtx {
                 let mut subst = BTreeMap::new();
                 for (pty, a) in vi.payload_tys.iter().zip(args.iter()) {
                     let aty = self.infer_expr_type(&a.value, var_types);
-                    Self::unify_type_pattern(pty, &aty, &ed.type_params, &mut subst);
+                    self.unify_type_pattern(pty, &aty, &ed.type_params, &mut subst);
                 }
                 let targs: Vec<TypeExpr> = ed
                     .type_params
@@ -3696,6 +3784,22 @@ impl CheckerCtx {
                                                 op: BinOp::Eq,
                                                 left: Box::new(Expr { kind: ExprKind::Ident(dst_lk), span: fexpr.span }),
                                                 right: Box::new(Expr { kind: ExprKind::Ident(src_lk), span: fexpr.span }),
+                                            },
+                                            span: fexpr.span,
+                                        },
+                                        BTreeMap::new(),
+                                    ));
+                                } else if let ExprKind::List(elems) = &fexpr.kind {
+                                    let dst_lk = format!("__len__{}__{}", name, fname);
+                                    let n = elems.len() as i64;
+                                    env.set_int(dst_lk.clone(), AbsInt::exact(n as i128));
+                                    smt_int_vars.insert(dst_lk.clone());
+                                    smt_premises.push((
+                                        Expr {
+                                            kind: ExprKind::Binary {
+                                                op: BinOp::Eq,
+                                                left: Box::new(Expr { kind: ExprKind::Ident(dst_lk), span: fexpr.span }),
+                                                right: Box::new(Expr { kind: ExprKind::Int(n), span: fexpr.span }),
                                             },
                                             span: fexpr.span,
                                         },
@@ -6039,6 +6143,9 @@ impl CheckerCtx {
                                 unify_lit(&fdecl.ty, &aty, &rec.type_params, &mut rsubst);
                             }
                         }
+                        for (tp, def) in &rec.type_param_defaults {
+                            rsubst.entry(tp.clone()).or_insert_with(|| def.clone());
+                        }
                     }
                     // Check unknown & missing required fields + field type compatibility!
                     let provided_names: BTreeSet<&str> =
@@ -8027,14 +8134,14 @@ impl CheckerCtx {
             for (p, a) in fdecl.params.iter().zip(args.iter()) {
                 if !matches!(a.value.kind, ExprKind::Lambda { .. }) {
                     let aty = self.infer_expr_type(&a.value, var_types);
-                    Self::unify_type_pattern(&p.ty, &aty, &fdecl.type_params, &mut inferred_tp);
+                    self.unify_type_pattern(&p.ty, &aty, &fdecl.type_params, &mut inferred_tp);
                 }
             }
             for (p, a) in fdecl.params.iter().zip(args.iter()) {
                 if matches!(a.value.kind, ExprKind::Lambda { .. }) {
                     let expected_pty = subst_type_expr(&p.ty, &inferred_tp);
                     let aty = self.infer_expr_type_expected(&a.value, Some(&expected_pty), var_types);
-                    Self::unify_type_pattern(&p.ty, &aty, &fdecl.type_params, &mut inferred_tp);
+                    self.unify_type_pattern(&p.ty, &aty, &fdecl.type_params, &mut inferred_tp);
                 }
             }
             for (tp, concrete_ty) in &inferred_tp {
@@ -8393,7 +8500,7 @@ impl CheckerCtx {
             if !ed.type_params.is_empty() {
                 for (pty, a) in vi.payload_tys.iter().zip(args.iter()) {
                     let aty = self.infer_expr_type(&a.value, var_types);
-                    Self::unify_type_pattern(pty, &aty, &ed.type_params, &mut esubst);
+                    self.unify_type_pattern(pty, &aty, &ed.type_params, &mut esubst);
                 }
                 for (tp, ta) in &esubst {
                     if ta.display_name() != "Any" && !self.cur_type_params.contains(&ta.display_name()) {
@@ -8736,9 +8843,11 @@ impl CheckerCtx {
         }
 
         // Record-level refinement alias fast path (e.g. `type Matrix[R, C] = Tensor2D where self.rows == R && self.cols == C`):
-        // Supports both `Ident(v)` (using `v.field` directly) and `RecordLit { fields }` (substituting `self.field` -> field value)!
+        // Supports `Ident(v)`, `RecordLit { fields }`, and `Call` (instantiating callee `ensures` & return refinement)!
         let pred_uses_self_field = expr_mentions_self_field(pred);
         if pred_uses_self_field {
+            let mut extra_smt_premises: Vec<(Expr, BTreeMap<String, String>)> = Vec::new();
+            let mut extra_smt_vars: BTreeSet<String> = BTreeSet::new();
             let (l0_res, l1_goal, l1_subst) = match &expr.kind {
                 ExprKind::Ident(vname) => {
                     let mut s = BTreeMap::new();
@@ -8748,6 +8857,53 @@ impl CheckerCtx {
                 ExprKind::RecordLit { fields, .. } => {
                     let rewritten = substitute_self_fields_from_lit(pred, fields);
                     (env.check_predicate(&rewritten, None), rewritten, BTreeMap::new())
+                }
+                ExprKind::Call { callee, args } => {
+                    let fd_opt = match &callee.kind {
+                        ExprKind::Ident(fnm) => self.all_fns.get(fnm).cloned(),
+                        ExprKind::Field { target, field } => {
+                            if let ExprKind::Ident(tname) = &target.kind {
+                                self.resolve_assoc_method_sig(tname, field)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(fdecl) = fd_opt {
+                        let mut call_env = env.clone();
+                        let res_sym = "__call_res".to_string();
+                        extra_smt_vars.insert(res_sym.clone());
+                        if let Some(rt) = &fdecl.ret_ty {
+                            self.assume_type_facts(
+                                &res_sym,
+                                rt,
+                                &mut call_env,
+                                &mut extra_smt_vars,
+                                &mut extra_smt_premises,
+                            );
+                        }
+                        if !fdecl.ensures.is_empty() && fdecl.params.len() == args.len() {
+                            let mut map = BTreeMap::new();
+                            map.insert(
+                                "result".to_string(),
+                                Expr { kind: ExprKind::Ident(res_sym.clone()), span },
+                            );
+                            for (p, a) in fdecl.params.iter().zip(args.iter()) {
+                                map.insert(p.name.clone(), a.value.clone());
+                            }
+                            for ens in &fdecl.ensures {
+                                let inst = substitute_expr_idents(ens, &map);
+                                call_env.assume_expr(&inst, None);
+                                extra_smt_premises.push((inst, BTreeMap::new()));
+                            }
+                        }
+                        let mut s = BTreeMap::new();
+                        s.insert("self".into(), res_sym.clone());
+                        (call_env.check_predicate(pred, Some(&res_sym)), pred.clone(), s)
+                    } else {
+                        (L0Result::Unknown, pred.clone(), BTreeMap::new())
+                    }
                 }
                 _ => (L0Result::Unknown, pred.clone(), BTreeMap::new()),
             };
@@ -8772,7 +8928,7 @@ impl CheckerCtx {
                 }
                 L0Result::Unknown => {
                     let mut q = SmtQuery::new(self.smt_pure_fns.clone());
-                    for v in smt_int_vars {
+                    for v in smt_int_vars.iter().chain(extra_smt_vars.iter()) {
                         if !self.cur_real_vars.contains(v) {
                             q.declare_int(v.clone());
                         }
@@ -8780,7 +8936,7 @@ impl CheckerCtx {
                     for rv in &self.cur_real_vars {
                         q.declare_real(rv.clone());
                     }
-                    for (p, s) in smt_premises {
+                    for (p, s) in smt_premises.iter().chain(extra_smt_premises.iter()) {
                         let _ = q.add_premise_expr(p, s);
                     }
                     if let Err(e) = q.set_goal_expr(&l1_goal, &l1_subst) {
@@ -9197,7 +9353,7 @@ impl CheckerCtx {
                     },
                 });
             }
-            cur = alias.base.clone();
+            cur = instantiate_alias_base(alias, &args);
         }
         combined
     }

@@ -773,8 +773,28 @@ impl Parser {
     fn parse_type_params_with_bounds(
         &mut self,
     ) -> Result<(Vec<String>, BTreeMap<String, Vec<String>>), ParseError> {
+        let (params, bounds, _, _) = self.parse_type_params_full()?;
+        Ok((params, bounds))
+    }
+
+    /// Parses generic/const/variadic/default type parameter lists:
+    /// `[T, K Hash + Eq, R Int, ...Shape Int, DType = Float32]`
+    #[allow(clippy::type_complexity)]
+    fn parse_type_params_full(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<String>,
+            BTreeMap<String, Vec<String>>,
+            BTreeMap<String, TypeExpr>,
+            Option<String>,
+        ),
+        ParseError,
+    > {
         let mut params = Vec::new();
         let mut bounds: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut defaults: BTreeMap<String, TypeExpr> = BTreeMap::new();
+        let mut variadic_param: Option<String> = None;
         if self.peek().kind == TokenKind::LBracket {
             self.bump();
             loop {
@@ -784,8 +804,9 @@ impl Parser {
                     break;
                 }
                 let is_comptime = self.eat(&TokenKind::Comptime);
+                let is_variadic = self.eat(&TokenKind::DotDotDot);
                 // Effect polymorphism parameter: `effect E` (ADR-0001 D04)
-                if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "effect") {
+                if !is_variadic && matches!(&self.peek().kind, TokenKind::Ident(s) if s == "effect") {
                     self.bump();
                     let (ename, _) = self.expect_ident()?;
                     bounds.insert(ename, vec!["__effect__".into()]);
@@ -796,13 +817,16 @@ impl Parser {
                     continue;
                 }
                 let (name, _) = self.expect_ident()?;
-                // Optional bound(s) e.g. `T Tool` or `K Hash + Eq` or `comptime N USize where ...`
+                if is_variadic {
+                    variadic_param = Some(name.clone());
+                }
+                // Optional bound(s) e.g. `T Tool` or `K Hash + Eq` or `R Int` or `...Shape Int`
                 if !matches!(
                     self.peek_non_nl().kind,
-                    TokenKind::Comma | TokenKind::RBracket
+                    TokenKind::Comma | TokenKind::RBracket | TokenKind::Eq
                 ) {
                     let first_bound = self.parse_type_expr()?;
-                    if !is_comptime {
+                    if !is_comptime && !is_variadic {
                         let mut bvec = vec![first_bound.display_name()];
                         while self.eat(&TokenKind::Plus) {
                             let next_b = self.parse_type_expr()?;
@@ -814,6 +838,11 @@ impl Parser {
                         let _ = self.parse_expr()?;
                     }
                 }
+                // Optional default type parameter: `DType = Float32`
+                if self.eat(&TokenKind::Eq) {
+                    let def_ty = self.parse_type_expr()?;
+                    defaults.insert(name.clone(), def_ty);
+                }
                 params.push(name);
                 if !self.eat(&TokenKind::Comma) {
                     self.expect(TokenKind::RBracket)?;
@@ -821,7 +850,7 @@ impl Parser {
                 }
             }
         }
-        Ok((params, bounds))
+        Ok((params, bounds, defaults, variadic_param))
     }
 
     fn parse_interface(
@@ -995,7 +1024,7 @@ impl Parser {
         let is_distinct = self.eat(&TokenKind::Distinct);
         self.expect(TokenKind::Type)?;
         let (name, _) = self.expect_ident()?;
-        let type_params = self.parse_type_params()?;
+        let (type_params, _bounds, type_param_defaults, variadic_param) = self.parse_type_params_full()?;
         self.expect(TokenKind::Eq)?;
         let base = self.parse_type_expr()?;
         let predicate = if self.peek().kind == TokenKind::Where
@@ -1020,6 +1049,8 @@ impl Parser {
             is_distinct,
             name,
             type_params,
+            type_param_defaults,
+            variadic_param,
             base,
             predicate,
             span: start.merge(end),
@@ -1029,7 +1060,7 @@ impl Parser {
     fn parse_record(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Result<RecordDecl, ParseError> {
         let start = self.expect(TokenKind::Record)?.span;
         let (name, _) = self.expect_ident()?;
-        let (type_params, type_param_bounds) = self.parse_type_params_with_bounds()?;
+        let (type_params, type_param_bounds, type_param_defaults, _) = self.parse_type_params_full()?;
         self.expect(TokenKind::LBrace)?;
         let mut fields = Vec::new();
         let mut where_clauses = Vec::new();
@@ -1045,6 +1076,7 @@ impl Parser {
                     name,
                     type_params,
                     type_param_bounds,
+                    type_param_defaults,
                     fields,
                     where_clauses,
                     invariants,
@@ -1158,7 +1190,7 @@ impl Parser {
     fn parse_enum(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Result<EnumDecl, ParseError> {
         let start = self.expect(TokenKind::Enum)?.span;
         let (name, _) = self.expect_ident()?;
-        let (type_params, type_param_bounds) = self.parse_type_params_with_bounds()?;
+        let (type_params, type_param_bounds, type_param_defaults, _) = self.parse_type_params_full()?;
         self.expect(TokenKind::LBrace)?;
         let mut variants = Vec::new();
         loop {
@@ -1171,6 +1203,7 @@ impl Parser {
                     name,
                     type_params,
                     type_param_bounds,
+                    type_param_defaults,
                     variants,
                     span: start.merge(end),
                 });
@@ -1464,6 +1497,7 @@ impl Parser {
                             name: aname,
                             type_params: Vec::new(),
                             type_param_bounds: BTreeMap::new(),
+                            type_param_defaults: BTreeMap::new(),
                             fields,
                             where_clauses: Vec::new(),
                             invariants: Vec::new(),
@@ -2187,7 +2221,31 @@ impl Parser {
                     end = self.bump().span;
                     break;
                 }
-                if let TokenKind::Int(n) = self.peek().kind {
+                if matches!(self.peek().kind, TokenKind::Ident(_))
+                    && self.peek_ahead_non_nl(1).kind == TokenKind::Eq
+                {
+                    let (key, kspan) = self.expect_ident()?;
+                    self.expect(TokenKind::Eq)?;
+                    let val_ty = if let TokenKind::Int(n) = self.peek().kind {
+                        let sp = self.bump().span;
+                        TypeExpr::Named {
+                            name: n.to_string(),
+                            version: None,
+                            args: Vec::new(),
+                            span: sp,
+                        }
+                    } else {
+                        self.parse_type_expr()?
+                    };
+                    let vspan = match &val_ty {
+                        TypeExpr::Named { span, .. }
+                        | TypeExpr::Dyn { span, .. }
+                        | TypeExpr::Tuple(_, span)
+                        | TypeExpr::Fn { span, .. }
+                        | TypeExpr::Array { span, .. } => *span,
+                    };
+                    args.push(TypeExpr::named_arg(key, val_ty, kspan.merge(vspan)));
+                } else if let TokenKind::Int(n) = self.peek().kind {
                     let sp = self.bump().span;
                     args.push(TypeExpr::Named {
                         name: n.to_string(),

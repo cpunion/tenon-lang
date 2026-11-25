@@ -964,6 +964,9 @@ impl L0Env {
             ExprKind::Call { callee, args }
                 if matches!(&callee.kind, ExprKind::Ident(s) if s == "len") && args.len() == 1 =>
             {
+                if let ExprKind::List(elems) = &args[0].value.kind {
+                    return AbsInt::exact(elems.len() as i128);
+                }
                 if let Some(k) = expr_var_name(expr, self_var) {
                     self.get_int(&k)
                 } else {
