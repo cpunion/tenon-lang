@@ -54,6 +54,107 @@ pub type Tensor[...Shape Int, DType = Float32] =
 /// Variadic Dependent-Rank Shape descriptor (`Shape[4]`, `Shape[1, 1, 2, 3, 4]`).
 pub type Shape[...Dims Int] = List[Positive] where len(self) == len(Dims)
 
+/// 3D Batched Matrix / Sequence Tensor (`[B, M, N]`, optional `DType = Float32`).
+pub type Tensor3D[B Int, M Int, N Int, DType = Float32] =
+    NdTensor[DType] where len(self.shape) == 3 && len(self.data) == B * M * N
+
+/// 4D Multi-Head Attention Tensor (`[B, Heads, Seq, HeadDim]`, optional `DType = Float32`).
+pub type Tensor4D[B Int, H Int, S Int, D Int, DType = Float32] =
+    NdTensor[DType] where len(self.shape) == 4 && len(self.data) == B * H * S * D
+
+/// Compile-time verified 2D Matrix transpose (`[R, C]` -> `[C, R]`, preserves element count `R * C`).
+pub pure fn nd_transpose_2d[DType](
+    t NdTensor[DType],
+    rows Int where 1 <= self && self <= 4096,
+    cols Int where 1 <= self && self <= 4096,
+) NdTensor[DType]
+    requires len(t.shape) == 2 && len(t.data) == rows * cols
+    ensures len(result.shape) == 2 && len(result.data) == cols * rows
+{
+    let total = rows * cols
+    var out List[DType] = list_filled(total, t.data[0])
+    var r = 0
+    while r < rows {
+        var c = 0
+        while c < cols {
+            out[c * rows + r] = t.data[r * cols + c]
+            c += 1
+        }
+        r += 1
+    }
+    let out_shape List[Positive] = [cols, rows]
+    NdTensor { shape = out_shape, data = out }
+}
+
+/// Compile-time verified Batched Matrix Multiplication:
+/// `A: Tensor3D[B, M, K]`, `B: Tensor3D[B, K, N]` -> `Tensor3D[B, M, N]` (proves `len(result.data) == b * m * n`!).
+pub pure fn nd_batch_matmul(
+    a NdTensor[Float32],
+    b NdTensor[Float32],
+    batch Int where 1 <= self && self <= 256,
+    m Int where 1 <= self && self <= 1024,
+    k Int where 1 <= self && self <= 1024,
+    n Int where 1 <= self && self <= 1024,
+) NdTensor[Float32]
+    requires len(a.shape) == 3 && len(b.shape) == 3
+    requires len(a.data) == batch * m * k && len(b.data) == batch * k * n
+    ensures len(result.shape) == 3 && len(result.data) == batch * m * n
+{
+    let total = batch * m * n
+    let zero Float32 = 0.0 as Float32
+    var out List[Float32] = list_filled(total, zero)
+    var bi = 0
+    while bi < batch invariant len(out) == total {
+        let a_off = bi * m * k
+        let b_off = bi * k * n
+        let o_off = bi * m * n
+        var i = 0
+        while i < m invariant len(out) == total {
+            var j = 0
+            while j < n invariant len(out) == total {
+                var acc Float32 = zero
+                var p = 0
+                while p < k {
+                    acc = acc + a.data[a_off + i * k + p] * b.data[b_off + p * n + j]
+                    p += 1
+                }
+                out[o_off + i * n + j] = acc
+                j += 1
+            }
+            i += 1
+        }
+        bi += 1
+    }
+    let out_shape List[Positive] = [batch, m, n]
+    NdTensor { shape = out_shape, data = out }
+}
+
+/// Compile-time verified Last-Axis Broadcast Add (`Tensor[...Leading, D] + Tensor[D] -> Tensor[...Leading, D]`).
+pub pure fn nd_broadcast_add_last(
+    x NdTensor[Float32],
+    bias NdTensor[Float32],
+    leading Int where 1 <= self && self <= 65536,
+    dim Int where 1 <= self && self <= 8192,
+) NdTensor[Float32]
+    requires len(x.data) == leading * dim && len(bias.data) == dim
+    ensures len(result.shape) == len(x.shape) && len(result.data) == leading * dim
+{
+    let total = leading * dim
+    let zero Float32 = 0.0 as Float32
+    var out List[Float32] = list_filled(total, zero)
+    var row = 0
+    while row < leading {
+        let base = row * dim
+        var d = 0
+        while d < dim {
+            out[base + d] = x.data[base + d] + bias.data[d]
+            d += 1
+        }
+        row += 1
+    }
+    NdTensor { shape = x.shape, data = out }
+}
+
 pub pure fn tensor2d_zeros(
     r Int where 1 <= self && self <= 4096,
     c Int where 1 <= self && self <= 4096,

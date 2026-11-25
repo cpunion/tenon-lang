@@ -2046,8 +2046,40 @@ fn cmd_pkg(args: &[String]) -> ExitCode {
                 }
             }
         }
+        "check" | "info" => {
+            let dir = PathBuf::from(args.get(1).map(|s| s.as_str()).unwrap_or("."));
+            let toml_path = dir.join("tenon.toml");
+            if !toml_path.exists() {
+                eprintln!("error: missing `{}`", toml_path.display());
+                return ExitCode::from(1);
+            }
+            match tenon_syntax::format_dep_tree(&dir) {
+                Ok(tree) => {
+                    print!("{}", tree);
+                    if dir.join("tenon.lock").exists() {
+                        match tenon_syntax::verify_lockfile(&dir) {
+                            Ok(count) => {
+                                println!("PASS: manifest & {} locked dependency(ies) verified in `{}`", count, dir.display());
+                                ExitCode::SUCCESS
+                            }
+                            Err(e) => {
+                                eprintln!("lockfile mismatch: {}", e);
+                                ExitCode::from(1)
+                            }
+                        }
+                    } else {
+                        println!("PASS: manifest valid in `{}` (run `tenon pkg lock` to generate `tenon.lock`)", dir.display());
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    ExitCode::from(1)
+                }
+            }
+        }
         other => {
-            eprintln!("unknown `tenon pkg` command `{}` (expected lock|verify|tree|add|sync)", other);
+            eprintln!("unknown `tenon pkg` command `{}` (expected lock|verify|tree|add|sync|check|info)", other);
             ExitCode::from(2)
         }
     }

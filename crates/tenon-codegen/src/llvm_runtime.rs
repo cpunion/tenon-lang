@@ -377,6 +377,16 @@ int64_t tenon_gpu_wgid_x(void) { return 0; }
 int64_t tenon_gpu_wgid_y(void) { return 0; }
 int64_t tenon_gpu_barrier(void) { return 0; }
 int64_t tenon_gpu_shared_f32(int64_t n) { int64_t z = 0; return tenon_flat_list_filled(n, 4, &z); }
+int64_t tenon_gpu_shared_f16(int64_t n) { int64_t z = 0; return tenon_flat_list_filled(n, 2, &z); }
+static inline float tn_u32_to_f32(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+static inline int64_t tn_f32_to_i64(float f) { uint32_t u; memcpy(&u, &f, 4); return (int64_t)u; }
+int64_t tenon_gpu_exp(int64_t x) { return tn_f32_to_i64(expf(tn_u32_to_f32((uint32_t)x))); }
+int64_t tenon_gpu_sqrt(int64_t x) { return tn_f32_to_i64(sqrtf(tn_u32_to_f32((uint32_t)x))); }
+int64_t tenon_gpu_rsqrt(int64_t x) { return tn_f32_to_i64(1.0f / sqrtf(tn_u32_to_f32((uint32_t)x))); }
+int64_t tenon_gpu_cos(int64_t x) { return tn_f32_to_i64(cosf(tn_u32_to_f32((uint32_t)x))); }
+int64_t tenon_gpu_sin(int64_t x) { return tn_f32_to_i64(sinf(tn_u32_to_f32((uint32_t)x))); }
+int64_t tenon_gpu_pow(int64_t a, int64_t b) { return tn_f32_to_i64(powf(tn_u32_to_f32((uint32_t)a), tn_u32_to_f32((uint32_t)b))); }
+int64_t tenon_gpu_tanh(int64_t x) { return tn_f32_to_i64(tanhf(tn_u32_to_f32((uint32_t)x))); }
 
 int64_t tenon_text_cstr_ptr(int64_t s) {
     if (s == 0) return (int64_t)(uintptr_t)"";

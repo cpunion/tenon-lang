@@ -19,9 +19,10 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tenon_syntax::{
-    Attr, AttrDecl, BitfieldDecl, ConstDecl, EnumDecl, Expr, ExprKind, FnDecl, InterfaceDecl,
-    InterfaceMethodDecl, Item, LayoutEngine, LoadMode, MacroDecl, Program, RecordDecl, Span,
-    TypeAliasDecl, UnionDecl, load_package_with_overlays, parse_with_file_id,
+    Attr, AttrDecl, BitfieldDecl, Block, ConstDecl, EnumDecl, Expr, ExprKind, FnDecl,
+    InterfaceDecl, InterfaceMethodDecl, Item, LayoutEngine, LoadMode, MacroDecl, Program,
+    RecordDecl, ScalarKind, Span, Stmt, TypeAliasDecl, TypeExpr, UnionDecl,
+    load_package_with_overlays, parse_with_file_id,
 };
 use tenon_verify::{CheckReport, IncrementalDb, ProofTier};
 
@@ -962,9 +963,10 @@ impl LspServer {
 
         for ty in [
             "Int", "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
-            "ISize", "USize", "Float", "Float32", "Float64", "Bool", "Text", "Bytes", "BytesSlice",
+            "ISize", "USize", "Float", "Float16", "BFloat16", "Float32", "Float64", "Bool", "Text", "Bytes", "BytesSlice",
             "List", "Map", "Option", "Result", "Store", "Channel", "Mutex", "AtomicInt", "Ptr",
-            "MutPtr", "Float32x4", "Float64x4", "Int32x4", "Int64x4", "UInt8x16",
+            "MutPtr", "Float16x8", "Float32x4", "Float64x4", "Int32x4", "Int64x4", "UInt8x16",
+            "Tensor", "Matrix", "Tensor3D", "Tensor4D", "Shape",
         ] {
             if seen.insert(ty.into()) {
                 items.push(json!({ "label": ty, "kind": 22, "detail": "built-in type" }));
@@ -1222,6 +1224,34 @@ impl LspServer {
                             }));
                         }
                     }
+                    // 3. LSP 2.0 Tensor/Matrix static shape & compact byte-size inlay hints!
+                    //    e.g. `Tensor[1, 1, 2, 3, 4, DType = Float16]` -> ` // rank=5, numel=24, 48B Float16`
+                    fn collect_tensor_hints(
+                        blk: &Block,
+                        lines: &[&str],
+                        hints: &mut Vec<Value>,
+                    ) {
+                        for stmt in &blk.stmts {
+                            if let Stmt::Let { ty: Some(t), span, .. } = stmt {
+                                if let Some(summary) = format_tensor_shape_hint(t) {
+                                    let ln = span.line.saturating_sub(1) as u32;
+                                    if let Some(line_str) = lines.get(ln as usize) {
+                                        hints.push(json!({
+                                            "position": { "line": ln, "character": line_str.len() as u32 },
+                                            "label": format!("  // {}", summary),
+                                            "kind": 1,
+                                            "paddingLeft": true,
+                                            "tooltip": format!("Static dependent-shape tensor layout: {}", summary)
+                                        }));
+                                    }
+                                }
+                            }
+                            if let Stmt::While { body, .. } | Stmt::For { body, .. } = stmt {
+                                collect_tensor_hints(body, lines, hints);
+                            }
+                        }
+                    }
+                    collect_tensor_hints(&f.body, &lines, &mut hints);
                 }
             }
         }
@@ -2786,6 +2816,51 @@ fn guess_var_type_in_source(src: &str, var_name: &str) -> Option<String> {
     None
 }
 
+fn format_tensor_shape_hint(ty: &TypeExpr) -> Option<String> {
+    let TypeExpr::Named { name, args, .. } = ty else {
+        return None;
+    };
+    if !matches!(name.as_str(), "Tensor" | "Matrix" | "Tensor3D" | "Tensor4D") || args.is_empty() {
+        return None;
+    }
+    let mut dims: Vec<i64> = Vec::new();
+    let mut dtype = "Float32".to_string();
+    for a in args {
+        if let Some((k, v)) = a.as_named_arg() {
+            if k == "DType" {
+                dtype = v.display_name();
+            }
+            continue;
+        }
+        let d = a.display_name();
+        if let Ok(n) = d.parse::<i64>() {
+            dims.push(n);
+        } else if ScalarKind::from_name(&d).is_some() {
+            dtype = d;
+        }
+    }
+    if dims.is_empty() {
+        return None;
+    }
+    let numel: i64 = dims.iter().try_fold(1i64, |acc, &x| acc.checked_mul(x))?;
+    let elem_bytes = ScalarKind::from_name(&dtype).map(|k| k.byte_size() as i64).unwrap_or(4);
+    let total_bytes = numel.checked_mul(elem_bytes)?;
+    let byte_str = if total_bytes >= 1024 * 1024 {
+        format!("{}MB", total_bytes / (1024 * 1024))
+    } else if total_bytes >= 1024 {
+        format!("{}KB", total_bytes / 1024)
+    } else {
+        format!("{}B", total_bytes)
+    };
+    Some(format!(
+        "rank={}, numel={}, {} {}",
+        dims.len(),
+        numel,
+        byte_str,
+        dtype
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3224,6 +3299,52 @@ pub pure fn bad_pos(x Int where self >= 0) Pos {
             }),
             "expected Z3 counterexample unit test quickfix, got {:?}",
             actions
+        );
+    }
+
+    #[test]
+    fn lsp_tensor_shape_and_dtype_inlay_hints() {
+        let src = r#"pub type Positive = Int where self >= 1
+pub record NdTensor[DType = Float32] {
+    shape List[Positive]
+    data  List[DType]
+}
+pub type Tensor[...Shape Int, DType = Float32] =
+    NdTensor[DType] where len(self.shape) == len(Shape) && len(self.data) == prod(Shape)
+
+pub pure fn inspect_tensor(t Tensor[1, 1, 2, 3, 4, DType = Float16]) Int {
+    let x Tensor[1, 1, 2, 3, 4, DType = Float16] = t
+    len(x.data)
+}
+"#;
+        let uri = "file:///tmp/tensor_lsp_test.tn";
+        let mut input = Vec::new();
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": uri, "languageId": "tenon", "version": 1, "text": src } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "textDocument/inlayHint",
+            "params": { "textDocument": { "uri": uri } }
+        })));
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": null })));
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "method": "exit", "params": null })));
+
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        let mut server = LspServer::new();
+        assert!(server.run_loop(&mut reader, &mut output));
+
+        let msgs = read_all_messages(&output);
+        let hints = msgs.iter().find(|m| m.get("id") == Some(&json!(2))).unwrap()["result"].as_array().unwrap();
+        assert!(
+            hints.iter().any(|h| {
+                let lbl = h["label"].as_str().unwrap_or("");
+                lbl.contains("rank=5") && lbl.contains("numel=24") && lbl.contains("48B Float16")
+            }),
+            "expected Tensor[1,1,2,3,4,DType=Float16] inlay hint (rank=5, numel=24, 48B Float16), got {:?}",
+            hints
         );
     }
 }

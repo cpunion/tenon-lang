@@ -96,4 +96,28 @@ test fn test_variadic_nd_tensor_and_verified_reshape() {
     let h5 Tensor[1, 1, 2, 3, 4, DType = Float16] = nd_tensor_zeros_f16([1, 1, 2, 3, 4], 24)
     let h3 Tensor[2, 3, 4, DType = Float16] = reshape_5d_f16_to_3d(h5)
     assert len(h3.shape) == 3 && len(h3.data) == 24
+
+    // Verified 2D Transpose (`[2, 3]` -> `[3, 2]`), Batched MatMul (`[2, 2, 2] @ [2, 2, 2]`), and Broadcast Add!
+    let m23 Tensor[2, 3] = nd_tensor_from_data([2, 3], [
+        1.0 as Float32, 2.0 as Float32, 3.0 as Float32,
+        4.0 as Float32, 5.0 as Float32, 6.0 as Float32,
+    ])
+    let m32 Tensor[3, 2] = nd_transpose_2d(m23, 2, 3)
+    assert len(m32.shape) == 2 && len(m32.data) == 6
+    assert float_to_int(m32.data[1] as Float) == 4 && float_to_int(m32.data[2] as Float) == 2
+
+    let ba Tensor3D[2, 2, 2] = nd_tensor_from_data([2, 2, 2], [
+        1.0 as Float32, 2.0 as Float32, 3.0 as Float32, 4.0 as Float32,
+        2.0 as Float32, 0.0 as Float32, 0.0 as Float32, 2.0 as Float32,
+    ])
+    let bb Tensor3D[2, 2, 2] = nd_tensor_from_data([2, 2, 2], [
+        1.0 as Float32, 0.0 as Float32, 0.0 as Float32, 1.0 as Float32,
+        5.0 as Float32, 6.0 as Float32, 7.0 as Float32, 8.0 as Float32,
+    ])
+    let bc Tensor3D[2, 2, 2] = nd_batch_matmul(ba, bb, 2, 2, 2, 2)
+    assert float_to_int(bc.data[0] as Float) == 1 && float_to_int(bc.data[4] as Float) == 10 && float_to_int(bc.data[7] as Float) == 16
+
+    let bias1d Tensor[2] = nd_tensor_from_data([2], [10.0 as Float32, 20.0 as Float32])
+    let badded Tensor3D[2, 2, 2] = nd_broadcast_add_last(bc, bias1d, 4, 2)
+    assert float_to_int(badded.data[0] as Float) == 11 && float_to_int(badded.data[1] as Float) == 22
 }

@@ -12,7 +12,7 @@ static id<MTLDevice> g_mtl_device = nil;
 static id<MTLCommandQueue> g_mtl_queue = nil;
 static char g_device_name_buf[256] = "Unavailable";
 
-#define MAX_HANDLES 1024
+#define MAX_HANDLES 4096
 static id<MTLBuffer> g_buffers[MAX_HANDLES];
 static id<MTLComputePipelineState> g_pipelines[MAX_HANDLES];
 static id<MTLRenderPipelineState> g_quad_render_pipe = nil;
@@ -35,6 +35,27 @@ static int64_t ensure_metal_init(void) {
 
 int64_t tn_metal_init(void) {
     return ensure_metal_init();
+}
+
+// Bridge accessors shared with `mps_shim.m` (MetalPerformanceShaders.framework)
+void* tn_metal_raw_device(void) {
+    ensure_metal_init();
+    return (__bridge void*)g_mtl_device;
+}
+
+void* tn_metal_raw_queue(void) {
+    ensure_metal_init();
+    return (__bridge void*)g_mtl_queue;
+}
+
+void* tn_metal_raw_buffer(int64_t handle) {
+    if (handle <= 0 || handle >= MAX_HANDLES) return NULL;
+    return (__bridge void*)g_buffers[handle];
+}
+
+void* tn_metal_raw_pipeline(int64_t handle) {
+    if (handle <= 0 || handle >= MAX_HANDLES) return NULL;
+    return (__bridge void*)g_pipelines[handle];
 }
 
 int64_t tn_metal_device_name_cstr(void) {

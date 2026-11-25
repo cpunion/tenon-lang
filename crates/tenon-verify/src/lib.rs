@@ -2496,6 +2496,13 @@ pub record NdTensor[DType = Float32] {
 pub type Tensor[...Shape Int, DType = Float32] =
     NdTensor[DType] where len(self.shape) == len(Shape) && len(self.data) == prod(Shape)
 
+pub type LastDim[...Shape Int] = Int where self == Shape[-1]
+pub type BatchProd[...Shape Int] = Int where self == init_prod(Shape)
+
+pub pure fn check_neg_axis() (LastDim[2, 16, 64], BatchProd[2, 16, 64]) {
+    (64, 32)
+}
+
 pub pure fn nd_reshape[DType](t NdTensor[DType], new_shape List[Positive]) NdTensor[DType]
     ensures len(result.shape) == len(new_shape) && len(result.data) == len(t.data)
 {

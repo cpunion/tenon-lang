@@ -1425,6 +1425,65 @@ pub fn compile_tenon_file(src Text) Text {
     return buf_finish(hdr)
 }
 
+// Multi-file `import "..."` preprocessor directly in the 0%-Rust Stage-3 self-hosted compiler!
+pure fn dirname_of(path Text) Text {
+    var i = len(path) - 1
+    while i >= 0 {
+        if byte_at(path, i) == 47 {
+            return str_slice(path, 0, i + 1)
+        }
+        i -= 1
+    }
+    return ""
+}
+
+fn preprocess_imports_rec(src Text, base_dir Text, inout seen List[Text], depth Int) Text {
+    if depth > 8 { return src }
+    let out = buf_new()
+    let n = len(src)
+    var pos = 0
+    while pos < n {
+        var end = pos
+        while end < n && byte_at(src, end) != 10 {
+            end += 1
+        }
+        let line = str_slice(src, pos, end)
+        var matched_imp = 0
+        if len(line) > 9 && str_slice(line, 0, 8) == "import \"" {
+            var q = 8
+            while q < len(line) && byte_at(line, q) != 34 {
+                q += 1
+            }
+            if q > 8 && q < len(line) {
+                let rel = str_slice(line, 8, q)
+                let full = if len(rel) > 0 && byte_at(rel, 0) == 47 { rel } else { base_dir ++ rel }
+                var already = 0
+                var si = 0
+                while si < len(seen) {
+                    if seen[si] == full { already = 1 }
+                    si += 1
+                }
+                if already == 0 {
+                    seen = push(seen, full)
+                    let isrc = sys_read_file(full)
+                    if len(isrc) > 0 {
+                        let expanded = preprocess_imports_rec(isrc, dirname_of(full), seen, depth + 1)
+                        let _ = buf_push_str(out, expanded)
+                        let _ = buf_push_str(out, "\n")
+                    }
+                }
+                matched_imp = 1
+            }
+        }
+        if matched_imp == 0 {
+            let _ = buf_push_str(out, line)
+            let _ = buf_push_str(out, "\n")
+        }
+        pos = end + 1
+    }
+    return buf_finish(out)
+}
+
 pub fn main() Int {
     let in_path = sys_env("TENON_IN")
     let out_path = sys_env("TENON_OUT")
@@ -1434,11 +1493,14 @@ pub fn main() Int {
         let _ = println("Tenon Stage-3 Self-Hosting Compiler OK (emitted " ++ int_to_text(len(ll)) ++ " B LLVM IR)")
         return 0
     }
-    let src = sys_read_file(in_path)
-    if len(src) == 0 {
+    let raw_src = sys_read_file(in_path)
+    if len(raw_src) == 0 {
         let _ = println("ERROR: could not read " ++ in_path)
         return 1
     }
+    var seen List[Text] = []
+    seen = push(seen, in_path)
+    let src = preprocess_imports_rec(raw_src, dirname_of(in_path), seen, 0)
     let ll = compile_tenon_file(src)
     if len(ll) >= 4 && str_slice(ll, 0, 4) == "ERR:" {
         let _ = println("VERIFY FAIL: " ++ ll)

@@ -74,16 +74,17 @@ fn is_buffer_param(ty: &TypeExpr) -> bool {
     matches!(ty, TypeExpr::Named { name, .. } if name == "List" || name == "Bytes")
 }
 
-/// Scans a block for `let/var name = gpu_shared_f32(N)` declarations (used for WGSL module-level `var<workgroup>`).
-fn collect_shared_arrays(blk: &Block, out: &mut Vec<(String, i64)>) {
+/// Scans a block for `let/var name = gpu_shared_f32(N)` / `gpu_shared_f16(N)` declarations
+/// (used for WGSL module-level `var<workgroup>`). Returns `(name, len, is_f16)`.
+fn collect_shared_arrays(blk: &Block, out: &mut Vec<(String, i64, bool)>) {
     for stmt in &blk.stmts {
         if let Stmt::Let { name, value, .. } = stmt {
             if let ExprKind::Call { callee, args } = &value.kind {
-                if matches!(&callee.kind, ExprKind::Ident(s) if s == "gpu_shared_f32")
-                    && args.len() == 1
-                {
-                    if let ExprKind::Int(sz) = &args[0].value.kind {
-                        out.push((name.clone(), (*sz).max(1)));
+                if let ExprKind::Ident(s) = &callee.kind {
+                    if (s == "gpu_shared_f32" || s == "gpu_shared_f16") && args.len() == 1 {
+                        if let ExprKind::Int(sz) = &args[0].value.kind {
+                            out.push((name.clone(), (*sz).max(1), s == "gpu_shared_f16"));
+                        }
                     }
                 }
             }
@@ -268,6 +269,24 @@ fn emit_expr_subst(
                             .collect();
                         return format!("{}({})", fname, av.join(", "));
                     }
+                    "gpu_exp" | "gpu_sqrt" | "gpu_rsqrt" | "gpu_cos" | "gpu_sin" | "gpu_pow" | "gpu_tanh" => {
+                        let av: Vec<String> = args
+                            .iter()
+                            .map(|a| emit_expr_subst(&a.value, target, subst_idents, subst_buf_reads))
+                            .collect();
+                        let fn_out = match (fname.as_str(), target) {
+                            ("gpu_exp", _) => "exp",
+                            ("gpu_sqrt", _) => "sqrt",
+                            ("gpu_rsqrt", ShaderTarget::Msl) => "rsqrt",
+                            ("gpu_rsqrt", ShaderTarget::Wgsl) => "inverseSqrt",
+                            ("gpu_cos", _) => "cos",
+                            ("gpu_sin", _) => "sin",
+                            ("gpu_pow", _) => "pow",
+                            ("gpu_tanh", _) => "tanh",
+                            _ => "exp",
+                        };
+                        return format!("{}({})", fn_out, av.join(", "));
+                    }
                     _ => {}
                 }
             }
@@ -298,14 +317,23 @@ fn emit_block_subst(
     for stmt in &blk.stmts {
         match stmt {
             Stmt::Let { name, ty, value, is_mut, .. } => {
-                // `let tile = gpu_shared_f32(N)` -> MSL `threadgroup float tile[N];` (WGSL hoisted to module scope!)
+                // `let tile = gpu_shared_f32(N)` / `gpu_shared_f16(N)` -> MSL `threadgroup float/half tile[N];`
                 if let ExprKind::Call { callee, args } = &value.kind {
-                    if matches!(&callee.kind, ExprKind::Ident(s) if s == "gpu_shared_f32") && args.len() == 1 {
-                        if let ExprKind::Int(sz) = &args[0].value.kind {
-                            if target == ShaderTarget::Msl {
-                                out.push_str(&format!("{}threadgroup float {}[{}];\n", pad, name, (*sz).max(1)));
+                    if let ExprKind::Ident(s) = &callee.kind {
+                        if (s == "gpu_shared_f32" || s == "gpu_shared_f16") && args.len() == 1 {
+                            if let ExprKind::Int(sz) = &args[0].value.kind {
+                                if target == ShaderTarget::Msl {
+                                    let elem_t = if s == "gpu_shared_f16" { "half" } else { "float" };
+                                    out.push_str(&format!(
+                                        "{}threadgroup {} {}[{}];\n",
+                                        pad,
+                                        elem_t,
+                                        name,
+                                        (*sz).max(1)
+                                    ));
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                     if matches!(&callee.kind, ExprKind::Ident(s) if s == "gpu_barrier") {
@@ -458,6 +486,17 @@ fn infer_shader_expr_type(expr: &Expr, target: ShaderTarget) -> String {
                     lt
                 }
             }
+        }
+        ExprKind::Call { callee, .. } => {
+            if let ExprKind::Ident(f) = &callee.kind {
+                if matches!(
+                    f.as_str(),
+                    "gpu_exp" | "gpu_sqrt" | "gpu_rsqrt" | "gpu_cos" | "gpu_sin" | "gpu_pow" | "gpu_tanh" | "sqrt" | "abs" | "max" | "min" | "clamp"
+                ) {
+                    return map_gpu_scalar("Float32", target).into();
+                }
+            }
+            map_gpu_scalar("Int32", target).into()
         }
         ExprKind::Index { .. } => map_gpu_scalar("Float32", target).into(),
         ExprKind::Field { .. } => map_gpu_scalar("UInt32", target).into(),
@@ -720,6 +759,197 @@ fn emit_ast_fused_kernel(
     }
 }
 
+/// Emits a general N-stage (`k0 -> k1 -> ... -> km`, N >= 3) AST-inlined fused compute kernel
+/// in MSL or WGSL, keeping every intermediate value in a GPU register (`__fused_tmp_0`, `__fused_tmp_1`, ...).
+fn emit_ast_fused_chain(
+    plan_fn: &str,
+    fused_name: &str,
+    eliminated_bufs: &[String],
+    stages: &[&FnDecl],
+    target: ShaderTarget,
+    wgsl_group: usize,
+    out: &mut String,
+) {
+    let mut fused_params: Vec<(String, TypeExpr, bool)> = Vec::new();
+    let mut stage_substs: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut stage_in_bufs: Vec<String> = Vec::new();
+    let mut stage_out_bufs: Vec<String> = Vec::new();
+    let mut used_names = std::collections::BTreeSet::new();
+
+    for (si, k) in stages.iter().enumerate() {
+        let mut ksub = BTreeMap::new();
+        let k_out = k
+            .params
+            .iter()
+            .find(|p| p.is_inout && is_buffer_param(&p.ty))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "out".into());
+        let k_in = k
+            .params
+            .iter()
+            .find(|p| !p.is_inout && is_buffer_param(&p.ty))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "x".into());
+        for p in &k.params {
+            if !is_buffer_param(&p.ty) || p.is_inout {
+                continue;
+            }
+            if si > 0 && p.name == k_in {
+                continue;
+            }
+            let mut nm = p.name.clone();
+            while !used_names.insert(nm.clone()) {
+                nm = format!("p{}_{}", si, nm);
+            }
+            ksub.insert(p.name.clone(), nm.clone());
+            fused_params.push((nm, p.ty.clone(), false));
+        }
+        stage_substs.push(ksub);
+        stage_in_bufs.push(k_in);
+        stage_out_bufs.push(k_out);
+    }
+
+    let last = *stages.last().unwrap();
+    let last_out_name = stage_out_bufs.last().unwrap();
+    let out_nm = if used_names.insert("out".into()) {
+        "out".to_string()
+    } else {
+        "fused_out".to_string()
+    };
+    let out_ty = last
+        .params
+        .iter()
+        .find(|p| &p.name == last_out_name)
+        .map(|p| p.ty.clone())
+        .unwrap_or_else(|| TypeExpr::Named {
+            name: "List".into(),
+            version: None,
+            args: vec![TypeExpr::Named { name: "Float32".into(), version: None, args: vec![], span: last.span }],
+            span: last.span,
+        });
+    fused_params.push((out_nm.clone(), out_ty, true));
+    let total_nm = "total".to_string();
+    fused_params.push((
+        total_nm.clone(),
+        TypeExpr::Named { name: "UInt32".into(), version: None, args: vec![], span: last.span },
+        false,
+    ));
+
+    let names_joined: Vec<&str> = stages.iter().map(|s| s.name.as_str()).collect();
+    out.push_str(&format!(
+        "// Auto-fused {}-stage chain by @gpu_graph `{}`: `{}` (eliminates VRAM buffers: {})\n",
+        stages.len(),
+        plan_fn,
+        names_joined.join(" -> "),
+        eliminated_bufs.join(", ")
+    ));
+
+    match target {
+        ShaderTarget::Msl => {
+            out.push_str(&format!("kernel void {}(\n", fused_name));
+            let mut pstrs = Vec::new();
+            for (idx, (nm, ty, is_io)) in fused_params.iter().enumerate() {
+                let bt = map_type_name(ty, target);
+                if is_buffer_param(ty) {
+                    let qual = if *is_io { "device" } else { "device const" };
+                    pstrs.push(format!("    {} {}* {} [[buffer({})]]", qual, bt, nm, idx));
+                } else {
+                    pstrs.push(format!("    constant {}& {} [[buffer({})]]", bt, nm, idx));
+                }
+            }
+            pstrs.push("    uint3 gid [[thread_position_in_grid]]".into());
+            out.push_str(&pstrs.join(",\n"));
+            out.push_str("\n) {\n    const int idx = (int)(gid.x);\n    if (idx < (int)(total)) {\n");
+            for (si, k) in stages.iter().enumerate() {
+                let (pre, rhs, iv) = extract_elementwise_stage(&k.body, &stage_out_bufs[si]);
+                let mut sub = stage_substs[si].clone();
+                if let Some(ivn) = iv {
+                    sub.insert(ivn, "idx".into());
+                }
+                let mut reads = BTreeMap::new();
+                if si > 0 {
+                    reads.insert(stage_in_bufs[si].clone(), format!("__fused_tmp_{}", si - 1));
+                }
+                for s in pre {
+                    let tmp_blk = Block { stmts: vec![s.clone()], tail: None, span: k.span };
+                    emit_block_subst(&tmp_blk, target, 8, &sub, &reads, out);
+                }
+                let expr_s = rhs
+                    .map(|e| emit_expr_subst(e, target, &sub, &reads))
+                    .unwrap_or_else(|| "0.0f".into());
+                if si + 1 < stages.len() {
+                    out.push_str(&format!("        const float __fused_tmp_{} = {};\n", si, expr_s));
+                } else {
+                    out.push_str(&format!("        {}[idx] = {};\n", out_nm, expr_s));
+                }
+            }
+            out.push_str("    }\n}\n\n");
+        }
+        ShaderTarget::Wgsl => {
+            let mut wgsl_substs = stage_substs.clone();
+            let mut wgsl_out_nm = out_nm.clone();
+            let mut wgsl_total_nm = total_nm.clone();
+            for (idx, (nm, ty, is_io)) in fused_params.iter().enumerate() {
+                let gnm = format!("{}__{}", fused_name, nm);
+                let bt = map_type_name(ty, target);
+                for s in &mut wgsl_substs {
+                    for v in s.values_mut() {
+                        if v == nm {
+                            *v = gnm.clone();
+                        }
+                    }
+                }
+                if nm == &out_nm {
+                    wgsl_out_nm = gnm.clone();
+                }
+                if nm == &total_nm {
+                    wgsl_total_nm = gnm.clone();
+                }
+                if is_buffer_param(ty) {
+                    let acc = if *is_io { "read_write" } else { "read" };
+                    out.push_str(&format!(
+                        "@group({}) @binding({}) var<storage, {}> {}: array<{}>;\n",
+                        wgsl_group, idx, acc, gnm, bt
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "@group({}) @binding({}) var<uniform> {}: {};\n",
+                        wgsl_group, idx, gnm, bt
+                    ));
+                }
+            }
+            out.push_str(&format!(
+                "@compute @workgroup_size(64, 1, 1)\nfn {}(@builtin(global_invocation_id) gid: vec3<u32>) {{\n    let idx = i32(gid.x);\n    if (idx < i32({})) {{\n",
+                fused_name, wgsl_total_nm
+            ));
+            for (si, k) in stages.iter().enumerate() {
+                let (pre, rhs, iv) = extract_elementwise_stage(&k.body, &stage_out_bufs[si]);
+                let mut sub = wgsl_substs[si].clone();
+                if let Some(ivn) = iv {
+                    sub.insert(ivn, "idx".into());
+                }
+                let mut reads = BTreeMap::new();
+                if si > 0 {
+                    reads.insert(stage_in_bufs[si].clone(), format!("__fused_tmp_{}", si - 1));
+                }
+                for s in pre {
+                    let tmp_blk = Block { stmts: vec![s.clone()], tail: None, span: k.span };
+                    emit_block_subst(&tmp_blk, target, 8, &sub, &reads, out);
+                }
+                let expr_s = rhs
+                    .map(|e| emit_expr_subst(e, target, &sub, &reads))
+                    .unwrap_or_else(|| "0.0".into());
+                if si + 1 < stages.len() {
+                    out.push_str(&format!("        let __fused_tmp_{}: f32 = {};\n", si, expr_s));
+                } else {
+                    out.push_str(&format!("        {}[idx] = {};\n", wgsl_out_nm, expr_s));
+                }
+            }
+            out.push_str("    }\n}\n\n");
+        }
+    }
+}
+
 /// Emits Apple Metal Shading Language (`.metal`) for all `@gpu_struct` records,
 /// `@kernel` compute functions (including `threadgroup` shared memory & barriers),
 /// and AST-fused `@gpu_graph` kernels in `program`.
@@ -732,7 +962,7 @@ pub fn emit_msl(program: &Program, verified: &VerifiedMir) -> String {
 /// and AST-fused `@gpu_graph` kernels in `program`.
 pub fn emit_wgsl(program: &Program, verified: &VerifiedMir) -> String {
     let wgsl = emit_shaders(program, verified, ShaderTarget::Wgsl);
-    if wgsl.contains("<f16>") || wgsl.contains(": f16") || wgsl.contains("f16(") {
+    if wgsl.contains("<f16>") || wgsl.contains("<f16,") || wgsl.contains(": f16") || wgsl.contains("f16(") {
         if let Some(rest) = wgsl.strip_prefix("// Auto-generated by Tenon Single-Source GPU Compiler (WebGPU WGSL)\n") {
             return format!(
                 "// Auto-generated by Tenon Single-Source GPU Compiler (WebGPU WGSL)\nenable f16;\n{}",
@@ -825,9 +1055,10 @@ fn emit_shaders(program: &Program, verified: &VerifiedMir, target: ShaderTarget)
                 }
                 ShaderTarget::Wgsl => {
                     let mut subst = BTreeMap::new();
-                    for (sname, sz) in &shared_arrs {
+                    for (sname, sz, is_f16) in &shared_arrs {
                         let mname = format!("{}__{}", f.name, sname);
-                        out.push_str(&format!("var<workgroup> {}: array<f32, {}>;\n", mname, sz));
+                        let wt = if *is_f16 { "f16" } else { "f32" };
+                        out.push_str(&format!("var<workgroup> {}: array<{}, {}>;\n", mname, wt, sz));
                         subst.insert(sname.clone(), mname);
                     }
                     for (idx, p) in f.params.iter().enumerate() {
@@ -866,11 +1097,29 @@ fn emit_shaders(program: &Program, verified: &VerifiedMir, target: ShaderTarget)
         }
     }
 
-    // 3. Emit REAL AST-Fused `@gpu_graph` Kernels (BOTH MSL and WGSL!)
+    // 3. Emit REAL AST-Fused `@gpu_graph` Kernels (BOTH MSL and WGSL, 2-stage and multi-stage N-kernel chains!)
     let mut wgsl_group = 0usize;
     for plan in &verified.gpu_graphs {
         for fusion in &plan.fusions {
-            if let (Some(&k1), Some(&k2)) = (
+            if fusion.chain_kernels.len() > 2 {
+                let stages: Vec<&FnDecl> = fusion
+                    .chain_kernels
+                    .iter()
+                    .filter_map(|kn| kernel_fns.get(kn).copied())
+                    .collect();
+                if stages.len() == fusion.chain_kernels.len() {
+                    emit_ast_fused_chain(
+                        &plan.fn_name,
+                        &fusion.fused_name,
+                        &fusion.eliminated_buffers,
+                        &stages,
+                        target,
+                        wgsl_group,
+                        &mut out,
+                    );
+                    wgsl_group += 1;
+                }
+            } else if let (Some(&k1), Some(&k2)) = (
                 kernel_fns.get(&fusion.first_kernel),
                 kernel_fns.get(&fusion.second_kernel),
             ) {
@@ -1431,6 +1680,88 @@ pub fn fp16_mixed_dot(a List[Float16], b List[BFloat16], inout out List[Float32]
             fp16_wgsl.contains("enable f16;") && fp16_wgsl.contains("array<f16>"),
             "expected WGSL `enable f16;` and `array<f16>`:\n{}",
             fp16_wgsl
+        );
+
+        // J3: `gpu_shared_f16` (`threadgroup half` / `var<workgroup> array<f16>`) + GPU math (`gpu_rsqrt`, `gpu_exp`) + 3-stage `@gpu_graph` fusion!
+        let j3_src = r#"
+@kernel
+pub fn tiled_f16_norm(x List[Float16], inout out List[Float16], n UInt32) {
+    var tile = gpu_shared_f16(16)
+    let tid = gpu_global_id_x()
+    let lx = gpu_local_id_x()
+    if lx < 16 {
+        tile[lx] = x[tid]
+    }
+    let _ = gpu_barrier()
+    if tid < (n as Int) {
+        let v Float32 = (tile[lx] as Float32) * gpu_rsqrt(4.0 as Float32)
+        out[tid] = (v / ((1.0 as Float32) + gpu_exp(-v))) as Float16
+    }
+}
+
+@kernel("elementwise")
+pub fn st_scale(x List[Float32], inout out List[Float32], n UInt32) {
+    let i = gpu_global_id_x()
+    if i < (n as Int) {
+        out[i] = x[i] * (2.0 as Float32)
+    }
+}
+
+@kernel("elementwise")
+pub fn st_bias(x List[Float32], b List[Float32], inout out List[Float32], n UInt32) {
+    let i = gpu_global_id_x()
+    if i < (n as Int) {
+        out[i] = x[i] + b[i]
+    }
+}
+
+@kernel("elementwise")
+pub fn st_silu(x List[Float32], inout out List[Float32], n UInt32) {
+    let i = gpu_global_id_x()
+    if i < (n as Int) {
+        let v = x[i]
+        out[i] = v / ((1.0 as Float32) + gpu_exp(-v))
+    }
+}
+
+@gpu_graph
+pub fn three_stage_chain(x List[Float32], b List[Float32], n UInt32) List[Float32] {
+    var t1 List[Float32] = list_filled(16, 0.0 as Float32)
+    var t2 List[Float32] = list_filled(16, 0.0 as Float32)
+    var out List[Float32] = list_filled(16, 0.0 as Float32)
+    st_scale(x, t1, n)
+    st_bias(t1, b, t2, n)
+    st_silu(t2, out, n)
+    out
+}
+"#;
+        let j3_prog = tenon_syntax::parse(j3_src).unwrap();
+        let j3_rep = tenon_verify::check_program(&j3_prog);
+        assert!(j3_rep.ok, "J3 GPU verify failed: {:?}", j3_rep.diagnostics);
+        assert_eq!(j3_rep.mir.gpu_graphs.len(), 1);
+        assert_eq!(j3_rep.mir.gpu_graphs[0].fusions.len(), 1);
+        assert_eq!(
+            j3_rep.mir.gpu_graphs[0].fusions[0].fused_name,
+            "st_scale__fused__st_bias__fused__st_silu"
+        );
+        let j3_msl = emit_msl(&j3_prog, &j3_rep.mir);
+        assert!(
+            j3_msl.contains("threadgroup half tile[16];")
+                && j3_msl.contains("rsqrt(")
+                && j3_msl.contains("kernel void st_scale__fused__st_bias__fused__st_silu(")
+                && j3_msl.contains("__fused_tmp_0")
+                && j3_msl.contains("__fused_tmp_1"),
+            "expected J3 MSL shared_f16 + rsqrt + 3-stage fusion:\n{}",
+            j3_msl
+        );
+        let j3_wgsl = emit_wgsl(&j3_prog, &j3_rep.mir);
+        assert!(
+            j3_wgsl.contains("enable f16;")
+                && j3_wgsl.contains("array<f16, 16>")
+                && j3_wgsl.contains("inverseSqrt(")
+                && j3_wgsl.contains("fn st_scale__fused__st_bias__fused__st_silu("),
+            "expected J3 WGSL enable f16 + array<f16, 16> + inverseSqrt + 3-stage fusion:\n{}",
+            j3_wgsl
         );
     }
 }

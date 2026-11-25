@@ -26,10 +26,17 @@ shasum -a 256 /tmp/s3.o /tmp/s4.o
 cmp /tmp/s3.o /tmp/s4.o
 echo "  -> ARM64 Machine Code (.o) Fixed Point: BIT-EXACT IDENTICAL!"
 
-echo "=== [Stage-4 End-to-End Target Compilation + L0 Div-Zero Rejection] ==="
+echo "=== [Stage-4 End-to-End Multi-File Import Target Compilation + L0 Div-Zero Rejection] ==="
 /tmp/tenon_s4
-cat > /tmp/s4_good.tn << 'EOF'
+cat > /tmp/s4_math.tn << 'EOF'
 pub type Positive = Int where self >= 1
+
+pub pure fn safe_ratio(total Int, count Positive) Int {
+    return total / count
+}
+EOF
+cat > /tmp/s4_good.tn << 'EOF'
+import "s4_math.tn"
 
 pub enum Mode {
     Fast
@@ -40,10 +47,6 @@ pub enum Mode {
 pub record Point {
     x Int
     y Int
-}
-
-pub pure fn safe_ratio(total Int, count Positive) Int {
-    return total / count
 }
 
 pub fn main() Int {
@@ -57,7 +60,7 @@ pub fn main() Int {
     }
     let r = safe_ratio(p.x + p.y, bonus)
     assert r == 42
-    let _ = println("Stage-4 Native ARM64 Target (type+record+enum+match+assert): " ++ int_to_text(r))
+    let _ = println("Stage-4 Native ARM64 Target (import+type+record+enum+match+assert): " ++ int_to_text(r))
     return 0
 }
 EOF
@@ -75,5 +78,5 @@ else
   echo "  -> Stage-4 L0 Verifier Rejected Unproved Division by Zero (E0401) OK!"
 fi
 
-rm -f /tmp/tenon_s2 /tmp/tenon_s3 /tmp/tenon_s4 /tmp/s3.ll /tmp/s4.ll /tmp/s3.o /tmp/s4.o /tmp/s4_good.tn /tmp/s4_good.ll /tmp/s4_good_bin /tmp/s4_bad.tn /tmp/s4_bad.ll
+rm -f /tmp/tenon_s2 /tmp/tenon_s3 /tmp/tenon_s4 /tmp/s3.ll /tmp/s4.ll /tmp/s3.o /tmp/s4.o /tmp/s4_math.tn /tmp/s4_good.tn /tmp/s4_good.ll /tmp/s4_good_bin /tmp/s4_bad.tn /tmp/s4_bad.ll
 echo "=== STAGE-3 FIXED-POINT SELF-HOSTING BOOTSTRAP: 100% VERIFIED! ==="

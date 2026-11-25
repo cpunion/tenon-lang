@@ -2603,6 +2603,7 @@ impl<'a> LlvmFnGen<'a> {
                 "Float64x4" => Some(("<4 x double>", 32, 18)),
                 "Int64x4" => Some(("<4 x i64>", 32, 18)),
                 "Float32x4" => Some(("<4 x float>", 16, 17)),
+                "Float16x8" => Some(("<8 x half>", 16, 17)),
                 "Int32x4" => Some(("<4 x i32>", 16, 17)),
                 "UInt8x16" => Some(("<16 x i8>", 16, 17)),
                 _ => None,

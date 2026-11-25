@@ -157,6 +157,7 @@ impl ScalarKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SimdKind {
+    F16x8,
     F32x4,
     F64x4,
     I32x4,
@@ -167,6 +168,7 @@ pub enum SimdKind {
 impl SimdKind {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
+            "Float16x8" | "F16x8" => Some(Self::F16x8),
             "Float32x4" | "F32x4" => Some(Self::F32x4),
             "Float64x4" | "F64x4" => Some(Self::F64x4),
             "Int32x4" | "I32x4" => Some(Self::I32x4),
@@ -181,10 +183,11 @@ impl SimdKind {
             if let Some(k) = Self::from_name(name) {
                 return Some(k);
             }
-            if name == "Simd" && args.len() == 2 {
+            if (name == "Simd" || name == "SimdVec") && args.len() == 2 {
                 let elem = args[0].display_name();
                 let lanes = args[1].display_name().parse::<usize>().ok()?;
                 return match (ScalarKind::from_name(&elem)?, lanes) {
+                    (ScalarKind::F16, 8) => Some(Self::F16x8),
                     (ScalarKind::F32, 4) => Some(Self::F32x4),
                     (ScalarKind::F64, 4) => Some(Self::F64x4),
                     (ScalarKind::I32, 4) => Some(Self::I32x4),
@@ -199,6 +202,7 @@ impl SimdKind {
 
     pub fn lane_kind(self) -> ScalarKind {
         match self {
+            Self::F16x8 => ScalarKind::F16,
             Self::F32x4 => ScalarKind::F32,
             Self::F64x4 => ScalarKind::F64,
             Self::I32x4 => ScalarKind::I32,
@@ -209,6 +213,7 @@ impl SimdKind {
 
     pub fn lanes(self) -> usize {
         match self {
+            Self::F16x8 => 8,
             Self::U8x16 => 16,
             _ => 4,
         }
@@ -224,6 +229,7 @@ impl SimdKind {
 
     pub fn llvm_vec_ty(self) -> &'static str {
         match self {
+            Self::F16x8 => "<8 x half>",
             Self::F32x4 => "<4 x float>",
             Self::F64x4 => "<4 x double>",
             Self::I32x4 => "<4 x i32>",
@@ -234,6 +240,7 @@ impl SimdKind {
 
     pub fn canonical_name(self) -> &'static str {
         match self {
+            Self::F16x8 => "Float16x8",
             Self::F32x4 => "Float32x4",
             Self::F64x4 => "Float64x4",
             Self::I32x4 => "Int32x4",

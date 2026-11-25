@@ -1,0 +1,224 @@
+// std/gpu/metal/mps.tn — Native Apple Metal Performance Shaders (MPS) Hardware Acceleration
+//
+// Zero Rust dependencies: auto-links `MetalPerformanceShaders.framework` + `mps_shim.m` via `@c_src`
+// and shares the exact same `@linear GpuBuffer` & `GpuComputePipeline` handles with `std/gpu/metal/gpu.tn`!
+//
+// Provides:
+//   - `@linear MpsCommandBatch`: encodes an ENTIRE multi-layer Transformer forward pass (MPS FP16/FP32
+//     `MPSMatrixMultiplication` + `MPSMatrixSoftMax` + Tenon `@kernel` compute shaders + Blit copies)
+//     into ONE single Metal command buffer with ZERO intermediate CPU synchronization!
+//   - Strided/offset GEMM & SoftMax directly over preallocated `@linear` KV-Cache VRAM buffers!
+
+import "std/core/types.tn"
+import "std/gpu/metal/gpu.tn"
+
+@c_src("mps_shim.m")
+@link(framework = "MetalPerformanceShaders")
+extern "C" {
+    fn tn_mps_available() Int
+    fn tn_mps_batch_begin() Int
+    fn tn_mps_batch_commit() Int
+    fn tn_mps_gemm_ex(
+        buf_a Int, off_a Int, lda Int,
+        buf_b Int, off_b Int, ldb Int,
+        buf_c Int, off_c Int, ldc Int,
+        m Int, n Int, k Int,
+        tr_a Int, tr_b Int,
+        is_f16 Int,
+        alpha Float, beta Float,
+    ) Int
+    fn tn_mps_batched_gemm_f16(
+        buf_a Int, off_a Int, lda Int, stride_a_bytes Int,
+        buf_b Int, off_b Int, ldb Int, stride_b_bytes Int,
+        buf_c Int, off_c Int, ldc Int, stride_c_bytes Int,
+        batch Int, m Int, n Int, k Int,
+        tr_b Int,
+        alpha Float, beta Float,
+    ) Int
+    fn tn_mps_softmax_ex(
+        buf_src Int, off_src Int, ld_src Int,
+        buf_dst Int, off_dst Int, ld_dst Int,
+        rows Int, cols Int,
+        is_f16 Int,
+    ) Int
+    fn tn_mps_dispatch_kernel6(
+        pipe_handle Int,
+        b0 Int, o0 Int,
+        b1 Int, o1 Int,
+        b2 Int, o2 Int,
+        b3 Int, o3 Int,
+        b4 Int, o4 Int,
+        b5 Int, o5 Int,
+        gx Int, gy Int, gz Int,
+    ) Int
+    fn tn_mps_blit_copy(
+        src_h Int, src_off Int,
+        dst_h Int, dst_off Int,
+        nbytes Int,
+    ) Int
+    fn tn_mps_buf_write_offset(handle Int, dst_off Int, src_ptr Ptr[UInt8], nbytes Int) Int
+    fn tn_mps_buf_read_offset(handle Int, src_off Int, dst_ptr Ptr[UInt8], nbytes Int) Int
+    fn tn_mps_write_u32_4(handle Int, off_bytes Int, v0 Int, v1 Int, v2 Int, v3 Int) Int
+}
+
+/// Checks if Apple Metal Performance Shaders (MPS) hardware acceleration is available.
+pub fn mps_available() Bool {
+    unsafe { tn_mps_available() != 0 }
+}
+
+/// `@linear` Metal Command Batch: statically guarantees every opened GPU command buffer
+/// is committed exactly once (never leaked or double-committed!).
+@linear
+pub record MpsBatch {
+    active Int
+}
+
+impl MpsBatch {
+    pub fn begin() MpsBatch {
+        let ok = unsafe { tn_mps_batch_begin() }
+        MpsBatch { active = ok }
+    }
+
+    /// Consumes `self`, commits all encoded MPS + `@kernel` ops to Apple Silicon GPU, and waits.
+    pub fn commit_and_wait(self) Bool {
+        if self.active == 0 { return false }
+        unsafe { tn_mps_batch_commit() != 0 }
+    }
+}
+
+/// Hardware Apple MPS FP16 GEMM (`C[m, n] = alpha * op(A) @ op(B) + beta * C`) on raw `GpuBuffer` handles.
+pub fn mps_gemm_f16_raw(
+    a_h Int, a_off Int, lda Int,
+    b_h Int, b_off Int, ldb Int,
+    c_h Int, c_off Int, ldc Int,
+    m Int, n Int, k Int,
+    tr_a Bool, tr_b Bool,
+    alpha Float, beta Float,
+) Bool {
+    let ta = if tr_a { 1 } else { 0 }
+    let tb = if tr_b { 1 } else { 0 }
+    unsafe {
+        tn_mps_gemm_ex(
+            a_h, a_off, lda,
+            b_h, b_off, ldb,
+            c_h, c_off, ldc,
+            m, n, k,
+            ta, tb,
+            1,
+            alpha, beta,
+        ) != 0
+    }
+}
+
+/// Hardware Apple MPS FP32 GEMM (`C[m, n] = alpha * op(A) @ op(B) + beta * C`).
+pub fn mps_gemm_f32_raw(
+    a_h Int, a_off Int, lda Int,
+    b_h Int, b_off Int, ldb Int,
+    c_h Int, c_off Int, ldc Int,
+    m Int, n Int, k Int,
+    tr_a Bool, tr_b Bool,
+    alpha Float, beta Float,
+) Bool {
+    let ta = if tr_a { 1 } else { 0 }
+    let tb = if tr_b { 1 } else { 0 }
+    unsafe {
+        tn_mps_gemm_ex(
+            a_h, a_off, lda,
+            b_h, b_off, ldb,
+            c_h, c_off, ldc,
+            m, n, k,
+            ta, tb,
+            0,
+            alpha, beta,
+        ) != 0
+    }
+}
+
+/// Hardware Apple MPS 3D Batched FP16 GEMM (`batch` GQA/MHA attention heads in ONE Metal dispatch!).
+pub fn mps_batched_gemm_f16_raw(
+    a_h Int, a_off Int, lda Int, stride_a_bytes Int,
+    b_h Int, b_off Int, ldb Int, stride_b_bytes Int,
+    c_h Int, c_off Int, ldc Int, stride_c_bytes Int,
+    batch Int, m Int, n Int, k Int,
+    tr_b Bool,
+    alpha Float, beta Float,
+) Bool {
+    let tb = if tr_b { 1 } else { 0 }
+    unsafe {
+        tn_mps_batched_gemm_f16(
+            a_h, a_off, lda, stride_a_bytes,
+            b_h, b_off, ldb, stride_b_bytes,
+            c_h, c_off, ldc, stride_c_bytes,
+            batch, m, n, k,
+            tb, alpha, beta,
+        ) != 0
+    }
+}
+
+/// Hardware Apple MPS Row-Wise SoftMax in FP16 (`dst[rows, cols] = softmax(src[rows, cols])`).
+pub fn mps_softmax_f16_raw(
+    src_h Int, src_off Int, ld_src Int,
+    dst_h Int, dst_off Int, ld_dst Int,
+    rows Int, cols Int,
+) Bool {
+    unsafe {
+        tn_mps_softmax_ex(src_h, src_off, ld_src, dst_h, dst_off, ld_dst, rows, cols, 1) != 0
+    }
+}
+
+/// Hardware Apple MPS Row-Wise SoftMax in FP32.
+pub fn mps_softmax_f32_raw(
+    src_h Int, src_off Int, ld_src Int,
+    dst_h Int, dst_off Int, ld_dst Int,
+    rows Int, cols Int,
+) Bool {
+    unsafe {
+        tn_mps_softmax_ex(src_h, src_off, ld_src, dst_h, dst_off, ld_dst, rows, cols, 0) != 0
+    }
+}
+
+/// Encodes a Tenon `@kernel` compute shader into the active MPS command buffer (up to 6 offset bindings).
+pub fn mps_dispatch6(
+    pipe_h Int,
+    b0 Int, o0 Int,
+    b1 Int, o1 Int,
+    b2 Int, o2 Int,
+    b3 Int, o3 Int,
+    b4 Int, o4 Int,
+    b5 Int, o5 Int,
+    gx Int, gy Int, gz Int,
+) Bool {
+    unsafe {
+        tn_mps_dispatch_kernel6(pipe_h, b0, o0, b1, o1, b2, o2, b3, o3, b4, o4, b5, o5, gx, gy, gz) != 0
+    }
+}
+
+/// GPU-to-GPU Blit DMA copy inside the active MPS command buffer.
+pub fn mps_blit_copy(src_h Int, src_off Int, dst_h Int, dst_off Int, nbytes Int) Bool {
+    unsafe { tn_mps_blit_copy(src_h, src_off, dst_h, dst_off, nbytes) != 0 }
+}
+
+/// Writes 4 `UInt32` uniform parameters directly into a preallocated uniform ring slot (zero heap alloc!).
+pub fn mps_write_params4(handle Int, slot_idx Int, v0 Int, v1 Int, v2 Int, v3 Int) Bool {
+    unsafe { tn_mps_write_u32_4(handle, slot_idx * 16, v0, v1, v2, v3) != 0 }
+}
+
+pub fn mps_upload_f16_at(handle Int, byte_off Int, xs List[Float16]) Int {
+    let nbytes = len(xs) * 2
+    unsafe { tn_mps_buf_write_offset(handle, byte_off, list_data_ptr(xs), nbytes) }
+}
+
+pub fn mps_upload_u32_at(handle Int, byte_off Int, xs List[UInt32]) Int {
+    let nbytes = len(xs) * 4
+    unsafe { tn_mps_buf_write_offset(handle, byte_off, list_data_ptr(xs), nbytes) }
+}
+
+pub fn mps_download_f16_at(handle Int, byte_off Int, inout out List[Float16]) Int {
+    let nbytes = len(out) * 2
+    unsafe { tn_mps_buf_read_offset(handle, byte_off, list_data_ptr(out), nbytes) }
+}
+
+pub fn mps_download_f32_at(handle Int, byte_off Int, inout out List[Float32]) Int {
+    let nbytes = len(out) * 4
+    unsafe { tn_mps_buf_read_offset(handle, byte_off, list_data_ptr(out), nbytes) }
+}

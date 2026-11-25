@@ -1072,13 +1072,55 @@ fn subst_variadic_pack_in_expr(expr: &Expr, pack_name: &str, pack: &[Expr]) -> E
             }
             acc
         }
-        // `Shape[i]` with constant index -> `pack[i]`
+        // `init_prod(Shape)` -> product of all dims except last (batch/leading dims)
+        ExprKind::Call { callee, args }
+            if args.len() == 1
+                && matches!(&callee.kind, ExprKind::Ident(f) if f == "init_prod")
+                && matches!(&args[0].value.kind, ExprKind::Ident(s) if s == pack_name) =>
+        {
+            if pack.len() <= 1 {
+                return Expr { kind: ExprKind::Int(1), span: sp };
+            }
+            let init = &pack[..pack.len() - 1];
+            if let Some(p) = init.iter().try_fold(1i64, |acc, e| match e.kind {
+                ExprKind::Int(n) => acc.checked_mul(n),
+                _ => None,
+            }) {
+                return Expr { kind: ExprKind::Int(p), span: sp };
+            }
+            let mut acc = init[0].clone();
+            for item in &init[1..] {
+                acc = Expr {
+                    kind: ExprKind::Binary {
+                        op: BinOp::Mul,
+                        left: Box::new(acc),
+                        right: Box::new(item.clone()),
+                    },
+                    span: sp,
+                };
+            }
+            acc
+        }
+        // `Shape[i]` with constant index (supports negative Python/PyTorch-style indexing `Shape[-1]`, `Shape[-2]`)
         ExprKind::Index { target, index }
             if matches!(&target.kind, ExprKind::Ident(s) if s == pack_name) =>
         {
-            if let ExprKind::Int(idx) = index.kind {
-                if idx >= 0 && (idx as usize) < pack.len() {
-                    return pack[idx as usize].clone();
+            let idx_opt = match &index.kind {
+                ExprKind::Int(n) => Some(*n),
+                ExprKind::Unary { op: UnOp::Neg, expr: inner } => match inner.kind {
+                    ExprKind::Int(n) => Some(-n),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(idx) = idx_opt {
+                let resolved = if idx < 0 {
+                    (pack.len() as i64) + idx
+                } else {
+                    idx
+                };
+                if resolved >= 0 && (resolved as usize) < pack.len() {
+                    return pack[resolved as usize].clone();
                 }
             }
             expr.clone()

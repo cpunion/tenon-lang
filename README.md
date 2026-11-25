@@ -14,9 +14,10 @@
 # 0. 可视化交互体验与旗舰应用（零 `--c-src` 参数、零外部 Shader 文件，全量内置 `@c_src` 与 `gpu_embedded_msl()`！）
 cargo build --release --bin tenon
 
-# (A0) PyTorch 风格精化验证 AI 库（Tenon-Torch `std/nn`：AutogradTape + Transformer Self-Attention + AdamW + 编译期 `Matrix[R,C]` 维度证明 + Apple Silicon Metal 融合推理 Live 桌面工作台！）
+# (A0) PyTorch 风格精化验证 AI 库（Tenon-Torch `std/nn`：AutogradTape + AMP 混合精度 `GradScaler` + Transformer Self-Attention + AdamW + 编译期 `Matrix[R, C, DType = Float16]` / 变长 `Tensor[...Shape]` 维度证明 + Apple Silicon Metal MPS 硬件加速 Llama-3 GQA Transformer！）
 ./target/release/tenon test std/nn/nn_test.tn
 ./target/release/tenon check examples/showcase/bad_nn_shape.tn   # 负例：Matrix[4,8] @ Matrix[6,2] 编译期秒抓维度错误！
+./target/release/tenon build examples/showcase/tenon_transformer_mps.tn -o /tmp/tenon_mps_tf && /tmp/tenon_mps_tf  # 完整 6 层 Llama-3 GQA Transformer（Apple MPS 3D Batched FP16 GEMM + MPSMatrixSoftMax + GEMV + Safetensors + KV-Cache！）
 ./target/release/tenon build examples/showcase/tenon_torch_studio.tn -o /tmp/tenon_torch_studio && /tmp/tenon_torch_studio
 # 或无头截图预览（生成 /tmp/tenon_torch_studio.png）：TENON_TORCH_SMOKE=1 /tmp/tenon_torch_studio
 
@@ -53,7 +54,7 @@ cargo build --release --bin tenon
 # (H) 脚手架模板一键创建项目（支持 cli / lib / web / gpui / openui-web / tui / gpu）
 ./target/release/tenon new /tmp/my_gpu_app --template gpu
 
-# 1. 全工作区自动化测试（78 项全量回归；macOS 默认通过 real clang 原生链接校验 + LLVM 22 `lli` 并行执行，全量约 3 秒全绿；设置 `TENON_TEST_NATIVE_EXEC=1` 可切回逐二进制直接执行）
+# 1. 全工作区自动化测试（79 项全量回归；macOS 默认通过 real clang 原生链接校验 + LLVM 22 `lli` 并行执行，全量约 3 秒全绿；设置 `TENON_TEST_NATIVE_EXEC=1` 可切回逐二进制直接执行）
 cargo test --workspace
 
 # 2. 精化类型别名复用 + 高阶形式化验证闭环 + 独立证明导出与审计 + 可执行反例转测试

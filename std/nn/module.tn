@@ -150,3 +150,76 @@ impl TransformerBlock {
         }
     }
 }
+
+/// Mixed-Precision Linear Layer (PyTorch AMP style):
+/// Stores compact 2-byte `Float16` inference weights alongside `Float` (FP64/FP32) master weights
+/// for numerical stability during AdamW updates, with statically verified `Dim` dimensions!
+pub record MixedPrecisionLinear {
+    in_features  Dim
+    out_features Dim
+    master_w     List[Float]
+    master_b     List[Float]
+    weight_f16   List[Float16]
+    bias_f16     List[Float16]
+}
+
+impl MixedPrecisionLinear {
+    pub pure fn new(in_f Dim, out_f Dim, seed Int) MixedPrecisionLinear {
+        let base = Linear.new(in_f, out_f, seed)
+        var wf16 List[Float16] = []
+        var i = 0
+        while i < len(base.weight) {
+            wf16 = push(wf16, base.weight[i] as Float16)
+            i += 1
+        }
+        var bf16 List[Float16] = []
+        var j = 0
+        while j < len(base.bias) {
+            bf16 = push(bf16, base.bias[j] as Float16)
+            j += 1
+        }
+        MixedPrecisionLinear {
+            in_features = in_f,
+            out_features = out_f,
+            master_w = base.weight,
+            master_b = base.bias,
+            weight_f16 = wf16,
+            bias_f16 = bf16,
+        }
+    }
+
+    /// Synchronizes compact 2-byte `Float16` weight shadow copy after master-weight optimizer update.
+    pub pure fn sync_f16(inout self) {
+        var i = 0
+        while i < len(self.master_w) && i < len(self.weight_f16) {
+            self.weight_f16[i] = self.master_w[i] as Float16
+            i += 1
+        }
+        var j = 0
+        while j < len(self.master_b) && j < len(self.bias_f16) {
+            self.bias_f16[j] = self.master_b[j] as Float16
+            j += 1
+        }
+    }
+
+    /// Forward pass using quantized `Float16` weights cast into the autograd tape.
+    pub pure fn forward_amp(self, inout tape AutogradTape, x_id Int) LinearIds {
+        var w_up List[Float] = []
+        var i = 0
+        while i < len(self.weight_f16) {
+            w_up = push(w_up, self.weight_f16[i] as Float)
+            i += 1
+        }
+        var b_up List[Float] = []
+        var j = 0
+        while j < len(self.bias_f16) {
+            b_up = push(b_up, self.bias_f16[j] as Float)
+            j += 1
+        }
+        let w_id = tape_leaf(tape, self.in_features, self.out_features, w_up)
+        let b_id = tape_leaf(tape, 1, self.out_features, b_up)
+        let mm = tape_matmul(tape, x_id, w_id)
+        let out_id = tape_add_bias(tape, mm, b_id)
+        LinearIds { out_id = out_id, w_id = w_id, b_id = b_id }
+    }
+}

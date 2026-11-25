@@ -547,6 +547,46 @@ pub extern "C" fn tenon_gpu_shared_f32(n: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_shared_f16(n: i64) -> i64 {
+    crate::perceus::tenon_list_filled(n, 0, 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_exp(bits: i64) -> i64 {
+    f32::from_bits(bits as u32).exp().to_bits() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_sqrt(bits: i64) -> i64 {
+    f32::from_bits(bits as u32).sqrt().to_bits() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_rsqrt(bits: i64) -> i64 {
+    (1.0f32 / f32::from_bits(bits as u32).sqrt()).to_bits() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_cos(bits: i64) -> i64 {
+    f32::from_bits(bits as u32).cos().to_bits() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_sin(bits: i64) -> i64 {
+    f32::from_bits(bits as u32).sin().to_bits() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_pow(a_bits: i64, b_bits: i64) -> i64 {
+    f32::from_bits(a_bits as u32).powf(f32::from_bits(b_bits as u32)).to_bits() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_tanh(bits: i64) -> i64 {
+    f32::from_bits(bits as u32).tanh().to_bits() as i64
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_text_cstr_ptr(s: i64) -> i64 {
     if s == 0 {
         return c"".as_ptr() as i64;

@@ -1,0 +1,1060 @@
+// std/nn/gpu/transformer_mps.tn — Complete Llama-3 / Modern Transformer on Apple Silicon MPS!
+//
+// Full end-to-end Transformer architecture combining:
+//   - Apple Metal Performance Shaders (`MetalPerformanceShaders.framework`):
+//       * `MPSMatrixMultiplication` (FP16 `MPSDataTypeFloat16` hardware tensor/matrix throughput)
+//         for Q/K/V projections, GQA per-head `Q @ K_cache^T` (with fused `1/sqrt(d_head)` alpha!),
+//         `Attn @ V_cache`, O-projection, SwiGLU Gate/Up/Down FFN projections, and LM Head!
+//       * `MPSMatrixSoftMax` (FP16 hardware row-wise softmax) for attention weights!
+//       * Single-Command-Buffer `@linear MpsBatch` encoding ALL layers with ZERO intermediate CPU waits!
+//   - Single-Source Tenon `@kernel` Metal FP16 shaders (`gpu_embedded_msl()`, zero `.metal` files!):
+//       * `tf_embed_lookup_f16`, `tf_rmsnorm_f16`, `tf_rope_f16`, `tf_transpose_to_heads_f16`,
+//         `tf_kv_cache_write_f16`, `tf_causal_mask_f16`, `tf_transpose_from_heads_f16`,
+//         `tf_swiglu_f16`, `tf_residual_add_f16`
+//   - Compile-time verified `@linear` VRAM/Pipeline/KV-Cache ownership (`live_objects == 0`)
+//   - Exact CPU FP32 reference forward pass for numerical equivalence validation!
+
+import "std/core/types.tn"
+import "std/gpu/tensor.tn"
+import "std/gpu/metal/gpu.tn"
+import "std/gpu/metal/mps.tn"
+import "std/nn/safetensors.tn"
+
+/// Compile-time refined Transformer architecture configuration (supports MHA & GQA!).
+pub record TransformerConfig {
+    vocab_size  Positive
+    d_model     Positive
+    n_layers    Positive
+    n_heads     Positive
+    n_kv_heads  Positive
+    d_head      Positive
+    d_ff        Positive
+    max_seq_len Positive
+}
+
+// =========================================================================
+// 1. Single-Source Tenon `@kernel` FP16 Metal Compute Shaders (Embedded MSL)
+// =========================================================================
+
+/// Token embedding lookup: `out[t, d] = tok_emb[tok_ids[t], d]` (`Float16`).
+@kernel
+pub fn tf_embed_lookup_f16(
+    tok_ids List[UInt32],
+    tok_emb List[Float16],
+    inout out List[Float16],
+    params List[UInt32],
+) {
+    let tid = gpu_global_id_x()
+    let seq_len = params[0] as Int
+    let d_model = params[1] as Int
+    let vocab = params[2] as Int
+    let total = seq_len * d_model
+    if tid < total && d_model > 0 {
+        let t = tid / d_model
+        let d = tid % d_model
+        let tok = tok_ids[t] as Int
+        let safe_tok = if tok < vocab { tok } else { 0 }
+        out[tid] = tok_emb[safe_tok * d_model + d]
+    }
+}
+
+/// Llama RMSNorm in FP16 with FP32 variance accumulation:
+/// `out[t, d] = (x[t, d] * rsqrt(mean(x[t, :]^2) + 1e-5)) * weight[d]`.
+@kernel
+pub fn tf_rmsnorm_f16(
+    x List[Float16],
+    weight List[Float16],
+    inout out List[Float16],
+    params List[UInt32],
+) {
+    let row = gpu_global_id_x()
+    let seq_len = params[0] as Int
+    let d_model = params[1] as Int
+    if row < seq_len && d_model > 0 {
+        let base = row * d_model
+        var ss Float32 = 0.0 as Float32
+        var i = 0
+        while i < d_model {
+            let v Float32 = x[base + i] as Float32
+            ss = ss + v * v
+            i += 1
+        }
+        let mean_sq Float32 = ss / (d_model as Float32)
+        let inv Float32 = gpu_rsqrt(mean_sq + (0.00001 as Float32))
+        var j = 0
+        while j < d_model {
+            let xv Float32 = x[base + j] as Float32
+            let wv Float32 = weight[j] as Float32
+            out[base + j] = (xv * inv * wv) as Float16
+            j += 1
+        }
+    }
+}
+
+/// Rotary Positional Embedding (RoPE, `theta = 10000.0`) applied in-place to Q or K (`[T, H * Dh]`).
+@kernel
+pub fn tf_rope_f16(
+    inout x List[Float16],
+    params List[UInt32],
+) {
+    let tid = gpu_global_id_x()
+    let seq_len = params[0] as Int
+    let n_h = params[1] as Int
+    let d_head = params[2] as Int
+    let start_pos = params[3] as Int
+    let half_d = d_head / 2
+    let total = seq_len * n_h * half_d
+    if tid < total && half_d > 0 && n_h > 0 {
+        let pair = tid % half_d
+        let rem = tid / half_d
+        let h = rem % n_h
+        let t = rem / n_h
+        let abs_pos = start_pos + t
+        let exp_arg Float32 = ((2 * pair) as Float32) / (d_head as Float32)
+        let inv_freq Float32 = (1.0 as Float32) / gpu_pow(10000.0 as Float32, exp_arg)
+        let angle Float32 = (abs_pos as Float32) * inv_freq
+        let c Float32 = gpu_cos(angle)
+        let s Float32 = gpu_sin(angle)
+        let idx0 = (t * n_h + h) * d_head + 2 * pair
+        let x0 Float32 = x[idx0] as Float32
+        let x1 Float32 = x[idx0 + 1] as Float32
+        x[idx0] = (x0 * c - x1 * s) as Float16
+        x[idx0 + 1] = (x0 * s + x1 * c) as Float16
+    }
+}
+
+/// Transposes `[T, H * Dh]` -> `[H, T, Dh]` so Apple MPS executes per-head GEMM contiguously!
+@kernel
+pub fn tf_transpose_to_heads_f16(
+    src List[Float16],
+    inout dst List[Float16],
+    params List[UInt32],
+) {
+    let tid = gpu_global_id_x()
+    let seq_len = params[0] as Int
+    let n_h = params[1] as Int
+    let d_head = params[2] as Int
+    let total = seq_len * n_h * d_head
+    if tid < total && d_head > 0 && n_h > 0 {
+        let d = tid % d_head
+        let rem = tid / d_head
+        let h = rem % n_h
+        let t = rem / n_h
+        dst[(h * seq_len + t) * d_head + d] = src[tid]
+    }
+}
+
+/// Writes new K/V projections `[T, H_kv * Dh]` into layer's KV-Cache `[H_kv, max_seq, Dh]` at `start_pos`.
+@kernel
+pub fn tf_kv_cache_write_f16(
+    src List[Float16],
+    inout cache List[Float16],
+    params List[UInt32],
+) {
+    let tid = gpu_global_id_x()
+    let seq_len = params[0] as Int
+    let n_kv = params[1] as Int
+    let d_head = params[2] as Int
+    let start_pos_and_max = params[3] as Int
+    let max_seq = start_pos_and_max / 65536
+    let start_pos = start_pos_and_max % 65536
+    let total = seq_len * n_kv * d_head
+    if tid < total && d_head > 0 && n_kv > 0 {
+        let d = tid % d_head
+        let rem = tid / d_head
+        let h = rem % n_kv
+        let t = rem / n_kv
+        let dst_idx = (h * max_seq + (start_pos + t)) * d_head + d
+        cache[dst_idx] = src[tid]
+    }
+}
+
+/// Applies strict lower-triangular causal mask (`k_pos > start_pos + q_pos => -10000.0h`)
+/// across all `n_heads` heads stored contiguously as `[n_heads, seq_len, max_seq]` so
+/// Apple MPS executes ALL heads of `Q@K^T`, `MPSMatrixSoftMax`, and `Probs@V` in 3 single batched dispatches!
+@kernel
+pub fn tf_causal_mask_f16(
+    inout scores List[Float16],
+    params List[UInt32],
+) {
+    let tid = gpu_global_id_x()
+    let seq_len = params[0] as Int
+    let max_seq = params[1] as Int
+    let n_heads = params[2] as Int
+    let start_pos = params[3] as Int
+    let total = n_heads * seq_len * max_seq
+    if tid < total && max_seq > 0 && seq_len > 0 {
+        let k_pos = tid % max_seq
+        let rem = tid / max_seq
+        let q_pos = rem % seq_len
+        if k_pos > start_pos + q_pos {
+            scores[tid] = (-10000.0) as Float16
+        }
+    }
+}
+
+/// Merges per-head attention context `[H, T, Dh]` -> `[T, H * Dh]` before O-Projection MPS GEMM.
+@kernel
+pub fn tf_transpose_from_heads_f16(
+    src List[Float16],
+    inout dst List[Float16],
+    params List[UInt32],
+) {
+    let tid = gpu_global_id_x()
+    let seq_len = params[0] as Int
+    let n_h = params[1] as Int
+    let d_head = params[2] as Int
+    let total = seq_len * n_h * d_head
+    if tid < total && d_head > 0 && n_h > 0 {
+        let d = tid % d_head
+        let rem = tid / d_head
+        let h = rem % n_h
+        let t = rem / n_h
+        dst[tid] = src[(h * seq_len + t) * d_head + d]
+    }
+}
+
+/// Fused Llama SwiGLU activation: `out[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i]` (`Float16`).
+@kernel
+pub fn tf_swiglu_f16(
+    gate List[Float16],
+    up List[Float16],
+    inout out List[Float16],
+    params List[UInt32],
+) {
+    let tid = gpu_global_id_x()
+    let total = params[0] as Int
+    if tid < total {
+        let g Float32 = gate[tid] as Float32
+        let u Float32 = up[tid] as Float32
+        let silu Float32 = g / ((1.0 as Float32) + gpu_exp(-g))
+        out[tid] = (silu * u) as Float16
+    }
+}
+
+/// Residual stream addition in-place: `x[i] = x[i] + delta[i]` (`Float16`).
+@kernel
+pub fn tf_residual_add_f16(
+    inout x List[Float16],
+    delta List[Float16],
+    params List[UInt32],
+) {
+    let tid = gpu_global_id_x()
+    let total = params[0] as Int
+    if tid < total {
+        let a Float32 = x[tid] as Float32
+        let b Float32 = delta[tid] as Float32
+        x[tid] = (a + b) as Float16
+    }
+}
+
+// =========================================================================
+// 2. Deterministic FP16 Weight Initialization + Safetensors Checkpoint I/O
+// =========================================================================
+
+pure fn tf_init_f16_vec(n Int, seed Int, scale Float) List[Float16] {
+    var out List[Float16] = list_filled(n, 0.0 as Float16)
+    var i = 0
+    while i < n {
+        let h = ((seed * 1103515245 + i * 2654435761 + 1013904223) % 20001) - 10000
+        let v = (int_to_float(h) / 10000.0) * scale
+        out[i] = v as Float16
+        i += 1
+    }
+    out
+}
+
+pure fn tf_init_ones_f16(n Int) List[Float16] {
+    list_filled(n, 1.0 as Float16)
+}
+
+pub record TransformerWeightsF16 {
+    cfg          TransformerConfig
+    tok_emb      List[Float16] // [vocab, d_model]
+    norm1_w      List[Float16] // [n_layers, d_model]
+    wq           List[Float16] // [n_layers, d_model, d_model]
+    wk           List[Float16] // [n_layers, kv_dim, d_model]
+    wv           List[Float16] // [n_layers, kv_dim, d_model]
+    wo           List[Float16] // [n_layers, d_model, d_model]
+    norm2_w      List[Float16] // [n_layers, d_model]
+    w_gate       List[Float16] // [n_layers, d_ff, d_model]
+    w_up         List[Float16] // [n_layers, d_ff, d_model]
+    w_down       List[Float16] // [n_layers, d_model, d_ff]
+    final_norm_w List[Float16] // [d_model]
+    lm_head_w    List[Float16] // [vocab, d_model]
+}
+
+pub pure fn transformer_weights_init(cfg TransformerConfig, seed Int) TransformerWeightsF16 {
+    let kv_dim = cfg.n_kv_heads * cfg.d_head
+    let s_emb = 0.25
+    let s_proj = 0.2 / (gpu_sqrt(cfg.d_model as Float32) as Float)
+    let s_ff = 0.2 / (gpu_sqrt(cfg.d_ff as Float32) as Float)
+    TransformerWeightsF16 {
+        cfg = cfg,
+        tok_emb = tf_init_f16_vec(cfg.vocab_size * cfg.d_model, seed + 1, s_emb),
+        norm1_w = tf_init_ones_f16(cfg.n_layers * cfg.d_model),
+        wq = tf_init_f16_vec(cfg.n_layers * cfg.d_model * cfg.d_model, seed + 11, s_proj),
+        wk = tf_init_f16_vec(cfg.n_layers * kv_dim * cfg.d_model, seed + 23, s_proj),
+        wv = tf_init_f16_vec(cfg.n_layers * kv_dim * cfg.d_model, seed + 37, s_proj),
+        wo = tf_init_f16_vec(cfg.n_layers * cfg.d_model * cfg.d_model, seed + 53, s_proj),
+        norm2_w = tf_init_ones_f16(cfg.n_layers * cfg.d_model),
+        w_gate = tf_init_f16_vec(cfg.n_layers * cfg.d_ff * cfg.d_model, seed + 71, s_proj),
+        w_up = tf_init_f16_vec(cfg.n_layers * cfg.d_ff * cfg.d_model, seed + 89, s_proj),
+        w_down = tf_init_f16_vec(cfg.n_layers * cfg.d_model * cfg.d_ff, seed + 101, s_ff),
+        final_norm_w = tf_init_ones_f16(cfg.d_model),
+        lm_head_w = tf_init_f16_vec(cfg.vocab_size * cfg.d_model, seed + 131, s_proj),
+    }
+}
+
+pub pure fn transformer_param_count(cfg TransformerConfig) Int {
+    let kv_dim = cfg.n_kv_heads * cfg.d_head
+    let per_layer =
+        cfg.d_model +
+        cfg.d_model * cfg.d_model +
+        kv_dim * cfg.d_model * 2 +
+        cfg.d_model * cfg.d_model +
+        cfg.d_model +
+        cfg.d_ff * cfg.d_model * 3
+    cfg.vocab_size * cfg.d_model * 2 + cfg.d_model + cfg.n_layers * per_layer
+}
+
+/// Exports ALL Transformer FP16 weights to standard HuggingFace `.safetensors` binary format!
+pub fn transformer_export_safetensors(w TransformerWeightsF16) Bytes {
+    let c = w.cfg
+    let kv_dim = c.n_kv_heads * c.d_head
+    let names List[Text] = [
+        "tok_emb", "norm1_w", "wq", "wk", "wv", "wo",
+        "norm2_w", "w_gate", "w_up", "w_down", "final_norm_w", "lm_head_w",
+    ]
+    let shapes List[List[Int]] = [
+        [c.vocab_size, c.d_model],
+        [c.n_layers, c.d_model],
+        [c.n_layers, c.d_model, c.d_model],
+        [c.n_layers, kv_dim, c.d_model],
+        [c.n_layers, kv_dim, c.d_model],
+        [c.n_layers, c.d_model, c.d_model],
+        [c.n_layers, c.d_model],
+        [c.n_layers, c.d_ff, c.d_model],
+        [c.n_layers, c.d_ff, c.d_model],
+        [c.n_layers, c.d_model, c.d_ff],
+        [c.d_model],
+        [c.vocab_size, c.d_model],
+    ]
+    let tensors List[List[Float16]] = [
+        w.tok_emb, w.norm1_w, w.wq, w.wk, w.wv, w.wo,
+        w.norm2_w, w.w_gate, w.w_up, w.w_down, w.final_norm_w, w.lm_head_w,
+    ]
+    safetensors_encode_f16(names, shapes, tensors)
+}
+
+/// Zero-copy loads ALL Transformer FP16 weights back from `.safetensors` bytes!
+pub fn transformer_load_safetensors(cfg TransformerConfig, raw Bytes) Result[TransformerWeightsF16, Text] {
+    let sf = safetensors_parse(raw)?
+    let tok_emb = safetensors_get_f16(sf, "tok_emb")?
+    let norm1_w = safetensors_get_f16(sf, "norm1_w")?
+    let wq = safetensors_get_f16(sf, "wq")?
+    let wk = safetensors_get_f16(sf, "wk")?
+    let wv = safetensors_get_f16(sf, "wv")?
+    let wo = safetensors_get_f16(sf, "wo")?
+    let norm2_w = safetensors_get_f16(sf, "norm2_w")?
+    let w_gate = safetensors_get_f16(sf, "w_gate")?
+    let w_up = safetensors_get_f16(sf, "w_up")?
+    let w_down = safetensors_get_f16(sf, "w_down")?
+    let final_norm_w = safetensors_get_f16(sf, "final_norm_w")?
+    let lm_head_w = safetensors_get_f16(sf, "lm_head_w")?
+    Ok(TransformerWeightsF16 {
+        cfg = cfg,
+        tok_emb = tok_emb, norm1_w = norm1_w, wq = wq, wk = wk, wv = wv, wo = wo,
+        norm2_w = norm2_w, w_gate = w_gate, w_up = w_up, w_down = w_down,
+        final_norm_w = final_norm_w, lm_head_w = lm_head_w,
+    })
+}
+
+// =========================================================================
+// 3. `@linear` Apple MPS Hardware Transformer Engine (100% GPU VRAM Resident)
+// =========================================================================
+
+/// `@linear` MPS Transformer Engine: owns ALL FP16 weight buffers, KV-Cache, scratch VRAM,
+/// and compiled Metal compute pipelines — guaranteed leak-free by Tenon's linear verifier!
+@linear
+pub record MpsTransformer {
+    cfg          TransformerConfig
+    kv_pos       Int
+    // Weight VRAM buffers (2-byte FP16)
+    b_tok_emb    GpuBuffer
+    b_norm1      GpuBuffer
+    b_wq         GpuBuffer
+    b_wk         GpuBuffer
+    b_wv         GpuBuffer
+    b_wo         GpuBuffer
+    b_norm2      GpuBuffer
+    b_w_gate     GpuBuffer
+    b_w_up       GpuBuffer
+    b_w_down     GpuBuffer
+    b_final_norm GpuBuffer
+    b_lm_head    GpuBuffer
+    // KV-Cache VRAM buffers: [n_layers, n_kv_heads, max_seq_len, d_head] (2-byte FP16)
+    b_k_cache    GpuBuffer
+    b_v_cache    GpuBuffer
+    // Reusable scratch VRAM (ZERO allocs during prefill & decode!)
+    b_tok_ids    GpuBuffer
+    b_x          GpuBuffer
+    b_norm       GpuBuffer
+    b_q          GpuBuffer
+    b_k          GpuBuffer
+    b_v          GpuBuffer
+    b_q_heads    GpuBuffer
+    b_scores     GpuBuffer
+    b_probs      GpuBuffer
+    b_ctx_heads  GpuBuffer
+    b_ctx_flat   GpuBuffer
+    b_delta      GpuBuffer
+    b_gate       GpuBuffer
+    b_up         GpuBuffer
+    b_ffn        GpuBuffer
+    b_logits     GpuBuffer
+    b_params     GpuBuffer
+    // Compiled Metal pipelines (from `gpu_embedded_msl()`, zero external shader files!)
+    p_embed      GpuComputePipeline
+    p_rmsnorm    GpuComputePipeline
+    p_rope       GpuComputePipeline
+    p_to_heads   GpuComputePipeline
+    p_kv_write   GpuComputePipeline
+    p_mask       GpuComputePipeline
+    p_from_heads GpuComputePipeline
+    p_swiglu     GpuComputePipeline
+    p_res_add    GpuComputePipeline
+}
+
+impl MpsTransformer {
+    pub fn from_weights(w TransformerWeightsF16) MpsTransformer {
+        let c = w.cfg
+        let msl = gpu_embedded_msl()
+        let kv_dim = c.n_kv_heads * c.d_head
+        let max_t = c.max_seq_len
+        let kv_bytes = c.n_layers * c.n_kv_heads * max_t * c.d_head * 2
+        let act_bytes = max_t * c.d_model * 2
+        let kv_act_bytes = max_t * kv_dim * 2
+        let score_bytes = c.n_heads * max_t * max_t * 2
+        let ffn_bytes = max_t * c.d_ff * 2
+        let logit_bytes = max_t * c.vocab_size * 2
+
+        MpsTransformer {
+            cfg = c,
+            kv_pos = 0,
+            b_tok_emb = GpuBuffer.from_f16_list(w.tok_emb),
+            b_norm1 = GpuBuffer.from_f16_list(w.norm1_w),
+            b_wq = GpuBuffer.from_f16_list(w.wq),
+            b_wk = GpuBuffer.from_f16_list(w.wk),
+            b_wv = GpuBuffer.from_f16_list(w.wv),
+            b_wo = GpuBuffer.from_f16_list(w.wo),
+            b_norm2 = GpuBuffer.from_f16_list(w.norm2_w),
+            b_w_gate = GpuBuffer.from_f16_list(w.w_gate),
+            b_w_up = GpuBuffer.from_f16_list(w.w_up),
+            b_w_down = GpuBuffer.from_f16_list(w.w_down),
+            b_final_norm = GpuBuffer.from_f16_list(w.final_norm_w),
+            b_lm_head = GpuBuffer.from_f16_list(w.lm_head_w),
+            b_k_cache = GpuBuffer.uninit(if kv_bytes > 0 { kv_bytes } else { 16 }),
+            b_v_cache = GpuBuffer.uninit(if kv_bytes > 0 { kv_bytes } else { 16 }),
+            b_tok_ids = GpuBuffer.uninit(if max_t * 4 > 0 { max_t * 4 } else { 16 }),
+            b_x = GpuBuffer.uninit(if act_bytes > 0 { act_bytes } else { 16 }),
+            b_norm = GpuBuffer.uninit(if act_bytes > 0 { act_bytes } else { 16 }),
+            b_q = GpuBuffer.uninit(if act_bytes > 0 { act_bytes } else { 16 }),
+            b_k = GpuBuffer.uninit(if kv_act_bytes > 0 { kv_act_bytes } else { 16 }),
+            b_v = GpuBuffer.uninit(if kv_act_bytes > 0 { kv_act_bytes } else { 16 }),
+            b_q_heads = GpuBuffer.uninit(if act_bytes > 0 { act_bytes } else { 16 }),
+            b_scores = GpuBuffer.uninit(if score_bytes > 0 { score_bytes } else { 16 }),
+            b_probs = GpuBuffer.uninit(if score_bytes > 0 { score_bytes } else { 16 }),
+            b_ctx_heads = GpuBuffer.uninit(if act_bytes > 0 { act_bytes } else { 16 }),
+            b_ctx_flat = GpuBuffer.uninit(if act_bytes > 0 { act_bytes } else { 16 }),
+            b_delta = GpuBuffer.uninit(if act_bytes > 0 { act_bytes } else { 16 }),
+            b_gate = GpuBuffer.uninit(if ffn_bytes > 0 { ffn_bytes } else { 16 }),
+            b_up = GpuBuffer.uninit(if ffn_bytes > 0 { ffn_bytes } else { 16 }),
+            b_ffn = GpuBuffer.uninit(if ffn_bytes > 0 { ffn_bytes } else { 16 }),
+            b_logits = GpuBuffer.uninit(if logit_bytes > 0 { logit_bytes } else { 16 }),
+            b_params = GpuBuffer.uninit(4096 * 16),
+            p_embed = GpuComputePipeline.compile_msl(msl, "tf_embed_lookup_f16"),
+            p_rmsnorm = GpuComputePipeline.compile_msl(msl, "tf_rmsnorm_f16"),
+            p_rope = GpuComputePipeline.compile_msl(msl, "tf_rope_f16"),
+            p_to_heads = GpuComputePipeline.compile_msl(msl, "tf_transpose_to_heads_f16"),
+            p_kv_write = GpuComputePipeline.compile_msl(msl, "tf_kv_cache_write_f16"),
+            p_mask = GpuComputePipeline.compile_msl(msl, "tf_causal_mask_f16"),
+            p_from_heads = GpuComputePipeline.compile_msl(msl, "tf_transpose_from_heads_f16"),
+            p_swiglu = GpuComputePipeline.compile_msl(msl, "tf_swiglu_f16"),
+            p_res_add = GpuComputePipeline.compile_msl(msl, "tf_residual_add_f16"),
+        }
+    }
+
+    pub fn reset_kv_cache(inout self) {
+        self.kv_pos = 0
+    }
+
+    /// Executes an ENTIRE multi-layer Llama-3 GQA Transformer forward pass (`seq_len` tokens starting
+    /// at `self.kv_pos`) in ONE single Apple MPS command buffer (`MpsBatch`), returning FP16 logits
+    /// for the LAST token (`[vocab_size]`) and advancing `self.kv_pos += seq_len`!
+    pub fn forward_tokens(inout self, tokens List[Int]) List[Float16] {
+        let c = self.cfg
+        let seq_len = len(tokens)
+        let start_pos = self.kv_pos
+        let kv_len = start_pos + seq_len
+        let d_model = c.d_model
+        let n_heads = c.n_heads
+        let n_kv = c.n_kv_heads
+        let d_head = c.d_head
+        let kv_dim = n_kv * d_head
+        let d_ff = c.d_ff
+        let max_t = c.max_seq_len
+        let group_size = n_heads / n_kv
+        let attn_scale = (1.0 as Float) / (gpu_sqrt(d_head as Float32) as Float)
+
+        // Upload token IDs once
+        var tids List[UInt32] = list_filled(seq_len, 0 as UInt32)
+        var ti = 0
+        while ti < seq_len {
+            tids[ti] = tokens[ti] as UInt32
+            ti += 1
+        }
+        let _ = mps_upload_u32_at(self.b_tok_ids.handle, 0, tids)
+
+        let ph = self.b_params.handle
+        var slot = 0
+
+        // Open ONE single Metal/MPS command buffer for ALL layers!
+        let batch = MpsBatch.begin()
+
+        // 0. Embedding Lookup: tok_ids[T] -> b_x[T, D]
+        let _ = mps_write_params4(ph, slot, seq_len, d_model, c.vocab_size, 0)
+        let _ = mps_dispatch6(
+            self.p_embed.handle,
+            self.b_tok_ids.handle, 0,
+            self.b_tok_emb.handle, 0,
+            self.b_x.handle, 0,
+            ph, slot * 16,
+            0, 0, 0, 0,
+            seq_len * d_model, 1, 1,
+        )
+        slot += 1
+
+        // 1. Transformer Decoder Layers (0..n_layers)
+        var layer = 0
+        while layer < c.n_layers {
+            let norm_off = layer * d_model * 2
+            let wq_off = layer * d_model * d_model * 2
+            let wkv_off = layer * kv_dim * d_model * 2
+            let wo_off = layer * d_model * d_model * 2
+            let wff_in_off = layer * d_ff * d_model * 2
+            let wff_out_off = layer * d_model * d_ff * 2
+            let kv_layer_off = layer * n_kv * max_t * d_head * 2
+
+            // 1a. Pre-Attention RMSNorm: b_x -> b_norm
+            let _ = mps_write_params4(ph, slot, seq_len, d_model, 0, 0)
+            let _ = mps_dispatch6(
+                self.p_rmsnorm.handle,
+                self.b_x.handle, 0,
+                self.b_norm1.handle, norm_off,
+                self.b_norm.handle, 0,
+                ph, slot * 16,
+                0, 0, 0, 0,
+                seq_len, 1, 1,
+            )
+            slot += 1
+
+            // 1b. Q, K, V Linear Projections via Apple MPS FP16 Hardware GEMM!
+            let _ = mps_gemm_f16_raw(
+                self.b_norm.handle, 0, d_model,
+                self.b_wq.handle, wq_off, d_model,
+                self.b_q.handle, 0, d_model,
+                seq_len, d_model, d_model, false, true, 1.0, 0.0,
+            )
+            let _ = mps_gemm_f16_raw(
+                self.b_norm.handle, 0, d_model,
+                self.b_wk.handle, wkv_off, d_model,
+                self.b_k.handle, 0, kv_dim,
+                seq_len, kv_dim, d_model, false, true, 1.0, 0.0,
+            )
+            let _ = mps_gemm_f16_raw(
+                self.b_norm.handle, 0, d_model,
+                self.b_wv.handle, wkv_off, d_model,
+                self.b_v.handle, 0, kv_dim,
+                seq_len, kv_dim, d_model, false, true, 1.0, 0.0,
+            )
+
+            // 1c. Rotary Positional Embeddings (RoPE) in-place on Q and K
+            let _ = mps_write_params4(ph, slot, seq_len, n_heads, d_head, start_pos)
+            let _ = mps_dispatch6(
+                self.p_rope.handle,
+                self.b_q.handle, 0,
+                ph, slot * 16,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                seq_len * n_heads * (d_head / 2), 1, 1,
+            )
+            slot += 1
+
+            let _ = mps_write_params4(ph, slot, seq_len, n_kv, d_head, start_pos)
+            let _ = mps_dispatch6(
+                self.p_rope.handle,
+                self.b_k.handle, 0,
+                ph, slot * 16,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                seq_len * n_kv * (d_head / 2), 1, 1,
+            )
+            slot += 1
+
+            // 1d. Transpose Q -> [H, T, Dh] & Write K, V -> KV-Cache [H_kv, max_seq, Dh]
+            let _ = mps_write_params4(ph, slot, seq_len, n_heads, d_head, 0)
+            let _ = mps_dispatch6(
+                self.p_to_heads.handle,
+                self.b_q.handle, 0,
+                self.b_q_heads.handle, 0,
+                ph, slot * 16,
+                0, 0, 0, 0, 0, 0,
+                seq_len * d_model, 1, 1,
+            )
+            slot += 1
+
+            let packed_pos_max = max_t * 65536 + start_pos
+            let _ = mps_write_params4(ph, slot, seq_len, n_kv, d_head, packed_pos_max)
+            let _ = mps_dispatch6(
+                self.p_kv_write.handle,
+                self.b_k.handle, 0,
+                self.b_k_cache.handle, kv_layer_off,
+                ph, slot * 16,
+                0, 0, 0, 0, 0, 0,
+                seq_len * kv_dim, 1, 1,
+            )
+            let _ = mps_dispatch6(
+                self.p_kv_write.handle,
+                self.b_v.handle, 0,
+                self.b_v_cache.handle, kv_layer_off,
+                ph, slot * 16,
+                0, 0, 0, 0, 0, 0,
+                seq_len * kv_dim, 1, 1,
+            )
+            slot += 1
+
+            // 1e. Grouped-Query Attention (GQA) — ALL `n_heads` in ONE SINGLE 3D Batched MPS FP16 Dispatch!
+            //     Since `q_heads` is `[n_kv, group_size * seq_len, d_head]` and `k_cache` is `[n_kv, max_t, d_head]`,
+            //     a single `batch = n_kv` MPS GEMM computes ALL `n_heads` simultaneously with fused `1/sqrt(d_head)`!
+            let gq_rows = group_size * seq_len
+            let q_mat_bytes = gq_rows * d_head * 2
+            let kv_mat_bytes = max_t * d_head * 2
+            let sc_mat_bytes = gq_rows * max_t * 2
+            let _ = mps_batched_gemm_f16_raw(
+                self.b_q_heads.handle, 0, d_head, q_mat_bytes,
+                self.b_k_cache.handle, kv_layer_off, d_head, kv_mat_bytes,
+                self.b_scores.handle, 0, max_t, sc_mat_bytes,
+                n_kv, gq_rows, max_t, d_head, true, attn_scale, 0.0,
+            )
+
+            // 1f. Strict Causal Lower-Triangular Mask across ALL `[n_heads * seq_len, max_t]`
+            let _ = mps_write_params4(ph, slot, seq_len, max_t, n_heads, start_pos)
+            let _ = mps_dispatch6(
+                self.p_mask.handle,
+                self.b_scores.handle, 0,
+                ph, slot * 16,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                n_heads * seq_len * max_t, 1, 1,
+            )
+            slot += 1
+
+            // 1g. ONE SINGLE Hardware Apple `MPSMatrixSoftMax` across ALL `n_heads * seq_len` rows
+            //     + ONE SINGLE 3D Batched MPS FP16 GEMM (`Probs @ V_cache`) for ALL `n_heads`!
+            let _ = mps_softmax_f16_raw(
+                self.b_scores.handle, 0, max_t,
+                self.b_probs.handle, 0, max_t,
+                n_heads * seq_len, max_t,
+            )
+            let _ = mps_batched_gemm_f16_raw(
+                self.b_probs.handle, 0, max_t, sc_mat_bytes,
+                self.b_v_cache.handle, kv_layer_off, d_head, kv_mat_bytes,
+                self.b_ctx_heads.handle, 0, d_head, q_mat_bytes,
+                n_kv, gq_rows, d_head, max_t, false, 1.0, 0.0,
+            )
+
+            // 1h. Merge Heads -> O-Projection MPS FP16 GEMM -> Residual Add!
+            let _ = mps_write_params4(ph, slot, seq_len, n_heads, d_head, 0)
+            let _ = mps_dispatch6(
+                self.p_from_heads.handle,
+                self.b_ctx_heads.handle, 0,
+                self.b_ctx_flat.handle, 0,
+                ph, slot * 16,
+                0, 0, 0, 0, 0, 0,
+                seq_len * d_model, 1, 1,
+            )
+            slot += 1
+
+            let _ = mps_gemm_f16_raw(
+                self.b_ctx_flat.handle, 0, d_model,
+                self.b_wo.handle, wo_off, d_model,
+                self.b_delta.handle, 0, d_model,
+                seq_len, d_model, d_model, false, true, 1.0, 0.0,
+            )
+
+            let _ = mps_write_params4(ph, slot, seq_len * d_model, 0, 0, 0)
+            let _ = mps_dispatch6(
+                self.p_res_add.handle,
+                self.b_x.handle, 0,
+                self.b_delta.handle, 0,
+                ph, slot * 16,
+                0, 0, 0, 0, 0, 0,
+                seq_len * d_model, 1, 1,
+            )
+            slot += 1
+
+            // 1i. Pre-FFN RMSNorm -> Gate/Up MPS FP16 GEMM -> Fused SwiGLU -> Down MPS FP16 GEMM -> Residual!
+            let _ = mps_write_params4(ph, slot, seq_len, d_model, 0, 0)
+            let _ = mps_dispatch6(
+                self.p_rmsnorm.handle,
+                self.b_x.handle, 0,
+                self.b_norm2.handle, norm_off,
+                self.b_norm.handle, 0,
+                ph, slot * 16,
+                0, 0, 0, 0,
+                seq_len, 1, 1,
+            )
+            slot += 1
+
+            let _ = mps_gemm_f16_raw(
+                self.b_norm.handle, 0, d_model,
+                self.b_w_gate.handle, wff_in_off, d_model,
+                self.b_gate.handle, 0, d_ff,
+                seq_len, d_ff, d_model, false, true, 1.0, 0.0,
+            )
+            let _ = mps_gemm_f16_raw(
+                self.b_norm.handle, 0, d_model,
+                self.b_w_up.handle, wff_in_off, d_model,
+                self.b_up.handle, 0, d_ff,
+                seq_len, d_ff, d_model, false, true, 1.0, 0.0,
+            )
+
+            let _ = mps_write_params4(ph, slot, seq_len * d_ff, 0, 0, 0)
+            let _ = mps_dispatch6(
+                self.p_swiglu.handle,
+                self.b_gate.handle, 0,
+                self.b_up.handle, 0,
+                self.b_ffn.handle, 0,
+                ph, slot * 16,
+                0, 0, 0, 0,
+                seq_len * d_ff, 1, 1,
+            )
+            slot += 1
+
+            let _ = mps_gemm_f16_raw(
+                self.b_ffn.handle, 0, d_ff,
+                self.b_w_down.handle, wff_out_off, d_ff,
+                self.b_delta.handle, 0, d_model,
+                seq_len, d_model, d_ff, false, true, 1.0, 0.0,
+            )
+
+            let _ = mps_write_params4(ph, slot, seq_len * d_model, 0, 0, 0)
+            let _ = mps_dispatch6(
+                self.p_res_add.handle,
+                self.b_x.handle, 0,
+                self.b_delta.handle, 0,
+                ph, slot * 16,
+                0, 0, 0, 0, 0, 0,
+                seq_len * d_model, 1, 1,
+            )
+            slot += 1
+
+            layer += 1
+        }
+
+        // 2. Final RMSNorm + LM Head MPS FP16 GEMM (compute logits for all T tokens!)
+        let _ = mps_write_params4(ph, slot, seq_len, d_model, 0, 0)
+        let _ = mps_dispatch6(
+            self.p_rmsnorm.handle,
+            self.b_x.handle, 0,
+            self.b_final_norm.handle, 0,
+            self.b_norm.handle, 0,
+            ph, slot * 16,
+            0, 0, 0, 0,
+            seq_len, 1, 1,
+        )
+        let _ = mps_gemm_f16_raw(
+            self.b_norm.handle, 0, d_model,
+            self.b_lm_head.handle, 0, d_model,
+            self.b_logits.handle, 0, c.vocab_size,
+            seq_len, c.vocab_size, d_model, false, true, 1.0, 0.0,
+        )
+
+        // Submit the ENTIRE Transformer pass to Apple Silicon GPU in ONE command buffer!
+        let _ = batch.commit_and_wait()
+        self.kv_pos = kv_len
+
+        // Read back the last token's logits `[vocab_size]` (2B FP16)
+        let last_off = (seq_len - 1) * c.vocab_size * 2
+        var logits List[Float16] = list_filled(c.vocab_size, 0.0 as Float16)
+        let _ = mps_download_f16_at(self.b_logits.handle, last_off, logits)
+        logits
+    }
+
+    /// Consumes `@linear self` and deterministically frees EVERY Metal buffer & pipeline!
+    pub fn destroy(self) {
+        self.b_tok_emb.destroy()
+        self.b_norm1.destroy()
+        self.b_wq.destroy()
+        self.b_wk.destroy()
+        self.b_wv.destroy()
+        self.b_wo.destroy()
+        self.b_norm2.destroy()
+        self.b_w_gate.destroy()
+        self.b_w_up.destroy()
+        self.b_w_down.destroy()
+        self.b_final_norm.destroy()
+        self.b_lm_head.destroy()
+        self.b_k_cache.destroy()
+        self.b_v_cache.destroy()
+        self.b_tok_ids.destroy()
+        self.b_x.destroy()
+        self.b_norm.destroy()
+        self.b_q.destroy()
+        self.b_k.destroy()
+        self.b_v.destroy()
+        self.b_q_heads.destroy()
+        self.b_scores.destroy()
+        self.b_probs.destroy()
+        self.b_ctx_heads.destroy()
+        self.b_ctx_flat.destroy()
+        self.b_delta.destroy()
+        self.b_gate.destroy()
+        self.b_up.destroy()
+        self.b_ffn.destroy()
+        self.b_logits.destroy()
+        self.b_params.destroy()
+        self.p_embed.destroy()
+        self.p_rmsnorm.destroy()
+        self.p_rope.destroy()
+        self.p_to_heads.destroy()
+        self.p_kv_write.destroy()
+        self.p_mask.destroy()
+        self.p_from_heads.destroy()
+        self.p_swiglu.destroy()
+        self.p_res_add.destroy()
+    }
+}
+
+/// Greedy argmax over FP16 logits.
+pub pure fn argmax_f16(logits List[Float16]) Int {
+    if len(logits) == 0 { return 0 }
+    var best_i = 0
+    var best_v Float32 = logits[0] as Float32
+    var i = 1
+    while i < len(logits) {
+        let v Float32 = logits[i] as Float32
+        if v > best_v {
+            best_v = v
+            best_i = i
+        }
+        i += 1
+    }
+    best_i
+}
+
+// =========================================================================
+// 4. Exact CPU FP32 Ground-Truth Reference Transformer (Cross-Verification)
+// =========================================================================
+
+pure fn cpu_rmsnorm_row(x List[Float32], x_off Int, w List[Float16], w_off Int, d Int) List[Float32] {
+    var ss Float32 = 0.0 as Float32
+    var i = 0
+    while i < d {
+        let v = x[x_off + i]
+        ss = ss + v * v
+        i += 1
+    }
+    let inv = gpu_rsqrt(ss / (d as Float32) + (0.00001 as Float32))
+    var out List[Float32] = list_filled(d, 0.0 as Float32)
+    var j = 0
+    while j < d {
+        out[j] = x[x_off + j] * inv * (w[w_off + j] as Float32)
+        j += 1
+    }
+    out
+}
+
+pure fn cpu_matvec_t_f16(x List[Float32], w List[Float16], w_off Int, out_d Int, in_d Int) List[Float32] {
+    var out List[Float32] = list_filled(out_d, 0.0 as Float32)
+    var o = 0
+    while o < out_d {
+        var acc Float32 = 0.0 as Float32
+        let row_off = w_off + o * in_d
+        var k = 0
+        while k < in_d {
+            acc = acc + x[k] * (w[row_off + k] as Float32)
+            k += 1
+        }
+        out[o] = acc
+        o += 1
+    }
+    out
+}
+
+/// Exact CPU FP32 Llama-3 GQA Transformer reference (returns final-token FP32 logits `[vocab_size]`).
+pub pure fn cpu_transformer_forward_ref(w TransformerWeightsF16, tokens List[Int]) List[Float32] {
+    let c = w.cfg
+    let seq_len = len(tokens)
+    let d_model = c.d_model
+    let n_heads = c.n_heads
+    let n_kv = c.n_kv_heads
+    let d_head = c.d_head
+    let kv_dim = n_kv * d_head
+    let d_ff = c.d_ff
+    let group_size = n_heads / n_kv
+    let inv_sqrt_dh = (1.0 as Float32) / gpu_sqrt(d_head as Float32)
+
+    var x List[Float32] = list_filled(seq_len * d_model, 0.0 as Float32)
+    var t = 0
+    while t < seq_len {
+        let tok = tokens[t]
+        var d = 0
+        while d < d_model {
+            x[t * d_model + d] = w.tok_emb[tok * d_model + d] as Float32
+            d += 1
+        }
+        t += 1
+    }
+
+    var layer = 0
+    while layer < c.n_layers {
+        let norm_off = layer * d_model
+        let wq_off = layer * d_model * d_model
+        let wkv_off = layer * kv_dim * d_model
+        let wo_off = layer * d_model * d_model
+        let wff_in_off = layer * d_ff * d_model
+        let wff_out_off = layer * d_model * d_ff
+
+        var q_all List[Float32] = list_filled(seq_len * d_model, 0.0 as Float32)
+        var k_all List[Float32] = list_filled(seq_len * kv_dim, 0.0 as Float32)
+        var v_all List[Float32] = list_filled(seq_len * kv_dim, 0.0 as Float32)
+
+        var ti = 0
+        while ti < seq_len {
+            let xn = cpu_rmsnorm_row(x, ti * d_model, w.norm1_w, norm_off, d_model)
+            var qv = cpu_matvec_t_f16(xn, w.wq, wq_off, d_model, d_model)
+            var kv = cpu_matvec_t_f16(xn, w.wk, wkv_off, kv_dim, d_model)
+            let vv = cpu_matvec_t_f16(xn, w.wv, wkv_off, kv_dim, d_model)
+
+            // Apply RoPE to Q and K
+            var h = 0
+            while h < n_heads {
+                var p = 0
+                while p < d_head / 2 {
+                    let freq = (1.0 as Float32) / gpu_pow(10000.0 as Float32, ((2 * p) as Float32) / (d_head as Float32))
+                    let ang = (ti as Float32) * freq
+                    let cv = gpu_cos(ang)
+                    let sv = gpu_sin(ang)
+                    let idx0 = h * d_head + 2 * p
+                    let a0 = qv[idx0]
+                    let a1 = qv[idx0 + 1]
+                    qv[idx0] = a0 * cv - a1 * sv
+                    qv[idx0 + 1] = a0 * sv + a1 * cv
+                    p += 1
+                }
+                h += 1
+            }
+            var kh = 0
+            while kh < n_kv {
+                var p = 0
+                while p < d_head / 2 {
+                    let freq = (1.0 as Float32) / gpu_pow(10000.0 as Float32, ((2 * p) as Float32) / (d_head as Float32))
+                    let ang = (ti as Float32) * freq
+                    let cv = gpu_cos(ang)
+                    let sv = gpu_sin(ang)
+                    let idx0 = kh * d_head + 2 * p
+                    let a0 = kv[idx0]
+                    let a1 = kv[idx0 + 1]
+                    kv[idx0] = a0 * cv - a1 * sv
+                    kv[idx0 + 1] = a0 * sv + a1 * cv
+                    p += 1
+                }
+                kh += 1
+            }
+
+            var j = 0
+            while j < d_model { q_all[ti * d_model + j] = qv[j]; j += 1 }
+            var jk = 0
+            while jk < kv_dim {
+                k_all[ti * kv_dim + jk] = kv[jk]
+                v_all[ti * kv_dim + jk] = vv[jk]
+                jk += 1
+            }
+            ti += 1
+        }
+
+        // Causal GQA Attention + O-Projection + Residual + SwiGLU FFN + Residual
+        var t2 = 0
+        while t2 < seq_len {
+            var ctx List[Float32] = list_filled(d_model, 0.0 as Float32)
+            var h = 0
+            while h < n_heads {
+                let kv_h = h / group_size
+                let attn_len = t2 + 1
+                var sc List[Float32] = list_filled(attn_len, 0.0 as Float32)
+                var mx Float32 = (-1000000.0) as Float32
+                var s = 0
+                while s < attn_len {
+                    var dot Float32 = 0.0 as Float32
+                    var d = 0
+                    while d < d_head {
+                        dot = dot + q_all[t2 * d_model + h * d_head + d] * k_all[s * kv_dim + kv_h * d_head + d]
+                        d += 1
+                    }
+                    let val = dot * inv_sqrt_dh
+                    sc[s] = val
+                    if val > mx { mx = val }
+                    s += 1
+                }
+                var sum_e Float32 = 0.0 as Float32
+                var s2 = 0
+                while s2 < attn_len {
+                    let e = gpu_exp(sc[s2] - mx)
+                    sc[s2] = e
+                    sum_e = sum_e + e
+                    s2 += 1
+                }
+                var d2 = 0
+                while d2 < d_head {
+                    var acc Float32 = 0.0 as Float32
+                    var s3 = 0
+                    while s3 < attn_len {
+                        acc = acc + (sc[s3] / sum_e) * v_all[s3 * kv_dim + kv_h * d_head + d2]
+                        s3 += 1
+                    }
+                    ctx[h * d_head + d2] = acc
+                    d2 += 1
+                }
+                h += 1
+            }
+            let o_proj = cpu_matvec_t_f16(ctx, w.wo, wo_off, d_model, d_model)
+            var d3 = 0
+            while d3 < d_model {
+                x[t2 * d_model + d3] = x[t2 * d_model + d3] + o_proj[d3]
+                d3 += 1
+            }
+
+            // Pre-FFN RMSNorm + SwiGLU FFN + Residual
+            let hn = cpu_rmsnorm_row(x, t2 * d_model, w.norm2_w, norm_off, d_model)
+            let gate = cpu_matvec_t_f16(hn, w.w_gate, wff_in_off, d_ff, d_model)
+            let up = cpu_matvec_t_f16(hn, w.w_up, wff_in_off, d_ff, d_model)
+            var act List[Float32] = list_filled(d_ff, 0.0 as Float32)
+            var fi = 0
+            while fi < d_ff {
+                let g = gate[fi]
+                act[fi] = (g / ((1.0 as Float32) + gpu_exp(-g))) * up[fi]
+                fi += 1
+            }
+            let down = cpu_matvec_t_f16(act, w.w_down, wff_out_off, d_model, d_ff)
+            var d4 = 0
+            while d4 < d_model {
+                x[t2 * d_model + d4] = x[t2 * d_model + d4] + down[d4]
+                d4 += 1
+            }
+            t2 += 1
+        }
+        layer += 1
+    }
+
+    let last_norm = cpu_rmsnorm_row(x, (seq_len - 1) * d_model, w.final_norm_w, 0, d_model)
+    cpu_matvec_t_f16(last_norm, w.lm_head_w, 0, c.vocab_size, d_model)
+}

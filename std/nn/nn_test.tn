@@ -139,3 +139,33 @@ test fn test_transformer_block_self_attention_autograd() {
     }
     assert last_loss < first_loss * 0.4
 }
+
+test fn test_mixed_precision_fp16_amp_and_grad_scaler() {
+    let x List[Float] = [
+        -1.0, -1.0,
+        -1.0,  1.0,
+         1.0, -1.0,
+         1.0,  1.0,
+    ]
+    let y List[Int] = [0, 1, 1, 0]
+    var mp = MixedPrecisionLinear.new(2, 2, 31)
+    var st = LinearAdamState {
+        w_st = adamw_state_new(len(mp.master_w)),
+        b_st = adamw_state_new(len(mp.master_b)),
+    }
+    var scaler = GradScaler.new()
+    var step = 0
+    while step < 10 {
+        var tape = tape_new()
+        let x_id = tape_leaf(tape, 4, 2, x)
+        let ids = mp.forward_amp(tape, x_id)
+        let loss_id = tape_cross_entropy(tape, ids.out_id, y)
+        let scaled_loss = tape_scale(tape, loss_id, scaler.scale)
+        tape_backward(tape, scaled_loss)
+        let (next_scaler, ok) = scaler.unscale_and_step(mp, st, tape, ids, 0.05, 0.001)
+        scaler = next_scaler
+        assert ok
+        step += 1
+    }
+    assert len(mp.weight_f16) == 4 && scaler.scale >= 1024.0
+}

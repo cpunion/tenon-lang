@@ -34,6 +34,10 @@ pub struct GpuFusionPlan {
     pub first_kernel: String,
     pub second_kernel: String,
     pub eliminated_buffer: String,
+    #[serde(default)]
+    pub chain_kernels: Vec<String>,
+    #[serde(default)]
+    pub eliminated_buffers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,41 +331,62 @@ pub fn analyze_gpu_graph_fn(
         }
     }
 
-    // 1. Automatic Elementwise Kernel Fusion:
-    // If node `i` produces a transient single-use buffer `v` consumed immediately by elementwise node `j`
-    // and `i` is also elementwise, fuse `i` + `j` into a single GPU dispatch (eliminating VRAM round-trip)!
+    // 1. Automatic Multi-Stage Elementwise Kernel Fusion:
+    // Fuses arbitrary-length chains of elementwise kernels (`k0 -> k1 -> ... -> km`) where every
+    // intermediate buffer is single-use and non-escaping into ONE GPU kernel with zero intermediate VRAM!
     let mut fusions = Vec::new();
+    let mut visited_in_chain = vec![false; nodes.len()];
     for i in 0..nodes.len() {
-        if !nodes[i].is_elementwise || nodes[i].fused_into.is_some() {
+        if !nodes[i].is_elementwise || visited_in_chain[i] || nodes[i].fused_into.is_some() {
             continue;
         }
-        let Some(ref out_v) = nodes[i].output_var.clone() else {
-            continue;
-        };
-        if escaping_vars.contains(out_v) {
-            continue;
-        }
-        if use_count_of.get(out_v).copied().unwrap_or(0) != 1 {
-            continue;
-        }
-        if let Some(&consumer_id) = last_use_of.get(out_v) {
-            if consumer_id > i
-                && consumer_id < nodes.len()
-                && nodes[consumer_id].is_elementwise
-                && nodes[consumer_id].fused_into.is_none()
-            {
-                let fused_name = format!(
-                    "{}__fused__{}",
-                    nodes[i].kernel_name, nodes[consumer_id].kernel_name
-                );
-                fusions.push(GpuFusionPlan {
-                    fused_name,
-                    first_kernel: nodes[i].kernel_name.clone(),
-                    second_kernel: nodes[consumer_id].kernel_name.clone(),
-                    eliminated_buffer: out_v.clone(),
-                });
-                nodes[i].fused_into = Some(consumer_id);
+        let mut chain_ids = vec![i];
+        let mut elim_bufs = Vec::new();
+        let mut cur = i;
+        loop {
+            let Some(ref out_v) = nodes[cur].output_var.clone() else {
+                break;
+            };
+            if escaping_vars.contains(out_v) || use_count_of.get(out_v).copied().unwrap_or(0) != 1 {
+                break;
             }
+            let Some(&next_id) = last_use_of.get(out_v) else {
+                break;
+            };
+            if next_id > cur
+                && next_id < nodes.len()
+                && nodes[next_id].is_elementwise
+                && !visited_in_chain[next_id]
+                && nodes[next_id].fused_into.is_none()
+            {
+                elim_bufs.push(out_v.clone());
+                chain_ids.push(next_id);
+                cur = next_id;
+            } else {
+                break;
+            }
+        }
+        if chain_ids.len() >= 2 {
+            let tail_id = *chain_ids.last().unwrap();
+            for &cid in &chain_ids {
+                visited_in_chain[cid] = true;
+            }
+            for &cid in &chain_ids[..chain_ids.len() - 1] {
+                nodes[cid].fused_into = Some(tail_id);
+            }
+            let chain_kernels: Vec<String> = chain_ids
+                .iter()
+                .map(|&cid| nodes[cid].kernel_name.clone())
+                .collect();
+            let fused_name = chain_kernels.join("__fused__");
+            fusions.push(GpuFusionPlan {
+                fused_name,
+                first_kernel: chain_kernels[0].clone(),
+                second_kernel: chain_kernels[1].clone(),
+                eliminated_buffer: elim_bufs[0].clone(),
+                chain_kernels,
+                eliminated_buffers: elim_bufs,
+            });
         }
     }
 

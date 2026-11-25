@@ -163,3 +163,97 @@ pub pure fn transformer_adam_step(
     linear_adam_step(blk.ff1, st.ff1, tape, ids.ff1_ids, lr, weight_decay)
     linear_adam_step(blk.ff2, st.ff2, tape, ids.ff2_ids, lr, weight_decay)
 }
+
+/// Verified AMP Dynamic Loss Scaler (`torch.amp.GradScaler` equivalent):
+/// `scale: PosFloat` statically guarantees unscaling `grad / scale` can NEVER divide by zero or produce NaN!
+pub record GradScaler {
+    scale          PosFloat
+    growth_factor  PosFloat
+    backoff_factor PosFloat
+    growth_steps   Int
+    steps_since    Int
+}
+
+impl GradScaler {
+    pub pure fn new() GradScaler {
+        GradScaler {
+            scale = 1024.0,
+            growth_factor = 2.0,
+            backoff_factor = 0.5,
+            growth_steps = 8,
+            steps_since = 0,
+        }
+    }
+
+    /// Unscales gradients by `1 / self.scale` and checks finite overflow (`!is_finite(g)` -> backoff!).
+    /// Returns the updated `GradScaler` (with `PosFloat` statically re-proved on construction!) and `stepped` flag.
+    pub pure fn unscale_and_step(
+        self,
+        inout lin MixedPrecisionLinear,
+        inout st LinearAdamState,
+        tape AutogradTape,
+        ids LinearIds,
+        lr PosFloat,
+        weight_decay NonNegFloat,
+    ) (GradScaler, Bool) {
+        let raw_gw = tape_grad(tape, ids.w_id)
+        let raw_gb = tape_grad(tape, ids.b_id)
+        let cur_s PosFloat = if self.scale > 0.0 && is_finite(self.scale) { self.scale } else { 1024.0 }
+        let gf PosFloat = if self.growth_factor > 0.0 && is_finite(self.growth_factor) { self.growth_factor } else { 2.0 }
+        let bf PosFloat = if self.backoff_factor > 0.0 && is_finite(self.backoff_factor) { self.backoff_factor } else { 0.5 }
+        let inv = 1.0 / cur_s
+        var gw List[Float] = []
+        var overflow = false
+        var i = 0
+        while i < len(raw_gw) {
+            let v = raw_gw[i] * inv
+            if !is_finite(v) { overflow = true }
+            gw = push(gw, v)
+            i += 1
+        }
+        var gb List[Float] = []
+        var j = 0
+        while j < len(raw_gb) {
+            let v = raw_gb[j] * inv
+            if !is_finite(v) { overflow = true }
+            gb = push(gb, v)
+            j += 1
+        }
+        if overflow {
+            let next_s = cur_s * bf
+            let safe_s PosFloat = if next_s > 0.0 && is_finite(next_s) { next_s } else { cur_s }
+            let updated = GradScaler {
+                scale = safe_s,
+                growth_factor = gf,
+                backoff_factor = bf,
+                growth_steps = self.growth_steps,
+                steps_since = 0,
+            }
+            return (updated, false)
+        }
+        adamw_step(lin.master_w, gw, st.w_st, lr, 0.9, 0.999, 0.00000001, weight_decay)
+        adamw_step(lin.master_b, gb, st.b_st, lr, 0.9, 0.999, 0.00000001, 0.0)
+        lin.sync_f16()
+        let next_steps = self.steps_since + 1
+        if next_steps >= self.growth_steps {
+            let next_s = cur_s * gf
+            let safe_s PosFloat = if next_s > 0.0 && next_s < 65536.0 && is_finite(next_s) { next_s } else { cur_s }
+            let updated = GradScaler {
+                scale = safe_s,
+                growth_factor = gf,
+                backoff_factor = bf,
+                growth_steps = self.growth_steps,
+                steps_since = 0,
+            }
+            return (updated, true)
+        }
+        let updated = GradScaler {
+            scale = cur_s,
+            growth_factor = gf,
+            backoff_factor = bf,
+            growth_steps = self.growth_steps,
+            steps_since = next_steps,
+        }
+        (updated, true)
+    }
+}

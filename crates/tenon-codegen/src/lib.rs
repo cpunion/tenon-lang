@@ -136,6 +136,14 @@ pub(crate) const CORE_SYSCALLS: &[CoreSyscallSpec] = &[
     CoreSyscallSpec { tenon_name: "gpu_group_id_y", c_symbol: "tenon_gpu_wgid_y", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     CoreSyscallSpec { tenon_name: "gpu_barrier", c_symbol: "tenon_gpu_barrier", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     CoreSyscallSpec { tenon_name: "gpu_shared_f32", c_symbol: "tenon_gpu_shared_f32", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "List[Float32]" },
+    CoreSyscallSpec { tenon_name: "gpu_shared_f16", c_symbol: "tenon_gpu_shared_f16", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "List[Float16]" },
+    CoreSyscallSpec { tenon_name: "gpu_exp", c_symbol: "tenon_gpu_exp", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
+    CoreSyscallSpec { tenon_name: "gpu_sqrt", c_symbol: "tenon_gpu_sqrt", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
+    CoreSyscallSpec { tenon_name: "gpu_rsqrt", c_symbol: "tenon_gpu_rsqrt", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
+    CoreSyscallSpec { tenon_name: "gpu_cos", c_symbol: "tenon_gpu_cos", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
+    CoreSyscallSpec { tenon_name: "gpu_sin", c_symbol: "tenon_gpu_sin", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
+    CoreSyscallSpec { tenon_name: "gpu_pow", c_symbol: "tenon_gpu_pow", arity: 2, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
+    CoreSyscallSpec { tenon_name: "gpu_tanh", c_symbol: "tenon_gpu_tanh", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float32" },
     CoreSyscallSpec { tenon_name: "text_cstr_ptr", c_symbol: "tenon_text_cstr_ptr", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "CStr" },
     CoreSyscallSpec { tenon_name: "cstr_to_text", c_symbol: "tenon_cstr_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
     // 6. S2 Raw memory ops
@@ -500,6 +508,14 @@ impl JitProgram {
         jit_builder.symbol("tenon_gpu_wgid_y", systems::tenon_gpu_wgid_y as *const u8);
         jit_builder.symbol("tenon_gpu_barrier", systems::tenon_gpu_barrier as *const u8);
         jit_builder.symbol("tenon_gpu_shared_f32", systems::tenon_gpu_shared_f32 as *const u8);
+        jit_builder.symbol("tenon_gpu_shared_f16", systems::tenon_gpu_shared_f16 as *const u8);
+        jit_builder.symbol("tenon_gpu_exp", systems::tenon_gpu_exp as *const u8);
+        jit_builder.symbol("tenon_gpu_sqrt", systems::tenon_gpu_sqrt as *const u8);
+        jit_builder.symbol("tenon_gpu_rsqrt", systems::tenon_gpu_rsqrt as *const u8);
+        jit_builder.symbol("tenon_gpu_cos", systems::tenon_gpu_cos as *const u8);
+        jit_builder.symbol("tenon_gpu_sin", systems::tenon_gpu_sin as *const u8);
+        jit_builder.symbol("tenon_gpu_pow", systems::tenon_gpu_pow as *const u8);
+        jit_builder.symbol("tenon_gpu_tanh", systems::tenon_gpu_tanh as *const u8);
         jit_builder.symbol("tenon_text_cstr_ptr", systems::tenon_text_cstr_ptr as *const u8);
         jit_builder.symbol("tenon_cstr_to_text", systems::tenon_cstr_to_text as *const u8);
         jit_builder.symbol("tenon_cstruct_alloc", systems::tenon_cstruct_alloc as *const u8);
