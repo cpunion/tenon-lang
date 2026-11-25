@@ -38,6 +38,15 @@ res["mxu_4096_ms"] = ms_mm
 res["mxu_4096_tflops"] = (2.0 * 4096**3 / (ms_mm / 1e3)) / 1e12
 del a, b
 
+# 1B. MXU INT8 4096^3 (394 TOPS ceiling!)
+a8 = jnp.zeros((4096, 4096), dtype=jnp.int8)
+b8 = jnp.zeros((4096, 4096), dtype=jnp.int8)
+i8_jit = jax.jit(lambda x, y: jnp.matmul(x, y, preferred_element_type=jnp.int32))
+ms_i8 = bench(i8_jit, (a8, b8), warmup=5, iters=50)
+res["mxu_int8_ms"] = ms_i8
+res["mxu_int8_tops"] = (2.0 * 4096**3 / (ms_i8 / 1e3)) / 1e12
+del a8, b8
+
 # 2. HBM BF16 GEMV 1x16384x16384
 x = jnp.zeros((1, 16384), dtype=jnp.bfloat16)
 w = jnp.zeros((16384, 16384), dtype=jnp.bfloat16)
@@ -53,34 +62,26 @@ w8_jit = jax.jit(lambda x, wq, sc: (jnp.matmul(x, wq.astype(jnp.bfloat16), prefe
 ms_w8 = bench(w8_jit, (x, wq, sc), warmup=5, iters=50)
 res["hbm_w8_ms"] = ms_w8
 res["hbm_w8_gbs"] = ((16384*16384*1.0) / 1e9) / (ms_w8 / 1e3)
-# 3B. HBM W4A16 Packed INT4 GEMV 1x16384x16384
-wq4 = jnp.zeros((16384, 8192), dtype=jnp.int8)
+# 3B. HBM W4A16 Native Hardware INT4 (`jnp.int4`) GEMV 1x16384x16384
+wq4 = jnp.zeros((16384, 16384), dtype=jnp.int4)
 sc4 = jnp.ones((16384,), dtype=jnp.bfloat16) * jnp.bfloat16(0.01)
-def unpack_w4(wp):
-    lo = jax.lax.shift_right_arithmetic(jax.lax.shift_left(wp, jnp.int8(4)), jnp.int8(4)).astype(jnp.bfloat16)
-    hi = jax.lax.shift_right_arithmetic(wp, jnp.int8(4)).astype(jnp.bfloat16)
-    return jnp.concatenate([lo, hi], axis=-1)
-w4_jit = jax.jit(lambda x, wq, sc: (jnp.matmul(x, unpack_w4(wq), preferred_element_type=jnp.float32) * sc.astype(jnp.float32)).astype(jnp.bfloat16))
+w4_jit = jax.jit(lambda x, wq, sc: (jnp.matmul(x, wq.astype(jnp.bfloat16), preferred_element_type=jnp.float32) * sc.astype(jnp.float32)).astype(jnp.bfloat16))
 ms_w4 = bench(w4_jit, (x, wq4, sc4), warmup=5, iters=50)
 res["hbm_w4_ms"] = ms_w4
-res["hbm_w4_gbs"] = ((16384*8192*1.0) / 1e9) / (ms_w4 / 1e3)
+res["hbm_w4_gbs"] = ((16384*16384*0.5) / 1e9) / (ms_w4 / 1e3)
 del x, wq, sc, wq4, sc4
 
-# 4. Statically-Unrolled + Horizontally-Fused 16-Layer Llama-3.2-1B (BF16 / W8A16 / W4A16 — exact match to Tenon!)
+# 4. Statically-Unrolled + Horizontally-Fused 16-Layer Llama-3.2-1B (BF16 / W8A16 / Native INT4 W4A16 — exact match to Tenon!)
 def run_llama16(seq, qbits, iters):
     L, D, F = 16, 2048, 8192
-    wdtype = jnp.bfloat16 if qbits == 16 else jnp.int8
-    qkv_c = (3 * D) // 2 if qbits == 4 else 3 * D
-    wo_c = D // 2 if qbits == 4 else D
-    gu_c = F if qbits == 4 else 2 * F
-    wd_c = D // 2 if qbits == 4 else D
+    wdtype = jnp.bfloat16 if qbits == 16 else (jnp.int8 if qbits == 8 else jnp.int4)
     x0 = jnp.zeros((seq, D), dtype=jnp.bfloat16)
     n1 = jnp.ones((L, D), dtype=jnp.bfloat16)
     n2 = jnp.ones((L, D), dtype=jnp.bfloat16)
-    wqkv = jnp.zeros((L, D, qkv_c), dtype=wdtype)
-    wo = jnp.zeros((L, D, wo_c), dtype=wdtype)
-    wgu = jnp.zeros((L, D, gu_c), dtype=wdtype)
-    wd = jnp.zeros((L, F, wd_c), dtype=wdtype)
+    wqkv = jnp.zeros((L, D, 3 * D), dtype=wdtype)
+    wo = jnp.zeros((L, D, D), dtype=wdtype)
+    wgu = jnp.zeros((L, D, 2 * F), dtype=wdtype)
+    wd = jnp.zeros((L, F, D), dtype=wdtype)
     inv_sqrt_d = jnp.float32(1.0 / (D ** 0.5))
 
     def rmsnorm(x_f32, nw):
@@ -88,9 +89,7 @@ def run_llama16(seq, qbits, iters):
         return (x_f32 * jax.lax.rsqrt(ss + 1e-5) * nw.astype(jnp.float32)).astype(jnp.bfloat16)
 
     def deq(w):
-        if qbits == 4: return unpack_w4(w)
-        if qbits == 8: return w.astype(jnp.bfloat16)
-        return w
+        return w if qbits == 16 else w.astype(jnp.bfloat16)
 
     @jax.jit
     def fwd(x, n1, wqkv, wo, n2, wgu, wd):
@@ -114,6 +113,7 @@ def run_llama16(seq, qbits, iters):
 
 for tag, seq, qbits, iters in [
     ("prefill_s512_bf16", 512, 16, 15),
+    ("decode_b128_w4", 128, 4, 20),
     ("decode_b32_bf16", 32, 16, 20),
     ("decode_b32_w8", 32, 8, 20),
     ("decode_b32_w4", 32, 4, 20),
@@ -297,6 +297,9 @@ def parse_tenon_output(stdout):
         m = re.search(r"TPU_MXU_BF16 4096x4096x4096 ms=([0-9.]+) TFLOPS=([0-9.]+)", line)
         if m:
             res["mxu_4096_ms"], res["mxu_4096_tflops"] = float(m.group(1)), float(m.group(2))
+        m = re.search(r"TPU_MXU_INT8 4096x4096x4096 ms=([0-9.]+) TOPS=([0-9.]+)", line)
+        if m:
+            res["mxu_int8_ms"], res["mxu_int8_tops"] = float(m.group(1)), float(m.group(2))
         m = re.search(r"TPU_MXU_BF16 1x16384x16384 ms=([0-9.]+).*eff_GBs=([0-9.]+)", line)
         if m:
             res["hbm_bf16_ms"], res["hbm_bf16_gbs"] = float(m.group(1)), float(m.group(2))
@@ -311,6 +314,7 @@ def parse_tenon_output(stdout):
             res["decl_ffn_ms"], res["decl_ffn_gbs"] = float(m.group(1)), float(m.group(2))
         for tag, pat in [
             ("prefill_s512_bf16", "Llama3.2_1B_Prefill_S512_BF16"),
+            ("decode_b128_w4", "Llama3.2_1B_Decode_B128_W4A16"),
             ("decode_b32_bf16", "Llama3.2_1B_Decode_B32_BF16"),
             ("decode_b32_w8", "Llama3.2_1B_Decode_B32_W8A16"),
             ("decode_b32_w4", "Llama3.2_1B_Decode_B32_W4A16"),
@@ -353,8 +357,8 @@ def main():
     print("PT_XLA:", r_pt)
 
     rows = [r_tenon, r_jax, r_tf, r_pt]
-    print("\n================ SAME-MACHINE TPU v5e-1 HEAD-TO-HEAD (Silicon Ceiling: 197 TFLOPS / 819 GB/s) ================")
-    hdr = f"{'Framework':<28} | {'MXU 4096^3':<16} | {'HBM BF16':<14} | {'HBM W4':<14} | {'1B S=512':<11} | {'B=32 BF16':<10} | {'B=32 W8':<10} | {'B=32 W4':<10} | {'B=1 BF16':<9} | {'B=1 W8':<9} | {'B=1 W4':<9}"
+    print("\n================ SAME-MACHINE TPU v5e-1 HEAD-TO-HEAD (Silicon Ceiling: 197T BF16 / 394T INT8 / 819 GB/s) ================")
+    hdr = f"{'Framework':<28} | {'MXU BF16':<14} | {'MXU INT8':<14} | {'HBM BF16':<14} | {'1B S=512':<10} | {'B=128 W4':<10} | {'B=32 W8':<9} | {'B=32 W4':<9} | {'B=1 BF16':<8} | {'B=1 W8':<8} | {'B=1 W4':<8}"
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
@@ -363,16 +367,16 @@ def main():
             continue
         print(
             f"{r['framework']:<28} | "
-            f"{fmt(r.get('mxu_4096_tflops'), 'T', TPU_PEAK_TFLOPS):<16} | "
+            f"{fmt(r.get('mxu_4096_tflops'), 'T', TPU_PEAK_TFLOPS):<14} | "
+            f"{fmt(r.get('mxu_int8_tops'), 'T', 394.0):<14} | "
             f"{fmt(r.get('hbm_bf16_gbs'), '', TPU_PEAK_GBS):<14} | "
-            f"{fmt(r.get('hbm_w4_gbs'), '', TPU_PEAK_GBS):<14} | "
-            f"{fmt(r.get('prefill_s512_bf16_toks')):<11} | "
-            f"{fmt(r.get('decode_b32_bf16_toks')):<10} | "
-            f"{fmt(r.get('decode_b32_w8_toks')):<10} | "
-            f"{fmt(r.get('decode_b32_w4_toks')):<10} | "
-            f"{fmt(r.get('decode_b1_bf16_toks')):<9} | "
-            f"{fmt(r.get('decode_b1_w8_toks')):<9} | "
-            f"{fmt(r.get('decode_b1_w4_toks')):<9}"
+            f"{fmt(r.get('prefill_s512_bf16_toks')):<10} | "
+            f"{fmt(r.get('decode_b128_w4_toks')):<10} | "
+            f"{fmt(r.get('decode_b32_w8_toks')):<9} | "
+            f"{fmt(r.get('decode_b32_w4_toks')):<9} | "
+            f"{fmt(r.get('decode_b1_bf16_toks')):<8} | "
+            f"{fmt(r.get('decode_b1_w8_toks')):<8} | "
+            f"{fmt(r.get('decode_b1_w4_toks')):<8}"
         )
 
 if __name__ == "__main__":

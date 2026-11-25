@@ -45,24 +45,30 @@ pub fn shlo_w8a16_matmul(m Int, k Int, n Int) Text {
     ++ "}\n"
 }
 
-/// Emits a StableHLO MLIR module for TPU INT4 Packed Weight-Only Quantized GEMV (W4A16):
-/// Weight tensor `%wq: tensor<K x (N/2) x i8>` packs TWO signed 4-bit weights per byte (4x less HBM than BF16!):
-/// low nibble bits [0..3] -> cols [0..N/2), high nibble bits [4..7] -> cols [N/2..N).
-/// XLA fuses the VPU arithmetic nibble sign-extension + BF16 cast directly into the MXU stream!
+/// Emits a StableHLO MLIR module for TPU INT8 MXU Systolic Array Matmul (`C[M, N] = A_i8[M, K] @ B_i8[K, N] -> i32`)
+/// — taps TPU v5e-1's 394 TOPS INT8 MXU (2x the 197 TFLOPS BF16 MXU ceiling!).
+pub fn shlo_int8_matmul(m Int, k Int, n Int) Text {
+    let ms = int_to_text(m)
+    let ks = int_to_text(k)
+    let ns = int_to_text(n)
+    "module @tenon_tpu_int8_mm {\n"
+    ++ "  func.func public @main(%a: tensor<" ++ ms ++ "x" ++ ks ++ "xi8>, %b: tensor<" ++ ks ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xi32> {\n"
+    ++ "    %acc = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<" ++ ms ++ "x" ++ ks ++ "xi8>, tensor<" ++ ks ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xi32>\n"
+    ++ "    return %acc : tensor<" ++ ms ++ "x" ++ ns ++ "xi32>\n"
+    ++ "  }\n"
+    ++ "}\n"
+}
+
+/// Emits a StableHLO MLIR module for TPU Native Sub-Byte `i4` (S4) Weight-Only Quantized GEMV (W4A16):
+/// Weight tensor `%wq: tensor<K x N x i4>` is stored natively 4-bit packed in TPU HBM (`PJRT_Buffer_Type_S4`, 4x less HBM!).
+/// XLA lowers `stablehlo.convert i4 -> bf16` directly into hardware TPU v5e sub-byte DMA + VPU unpack fused into MXU!
 pub fn shlo_w4a16_matmul(m Int, k Int, n Int) Text {
     let ms = int_to_text(m)
     let ks = int_to_text(k)
     let ns = int_to_text(n)
-    let nhs = int_to_text(n / 2)
     "module @tenon_tpu_w4a16 {\n"
-    ++ "  func.func public @main(%x: tensor<" ++ ms ++ "x" ++ ks ++ "xbf16>, %wq: tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>, %sc: tensor<" ++ ns ++ "xbf16>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xbf16> {\n"
-    ++ "    %c4 = stablehlo.constant dense<4> : tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>\n"
-    ++ "    %shl = stablehlo.shift_left %wq, %c4 : tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>\n"
-    ++ "    %lo_i8 = stablehlo.shift_right_arithmetic %shl, %c4 : tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>\n"
-    ++ "    %hi_i8 = stablehlo.shift_right_arithmetic %wq, %c4 : tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>\n"
-    ++ "    %lo_bf = stablehlo.convert %lo_i8 : (tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>) -> tensor<" ++ ks ++ "x" ++ nhs ++ "xbf16>\n"
-    ++ "    %hi_bf = stablehlo.convert %hi_i8 : (tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>) -> tensor<" ++ ks ++ "x" ++ nhs ++ "xbf16>\n"
-    ++ "    %wf = stablehlo.concatenate %lo_bf, %hi_bf, dim = 1 : (tensor<" ++ ks ++ "x" ++ nhs ++ "xbf16>, tensor<" ++ ks ++ "x" ++ nhs ++ "xbf16>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>\n"
+    ++ "  func.func public @main(%x: tensor<" ++ ms ++ "x" ++ ks ++ "xbf16>, %wq: tensor<" ++ ks ++ "x" ++ ns ++ "xi4>, %sc: tensor<" ++ ns ++ "xbf16>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xbf16> {\n"
+    ++ "    %wf = stablehlo.convert %wq : (tensor<" ++ ks ++ "x" ++ ns ++ "xi4>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>\n"
     ++ "    %acc = stablehlo.dot_general %x, %wf, contracting_dims = [1] x [0] : (tensor<" ++ ms ++ "x" ++ ks ++ "xbf16>, tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xf32>\n"
     ++ "    %scf = stablehlo.convert %sc : (tensor<" ++ ns ++ "xbf16>) -> tensor<" ++ ns ++ "xf32>\n"
     ++ "    %scb = stablehlo.broadcast_in_dim %scf, dims = [1] : (tensor<" ++ ns ++ "xf32>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xf32>\n"
@@ -77,14 +83,7 @@ fn shlo_emit_unpack_2d(pfx Text, src Text, k Int, n Int, quant_bits Int, out_var
     let ks = int_to_text(k)
     let ns = int_to_text(n)
     if quant_bits == 4 {
-        let nhs = int_to_text(n / 2)
-        "    %" ++ pfx ++ "_c4 = stablehlo.constant dense<4> : tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>\n"
-        ++ "    %" ++ pfx ++ "_shl = stablehlo.shift_left " ++ src ++ ", %" ++ pfx ++ "_c4 : tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>\n"
-        ++ "    %" ++ pfx ++ "_lo = stablehlo.shift_right_arithmetic %" ++ pfx ++ "_shl, %" ++ pfx ++ "_c4 : tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>\n"
-        ++ "    %" ++ pfx ++ "_hi = stablehlo.shift_right_arithmetic " ++ src ++ ", %" ++ pfx ++ "_c4 : tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>\n"
-        ++ "    %" ++ pfx ++ "_lob = stablehlo.convert %" ++ pfx ++ "_lo : (tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>) -> tensor<" ++ ks ++ "x" ++ nhs ++ "xbf16>\n"
-        ++ "    %" ++ pfx ++ "_hib = stablehlo.convert %" ++ pfx ++ "_hi : (tensor<" ++ ks ++ "x" ++ nhs ++ "xi8>) -> tensor<" ++ ks ++ "x" ++ nhs ++ "xbf16>\n"
-        ++ "    " ++ out_var ++ " = stablehlo.concatenate %" ++ pfx ++ "_lob, %" ++ pfx ++ "_hib, dim = 1 : (tensor<" ++ ks ++ "x" ++ nhs ++ "xbf16>, tensor<" ++ ks ++ "x" ++ nhs ++ "xbf16>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>\n"
+        "    " ++ out_var ++ " = stablehlo.convert " ++ src ++ " : (tensor<" ++ ks ++ "x" ++ ns ++ "xi4>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>\n"
     } else if quant_bits == 8 {
         "    " ++ out_var ++ " = stablehlo.convert " ++ src ++ " : (tensor<" ++ ks ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>\n"
     } else {
@@ -95,7 +94,7 @@ fn shlo_emit_unpack_2d(pfx Text, src Text, k Int, n Int, quant_bits Int, out_var
 /// Roofline-Optimal Statically-Unrolled + Horizontally-Fused All-N-Layer Llama-3 StableHLO Pipeline!
 ///   - Horizontally fuses `W_qkv [L, D, 3D]` (1 MXU dot -> VMEM slice Q,K,V) & `W_gate_up [L, D, 2F]` (1 MXU dot -> SwiGLU)!
 ///   - Statically unrolls all `n_layers` with static `stablehlo.slice` (ZERO `while` loop barrier -> full XLA HBM DMA prefetch overlap!)
-///   - Supports BF16 (`quant_bits=16`), W8A16 (`quant_bits=8`, 2x less HBM), and W4A16 packed nibbles (`quant_bits=4`, 4x less HBM!)
+///   - Supports BF16 (`quant_bits=16`), W8A16 (`quant_bits=8`, 2x less HBM), and Native Hardware `i4` W4A16 (`quant_bits=4`, 4x less HBM!)
 pub fn shlo_llama3_fused_unrolled(
     n_layers Int where self > 0,
     seq Int where self > 0,
@@ -110,11 +109,11 @@ pub fn shlo_llama3_fused_unrolled(
     let d3s = int_to_text(d * 3)
     let fs = int_to_text(dff)
     let f2s = int_to_text(dff * 2)
-    let wt = if quant_bits == 16 { "bf16" } else { "i8" }
-    let qkv_c = if quant_bits == 4 { (d * 3) / 2 } else { d * 3 }
-    let wo_c = if quant_bits == 4 { d / 2 } else { d }
-    let gu_c = if quant_bits == 4 { dff } else { dff * 2 }
-    let wd_c = if quant_bits == 4 { d / 2 } else { d }
+    let wt = if quant_bits == 16 { "bf16" } else if quant_bits == 8 { "i8" } else { "i4" }
+    let qkv_c = d * 3
+    let wo_c = d
+    let gu_c = dff * 2
+    let wd_c = d
     let qkv_cs = int_to_text(qkv_c)
     let wo_cs = int_to_text(wo_c)
     let gu_cs = int_to_text(gu_c)

@@ -406,7 +406,42 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    }\n"
 "}\n"
 "\n"
-"/* 3A. Zero-SMEM 128-bit `float4` FP16 GEMV (936 GB/s = 92.8% RTX 4090 peak!) */\n"
+"/* 3A. Zero-SMEM 128-bit `float4` FP16 GEMV — 4w1r (high SM occupancy for od<=4096) & 4w2r (2x x-reuse for od>4096) */\n"
+"extern \"C\" __global__ void cuda_gemv_f16_1r(\n"
+"    const half* __restrict__ x,\n"
+"    const half* __restrict__ w,\n"
+"    half* __restrict__ y,\n"
+"    const half* __restrict__ bias,\n"
+"    uint32_t out_dim, uint32_t in_dim, uint32_t add_res, uint32_t has_bias\n"
+") {\n"
+"    uint32_t wid = threadIdx.x >> 5;\n"
+"    uint32_t lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4 + wid;\n"
+"    if (row >= out_dim) return;\n"
+"    uint32_t k8 = in_dim >> 3;\n"
+"    const float4* x8 = (const float4*)x;\n"
+"    const float4* w0 = (const float4*)(w + (size_t)row * in_dim);\n"
+"    float s0 = 0.0f;\n"
+"    for (uint32_t i = lane; i < k8; i += 32u) {\n"
+"        float4 xv = __ldg(&x8[i]);\n"
+"        float4 a0 = __ldg(&w0[i]);\n"
+"        const half2* xh = (const half2*)&xv;\n"
+"        const half2* h0 = (const half2*)&a0;\n"
+"        #pragma unroll\n"
+"        for (int g = 0; g < 4; g++) {\n"
+"            float2 xf = __half22float2(xh[g]);\n"
+"            float2 f0 = __half22float2(h0[g]);\n"
+"            s0 = fmaf(xf.x, f0.x, fmaf(xf.y, f0.y, s0));\n"
+"        }\n"
+"    }\n"
+"    s0 = warp_sum(s0);\n"
+"    if (lane == 0) {\n"
+"        if (has_bias) s0 += __half2float(bias[row]);\n"
+"        if (add_res)  s0 += __half2float(y[row]);\n"
+"        y[row] = __float2half(s0);\n"
+"    }\n"
+"}\n"
+"\n"
 "extern \"C\" __global__ void cuda_gemv_f16(\n"
 "    const half* __restrict__ x,\n"
 "    const half* __restrict__ w,\n"
@@ -499,7 +534,7 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    }\n"
 "}\n"
 "\n"
-"/* 4A. Zero-SMEM L2-Q8_1 + 128-bit `uint4` SB8 `__dp4a` Q8_0 GEMV (for huge vocab / raw 8192x8192!) */\n"
+"/* 4A. Zero-SMEM L2-Q8_1 + 128-bit `uint4` SB8 `__dp4a` 4w1r Q8_0 GEMV (4 rows/CTA -> max SM occupancy!) */\n"
 "extern \"C\" __global__ void cuda_gemv_q8_0(\n"
 "    const uint8_t* __restrict__ q8_in,\n"
 "    const uint8_t* __restrict__ w,\n"
@@ -509,33 +544,53 @@ static const char* TENON_CUDA_ULTRA_SRC =
 ") {\n"
 "    uint32_t wid = threadIdx.x >> 5;\n"
 "    uint32_t lane = threadIdx.x & 31u;\n"
-"    uint32_t row0 = (blockIdx.x * 4 + wid) * 2;\n"
-"    if (row0 >= out_dim) return;\n"
-"    uint32_t row1 = (row0 + 1 < out_dim) ? (row0 + 1) : row0;\n"
+"    uint32_t row = blockIdx.x * 4 + wid;\n"
+"    if (row >= out_dim) return;\n"
 "    uint32_t nb = in_dim >> 5;\n"
 "    const int4* sxq4 = (const int4*)q8_in;\n"
 "    const float* sdx = (const float*)((const int32_t*)q8_in + (nb << 3));\n"
-"    size_t b0 = (size_t)row0 * nb;\n"
-"    size_t b1 = (size_t)row1 * nb;\n"
-"    float s0 = 0.0f, s1 = 0.0f;\n"
+"    size_t b0 = (size_t)row * nb;\n"
+"    float s0 = 0.0f;\n"
 "    for (uint32_t b = lane; b < nb; b += 32u) {\n"
 "        int4 xqa = __ldg(&sxq4[(b << 1) + 0]);\n"
 "        int4 xqb = __ldg(&sxq4[(b << 1) + 1]);\n"
 "        float dx = __ldg(&sdx[b]);\n"
 "        s0 += q8_sb8_dot_dp4a(w, b0 + b, xqa, xqb, dx);\n"
-"        s1 += q8_sb8_dot_dp4a(w, b1 + b, xqa, xqb, dx);\n"
 "    }\n"
-"    s0 = warp_sum(s0); s1 = warp_sum(s1);\n"
+"    s0 = warp_sum(s0);\n"
 "    if (lane == 0) {\n"
-"        if (has_bias) s0 += __half2float(bias[row0]);\n"
-"        if (add_res)  s0 += __half2float(y[row0]);\n"
-"        y[row0] = __float2half(s0);\n"
-"        if (row0 + 1 < out_dim) {\n"
-"            if (has_bias) s1 += __half2float(bias[row0 + 1]);\n"
-"            if (add_res)  s1 += __half2float(y[row0 + 1]);\n"
-"            y[row0 + 1] = __float2half(s1);\n"
-"        }\n"
+"        if (has_bias) s0 += __half2float(bias[row]);\n"
+"        if (add_res)  s0 += __half2float(y[row]);\n"
+"        y[row] = __float2half(s0);\n"
 "    }\n"
+"}\n"
+"\n"
+"/* 4A2. Zero-SMEM L2-Q8_1 + 128-bit `uint4` SB8 `__dp4a` 4w1r Fused Gate+Up+SwiGLU/GeGLU Q8_0 */\n"
+"extern \"C\" __global__ void cuda_ffn_q8_0(\n"
+"    const uint8_t* __restrict__ q8_in,\n"
+"    const uint8_t* __restrict__ wg,\n"
+"    const uint8_t* __restrict__ wu,\n"
+"    half* __restrict__ out,\n"
+"    uint32_t d_ff, uint32_t in_dim, uint32_t is_geglu\n"
+") {\n"
+"    uint32_t wid = threadIdx.x >> 5;\n"
+"    uint32_t lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4 + wid;\n"
+"    if (row >= d_ff) return;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    const int4* sxq4 = (const int4*)q8_in;\n"
+"    const float* sdx = (const float*)((const int32_t*)q8_in + (nb << 3));\n"
+"    size_t b0 = (size_t)row * nb;\n"
+"    float sg = 0.0f, su = 0.0f;\n"
+"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"        int4 xqa = __ldg(&sxq4[(b << 1) + 0]);\n"
+"        int4 xqb = __ldg(&sxq4[(b << 1) + 1]);\n"
+"        float dx = __ldg(&sdx[b]);\n"
+"        sg += q8_sb8_dot_dp4a(wg, b0 + b, xqa, xqb, dx);\n"
+"        su += q8_sb8_dot_dp4a(wu, b0 + b, xqa, xqb, dx);\n"
+"    }\n"
+"    sg = warp_sum(sg); su = warp_sum(su);\n"
+"    if (lane == 0) out[row] = __float2half(apply_gated_act(sg, su, is_geglu));\n"
 "}\n"
 "\n"
 "/* 4B. 8-Warp (256 thr, 16 rows/CTA) In-CTA SMEM Q8_1 + 128-bit `uint4` SB8 `__dp4a` Q8_0 GEMV (ZERO extra GPU drain!) */\n"
@@ -580,7 +635,7 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    }\n"
 "}\n"
 "\n"
-"/* 5A. Zero-SMEM L2-Q8_1 + 128-bit `uint4` SB8 `__dp4a` Q4_0 GEMV (for huge vocab / raw 8192x8192!) */\n"
+"/* 5A. Zero-SMEM L2-Q8_1 + 128-bit `uint4` SB8 `__dp4a` 4w1r Q4_0 GEMV (4 rows/CTA -> 880-931 GB/s!) */\n"
 "extern \"C\" __global__ void cuda_gemv_q4_0(\n"
 "    const uint8_t* __restrict__ q8_in,\n"
 "    const uint8_t* __restrict__ w,\n"
@@ -590,35 +645,57 @@ static const char* TENON_CUDA_ULTRA_SRC =
 ") {\n"
 "    uint32_t wid = threadIdx.x >> 5;\n"
 "    uint32_t lane = threadIdx.x & 31u;\n"
-"    uint32_t row0 = (blockIdx.x * 4 + wid) * 2;\n"
-"    if (row0 >= out_dim) return;\n"
-"    uint32_t row1 = (row0 + 1 < out_dim) ? (row0 + 1) : row0;\n"
+"    uint32_t row = blockIdx.x * 4 + wid;\n"
+"    if (row >= out_dim) return;\n"
 "    uint32_t nb = in_dim >> 5;\n"
 "    const int4* sxq4 = (const int4*)q8_in;\n"
 "    const float* sdx = (const float*)((const int32_t*)q8_in + (nb << 3));\n"
 "    const int32_t* sxsum = (const int32_t*)(sdx + nb);\n"
-"    size_t b0 = (size_t)row0 * nb;\n"
-"    size_t b1 = (size_t)row1 * nb;\n"
-"    float s0 = 0.0f, s1 = 0.0f;\n"
+"    size_t b0 = (size_t)row * nb;\n"
+"    float s0 = 0.0f;\n"
 "    for (uint32_t b = lane; b < nb; b += 32u) {\n"
 "        int4 xqa = __ldg(&sxq4[(b << 1) + 0]);\n"
 "        int4 xqb = __ldg(&sxq4[(b << 1) + 1]);\n"
 "        float dx = __ldg(&sdx[b]);\n"
 "        int32_t xs = __ldg(&sxsum[b]);\n"
 "        s0 += q4_sb8_dot_dp4a(w, b0 + b, xqa, xqb, dx, xs);\n"
-"        s1 += q4_sb8_dot_dp4a(w, b1 + b, xqa, xqb, dx, xs);\n"
 "    }\n"
-"    s0 = warp_sum(s0); s1 = warp_sum(s1);\n"
+"    s0 = warp_sum(s0);\n"
 "    if (lane == 0) {\n"
-"        if (has_bias) s0 += __half2float(bias[row0]);\n"
-"        if (add_res)  s0 += __half2float(y[row0]);\n"
-"        y[row0] = __float2half(s0);\n"
-"        if (row0 + 1 < out_dim) {\n"
-"            if (has_bias) s1 += __half2float(bias[row0 + 1]);\n"
-"            if (add_res)  s1 += __half2float(y[row0 + 1]);\n"
-"            y[row0 + 1] = __float2half(s1);\n"
-"        }\n"
+"        if (has_bias) s0 += __half2float(bias[row]);\n"
+"        if (add_res)  s0 += __half2float(y[row]);\n"
+"        y[row] = __float2half(s0);\n"
 "    }\n"
+"}\n"
+"\n"
+"/* 5A2. Zero-SMEM L2-Q8_1 + 128-bit `uint4` SB8 `__dp4a` 4w1r Fused Gate+Up+SwiGLU/GeGLU Q4_0 */\n"
+"extern \"C\" __global__ void cuda_ffn_q4_0(\n"
+"    const uint8_t* __restrict__ q8_in,\n"
+"    const uint8_t* __restrict__ wg,\n"
+"    const uint8_t* __restrict__ wu,\n"
+"    half* __restrict__ out,\n"
+"    uint32_t d_ff, uint32_t in_dim, uint32_t is_geglu\n"
+") {\n"
+"    uint32_t wid = threadIdx.x >> 5;\n"
+"    uint32_t lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4 + wid;\n"
+"    if (row >= d_ff) return;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    const int4* sxq4 = (const int4*)q8_in;\n"
+"    const float* sdx = (const float*)((const int32_t*)q8_in + (nb << 3));\n"
+"    const int32_t* sxsum = (const int32_t*)(sdx + nb);\n"
+"    size_t b0 = (size_t)row * nb;\n"
+"    float sg = 0.0f, su = 0.0f;\n"
+"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"        int4 xqa = __ldg(&sxq4[(b << 1) + 0]);\n"
+"        int4 xqb = __ldg(&sxq4[(b << 1) + 1]);\n"
+"        float dx = __ldg(&sdx[b]);\n"
+"        int32_t xs = __ldg(&sxsum[b]);\n"
+"        sg += q4_sb8_dot_dp4a(wg, b0 + b, xqa, xqb, dx, xs);\n"
+"        su += q4_sb8_dot_dp4a(wu, b0 + b, xqa, xqb, dx, xs);\n"
+"    }\n"
+"    sg = warp_sum(sg); su = warp_sum(su);\n"
+"    if (lane == 0) out[row] = __float2half(apply_gated_act(sg, su, is_geglu));\n"
 "}\n"
 "\n"
 "/* 5B. 8-Warp (256 thr, 16 rows/CTA) In-CTA SMEM Q8_1 + 128-bit `uint4` SB8 `__dp4a` Q4_0 GEMV (ZERO extra GPU drain!) */\n"
@@ -775,6 +852,61 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    half* kc_h = k_cache + (size_t)kv_h * max_seq * d_head;\n"
 "    half* vc_h = v_cache + (size_t)kv_h * max_seq * d_head;\n"
 "\n"
+"    /* Fast Register-Only Path for d_head == 64 (Llama-3.2-1B): ZERO shared memory traffic! */\n"
+"    if (d_head == 64u) {\n"
+"        float freq = exp2f(-0.41524101187f * (float)lane);\n"
+"        float ang = (float)pos * freq;\n"
+"        float c, s;\n"
+"        __sincosf(ang, &s, &c);\n"
+"        float q0 = __half2float(q_src[lane]);\n"
+"        float q1 = __half2float(q_src[lane + 32u]);\n"
+"        float rq0 = q0 * c - q1 * s;\n"
+"        float rq1 = q0 * s + q1 * c;\n"
+"        float k0 = __half2float(k_src[lane]);\n"
+"        float k1 = __half2float(k_src[lane + 32u]);\n"
+"        float rk0 = k0 * c - k1 * s;\n"
+"        float rk1 = k0 * s + k1 * c;\n"
+"        float rv0 = __half2float(v_src[lane]);\n"
+"        float rv1 = __half2float(v_src[lane + 32u]);\n"
+"        if ((h % group) == 0) {\n"
+"            kc_h[(size_t)pos * 64u + lane]        = __float2half(rk0);\n"
+"            kc_h[(size_t)pos * 64u + lane + 32u]  = __float2half(rk1);\n"
+"            vc_h[(size_t)pos * 64u + lane]        = __float2half(rv0);\n"
+"            vc_h[(size_t)pos * 64u + lane + 32u]  = __float2half(rv1);\n"
+"        }\n"
+"        float a0 = 0.0f, a1 = 0.0f;\n"
+"        float scale = 0.125f;\n"
+"        float m_run = -1e30f, l_run = 0.0f;\n"
+"        for (uint32_t t = 0; t <= pos; t++) {\n"
+"            float kt0, kt1, vt0, vt1;\n"
+"            if (t == pos) {\n"
+"                kt0 = rk0; kt1 = rk1; vt0 = rv0; vt1 = rv1;\n"
+"            } else {\n"
+"                const half* kt = kc_h + (size_t)t * 64u;\n"
+"                const half* vt = vc_h + (size_t)t * 64u;\n"
+"                kt0 = __half2float(__ldg(&kt[lane]));\n"
+"                kt1 = __half2float(__ldg(&kt[lane + 32u]));\n"
+"                vt0 = __half2float(__ldg(&vt[lane]));\n"
+"                vt1 = __half2float(__ldg(&vt[lane + 32u]));\n"
+"            }\n"
+"            float dot = warp_sum(fmaf(rq0, kt0, rq1 * kt1));\n"
+"            float sc = __shfl_sync(0xFFFFFFFFu, dot, 0) * scale;\n"
+"            if (softcap > 0.0f) sc = softcap * tanhf(sc / softcap);\n"
+"            float m_new = fmaxf(m_run, sc);\n"
+"            float alpha = __expf(m_run - m_new);\n"
+"            float w_t   = __expf(sc - m_new);\n"
+"            l_run = l_run * alpha + w_t;\n"
+"            m_run = m_new;\n"
+"            a0 = fmaf(a0, alpha, w_t * vt0);\n"
+"            a1 = fmaf(a1, alpha, w_t * vt1);\n"
+"        }\n"
+"        float inv_l = 1.0f / fmaxf(l_run, 1e-12f);\n"
+"        half* out_h = ctx + h * 64u;\n"
+"        out_h[lane]       = __float2half(a0 * inv_l);\n"
+"        out_h[lane + 32u] = __float2half(a1 * inv_l);\n"
+"        return;\n"
+"    }\n"
+"\n"
 "    for (uint32_t p = lane; p < half_d; p += 32u) {\n"
 "        float freq = exp2f(-26.57542476f * (float)p / (float)d_head);\n"
 "        float ang = (float)pos * freq;\n"
@@ -835,15 +967,15 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    for (uint32_t i = lane; i < d_head; i += 32u) out_h[i] = __float2half(s_acc[i] * inv_l);\n"
 "}\n"
 "\n"
-"/* 8. 128-bit `float4` Vectorized On-GPU Argmax + Auto-Increment `tok_pos[1]` (8x fewer loads on 128k vocab!) */\n"
+"/* 8. 1024-Thread 128-bit `float4` Vectorized On-GPU Argmax + Auto-Increment `tok_pos[1]` (~4 us on 128k vocab!) */\n"
 "extern \"C\" __global__ void cuda_argmax_f16(\n"
 "    const half* __restrict__ logits,\n"
 "    uint32_t* __restrict__ tok_pos,\n"
 "    uint32_t n_elems,\n"
 "    uint32_t inc_pos\n"
 ") {\n"
-"    __shared__ float s_val[8];\n"
-"    __shared__ uint32_t s_idx[8];\n"
+"    __shared__ float s_val[32];\n"
+"    __shared__ uint32_t s_idx[32];\n"
 "    uint32_t tid = threadIdx.x;\n"
 "    float bv = -1e30f;\n"
 "    uint32_t bi = 0;\n"
@@ -872,14 +1004,20 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    }\n"
 "    if ((tid & 31u) == 0) { s_val[tid >> 5] = bv; s_idx[tid >> 5] = bi; }\n"
 "    __syncthreads();\n"
-"    if (tid == 0) {\n"
+"    if (tid < 32u) {\n"
 "        uint32_t nwarps = blockDim.x >> 5;\n"
-"        float fbv = s_val[0]; uint32_t fbi = s_idx[0];\n"
-"        for (uint32_t w = 1; w < nwarps; w++) {\n"
-"            if (s_val[w] > fbv || (s_val[w] == fbv && s_idx[w] < fbi)) { fbv = s_val[w]; fbi = s_idx[w]; }\n"
+"        float fbv = (tid < nwarps) ? s_val[tid] : -1e30f;\n"
+"        uint32_t fbi = (tid < nwarps) ? s_idx[tid] : 0u;\n"
+"        #pragma unroll\n"
+"        for (int off = 16; off > 0; off >>= 1) {\n"
+"            float ov = __shfl_down_sync(0xFFFFFFFFu, fbv, off);\n"
+"            uint32_t oi = __shfl_down_sync(0xFFFFFFFFu, fbi, off);\n"
+"            if (ov > fbv || (ov == fbv && oi < fbi)) { fbv = ov; fbi = oi; }\n"
 "        }\n"
-"        tok_pos[0] = fbi;\n"
-"        if (inc_pos != 0) tok_pos[1] += 1;\n"
+"        if (tid == 0) {\n"
+"            tok_pos[0] = fbi;\n"
+"            if (inc_pos != 0) tok_pos[1] += 1;\n"
+"        }\n"
 "    }\n"
 "}\n"
 "\n"
@@ -972,8 +1110,8 @@ static const char* TENON_CUDA_ULTRA_SRC =
 static int g_cu_ultra_ready = 0;
 static CUmodule g_cu_ultra_mod = NULL;
 static CUdeviceptr g_l2_scratch_dptr = 0;
-static CUfunction k_embed, k_rmsnorm, k_x_to_q8_1, k_gemv_f16, k_ffn_f16;
-static CUfunction k_gemv_q8, k_gemv_q4, k_gemv_q8_smem, k_gemv_q4_smem;
+static CUfunction k_embed, k_rmsnorm, k_x_to_q8_1, k_gemv_f16, k_gemv_f16_1r, k_ffn_f16;
+static CUfunction k_gemv_q8, k_gemv_q4, k_ffn_q8, k_ffn_q4, k_gemv_q8_smem, k_gemv_q4_smem;
 static CUfunction k_norm_ffn_q8_smem, k_norm_ffn_q4_smem;
 static CUfunction k_rope_flash, k_argmax, k_silu_mul, k_mm_f16, k_mm_q4;
 
@@ -987,9 +1125,12 @@ int64_t tn_cuda_ultra_init(void) {
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_rmsnorm_f16", &k_rmsnorm);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_x_to_q8_1", &k_x_to_q8_1);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_f16", &k_gemv_f16);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_f16_1r", &k_gemv_f16_1r);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_ffn_f16", &k_ffn_f16);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_q8_0", &k_gemv_q8);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_q4_0", &k_gemv_q4);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_ffn_q8_0", &k_ffn_q8);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_ffn_q4_0", &k_ffn_q4);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_q8_0_smem", &k_gemv_q8_smem);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_q4_0_smem", &k_gemv_q4_smem);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_norm_ffn_q8_0_smem", &k_norm_ffn_q8_smem);
@@ -1048,14 +1189,15 @@ int64_t tn_cuda_ultra_gemv(
     CUdeviceptr pb = has_bias ? (tn_cuda_buf_dptr(b_h) + (uint64_t)b_off) : py;
     uint32_t od = (uint32_t)out_dim, id = (uint32_t)in_dim, ar = (uint32_t)add_res, hb = (uint32_t)has_bias;
     if (quant_mode == 2 || quant_mode == 1) {
-        /* Roofline Dual-Schedule: hoist L2 Q8_1 ONLY for huge vocab (>=16384) or huge 8192x8192;
-           use 8-warp in-CTA SMEM Q8_1 for layer projections to eliminate 64 full-GPU drain barriers! */
-        if (od >= 16384u || (od >= 8192u && id >= 8192u)) {
+        /* Roofline Dual-Schedule:
+           - Real LLMs (in_dim >= 1024 or huge vocab >= 16384): hoisted L2 Q8_1 + Zero-SMEM 4w1r SB8 __dp4a (880-931 GB/s!)
+           - Tiny L2-resident models (in_dim < 1024): in-CTA SMEM Q8_1 (avoids 1-CTA barrier overhead!) */
+        if (id >= 1024u || od >= 16384u) {
             if (!tn_launch_x_to_q8_1(px, px, id, 0, 0)) return 0;
             CUdeviceptr pq = g_l2_scratch_dptr;
             void* ps[8] = { &pq, &pw, &py, &pb, &od, &id, &ar, &hb };
             CUfunction fn = quant_mode == 2 ? k_gemv_q4 : k_gemv_q8;
-            return tn_cuda_launch_raw(fn, (od + 7u) / 8u, 1, 1, 128, 1, 1, 0, ps);
+            return tn_cuda_launch_raw(fn, (od + 3u) / 4u, 1, 1, 128, 1, 1, 0, ps);
         }
         uint32_t dn = 0, gm = 0;
         unsigned int smem = (id >> 5) * 40u;
@@ -1064,6 +1206,9 @@ int64_t tn_cuda_ultra_gemv(
         return tn_cuda_launch_raw(fn, (od + 15u) / 16u, 1, 1, 256, 1, 1, smem, ps);
     }
     void* ps[8] = { &px, &pw, &py, &pb, &od, &id, &ar, &hb };
+    if (od <= 4096u) {
+        return tn_cuda_launch_raw(k_gemv_f16_1r, (od + 3u) / 4u, 1, 1, 128, 1, 1, 0, ps);
+    }
     return tn_cuda_launch_raw(k_gemv_f16, (od + 7u) / 8u, 1, 1, 128, 1, 1, 0, ps);
 }
 
@@ -1079,12 +1224,12 @@ int64_t tn_cuda_ultra_norm_gemv(
     CUdeviceptr pb = has_bias ? (tn_cuda_buf_dptr(b_h) + (uint64_t)b_off) : py;
     uint32_t od = (uint32_t)out_dim, id = (uint32_t)in_dim, gm = (uint32_t)gemma_mode, hb = (uint32_t)has_bias, ar = 0;
     if (quant_mode == 2 || quant_mode == 1) {
-        if (od >= 16384u) {
+        if (id >= 1024u || od >= 16384u) {
             if (!tn_launch_x_to_q8_1(px, pnw, id, 1, gm)) return 0;
             CUdeviceptr pq = g_l2_scratch_dptr;
             void* ps[8] = { &pq, &pw, &py, &pb, &od, &id, &ar, &hb };
             CUfunction fn = quant_mode == 2 ? k_gemv_q4 : k_gemv_q8;
-            return tn_cuda_launch_raw(fn, (od + 7u) / 8u, 1, 1, 128, 1, 1, 0, ps);
+            return tn_cuda_launch_raw(fn, (od + 3u) / 4u, 1, 1, 128, 1, 1, 0, ps);
         }
         uint32_t dn = 1u;
         unsigned int smem = (id >> 5) * 40u;
@@ -1096,6 +1241,9 @@ int64_t tn_cuda_ultra_norm_gemv(
     if (!tn_launch_rmsnorm_to_l2(px, pnw, id, gm)) return 0;
     CUdeviceptr pxn = g_l2_scratch_dptr;
     void* ps[8] = { &pxn, &pw, &py, &pb, &od, &id, &ar, &hb };
+    if (od <= 4096u) {
+        return tn_cuda_launch_raw(k_gemv_f16_1r, (od + 3u) / 4u, 1, 1, 128, 1, 1, 0, ps);
+    }
     return tn_cuda_launch_raw(k_gemv_f16, (od + 7u) / 8u, 1, 1, 128, 1, 1, 0, ps);
 }
 
@@ -1110,13 +1258,19 @@ int64_t tn_cuda_ultra_norm_ffn(
     CUdeviceptr po = tn_cuda_buf_dptr(out_h);
     uint32_t df = (uint32_t)d_ff, id = (uint32_t)in_dim, ig = (uint32_t)is_geglu, gm = (uint32_t)gemma_mode;
     if (quant_mode == 2 || quant_mode == 1) {
-        /* 8-warp (256 thr, 16 FFN rows/CTA) fused RMSNorm+Q8_1+Gate+Up+SwiGLU (ZERO extra GPU drain!) */
+        if (id >= 1024u || df >= 4096u) {
+            if (!tn_launch_x_to_q8_1(px, pnw, id, 1, gm)) return 0;
+            CUdeviceptr pq = g_l2_scratch_dptr;
+            void* ps[7] = { &pq, &pwg, &pwu, &po, &df, &id, &ig };
+            CUfunction fn = quant_mode == 2 ? k_ffn_q4 : k_ffn_q8;
+            return tn_cuda_launch_raw(fn, (df + 3u) / 4u, 1, 1, 128, 1, 1, 0, ps);
+        }
         unsigned int smem = (id >> 5) * 40u;
         void* ps[9] = { &px, &pnw, &pwg, &pwu, &po, &df, &id, &ig, &gm };
         CUfunction fn = quant_mode == 2 ? k_norm_ffn_q4_smem : k_norm_ffn_q8_smem;
         return tn_cuda_launch_raw(fn, (df + 15u) / 16u, 1, 1, 256, 1, 1, smem, ps);
     }
-    /* FP16: 1-CTA vectorized float4 RMSNorm -> L2-hot 4KB scratch + zero-SMEM float4 FFN (eliminates 16,384 redundant norms!) */
+    /* FP16: 1-CTA vectorized float4 RMSNorm -> L2-hot 4KB scratch + zero-SMEM float4 FFN */
     if (!tn_launch_rmsnorm_to_l2(px, pnw, id, gm)) return 0;
     CUdeviceptr pxn = g_l2_scratch_dptr;
     void* ps[7] = { &pxn, &pwg, &pwu, &po, &df, &id, &ig };
@@ -1144,7 +1298,7 @@ int64_t tn_cuda_ultra_argmax(int64_t logits_h, int64_t tok_pos_h, int64_t n_elem
     CUdeviceptr ptp = tn_cuda_buf_dptr(tok_pos_h);
     uint32_t n = (uint32_t)n_elems, ip = (uint32_t)inc_pos;
     void* ps[4] = { &pl, &ptp, &n, &ip };
-    return tn_cuda_launch_raw(k_argmax, 1, 1, 1, 256, 1, 1, 0, ps);
+    return tn_cuda_launch_raw(k_argmax, 1, 1, 1, 1024, 1, 1, 0, ps);
 }
 
 int64_t tn_cuda_ultra_silu_mul(int64_t g_h, int64_t u_h, int64_t o_h, int64_t n_elems) {

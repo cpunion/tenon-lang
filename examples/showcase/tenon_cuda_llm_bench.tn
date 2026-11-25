@@ -289,7 +289,7 @@ fn bench_cuda_tensorcore_gemm(m Int, n Int, k Int, iters Int) Int {
     let w_b = CudaBuffer.uninit(n * k * 2)
     let y_b = CudaBuffer.uninit(m * n * 2)
     var wi = 0
-    while wi < 10 {
+    while wi < 25 {
         let _ = cuda_mm(x_b.handle, w_b.handle, 0, y_b.handle, m, n, k, CUDA_QUANT_FP16, false)
         wi += 1
     }

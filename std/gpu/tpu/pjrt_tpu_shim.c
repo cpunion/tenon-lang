@@ -88,18 +88,20 @@ static PJRT_Buffer_Type tn_map_dtype(int64_t dt) {
         case 2: return PJRT_Buffer_Type_F16;
         case 3: return PJRT_Buffer_Type_S32;
         case 4: return PJRT_Buffer_Type_S8;
+        case 5: return PJRT_Buffer_Type_S4;
         default: return PJRT_Buffer_Type_F32;
     }
 }
 
-static size_t tn_dtype_bytes(int64_t dt) {
+static size_t tn_dtype_nbytes(int64_t dt, size_t n_elems) {
     switch (dt) {
-        case 0: return 4;
-        case 1: return 2;
-        case 2: return 2;
-        case 3: return 4;
-        case 4: return 1;
-        default: return 4;
+        case 0: return n_elems * 4u;
+        case 1: return n_elems * 2u;
+        case 2: return n_elems * 2u;
+        case 3: return n_elems * 4u;
+        case 4: return n_elems;
+        case 5: return n_elems; /* Host staging uses 1B/elem (ml_dtypes.int4); PJRT packs sub-byte 4-bit in TPU HBM! */
+        default: return n_elems * 4u;
     }
 }
 
@@ -269,7 +271,7 @@ int64_t tn_tpu_buf_create_scalar_i32(int64_t val) {
 }
 
 int64_t tn_tpu_buf_zeros_1d(int64_t dtype, int64_t d0) {
-    size_t nbytes = (size_t)d0 * tn_dtype_bytes(dtype);
+    size_t nbytes = tn_dtype_nbytes(dtype, (size_t)d0);
     void* tmp = calloc(1, nbytes > 0 ? nbytes : 4);
     if (!tmp) return 0;
     int64_t dims[1] = { d0 };
@@ -279,7 +281,7 @@ int64_t tn_tpu_buf_zeros_1d(int64_t dtype, int64_t d0) {
 }
 
 int64_t tn_tpu_buf_zeros_2d(int64_t dtype, int64_t d0, int64_t d1) {
-    size_t nbytes = (size_t)d0 * (size_t)d1 * tn_dtype_bytes(dtype);
+    size_t nbytes = tn_dtype_nbytes(dtype, (size_t)d0 * (size_t)d1);
     void* tmp = calloc(1, nbytes > 0 ? nbytes : 4);
     if (!tmp) return 0;
     int64_t dims[2] = { d0, d1 };
@@ -289,7 +291,7 @@ int64_t tn_tpu_buf_zeros_2d(int64_t dtype, int64_t d0, int64_t d1) {
 }
 
 int64_t tn_tpu_buf_zeros_3d(int64_t dtype, int64_t d0, int64_t d1, int64_t d2) {
-    size_t nbytes = (size_t)d0 * (size_t)d1 * (size_t)d2 * tn_dtype_bytes(dtype);
+    size_t nbytes = tn_dtype_nbytes(dtype, (size_t)d0 * (size_t)d1 * (size_t)d2);
     void* tmp = calloc(1, nbytes > 0 ? nbytes : 4);
     if (!tmp) return 0;
     int64_t dims[3] = { d0, d1, d2 };

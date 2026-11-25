@@ -11,6 +11,7 @@ pub const TPU_BF16 Int = 1
 pub const TPU_F16  Int = 2
 pub const TPU_S32  Int = 3
 pub const TPU_S8   Int = 4
+pub const TPU_S4   Int = 5
 
 @c_src("pjrt_tpu_shim.c")
 extern "C" {
@@ -119,6 +120,11 @@ impl TpuBuffer {
         TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S8 }
     }
 
+    pub fn from_s4_2d(packed_bytes List[UInt8], rows Int, cols Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_create_2d(list_data_ptr(packed_bytes), TPU_S4, rows, cols) }
+        TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S4 }
+    }
+
     pub fn zeros_bf16_2d(rows Int, cols Int) TpuBuffer {
         let h = unsafe { tn_tpu_buf_zeros_2d(TPU_BF16, rows, cols) }
         TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_BF16 }
@@ -127,6 +133,11 @@ impl TpuBuffer {
     pub fn zeros_s8_2d(rows Int, cols Int) TpuBuffer {
         let h = unsafe { tn_tpu_buf_zeros_2d(TPU_S8, rows, cols) }
         TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S8 }
+    }
+
+    pub fn zeros_s4_2d(rows Int, cols Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_zeros_2d(TPU_S4, rows, cols) }
+        TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S4 }
     }
 
     pub fn scalar_i32(val Int) TpuBuffer {
@@ -147,6 +158,11 @@ impl TpuBuffer {
     pub fn zeros_s8_3d(d0 Int, d1 Int, d2 Int) TpuBuffer {
         let h = unsafe { tn_tpu_buf_zeros_3d(TPU_S8, d0, d1, d2) }
         TpuBuffer { handle = h, n_elems = d0 * d1 * d2, dtype = TPU_S8 }
+    }
+
+    pub fn zeros_s4_3d(d0 Int, d1 Int, d2 Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_zeros_3d(TPU_S4, d0, d1, d2) }
+        TpuBuffer { handle = h, n_elems = d0 * d1 * d2, dtype = TPU_S4 }
     }
 
     pub fn read_f32(inout self, dst List[Float32]) Int {
