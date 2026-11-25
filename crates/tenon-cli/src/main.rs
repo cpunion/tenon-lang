@@ -2107,6 +2107,14 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 opts.linker = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--pgo-gen" if i + 1 < args.len() => {
+                opts.pgo_gen = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--pgo-use" if i + 1 < args.len() => {
+                opts.pgo_use = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
             "-l" if i + 1 < args.len() => {
                 opts.link_libs.push(args[i + 1].clone());
                 i += 2;

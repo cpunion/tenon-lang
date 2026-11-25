@@ -212,17 +212,35 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
          extern const char* tenon_text_data_ptr(int64_t ptr);\n\
          extern int64_t tenon_text_byte_len(int64_t ptr);\n\
          extern int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc);\n\
+         extern void* tenon_obj_fields_ptr(int64_t ptr);\n\
          extern int64_t tenon_rt_live_objects(void);\n\n\
          static inline int64_t tn_f64_to_bits(double v) {{ int64_t b; memcpy(&b, &v, 8); return b; }}\n\
          static inline double tn_bits_to_f64(int64_t b) {{ double v; memcpy(&v, &b, 8); return v; }}\n\n\
+         /* PEP 3118 Zero-Copy/Bulk Buffer Protocol Fast-Path (NumPy/PyTorch/array.array/memoryview -> memcpy!) */\n\
          static int64_t tn_py_to_list_int(PyObject* seq) {{\n\
-             PyObject* fast = PySequence_Fast(seq, \"expected sequence of ints\");\n\
+             if (PyObject_CheckBuffer(seq)) {{\n\
+                 Py_buffer view;\n\
+                 if (PyObject_GetBuffer(seq, &view, PyBUF_CONTIG_RO | PyBUF_FORMAT) == 0) {{\n\
+                     if (view.itemsize == 8 && view.format && (view.format[0] == 'q' || view.format[0] == 'l')) {{\n\
+                         int64_t n = (int64_t)(view.len / 8);\n\
+                         int64_t h = tenon_list_filled(n, 0, 0);\n\
+                         if (n > 0) memcpy(tenon_obj_fields_ptr(h), view.buf, (size_t)view.len);\n\
+                         PyBuffer_Release(&view);\n\
+                         return h;\n\
+                     }}\n\
+                     PyBuffer_Release(&view);\n\
+                 }} else {{\n\
+                     PyErr_Clear();\n\
+                 }}\n\
+             }}\n\
+             PyObject* fast = PySequence_Fast(seq, \"expected sequence or int64 buffer\");\n\
              if (!fast) return 0;\n\
              Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);\n\
              int64_t h = tenon_list_filled((int64_t)n, 0, 0);\n\
+             int64_t* dst = (int64_t*)tenon_obj_fields_ptr(h);\n\
              PyObject** items = PySequence_Fast_ITEMS(fast);\n\
              for (Py_ssize_t i = 0; i < n; i++) {{\n\
-                 tenon_rc_set_field(h, (int64_t)i, (int64_t)PyLong_AsLongLong(items[i]));\n\
+                 dst[i] = (int64_t)PyLong_AsLongLong(items[i]);\n\
              }}\n\
              Py_DECREF(fast);\n\
              return h;\n\
@@ -231,20 +249,37 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
              int64_t n = tenon_rc_get_len(h);\n\
              PyObject* lst = PyList_New((Py_ssize_t)n);\n\
              if (!lst) {{ tenon_rc_dec(h); return NULL; }}\n\
+             const int64_t* src = (const int64_t*)tenon_obj_fields_ptr(h);\n\
              for (int64_t i = 0; i < n; i++) {{\n\
-                 PyList_SET_ITEM(lst, (Py_ssize_t)i, PyLong_FromLongLong(tenon_rc_get_field(h, i)));\n\
+                 PyList_SET_ITEM(lst, (Py_ssize_t)i, PyLong_FromLongLong(src[i]));\n\
              }}\n\
              tenon_rc_dec(h);\n\
              return lst;\n\
          }}\n\
          static int64_t tn_py_to_list_f64(PyObject* seq) {{\n\
-             PyObject* fast = PySequence_Fast(seq, \"expected sequence of floats\");\n\
+             if (PyObject_CheckBuffer(seq)) {{\n\
+                 Py_buffer view;\n\
+                 if (PyObject_GetBuffer(seq, &view, PyBUF_CONTIG_RO | PyBUF_FORMAT) == 0) {{\n\
+                     if (view.itemsize == 8 && view.format && view.format[0] == 'd') {{\n\
+                         int64_t n = (int64_t)(view.len / 8);\n\
+                         int64_t h = tenon_list_filled(n, 0, 0);\n\
+                         if (n > 0) memcpy(tenon_obj_fields_ptr(h), view.buf, (size_t)view.len);\n\
+                         PyBuffer_Release(&view);\n\
+                         return h;\n\
+                     }}\n\
+                     PyBuffer_Release(&view);\n\
+                 }} else {{\n\
+                     PyErr_Clear();\n\
+                 }}\n\
+             }}\n\
+             PyObject* fast = PySequence_Fast(seq, \"expected sequence or float64 buffer\");\n\
              if (!fast) return 0;\n\
              Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);\n\
              int64_t h = tenon_list_filled((int64_t)n, 0, 0);\n\
+             double* dst = (double*)tenon_obj_fields_ptr(h);\n\
              PyObject** items = PySequence_Fast_ITEMS(fast);\n\
              for (Py_ssize_t i = 0; i < n; i++) {{\n\
-                 tenon_rc_set_field(h, (int64_t)i, tn_f64_to_bits(PyFloat_AsDouble(items[i])));\n\
+                 dst[i] = PyFloat_AsDouble(items[i]);\n\
              }}\n\
              Py_DECREF(fast);\n\
              return h;\n\
@@ -253,8 +288,9 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
              int64_t n = tenon_rc_get_len(h);\n\
              PyObject* lst = PyList_New((Py_ssize_t)n);\n\
              if (!lst) {{ tenon_rc_dec(h); return NULL; }}\n\
+             const double* src = (const double*)tenon_obj_fields_ptr(h);\n\
              for (int64_t i = 0; i < n; i++) {{\n\
-                 PyList_SET_ITEM(lst, (Py_ssize_t)i, PyFloat_FromDouble(tn_bits_to_f64(tenon_rc_get_field(h, i))));\n\
+                 PyList_SET_ITEM(lst, (Py_ssize_t)i, PyFloat_FromDouble(src[i]));\n\
              }}\n\
              tenon_rc_dec(h);\n\
              return lst;\n\
@@ -487,7 +523,7 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
              }}\n\n"
         ));
 
-        // impl methods on this record!
+        // impl methods on this record — PEP 590 METH_FASTCALL (ZERO PyTuple allocation!)
         let methods = collect_record_methods(program, &r.name);
         for m in &methods {
             let mn = sanitize_ident(&m.name);
@@ -497,77 +533,55 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
                 .as_ref()
                 .map(|t| resolve_bridge_ty(t, &aliases, &rec_names))
                 .unwrap_or(BridgeTy::Void);
-            out.push_str(&format!(
-                "static PyObject* PyTenon_{rn}_m_{mn}(PyTenon_{rn}* self, PyObject* args) {{\n"
-            ));
-            let mut mfmt = String::new();
-            let mut mpargs = Vec::new();
+            if extra_params.is_empty() {
+                out.push_str(&format!(
+                    "static PyObject* PyTenon_{rn}_m_{mn}(PyTenon_{rn}* self, PyObject* Py_UNUSED(ignored)) {{\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "static PyObject* PyTenon_{rn}_m_{mn}(PyTenon_{rn}* self, PyObject* const* args, Py_ssize_t nargs) {{\n\
+                         if (nargs != {}) {{ PyErr_Format(PyExc_TypeError, \"{}.{}() takes {} argument(s) (%zd given)\", nargs); return NULL; }}\n",
+                    extra_params.len(),
+                    r.name,
+                    m.name,
+                    extra_params.len()
+                ));
+            }
             let mut mcall = vec!["self->handle".to_string()];
             let mut mclean = Vec::new();
             for (pi, p) in extra_params.iter().enumerate() {
                 let pt = resolve_bridge_ty(&p.ty, &aliases, &rec_names);
                 match &pt {
                     BridgeTy::Float | BridgeTy::Float32 => {
-                        out.push_str(&format!("    double a{pi} = 0.0;\n"));
-                        mfmt.push('d');
-                        mpargs.push(format!("&a{pi}"));
+                        out.push_str(&format!("    double a{pi} = PyFloat_AsDouble(args[{pi}]); if (a{pi} == -1.0 && PyErr_Occurred()) return NULL;\n"));
                         mcall.push(format!("tn_f64_to_bits(a{pi})"));
                     }
                     BridgeTy::Bool => {
-                        out.push_str(&format!("    int a{pi} = 0;\n"));
-                        mfmt.push('p');
-                        mpargs.push(format!("&a{pi}"));
+                        out.push_str(&format!("    int a{pi} = PyObject_IsTrue(args[{pi}]); if (a{pi} < 0) return NULL;\n"));
                         mcall.push(format!("(int64_t)(a{pi} != 0 ? 1 : 0)"));
                     }
                     BridgeTy::Text => {
-                        out.push_str(&format!("    const char* s{pi} = \"\"; Py_ssize_t sl{pi} = 0;\n"));
-                        mfmt.push_str("s#");
-                        mpargs.push(format!("&s{pi}, &sl{pi}"));
+                        out.push_str(&format!("    Py_ssize_t sl{pi} = 0; const char* s{pi} = PyUnicode_AsUTF8AndSize(args[{pi}], &sl{pi}); if (!s{pi}) return NULL;\n"));
                         mcall.push(format!("h{pi}"));
                         mclean.push((pi, BridgeTy::Text));
                     }
                     BridgeTy::ListInt => {
-                        out.push_str(&format!("    PyObject* o{pi} = NULL;\n"));
-                        mfmt.push('O');
-                        mpargs.push(format!("&o{pi}"));
                         mcall.push(format!("h{pi}"));
                         mclean.push((pi, BridgeTy::ListInt));
                     }
                     BridgeTy::ListFloat => {
-                        out.push_str(&format!("    PyObject* o{pi} = NULL;\n"));
-                        mfmt.push('O');
-                        mpargs.push(format!("&o{pi}"));
                         mcall.push(format!("h{pi}"));
                         mclean.push((pi, BridgeTy::ListFloat));
                     }
                     BridgeTy::Record(sub) => {
-                        out.push_str(&format!("    PyObject* o{pi} = NULL;\n"));
-                        mfmt.push('O');
-                        mpargs.push(format!("&o{pi}"));
-                        mcall.push(format!("((PyTenon_{}*)o{pi})->handle", sanitize_ident(sub)));
+                        let sr = sanitize_ident(sub);
+                        out.push_str(&format!("    if (!PyObject_TypeCheck(args[{pi}], &PyTenon_{sr}_Type)) {{ PyErr_SetString(PyExc_TypeError, \"expected {sub}\"); return NULL; }}\n"));
+                        mcall.push(format!("((PyTenon_{sr}*)args[{pi}])->handle"));
                     }
                     _ => {
-                        out.push_str(&format!("    long long a{pi} = 0;\n"));
-                        mfmt.push('L');
-                        mpargs.push(format!("&a{pi}"));
+                        out.push_str(&format!("    long long a{pi} = PyLong_AsLongLong(args[{pi}]); if (a{pi} == -1 && PyErr_Occurred()) return NULL;\n"));
                         mcall.push(format!("(int64_t)a{pi}"));
                     }
-                }
-            }
-            if !extra_params.is_empty() {
-                out.push_str(&format!(
-                    "    if (!PyArg_ParseTuple(args, \"{mfmt}\", {})) return NULL;\n",
-                    mpargs.join(", ")
-                ));
-            } else {
-                out.push_str("    (void)args;\n");
-            }
-            for (pi, p) in extra_params.iter().enumerate() {
-                if let BridgeTy::Record(sub) = resolve_bridge_ty(&p.ty, &aliases, &rec_names) {
-                    let sr = sanitize_ident(&sub);
-                    out.push_str(&format!(
-                        "    if (!PyObject_TypeCheck(o{pi}, &PyTenon_{sr}_Type)) {{ PyErr_SetString(PyExc_TypeError, \"expected {sub}\"); return NULL; }}\n"
-                    ));
                 }
             }
             for (pi, cty) in &mclean {
@@ -576,10 +590,10 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
                         out.push_str(&format!("    int64_t h{pi} = tenon_text_new((int64_t)(uintptr_t)s{pi}, (int64_t)sl{pi});\n"));
                     }
                     BridgeTy::ListInt => {
-                        out.push_str(&format!("    int64_t h{pi} = tn_py_to_list_int(o{pi});\n    if (PyErr_Occurred()) {{ if (h{pi}) tenon_rc_dec(h{pi}); return NULL; }}\n"));
+                        out.push_str(&format!("    int64_t h{pi} = tn_py_to_list_int(args[{pi}]);\n    if (PyErr_Occurred()) {{ if (h{pi}) tenon_rc_dec(h{pi}); return NULL; }}\n"));
                     }
                     BridgeTy::ListFloat => {
-                        out.push_str(&format!("    int64_t h{pi} = tn_py_to_list_f64(o{pi});\n    if (PyErr_Occurred()) {{ if (h{pi}) tenon_rc_dec(h{pi}); return NULL; }}\n"));
+                        out.push_str(&format!("    int64_t h{pi} = tn_py_to_list_f64(args[{pi}]);\n    if (PyErr_Occurred()) {{ if (h{pi}) tenon_rc_dec(h{pi}); return NULL; }}\n"));
                     }
                     _ => {}
                 }
@@ -612,7 +626,7 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
         out.push_str(&format!("static PyMethodDef PyTenon_{rn}_methods[] = {{\n"));
         for m in &methods {
             let mn = sanitize_ident(&m.name);
-            let flags = if m.params.len() <= 1 { "METH_NOARGS" } else { "METH_VARARGS" };
+            let flags = if m.params.len() <= 1 { "METH_NOARGS" } else { "METH_FASTCALL" };
             out.push_str(&format!(
                 "    {{\"{}\", (PyCFunction)PyTenon_{rn}_m_{mn}, {flags}, \"Tenon verified method `{}.{}`\"}},\n",
                 m.name, r.name, m.name
@@ -638,7 +652,7 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
         ));
     }
 
-    // Module-level @export functions!
+    // Module-level @export functions — PEP 590 METH_FASTCALL (ZERO PyTuple / PyArg_ParseTuple!)
     for (f, csym) in &fns {
         let fn_ident = sanitize_ident(&f.name);
         let rt = f
@@ -646,81 +660,57 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
             .as_ref()
             .map(|t| resolve_bridge_ty(t, &aliases, &rec_names))
             .unwrap_or(BridgeTy::Void);
-        out.push_str(&format!("static PyObject* py_tn_{fn_ident}(PyObject* self, PyObject* args) {{\n    (void)self;\n"));
-        let mut fmt_str = String::new();
-        let mut parse_args = Vec::new();
+        if f.params.is_empty() {
+            out.push_str(&format!("static PyObject* py_tn_{fn_ident}(PyObject* self, PyObject* Py_UNUSED(ignored)) {{\n    (void)self;\n"));
+        } else {
+            out.push_str(&format!(
+                "static PyObject* py_tn_{fn_ident}(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {{\n\
+                     (void)self;\n\
+                     if (nargs != {}) {{ PyErr_Format(PyExc_TypeError, \"{}() takes {} argument(s) (%zd given)\", nargs); return NULL; }}\n",
+                f.params.len(),
+                f.name,
+                f.params.len()
+            ));
+        }
         let mut call_args = Vec::new();
         let mut cleanups = Vec::new();
         for (pi, p) in f.params.iter().enumerate() {
             let pt = resolve_bridge_ty(&p.ty, &aliases, &rec_names);
             match &pt {
                 BridgeTy::Float => {
-                    out.push_str(&format!("    double a{pi} = 0.0;\n"));
-                    fmt_str.push('d');
-                    parse_args.push(format!("&a{pi}"));
+                    out.push_str(&format!("    double a{pi} = PyFloat_AsDouble(args[{pi}]); if (a{pi} == -1.0 && PyErr_Occurred()) return NULL;\n"));
                     call_args.push(format!("a{pi}"));
                 }
                 BridgeTy::Float32 => {
-                    out.push_str(&format!("    float a{pi} = 0.0f;\n"));
-                    fmt_str.push('f');
-                    parse_args.push(format!("&a{pi}"));
+                    out.push_str(&format!("    double ad{pi} = PyFloat_AsDouble(args[{pi}]); if (ad{pi} == -1.0 && PyErr_Occurred()) return NULL; float a{pi} = (float)ad{pi};\n"));
                     call_args.push(format!("a{pi}"));
                 }
                 BridgeTy::Bool => {
-                    out.push_str(&format!("    int a{pi} = 0;\n"));
-                    fmt_str.push('p');
-                    parse_args.push(format!("&a{pi}"));
+                    out.push_str(&format!("    int a{pi} = PyObject_IsTrue(args[{pi}]); if (a{pi} < 0) return NULL;\n"));
                     call_args.push(format!("(a{pi} != 0)"));
                 }
                 BridgeTy::Text => {
-                    out.push_str(&format!("    const char* s{pi} = \"\"; Py_ssize_t sl{pi} = 0;\n"));
-                    fmt_str.push_str("s#");
-                    parse_args.push(format!("&s{pi}, &sl{pi}"));
+                    out.push_str(&format!("    Py_ssize_t sl{pi} = 0; const char* s{pi} = PyUnicode_AsUTF8AndSize(args[{pi}], &sl{pi}); if (!s{pi}) return NULL;\n"));
                     call_args.push(format!("h{pi}"));
                     cleanups.push((pi, BridgeTy::Text));
                 }
                 BridgeTy::ListInt => {
-                    out.push_str(&format!("    PyObject* o{pi} = NULL;\n"));
-                    fmt_str.push('O');
-                    parse_args.push(format!("&o{pi}"));
                     call_args.push(format!("h{pi}"));
                     cleanups.push((pi, BridgeTy::ListInt));
                 }
                 BridgeTy::ListFloat => {
-                    out.push_str(&format!("    PyObject* o{pi} = NULL;\n"));
-                    fmt_str.push('O');
-                    parse_args.push(format!("&o{pi}"));
                     call_args.push(format!("h{pi}"));
                     cleanups.push((pi, BridgeTy::ListFloat));
                 }
                 BridgeTy::Record(sub) => {
-                    out.push_str(&format!("    PyObject* o{pi} = NULL;\n"));
-                    fmt_str.push('O');
-                    parse_args.push(format!("&o{pi}"));
-                    call_args.push(format!("((PyTenon_{}*)o{pi})->handle", sanitize_ident(sub)));
+                    let sr = sanitize_ident(sub);
+                    out.push_str(&format!("    if (!PyObject_TypeCheck(args[{pi}], &PyTenon_{sr}_Type)) {{ PyErr_SetString(PyExc_TypeError, \"expected {sub}\"); return NULL; }}\n"));
+                    call_args.push(format!("((PyTenon_{sr}*)args[{pi}])->handle"));
                 }
                 _ => {
-                    out.push_str(&format!("    long long a{pi} = 0;\n"));
-                    fmt_str.push('L');
-                    parse_args.push(format!("&a{pi}"));
+                    out.push_str(&format!("    long long a{pi} = PyLong_AsLongLong(args[{pi}]); if (a{pi} == -1 && PyErr_Occurred()) return NULL;\n"));
                     call_args.push(format!("(int64_t)a{pi}"));
                 }
-            }
-        }
-        if !f.params.is_empty() {
-            out.push_str(&format!(
-                "    if (!PyArg_ParseTuple(args, \"{fmt_str}\", {})) return NULL;\n",
-                parse_args.join(", ")
-            ));
-        } else {
-            out.push_str("    (void)args;\n");
-        }
-        for (pi, p) in f.params.iter().enumerate() {
-            if let BridgeTy::Record(sub) = resolve_bridge_ty(&p.ty, &aliases, &rec_names) {
-                let sr = sanitize_ident(&sub);
-                out.push_str(&format!(
-                    "    if (!PyObject_TypeCheck(o{pi}, &PyTenon_{sr}_Type)) {{ PyErr_SetString(PyExc_TypeError, \"expected {sub}\"); return NULL; }}\n"
-                ));
             }
         }
         for (pi, cty) in &cleanups {
@@ -729,10 +719,10 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
                     out.push_str(&format!("    int64_t h{pi} = tenon_text_new((int64_t)(uintptr_t)s{pi}, (int64_t)sl{pi});\n"));
                 }
                 BridgeTy::ListInt => {
-                    out.push_str(&format!("    int64_t h{pi} = tn_py_to_list_int(o{pi});\n    if (PyErr_Occurred()) {{ if (h{pi}) tenon_rc_dec(h{pi}); return NULL; }}\n"));
+                    out.push_str(&format!("    int64_t h{pi} = tn_py_to_list_int(args[{pi}]);\n    if (PyErr_Occurred()) {{ if (h{pi}) tenon_rc_dec(h{pi}); return NULL; }}\n"));
                 }
                 BridgeTy::ListFloat => {
-                    out.push_str(&format!("    int64_t h{pi} = tn_py_to_list_f64(o{pi});\n    if (PyErr_Occurred()) {{ if (h{pi}) tenon_rc_dec(h{pi}); return NULL; }}\n"));
+                    out.push_str(&format!("    int64_t h{pi} = tn_py_to_list_f64(args[{pi}]);\n    if (PyErr_Occurred()) {{ if (h{pi}) tenon_rc_dec(h{pi}); return NULL; }}\n"));
                 }
                 _ => {}
             }
@@ -770,9 +760,9 @@ pub fn emit_python_c_ext(program: &Program, mod_name: &str) -> String {
     out.push_str("static PyMethodDef TenonModuleMethods[] = {\n");
     for (f, _) in &fns {
         let fn_ident = sanitize_ident(&f.name);
-        let flags = if f.params.is_empty() { "METH_NOARGS" } else { "METH_VARARGS" };
+        let flags = if f.params.is_empty() { "METH_NOARGS" } else { "METH_FASTCALL" };
         out.push_str(&format!(
-            "    {{\"{}\", py_tn_{fn_ident}, {flags}, \"Tenon verified native function `{}`\"}},\n",
+            "    {{\"{}\", (PyCFunction)py_tn_{fn_ident}, {flags}, \"Tenon verified native function `{}`\"}},\n",
             f.name, f.name
         ));
     }
@@ -967,18 +957,91 @@ pub fn emit_napi_c_addon(program: &Program, mod_name: &str) -> String {
          extern napi_status napi_get_value_string_utf8(napi_env, napi_value, char*, size_t, size_t*);\n\
          extern napi_status napi_define_class(napi_env, const char*, size_t, napi_callback, void*, size_t, const napi_property_descriptor*, napi_value*);\n\
          extern napi_status napi_wrap(napi_env, napi_value, void*, napi_finalize, void*, napi_ref*);\n\
-         extern napi_status napi_unwrap(napi_env, napi_value, void**);\n\n\
+         extern napi_status napi_unwrap(napi_env, napi_value, void**);\n\
+         extern napi_status napi_is_typedarray(napi_env, napi_value, bool*);\n\
+         extern napi_status napi_get_typedarray_info(napi_env, napi_value, int*, size_t*, void**, napi_value*, size_t*);\n\
+         extern napi_status napi_create_arraybuffer(napi_env, size_t, void**, napi_value*);\n\
+         extern napi_status napi_create_typedarray(napi_env, int, size_t, napi_value, size_t, napi_value*);\n\
+         extern napi_status napi_get_array_length(napi_env, napi_value, uint32_t*);\n\
+         extern napi_status napi_get_element(napi_env, napi_value, uint32_t, napi_value*);\n\
+         extern napi_status napi_create_array_with_length(napi_env, size_t, napi_value*);\n\
+         extern napi_status napi_set_element(napi_env, napi_value, uint32_t, napi_value);\n\n\
          extern int64_t tenon_rc_alloc(int64_t tag, int64_t len);\n\
          extern void tenon_rc_set_rc_mask(int64_t ptr, int64_t mask);\n\
          extern void tenon_rc_dec(int64_t ptr);\n\
          extern int64_t tenon_rc_get_field(int64_t ptr, int64_t idx);\n\
          extern void tenon_rc_set_field(int64_t ptr, int64_t idx, int64_t val);\n\
+         extern int64_t tenon_rc_get_len(int64_t ptr);\n\
+         extern int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc);\n\
+         extern void* tenon_obj_fields_ptr(int64_t ptr);\n\
          extern int64_t tenon_text_new(int64_t data_ptr, int64_t byte_len);\n\
          extern const char* tenon_text_data_ptr(int64_t ptr);\n\
          extern int64_t tenon_text_byte_len(int64_t ptr);\n\
          extern int64_t tenon_rt_live_objects(void);\n\n\
          static inline int64_t tn_f64_to_bits(double v) {{ int64_t b; memcpy(&b, &v, 8); return b; }}\n\
          static inline double tn_bits_to_f64(int64_t b) {{ double v; memcpy(&v, &b, 8); return v; }}\n\
+         static int64_t tn_napi_to_list_f64(napi_env env, napi_value v) {{\n\
+             bool is_ta = false;\n\
+             napi_is_typedarray(env, v, &is_ta);\n\
+             if (is_ta) {{\n\
+                 int ty = 0; size_t len = 0, off = 0; void* data = NULL; napi_value ab = NULL;\n\
+                 if (napi_get_typedarray_info(env, v, &ty, &len, &data, &ab, &off) == 0 && ty == 8) {{\n\
+                     int64_t h = tenon_list_filled((int64_t)len, 0, 0);\n\
+                     if (len > 0) memcpy(tenon_obj_fields_ptr(h), data, len * sizeof(double));\n\
+                     return h;\n\
+                 }}\n\
+             }}\n\
+             uint32_t len = 0; napi_get_array_length(env, v, &len);\n\
+             int64_t h = tenon_list_filled((int64_t)len, 0, 0);\n\
+             double* dst = (double*)tenon_obj_fields_ptr(h);\n\
+             for (uint32_t i = 0; i < len; i++) {{\n\
+                 napi_value el = NULL; double dv = 0.0;\n\
+                 napi_get_element(env, v, i, &el); napi_get_value_double(env, el, &dv);\n\
+                 dst[i] = dv;\n\
+             }}\n\
+             return h;\n\
+         }}\n\
+         static int64_t tn_napi_to_list_int(napi_env env, napi_value v) {{\n\
+             bool is_ta = false;\n\
+             napi_is_typedarray(env, v, &is_ta);\n\
+             if (is_ta) {{\n\
+                 int ty = 0; size_t len = 0, off = 0; void* data = NULL; napi_value ab = NULL;\n\
+                 if (napi_get_typedarray_info(env, v, &ty, &len, &data, &ab, &off) == 0 && ty == 9) {{\n\
+                     int64_t h = tenon_list_filled((int64_t)len, 0, 0);\n\
+                     if (len > 0) memcpy(tenon_obj_fields_ptr(h), data, len * sizeof(int64_t));\n\
+                     return h;\n\
+                 }}\n\
+             }}\n\
+             uint32_t len = 0; napi_get_array_length(env, v, &len);\n\
+             int64_t h = tenon_list_filled((int64_t)len, 0, 0);\n\
+             int64_t* dst = (int64_t*)tenon_obj_fields_ptr(h);\n\
+             for (uint32_t i = 0; i < len; i++) {{\n\
+                 napi_value el = NULL; int64_t iv = 0;\n\
+                 napi_get_element(env, v, i, &el); napi_get_value_int64(env, el, &iv);\n\
+                 dst[i] = iv;\n\
+             }}\n\
+             return h;\n\
+         }}\n\
+         static napi_value tn_napi_from_list_f64(napi_env env, int64_t h) {{\n\
+             size_t len = (size_t)tenon_rc_get_len(h);\n\
+             void* ab_data = NULL; napi_value ab = NULL; napi_value ta = NULL;\n\
+             napi_create_arraybuffer(env, len * sizeof(double), &ab_data, &ab);\n\
+             if (len > 0) memcpy(ab_data, tenon_obj_fields_ptr(h), len * sizeof(double));\n\
+             tenon_rc_dec(h);\n\
+             napi_create_typedarray(env, 8, len, ab, 0, &ta);\n\
+             return ta;\n\
+         }}\n\
+         static napi_value tn_napi_from_list_int(napi_env env, int64_t h) {{\n\
+             size_t len = (size_t)tenon_rc_get_len(h);\n\
+             napi_value arr = NULL; napi_create_array_with_length(env, len, &arr);\n\
+             const int64_t* src = (const int64_t*)tenon_obj_fields_ptr(h);\n\
+             for (size_t i = 0; i < len; i++) {{\n\
+                 napi_value el = NULL; napi_create_int64(env, src[i], &el);\n\
+                 napi_set_element(env, arr, (uint32_t)i, el);\n\
+             }}\n\
+             tenon_rc_dec(h);\n\
+             return arr;\n\
+         }}\n\
          static int64_t tn_napi_to_text(napi_env env, napi_value v) {{\n\
              size_t len = 0;\n\
              napi_get_value_string_utf8(env, v, NULL, 0, &len);\n\
@@ -1159,6 +1222,16 @@ pub fn emit_napi_c_addon(program: &Program, mod_name: &str) -> String {
                     call_args.push(format!("h{pi}"));
                     cleanups.push(pi);
                 }
+                BridgeTy::ListFloat => {
+                    out.push_str(&format!("    int64_t h{pi} = (argc > {pi}) ? tn_napi_to_list_f64(env, argv[{pi}]) : tenon_list_filled(0, 0, 0);\n"));
+                    call_args.push(format!("h{pi}"));
+                    cleanups.push(pi);
+                }
+                BridgeTy::ListInt => {
+                    out.push_str(&format!("    int64_t h{pi} = (argc > {pi}) ? tn_napi_to_list_int(env, argv[{pi}]) : tenon_list_filled(0, 0, 0);\n"));
+                    call_args.push(format!("h{pi}"));
+                    cleanups.push(pi);
+                }
                 BridgeTy::Record(_) => {
                     out.push_str(&format!("    void* rp{pi} = NULL; if (argc > {pi}) napi_unwrap(env, argv[{pi}], &rp{pi});\n"));
                     call_args.push(format!("(int64_t)(uintptr_t)rp{pi}"));
@@ -1255,6 +1328,8 @@ fn emit_napi_return(out: &mut String, rt: &BridgeTy, raw_bits: bool) {
             "    napi_create_string_utf8(env, tenon_text_data_ptr({var}), (size_t)tenon_text_byte_len({var}), &out);\n\
                  tenon_rc_dec({var});\n"
         )),
+        BridgeTy::ListFloat => out.push_str(&format!("    return tn_napi_from_list_f64(env, {var});\n")),
+        BridgeTy::ListInt => out.push_str(&format!("    return tn_napi_from_list_int(env, {var});\n")),
         _ => out.push_str(&format!("    napi_create_int64(env, (int64_t){var}, &out);\n")),
     }
     out.push_str("    return out;\n");
@@ -1815,6 +1890,8 @@ pub fn add_i(a Int, b Int) Int { a + b }
         assert!(py_c.contains("PyTenon_Box2D_Type"));
         assert!(py_c.contains("tenon_fn___m__Box2D__area"));
         assert!(py_c.contains("Py_BEGIN_ALLOW_THREADS"));
+        assert!(py_c.contains("METH_FASTCALL"));
+        assert!(py_c.contains("PyObject_GetBuffer"));
 
         let pyi = emit_python_pyi(&prog, "demo");
         assert!(pyi.contains("class Box2D:"));
@@ -1822,6 +1899,7 @@ pub fn add_i(a Int, b Int) Int { a + b }
 
         let napi = emit_napi_c_addon(&prog, "demo");
         assert!(napi.contains("napi_define_class"));
+        assert!(napi.contains("napi_is_typedarray"));
         assert!(napi.contains("tenon_fn___m__Box2D__area"));
 
         let jni = emit_jni_c_bridge(&prog, "", "Demo");

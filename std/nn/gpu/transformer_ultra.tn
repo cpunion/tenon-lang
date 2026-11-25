@@ -597,17 +597,27 @@ impl UltraMpsTransformer {
         let _ = ultra_embed_off(self.tok_ids_b.handle, h_emb, self.off_tok_emb, self.x_b.handle, 1, d, c.vocab_size)
 
         var l = 0
+        let fuse_norm = d >= 1024 && d <= 4096
         while l < c.n_layers {
             let norm_off = l * d * 2
             let kv_off = l * kv_layer_bytes
-            let _ = ultra_rmsnorm(self.x_b.handle, h_n1, self.off_norm1 + norm_off, self.x_norm_b.handle, 1, d, c.gemma_norm)
-            let _ = ultra_gemv(
-                self.x_norm_b.handle, 0,
-                h_wqkv, self.off_wqkv + l * qkv_stride,
-                self.qkv_b.handle, 0,
-                h_bqkv, self.off_bqkv + l * qkv_dim * 2,
-                qkv_dim, d, qm, false, c.has_qkv_bias,
-            )
+            if fuse_norm {
+                let _ = ultra_norm_gemv(
+                    self.x_b.handle, h_n1, self.off_norm1 + norm_off,
+                    h_wqkv, self.off_wqkv + l * qkv_stride, self.qkv_b.handle,
+                    h_bqkv, self.off_bqkv + l * qkv_dim * 2,
+                    qkv_dim, d, qm, c.gemma_norm, c.has_qkv_bias,
+                )
+            } else {
+                let _ = ultra_rmsnorm(self.x_b.handle, h_n1, self.off_norm1 + norm_off, self.x_norm_b.handle, 1, d, c.gemma_norm)
+                let _ = ultra_gemv(
+                    self.x_norm_b.handle, 0,
+                    h_wqkv, self.off_wqkv + l * qkv_stride,
+                    self.qkv_b.handle, 0,
+                    h_bqkv, self.off_bqkv + l * qkv_dim * 2,
+                    qkv_dim, d, qm, false, c.has_qkv_bias,
+                )
+            }
             let _ = ultra_rope_flash_decode(
                 self.qkv_b.handle,
                 self.k_cache_b.handle, kv_off,
@@ -622,8 +632,8 @@ impl UltraMpsTransformer {
                 h_bqkv, self.off_bqkv,
                 d, d, qm, true, false,
             )
-            let _ = ultra_rmsnorm(self.x_b.handle, h_n2, self.off_norm2 + norm_off, self.x_norm_b.handle, 1, d, c.gemma_norm)
             if c.arch == ARCH_MIXTRAL_MOE {
+                let _ = ultra_rmsnorm(self.x_b.handle, h_n2, self.off_norm2 + norm_off, self.x_norm_b.handle, 1, d, c.gemma_norm)
                 let r_off = self.off_wrouter + l * c.n_experts * d * 2
                 let _ = ultra_moe_router(self.x_norm_b.handle, h_wr, r_off, self.moe_idx_b.handle, self.moe_wt_b.handle, d, c.n_experts)
                 let _ = ultra_moe_expert_ffn(
@@ -647,13 +657,24 @@ impl UltraMpsTransformer {
                     1, ff_exp_elems, d, c.d_ff, qm,
                 )
             } else {
-                let _ = ultra_ffn_gate_up(
-                    self.x_norm_b.handle,
-                    h_wg, self.off_wgate + l * ff_layer_stride,
-                    h_wu, self.off_wup + l * ff_layer_stride,
-                    self.ffn_act_b.handle,
-                    c.d_ff, d, qm, c.is_geglu,
-                )
+                if fuse_norm {
+                    let _ = ultra_norm_ffn_gate_up(
+                        self.x_b.handle, h_n2, self.off_norm2 + norm_off,
+                        h_wg, self.off_wgate + l * ff_layer_stride,
+                        h_wu, self.off_wup + l * ff_layer_stride,
+                        self.ffn_act_b.handle,
+                        c.d_ff, d, qm, c.is_geglu, c.gemma_norm,
+                    )
+                } else {
+                    let _ = ultra_rmsnorm(self.x_b.handle, h_n2, self.off_norm2 + norm_off, self.x_norm_b.handle, 1, d, c.gemma_norm)
+                    let _ = ultra_ffn_gate_up(
+                        self.x_norm_b.handle,
+                        h_wg, self.off_wgate + l * ff_layer_stride,
+                        h_wu, self.off_wup + l * ff_layer_stride,
+                        self.ffn_act_b.handle,
+                        c.d_ff, d, qm, c.is_geglu,
+                    )
+                }
                 let _ = ultra_gemv(
                     self.ffn_act_b.handle, 0,
                     h_wd, self.off_wdown + l * ff_layer_stride,
@@ -679,6 +700,158 @@ impl UltraMpsTransformer {
         let _ = ultra_gpu_argmax_f16(self.logits_b.handle, self.tok_ids_b.handle, c.vocab_size)
         let _ = batch.commit_and_wait()
         ultra_read_u32_0(self.tok_ids_b.handle)
+    }
+
+    /// Multi-Token GPU-Chained Greedy Decode: encodes `n_steps` autoregressive tokens inside ONE
+    /// single `MTLCommandBuffer` + ONE persistent `MTLComputeCommandEncoder` (ZERO inter-token CPU sync!).
+    pub fn decode_steps_greedy(inout self, start_tok Int, start_pos Int, n_steps Int) List[Int] {
+        let c = self.cfg
+        let d = c.d_model
+        let kv_dim = c.n_kv_heads * c.d_head
+        let qkv_dim = d + kv_dim * 2
+        let ms = c.max_seq_len
+        let qm = c.quant_mode
+        let qkv_stride = ultra_weight_stride_bytes(qkv_dim * d, qm)
+        let wo_stride = ultra_weight_stride_bytes(d * d, qm)
+        let ff_exp_elems = c.d_ff * d
+        let ff_exp_stride = ultra_weight_stride_bytes(ff_exp_elems, qm)
+        let ff_layer_stride = ff_exp_stride * c.n_experts
+        let kv_layer_bytes = kv_dim * ms * 2
+
+        let is_mm = self.mmap_b.handle > 0
+        let mh = self.mmap_b.handle
+        let h_emb = if is_mm { mh } else { self.tok_emb_b.handle }
+        let h_n1 = if is_mm { mh } else { self.norm1_b.handle }
+        let h_wqkv = if is_mm { mh } else { self.wqkv_b.handle }
+        let h_bqkv = if is_mm { mh } else { self.bqkv_b.handle }
+        let h_wo = if is_mm { mh } else { self.wo_b.handle }
+        let h_n2 = if is_mm { mh } else { self.norm2_b.handle }
+        let h_wg = if is_mm { mh } else { self.wgate_b.handle }
+        let h_wu = if is_mm { mh } else { self.wup_b.handle }
+        let h_wd = if is_mm { mh } else { self.wdown_b.handle }
+        let h_wr = if is_mm { mh } else { self.wrouter_b.handle }
+        let h_fn = if is_mm { mh } else { self.fnorm_b.handle }
+        let h_lm = if is_mm { mh } else { self.lmhead_b.handle }
+
+        let hist_b = GpuBuffer.uninit(if n_steps > 0 { n_steps * 4 } else { 4 })
+        let _ = mps_write_params4(self.tok_ids_b.handle, 0, start_tok, 0, 0, 0)
+        let batch = MpsBatch.begin()
+        var s = 0
+        while s < n_steps {
+            let pos = start_pos + s
+            let _ = ultra_embed_off(self.tok_ids_b.handle, h_emb, self.off_tok_emb, self.x_b.handle, 1, d, c.vocab_size)
+            var l = 0
+            let fuse_norm = d >= 1024 && d <= 4096
+            while l < c.n_layers {
+                let norm_off = l * d * 2
+                let kv_off = l * kv_layer_bytes
+                if fuse_norm {
+                    let _ = ultra_norm_gemv(
+                        self.x_b.handle, h_n1, self.off_norm1 + norm_off,
+                        h_wqkv, self.off_wqkv + l * qkv_stride, self.qkv_b.handle,
+                        h_bqkv, self.off_bqkv + l * qkv_dim * 2,
+                        qkv_dim, d, qm, c.gemma_norm, c.has_qkv_bias,
+                    )
+                } else {
+                    let _ = ultra_rmsnorm(self.x_b.handle, h_n1, self.off_norm1 + norm_off, self.x_norm_b.handle, 1, d, c.gemma_norm)
+                    let _ = ultra_gemv(
+                        self.x_norm_b.handle, 0,
+                        h_wqkv, self.off_wqkv + l * qkv_stride,
+                        self.qkv_b.handle, 0,
+                        h_bqkv, self.off_bqkv + l * qkv_dim * 2,
+                        qkv_dim, d, qm, false, c.has_qkv_bias,
+                    )
+                }
+                let _ = ultra_rope_flash_decode(
+                    self.qkv_b.handle,
+                    self.k_cache_b.handle, kv_off,
+                    self.v_cache_b.handle, kv_off,
+                    self.ctx_flat_b.handle,
+                    c.n_heads, c.n_kv_heads, c.d_head, pos, ms, c.attn_softcap,
+                )
+                let _ = ultra_gemv(
+                    self.ctx_flat_b.handle, 0,
+                    h_wo, self.off_wo + l * wo_stride,
+                    self.x_b.handle, 0,
+                    h_bqkv, self.off_bqkv,
+                    d, d, qm, true, false,
+                )
+                if c.arch == ARCH_MIXTRAL_MOE {
+                    let _ = ultra_rmsnorm(self.x_b.handle, h_n2, self.off_norm2 + norm_off, self.x_norm_b.handle, 1, d, c.gemma_norm)
+                    let r_off = self.off_wrouter + l * c.n_experts * d * 2
+                    let _ = ultra_moe_router(self.x_norm_b.handle, h_wr, r_off, self.moe_idx_b.handle, self.moe_wt_b.handle, d, c.n_experts)
+                    let _ = ultra_moe_expert_ffn(
+                        self.x_norm_b.handle, h_wg, self.off_wgate + l * ff_layer_stride,
+                        h_wu, self.off_wup + l * ff_layer_stride, self.ffn_act_b.handle,
+                        self.moe_idx_b.handle, 0, ff_exp_elems, c.d_ff, d, qm, c.is_geglu,
+                    )
+                    let _ = ultra_moe_expert_down(
+                        self.ffn_act_b.handle, h_wd, self.off_wdown + l * ff_layer_stride,
+                        self.x_b.handle, self.moe_idx_b.handle, self.moe_wt_b.handle,
+                        0, ff_exp_elems, d, c.d_ff, qm,
+                    )
+                    let _ = ultra_moe_expert_ffn(
+                        self.x_norm_b.handle, h_wg, self.off_wgate + l * ff_layer_stride,
+                        h_wu, self.off_wup + l * ff_layer_stride, self.ffn_act_b.handle,
+                        self.moe_idx_b.handle, 1, ff_exp_elems, c.d_ff, d, qm, c.is_geglu,
+                    )
+                    let _ = ultra_moe_expert_down(
+                        self.ffn_act_b.handle, h_wd, self.off_wdown + l * ff_layer_stride,
+                        self.x_b.handle, self.moe_idx_b.handle, self.moe_wt_b.handle,
+                        1, ff_exp_elems, d, c.d_ff, qm,
+                    )
+                } else {
+                    if fuse_norm {
+                        let _ = ultra_norm_ffn_gate_up(
+                            self.x_b.handle, h_n2, self.off_norm2 + norm_off,
+                            h_wg, self.off_wgate + l * ff_layer_stride,
+                            h_wu, self.off_wup + l * ff_layer_stride,
+                            self.ffn_act_b.handle,
+                            c.d_ff, d, qm, c.is_geglu, c.gemma_norm,
+                        )
+                    } else {
+                        let _ = ultra_rmsnorm(self.x_b.handle, h_n2, self.off_norm2 + norm_off, self.x_norm_b.handle, 1, d, c.gemma_norm)
+                        let _ = ultra_ffn_gate_up(
+                            self.x_norm_b.handle,
+                            h_wg, self.off_wgate + l * ff_layer_stride,
+                            h_wu, self.off_wup + l * ff_layer_stride,
+                            self.ffn_act_b.handle,
+                            c.d_ff, d, qm, c.is_geglu,
+                        )
+                    }
+                    let _ = ultra_gemv(
+                        self.ffn_act_b.handle, 0,
+                        h_wd, self.off_wdown + l * ff_layer_stride,
+                        self.x_b.handle, 0,
+                        h_bqkv, self.off_bqkv,
+                        d, c.d_ff, qm, true, false,
+                    )
+                }
+                l += 1
+            }
+            let _ = ultra_rmsnorm(self.x_b.handle, h_fn, self.off_fnorm, self.x_norm_b.handle, 1, d, c.gemma_norm)
+            let _ = ultra_gemv(
+                self.x_norm_b.handle, 0,
+                h_lm, self.off_lmhead,
+                self.logits_b.handle, 0,
+                h_bqkv, self.off_bqkv,
+                c.vocab_size, d, qm, false, false,
+            )
+            if c.logit_softcap > 0.0 {
+                let _ = ultra_softcap(self.logits_b.handle, c.vocab_size, c.logit_softcap)
+            }
+            let _ = ultra_gpu_argmax_step_f16(self.logits_b.handle, self.tok_ids_b.handle, hist_b.handle, s, c.vocab_size)
+            s += 1
+        }
+        let _ = batch.commit_and_wait()
+        var out List[Int] = list_filled(n_steps, 0)
+        var k = 0
+        while k < n_steps {
+            out[k] = ultra_read_u32_at(hist_b.handle, k)
+            k += 1
+        }
+        hist_b.destroy()
+        out
     }
 
     /// Hybrid Multi-Token Prefill (`seq_len >= 1`): On-GPU Dequant + Apple Hardware `MPSMatrixMultiplication`
@@ -730,17 +903,24 @@ impl UltraMpsTransformer {
 
             let _ = ultra_rmsnorm(self.x_b.handle, h_n1, self.off_norm1 + norm_off, self.x_norm_b.handle, seq_len, d, c.gemma_norm)
 
-            let wqkv_h = if qm == QUANT_FP16 { h_wqkv } else {
-                let _ = ultra_dequant_to_f16(h_wqkv, self.off_wqkv + l * qkv_stride, self.deq_b.handle, qkv_dim * d, qm)
-                self.deq_b.handle
+            if qm != QUANT_FP16 && seq_len >= 16 {
+                let _ = ultra_mm_quant_f16(
+                    self.x_norm_b.handle, h_wqkv, self.off_wqkv + l * qkv_stride,
+                    self.qkv_b.handle, seq_len, qkv_dim, d, qm, false,
+                )
+            } else {
+                let wqkv_h = if qm == QUANT_FP16 { h_wqkv } else {
+                    let _ = ultra_dequant_to_f16(h_wqkv, self.off_wqkv + l * qkv_stride, self.deq_b.handle, qkv_dim * d, qm)
+                    self.deq_b.handle
+                }
+                let wqkv_off = if qm == QUANT_FP16 { self.off_wqkv + l * qkv_stride } else { 0 }
+                let _ = mps_gemm_f16_raw(
+                    self.x_norm_b.handle, 0, d,
+                    wqkv_h, wqkv_off, d,
+                    self.qkv_b.handle, 0, qkv_dim,
+                    seq_len, qkv_dim, d, false, true, 1.0, 0.0,
+                )
             }
-            let wqkv_off = if qm == QUANT_FP16 { self.off_wqkv + l * qkv_stride } else { 0 }
-            let _ = mps_gemm_f16_raw(
-                self.x_norm_b.handle, 0, d,
-                wqkv_h, wqkv_off, d,
-                self.qkv_b.handle, 0, qkv_dim,
-                seq_len, qkv_dim, d, false, true, 1.0, 0.0,
-            )
             if c.has_qkv_bias {
                 let _ = ultra_add_bias_rows(self.qkv_b.handle, h_bqkv, self.off_bqkv + l * qkv_dim * 2, seq_len, qkv_dim)
             }
@@ -785,53 +965,76 @@ impl UltraMpsTransformer {
             }
             let _ = ultra_from_heads(self.ctx_heads_b.handle, self.ctx_flat_b.handle, seq_len, c.n_heads, c.d_head)
 
-            let wo_h = if qm == QUANT_FP16 { h_wo } else {
-                let _ = ultra_dequant_to_f16(h_wo, self.off_wo + l * wo_stride, self.deq_b.handle, d * d, qm)
-                self.deq_b.handle
+            if qm != QUANT_FP16 && seq_len >= 16 {
+                let _ = ultra_mm_quant_f16(
+                    self.ctx_flat_b.handle, h_wo, self.off_wo + l * wo_stride,
+                    self.x_b.handle, seq_len, d, d, qm, true,
+                )
+            } else {
+                let wo_h = if qm == QUANT_FP16 { h_wo } else {
+                    let _ = ultra_dequant_to_f16(h_wo, self.off_wo + l * wo_stride, self.deq_b.handle, d * d, qm)
+                    self.deq_b.handle
+                }
+                let wo_off = if qm == QUANT_FP16 { self.off_wo + l * wo_stride } else { 0 }
+                let _ = mps_gemm_f16_raw(
+                    self.ctx_flat_b.handle, 0, d,
+                    wo_h, wo_off, d,
+                    self.x_b.handle, 0, d,
+                    seq_len, d, d, false, true, 1.0, 1.0,
+                )
             }
-            let wo_off = if qm == QUANT_FP16 { self.off_wo + l * wo_stride } else { 0 }
-            let _ = mps_gemm_f16_raw(
-                self.ctx_flat_b.handle, 0, d,
-                wo_h, wo_off, d,
-                self.x_b.handle, 0, d,
-                seq_len, d, d, false, true, 1.0, 1.0,
-            )
 
             let _ = ultra_rmsnorm(self.x_b.handle, h_n2, self.off_norm2 + norm_off, self.x_norm_b.handle, seq_len, d, c.gemma_norm)
-            let wg_h = if qm == QUANT_FP16 { h_wg } else {
-                let _ = ultra_dequant_to_f16(h_wg, self.off_wgate + l * ff_layer_stride, self.deq_b.handle, c.d_ff * d, qm)
-                self.deq_b.handle
+            if qm != QUANT_FP16 && seq_len >= 16 {
+                let _ = ultra_mm_quant_f16(
+                    self.x_norm_b.handle, h_wg, self.off_wgate + l * ff_layer_stride,
+                    self.ffn_gate_b.handle, seq_len, c.d_ff, d, qm, false,
+                )
+                let _ = ultra_mm_quant_f16(
+                    self.x_norm_b.handle, h_wu, self.off_wup + l * ff_layer_stride,
+                    self.ffn_up_b.handle, seq_len, c.d_ff, d, qm, false,
+                )
+                let _ = ultra_gated_act(self.ffn_gate_b.handle, self.ffn_up_b.handle, self.ffn_act_b.handle, seq_len * c.d_ff, c.is_geglu)
+                let _ = ultra_mm_quant_f16(
+                    self.ffn_act_b.handle, h_wd, self.off_wdown + l * ff_layer_stride,
+                    self.x_b.handle, seq_len, d, c.d_ff, qm, true,
+                )
+            } else {
+                let wg_h = if qm == QUANT_FP16 { h_wg } else {
+                    let _ = ultra_dequant_to_f16(h_wg, self.off_wgate + l * ff_layer_stride, self.deq_b.handle, c.d_ff * d, qm)
+                    self.deq_b.handle
+                }
+                let wg_off = if qm == QUANT_FP16 { self.off_wgate + l * ff_layer_stride } else { 0 }
+                let _ = mps_gemm_f16_raw(
+                    self.x_norm_b.handle, 0, d,
+                    wg_h, wg_off, d,
+                    self.ffn_gate_b.handle, 0, c.d_ff,
+                    seq_len, c.d_ff, d, false, true, 1.0, 0.0,
+                )
+                let wu_h = if qm == QUANT_FP16 { h_wu } else {
+                    let _ = ultra_dequant_to_f16(h_wu, self.off_wup + l * ff_layer_stride, self.deq_b.handle, c.d_ff * d, qm)
+                    self.deq_b.handle
+                }
+                let wu_off = if qm == QUANT_FP16 { self.off_wup + l * ff_layer_stride } else { 0 }
+                let _ = mps_gemm_f16_raw(
+                    self.x_norm_b.handle, 0, d,
+                    wu_h, wu_off, d,
+                    self.ffn_up_b.handle, 0, c.d_ff,
+                    seq_len, c.d_ff, d, false, true, 1.0, 0.0,
+                )
+                let _ = ultra_gated_act(self.ffn_gate_b.handle, self.ffn_up_b.handle, self.ffn_act_b.handle, seq_len * c.d_ff, c.is_geglu)
+                let wd_h = if qm == QUANT_FP16 { h_wd } else {
+                    let _ = ultra_dequant_to_f16(h_wd, self.off_wdown + l * ff_layer_stride, self.deq_b.handle, d * c.d_ff, qm)
+                    self.deq_b.handle
+                }
+                let wd_off = if qm == QUANT_FP16 { self.off_wdown + l * ff_layer_stride } else { 0 }
+                let _ = mps_gemm_f16_raw(
+                    self.ffn_act_b.handle, 0, c.d_ff,
+                    wd_h, wd_off, c.d_ff,
+                    self.x_b.handle, 0, d,
+                    seq_len, d, c.d_ff, false, true, 1.0, 1.0,
+                )
             }
-            let wg_off = if qm == QUANT_FP16 { self.off_wgate + l * ff_layer_stride } else { 0 }
-            let _ = mps_gemm_f16_raw(
-                self.x_norm_b.handle, 0, d,
-                wg_h, wg_off, d,
-                self.ffn_gate_b.handle, 0, c.d_ff,
-                seq_len, c.d_ff, d, false, true, 1.0, 0.0,
-            )
-            let wu_h = if qm == QUANT_FP16 { h_wu } else {
-                let _ = ultra_dequant_to_f16(h_wu, self.off_wup + l * ff_layer_stride, self.deq_b.handle, c.d_ff * d, qm)
-                self.deq_b.handle
-            }
-            let wu_off = if qm == QUANT_FP16 { self.off_wup + l * ff_layer_stride } else { 0 }
-            let _ = mps_gemm_f16_raw(
-                self.x_norm_b.handle, 0, d,
-                wu_h, wu_off, d,
-                self.ffn_up_b.handle, 0, c.d_ff,
-                seq_len, c.d_ff, d, false, true, 1.0, 0.0,
-            )
-            let _ = ultra_gated_act(self.ffn_gate_b.handle, self.ffn_up_b.handle, self.ffn_act_b.handle, seq_len * c.d_ff, c.is_geglu)
-            let wd_h = if qm == QUANT_FP16 { h_wd } else {
-                let _ = ultra_dequant_to_f16(h_wd, self.off_wdown + l * ff_layer_stride, self.deq_b.handle, d * c.d_ff, qm)
-                self.deq_b.handle
-            }
-            let wd_off = if qm == QUANT_FP16 { self.off_wdown + l * ff_layer_stride } else { 0 }
-            let _ = mps_gemm_f16_raw(
-                self.ffn_act_b.handle, 0, c.d_ff,
-                wd_h, wd_off, c.d_ff,
-                self.x_b.handle, 0, d,
-                seq_len, d, c.d_ff, false, true, 1.0, 1.0,
-            )
             l += 1
         }
 

@@ -33,7 +33,13 @@ extern "C" {
         n_heads Int, n_kv Int, d_head Int, pos Int, max_seq Int, softcap Float,
     ) Int
     fn tn_ultra_argmax_f16(logits_h Int, out_tok_h Int, n_elems Int) Int
+    fn tn_ultra_argmax_step_f16(logits_h Int, cur_tok_h Int, hist_tok_h Int, step_idx Int, n_elems Int) Int
     fn tn_ultra_read_u32_0(buf_h Int) Int
+    fn tn_ultra_read_u32_at(buf_h Int, idx Int) Int
+    fn tn_ultra_mm_quant_f16(
+        x_h Int, w_h Int, w_off Int, y_h Int,
+        m Int, n Int, k Int, quant_mode Int, add_res Int,
+    ) Int
     fn tn_ultra_gemv(
         x_h Int, x_off Int,
         w_h Int, w_off Int,
@@ -49,6 +55,19 @@ extern "C" {
         out_h Int,
         d_ff Int, in_dim Int,
         quant_mode Int, is_geglu Int,
+    ) Int
+    fn tn_ultra_norm_gemv(
+        x_h Int, wn_h Int, wn_off Int,
+        w_h Int, w_off Int, y_h Int,
+        bias_h Int, bias_off Int,
+        out_dim Int, in_dim Int,
+        quant_mode Int, gemma_mode Int, has_bias Int,
+    ) Int
+    fn tn_ultra_norm_ffn_gate_up(
+        x_h Int, wn_h Int, wn_off Int,
+        wg_h Int, wg_off Int, wu_h Int, wu_off Int,
+        out_h Int, d_ff Int, in_dim Int,
+        quant_mode Int, is_geglu Int, gemma_mode Int,
     ) Int
     fn tn_ultra_dequant_to_f16(src_h Int, src_off Int, dst_h Int, n_elems Int, quant_mode Int) Int
     fn tn_ultra_softcap(buf_h Int, n_elems Int, cap Float) Int
@@ -174,8 +193,23 @@ pub fn ultra_gpu_argmax_f16(logits_h Int, out_tok_h Int, n_elems Int) Bool {
     unsafe { tn_ultra_argmax_f16(logits_h, out_tok_h, n_elems) != 0 }
 }
 
+pub fn ultra_gpu_argmax_step_f16(logits_h Int, cur_tok_h Int, hist_tok_h Int, step_idx Int, n_elems Int) Bool {
+    unsafe { tn_ultra_argmax_step_f16(logits_h, cur_tok_h, hist_tok_h, step_idx, n_elems) != 0 }
+}
+
 pub fn ultra_read_u32_0(buf_h Int) Int {
     unsafe { tn_ultra_read_u32_0(buf_h) }
+}
+
+pub fn ultra_read_u32_at(buf_h Int, idx Int) Int {
+    unsafe { tn_ultra_read_u32_at(buf_h, idx) }
+}
+
+pub fn ultra_mm_quant_f16(
+    x_h Int, w_h Int, w_off Int, y_h Int,
+    m Int, n Int, k Int, quant_mode Int, add_res Bool,
+) Bool {
+    unsafe { tn_ultra_mm_quant_f16(x_h, w_h, w_off, y_h, m, n, k, quant_mode, if add_res { 1 } else { 0 }) != 0 }
 }
 
 pub fn ultra_gemv(
@@ -201,6 +235,39 @@ pub fn ultra_ffn_gate_up(
     d_ff Int, in_dim Int, quant_mode Int, is_geglu Bool,
 ) Bool {
     unsafe { tn_ultra_ffn_gate_up(x_h, wg_h, wg_off, wu_h, wu_off, out_h, d_ff, in_dim, quant_mode, if is_geglu { 1 } else { 0 }) != 0 }
+}
+
+pub fn ultra_norm_gemv(
+    x_h Int, wn_h Int, wn_off Int,
+    w_h Int, w_off Int, y_h Int,
+    bias_h Int, bias_off Int,
+    out_dim Int, in_dim Int,
+    quant_mode Int, gemma_mode Bool, has_bias Bool,
+) Bool {
+    unsafe {
+        tn_ultra_norm_gemv(
+            x_h, wn_h, wn_off, w_h, w_off, y_h, bias_h, bias_off,
+            out_dim, in_dim, quant_mode,
+            if gemma_mode { 1 } else { 0 },
+            if has_bias { 1 } else { 0 },
+        ) != 0
+    }
+}
+
+pub fn ultra_norm_ffn_gate_up(
+    x_h Int, wn_h Int, wn_off Int,
+    wg_h Int, wg_off Int, wu_h Int, wu_off Int,
+    out_h Int, d_ff Int, in_dim Int,
+    quant_mode Int, is_geglu Bool, gemma_mode Bool,
+) Bool {
+    unsafe {
+        tn_ultra_norm_ffn_gate_up(
+            x_h, wn_h, wn_off, wg_h, wg_off, wu_h, wu_off,
+            out_h, d_ff, in_dim, quant_mode,
+            if is_geglu { 1 } else { 0 },
+            if gemma_mode { 1 } else { 0 },
+        ) != 0
+    }
 }
 
 pub fn ultra_dequant_to_f16(src_h Int, src_off Int, dst_h Int, n_elems Int, quant_mode Int) Bool {

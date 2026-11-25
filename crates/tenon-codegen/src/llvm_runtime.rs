@@ -160,7 +160,7 @@ int64_t tenon_bytes_push(int64_t b, int64_t byte_val) {
     int64_t old_len = hdr->len;
     int64_t cap_bytes = hdr->cap * 8;
 #ifdef TENON_THREAD_SAFE
-    int is_uniq = __atomic_load_n(&hdr->rc, __ATOMIC_ACQUIRE) == 1;
+    int is_uniq = tenon_rc_is_unique_mt(hdr);
 #else
     int is_uniq = hdr->rc == 1;
 #endif
@@ -428,6 +428,7 @@ static void* tenon_thread_trampoline(void* arg) {
 
 int64_t tenon_thread_spawn(int64_t closure_ptr) {
     if (closure_ptr == 0) return 0;
+    tenon_rc_mark_shared(closure_ptr);
     TenonThreadRec* tr = (TenonThreadRec*)calloc(1, sizeof(TenonThreadRec));
     tr->closure = tenon_rc_inc(closure_ptr);
     pthread_create(&tr->th, NULL, tenon_thread_trampoline, tr);
@@ -536,7 +537,7 @@ int64_t tenon_mutex_new(int64_t init_val, int64_t elem_is_rc) {
     TenonObj* obj = tenon_rc_alloc_raw(14, 2, 2);
     if (elem_is_rc != 0) {
         obj->rc_mask = 2;
-        if (init_val != 0) tenon_rc_inc(init_val);
+        if (init_val != 0) { tenon_rc_mark_shared(init_val); tenon_rc_inc(init_val); }
     }
     obj->fields[0] = (int64_t)(uintptr_t)mu;
     obj->fields[1] = init_val;
@@ -570,7 +571,7 @@ int64_t tenon_mutex_set(int64_t m, int64_t val) {
     TenonObj* obj = (TenonObj*)(uintptr_t)m;
     int is_rc = (obj->rc_mask & 2) != 0;
     int64_t old = obj->fields[1];
-    if (is_rc && val != 0) tenon_rc_inc(val);
+    if (is_rc && val != 0) { tenon_rc_mark_shared(val); tenon_rc_inc(val); }
     obj->fields[1] = val;
     if (is_rc && old != 0) tenon_rc_dec(old);
     return 0;
@@ -624,7 +625,7 @@ int64_t tenon_chan_send(int64_t ch_ptr, int64_t val) {
         pthread_mutex_unlock(&ch->mu);
         return 0;
     }
-    if (is_rc && val != 0) tenon_rc_inc(val);
+    if (is_rc && val != 0) { tenon_rc_mark_shared(val); tenon_rc_inc(val); }
     TenonChanNode* node = (TenonChanNode*)malloc(sizeof(TenonChanNode));
     node->val = val;
     node->next = NULL;
@@ -1205,6 +1206,7 @@ void tenon_sched_preempt_point(void) {
 
 int64_t tenon_sched_spawn_owned(int64_t closure_ptr) {
     if (closure_ptr == 0) return 0;
+    tenon_rc_mark_shared(closure_ptr);
     tn_sched_ensure_init();
     int wid = tn_sched_get_or_claim_wid();
     TenonTask* t = __builtin_expect(wid == g_num_workers, 1) ? tn_task_alloc_main() : tn_task_alloc();
@@ -1602,18 +1604,32 @@ int64_t tenon_reactor_close(int64_t rfd) {
 }
 "#;
 
-/// Atomic Perceus RC inline LLVM IR helpers — ONLY emitted when the program uses threads/atomics!
+/// Biased Non-Atomic + Atomic Perceus RC inline LLVM IR helpers — ONLY emitted when the program uses threads/atomics!
+/// Thread-local objects (`owner_tid == tenon_tls_owner_tid`) execute 0 atomic instructions (~0.5ns vs ~5ns)!
 pub(crate) const TENON_ATOMIC_RC_IR_HELPERS: &str = r#"
+@tenon_tls_owner_tid = external thread_local global i32
+
 define internal i64 @__tn_rc_inc(i64 %p) alwaysinline {
 entry:
   %nz = icmp ne i64 %p, 0
   br i1 %nz, label %chk, label %done
 chk:
   %obj = inttoptr i64 %p to ptr
-  %rc = load atomic i64, ptr %obj monotonic, align 8
-  %pos = icmp sgt i64 %rc, 0
-  br i1 %pos, label %inc, label %done
-inc:
+  %rc = load i64, ptr %obj, align 8
+  %hi = lshr i64 %rc, 32
+  %own = trunc i64 %hi to i32
+  %me = load i32, ptr @tenon_tls_owner_tid, align 4
+  %mine = icmp eq i32 %own, %me
+  br i1 %mine, label %fast_inc, label %shared_chk
+fast_inc:
+  %nxt = add i64 %rc, 1
+  store i64 %nxt, ptr %obj, align 8
+  br label %done
+shared_chk:
+  %src = load atomic i64, ptr %obj monotonic, align 8
+  %pos = icmp sgt i64 %src, 0
+  br i1 %pos, label %atomic_inc, label %done
+atomic_inc:
   %old = atomicrmw add ptr %obj, i64 1 monotonic, align 8
   br label %done
 done:
@@ -1626,15 +1642,32 @@ entry:
   br i1 %nz, label %chk, label %done
 chk:
   %obj = inttoptr i64 %p to ptr
-  %rc = load atomic i64, ptr %obj acquire, align 8
-  %is1 = icmp eq i64 %rc, 1
-  br i1 %is1, label %free, label %chk_gt
-chk_gt:
-  %pos = icmp sgt i64 %rc, 1
-  br i1 %pos, label %dec, label %done
-dec:
+  %rc = load i64, ptr %obj, align 8
+  %hi = lshr i64 %rc, 32
+  %own = trunc i64 %hi to i32
+  %me = load i32, ptr @tenon_tls_owner_tid, align 4
+  %mine = icmp eq i32 %own, %me
+  br i1 %mine, label %fast_dec, label %shared_chk
+fast_dec:
+  %cnt = trunc i64 %rc to i32
+  %is1 = icmp ule i32 %cnt, 1
+  br i1 %is1, label %free, label %fast_sub
+fast_sub:
+  %nxt = sub i64 %rc, 1
+  store i64 %nxt, ptr %obj, align 8
+  br label %done
+shared_chk:
+  %src = load atomic i64, ptr %obj acquire, align 8
+  %pos = icmp sgt i64 %src, 0
+  br i1 %pos, label %shared_live, label %done
+shared_live:
+  %scnt = trunc i64 %src to i32
+  %sis1 = icmp eq i32 %scnt, 1
+  br i1 %sis1, label %free, label %atomic_dec
+atomic_dec:
   %old = atomicrmw sub ptr %obj, i64 1 acq_rel, align 8
-  %was1 = icmp sle i64 %old, 1
+  %ocnt = trunc i64 %old to i32
+  %was1 = icmp ule i32 %ocnt, 1
   br i1 %was1, label %free, label %done
 free:
   tail call void @tenon_rc_free_obj(i64 %p)
@@ -1649,9 +1682,21 @@ entry:
   br i1 %nz, label %chk, label %ret0
 chk:
   %obj = inttoptr i64 %p to ptr
-  %rc = load atomic i64, ptr %obj acquire, align 8
-  %uniq = icmp eq i64 %rc, 1
-  br i1 %uniq, label %retp, label %slow
+  %rc = load i64, ptr %obj, align 8
+  %hi = lshr i64 %rc, 32
+  %own = trunc i64 %hi to i32
+  %me = load i32, ptr @tenon_tls_owner_tid, align 4
+  %mine = icmp eq i32 %own, %me
+  br i1 %mine, label %fast_uniq, label %shared_uniq
+fast_uniq:
+  %cnt = trunc i64 %rc to i32
+  %u1 = icmp eq i32 %cnt, 1
+  br i1 %u1, label %retp, label %slow
+shared_uniq:
+  %src = load atomic i64, ptr %obj acquire, align 8
+  %scnt = trunc i64 %src to i32
+  %su1 = icmp eq i32 %scnt, 1
+  br i1 %su1, label %retp, label %slow
 slow:
   %cow = tail call i64 @tenon_rc_ensure_unique(i64 %p)
   ret i64 %cow

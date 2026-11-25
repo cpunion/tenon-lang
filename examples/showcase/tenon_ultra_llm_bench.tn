@@ -317,13 +317,26 @@ fn bench_mmap_1b(name Text, qm Int, path Text, decode_steps Int) {
     let ms_per_tok = (int_to_float(dt_ns) / 1000000.0) / int_to_float(decode_steps)
     let dec_tok_s = int_to_float(decode_steps) / (int_to_float(dt_ns) / 1000000000.0)
     let eff_gbs = (int_to_float(active_bytes) * dec_tok_s) / 1000000000.0
+
+    // Multi-Token GPU-Chained Decode (ZERO inter-token CPU-GPU sync inside ONE MTLCommandBuffer!)
+    let tc0 = time_now_ns()
+    let chained_toks = model.decode_steps_greedy(13, 4 + decode_steps, decode_steps)
+    let dtc_ns = time_now_ns() - tc0
+    let ms_chained = (int_to_float(dtc_ns) / 1000000.0) / int_to_float(decode_steps)
+    let tok_s_chained = int_to_float(decode_steps) / (int_to_float(dtc_ns) / 1000000000.0)
+    let eff_gbs_chained = (int_to_float(active_bytes) * tok_s_chained) / 1000000000.0
+    let last_c = chained_toks[decode_steps - 1]
+
     println("BENCH_MMAP_1B " ++ name
         ++ " params=" ++ int_to_text(params)
         ++ " gguf_MB=" ++ float_to_text(int_to_float(fbytes) / 1048576.0)
         ++ " mmap_load_ms=" ++ float_to_text(load_ms)
-        ++ " decode_ms=" ++ float_to_text(ms_per_tok)
-        ++ " decode_tok_s=" ++ float_to_text(dec_tok_s)
-        ++ " eff_GBs=" ++ float_to_text(eff_gbs)
-        ++ " last_tok=" ++ int_to_text(tok))
+        ++ " stream_ms=" ++ float_to_text(ms_per_tok)
+        ++ " stream_tok_s=" ++ float_to_text(dec_tok_s)
+        ++ " stream_GBs=" ++ float_to_text(eff_gbs)
+        ++ " chained_ms=" ++ float_to_text(ms_chained)
+        ++ " chained_tok_s=" ++ float_to_text(tok_s_chained)
+        ++ " chained_GBs=" ++ float_to_text(eff_gbs_chained)
+        ++ " last_tok=" ++ int_to_text(last_c))
     model.destroy()
 }

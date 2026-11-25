@@ -65,6 +65,10 @@ pub struct BuildOptions {
     pub sysroot: Option<PathBuf>,
     /// Optional explicit linker override (`-fuse-ld=...`).
     pub linker: Option<String>,
+    /// Optional PGO instrumentation output directory (`--pgo-gen <dir>` -> `-fprofile-instr-generate`).
+    pub pgo_gen: Option<PathBuf>,
+    /// Optional PGO profile data path (`--pgo-use <profdata>` -> `-fprofile-instr-use`).
+    pub pgo_use: Option<PathBuf>,
 }
 
 impl Default for BuildOptions {
@@ -88,6 +92,8 @@ impl Default for BuildOptions {
             resolved_target: None,
             sysroot: None,
             linker: None,
+            pgo_gen: None,
+            pgo_use: None,
         }
     }
 }
@@ -159,7 +165,8 @@ fn ir_uses_sync_runtime(ir: &str) -> bool {
         || ir.contains("call i64 @tenon_atomic_")
         || ir.contains("call i64 @tenon_mutex_")
         || ir.contains("call i64 @tenon_chan_")
-        || ir.contains("@tenon_sched_")
+        || ir.contains("call i64 @tenon_sched_")
+        || ir.contains("call void @tenon_sched_")
         || ir.contains("@tenon_preempt_flag")
 }
 
@@ -558,6 +565,12 @@ pub fn compile_with_options(
             if let Some(ld) = &opts.linker {
                 cmd.arg(format!("-fuse-ld={}", ld));
             }
+            if let Some(pg) = &opts.pgo_gen {
+                cmd.arg(format!("-fprofile-instr-generate={}", pg.display()));
+            }
+            if let Some(pu) = &opts.pgo_use {
+                cmd.arg(format!("-fprofile-instr-use={}", pu.display()));
+            }
             if opts.debug_info {
                 cmd.arg("-g");
             }
@@ -714,6 +727,11 @@ pub fn run_c_driver_against_tenon_lib_for_test(
     let pid = std::process::id();
     let seq = AOT_TMP_SEQ.fetch_add(1, Ordering::SeqCst);
     let ir = emit_llvm_ir_with_build_options(tenon_lib, opts)?;
+    if ir_uses_sync_runtime(&ir) {
+        return Command::new(native_bin)
+            .output()
+            .map_err(|e| format!("failed to run {}: {}", native_bin.display(), e));
+    }
     let tmp_ll = std::env::temp_dir().join(format!("tenon_lli_lib_{}_{}.ll", pid, seq));
     let tmp_c_bc = std::env::temp_dir().join(format!("tenon_lli_cdrv_{}_{}.bc", pid, seq));
     fs::write(&tmp_ll, &ir).map_err(|e| e.to_string())?;
@@ -796,6 +814,19 @@ pub fn compile_and_run_for_test(
     let uses_sync = ir_uses_sync_runtime(&ir);
     let uses_net = ir_uses_net_runtime(&ir);
     let uses_sys_core = ir_uses_systems_core(&ir);
+
+    if uses_sync {
+        // Multithreaded Biased RC uses native Mach-O TLS (`__thread tenon_tls_owner_tid`),
+        // which LLVM ORC JIT (`lli`) does not emulate; run the already-compiled native binary!
+        let out = Command::new(bin_path)
+            .output()
+            .map_err(|e| format!("failed to execute {}: {}", bin_path.display(), e))?;
+        let _ = fs::remove_file(bin_path);
+        if let Some(p) = &tmp_keep_ll {
+            let _ = fs::remove_file(p);
+        }
+        return Ok((art, out));
+    }
 
     let mut rt_c = String::with_capacity(TENON_AOT_RUNTIME_C.len() + 16384);
     if uses_sync {
@@ -5548,7 +5579,7 @@ impl<'a> LlvmFnGen<'a> {
                                 pf, need, pf, need, pslow, hdr, pslow, hdr
                             ));
                         } else {
-                            self.code.push_str(&format!("  br label %{}\n", hdr));
+                            self.code.push_str(&format!("  br label %{}, !llvm.loop !99\n", hdr));
                         }
                     }
                     self.terminated = false;

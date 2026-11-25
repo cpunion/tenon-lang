@@ -91,10 +91,15 @@ typedef struct __attribute__((aligned(64))) {
     int freelist_len[TENON_FREELIST_MAX_CAP + 1];
     int64_t live_delta;
     int64_t allocs_delta;
+    uint32_t owner_tid;
     TenonSlab* arena_slab;
     int arena_depth;
     TenonArenaMark arena_marks[64];
 } TenonMtCache;
+
+/* Exported 1-cycle TLS owner ID for Biased Non-Atomic Perceus RC (0x7FFFFFFF = uninit, 0 = shared/atomic!) */
+__thread uint32_t tenon_tls_owner_tid = 0x7FFFFFFFu;
+static __thread TenonMtCache* g_tn_tls_cache = NULL;
 
 static TenonMtCache* g_mt_caches[TENON_MT_MAX_CACHES];
 static volatile int g_mt_cache_count = 0;
@@ -145,23 +150,57 @@ static void tenon_mt_init_key(void) {
 static TenonMtCache* tenon_mt_get_cache_slow(void) {
     pthread_once(&g_mt_cache_once, tenon_mt_init_key);
     TenonMtCache* c = (TenonMtCache*)pthread_getspecific(g_mt_cache_key);
-    if (c) return c;
+    if (c) {
+        g_tn_tls_cache = c;
+        tenon_tls_owner_tid = c->owner_tid;
+        return c;
+    }
     c = (TenonMtCache*)calloc(1, sizeof(TenonMtCache));
     if (!c) abort();
     pthread_setspecific(g_mt_cache_key, c);
     int slot = __atomic_fetch_add(&g_mt_cache_count, 1, __ATOMIC_ACQ_REL);
+    c->owner_tid = (uint32_t)(slot + 1);
     if (slot < TENON_MT_MAX_CACHES) {
         __atomic_store_n(&g_mt_caches[slot], c, __ATOMIC_RELEASE);
     }
+    g_tn_tls_cache = c;
+    tenon_tls_owner_tid = c->owner_tid;
     return c;
 }
 
 static inline TenonMtCache* tenon_mt_get_cache(void) {
-    if (__builtin_expect(__atomic_load_n(&g_mt_cache_count, __ATOMIC_RELAXED) > 0, 1)) {
-        TenonMtCache* c = (TenonMtCache*)pthread_getspecific(g_mt_cache_key);
-        if (__builtin_expect(c != NULL, 1)) return c;
-    }
+    TenonMtCache* c = g_tn_tls_cache;
+    if (__builtin_expect(c != NULL, 1)) return c;
     return tenon_mt_get_cache_slow();
+}
+
+static inline int tenon_rc_is_unique_mt(TenonObj* obj) {
+    int64_t r = obj->rc;
+    if (__builtin_expect((uint32_t)((uint64_t)r >> 32) == tenon_tls_owner_tid, 1)) {
+        return ((uint32_t)r) == 1u;
+    }
+    return ((uint32_t)__atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE)) == 1u;
+}
+
+void tenon_rc_mark_shared(int64_t ptr) {
+    if (__builtin_expect(ptr == 0, 0)) return;
+    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
+    int64_t r = __atomic_load_n(&obj->rc, __ATOMIC_RELAXED);
+    if (r <= 0 || ((uint64_t)r >> 32) == 0) return;
+    __atomic_store_n(&obj->rc, (int64_t)((uint32_t)r), __ATOMIC_RELEASE);
+    uint64_t mask = obj->rc_mask;
+    if (mask == UINT64_MAX) {
+        for (int64_t i = 0; i < obj->len; i++) {
+            if (obj->fields[i] != 0) tenon_rc_mark_shared(obj->fields[i]);
+        }
+    } else if (mask != 0) {
+        int64_t n = obj->len < 64 ? obj->len : 64;
+        for (int64_t i = 0; i < n; i++) {
+            if ((mask & (1ULL << i)) && obj->fields[i] != 0) {
+                tenon_rc_mark_shared(obj->fields[i]);
+            }
+        }
+    }
 }
 
 static void tenon_mt_central_push(int cap, TenonObj* head, int count) {
@@ -359,7 +398,7 @@ static inline TenonObj* tenon_rc_alloc_raw(int64_t tag, int64_t lu, int64_t cap)
         obj = (TenonObj*)malloc(sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
         if (!obj) abort();
     }
-    obj->rc = 1;
+    obj->rc = ((int64_t)c->owner_tid << 32) | 1LL;
     obj->tag = tag;
     obj->len = lu;
     obj->cap = cap;
@@ -414,6 +453,11 @@ int64_t tenon_rc_inc(int64_t ptr) {
     if (__builtin_expect(ptr == 0, 0)) return 0;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
 #ifdef TENON_THREAD_SAFE
+    int64_t r = obj->rc;
+    if (__builtin_expect((uint32_t)((uint64_t)r >> 32) == tenon_tls_owner_tid, 1)) {
+        obj->rc = r + 1;
+        return ptr;
+    }
     if (__builtin_expect(__atomic_load_n(&obj->rc, __ATOMIC_RELAXED) > 0, 1)) {
         __atomic_add_fetch(&obj->rc, 1, __ATOMIC_RELAXED);
     }
@@ -496,13 +540,23 @@ void tenon_rc_dec(int64_t ptr) {
     if (__builtin_expect(ptr == 0, 0)) return;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
 #ifdef TENON_THREAD_SAFE
-    int64_t r = __atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE);
-    if (__builtin_expect(r == 1, 1)) {
-        tenon_rc_free_slow(obj);
+    int64_t r = obj->rc;
+    if (__builtin_expect((uint32_t)((uint64_t)r >> 32) == tenon_tls_owner_tid, 1)) {
+        if (__builtin_expect(((uint32_t)r) <= 1u, 1)) {
+            tenon_rc_free_slow(obj);
+        } else {
+            obj->rc = r - 1;
+        }
         return;
     }
-    if (__builtin_expect(r > 1, 1)) {
-        if (__builtin_expect(__atomic_sub_fetch(&obj->rc, 1, __ATOMIC_ACQ_REL) <= 0, 0)) {
+    r = __atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(r > 0, 1)) {
+        if (__builtin_expect(((uint32_t)r) == 1u, 1)) {
+            tenon_rc_free_slow(obj);
+            return;
+        }
+        int64_t old = __atomic_fetch_sub(&obj->rc, 1, __ATOMIC_ACQ_REL);
+        if (__builtin_expect(((uint32_t)old) <= 1u, 0)) {
             tenon_rc_free_slow(obj);
         }
     }
@@ -568,7 +622,7 @@ int64_t tenon_rc_ensure_unique(int64_t ptr) {
     if (__builtin_expect(ptr == 0, 0)) return 0;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
 #ifdef TENON_THREAD_SAFE
-    if (__builtin_expect(__atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE) == 1, 1)) {
+    if (__builtin_expect(tenon_rc_is_unique_mt(obj), 1)) {
         return ptr;
     }
 #else
@@ -853,7 +907,7 @@ int64_t tenon_list_push(int64_t ptr, int64_t val) {
     int64_t old_len = obj->len;
     uint64_t mask = obj->rc_mask;
 #ifdef TENON_THREAD_SAFE
-    int shared = __atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE) > 1;
+    int shared = !tenon_rc_is_unique_mt(obj);
 #else
     int shared = obj->rc > 1;
 #endif
@@ -896,7 +950,12 @@ int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc) {
         if (init_val != 0 && n > 0) {
             TenonObj* iv = (TenonObj*)(uintptr_t)init_val;
 #ifdef TENON_THREAD_SAFE
-            if (__atomic_load_n(&iv->rc, __ATOMIC_RELAXED) > 0) __atomic_add_fetch(&iv->rc, n, __ATOMIC_RELAXED);
+            int64_t ir = iv->rc;
+            if ((uint32_t)((uint64_t)ir >> 32) == tenon_tls_owner_tid) {
+                iv->rc = ir + n;
+            } else if (__atomic_load_n(&iv->rc, __ATOMIC_RELAXED) > 0) {
+                __atomic_add_fetch(&iv->rc, n, __ATOMIC_RELAXED);
+            }
 #else
             if (iv->rc > 0) iv->rc += n;
 #endif
@@ -939,7 +998,7 @@ int64_t tenon_flat_list_push(int64_t ptr, int64_t elem_bytes, const void* val_pt
     int64_t old_len = obj->len;
     int64_t cap_elems = (obj->cap * 8) / elem_bytes;
 #ifdef TENON_THREAD_SAFE
-    int shared = __atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE) > 1;
+    int shared = !tenon_rc_is_unique_mt(obj);
 #else
     int shared = obj->rc > 1;
 #endif
@@ -1805,5 +1864,7 @@ pub(crate) const TENON_TBAA_METADATA: &str = r#"
 !8 = !{!3, !3, i64 0}
 !9 = !{!4, !4, i64 0}
 !10 = !{!5, !5, i64 0}
+!98 = !{!"llvm.loop.vectorize.enable", i1 true}
+!99 = distinct !{!99, !98}
 "#;
 

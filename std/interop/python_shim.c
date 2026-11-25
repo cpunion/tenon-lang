@@ -46,6 +46,7 @@ typedef int (*fn_PyObject_SetAttrString)(PyObject*, const char*, PyObject*);
 typedef PyObject* (*fn_PyObject_GetItem)(PyObject*, PyObject*);
 typedef int (*fn_PyObject_SetItem)(PyObject*, PyObject*, PyObject*);
 typedef PyObject* (*fn_PyObject_CallObject)(PyObject*, PyObject*);
+typedef PyObject* (*fn_PyObject_Vectorcall)(PyObject*, PyObject* const*, size_t, PyObject*);
 typedef PyObject* (*fn_PyObject_Str)(PyObject*);
 typedef Py_ssize_t (*fn_PyObject_Length)(PyObject*);
 typedef PyObject* (*fn_PyLong_FromLongLong)(long long);
@@ -90,6 +91,7 @@ typedef struct {
     fn_PyObject_GetItem PyObject_GetItem;
     fn_PyObject_SetItem PyObject_SetItem;
     fn_PyObject_CallObject PyObject_CallObject;
+    fn_PyObject_Vectorcall PyObject_Vectorcall;
     fn_PyObject_Str PyObject_Str;
     fn_PyObject_Length PyObject_Length;
     fn_PyLong_FromLongLong PyLong_FromLongLong;
@@ -183,6 +185,8 @@ int64_t tn_py_init(void) {
     LOAD_SYM(PyObject_GetItem);
     LOAD_SYM(PyObject_SetItem);
     LOAD_SYM(PyObject_CallObject);
+    /* Optional PEP 590 Vectorcall fast-path (Python 3.9+): zero PyTuple heap alloc per call! */
+    g_py.PyObject_Vectorcall = (fn_PyObject_Vectorcall)dlsym(lib, "PyObject_Vectorcall");
     LOAD_SYM(PyObject_Str);
     LOAD_SYM(PyObject_Length);
     LOAD_SYM(PyLong_FromLongLong);
@@ -320,6 +324,16 @@ int64_t tn_py_setitem(int64_t obj, int64_t key, int64_t val) {
 
 static int64_t tn_py_call_n(int64_t fn, int n, int64_t a0, int64_t a1, int64_t a2) {
     if (!g_py.ready || !fn) return 0;
+    if (g_py.PyObject_Vectorcall) {
+        PyObject* stack[3] = {
+            (PyObject*)(uintptr_t)a0,
+            (PyObject*)(uintptr_t)a1,
+            (PyObject*)(uintptr_t)a2
+        };
+        PyObject* res = g_py.PyObject_Vectorcall((PyObject*)(uintptr_t)fn, stack, (size_t)n, NULL);
+        if (!res && g_py.PyErr_Occurred()) { g_py.PyErr_Print(); g_py.PyErr_Clear(); }
+        return (int64_t)(uintptr_t)res;
+    }
     PyObject* tup = g_py.PyTuple_New((Py_ssize_t)n);
     int64_t arr[3] = { a0, a1, a2 };
     for (int i = 0; i < n; i++) {

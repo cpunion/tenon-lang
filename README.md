@@ -14,7 +14,7 @@
 # 0. 可视化交互体验与旗舰应用（零 `--c-src` 参数、零外部 Shader 文件，全量内置 `@c_src` 与 `gpu_embedded_msl()`！）
 cargo build --release --bin tenon
 
-# (A0) PyTorch 风格精化验证 AI 库 & 零拷贝 mmap GGUF v3 超融合量化多架构 LLM 推理引擎（Tenon-Torch `std/nn`：AutogradTape + AMP `GradScaler` + 编译期 `Matrix[R, C, DType = Float16]` / 变长 `Tensor[...Shape]` + DLPack v1.0 / GGUF v3 `mmap` 零拷贝 `newBufferWithBytesNoCopy` / Safetensors + Apple MPS + 超融合持久化 Encoder / 零位移 SIMD `uchar4` Q4_0 / 融合 RoPE+FlashDecode / GPU Argmax 推理，支持 Llama-3/Qwen2/Gemma-2/Mixtral Sparse MoE；M4 Max 硬件实测带宽屋顶线 FP16 GEMV 达 472.5 GB/s [86.5% 理论峰值]、Q4_0 GEMV 达 451.3 GB/s [82.7% 理论峰值]，完整 1.10B Llama-3.2-1B 端到端达 467 tok/s Q4_0 / 313 tok/s Q8_0 / 197 tok/s FP16 @ 409 GB/s！）
+# (A0) PyTorch 风格精化验证 AI 库 & 零拷贝 mmap GGUF v3 超融合量化多架构 LLM 推理引擎（Tenon-Torch `std/nn`：AutogradTape + AMP `GradScaler` + 编译期 `Matrix[R, C, DType = Float16]` / 变长 `Tensor[...Shape]` + DLPack v1.0 / GGUF v3 `mmap` 零拷贝 `newBufferWithBytesNoCopy` / Safetensors + Apple MPS + 动态 4 KB 片上 SRAM 融合 `RMSNorm+GEMV` / `RMSNorm+Gate+Up+SwiGLU/GeGLU`（每层压缩至 5 个 Dispatch！）+ 零临时显存 `simdgroup_half8x8` 量化硬件 MMA Prefill + Split-K FlashDecoding + 多 Token GPU 链式解码；支持 Llama-3/Qwen2/Gemma-2/Mixtral Sparse MoE；M4 Max 实测 1.10B Llama-3.2-1B Q4_0 达 483 tok/s [2.07 ms/tok]、Q8_0 达 346 GB/s、FP16 达 383 GB/s，21M Q4_0 Decode 达 1,718 tok/s / Prefill 达 13,931 tok/s，Mixtral MoE 达 1,003 tok/s！）
 ./target/release/tenon test std/nn/nn_test.tn
 ./target/release/tenon check examples/showcase/bad_nn_shape.tn   # 负例：Matrix[4,8] @ Matrix[6,2] 编译期秒抓维度错误！
 ./target/release/tenon build examples/showcase/tenon_ultra_llm_bench.tn -o /tmp/tn_ultra_bench && /tmp/tn_ultra_bench  # Llama-3/Qwen2/Gemma-2/Mixtral-MoE + 1.10B Llama-3.2-1B 零拷贝 mmap GGUF v3 基准
@@ -23,13 +23,15 @@ cargo build --release --bin tenon
 # 或无头截图预览（生成 /tmp/tenon_torch_studio.png）：TENON_TORCH_SMOKE=1 /tmp/tenon_torch_studio
 
 # (A0b) 超越 PyO3 的一键全语言原生互操作 (`--export all`) + 类 Mojo 无缝调用并动态继承 Python/ObjC 对象 + 21 目标声明式交叉编译 (`tenon targets`) + Clang AST JSON `tenon bindgen` + 本地包注册表 `tenon pkg publish/search`
+#   - Python 3 PEP 590 `METH_FASTCALL`（实测 64.7 ns/call = 15.45M/s！）+ PEP 3118 Buffer Protocol 零拷/批量 memcpy（100 万整数 `array('q')` 0.23ms，提速 8.1×！）+ `PyObject_Vectorcall`
+#   - Node.js N-API `Float64Array`/`BigInt64Array`（实测 16.6 ns/call = 60.1M/s，100 万元素 `BigInt64Array` 0.41ms 提速 61.2× / `Float64Array` 往返 1.18ms 提速 25.8×！）
 ./target/release/tenon build examples/showcase/polyglot_quant_lib.tn --export all --export-dir target/export_quant   # 一键产出 Python .so/.pyi + Node.js 零 node-gyp .node/.d.ts + Swift 6 + Java/Kotlin JNI + C++17 + Rust + Zig + Go（全程 Perceus live_objects=0！）
 ./target/release/tenon build examples/showcase/python_and_objc_interop.tn -o /tmp/tn_py_objc && /tmp/tn_py_objc     # 零链接参数动态加载 CPython 3 + 零拷贝 memoryview + 动态继承 Python 类与 Apple NSObject 注入原生 LLVM Tenon 方法！
 ./target/release/tenon targets                                                                                      # 列出 21 个内置目标（macOS/Linux/Windows/iOS/Android/Wasm32/Cortex-M0/M4/M7/RP2040/STM32F4/ESP32-C3/AVR，支持 llgo 风格 JSON inherits！）
 ./target/release/tenon build examples/showcase/embedded_sensor_pid.tn --target esp32c3 --lib static -o /tmp/libpid_esp32c3.a
 ./target/release/tenon bindgen "$(xcrun --show-sdk-path)/usr/include/zlib.h" --lib z -o /tmp/zlib_bindings.tn       # Clang AST JSON 驱动自动绑定
 
-# (A0c) P-Core SPMC 批量窃取 M:N 抢占式协程调度器（10K 任务 2.2ms 超越 Go、零 cgo 1.76ns C FFI 快 Go 9.1×）+ 无锁线程本地 Perceus 堆缓存（160 万并发堆分配 2.2ms 快 Go 5×+ 且 live_objects=0）+ 非装箱栈上可变值记录 + 多后端 GPU（MSL/WGSL/CUDA/SPIR-V GLSL）+ 完整 DWARF v4 调试信息
+# (A0c) P-Core SPMC 批量窃取 M:N 抢占式协程调度器（10K 任务 2.12ms 超越 Go、零 cgo 1.74ns C FFI 快 Go 9×+）+ Biased Non-Atomic Perceus RC（线程本地对象 0 原子指令 + 1-cycle `__thread` TLS 缓存，160 万并发堆分配低至 1.73ms 且 live_objects=0）+ `!llvm.loop` 自动向量化 + `--pgo-gen`/`--pgo-use` PGO 优化 + 多后端 GPU（MSL/WGSL/CUDA/SPIR-V GLSL）+ 完整 DWARF v4 调试信息
 ./target/release/tenon build examples/dogfood/mn_preempt_sched_demo.tn -o /tmp/tn_mn_bench && /tmp/tn_mn_bench
 ./target/release/tenon build examples/showcase/tenon_transformer_mps.tn --emit-cuda /tmp/out.cu --emit-spirv-glsl /tmp/out.comp --debug -o /tmp/tn_dbg
 
