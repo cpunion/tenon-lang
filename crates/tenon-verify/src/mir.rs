@@ -18,6 +18,9 @@ pub struct MirFnSummary {
     pub param_count: usize,
     pub non_escaping_locals: Vec<String>,
     pub stack_promotable_locals: Vec<String>,
+    /// Interprocedurally inferred return interval `[lo, hi]` for pure integer functions without explicit `ensures`.
+    #[serde(default)]
+    pub inferred_ret_interval: Option<(i64, i64)>,
 }
 
 /// Unified Verified Middle-End IR facts shared across Cranelift, LLVM AOT, Wasm, and LSP.

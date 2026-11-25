@@ -2669,6 +2669,7 @@ impl CheckerCtx {
                 param_count: f.params.len(),
                 non_escaping_locals: non_esc.into_iter().collect(),
                 stack_promotable_locals: stack_promo.into_iter().collect(),
+                inferred_ret_interval: None,
             },
         );
         if !f.is_ghost {
@@ -2764,6 +2765,64 @@ impl CheckerCtx {
             }
             for ens in &f.ensures {
                 self.check_ensures(f, ens, Some(ret_expr), &env, &smt_int_vars, &smt_premises);
+            }
+            // I4: Interprocedural Pure Return Summary Inference — automatically infer `[lo, hi]`
+            // return bounds for pure integer functions without explicit `ensures` so callers benefit!
+            if f.is_pure && !saw_return && f.ensures.is_empty() && f.type_params.is_empty() {
+                if let Some(rt) = &f.ret_ty {
+                    if self.is_int_type_name(&rt.display_name()) {
+                        let abs = eval_abs_int_branch_sensitive(&env, ret_expr);
+                        let has_lo = abs.interval.min > (i64::MIN as i128) / 2
+                            && abs.interval.min <= i64::MAX as i128;
+                        let has_hi = abs.interval.max < (i64::MAX as i128) / 2
+                            && abs.interval.max >= i64::MIN as i128;
+                        if has_lo || has_hi {
+                            let res_id = Expr {
+                                kind: ExprKind::Ident("result".into()),
+                                span: f.span,
+                            };
+                            let mut inferred_ens = Vec::new();
+                            if has_lo {
+                                inferred_ens.push(Expr {
+                                    kind: ExprKind::Binary {
+                                        op: BinOp::Ge,
+                                        left: Box::new(res_id.clone()),
+                                        right: Box::new(Expr {
+                                            kind: ExprKind::Int(abs.interval.min as i64),
+                                            span: f.span,
+                                        }),
+                                    },
+                                    span: f.span,
+                                });
+                            }
+                            if has_hi {
+                                inferred_ens.push(Expr {
+                                    kind: ExprKind::Binary {
+                                        op: BinOp::Le,
+                                        left: Box::new(res_id),
+                                        right: Box::new(Expr {
+                                            kind: ExprKind::Int(abs.interval.max as i64),
+                                            span: f.span,
+                                        }),
+                                    },
+                                    span: f.span,
+                                });
+                            }
+                            if let Some(af) = self.all_fns.get_mut(&f.name) {
+                                af.ensures.extend(inferred_ens.clone());
+                            }
+                            if let Some(pf) = self.pure_fns.get_mut(&f.name) {
+                                pf.ensures.extend(inferred_ens);
+                            }
+                            if has_lo && has_hi {
+                                if let Some(sum) = self.fn_summaries.get_mut(&f.name) {
+                                    sum.inferred_ret_interval =
+                                        Some((abs.interval.min as i64, abs.interval.max as i64));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else if !saw_return {
             for ens in &f.ensures {
@@ -10826,6 +10885,47 @@ fn collect_lt_loop_bounds(expr: &Expr, out: &mut Vec<(String, Expr, Span)>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Branch-sensitive L0 integer interval evaluator used by I4 interprocedural pure summary inference:
+/// refines `if cond { t } else { e }` with branch-assumed environments so `clamp(x)` infers `[0, 100]`!
+fn eval_abs_int_branch_sensitive(env: &L0Env, expr: &Expr) -> AbsInt {
+    match &expr.kind {
+        ExprKind::If {
+            cond,
+            then_block,
+            else_branch: Some(eb),
+        } => {
+            if then_block.stmts.is_empty() {
+                if let Some(then_e) = &then_block.tail {
+                    let mut then_env = env.clone();
+                    then_env.assume_expr(cond, None);
+                    let t_abs = eval_abs_int_branch_sensitive(&then_env, then_e);
+
+                    let mut else_env = env.clone();
+                    let neg_cond = Expr {
+                        kind: ExprKind::Unary {
+                            op: UnOp::Not,
+                            expr: cond.clone(),
+                        },
+                        span: cond.span,
+                    };
+                    else_env.assume_expr(&neg_cond, None);
+                    let e_abs = eval_abs_int_branch_sensitive(&else_env, eb);
+                    return t_abs.join(e_abs);
+                }
+            }
+            env.eval_abs_int(expr, None)
+        }
+        ExprKind::Block(b) if b.stmts.is_empty() => {
+            if let Some(t) = &b.tail {
+                eval_abs_int_branch_sensitive(env, t)
+            } else {
+                AbsInt::top()
+            }
+        }
+        _ => env.eval_abs_int(expr, None),
     }
 }
 

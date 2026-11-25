@@ -197,6 +197,69 @@ test('real `tenon lsp` process handles initialize, diagnostics, hover, definitio
     const compResp = await compP;
     assert.ok(compResp.result.some((c) => c.label === 'build_app'));
 
+    // LSP 1.5: GPU `@kernel` + `@gpu_graph` CodeLens & Z3 Counterexample Quick Fix!
+    const gpuUri = 'file:///tmp/vscode_smoke_gpu.tn';
+    const gpuText = [
+      '@kernel("elementwise")',
+      'pub pure fn add_b(x List[Float32], b List[Float32], inout out List[Float32], n UInt32) {',
+      '    let i = gpu_global_id_x() as Int',
+      '    if i < (n as Int) { out[i] = x[i] + b[i] }',
+      '}',
+      '@kernel("elementwise")',
+      'pub pure fn relu_k(x List[Float32], inout out List[Float32], n UInt32) {',
+      '    let i = gpu_global_id_x() as Int',
+      '    if i < (n as Int) { let v = x[i]; out[i] = if v > (0.0 as Float32) { v } else { 0.0 as Float32 } }',
+      '}',
+      '@gpu_graph',
+      'pub pure fn fused_g(x List[Float32], b List[Float32], n UInt32) List[Float32] {',
+      '    var t List[Float32] = list_filled(16, 0.0 as Float32)',
+      '    var o List[Float32] = list_filled(16, 0.0 as Float32)',
+      '    add_b(x, b, t, n)',
+      '    relu_k(t, o, n)',
+      '    o',
+      '}',
+    ].join('\n');
+    const gpuDiagP = rpc.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === gpuUri);
+    rpc.send({
+      jsonrpc: '2.0',
+      method: 'textDocument/didOpen',
+      params: { textDocument: { uri: gpuUri, languageId: 'tenon', version: 1, text: gpuText } },
+    });
+    await gpuDiagP;
+    const lensP = rpc.waitFor((m) => m.id === 40);
+    rpc.send({ jsonrpc: '2.0', id: 40, method: 'textDocument/codeLens', params: { textDocument: { uri: gpuUri } } });
+    const lensResp = await lensP;
+    assert.ok(
+      lensResp.result.some((l) => l.command.title.includes('@gpu_graph') && l.command.title.includes('add_b__fused__relu_k')),
+      `expected @gpu_graph fusion CodeLens, got: ${JSON.stringify(lensResp.result)}`
+    );
+
+    const badUri = 'file:///tmp/vscode_smoke_bad.tn';
+    const badText = 'pub type Pos = Int where self > 0\npub pure fn bad(x Int where self >= 0) Pos { x }\n';
+    const badDiagP = rpc.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === badUri);
+    rpc.send({
+      jsonrpc: '2.0',
+      method: 'textDocument/didOpen',
+      params: { textDocument: { uri: badUri, languageId: 'tenon', version: 1, text: badText } },
+    });
+    await badDiagP;
+    const actP = rpc.waitFor((m) => m.id === 41);
+    rpc.send({
+      jsonrpc: '2.0',
+      id: 41,
+      method: 'textDocument/codeAction',
+      params: {
+        textDocument: { uri: badUri },
+        range: { start: { line: 0, character: 0 }, end: { line: 2, character: 0 } },
+        context: { diagnostics: [] },
+      },
+    });
+    const actResp = await actP;
+    assert.ok(
+      actResp.result.some((a) => a.title.includes('counterexample unit test')),
+      `expected Z3 counterexample unit test quickfix, got: ${JSON.stringify(actResp.result)}`
+    );
+
     // Shutdown + exit
     const shutP = rpc.waitFor((m) => m.id === 5);
     rpc.send({ jsonrpc: '2.0', id: 5, method: 'shutdown', params: null });

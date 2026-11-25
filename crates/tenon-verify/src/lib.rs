@@ -2399,4 +2399,81 @@ pub pure fn ok_matrix_call(a Matrix[2, 3], b Matrix[3, 2]) Int {
         assert!(r2.ok && hit2, "second disk cache lookup should be a hit");
         assert_eq!(r1.proofs.len(), r2.proofs.len());
     }
+
+    #[test]
+    fn verifies_i4_interprocedural_summary_inference_and_chained_matrix_matmul() {
+        let src = r#"
+pub type Pct = Int where 0 <= self && self <= 100
+pub type Pos = Int where self >= 1
+
+// ZERO manual `ensures` clause — I4 infers `[0..=100]` automatically from branch intervals!
+pure fn clamp_pct(x Int) Int {
+    if x < 0 { 0 } else if x > 100 { 100 } else { x }
+}
+
+// ZERO manual `ensures` clause — I4 infers `[1..=16]` automatically, proving caller division safe!
+pure fn safe_divisor(x Int) Int {
+    if x < 1 { 1 } else if x > 16 { 16 } else { x }
+}
+
+pub pure fn caller_uses_inferred_summaries(raw Int, step Int) Pct {
+    let p = clamp_pct(raw)
+    let d = safe_divisor(step)
+    let _q = 1000 / d
+    p
+}
+
+// Chained 3-matrix multiplication shape propagation: [2, 3] * [3, 4] * [4, 2] -> [2, 2]!
+pub record Tensor2D {
+    rows Pos
+    cols Pos
+    data List[Float32]
+}
+pub type Matrix[R Int, C Int] = Tensor2D where self.rows == R && self.cols == C && len(self.data) == R * C
+
+pub pure fn matmul_stub(a Tensor2D, b Tensor2D) Tensor2D
+    requires a.cols == b.rows
+    ensures result.rows == a.rows && result.cols == b.cols && len(result.data) == a.rows * b.cols
+{
+    let out List[Float32] = list_filled(a.rows * b.cols, 0.0 as Float32)
+    Tensor2D { rows = a.rows, cols = b.cols, data = out }
+}
+
+pub pure fn chained_mlp_dims(a Matrix[2, 3], b Matrix[3, 4], c Matrix[4, 2]) Int
+    ensures result == 4
+{
+    let ab = matmul_stub(a, b)
+    let abc = matmul_stub(ab, c)
+    abc.rows + abc.cols
+}
+"#;
+        let prog = parse(src).unwrap();
+        let rep = check_program(&prog);
+        assert!(
+            rep.ok,
+            "expected I4 interprocedural summary inference & chained matrix matmul to verify: {:?}",
+            rep.diagnostics
+        );
+        assert_eq!(
+            rep.mir.fn_summaries.get("clamp_pct").and_then(|s| s.inferred_ret_interval),
+            Some((0, 100)),
+            "expected clamp_pct inferred summary [0..=100]"
+        );
+        assert_eq!(
+            rep.mir.fn_summaries.get("safe_divisor").and_then(|s| s.inferred_ret_interval),
+            Some((1, 16)),
+            "expected safe_divisor inferred summary [1..=16]"
+        );
+
+        // Negative control: broken chain [2, 3] * [3, 5] * [4, 2] must be rejected at compile time!
+        let bad_chain = format!(
+            "{}\npub pure fn broken_chain(a Matrix[2, 3], b Matrix[3, 5], c Matrix[4, 2]) Int {{\n    let ab = matmul_stub(a, b)\n    let abc = matmul_stub(ab, c)\n    abc.rows\n}}\n",
+            src
+        );
+        let bad_rep = check_program(&parse(&bad_chain).unwrap());
+        assert!(
+            !bad_rep.ok,
+            "expected broken 3-matrix chain ([2,3]*[3,5]*[4,2]) to fail static verification!"
+        );
+    }
 }

@@ -68,7 +68,7 @@ fn print_usage() {
         r#"tenon — Verified Systems, Web & Distributed Application Language
 
 USAGE:
-  tenon check <file.tn> [--json] [--emit-proofs <dir>] [--emit-repro-test <out.tn>]
+  tenon check <file.tn> [--json] [--profile-proofs] [--emit-proofs <dir>] [--emit-repro-test <out.tn>]
                                                   Run L0 + L1 (Z3) Fail-Closed verification & Protocol Solver
   tenon verify-proofs <dir> [--solver z3|cvc5|auto]
                                                   Independently audit exported SMT-LIB2 proof certificates
@@ -196,6 +196,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let mut emit_repro_test: Option<PathBuf> = None;
     let mut format = "text".to_string();
     let as_json = args.iter().any(|a| a == "--json");
+    let profile_proofs = args.iter().any(|a| a == "--profile-proofs");
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -211,7 +212,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 format = args[i + 1].clone();
                 i += 2;
             }
-            "--json" => i += 1,
+            "--json" | "--profile-proofs" => i += 1,
             s if !s.starts_with('-') && file_opt.is_none() => {
                 file_opt = Some(s);
                 i += 1;
@@ -220,7 +221,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
     }
     let Some(file) = file_opt else {
-        eprintln!("usage: tenon check <file.tn> [--json] [--format text|json|sarif] [--emit-proofs <dir>] [--emit-repro-test <out.tn>]");
+        eprintln!("usage: tenon check <file.tn> [--json] [--profile-proofs] [--format text|json|sarif] [--emit-proofs <dir>] [--emit-repro-test <out.tn>]");
         return ExitCode::from(2);
     };
 
@@ -238,12 +239,13 @@ fn cmd_check(args: &[String]) -> ExitCode {
     if emit_proofs.is_some() {
         tenon_verify::begin_proof_recording();
     }
+    let t_start = std::time::Instant::now();
     let (report, disk_cache_hit) = if use_disk_cache {
         tenon_verify::check_program_cached_on_disk(&prog, Path::new(".tenon-cache"))
     } else {
         (check_program(&prog), false)
     };
-    let _ = disk_cache_hit;
+    let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     if let Some(pdir) = emit_proofs {
         let certs = tenon_verify::end_proof_recording();
         match tenon_verify::export_proof_certificates(&pdir, &certs) {
@@ -293,11 +295,70 @@ fn cmd_check(args: &[String]) -> ExitCode {
 
     if report.ok {
         println!(
-            "PASS  {}  (proofs: {} L0-fast, {} L1-Z3)",
-            file, l0_count, l1_count
+            "PASS  {}  (proofs: {} L0-fast, {} L1-Z3, {:.1}ms, cache={})",
+            file,
+            l0_count,
+            l1_count,
+            elapsed_ms,
+            if disk_cache_hit { "HIT" } else { "MISS" }
         );
-        for p in &report.proofs {
-            println!("  [OK:{:?}] {} (line {})", p.tier, p.obligation, p.span.line);
+        if profile_proofs {
+            println!("=== Proof Profile (Top Functions by Verification Load) ===");
+            println!(
+                "  {:<30} {:>6} {:>6} {:>7} {:>7}  {}",
+                "Function", "L0", "L1-Z3", "Bounds", "NoOv", "Inferred Summary"
+            );
+            let mut rows: Vec<(String, usize, usize, usize, usize, String)> = Vec::new();
+            for item in &prog.items {
+                if let Item::Fn(f) = item {
+                    let s = f.span.start;
+                    let e = f.body.span.end.max(f.span.end);
+                    let fid = f.span.file_id;
+                    let mut fl0 = 0usize;
+                    let mut fl1 = 0usize;
+                    for p in &report.proofs {
+                        if p.span.file_id == fid && p.span.start >= s && p.span.start <= e {
+                            match p.tier {
+                                ProofTier::L0Fast => fl0 += 1,
+                                ProofTier::L1Smt => fl1 += 1,
+                            }
+                        }
+                    }
+                    let fb = report.mir.proved_safe_indices.iter().filter(|&&o| o >= s && o <= e).count();
+                    let fo = report.mir.proved_no_overflow.iter().filter(|&&o| o >= s && o <= e).count();
+                    let inf = report
+                        .mir
+                        .fn_summaries
+                        .get(&f.name)
+                        .and_then(|sm| sm.inferred_ret_interval)
+                        .map(|(lo, hi)| format!("[{}..={}]", lo, hi))
+                        .unwrap_or_else(|| "-".into());
+                    if fl0 + fl1 + fb + fo > 0 || inf != "-" {
+                        rows.push((f.name.clone(), fl0, fl1, fb, fo, inf));
+                    }
+                }
+            }
+            rows.sort_by(|a, b| (b.2, b.1 + b.2).cmp(&(a.2, a.1 + a.2)));
+            for (nm, fl0, fl1, fb, fo, inf) in rows.into_iter().take(20) {
+                println!("  {:<30} {:>6} {:>6} {:>7} {:>7}  {}", nm, fl0, fl1, fb, fo, inf);
+            }
+            if !report.mir.gpu_graphs.is_empty() {
+                println!("=== Verified @gpu_graph Plans ===");
+                for g in &report.mir.gpu_graphs {
+                    println!(
+                        "  {}: {} pass(es), {} fused, {} barrier(s), {} VRAM slot(s)",
+                        g.fn_name,
+                        g.nodes.len(),
+                        g.fusions.len(),
+                        g.barriers,
+                        g.vram_slots_used
+                    );
+                }
+            }
+        } else {
+            for p in &report.proofs {
+                println!("  [OK:{:?}] {} (line {})", p.tier, p.obligation, p.span.line);
+            }
         }
     } else {
         println!(
