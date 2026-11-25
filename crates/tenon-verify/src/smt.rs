@@ -400,7 +400,16 @@ impl SmtQuery {
             }
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Ident(fname) = &callee.kind {
-                    if fname == "len" && args.len() == 1 && matches!(&args[0].value.kind, ExprKind::Ident(_)) {
+                    if fname == "len"
+                        && args.len() == 1
+                        && matches!(
+                            &args[0].value.kind,
+                            ExprKind::Ident(_)
+                                | ExprKind::List(_)
+                                | ExprKind::Str(_)
+                                | ExprKind::Field { .. }
+                        )
+                    {
                         return true;
                     }
                     if matches!(
@@ -1277,6 +1286,12 @@ pub fn encode_expr_with_reals(
         ExprKind::Call { callee, args } => {
             if let ExprKind::Ident(fname) = &callee.kind {
                 if fname == "len" && args.len() == 1 {
+                    if let ExprKind::List(elems) = &args[0].value.kind {
+                        return Ok(elems.len().to_string());
+                    }
+                    if let ExprKind::Str(s) = &args[0].value.kind {
+                        return Ok(s.len().to_string());
+                    }
                     if let ExprKind::Ident(var) = &args[0].value.kind {
                         let resolved = subst.get(var).map(|s| s.as_str()).unwrap_or(var.as_str());
                         return Ok(smt_ident(&format!("__len__{}", resolved)));

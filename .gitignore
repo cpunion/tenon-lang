@@ -8,3 +8,5 @@ Cargo.lock
 benchmarks/bin/
 editors/vscode/node_modules/
 *.vsix
+examples/showcase/web_openui_studio/openui.wasm
+examples/showcase/web_openui_studio/openui.mjs

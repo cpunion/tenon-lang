@@ -6036,16 +6036,15 @@ pub fn main() Int {
 
     #[test]
     fn differential_fuzz_jit_vs_llvm_aot_vs_wasm32_and_parser_roundtrip() {
-        let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let has_wasm = wasm_llvm::has_llvm_wasm32_toolchain()
             && std::process::Command::new("node")
                 .arg("--version")
                 .output()
                 .is_ok_and(|o| o.status.success());
 
-        // Deterministic SplitMix64 differential fuzzer: generates 12 diverse programs exercising
+        // Deterministic SplitMix64 differential fuzzer: generates diverse programs exercising
         // arithmetic, bitwise, branching, while loops, records, lists, and refinement casts,
-        // and asserts IDENTICAL outputs + `live_objects == 0` across Cranelift JIT, LLVM -O3 AOT, and Wasm32 V8!
+        // and asserts IDENTICAL outputs + `live_objects == 0` across Cranelift JIT, LLVM AOT, and Wasm32 V8!
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next_u64 = || -> u64 {
             seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -6055,22 +6054,22 @@ pub fn main() Int {
             z ^ (z >> 31)
         };
 
+        // Combine all 8 fuzzed cases into ONE multi-function program so all 8 run identically across
+        // Cranelift JIT, LLVM AOT (1 native binary), and Full LLVM Wasm32 V8 (1 wasm module) without
+        // paying repeated OS Mach-O Gatekeeper/syspolicyd first-launch overhead per case.
         let pid = std::process::id();
+        let mut combined = String::from(
+            "pub type SmallPos = Int where self >= 1 && self <= 100\n\npub record Pair {\n    x Int\n    y Int\n}\n\n",
+        );
+        let mut call_sum = Vec::new();
         for case_idx in 0..8 {
             let a = ((next_u64() % 40) as i64) + 5;
             let b = ((next_u64() % 30) as i64) + 3;
             let n = ((next_u64() % 12) as i64) + 4;
             let mask = [7, 15, 31, 63][(next_u64() % 4) as usize];
-            let src = format!(
+            combined.push_str(&format!(
                 r#"
-pub type SmallPos = Int where self >= 1 && self <= 100
-
-pub record Pair {{
-    x Int
-    y Int
-}}
-
-pub pure fn step(v Int, k Int) Int {{
+pub pure fn step_{idx}(v Int, k Int) Int {{
     if (v & 1) == 0 {{
         (v + k) ^ (k & {mask})
     }} else {{
@@ -6078,13 +6077,13 @@ pub pure fn step(v Int, k Int) Int {{
     }}
 }}
 
-pub fn main() Int {{
+pub fn fuzz_case_{idx}() Int {{
     let p = Pair {{ x = {a}, y = {b} }}
     var xs = list_filled({n}, p.x)
     var acc = p.y
     var i = 0
     while i < {n} invariant 0 <= i && i <= {n} {{
-        let v = step(xs[i] + i, p.y + i)
+        let v = step_{idx}(xs[i] + i, p.y + i)
         xs[i] = v
         acc = acc + (v & 255)
         i += 1
@@ -6094,62 +6093,70 @@ pub fn main() Int {{
     acc + widened + xs[0]
 }}
 "#,
+                idx = case_idx,
                 a = a,
                 b = b,
                 n = n,
                 mask = mask
-            );
+            ));
+            call_sum.push(format!("fuzz_case_{}()", case_idx));
+        }
+        combined.push_str(&format!(
+            "\npub fn main() Int {{\n    {}\n}}\n",
+            call_sum.join(" + ")
+        ));
 
-            let prog = parse(&src).expect("fuzzed program must parse");
-            let rep = tenon_verify::check_program(&prog);
-            assert!(rep.ok, "case {} failed verify: {:?}", case_idx, rep.diagnostics);
+        let prog = parse(&combined).expect("combined fuzzed program must parse");
+        let rep = tenon_verify::check_program(&prog);
+        assert!(rep.ok, "combined fuzz failed verify: {:?}", rep.diagnostics);
 
-            // Backend 1: Cranelift JIT + Perceus live_objects == 0
+        // Backend 1: Cranelift JIT + Perceus live_objects == 0 (hold lock ONLY during JIT execution!)
+        let jit_res = {
+            let _perceus_guard = PERCEUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             perceus::reset_stats();
             let jit = JitProgram::compile(&prog).unwrap();
-            let jit_res = jit.call_0("main").unwrap();
+            let res = jit.call_0("main").unwrap();
             let st = perceus::snapshot_stats();
-            assert_eq!(st.live_objects, 0, "JIT leak in fuzz case {}", case_idx);
+            assert_eq!(st.live_objects, 0, "JIT leak in combined differential fuzz");
+            res
+        };
 
-            // Backend 2: LLVM -O3 AOT + Perceus live_objects == 0
-            let bin = std::env::temp_dir().join(format!("tenon_fuzz_{}_{}", pid, case_idx));
-            let mut opts = llvm_aot::BuildOptions::default();
-            opts.opt_level = "O2".into();
-            opts.apply_verified_mir(&rep.mir);
-            llvm_aot::compile_with_options(&prog, &bin, &opts).unwrap();
-            let aot_out = std::process::Command::new(&bin).output().unwrap();
-            let _ = std::fs::remove_file(&bin);
-            let aot_stdout = String::from_utf8_lossy(&aot_out.stdout);
-            assert!(
-                aot_out.status.success()
-                    && aot_stdout.contains(&format!("main() => {}", jit_res))
-                    && aot_stdout.contains("live_objects=0"),
-                "LLVM AOT mismatch in fuzz case {}: expected {}, got {}",
-                case_idx,
-                jit_res,
-                aot_stdout
+        // Backend 2: LLVM AOT + Perceus live_objects == 0 (all 8 cases in 1 binary)
+        let bin = std::env::temp_dir().join(format!("tenon_fuzz_all_{}", pid));
+        let mut opts = llvm_aot::BuildOptions::default();
+        opts.opt_level = "O0".into();
+        opts.apply_verified_mir(&rep.mir);
+        llvm_aot::compile_with_options(&prog, &bin, &opts).unwrap();
+        let aot_out = std::process::Command::new(&bin).output().unwrap();
+        let _ = std::fs::remove_file(&bin);
+        let aot_stdout = String::from_utf8_lossy(&aot_out.stdout);
+        assert!(
+            aot_out.status.success()
+                && aot_stdout.contains(&format!("main() => {}", jit_res))
+                && aot_stdout.contains("live_objects=0"),
+            "LLVM AOT mismatch in combined fuzz: expected {}, got {}",
+            jit_res,
+            aot_stdout
+        );
+
+        // Backend 3: Full LLVM Wasm32 in Node.js V8 + Perceus live_objects == 0 (all 8 cases in 1 wasm module)
+        if has_wasm {
+            let wasm_p = std::env::temp_dir().join(format!("tenon_fuzz_all_{}.wasm", pid));
+            wasm_llvm::compile_program_to_wasm32_llvm(&prog, &wasm_p, &opts).unwrap();
+            let js = format!(
+                "const fs=require('fs');(async()=>{{const {{instance}}=await WebAssembly.instantiate(fs.readFileSync({:?}),{{}});const r=instance.exports.main();const l=instance.exports.tenon_wasm_live_objects();console.log(Number(r)+','+Number(l));}})();",
+                wasm_p.to_string_lossy()
             );
-
-            // Backend 3: Full LLVM Wasm32 in Node.js V8 + Perceus live_objects == 0 (first 3 cases for speed)
-            if has_wasm && case_idx < 3 {
-                let wasm_p = std::env::temp_dir().join(format!("tenon_fuzz_{}_{}.wasm", pid, case_idx));
-                wasm_llvm::compile_program_to_wasm32_llvm(&prog, &wasm_p, &opts).unwrap();
-                let js = format!(
-                    "const fs=require('fs');(async()=>{{const {{instance}}=await WebAssembly.instantiate(fs.readFileSync({:?}),{{}});const r=instance.exports.main();const l=instance.exports.tenon_wasm_live_objects();console.log(Number(r)+','+Number(l));}})();",
-                    wasm_p.to_string_lossy()
-                );
-                let wout = std::process::Command::new("node").args(["-e", &js]).output().unwrap();
-                let _ = std::fs::remove_file(&wasm_p);
-                let ws = String::from_utf8_lossy(&wout.stdout);
-                assert_eq!(
-                    ws.trim(),
-                    format!("{},0", jit_res),
-                    "Wasm32 mismatch in fuzz case {}: expected {},0 got {}",
-                    case_idx,
-                    jit_res,
-                    ws
-                );
-            }
+            let wout = std::process::Command::new("node").args(["-e", &js]).output().unwrap();
+            let _ = std::fs::remove_file(&wasm_p);
+            let ws = String::from_utf8_lossy(&wout.stdout);
+            assert_eq!(
+                ws.trim(),
+                format!("{},0", jit_res),
+                "Wasm32 mismatch in combined fuzz: expected {},0 got {}",
+                jit_res,
+                ws
+            );
         }
     }
 }

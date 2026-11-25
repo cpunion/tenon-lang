@@ -1,0 +1,71 @@
+// std/gpu/window/window.tn — Pure Tenon Native macOS Metal Desktop Window API (`tenon-gpui`)
+//
+// Zero Rust dependencies: links directly against macOS Cocoa + Metal + QuartzCore + CoreGraphics + CoreText + ImageIO.
+
+import "std/core/types.tn"
+
+@link(framework = "Cocoa")
+@link(framework = "Metal")
+@link(framework = "QuartzCore")
+@link(framework = "CoreGraphics")
+@link(framework = "CoreText")
+@link(framework = "ImageIO")
+extern "C" {
+    fn tn_win_open(title_cstr Ptr[UInt8], width Int, height Int, headless Int) Int
+    fn tn_win_device_name() Ptr[UInt8]
+    fn tn_win_begin_text() Int
+    fn tn_win_draw_text(
+        text_cstr Ptr[UInt8],
+        x Int,
+        y Int,
+        font_px Int,
+        bold Int,
+        r255 Int,
+        g255 Int,
+        b255 Int,
+    ) Int
+    fn tn_win_present(quads_ptr Ptr[UInt8], quad_count Int, bg_r Int, bg_g Int, bg_b Int) Int
+    fn tn_win_save_png(quads_ptr Ptr[UInt8], quad_count Int, bg_r Int, bg_g Int, bg_b Int, path_cstr Ptr[UInt8]) Int
+    fn tn_win_poll_event(timeout_ms Int) Int
+    fn tn_win_event_a() Int
+    fn tn_win_event_b() Int
+}
+
+pub record WinEvent {
+    kind Int // 0=none, 1=key, 2=mouse_down, 3=quit
+    a    Int // keycode or mouse_x
+    b    Int // char code or mouse_y
+}
+
+pub fn win_open(title Text, width Int, height Int, headless Bool) Bool {
+    let h = if headless { 1 } else { 0 }
+    unsafe { tn_win_open(text_cstr_ptr(title), width, height, h) != 0 }
+}
+
+pub fn win_gpu_name() Text {
+    unsafe { cstr_to_text(tn_win_device_name()) }
+}
+
+pub fn win_begin_text() {
+    let _ = unsafe { tn_win_begin_text() }
+}
+
+pub fn win_draw_text(s Text, x Int, y Int, font_px Int, bold Bool, r Int, g Int, b Int) {
+    let bf = if bold { 1 } else { 0 }
+    let _ = unsafe { tn_win_draw_text(text_cstr_ptr(s), x, y, font_px, bf, r, g, b) }
+}
+
+pub fn win_present(quad_floats List[Float32], quad_count Int, bg_r Int, bg_g Int, bg_b Int) Bool {
+    unsafe { tn_win_present(list_data_ptr(quad_floats), quad_count, bg_r, bg_g, bg_b) != 0 }
+}
+
+pub fn win_save_png(quad_floats List[Float32], quad_count Int, bg_r Int, bg_g Int, bg_b Int, path Text) Bool {
+    unsafe { tn_win_save_png(list_data_ptr(quad_floats), quad_count, bg_r, bg_g, bg_b, text_cstr_ptr(path)) != 0 }
+}
+
+pub fn win_poll_event(timeout_ms Int) WinEvent {
+    let k = unsafe { tn_win_poll_event(timeout_ms) }
+    let a = unsafe { tn_win_event_a() }
+    let b = unsafe { tn_win_event_b() }
+    WinEvent { kind = k, a = a, b = b }
+}

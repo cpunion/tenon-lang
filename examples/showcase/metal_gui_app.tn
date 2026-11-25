@@ -1,0 +1,226 @@
+// examples/showcase/metal_gui_app.tn — Real Interactive Native macOS Metal Desktop GUI Window (`tenon-gpui`)!
+//
+// Zero Rust runtime — 100% Tenon + native macOS Cocoa / Apple Silicon Metal GPU:
+//   OpenUI Lang -> Unified VDOM -> FiniteFloat Flexbox Layout -> Batched SDF Rounded Quads + Retina Typography!
+//
+// Build & launch the real desktop window:
+//   ./target/release/tenon build --c-src std/gpu/window/metal_window.m -o /tmp/tenon_metal_gui examples/showcase/metal_gui_app.tn
+//   /tmp/tenon_metal_gui
+//
+// Interactive Controls:
+//   - Click [+ Boost] / key `+`    : Increase GPU load & watch bar chart + KPI update at 120Hz
+//   - Click [- Cool]  / key `-`    : Decrease GPU load
+//   - Click [Stream]  / key Space  : Replay live progressive OpenUI Lang LLM streaming inside the GPU window!
+//   - Click [Theme]   / key `t`    : Switch Midnight Indigo <-> Emerald Matrix palette
+//   - Key `q` / `Esc` / close btn  : Exit cleanly with 0 leaks
+//
+// Headless PNG preview mode (used by CI & quick inspection):
+//   TENON_GUI_SMOKE=1 /tmp/tenon_metal_gui   -> saves Retina PNG to `/tmp/tenon_gpui_preview.png`
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+import "std/os/io.tn"
+import "std/ui/vdom.tn"
+import "std/ui/openui.tn"
+import "std/ui/layout.tn"
+import "std/ui/scene.tn"
+import "std/gpu/window/window.tn"
+
+pure fn push_quad_f32(
+    inout buf List[Float32],
+    x Float, y Float, w Float, h Float,
+    r Float, g Float, b Float, a Float,
+    rad Float, bw Float, br Float, bg Float,
+) {
+    buf = push(buf, x as Float32)
+    buf = push(buf, y as Float32)
+    buf = push(buf, w as Float32)
+    buf = push(buf, h as Float32)
+    buf = push(buf, r as Float32)
+    buf = push(buf, g as Float32)
+    buf = push(buf, b as Float32)
+    buf = push(buf, a as Float32)
+    buf = push(buf, rad as Float32)
+    buf = push(buf, bw as Float32)
+    buf = push(buf, br as Float32)
+    buf = push(buf, bg as Float32)
+}
+
+pure fn hit_rect(px Int, py Int, rx Int, ry Int, rw Int, rh Int) Bool {
+    px >= rx && px <= rx + rw && py >= ry && py <= ry + rh
+}
+
+pure fn openui_template() Text {
+    "root = Card([hdr, kpis, chart])\nhdr = Header(\"Tenon GPUI Studio\", \"Native Apple Silicon Metal Window | OpenUI -> VDOM -> Flexbox -> 120Hz SDF\")\nkpis = Row([m1, m2, m3])\nm1 = Metric(\"Throughput\", $tps, \"+24%\")\nm2 = Metric(\"VDOM Diff\", $patches, \"Keyed\")\nm3 = Metric(\"Perceus Leaks\", \"0 objs\", \"Verified\")\nchart = BarChart([\"Web Wasm\", \"ANSI TUI\", \"Metal GPU\"], [$b1, $b2, $b3])\n"
+}
+
+fn render_gui_frame(
+    tps Int,
+    theme Int,
+    stream_cursor Int,
+    last_action Text,
+    patch_count Int,
+    gpu_name Text,
+    save_png_path Text,
+) {
+    let full_src = openui_template()
+    let cur_src = if stream_cursor < len(full_src) {
+        str_slice(full_src, 0, stream_cursor)
+    } else {
+        full_src
+    }
+    let doc = openui_parse_stream(cur_src, stream_cursor >= len(full_src))
+    var store = ui_store_new()
+    store = ui_store_set(store, "tps", int_to_text(tps) ++ "k/s")
+    store = ui_store_set(store, "patches", int_to_text(patch_count) ++ " ops")
+    store = ui_store_set(store, "b1", int_to_text(tps / 2))
+    store = ui_store_set(store, "b2", int_to_text((tps * 3) / 4))
+    store = ui_store_set(store, "b3", int_to_text(tps))
+
+    let vdom = openui_to_vdom(doc, store)
+    let boxes = layout_vdom(vdom, 840.0, 344.0)
+    let scene = layout_to_scene(boxes, 840, 344)
+
+    // Pack SceneGraph quads + 4 interactive toolbar buttons + status footer into ONE batched Metal draw call!
+    var qf List[Float32] = []
+    var qcount = 0
+    var qi = 0
+    while qi < len(scene.quads) {
+        let q = scene.quads[qi]
+        // Theme tint for Header & Card accents
+        let rr = if theme == 1 && qi == 1 { 0.04 } else { q.r as Float }
+        let gg = if theme == 1 && qi == 1 { 0.62 } else { q.g as Float }
+        let bb = if theme == 1 && qi == 1 { 0.48 } else { q.b as Float }
+        push_quad_f32(qf, q.x as Float, q.y as Float, q.w as Float, q.h as Float, rr, gg, bb, q.a as Float, q.radius as Float, q.border_w as Float, q.br as Float, q.bg as Float)
+        qcount += 1
+        qi += 1
+    }
+
+    // Interactive Action Buttons Row (y = 358, h = 40)
+    push_quad_f32(qf, 28.0, 358.0, 146.0, 40.0, 0.06, 0.56, 0.88, 1.0, 9.0, 1.0, 0.40, 0.82) // [+ Boost]
+    push_quad_f32(qf, 188.0, 358.0, 146.0, 40.0, 0.22, 0.30, 0.44, 1.0, 9.0, 1.0, 0.45, 0.55) // [- Cool]
+    push_quad_f32(qf, 348.0, 358.0, 175.0, 40.0, 0.94, 0.58, 0.06, 1.0, 9.0, 0.0, 0.0, 0.0)  // [Stream OpenUI]
+    push_quad_f32(qf, 537.0, 358.0, 156.0, 40.0, 0.09, 0.68, 0.48, 1.0, 9.0, 0.0, 0.0, 0.0)  // [Toggle Theme]
+    // Footer status pill
+    push_quad_f32(qf, 28.0, 410.0, 784.0, 30.0, 0.10, 0.14, 0.22, 1.0, 7.0, 1.0, 0.24, 0.34)
+    qcount += 5
+
+    // Crisp Retina CoreText typography pass aligned to the exact Flexbox `LayoutBox` rects!
+    win_begin_text()
+    var bi = 0
+    while bi < len(boxes) {
+        let bx = boxes[bi]
+        let rx = float_to_int(bx.rect.x)
+        let ry = float_to_int(bx.rect.y)
+        if bx.kind == "Header" {
+            win_draw_text(bx.label, rx + 16, ry + 8, 20, true, 255, 255, 255)
+            win_draw_text(bx.value, rx + 16, ry + 34, 12, false, 224, 242, 254)
+        } else if bx.kind == "Metric" {
+            win_draw_text(bx.label, rx + 24, ry + 10, 12, false, 148, 163, 184)
+            win_draw_text(bx.value, rx + 24, ry + 28, 22, true, 248, 250, 252)
+            win_draw_text(bx.delta, rx + 24, ry + 54, 12, true, 52, 211, 153)
+        } else if bx.kind == "BarChart" {
+            win_draw_text("Web Wasm (" ++ int_to_text(tps / 2) ++ ")", rx + 20, ry + 11, 12, true, 15, 23, 42)
+            win_draw_text("ANSI TUI (" ++ int_to_text((tps * 3) / 4) ++ ")", rx + 20, ry + 41, 12, true, 15, 23, 42)
+            win_draw_text("Metal GPU (" ++ int_to_text(tps) ++ ")", rx + 20, ry + 71, 12, true, 15, 23, 42)
+        }
+        bi += 1
+    }
+
+    // Button labels & footer telemetry
+    win_draw_text("+ Boost Load", 54, 369, 14, true, 255, 255, 255)
+    win_draw_text("- Cool Down", 218, 369, 14, true, 226, 232, 240)
+    win_draw_text("Stream OpenUI", 384, 369, 14, true, 15, 23, 42)
+    win_draw_text("Switch Theme", 566, 369, 14, true, 255, 255, 255)
+    win_draw_text("GPU: " ++ gpu_name ++ "  |  Quads: " ++ int_to_text(qcount) ++ " (1 draw call)  |  Last: " ++ last_action, 42, 418, 12, false, 148, 163, 184)
+
+    let bg_r = if theme == 1 { 10 } else { 11 }
+    let bg_g = if theme == 1 { 24 } else { 17 }
+    let bg_b = if theme == 1 { 22 } else { 32 }
+    if len(save_png_path) > 0 {
+        let _ = win_save_png(qf, qcount, bg_r, bg_g, bg_b, save_png_path)
+    } else {
+        let _ = win_present(qf, qcount, bg_r, bg_g, bg_b)
+    }
+}
+
+pub fn main() Int {
+    let smoke = sys_env("TENON_GUI_SMOKE") == "1"
+    if !win_open("Tenon GPUI — Native Apple Silicon Metal Window", 840, 456, smoke) {
+        println("ERROR: Failed to initialize Metal GUI window")
+        return 1
+    }
+    let gpu = win_gpu_name()
+    if smoke {
+        let out_png = "/tmp/tenon_gpui_preview.png"
+        render_gui_frame(240, 0, 9999, "Smoke Snapshot", 2, gpu, out_png)
+        println("Tenon Native Metal GUI Smoke OK -> " ++ out_png ++ " (GPU: " ++ gpu ++ ")")
+        return 0
+    }
+
+    println("Opened native macOS Metal GUI window on " ++ gpu ++ " (press Esc/Q or close window to exit).")
+    var tps = 220
+    var theme = 0
+    var stream_cursor = 9999
+    var last_action = "Ready (Click buttons or press +, -, Space, T, Q)"
+    var patch_count = 2
+    var dirty = true
+    var running = true
+
+    while running {
+        if dirty || stream_cursor < len(openui_template()) {
+            render_gui_frame(tps, theme, stream_cursor, last_action, patch_count, gpu, "")
+            dirty = false
+        }
+        let wait_ms = if stream_cursor < len(openui_template()) { 16 } else { 32 }
+        let ev = win_poll_event(wait_ms)
+        if ev.kind == 3 {
+            running = false
+        } else if ev.kind == 1 {
+            // Key press (`ev.a` = macOS keyCode, `ev.b` = ASCII char)
+            if ev.a == 53 || ev.b == 113 || ev.b == 81 { // Esc / q / Q
+                running = false
+            } else if ev.b == 43 || ev.b == 61 { // + / =
+                tps += 20
+                last_action = "Key + (Boosted)"
+                dirty = true
+            } else if ev.b == 45 { // -
+                if tps > 40 { tps -= 20 }
+                last_action = "Key - (Cooled)"
+                dirty = true
+            } else if ev.b == 32 { // Space -> replay OpenUI streaming!
+                stream_cursor = 24
+                last_action = "Streaming OpenUI Lang..."
+                dirty = true
+            } else if ev.b == 116 || ev.b == 84 { // t / T
+                theme = if theme == 0 { 1 } else { 0 }
+                last_action = "Switched Theme"
+                dirty = true
+            }
+        } else if ev.kind == 2 {
+            // Mouse click at `(ev.a, ev.b)`
+            if hit_rect(ev.a, ev.b, 28, 358, 146, 40) {
+                tps += 20
+                last_action = "Clicked [+ Boost Load]"
+                dirty = true
+            } else if hit_rect(ev.a, ev.b, 188, 358, 146, 40) {
+                if tps > 40 { tps -= 20 }
+                last_action = "Clicked [- Cool Down]"
+                dirty = true
+            } else if hit_rect(ev.a, ev.b, 348, 358, 175, 40) {
+                stream_cursor = 24
+                last_action = "Clicked [Stream OpenUI]"
+                dirty = true
+            } else if hit_rect(ev.a, ev.b, 537, 358, 156, 40) {
+                theme = if theme == 0 { 1 } else { 0 }
+                last_action = "Clicked [Switch Theme]"
+                dirty = true
+            }
+        }
+        if stream_cursor < len(openui_template()) {
+            stream_cursor += 12
+            dirty = true
+        }
+    }
+    0
+}

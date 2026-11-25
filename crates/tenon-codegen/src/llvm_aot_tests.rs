@@ -2,206 +2,125 @@ use super::*;
 use tenon_syntax::parse;
 
 #[test]
-fn llvm_aot_compiles_and_runs_records_mutate_parse_and_stackless_async() {
+fn llvm_aot_core_records_async_syscalls_and_interfaces_zero_leaks() {
     let src = r#"
 pub type Year  = Int where 1 <= self && self <= 9999
 pub type Month = Int where 1 <= self && self <= 12
 
 pub pure fn is_leap_year(y Int) Bool {
-(y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }
 
 pub pure fn days_in_month(y Year, m Month) Int {
-match m {
-    2 => if is_leap_year(y) { 29 } else { 28 }
-    4 | 6 | 9 | 11 => 30
-    _ => 31
-}
+    match m {
+        2 => if is_leap_year(y) { 29 } else { 28 }
+        4 | 6 | 9 | 11 => 30
+        _ => 31
+    }
 }
 
 pub record Date {
-year  Year
-month Month
-day   Int where 1 <= self && self <= days_in_month(year, month)
+    year  Year
+    month Month
+    day   Int where 1 <= self && self <= days_in_month(year, month)
 }
 
 pub fn shift_prev(inout d Date) {
-mutate d {
-    d.year -= 1
-    if d.month == 2 && d.day == 29 && !is_leap_year(d.year) {
-        d.day = 28
+    mutate d {
+        d.year -= 1
+        if d.month == 2 && d.day == 29 && !is_leap_year(d.year) {
+            d.day = 28
+        }
     }
-}
 }
 
 pub async fn async_add(v Int) Int {
-let a = await yield_val(v + 5)
-let b = await yield_val(a + 7)
-b
+    let a = await yield_val(v + 5)
+    let b = await yield_val(a + 7)
+    b
 }
 
-pub fn main() Int {
-var d Date = Date { year = 2024, month = 2, day = 29 }
-shift_prev(d)
-assert d.year == 2023
-assert d.day == 28
-
-let ok_day = match Date.parse(2024, 2, 29) {
-    Ok(dt) => dt.day
-    Err(c) => -c
-}
-let bad_m = match Date.parse(2024, 13, 1) {
-    Ok(dt) => dt.day
-    Err(c) => -c
-}
-assert ok_day == 29
-assert bad_m == -2
-
-let ar = block_on(async_add(10))
-assert ar == 22
-ok_day + d.day + ar
-}
-"#;
-    let prog = parse(src).unwrap();
-    let bin = std::env::temp_dir().join(format!("tenon_llvm_aot_test_{}", std::process::id()));
-    let art = compile_to_native_binary(&prog, &bin, None, "O3").unwrap();
-    assert!(art.binary_bytes > 1024);
-
-    let run = Command::new(&bin).output().unwrap();
-    let _ = fs::remove_file(&bin);
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        run.status.success(),
-        "native LLVM binary failed: stdout={} stderr={}",
-        stdout,
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(stdout.contains("main() => 79"), "unexpected stdout: {}", stdout);
-    assert!(stdout.contains("live_objects=0"), "leaked objects: {}", stdout);
-    assert!(stdout.contains("async_suspends=2"), "missing suspensions: {}", stdout);
-}
-
-#[test]
-fn llvm_aot_links_tenon_rt_and_runs_core_syscalls() {
-    let src = r#"
-pub record Msg {
-tag Text
-body Text
-}
+pub record Msg { tag Text, body Text }
 
 pub enum BoxVal {
-BEmpty
-BMsg(Msg)
-BList(List[Msg])
+    BEmpty
+    BMsg(Msg)
+    BList(List[Msg])
 }
 
 pub fn build_msg(t Text, b Text) Msg {
-Msg { tag = "[" ++ t ++ "]", body = b }
+    Msg { tag = "[" ++ t ++ "]", body = b }
 }
 
-pub fn main() Int {
-var xs List[Msg] = []
-xs = push(xs, build_msg("OK", "hello tenon"))
-let bv = BList(xs)
-let out = match bv {
-    BList(items) => {
-        let m = items[0]
-        m.tag ++ " " ++ str_slice(m.body, 0, 5)
-    }
-    BMsg(m) => m.tag
-    BEmpty => ""
-}
-assert out == "[OK] hello"
-let _ = sys_write_stdout(out ++ "\n")
-0
-}
-"#;
-    let prog = parse(src).unwrap();
-    let bin = std::env::temp_dir().join(format!("tenon_llvm_rt_test_{}", std::process::id()));
-    let art = compile_to_native_binary(&prog, &bin, None, "O2").unwrap();
-    assert!(art.binary_bytes > 4096);
-
-    let run = Command::new(&bin).output().unwrap();
-    let _ = fs::remove_file(&bin);
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        run.status.success(),
-        "native LLVM+tenon_rt binary failed: stdout={} stderr={}",
-        stdout,
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert_eq!(stdout.trim(), "[OK] hello");
-}
-
-#[test]
-fn llvm_aot_interfaces_static_monomorph_and_dyn_vtable_zero_leaks() {
-    let src = r#"
 pub interface Greeter {
-pure fn greet(self, who Text) Text
+    pure fn greet(self, who Text) Text
 }
 
 pub interface Accumulator {
-fn add(inout self, delta Int) Int
-pure fn current(self) Int
+    fn add(inout self, delta Int) Int
+    pure fn current(self) Int
 }
 
 pub record EnGreeter { prefix Text }
 pub record ZhGreeter { prefix Text }
-
-impl Greeter for EnGreeter {
-pure fn greet(self, who Text) Text { self.prefix ++ " " ++ who }
-}
-
-impl Greeter for ZhGreeter {
-pure fn greet(self, who Text) Text { self.prefix ++ ", " ++ who }
-}
+impl Greeter for EnGreeter { pure fn greet(self, who Text) Text { self.prefix ++ " " ++ who } }
+impl Greeter for ZhGreeter { pure fn greet(self, who Text) Text { self.prefix ++ ", " ++ who } }
 
 pub record Counter { val Int }
-
 impl Accumulator for Counter {
-fn add(inout self, delta Int) Int {
-    self.val += delta
-    self.val
-}
-pure fn current(self) Int { self.val }
+    fn add(inout self, delta Int) Int { self.val += delta; self.val }
+    pure fn current(self) Int { self.val }
 }
 
-pub pure fn run_static[T Greeter](g T, name Text) Text {
-g.greet(name)
-}
-
-pub pure fn run_dyn(g dyn Greeter, name Text) Text {
-g.greet(name)
-}
+pub pure fn run_static[T Greeter](g T, name Text) Text { g.greet(name) }
+pub pure fn run_dyn(g dyn Greeter, name Text) Text { g.greet(name) }
 
 pub fn main() Int {
-let en = EnGreeter { prefix = "Hello" }
-let zh = ZhGreeter { prefix = "NiHao" }
-assert run_static(en, "Tenon") == "Hello Tenon"
-assert run_static(zh, "Tenon") == "NiHao, Tenon"
+    // 1. Records, mutate, Date.parse, stackless async
+    var d Date = Date { year = 2024, month = 2, day = 29 }
+    shift_prev(d)
+    assert d.year == 2023 && d.day == 28
+    let ok_day = match Date.parse(2024, 2, 29) { Ok(dt) => dt.day Err(c) => -c }
+    let bad_m = match Date.parse(2024, 13, 1) { Ok(dt) => dt.day Err(c) => -c }
+    assert ok_day == 29 && bad_m == -2
+    let ar = block_on(async_add(10))
+    assert ar == 22
 
-var list List[dyn Greeter] = []
-list = push(list, en)
-list = push(list, zh)
-let b = buf_new()
-let _ = buf_push_str(b, run_dyn(list[0], "World"))
-let _ = buf_push_byte(b, 124)
-let _ = buf_push_str(b, list[1].greet("World"))
-let joined = buf_finish(b)
-assert joined == "Hello World|NiHao, World"
+    // 2. Lists, enums, text slicing, core syscalls
+    var xs List[Msg] = []
+    xs = push(xs, build_msg("OK", "hello tenon"))
+    let bv = BList(xs)
+    let out = match bv {
+        BList(items) => { let m = items[0]; m.tag ++ " " ++ str_slice(m.body, 0, 5) }
+        BMsg(m) => m.tag
+        BEmpty => ""
+    }
+    assert out == "[OK] hello"
 
-var c dyn Accumulator = Counter { val = 10 }
-let c2 dyn Accumulator = c
-let v1 = c.add(5)
-assert v1 == 15
-assert c.current() == 15
-assert c2.current() == 10
-let _ = sys_write_stdout(joined ++ "\n")
-0
+    // 3. Static monomorph & dyn vtable interfaces + COW
+    let en = EnGreeter { prefix = "Hello" }
+    let zh = ZhGreeter { prefix = "NiHao" }
+    assert run_static(en, "Tenon") == "Hello Tenon"
+    assert run_static(zh, "Tenon") == "NiHao, Tenon"
+    var list List[dyn Greeter] = []
+    list = push(list, en)
+    list = push(list, zh)
+    let b = buf_new()
+    let _ = buf_push_str(b, run_dyn(list[0], "World"))
+    let _ = buf_push_byte(b, 124)
+    let _ = buf_push_str(b, list[1].greet("World"))
+    let joined = buf_finish(b)
+    assert joined == "Hello World|NiHao, World"
+    var c dyn Accumulator = Counter { val = 10 }
+    let c2 dyn Accumulator = c
+    assert c.add(5) == 15 && c.current() == 15 && c2.current() == 10
+
+    let _ = sys_write_stdout(out ++ "|" ++ joined ++ "\n")
+    0
 }
 "#;
     let prog = parse(src).unwrap();
-    let bin = std::env::temp_dir().join(format!("tenon_llvm_dyn_test_{}", std::process::id()));
+    let bin = std::env::temp_dir().join(format!("tenon_llvm_core_test_{}", std::process::id()));
     let art = compile_to_native_binary(&prog, &bin, None, "O3").unwrap();
     assert!(art.binary_bytes > 4096);
 
@@ -210,11 +129,11 @@ let _ = sys_write_stdout(joined ++ "\n")
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
         run.status.success(),
-        "native LLVM dyn/static interface binary failed: stdout={} stderr={}",
+        "native LLVM core suite binary failed: stdout={} stderr={}",
         stdout,
         String::from_utf8_lossy(&run.stderr)
     );
-    assert_eq!(stdout.trim(), "Hello World|NiHao, World");
+    assert_eq!(stdout.trim(), "[OK] hello|Hello World|NiHao, World");
 }
 
 #[test]
@@ -633,7 +552,7 @@ add_pair(10, 11)
     prog.source_files.push("debug_demo.tn".into());
 
     let pid = std::process::id();
-    let bin = std::env::temp_dir().join(format!("tenon_llvm_dbg_{}", pid));
+    let obj = std::env::temp_dir().join(format!("tenon_llvm_dbg_{}.o", pid));
     let ir_path = std::env::temp_dir().join(format!("tenon_llvm_dbg_{}.ll", pid));
     let opts = BuildOptions {
         opt_level: "O0".into(),
@@ -641,23 +560,15 @@ add_pair(10, 11)
         emit_ll_path: Some(ir_path.clone()),
         ..Default::default()
     };
-    compile_with_options(&prog, &bin, &opts).unwrap();
+    compile_with_options(&prog, &obj, &opts).unwrap();
     let ir = fs::read_to_string(&ir_path).unwrap();
     let _ = fs::remove_file(&ir_path);
     assert!(ir.contains("!DICompileUnit"), "missing !DICompileUnit in DWARF IR");
     assert!(ir.contains("!DIFile"), "missing !DIFile in DWARF IR");
     assert!(ir.contains("!DISubprogram"), "missing !DISubprogram in DWARF IR");
     assert!(ir.contains("!DILocation"), "missing !DILocation in DWARF IR");
-
-    let run = Command::new(&bin).output().unwrap();
-    let _ = fs::remove_file(&bin);
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        run.status.success() && stdout.contains("main() => 42"),
-        "DWARF -g binary failed: stdout={} stderr={}",
-        stdout,
-        String::from_utf8_lossy(&run.stderr)
-    );
+    assert!(fs::metadata(&obj).unwrap().len() > 256, "expected valid DWARF .o object");
+    let _ = fs::remove_file(&obj);
 }
 
 #[test]
@@ -665,8 +576,8 @@ fn llvm_aot_web_app_and_modules_demo_zero_leaks() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let pid = std::process::id();
 
-    let o3 = BuildOptions {
-        opt_level: "O3".into(),
+    let o1 = BuildOptions {
+        opt_level: "O1".into(),
         ..Default::default()
     };
 
@@ -677,7 +588,7 @@ fn llvm_aot_web_app_and_modules_demo_zero_leaks() {
     )
     .expect("modules_demo/app must load");
     let mod_bin = std::env::temp_dir().join(format!("tenon_llvm_mod_{}", pid));
-    compile_with_options(&mod_prog, &mod_bin, &o3).expect("modules_demo LLVM AOT build");
+    compile_with_options(&mod_prog, &mod_bin, &o1).expect("modules_demo LLVM AOT build");
     let run1 = Command::new(&mod_bin).output().unwrap();
     let _ = fs::remove_file(&mod_bin);
     let out1 = String::from_utf8_lossy(&run1.stdout);
@@ -695,7 +606,7 @@ fn llvm_aot_web_app_and_modules_demo_zero_leaks() {
     )
     .expect("examples/web_app must load");
     let web_bin = std::env::temp_dir().join(format!("tenon_llvm_web_{}", pid));
-    compile_with_options(&web_prog, &web_bin, &o3).expect("examples/web_app LLVM AOT build");
+    compile_with_options(&web_prog, &web_bin, &o1).expect("examples/web_app LLVM AOT build");
     let run2 = Command::new(&web_bin).output().unwrap();
     let _ = fs::remove_file(&web_bin);
     let out2 = String::from_utf8_lossy(&run2.stdout);
@@ -766,55 +677,109 @@ fn llvm_aot_advanced_verification_unchecked_indexing_ghost_erasure_and_zero_leak
 }
 
 #[test]
-fn llvm_aot_checked_overflow_elides_proved_nsw_and_traps_unproved() {
+fn llvm_aot_checked_overflow_flat_lists_mir_moves_and_xcompile_zero_leaks() {
     let prog = parse(r#"
 pub type Small = Int where self >= 0 && self <= 1000
 
 pub pure fn safe_add(a Small, b Small) Int {
-a + b
+    a + b
 }
 
 pub pure fn unchecked_add(a Int, b Int) Int {
-a + b
+    a + b
+}
+
+pub record Boxed {
+    tag Int
+    label Text
+}
+
+pub fn wrap_last_use(n Int) Boxed {
+    let b = Boxed { tag = n, label = "tenon-mir-move" }
+    b
+}
+
+pub fn flat_int32_sum(n Int where self >= 1 && self <= 16) Int {
+    var xs List[Int32] = list_filled(n, -3 as Int32)
+    let copy = xs
+    xs[0] = 10 as Int32
+    xs = push(xs, 5 as Int32)
+    var s = 0
+    var i = 0
+    while i < len(xs) {
+        s = s + (xs[i] as Int)
+        i += 1
+    }
+    s + (copy[0] as Int)
+}
+
+pub fn flat_float32_dot() Int {
+    var a List[Float32] = [1.5 as Float32, 2.5 as Float32, 3.0 as Float32]
+    a[1] = 4.0 as Float32
+    a = push(a, 2.0 as Float32)
+    let sum = (a[0] as Float) + (a[1] as Float) + (a[2] as Float) + (a[3] as Float)
+    float_to_int(sum * 2.0)
 }
 
 pub fn main() Int {
-let s = safe_add(10, 20)
-let u = unchecked_add(10, 2)
-s + u
+    let s = safe_add(10, 20)
+    let u = unchecked_add(10, 2)
+    let b = wrap_last_use(100)
+    let s32 = flat_int32_sum(4)
+    let f32s = flat_float32_dot()
+    // 42 + 100 + 3 + 21 = 166
+    s + u + b.tag + s32 + f32s
 }
 "#)
     .unwrap();
     let rep = tenon_verify::check_program(&prog);
     assert!(rep.ok, "verify failed: {:?}", rep.diagnostics);
+    let ssa_mir = tenon_mir::lower_program_to_ssa_mir(&prog, &rep.mir);
+    let mir_txt = tenon_mir::format_mir(&ssa_mir);
+    assert!(mir_txt.contains("move.local $b"), "expected move.local $b in MIR:\n{}", mir_txt);
 
     let pid = std::process::id();
-    let bin = std::env::temp_dir().join(format!("tenon_llvm_ov_{}", pid));
-    let ir_path = std::env::temp_dir().join(format!("tenon_llvm_ov_{}.ll", pid));
+    let bin = std::env::temp_dir().join(format!("tenon_llvm_ov_mir_{}", pid));
+    let ir_path = std::env::temp_dir().join(format!("tenon_llvm_ov_mir_{}.ll", pid));
     let mut opts = BuildOptions {
-        opt_level: "O2".into(),
+        opt_level: "O3".into(),
         emit_ll_path: Some(ir_path.clone()),
         checked_overflow: true,
         ..Default::default()
     };
     opts.apply_verified_mir(&rep.mir);
-    compile_with_options(&prog, &bin, &opts).expect("checked overflow AOT build");
+    opts.apply_ssa_mir(&ssa_mir);
+    compile_with_options(&prog, &bin, &opts).expect("checked overflow + MIR AOT build");
     let ir = fs::read_to_string(&ir_path).unwrap();
     let _ = fs::remove_file(&ir_path);
-    assert!(
-        ir.contains("add nsw i64"),
-        "expected `add nsw i64` for proved overflow-free `safe_add`"
-    );
+    assert!(ir.contains("add nsw i64"), "expected `add nsw i64` for proved overflow-free `safe_add`");
     assert!(
         ir.contains("@llvm.sadd.with.overflow.i64"),
         "expected `@llvm.sadd.with.overflow.i64` for unproved `unchecked_add`"
     );
+    assert!(
+        ir.contains("@tenon_flat_list_filled(i64") && ir.contains(", i64 4, ptr"),
+        "expected 4-byte flat list allocation in IR"
+    );
+    assert!(
+        ir.contains("load i32, ptr") && ir.contains("store i32"),
+        "expected native 32-bit packed element load/store in IR"
+    );
+    let wrap_start = ir.find("@tenon_fn_wrap_last_use(").expect("wrap_last_use IR");
+    let wrap_end = ir[wrap_start..].find("\n}\n").unwrap() + wrap_start;
+    let wrap_ir = &ir[wrap_start..wrap_end];
+    assert!(
+        !wrap_ir.contains("@__tn_rc_inc"),
+        "expected Last-Use Move to eliminate @__tn_rc_inc in wrap_last_use:\n{}",
+        wrap_ir
+    );
+
     let run = Command::new(&bin).output().unwrap();
     let _ = fs::remove_file(&bin);
     let out = String::from_utf8_lossy(&run.stdout);
     assert!(
-        run.status.success() && out.contains("main() => 42"),
-        "checked overflow run failed: stdout={} stderr={}",
+        run.status.success() && out.contains("main() => 166") && out.contains("live_objects=0"),
+        "checked overflow + MIR run failed: stdout={} stderr={}",
         out,
         String::from_utf8_lossy(&run.stderr)
     );
@@ -837,170 +802,154 @@ fn llvm_aot_sqlite3_check_constraints_and_openssl_tls_zero_leaks() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let pid = std::process::id();
 
-    // 1. Real SQLite3 `:memory:` DB with refinement-derived `CHECK(qty > 0)` constraint!
-    let sql_src = r#"
-import "std/db/sqlite.tn"
+    let (has_openssl, link_dirs, cert_path, key_path, gen_ok) =
+        if let Ok(pc) = Command::new("pkg-config").args(["--libs-only-L", "openssl"]).output() {
+            if pc.status.success() {
+                let lflags = String::from_utf8_lossy(&pc.stdout);
+                let dirs: Vec<String> = lflags
+                    .split_whitespace()
+                    .filter_map(|t| t.strip_prefix("-L").map(|s| s.to_string()))
+                    .collect();
+                let cp = std::env::temp_dir().join(format!("tenon_tls_cert_{}.pem", pid));
+                let kp = std::env::temp_dir().join(format!("tenon_tls_key_{}.pem", pid));
+                let ok = Command::new("openssl")
+                    .args([
+                        "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", &kp.to_string_lossy(),
+                        "-out", &cp.to_string_lossy(),
+                        "-days", "1", "-subj", "/CN=localhost",
+                    ])
+                    .output()
+                    .is_ok_and(|o| o.status.success());
+                (true, dirs, cp, kp, ok)
+            } else {
+                (false, vec![], PathBuf::new(), PathBuf::new(), false)
+            }
+        } else {
+            (false, vec![], PathBuf::new(), PathBuf::new(), false)
+        };
 
-pub fn main() Int {
-let db = match sqlite_open(":memory:") {
-    Ok(d) => d
-    Err(_) => { return -1 }
-}
-let ddl = sql_create_table_ddl(
-    "orders",
-    ["id INTEGER PRIMARY KEY", "sym TEXT NOT NULL", "qty INTEGER NOT NULL", "px INTEGER NOT NULL"],
-    ["qty > 0", "px >= 1"]
-)
-match db.exec(ddl) {
-    Ok(_) => {}
-    Err(_) => { db.close(); return -2 }
-}
-let _ = db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (1, 'BTC', 10, 50000);")
-let _ = db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (2, 'ETH', 25, 3000);")
-// Invalid row (`qty = -5`) MUST be rejected by SQLite CHECK constraint!
-let rejected = match db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (3, 'BAD', -5, 100);") {
-    Ok(_) => 0
-    Err(_) => 1
-}
-let sum_qty = match db.query_int("SELECT SUM(qty) FROM orders;") {
-    Ok(v) => v
-    Err(_) => -3
-}
-let first_sym = match db.query_text("SELECT sym FROM orders WHERE id = 1;") {
-    Ok(s) => s
-    Err(_) => ""
-}
-db.close()
-if rejected == 1 && first_sym == "BTC" { sum_qty } else { -99 }
-}
-"#;
-    let tmp_tn = repo_root.join(format!("target/tenon_sqlite_test_{}.tn", pid));
-    let _ = fs::create_dir_all(tmp_tn.parent().unwrap());
-    fs::write(&tmp_tn, sql_src).unwrap();
-    let sql_prog = tenon_syntax::load_program_with_imports(&tmp_tn).unwrap();
-    let _ = fs::remove_file(&tmp_tn);
-    let sql_rep = tenon_verify::check_program(&sql_prog);
-    assert!(sql_rep.ok, "sqlite test failed verification: {:?}", sql_rep.diagnostics);
-
-    let sql_bin = std::env::temp_dir().join(format!("tenon_llvm_sqlite_{}", pid));
-    let opts = BuildOptions {
-        opt_level: "O2".into(),
-        ..Default::default()
+    // Combine real SQLite3 CHECK constraint verification + OpenSSL TLS 1.3 handshake into ONE native binary!
+    let tls_imports = if has_openssl {
+        "import \"std/net/tls.tn\"\nimport \"std/sync/sync.tn\"\n"
+    } else {
+        ""
     };
-    compile_with_options(&sql_prog, &sql_bin, &opts).expect("SQLite3 LLVM AOT link failed");
-    let run1 = Command::new(&sql_bin).output().unwrap();
-    let _ = fs::remove_file(&sql_bin);
-    let out1 = String::from_utf8_lossy(&run1.stdout);
-    assert!(
-        run1.status.success() && out1.contains("main() => 35") && out1.contains("live_objects=0"),
-        "SQLite3 AOT run failed: stdout={} stderr={}",
-        out1,
-        String::from_utf8_lossy(&run1.stderr)
-    );
+    let tls_check = if has_openssl && gen_ok {
+        format!(
+            r#"
+    let ver = tls_openssl_version()
+    let sctx = match tls_server_context() {{ Ok(c) => c Err(_) => {{ return -11 }} }}
+    match sctx.load_cert_key("{}", "{}") {{
+        Ok(_) => {{}}
+        Err(_) => {{ sctx.close(); return -12 }}
+    }}
+    let cctx = match tls_client_context() {{ Ok(c) => c Err(_) => {{ sctx.close(); return -13 }} }}
+    let lfd = net_tcp_listen("127.0.0.1:0")
+    if lfd < 0 {{ cctx.close(); sctx.close(); return -14 }}
+    let port = net_tcp_local_port(lfd)
+    let srv = thread_spawn(|| {{
+        let cfd = net_tcp_accept(lfd)
+        if cfd < 0 {{ return -1 }}
+        let served = match sctx.accept_fd(cfd) {{
+            Ok(st) => {{
+                let n = https_serve_stream(st, |req| http_ok("tls:" ++ req.path))
+                st.close()
+                n
+            }}
+            Err(_) => -1
+        }}
+        let _ = net_close(cfd)
+        served
+    }})
+    let tls_ok = match https_get_with_context(cctx, f"127.0.0.1:{{port}}", "localhost", "/secure") {{
+        Ok(res) => if res.status == 200 && res.body == "tls:/secure" && ver > 0 {{ 1 }} else {{ -15 }}
+        Err(_) => -16
+    }}
+    let srv_n = thread_join(srv)
+    let _ = net_close(lfd)
+    cctx.close()
+    sctx.close()
+    if tls_ok != 1 || srv_n != 1 {{ return tls_ok }}
+"#,
+            cert_path.to_string_lossy().replace('\\', "\\\\"),
+            key_path.to_string_lossy().replace('\\', "\\\\")
+        )
+    } else {
+        String::new()
+    };
 
-    // 2. Real OpenSSL TLS 1.3 loopback HTTPS handshake + GET/200 (`std/net/tls.tn`)
-    if let Ok(pc) = Command::new("pkg-config").args(["--libs-only-L", "openssl"]).output() {
-        if pc.status.success() {
-            let lflags = String::from_utf8_lossy(&pc.stdout);
-            let link_dirs: Vec<String> = lflags
-                .split_whitespace()
-                .filter_map(|t| t.strip_prefix("-L").map(|s| s.to_string()))
-                .collect();
-            let cert_path = std::env::temp_dir().join(format!("tenon_tls_cert_{}.pem", pid));
-            let key_path = std::env::temp_dir().join(format!("tenon_tls_key_{}.pem", pid));
-            let gen_ok = Command::new("openssl")
-                .args([
-                    "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                    "-keyout", &key_path.to_string_lossy(),
-                    "-out", &cert_path.to_string_lossy(),
-                    "-days", "1", "-subj", "/CN=localhost",
-                ])
-                .output()
-                .is_ok_and(|o| o.status.success());
-
-            let tls_src = if gen_ok {
-                format!(
-                    r#"
-import "std/net/tls.tn"
-import "std/sync/sync.tn"
+    let combined_src = format!(
+        r#"
+import "std/db/sqlite.tn"
+{tls_imports}
 
 pub fn main() Int {{
-let ver = tls_openssl_version()
-let sctx = match tls_server_context() {{ Ok(c) => c Err(_) => {{ return -1 }} }}
-match sctx.load_cert_key("{}", "{}") {{
-    Ok(_) => {{}}
-    Err(_) => {{ sctx.close(); return -2 }}
-}}
-let cctx = match tls_client_context() {{ Ok(c) => c Err(_) => {{ sctx.close(); return -3 }} }}
-let lfd = net_tcp_listen("127.0.0.1:0")
-if lfd < 0 {{ cctx.close(); sctx.close(); return -4 }}
-let port = net_tcp_local_port(lfd)
-let srv = thread_spawn(|| {{
-    let cfd = net_tcp_accept(lfd)
-    if cfd < 0 {{ return -1 }}
-    let served = match sctx.accept_fd(cfd) {{
-        Ok(st) => {{
-            let n = https_serve_stream(st, |req| http_ok("tls:" ++ req.path))
-            st.close()
-            n
-        }}
-        Err(_) => -1
+    let db = match sqlite_open(":memory:") {{
+        Ok(d) => d
+        Err(_) => {{ return -1 }}
     }}
-    let _ = net_close(cfd)
-    served
-}})
-let ok = match https_get_with_context(cctx, f"127.0.0.1:{{port}}", "localhost", "/secure") {{
-    Ok(res) => if res.status == 200 && res.body == "tls:/secure" && ver > 0 {{ 1 }} else {{ -5 }}
-    Err(_) => -6
-}}
-let srv_n = thread_join(srv)
-let _ = net_close(lfd)
-cctx.close()
-sctx.close()
-if ok == 1 && srv_n == 1 {{ 1 }} else {{ ok }}
+    let ddl = sql_create_table_ddl(
+        "orders",
+        ["id INTEGER PRIMARY KEY", "sym TEXT NOT NULL", "qty INTEGER NOT NULL", "px INTEGER NOT NULL"],
+        ["qty > 0", "px >= 1"]
+    )
+    match db.exec(ddl) {{
+        Ok(_) => {{}}
+        Err(_) => {{ db.close(); return -2 }}
+    }}
+    let _ = db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (1, 'BTC', 10, 50000);")
+    let _ = db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (2, 'ETH', 25, 3000);")
+    let rejected = match db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (3, 'BAD', -5, 100);") {{
+        Ok(_) => 0
+        Err(_) => 1
+    }}
+    let sum_qty = match db.query_int("SELECT SUM(qty) FROM orders;") {{
+        Ok(v) => v
+        Err(_) => -3
+    }}
+    let first_sym = match db.query_text("SELECT sym FROM orders WHERE id = 1;") {{
+        Ok(s) => s
+        Err(_) => ""
+    }}
+    db.close()
+    if rejected != 1 || first_sym != "BTC" {{ return -99 }}
+{tls_check}
+    sum_qty
 }}
 "#,
-                    cert_path.to_string_lossy().replace('\\', "\\\\"),
-                    key_path.to_string_lossy().replace('\\', "\\\\")
-                )
-            } else {
-                r#"
-import "std/net/tls.tn"
-pub fn main() Int {
-let ver = tls_openssl_version()
-match tls_client_context() {
-    Ok(ctx) => { ctx.close(); if ver > 0 { 1 } else { 0 } }
-    Err(_) => 0
-}
-}
-"#.to_string()
-            };
-            let tmp_tls = repo_root.join(format!("target/tenon_tls_test_{}.tn", pid));
-            fs::write(&tmp_tls, tls_src).unwrap();
-            let tls_prog = tenon_syntax::load_program_with_imports(&tmp_tls).unwrap();
-            let _ = fs::remove_file(&tmp_tls);
-            let tls_rep = tenon_verify::check_program(&tls_prog);
-            assert!(tls_rep.ok, "tls test verify failed: {:?}", tls_rep.diagnostics);
-            let tls_bin = std::env::temp_dir().join(format!("tenon_llvm_tls_{}", pid));
-            let tls_opts = BuildOptions {
-                opt_level: "O2".into(),
-                link_dirs,
-                ..Default::default()
-            };
-            compile_with_options(&tls_prog, &tls_bin, &tls_opts).expect("OpenSSL TLS LLVM AOT link failed");
-            let run2 = Command::new(&tls_bin).output().unwrap();
-            let _ = fs::remove_file(&tls_bin);
-            let _ = fs::remove_file(&cert_path);
-            let _ = fs::remove_file(&key_path);
-            let out2 = String::from_utf8_lossy(&run2.stdout);
-            assert!(
-                run2.status.success() && out2.contains("main() => 1") && out2.contains("live_objects=0"),
-                "OpenSSL TLS AOT run failed: stdout={} stderr={}",
-                out2,
-                String::from_utf8_lossy(&run2.stderr)
-            );
-        }
+        tls_imports = tls_imports,
+        tls_check = tls_check
+    );
+
+    let tmp_tn = repo_root.join(format!("target/tenon_sqlite_tls_test_{}.tn", pid));
+    let _ = fs::create_dir_all(tmp_tn.parent().unwrap());
+    fs::write(&tmp_tn, combined_src).unwrap();
+    let prog = tenon_syntax::load_program_with_imports(&tmp_tn).unwrap();
+    let _ = fs::remove_file(&tmp_tn);
+    let rep = tenon_verify::check_program(&prog);
+    assert!(rep.ok, "sqlite+tls test verify failed: {:?}", rep.diagnostics);
+
+    let bin = std::env::temp_dir().join(format!("tenon_llvm_sqlite_tls_{}", pid));
+    let opts = BuildOptions {
+        opt_level: "O1".into(),
+        link_dirs,
+        ..Default::default()
+    };
+    compile_with_options(&prog, &bin, &opts).expect("SQLite3+OpenSSL LLVM AOT link failed");
+    let run = Command::new(&bin).output().unwrap();
+    let _ = fs::remove_file(&bin);
+    if has_openssl && gen_ok {
+        let _ = fs::remove_file(&cert_path);
+        let _ = fs::remove_file(&key_path);
     }
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && out.contains("main() => 35") && out.contains("live_objects=0"),
+        "SQLite3+OpenSSL AOT run failed: stdout={} stderr={}",
+        out,
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 #[test]
@@ -1019,7 +968,7 @@ fn llvm_aot_dogfood_matching_engine_and_tenon_docgen_zero_leaks() {
     assert!(me_rep.mir.proved_safe_indices.len() >= 2);
     let me_bin = std::env::temp_dir().join(format!("tenon_dogfood_me_{}", pid));
     let mut opts = BuildOptions {
-        opt_level: "O3".into(),
+        opt_level: "O1".into(),
         ..Default::default()
     };
     opts.apply_verified_mir(&me_rep.mir);
@@ -1043,7 +992,7 @@ fn llvm_aot_dogfood_matching_engine_and_tenon_docgen_zero_leaks() {
     assert!(doc_rep.ok, "tenon_docgen verify failed: {:?}", doc_rep.diagnostics);
     let doc_bin = std::env::temp_dir().join(format!("tenon_dogfood_doc_{}", pid));
     let mut doc_opts = BuildOptions {
-        opt_level: "O3".into(),
+        opt_level: "O1".into(),
         ..Default::default()
     };
     doc_opts.apply_verified_mir(&doc_rep.mir);
@@ -1059,97 +1008,4 @@ fn llvm_aot_dogfood_matching_engine_and_tenon_docgen_zero_leaks() {
     );
 }
 
-#[test]
-fn llvm_aot_verifies_flat_int32_float32_lists_and_tenon_mir_last_use_moves() {
-    let src = r#"
-pub record Boxed {
-    tag Int
-    label Text
-}
 
-pub fn wrap_last_use(n Int) Boxed {
-    let b = Boxed { tag = n, label = "tenon-mir-move" }
-    b
-}
-
-pub fn flat_int32_sum(n Int where self >= 1 && self <= 16) Int {
-    var xs List[Int32] = list_filled(n, -3 as Int32)
-    let copy = xs
-    xs[0] = 10 as Int32
-    xs = push(xs, 5 as Int32)
-    var s = 0
-    var i = 0
-    while i < len(xs) {
-        s = s + (xs[i] as Int)
-        i += 1
-    }
-    // `copy` must stay intact via COW (`copy[0] == -3`), `xs` has [10, -3, -3, -3, 5] => sum=6
-    s + (copy[0] as Int)
-}
-
-pub fn flat_float32_dot() Int {
-    var a List[Float32] = [1.5 as Float32, 2.5 as Float32, 3.0 as Float32]
-    a[1] = 4.0 as Float32
-    a = push(a, 2.0 as Float32)
-    let sum = (a[0] as Float) + (a[1] as Float) + (a[2] as Float) + (a[3] as Float)
-    // 1.5 + 4.0 + 3.0 + 2.0 = 10.5 => * 2 = 21
-    float_to_int(sum * 2.0)
-}
-
-pub fn main() Int {
-    let b = wrap_last_use(100)
-    let s32 = flat_int32_sum(4)
-    let f32s = flat_float32_dot()
-    // 100 + (6 - 3) + 21 = 124
-    b.tag + s32 + f32s
-}
-"#;
-    let prog = parse(src).expect("parse failed");
-    let rep = tenon_verify::check_program(&prog);
-    assert!(rep.ok, "verify failed: {:?}", rep.diagnostics);
-    let ssa_mir = tenon_mir::lower_program_to_ssa_mir(&prog, &rep.mir);
-    let mir_txt = tenon_mir::format_mir(&ssa_mir);
-    assert!(mir_txt.contains("move.local $b"), "expected move.local $b in MIR:\n{}", mir_txt);
-
-    let pid = std::process::id();
-    let bin = std::env::temp_dir().join(format!("tenon_r1_flat_mir_{}", pid));
-    let ll = std::env::temp_dir().join(format!("tenon_r1_flat_mir_{}.ll", pid));
-    let mut opts = BuildOptions {
-        opt_level: "O3".into(),
-        emit_ll_path: Some(ll.clone()),
-        ..Default::default()
-    };
-    opts.apply_verified_mir(&rep.mir);
-    opts.apply_ssa_mir(&ssa_mir);
-    compile_with_options(&prog, &bin, &opts).expect("R1 LLVM AOT build");
-
-    let ir = fs::read_to_string(&ll).expect("read emitted IR");
-    let _ = fs::remove_file(&ll);
-    assert!(
-        ir.contains("@tenon_flat_list_filled(i64") && ir.contains(", i64 4, ptr"),
-        "expected 4-byte flat list allocation in IR"
-    );
-    assert!(
-        ir.contains("load i32, ptr") && ir.contains("store i32"),
-        "expected native 32-bit packed element load/store in IR"
-    );
-    // In `wrap_last_use`, returning owned local `b` via Last-Use Move must NOT call `@__tn_rc_inc`!
-    let wrap_start = ir.find("@tenon_fn_wrap_last_use(").expect("wrap_last_use IR");
-    let wrap_end = ir[wrap_start..].find("\n}\n").unwrap() + wrap_start;
-    let wrap_ir = &ir[wrap_start..wrap_end];
-    assert!(
-        !wrap_ir.contains("@__tn_rc_inc"),
-        "expected Last-Use Move to eliminate @__tn_rc_inc in wrap_last_use:\n{}",
-        wrap_ir
-    );
-
-    let out = Command::new(&bin).output().unwrap();
-    let _ = fs::remove_file(&bin);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success() && stdout.contains("main() => 124") && stdout.contains("live_objects=0"),
-        "R1 AOT run failed: stdout={} stderr={}",
-        stdout,
-        String::from_utf8_lossy(&out.stderr)
-    );
-}

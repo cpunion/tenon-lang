@@ -655,10 +655,13 @@ pub fn compile_program_to_wasm32_llvm(
     let tmp_dir = std::env::temp_dir().join(format!("tenon_wasm_llvm_{}_{}", std::process::id(), seq));
     fs::create_dir_all(&tmp_dir).map_err(|e| format!("failed to create wasm tmp dir: {}", e))?;
     let ll_path = tmp_dir.join("module.ll");
-    let rt_c_path = tmp_dir.join("runtime.c");
+    let exports_c_path = tmp_dir.join("exports.c");
     fs::write(&ll_path, &ir).map_err(|e| format!("failed to write wasm IR: {}", e))?;
-    let full_c = format!("{}\n{}\n", TENON_WASM32_RUNTIME_C, exports_c);
-    fs::write(&rt_c_path, &full_c).map_err(|e| format!("failed to write wasm runtime C: {}", e))?;
+    fs::write(
+        &exports_c_path,
+        format!("#include <stdint.h>\n{}\n", exports_c),
+    )
+    .map_err(|e| format!("failed to write wasm exports C: {}", e))?;
 
     if let Some(parent) = output_wasm.parent() {
         if !parent.as_os_str().is_empty() {
@@ -666,6 +669,44 @@ pub fn compile_program_to_wasm32_llvm(
         }
     }
     let opt_flag = format!("-{}", opts.opt_level.trim_start_matches('-'));
+
+    // Content-addressed cache for the freestanding Wasm32 Perceus runtime object (`runtime.o`)!
+    let mut rt_hash: u64 = 0xcbf29ce484222325;
+    for &b in TENON_WASM32_RUNTIME_C.as_bytes() {
+        rt_hash ^= b as u64;
+        rt_hash = rt_hash.wrapping_mul(0x100000001b3);
+    }
+    let wasm_rt_cache = std::env::temp_dir().join(format!(
+        "tenon_wasm_rt_cache_{:016x}_{}.o",
+        rt_hash,
+        opts.opt_level.trim_start_matches('-')
+    ));
+    let rt_obj_arg = if !wasm_rt_cache.exists() {
+        let rt_c_path = tmp_dir.join("runtime.c");
+        let rt_tmp_o = tmp_dir.join("runtime.o");
+        fs::write(&rt_c_path, TENON_WASM32_RUNTIME_C)
+            .map_err(|e| format!("failed to write wasm runtime C: {}", e))?;
+        let built = Command::new("clang")
+            .arg("--target=wasm32-unknown-unknown")
+            .arg(&opt_flag)
+            .arg("-c")
+            .arg(&rt_c_path)
+            .arg("-o")
+            .arg(&rt_tmp_o)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if built {
+            let _ = fs::rename(&rt_tmp_o, &wasm_rt_cache);
+        }
+        if wasm_rt_cache.exists() {
+            wasm_rt_cache.clone()
+        } else {
+            rt_c_path
+        }
+    } else {
+        wasm_rt_cache.clone()
+    };
+
     let clang_out = Command::new("clang")
         .arg("--target=wasm32-unknown-unknown")
         .arg(&opt_flag)
@@ -676,7 +717,8 @@ pub fn compile_program_to_wasm32_llvm(
         .arg("-Wl,--gc-sections")
         .arg("-Wno-override-module")
         .arg(&ll_path)
-        .arg(&rt_c_path)
+        .arg(&rt_obj_arg)
+        .arg(&exports_c_path)
         .arg("-o")
         .arg(output_wasm)
         .output()

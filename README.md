@@ -11,7 +11,23 @@
 前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）、`z3`、LLVM `clang`（已验证 LLVM 22.1.8；可选 `node` 验证编译出的 `.wasm`）。
 
 ```bash
-# 1. 全工作区 73 项自动化测试（含全部 R1–R4 v1.0 能力：统一 SSA/CFG 中端 `tenon-mir` + Last-Use Move + `--emit-mir`、常驻增量 Z3 进程、平面 4 字节 `List[Int32]`/`List[Float32]` 与平面 `List[SimdVec]`、`alloca` 栈提升与 `@arena` 64 KiB Slab Arena；`@checkfree` 零运行时检查契约 `E0622`、`@linear`/`@must_use` 线性资源令牌 `E0821`、`inout` 独占定律 `E0820`、锁/`mutate` 临界区禁 `await` `E0603`、`TaskScope` 结构化并发与可运行反例转测试；单线程 C10K 非阻塞多路复用 HTTP Server、OpenSSL TLS 1.3、PostgreSQL SCRAM-SHA-256/`SSLRequest`/`RowDescription` 命名列 `PgRow` + `ConnPool`、5 大纯 Tenon 标准库 `std/{crypto,time,math/decimal,regex,encoding/{csv,url}}`；Wasm32 ESM 自动对象桥 `--emit-mjs` + WASI P2 `_start`、LSP 1.0 SignatureHelp/WorkspaceSymbol/CodeLens 与 Stage-1 纯 Tenon 递归下降自举解析器）
+# 0. 可视化交互体验四件套（强烈推荐：真实原生 Metal GPU 桌面窗口 + 浏览器 Web OpenUI Studio + 全屏交互 TUI + 语言编程体验导览）
+cargo build --release --bin tenon
+
+# (A) 原生 macOS Apple Silicon Metal GUI 桌面窗口（OpenUI -> VDOM -> Flexbox -> 1 次实例化 SDF Draw Call + Retina CoreText）
+./target/release/tenon build --c-src std/gpu/window/metal_window.m -o /tmp/tenon_metal_gui examples/showcase/metal_gui_app.tn && /tmp/tenon_metal_gui
+# 或无头截图预览（生成 /tmp/tenon_gpui_preview.png）：TENON_GUI_SMOKE=1 /tmp/tenon_metal_gui
+
+# (B) 真实浏览器交互式 OpenUI + Wasm32 VDOM Studio（实时编辑 OpenUI Lang、模拟 LLM 流式输出、拖动 $users 看最小 VDOM Patch 与 liveObjects=0）
+./examples/showcase/web_openui_studio/launch.sh
+
+# (C) 全屏交互式 ANSI 终端 TUI（OpenUI -> VDOM -> 双缓冲极简 ANSI Diff；支持 +/- 调负载、1/2 切视图、s 重放 OpenUI 流式动画、q 退出）
+./target/release/tenon build --c-src std/os/term_shim.c -o /tmp/tenon_tui examples/showcase/interactive_tui.tn && /tmp/tenon_tui
+
+# (D) Tenon 编程体验交互导览（精化类型 + 无边界检查循环 + FiniteFloat + 无生命周期 MVS/mutate + @linear 事务 + 依赖维度 Tensor2D；文件内附 4 处「取消注释即被编译器秒抓 Bug」挑战！）
+./target/release/tenon check examples/showcase/language_tour.tn && ./target/release/tenon run examples/showcase/language_tour.tn
+
+# 1. 全工作区自动化测试（74 项全量回归；注：macOS 若未在「系统设置 -> 隐私与安全性 -> 开发者工具」放行终端，syspolicyd 会对每个新链接 Mach-O 额外耗时 ~4s，放行后约 3~5 秒全绿）
 cargo test --workspace
 
 # 2. 精化类型别名复用 + 高阶形式化验证闭环 + 独立证明导出与审计 + 可执行反例转测试

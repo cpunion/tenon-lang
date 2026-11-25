@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tenon OpenUI + Wasm32 VDOM Studio</title>
+  <style>
+    :root {
+      --bg: #0b1120;
+      --panel: #111827;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #10b981;
+      --amber: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header.topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 22px;
+      border-bottom: 1px solid var(--border);
+      background: #0f172a;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 16px; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
+      background: rgba(16, 185, 129, 0.14); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35);
+    }
+    .pill.blue { background: rgba(56, 189, 248, 0.14); color: #38bdf8; border-color: rgba(56, 189, 248, 0.35); }
+    main {
+      display: grid;
+      grid-template-columns: 1fr 1.1fr;
+      gap: 16px;
+      padding: 16px 22px;
+      flex: 1;
+    }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    .pane {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .pane h3 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    button.ctrl {
+      background: #1e293b; color: var(--text); border: 1px solid var(--border);
+      border-radius: 8px; padding: 7px 12px; font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    button.ctrl:hover { border-color: var(--accent); color: #fff; }
+    button.ctrl.primary { background: #0284c7; border-color: #38bdf8; color: #fff; }
+    textarea {
+      width: 100%; height: 220px; resize: vertical;
+      background: #090e1a; color: #7dd3fc; border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; line-height: 1.5;
+    }
+    .state-row {
+      display: flex; align-items: center; gap: 12px; background: #0f172a;
+      padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
+    }
+    .state-row label { font-size: 13px; color: var(--muted); white-space: nowrap; }
+    .state-row input[type="range"] { flex: 1; accent-color: var(--accent); }
+    .state-val { font-family: monospace; font-weight: 700; color: var(--green); min-width: 72px; text-align: right; }
+
+    /* Rendered OpenUI VDOM Styles */
+    #preview-stage {
+      background: #090e1a; border: 1px solid var(--border); border-radius: 10px;
+      padding: 16px; min-height: 280px;
+    }
+    #preview-stage [data-ui="Card"] {
+      background: #1e293b; border: 1px solid #3b82f680; border-radius: 12px;
+      padding: 16px; display: flex; flex-direction: column; gap: 14px;
+    }
+    #preview-stage [data-ui="Header"] {
+      background: linear-gradient(135deg, #0284c7, #2563eb);
+      padding: 14px 16px; border-radius: 10px; color: #fff;
+    }
+    #preview-stage [data-ui="Header"] h2 { margin: 0 0 4px; font-size: 18px; }
+    #preview-stage [data-ui="Header"] p { margin: 0; font-size: 13px; opacity: 0.88; }
+    #preview-stage [data-ui="Row"] { display: flex; gap: 12px; flex-wrap: wrap; }
+    #preview-stage [data-ui="Metric"] {
+      flex: 1; min-width: 140px; background: #0f172a; border: 1px solid #334155;
+      border-left: 4px solid var(--green); border-radius: 8px; padding: 12px;
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    #preview-stage [data-role="label"] { font-size: 12px; color: var(--muted); }
+    #preview-stage [data-role="value"] { font-size: 22px; color: #fff; }
+    #preview-stage [data-role="delta"] { font-size: 12px; color: #34d399; font-style: normal; font-weight: 600; }
+    #preview-stage [data-ui="BarChart"] {
+      background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 12px;
+    }
+    #preview-stage [data-ui="Button"] {
+      align-self: flex-start; background: var(--amber); color: #0f172a; border: none;
+      border-radius: 8px; padding: 9px 16px; font-weight: 700; font-size: 13px; cursor: pointer;
+    }
+    #preview-stage [data-ui="Button"]:hover { filter: brightness(1.1); }
+    .chart-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 12px; }
+    .chart-lbl { width: 48px; color: var(--muted); font-family: monospace; }
+    .chart-bar-wrap { flex: 1; background: #1e293b; border-radius: 4px; height: 18px; overflow: hidden; }
+    .chart-bar { height: 100%; background: linear-gradient(90deg, #0ea5e9, #38bdf8); border-radius: 4px; transition: width 0.2s; }
+    .chart-num { width: 42px; text-align: right; font-family: monospace; color: #7dd3fc; }
+    pre.codebox {
+      margin: 0; background: #090e1a; border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 12px; font-size: 12px; color: #a5f3fc; overflow-x: auto; max-height: 150px;
+    }
+    .logbox { font-family: monospace; font-size: 12px; color: #fbbf24; min-height: 22px; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span>Tenon OpenUI + Wasm32 VDOM Studio</span>
+      <span class="pill blue" id="wasm-size">65 KB Wasm32</span>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center;">
+      <span class="pill" id="leak-meter">Perceus Live Objects: 0</span>
+      <span class="pill blue" id="render-time">Render: 0.00ms</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="pane">
+      <h3>1. OpenUI Lang Source (Streaming DSL)</h3>
+      <div class="toolbar">
+        <button class="ctrl primary" id="btn-stream">Stream Like LLM</button>
+        <button class="ctrl" id="btn-preset-saas">SaaS Preset</button>
+        <button class="ctrl" id="btn-preset-gpu">Metal GPU Preset</button>
+        <button class="ctrl" id="btn-prompt">Toggle System Prompt</button>
+      </div>
+      <textarea id="openui-input" spellcheck="false"></textarea>
+      <div class="state-row">
+        <label for="users-slider">Reactive <code>$users</code>:</label>
+        <input id="users-slider" type="range" min="1000" max="50000" step="100" value="12480" />
+        <span class="state-val" id="users-val">12,480</span>
+      </div>
+      <h3>2. Minimal VDOM JSON Diff (Computed Inside Wasm32)</h3>
+      <pre class="codebox" id="patch-output">[]</pre>
+      <pre class="codebox" id="prompt-output" style="display:none;"></pre>
+    </section>
+
+    <section class="pane">
+      <h3>3. Live Rendered DOM (From Tenon Wasm32 Kernel)</h3>
+      <div id="preview-stage">Loading Tenon Wasm32 kernel...</div>
+      <div class="logbox" id="action-log">Click any @action button in the rendered OpenUI card above.</div>
+    </section>
+  </main>
+
+  <script type="module">
+    import { loadTenonWasm } from "./openui.mjs";
+
+    const PRESET_SAAS = `root = Card([hdr, kpis, chart, btn])
+hdr = Header("Tenon OpenUI Dashboard", "Live Wasm32 VDOM + Zero-Leak Perceus")
+kpis = Row([m1, m2, m3])
+m1 = Metric("Active Users", $users, "+19%")
+m2 = Metric("P99 Latency", "0.42ms", "-31%")
+m3 = Metric("Heap Leaks", "0 objs", "Perceus")
+chart = BarChart(["Web", "TUI", "Metal"], [120, 165, 240])
+btn = Button("Deploy Release", @deploy)`;
+
+    const PRESET_GPU = `root = Card([hdr, kpis, chart, btn])
+hdr = Header("Apple Silicon Metal Cluster", "Declarative @gpu_graph + Fused Kernels")
+kpis = Row([m1, m2])
+m1 = Metric("Active Streams", $users, "120Hz")
+m2 = Metric("Fused Passes", "2 -> 1", "-50% VRAM")
+chart = BarChart(["MatMul", "Bias", "ReLU", "SDF"], [210, 95, 80, 185])
+btn = Button("Dispatch Compute", @dispatch_gpu)`;
+
+    const resp = await fetch("./openui.wasm");
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    document.getElementById("wasm-size").textContent = `${(bytes.length / 1024).toFixed(1)} KB Wasm32`;
+    const api = await loadTenonWasm(bytes);
+
+    const inputEl = document.getElementById("openui-input");
+    const sliderEl = document.getElementById("users-slider");
+    const valEl = document.getElementById("users-val");
+    const stageEl = document.getElementById("preview-stage");
+    const patchEl = document.getElementById("patch-output");
+    const promptEl = document.getElementById("prompt-output");
+    const leakEl = document.getElementById("leak-meter");
+    const timeEl = document.getElementById("render-time");
+    const logEl = document.getElementById("action-log");
+
+    let prevUsers = "12,480";
+    let streamTimer = null;
+
+    function enhanceCharts(root) {
+      root.querySelectorAll('[data-ui="BarChart"]').forEach((el) => {
+        const labels = (el.getAttribute("labels") || "").split(",").filter(Boolean);
+        const vals = (el.getAttribute("values") || "").split(",").map((v) => parseFloat(v) || 0);
+        const maxV = Math.max(1, ...vals);
+        el.innerHTML = labels.map((lbl, i) => {
+          const v = vals[i] || 0;
+          const pct = Math.round((v / maxV) * 100);
+          return `<div class="chart-row"><span class="chart-lbl">${lbl}</span><div class="chart-bar-wrap"><div class="chart-bar" style="width:${pct}%"></div></div><span class="chart-num">${v}</span></div>`;
+        }).join("");
+      });
+      root.querySelectorAll("[data-action]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const act = btn.getAttribute("data-action");
+          logEl.textContent = `[Event Dispatched] ${act} @ ${new Date().toLocaleTimeString()} (Wasm liveObjects=${api.liveObjects()})`;
+        });
+      });
+    }
+
+    function render(src, usersFmt) {
+      const t0 = performance.now();
+      const html = api.render_openui_html(src, usersFmt);
+      const patches = api.diff_openui_patches(src, prevUsers, usersFmt);
+      const dt = (performance.now() - t0).toFixed(2);
+      prevUsers = usersFmt;
+
+      stageEl.innerHTML = html;
+      enhanceCharts(stageEl);
+      const parsedPatches = JSON.parse(patches);
+      patchEl.textContent = parsedPatches.length > 0
+        ? JSON.stringify(parsedPatches, null, 2)
+        : `[]  /* Rendered ${html.length} B HTML from ${src.length} B OpenUI — drag $users slider to inspect minimal VDOM JSON patches */`;
+      timeEl.textContent = `Render + Diff: ${dt}ms`;
+      const live = api.liveObjects();
+      leakEl.textContent = `Perceus Live Objects: ${live}`;
+      leakEl.style.color = live === 0 ? "#34d399" : "#f87171";
+    }
+
+    inputEl.value = PRESET_SAAS;
+    render(inputEl.value, "12,480");
+
+    inputEl.addEventListener("input", () => render(inputEl.value, valEl.textContent));
+    sliderEl.addEventListener("input", () => {
+      const fmt = Number(sliderEl.value).toLocaleString("en-US");
+      valEl.textContent = fmt;
+      render(inputEl.value, fmt);
+    });
+    document.getElementById("btn-preset-saas").onclick = () => {
+      if (streamTimer) clearInterval(streamTimer);
+      inputEl.value = PRESET_SAAS;
+      render(inputEl.value, valEl.textContent);
+    };
+    document.getElementById("btn-preset-gpu").onclick = () => {
+      if (streamTimer) clearInterval(streamTimer);
+      inputEl.value = PRESET_GPU;
+      render(inputEl.value, valEl.textContent);
+    };
+    document.getElementById("btn-prompt").onclick = () => {
+      if (promptEl.style.display === "none") {
+        promptEl.textContent = api.get_openui_prompt();
+        promptEl.style.display = "block";
+      } else {
+        promptEl.style.display = "none";
+      }
+    };
+    document.getElementById("btn-stream").onclick = () => {
+      if (streamTimer) clearInterval(streamTimer);
+      const target = inputEl.value || PRESET_SAAS;
+      let cursor = 0;
+      streamTimer = setInterval(() => {
+        cursor += 6;
+        const partial = target.slice(0, cursor);
+        inputEl.value = partial;
+        render(partial, valEl.textContent);
+        if (cursor >= target.length) {
+          clearInterval(streamTimer);
+          streamTimer = null;
+        }
+      }, 28);
+    };
+  </script>
+</body>
+</html>

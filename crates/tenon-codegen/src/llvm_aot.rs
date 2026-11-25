@@ -256,8 +256,64 @@ pub fn compile_with_options(
 
     let opt_flag = match opts.opt_level.as_str() {
         "O0" | "-O0" => "-O0",
+        "O1" | "-O1" => "-O1",
         "O2" | "-O2" => "-O2",
         _ => "-O3",
+    };
+
+    let has_objc_sources = opts.extra_c_sources.iter().any(|p| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "m" || e == "mm")
+    });
+
+    // Content-addressed compiled object cache for the Tenon C runtime (`rt_c`)!
+    // Avoids recompiling ~1,500 lines of runtime C on repeated `tenon build` and `cargo test` runs.
+    let mut rt_hash: u64 = 0xcbf29ce484222325;
+    for &b in rt_c.as_bytes() {
+        rt_hash ^= b as u64;
+        rt_hash = rt_hash.wrapping_mul(0x100000001b3);
+    }
+    let use_thin_lto = opts.output_kind == OutputKind::Executable
+        && opt_flag == "-O3"
+        && !opts.debug_info
+        && opts.target_triple.is_none()
+        && !has_objc_sources;
+    let rt_cache_key = format!(
+        "tenon_rt_cache_{:016x}_{}_{}_{}_{}.o",
+        rt_hash,
+        opt_flag.trim_start_matches('-'),
+        if opts.debug_info { "g" } else { "ng" },
+        if use_thin_lto { "lto" } else { "nolto" },
+        opts.target_triple.as_deref().unwrap_or("host").replace(['/', ':', ' '], "_")
+    );
+    let rt_cache_obj = std::env::temp_dir().join(&rt_cache_key);
+    let rt_input_path = if opts.output_kind != OutputKind::SharedLib {
+        if !rt_cache_obj.exists() {
+            let rt_tmp_obj = std::env::temp_dir().join(format!("tenon_rt_build_{}_{}.o", pid, seq));
+            let mut crt = Command::new("clang");
+            crt.arg(opt_flag).arg("-c");
+            if use_thin_lto {
+                crt.arg("-flto=thin");
+            }
+            if let Some(triple) = &opts.target_triple {
+                crt.arg(format!("--target={}", triple));
+            }
+            if opts.debug_info {
+                crt.arg("-g");
+            }
+            crt.args([tmp_rt.to_str().unwrap(), "-o", rt_tmp_obj.to_str().unwrap()]);
+            if crt.output().is_ok_and(|o| o.status.success()) {
+                let _ = fs::rename(&rt_tmp_obj, &rt_cache_obj);
+            }
+        }
+        if rt_cache_obj.exists() {
+            rt_cache_obj.clone()
+        } else {
+            tmp_rt.clone()
+        }
+    } else {
+        tmp_rt.clone()
     };
 
     // Collect `@link("lib")` and `@link(framework = "Metal")` attributes from declarations
@@ -287,11 +343,6 @@ pub fn compile_with_options(
             all_link_libs.push(lib.clone());
         }
     }
-    let has_objc_sources = opts.extra_c_sources.iter().any(|p| {
-        p.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e == "m" || e == "mm")
-    });
 
     let res = match opts.output_kind {
         OutputKind::StaticLib => {
@@ -398,7 +449,7 @@ pub fn compile_with_options(
             } else {
                 if opts.output_kind == OutputKind::SharedLib {
                     cmd.args(["-shared", "-fPIC"]);
-                } else if opt_flag == "-O3" && !opts.debug_info && opts.target_triple.is_none() && !has_objc_sources {
+                } else if use_thin_lto {
                     cmd.arg("-flto=thin");
                 }
                 if has_objc_sources {
@@ -407,7 +458,7 @@ pub fn compile_with_options(
                 cmd.args([
                     "-Wno-override-module",
                     tmp_ll.to_str().unwrap(),
-                    tmp_rt.to_str().unwrap(),
+                    rt_input_path.to_str().unwrap(),
                 ]);
                 for csrc in &opts.extra_c_sources {
                     cmd.arg(csrc.to_str().unwrap());

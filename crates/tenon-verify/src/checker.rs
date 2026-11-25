@@ -3312,6 +3312,101 @@ impl CheckerCtx {
         }
     }
 
+    fn push_elem_bounds_quantifier(
+        var_name: &str,
+        eabs: AbsInt,
+        span: Span,
+        smt_premises: &mut Vec<(Expr, BTreeMap<String, String>)>,
+    ) {
+        if var_name.contains('.') {
+            return;
+        }
+        let has_lo = eabs.interval.min > i64::MIN as i128 && eabs.interval.min <= i64::MAX as i128;
+        let has_hi = eabs.interval.max < i64::MAX as i128 && eabs.interval.max >= i64::MIN as i128;
+        if !has_lo && !has_hi {
+            return;
+        }
+        let idx_expr = Expr {
+            kind: ExprKind::Index {
+                target: Box::new(Expr {
+                    kind: ExprKind::Ident(var_name.to_string()),
+                    span,
+                }),
+                index: Box::new(Expr {
+                    kind: ExprKind::Ident("__q_elem_i".into()),
+                    span,
+                }),
+            },
+            span,
+        };
+        let lo_cond = if has_lo {
+            Some(Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Le,
+                    left: Box::new(Expr {
+                        kind: ExprKind::Int(eabs.interval.min as i64),
+                        span,
+                    }),
+                    right: Box::new(idx_expr.clone()),
+                },
+                span,
+            })
+        } else {
+            None
+        };
+        let hi_cond = if has_hi {
+            Some(Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Le,
+                    left: Box::new(idx_expr),
+                    right: Box::new(Expr {
+                        kind: ExprKind::Int(eabs.interval.max as i64),
+                        span,
+                    }),
+                },
+                span,
+            })
+        } else {
+            None
+        };
+        let body = match (lo_cond, hi_cond) {
+            (Some(a), Some(b)) => Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::And,
+                    left: Box::new(a),
+                    right: Box::new(b),
+                },
+                span,
+            },
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => return,
+        };
+        let q = Expr {
+            kind: ExprKind::Quantifier {
+                is_forall: true,
+                var: "__q_elem_i".into(),
+                lo: Box::new(Expr { kind: ExprKind::Int(0), span }),
+                hi: Box::new(Expr {
+                    kind: ExprKind::Call {
+                        callee: Box::new(Expr { kind: ExprKind::Ident("len".into()), span }),
+                        args: vec![CallArg {
+                            name: None,
+                            value: Expr {
+                                kind: ExprKind::Ident(var_name.to_string()),
+                                span,
+                            },
+                        }],
+                    },
+                    span,
+                }),
+                body: Box::new(body),
+            },
+            span,
+        };
+        smt_premises.push((q, BTreeMap::new()));
+    }
+
     fn assume_type_facts(
         &mut self,
         var_name: &str,
@@ -3324,16 +3419,18 @@ impl CheckerCtx {
             env.fn_var_ret_tys.insert(var_name.to_string(), (**r).clone());
             return;
         }
-        if let TypeExpr::Array { elem, .. } = ty {
+        if let TypeExpr::Array { elem, span, .. } = ty {
             if let Some(eabs) = self.compute_elem_abs_int(elem, env) {
                 env.elem_ints.insert(var_name.to_string(), eabs);
+                Self::push_elem_bounds_quantifier(var_name, eabs, *span, smt_premises);
             }
             return;
         }
-        if let TypeExpr::Named { name, args, .. } = ty {
+        if let TypeExpr::Named { name, args, span, .. } = ty {
             if name == "List" && args.len() == 1 {
                 if let Some(eabs) = self.compute_elem_abs_int(&args[0], env) {
                     env.elem_ints.insert(var_name.to_string(), eabs);
+                    Self::push_elem_bounds_quantifier(var_name, eabs, *span, smt_premises);
                 }
                 return;
             }
@@ -9025,16 +9122,18 @@ impl CheckerCtx {
             env.fn_var_ret_tys.insert(var_name.to_string(), (**r).clone());
             return;
         }
-        if let TypeExpr::Array { elem, .. } = ty {
+        if let TypeExpr::Array { elem, span, .. } = ty {
             if let Some(eabs) = self.compute_elem_abs_int(elem, env) {
                 env.elem_ints.insert(var_name.to_string(), eabs);
+                Self::push_elem_bounds_quantifier(var_name, eabs, *span, smt_premises);
             }
             return;
         }
-        if let TypeExpr::Named { name, args, .. } = ty {
+        if let TypeExpr::Named { name, args, span, .. } = ty {
             if name == "List" && args.len() == 1 {
                 if let Some(eabs) = self.compute_elem_abs_int(&args[0], env) {
                     env.elem_ints.insert(var_name.to_string(), eabs);
+                    Self::push_elem_bounds_quantifier(var_name, eabs, *span, smt_premises);
                 }
                 return;
             }
