@@ -328,13 +328,17 @@ int64_t tn_tpu_compile_mlir(int64_t mlir_cstr) {
     prog.format = "mlir";
     prog.format_size = 4;
 
+    /* Hand-encoded OpenXLA CompileOptionsProto:
+       field 3 (executable_build_options, len=4): { field 4 (num_replicas=1), field 5 (num_partitions=1) } */
+    static const unsigned char k_default_compile_opts[6] = { 0x1A, 0x04, 0x20, 0x01, 0x28, 0x01 };
+
     PJRT_Client_Compile_Args ca;
     memset(&ca, 0, sizeof(ca));
     ca.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
     ca.client = g_client;
     ca.program = &prog;
-    ca.compile_options = "";
-    ca.compile_options_size = 0;
+    ca.compile_options = (const char*)k_default_compile_opts;
+    ca.compile_options_size = sizeof(k_default_compile_opts);
 
     if (!tn_pjrt_check(g_api->PJRT_Client_Compile(&ca), "PJRT_Client_Compile")) return 0;
     if (!ca.executable) return 0;
