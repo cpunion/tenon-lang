@@ -260,6 +260,19 @@ int64_t tn_tpu_buf_create_2d(int64_t data_ptr, int64_t dtype, int64_t d0, int64_
     return tn_tpu_buf_create_nd((const void*)(uintptr_t)data_ptr, dtype, dims, 2);
 }
 
+int64_t tn_tpu_buf_create_s8_from_i64_2d(int64_t i64_ptr, int64_t rows, int64_t cols) {
+    if (!i64_ptr || rows <= 0 || cols <= 0) return 0;
+    size_t n = (size_t)rows * (size_t)cols;
+    int8_t* tmp = (int8_t*)malloc(n);
+    if (!tmp) return 0;
+    const int64_t* src = (const int64_t*)(uintptr_t)i64_ptr;
+    for (size_t i = 0; i < n; i++) tmp[i] = (int8_t)src[i];
+    int64_t dims[2] = { rows, cols };
+    int64_t h = tn_tpu_buf_create_nd(tmp, 4, dims, 2);
+    free(tmp);
+    return h;
+}
+
 int64_t tn_tpu_buf_create_3d(int64_t data_ptr, int64_t dtype, int64_t d0, int64_t d1, int64_t d2) {
     int64_t dims[3] = { d0, d1, d2 };
     return tn_tpu_buf_create_nd((const void*)(uintptr_t)data_ptr, dtype, dims, 3);

@@ -25,6 +25,7 @@ extern "C" {
     fn tn_tpu_pjrt_minor() Int
     fn tn_tpu_buf_create_1d(data_ptr Ptr[UInt8], dtype Int, d0 Int) Int
     fn tn_tpu_buf_create_2d(data_ptr Ptr[UInt8], dtype Int, d0 Int, d1 Int) Int
+    fn tn_tpu_buf_create_s8_from_i64_2d(i64_ptr Ptr[UInt8], rows Int, cols Int) Int
     fn tn_tpu_buf_create_3d(data_ptr Ptr[UInt8], dtype Int, d0 Int, d1 Int, d2 Int) Int
     fn tn_tpu_buf_create_scalar_i32(val Int) Int
     fn tn_tpu_buf_zeros_1d(dtype Int, d0 Int) Int
@@ -116,12 +117,12 @@ impl TpuBuffer {
         TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_BF16 }
     }
 
-    pub fn from_s8_2d(xs List[UInt8], rows Int, cols Int) TpuBuffer {
-        let h = unsafe { tn_tpu_buf_create_2d(list_data_ptr(xs), TPU_S8, rows, cols) }
+    pub fn from_s8_2d(xs List[Int], rows Int, cols Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_create_s8_from_i64_2d(list_data_ptr(xs), rows, cols) }
         TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S8 }
     }
 
-    pub fn from_s4_2d(s8_vals List[UInt8], rows Int, cols Int) TpuBuffer {
+    pub fn from_s4_2d(s8_vals List[Int], rows Int, cols Int) TpuBuffer {
         // Upload standard S8 (values in [-8..7]) then convert to native hardware TPU `i4` on-device via StableHLO!
         let tmp_s8 = TpuBuffer.from_s8_2d(s8_vals, rows, cols)
         let rs = int_to_text(rows)

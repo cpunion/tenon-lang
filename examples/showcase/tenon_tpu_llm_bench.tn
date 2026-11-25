@@ -445,15 +445,14 @@ fn main() Int {
 
     // 1B. Exact Numerical Verification of Tenon Native Hardware `i4` (S4) W4A16 on real Google TPU MXU!
     // Uploads standard S8 [-7..7] and converts on-device via StableHLO to native sub-byte TPU `i4` HBM layout.
-    var w4_vals List[UInt8] = list_filled(vk * vn, 0 as UInt8)
+    var w4_vals List[Int] = list_filled(vk * vn, 0)
     var w4_ref List[Float] = list_filled(vk * vn, 0.0)
     var kr = 0
     while kr < vk {
         var jc = 0
         while jc < vn {
             let v = ((kr * 5 + jc * 3) % 15) - 7
-            let vu = if v < 0 { v + 256 } else { v }
-            w4_vals[kr * vn + jc] = vu as UInt8
+            w4_vals[kr * vn + jc] = v
             w4_ref[kr * vn + jc] = int_to_float(v) * 0.05
             jc += 1
         }
