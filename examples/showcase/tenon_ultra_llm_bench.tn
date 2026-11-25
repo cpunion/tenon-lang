@@ -282,6 +282,14 @@ fn main() {
     )
 
     // -------------------------------------------------------------------------
+    // 5B. Raw Apple M4 Max Silicon Roofline Microbenchmark (8192x8192 GEMV vs 546 GB/s!)
+    // -------------------------------------------------------------------------
+    bench_raw_gemv_metal("8192x8192_FP16", 8192, 8192, QUANT_FP16, 100)
+    bench_raw_gemv_metal("8192x8192_Q8_0", 8192, 8192, QUANT_Q8_0, 100)
+    bench_raw_gemv_metal("16384x8192_Q4_0", 16384, 8192, QUANT_Q4_0, 100)
+    bench_raw_gemv_metal("32000x2048_Q4_0", 32000, 2048, QUANT_Q4_0, 100)
+
+    // -------------------------------------------------------------------------
     // 6. FULL 1.24B-Param `Llama-3.2-1B` (`d=2048, 16L, 32H/8KV, d_ff=8192, vocab=32000`)
     //    Zero-Copy `mmap` GGUF v3 -> Metal `newBufferWithBytesNoCopy` Bandwidth-Saturated Benchmark!
     // -------------------------------------------------------------------------
@@ -290,6 +298,43 @@ fn main() {
     bench_mmap_1b("Llama3.2_1B_1.24B_FP16", QUANT_FP16, "/tmp/tenon_llama32_1b.gguf", 24)
 
     println("=== DONE (Perceus live_objects == 0, Linear VRAM == 0 leaks) ===")
+}
+
+fn bench_raw_gemv_metal(name Text, out_dim Positive, in_dim Positive, qm Int, iters Positive) {
+    let w_bytes_raw = ultra_weight_stride_bytes(out_dim * in_dim, qm)
+    let w_bytes = if w_bytes_raw >= 1 { w_bytes_raw } else { 1 }
+    let x_b = GpuBuffer.uninit(in_dim * 2)
+    let w_b = GpuBuffer.uninit(w_bytes)
+    let y_b = GpuBuffer.uninit(out_dim * 2)
+    // Warmup
+    let wb = MpsBatch.begin()
+    var wi = 0
+    while wi < 10 {
+        let _ = ultra_gemv(x_b.handle, 0, w_b.handle, 0, y_b.handle, 0, y_b.handle, 0, out_dim, in_dim, qm, false, false)
+        wi += 1
+    }
+    let _ = wb.commit_and_wait()
+    // Timed single-command-buffer batch
+    let t0 = time_now_ns()
+    let mb = MpsBatch.begin()
+    var i = 0
+    while i < iters {
+        let _ = ultra_gemv(x_b.handle, 0, w_b.handle, 0, y_b.handle, 0, y_b.handle, 0, out_dim, in_dim, qm, false, false)
+        i += 1
+    }
+    let _ = mb.commit_and_wait()
+    let dt_ns = time_now_ns() - t0
+    let ms = int_to_float(dt_ns) / (int_to_float(iters) * 1000000.0)
+    let gbs = (int_to_float(w_bytes) / 1000000000.0) / (ms / 1000.0)
+    let pct = (gbs / 546.0) * 100.0
+    println("ROOFLINE_METAL_GEMV " ++ name
+        ++ " MB=" ++ float_to_text(int_to_float(w_bytes) / 1048576.0)
+        ++ " ms=" ++ float_to_text(ms)
+        ++ " eff_GBs=" ++ float_to_text(gbs)
+        ++ " pct_M4Max_546GBs=" ++ float_to_text(pct) ++ "%")
+    x_b.destroy()
+    w_b.destroy()
+    y_b.destroy()
 }
 
 fn bench_mmap_1b(name Text, qm Int, path Text, decode_steps Int) {

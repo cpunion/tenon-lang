@@ -744,6 +744,8 @@ pub fn emit_tensor_graph_stablehlo(g: &CompiledTensorGraph) -> String {
             FusedStage::FusedRmsNormGateUpSwiGlu { x, nw, w_gate, w_up, out_var, seq, in_dim, d_ff, dtype } => {
                 let et = dtype.mlir_ty();
                 let h = emit_rmsnorm_mlir(&mut out, x, nw, *seq, *in_dim, *dtype, &mut fresh);
+                let w_gu = fresh("wgu");
+                let gu = fresh("gu");
                 let gf = fresh("gate");
                 let uf = fresh("up");
                 let ng = fresh("ng");
@@ -752,8 +754,24 @@ pub fn emit_tensor_graph_stablehlo(g: &CompiledTensorGraph) -> String {
                 let den = fresh("den");
                 let silu = fresh("silu");
                 let act = fresh("act");
-                out.push_str(&format!("    {} = stablehlo.dot_general {}, %{}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n", gf, h, w_gate, seq, in_dim, et, in_dim, d_ff, et, seq, d_ff));
-                out.push_str(&format!("    {} = stablehlo.dot_general {}, %{}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n", uf, h, w_up, seq, in_dim, et, in_dim, d_ff, et, seq, d_ff));
+                let dff2 = d_ff * 2;
+                // True Horizontal MXU Weight Fusion: concat(w_gate, w_up) -> ONE wide systolic dot_general -> VMEM slice!
+                out.push_str(&format!(
+                    "    {} = stablehlo.concatenate %{}, %{}, dim = 1 : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}x{}>\n",
+                    w_gu, w_gate, w_up, in_dim, d_ff, et, in_dim, d_ff, et, in_dim, dff2, et
+                ));
+                out.push_str(&format!(
+                    "    {} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n",
+                    gu, h, w_gu, seq, in_dim, et, in_dim, dff2, et, seq, dff2
+                ));
+                out.push_str(&format!(
+                    "    {} = stablehlo.slice {} [0:{}, 0:{}] : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n",
+                    gf, gu, seq, d_ff, seq, dff2, seq, d_ff
+                ));
+                out.push_str(&format!(
+                    "    {} = stablehlo.slice {} [0:{}, {}:{}] : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n",
+                    uf, gu, seq, d_ff, dff2, seq, dff2, seq, d_ff
+                ));
                 out.push_str(&format!("    {} = stablehlo.constant dense<1.0> : tensor<{}x{}xf32>\n", c1, seq, d_ff));
                 out.push_str(&format!("    {} = stablehlo.negate {} : tensor<{}x{}xf32>\n", ng, gf, seq, d_ff));
                 out.push_str(&format!("    {} = stablehlo.exponential {} : tensor<{}x{}xf32>\n", eg, ng, seq, d_ff));
@@ -779,13 +797,26 @@ pub fn emit_tensor_graph_stablehlo(g: &CompiledTensorGraph) -> String {
             }
             FusedStage::FusedDualMatMul { a, w1, w2, out1, out2, seq, in_dim, out_dim, dtype } => {
                 let et = dtype.mlir_ty();
-                for (w, ov) in [(w1, out1), (w2, out2)] {
-                    let mf = fresh("mm");
-                    out.push_str(&format!("    {} = stablehlo.dot_general %{}, %{}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n", mf, a, w, seq, in_dim, et, in_dim, out_dim, et, seq, out_dim));
+                let w12 = fresh("w12");
+                let mm12 = fresh("mm12");
+                let s1 = fresh("s1");
+                let s2 = fresh("s2");
+                let od2 = out_dim * 2;
+                out.push_str(&format!(
+                    "    {} = stablehlo.concatenate %{}, %{}, dim = 1 : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}x{}>\n",
+                    w12, w1, w2, in_dim, out_dim, et, in_dim, out_dim, et, in_dim, od2, et
+                ));
+                out.push_str(&format!(
+                    "    {} = stablehlo.dot_general %{}, {}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n",
+                    mm12, a, w12, seq, in_dim, et, in_dim, od2, et, seq, od2
+                ));
+                out.push_str(&format!("    {} = stablehlo.slice {} [0:{}, 0:{}] : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", s1, mm12, seq, out_dim, seq, od2, seq, out_dim));
+                out.push_str(&format!("    {} = stablehlo.slice {} [0:{}, {}:{}] : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", s2, mm12, seq, out_dim, od2, seq, od2, seq, out_dim));
+                for (sv, ov) in [(s1, out1), (s2, out2)] {
                     if *dtype == TensorDType::Float32 {
-                        out.push_str(&format!("    %{} = stablehlo.reshape {} : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", ov, mf, seq, out_dim, seq, out_dim));
+                        out.push_str(&format!("    %{} = stablehlo.reshape {} : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", ov, sv, seq, out_dim, seq, out_dim));
                     } else {
-                        out.push_str(&format!("    %{} = stablehlo.convert {} : (tensor<{}x{}xf32>) -> tensor<{}x{}x{}>\n", ov, mf, seq, out_dim, seq, out_dim, et));
+                        out.push_str(&format!("    %{} = stablehlo.convert {} : (tensor<{}x{}xf32>) -> tensor<{}x{}x{}>\n", ov, sv, seq, out_dim, seq, out_dim, et));
                     }
                 }
             }
@@ -861,42 +892,96 @@ pub fn emit_tensor_graph_cuda(g: &CompiledTensorGraph) -> String {
                     TensorDType::BFloat16 => format!("__float2bfloat16({})", e),
                     _ => format!("({})({})", ct, e),
                 };
-                out.push_str(&format!(
-                    "// Stage {idx}: Auto-Fused On-Chip SMEM RMSNorm + Horizontal Gate||Up + SwiGLU [{seq}x{in_dim} -> {seq}x{d_ff}]\n\
-                     extern \"C\" __global__ void {fn_name}_stage{idx}_fused_norm_swiglu(\n\
-                         const {ct}* __restrict__ x, const {ct}* __restrict__ nw,\n\
-                         const {ct}* __restrict__ w_gate, const {ct}* __restrict__ w_up,\n\
-                         {ct}* __restrict__ out\n\
-                     ) {{\n\
-                         extern __shared__ float sx[];\n\
-                         uint32_t row = blockIdx.y;\n\
-                         uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;\n\
-                         const uint32_t D = {in_dim}u, F = {d_ff}u;\n\
-                         float ss = 0.0f;\n\
-                         for (uint32_t k = threadIdx.x; k < D; k += blockDim.x) {{\n\
-                             float v = {lx}; sx[k] = v; ss += v * v;\n\
-                         }}\n\
-                         __shared__ float s_inv;\n\
-                         for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xFFFFFFFFu, ss, off);\n\
-                         if (threadIdx.x == 0) s_inv = rsqrtf(ss / (float)D + 1e-5f);\n\
-                         __syncthreads();\n\
-                         if (col < F) {{\n\
-                             float g = 0.0f, u = 0.0f;\n\
-                             for (uint32_t k = 0; k < D; k++) {{\n\
-                                 float hv = sx[k] * s_inv * {lnw};\n\
-                                 g = fmaf(hv, {lwg}, g);\n\
-                                 u = fmaf(hv, {lwu}, u);\n\
+                if *seq < 16 {
+                    // Roofline-selected MEMORY-BOUND Schedule: 4-warp (128 thr) cooperative GEMV + on-chip SMEM RMSNorm!
+                    out.push_str(&format!(
+                        "// Stage {idx}: Auto-Fused Warp-Cooperative SMEM RMSNorm + Horizontal Gate||Up + SwiGLU [{seq}x{in_dim} -> {seq}x{d_ff}]\n\
+                         extern \"C\" __global__ void {fn_name}_stage{idx}_fused_norm_swiglu(\n\
+                             const {ct}* __restrict__ x, const {ct}* __restrict__ nw,\n\
+                             const {ct}* __restrict__ w_gate, const {ct}* __restrict__ w_up,\n\
+                             {ct}* __restrict__ out\n\
+                         ) {{\n\
+                             extern __shared__ float sx[];\n\
+                             __shared__ float s_w[4];\n\
+                             uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n\
+                             uint32_t row = blockIdx.y;\n\
+                             uint32_t col = blockIdx.x * 4u + wid;\n\
+                             const uint32_t D = {in_dim}u, F = {d_ff}u;\n\
+                             float ss = 0.0f;\n\
+                             for (uint32_t k = threadIdx.x; k < D; k += blockDim.x) {{\n\
+                                 float v = {lx}; sx[k] = v; ss = fmaf(v, v, ss);\n\
                              }}\n\
-                             out[row * F + col] = {sout};\n\
-                         }}\n\
-                     }}\n\n",
-                    fn_name = g.fn_name,
-                    lx = to_f("x[row * D + k]"),
-                    lnw = to_f("nw[k]"),
-                    lwg = to_f("w_gate[k * F + col]"),
-                    lwu = to_f("w_up[k * F + col]"),
-                    sout = from_f("(g / (1.0f + expf(-g))) * u"),
-                ));
+                             for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xFFFFFFFFu, ss, off);\n\
+                             if (lane == 0) s_w[wid] = ss;\n\
+                             __syncthreads();\n\
+                             if (wid == 0) {{\n\
+                                 float tot = (lane < 4u) ? s_w[lane] : 0.0f;\n\
+                                 for (int off = 16; off > 0; off >>= 1) tot += __shfl_down_sync(0xFFFFFFFFu, tot, off);\n\
+                                 if (lane == 0) s_w[0] = rsqrtf(tot / (float)D + 1e-5f);\n\
+                             }}\n\
+                             __syncthreads();\n\
+                             float inv = s_w[0];\n\
+                             for (uint32_t k = threadIdx.x; k < D; k += blockDim.x) sx[k] = sx[k] * inv * {lnw};\n\
+                             __syncthreads();\n\
+                             if (col < F) {{\n\
+                                 float g = 0.0f, u = 0.0f;\n\
+                                 for (uint32_t k = lane; k < D; k += 32u) {{\n\
+                                     float hv = sx[k];\n\
+                                     g = fmaf(hv, {lwg}, g);\n\
+                                     u = fmaf(hv, {lwu}, u);\n\
+                                 }}\n\
+                                 for (int off = 16; off > 0; off >>= 1) {{\n\
+                                     g += __shfl_down_sync(0xFFFFFFFFu, g, off);\n\
+                                     u += __shfl_down_sync(0xFFFFFFFFu, u, off);\n\
+                                 }}\n\
+                                 if (lane == 0) out[row * F + col] = {sout};\n\
+                             }}\n\
+                         }}\n\n",
+                        fn_name = g.fn_name,
+                        lx = to_f("__ldg(&x[row * D + k])"),
+                        lnw = to_f("__ldg(&nw[k])"),
+                        lwg = to_f("__ldg(&w_gate[k * F + col])"),
+                        lwu = to_f("__ldg(&w_up[k * F + col])"),
+                        sout = from_f("(g / (1.0f + expf(-g))) * u"),
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "// Stage {idx}: Auto-Fused On-Chip SMEM RMSNorm + Horizontal Gate||Up + SwiGLU [{seq}x{in_dim} -> {seq}x{d_ff}]\n\
+                         extern \"C\" __global__ void {fn_name}_stage{idx}_fused_norm_swiglu(\n\
+                             const {ct}* __restrict__ x, const {ct}* __restrict__ nw,\n\
+                             const {ct}* __restrict__ w_gate, const {ct}* __restrict__ w_up,\n\
+                             {ct}* __restrict__ out\n\
+                         ) {{\n\
+                             extern __shared__ float sx[];\n\
+                             uint32_t row = blockIdx.y;\n\
+                             uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;\n\
+                             const uint32_t D = {in_dim}u, F = {d_ff}u;\n\
+                             float ss = 0.0f;\n\
+                             for (uint32_t k = threadIdx.x; k < D; k += blockDim.x) {{\n\
+                                 float v = {lx}; sx[k] = v; ss += v * v;\n\
+                             }}\n\
+                             __shared__ float s_inv;\n\
+                             for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xFFFFFFFFu, ss, off);\n\
+                             if (threadIdx.x == 0) s_inv = rsqrtf(ss / (float)D + 1e-5f);\n\
+                             __syncthreads();\n\
+                             if (col < F) {{\n\
+                                 float g = 0.0f, u = 0.0f;\n\
+                                 for (uint32_t k = 0; k < D; k++) {{\n\
+                                     float hv = sx[k] * s_inv * {lnw};\n\
+                                     g = fmaf(hv, {lwg}, g);\n\
+                                     u = fmaf(hv, {lwu}, u);\n\
+                                 }}\n\
+                                 out[row * F + col] = {sout};\n\
+                             }}\n\
+                         }}\n\n",
+                        fn_name = g.fn_name,
+                        lx = to_f("x[row * D + k]"),
+                        lnw = to_f("nw[k]"),
+                        lwg = to_f("w_gate[k * F + col]"),
+                        lwu = to_f("w_up[k * F + col]"),
+                        sout = from_f("(g / (1.0f + expf(-g))) * u"),
+                    ));
+                }
             }
             FusedStage::MatMulEpilogue { seq, k, n, residual, dtype, .. } => {
                 let ct = dtype.cuda_ty();
@@ -958,35 +1043,63 @@ pub fn emit_tensor_graph_msl(g: &CompiledTensorGraph) -> String {
         r.m4_max_t_min_ms,
     );
     for (idx, st) in g.stages.iter().enumerate() {
-        if let FusedStage::FusedRmsNormGateUpSwiGlu { seq, in_dim, d_ff, dtype, .. } = st {
-            let mt = dtype.msl_ty();
-            out.push_str(&format!(
-                "// Stage {idx}: Auto-Fused Threadgroup SRAM RMSNorm + Horizontal Gate||Up + SwiGLU [{seq}x{in_dim} -> {seq}x{d_ff}]\n\
-                 kernel void {fn_name}_stage{idx}_fused_norm_swiglu(\n\
-                     device const {mt}* x [[buffer(0)]], device const {mt}* nw [[buffer(1)]],\n\
-                     device const {mt}* w_gate [[buffer(2)]], device const {mt}* w_up [[buffer(3)]],\n\
-                     device {mt}* out [[buffer(4)]], threadgroup float* sx [[threadgroup(0)]],\n\
-                     uint2 gid [[thread_position_in_grid]], uint lid [[thread_index_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]\n\
-                 ) {{\n\
-                     const uint D = {in_dim}u, F = {d_ff}u;\n\
-                     uint row = gid.y, col = gid.x;\n\
-                     float ss = 0.0f;\n\
-                     for (uint k = lid; k < D; k += tgsz) {{ float v = (float)x[row * D + k]; sx[k] = v; ss += v * v; }}\n\
-                     ss = simd_sum(ss);\n\
-                     threadgroup_barrier(mem_flags::mem_threadgroup);\n\
-                     float inv = rsqrt(ss / (float)D + 1e-5f);\n\
-                     if (col < F) {{\n\
-                         float g = 0.0f, u = 0.0f;\n\
-                         for (uint k = 0; k < D; k++) {{\n\
-                             float hv = sx[k] * inv * (float)nw[k];\n\
-                             g = fma(hv, (float)w_gate[k * F + col], g);\n\
-                             u = fma(hv, (float)w_up[k * F + col], u);\n\
+        match st {
+            FusedStage::FusedRmsNormGateUpSwiGlu { seq, in_dim, d_ff, dtype, .. } => {
+                let mt = dtype.msl_ty();
+                out.push_str(&format!(
+                    "// Stage {idx}: Auto-Fused Threadgroup SRAM RMSNorm + Horizontal Gate||Up + SwiGLU [{seq}x{in_dim} -> {seq}x{d_ff}]\n\
+                     kernel void {fn_name}_stage{idx}_fused_norm_swiglu(\n\
+                         device const {mt}* x [[buffer(0)]], device const {mt}* nw [[buffer(1)]],\n\
+                         device const {mt}* w_gate [[buffer(2)]], device const {mt}* w_up [[buffer(3)]],\n\
+                         device {mt}* out [[buffer(4)]], threadgroup float* sx [[threadgroup(0)]],\n\
+                         uint2 gid [[thread_position_in_grid]], uint lid [[thread_index_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]\n\
+                     ) {{\n\
+                         const uint D = {in_dim}u, F = {d_ff}u;\n\
+                         uint row = gid.y, col = gid.x;\n\
+                         float ss = 0.0f;\n\
+                         for (uint k = lid; k < D; k += tgsz) {{ float v = (float)x[row * D + k]; sx[k] = v; ss += v * v; }}\n\
+                         ss = simd_sum(ss);\n\
+                         threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+                         float inv = rsqrt(ss / (float)D + 1e-5f);\n\
+                         if (col < F) {{\n\
+                             float g = 0.0f, u = 0.0f;\n\
+                             for (uint k = 0; k < D; k++) {{\n\
+                                 float hv = sx[k] * inv * (float)nw[k];\n\
+                                 g = fma(hv, (float)w_gate[k * F + col], g);\n\
+                                 u = fma(hv, (float)w_up[k * F + col], u);\n\
+                             }}\n\
+                             out[row * F + col] = ({mt})((g / (1.0f + exp(-g))) * u);\n\
                          }}\n\
-                         out[row * F + col] = ({mt})((g / (1.0f + exp(-g))) * u);\n\
-                     }}\n\
-                 }}\n\n",
-                fn_name = g.fn_name
-            ));
+                     }}\n\n",
+                    fn_name = g.fn_name
+                ));
+            }
+            FusedStage::MatMulEpilogue { seq, k, n, residual, dtype, .. } => {
+                let mt = dtype.msl_ty();
+                let res_param = if residual.is_some() { format!(", device const {mt}* res [[buffer(3)]]") } else { String::new() };
+                let out_idx = if residual.is_some() { 4 } else { 3 };
+                let res_add = if residual.is_some() { "acc += (float)res[row * N + col]; " } else { "" };
+                out.push_str(&format!(
+                    "// Stage {idx}: Auto-Fused SIMD-Group Cooperative MatMul{ep} [{seq}x{k} @ {k}x{n}]\n\
+                     kernel void {fn_name}_stage{idx}_matmul_epilogue(\n\
+                         device const {mt}* a [[buffer(0)]], device const {mt}* b [[buffer(1)]]{res_param},\n\
+                         device {mt}* out [[buffer({out_idx})]],\n\
+                         uint2 tgid [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+                     ) {{\n\
+                         const uint M = {seq}u, K = {k}u, N = {n}u;\n\
+                         uint row = tgid.y, col = tgid.x * 4u + sg;\n\
+                         if (row < M && col < N) {{\n\
+                             float acc = 0.0f;\n\
+                             for (uint kk = lane; kk < K; kk += 32u) acc = fma((float)a[row * K + kk], (float)b[kk * N + col], acc);\n\
+                             acc = simd_sum(acc);\n\
+                             if (lane == 0) {{ {res_add}out[row * N + col] = ({mt})acc; }}\n\
+                         }}\n\
+                     }}\n\n",
+                    ep = if residual.is_some() { " + Residual Epilogue" } else { "" },
+                    fn_name = g.fn_name,
+                ));
+            }
+            _ => {}
         }
     }
     out
@@ -1028,7 +1141,9 @@ pub fn llama3_ffn(
 
         let shlo = emit_tensor_graph_stablehlo(g);
         assert!(shlo.contains("module @tenon_tg_llama3_ffn"));
+        assert!(shlo.contains("stablehlo.concatenate"));
         assert!(shlo.contains("stablehlo.dot_general"));
+        assert!(shlo.contains("stablehlo.slice"));
         assert!(shlo.contains("stablehlo.rsqrt"));
         assert!(shlo.contains("TPU_v5e="));
 

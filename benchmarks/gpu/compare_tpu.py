@@ -53,65 +53,75 @@ w8_jit = jax.jit(lambda x, wq, sc: (jnp.matmul(x, wq.astype(jnp.bfloat16), prefe
 ms_w8 = bench(w8_jit, (x, wq, sc), warmup=5, iters=50)
 res["hbm_w8_ms"] = ms_w8
 res["hbm_w8_gbs"] = ((16384*16384*1.0) / 1e9) / (ms_w8 / 1e3)
-del x, wq, sc
+# 3B. HBM W4A16 Packed INT4 GEMV 1x16384x16384
+wq4 = jnp.zeros((16384, 8192), dtype=jnp.int8)
+sc4 = jnp.ones((16384,), dtype=jnp.bfloat16) * jnp.bfloat16(0.01)
+def unpack_w4(wp):
+    lo = jax.lax.shift_right_arithmetic(jax.lax.shift_left(wp, jnp.int8(4)), jnp.int8(4)).astype(jnp.bfloat16)
+    hi = jax.lax.shift_right_arithmetic(wp, jnp.int8(4)).astype(jnp.bfloat16)
+    return jnp.concatenate([lo, hi], axis=-1)
+w4_jit = jax.jit(lambda x, wq, sc: (jnp.matmul(x, unpack_w4(wq), preferred_element_type=jnp.float32) * sc.astype(jnp.float32)).astype(jnp.bfloat16))
+ms_w4 = bench(w4_jit, (x, wq4, sc4), warmup=5, iters=50)
+res["hbm_w4_ms"] = ms_w4
+res["hbm_w4_gbs"] = ((16384*8192*1.0) / 1e9) / (ms_w4 / 1e3)
+del x, wq, sc, wq4, sc4
 
-# 4. Single-Graph 16-Layer Llama-3.2-1B via lax.scan (exact apples-to-apples match to Tenon stablehlo.while!)
-def run_llama16(seq, w8, iters):
+# 4. Statically-Unrolled + Horizontally-Fused 16-Layer Llama-3.2-1B (BF16 / W8A16 / W4A16 — exact match to Tenon!)
+def run_llama16(seq, qbits, iters):
     L, D, F = 16, 2048, 8192
-    wdtype = jnp.int8 if w8 else jnp.bfloat16
+    wdtype = jnp.bfloat16 if qbits == 16 else jnp.int8
+    qkv_c = (3 * D) // 2 if qbits == 4 else 3 * D
+    wo_c = D // 2 if qbits == 4 else D
+    gu_c = F if qbits == 4 else 2 * F
+    wd_c = D // 2 if qbits == 4 else D
     x0 = jnp.zeros((seq, D), dtype=jnp.bfloat16)
     n1 = jnp.ones((L, D), dtype=jnp.bfloat16)
     n2 = jnp.ones((L, D), dtype=jnp.bfloat16)
-    wq = jnp.zeros((L, D, D), dtype=wdtype)
-    wk = jnp.zeros((L, D, D), dtype=wdtype)
-    wv = jnp.zeros((L, D, D), dtype=wdtype)
-    wo = jnp.zeros((L, D, D), dtype=wdtype)
-    wg = jnp.zeros((L, D, F), dtype=wdtype)
-    wu = jnp.zeros((L, D, F), dtype=wdtype)
-    wd = jnp.zeros((L, F, D), dtype=wdtype)
+    wqkv = jnp.zeros((L, D, qkv_c), dtype=wdtype)
+    wo = jnp.zeros((L, D, wo_c), dtype=wdtype)
+    wgu = jnp.zeros((L, D, gu_c), dtype=wdtype)
+    wd = jnp.zeros((L, F, wd_c), dtype=wdtype)
     inv_sqrt_d = jnp.float32(1.0 / (D ** 0.5))
 
     def rmsnorm(x_f32, nw):
         ss = jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True)
         return (x_f32 * jax.lax.rsqrt(ss + 1e-5) * nw.astype(jnp.float32)).astype(jnp.bfloat16)
 
+    def deq(w):
+        if qbits == 4: return unpack_w4(w)
+        if qbits == 8: return w.astype(jnp.bfloat16)
+        return w
+
     @jax.jit
-    def fwd(x0, n1, wq, wk, wv, wo, n2, wg, wu, wd):
-        def body(x, lw):
-            ln1, lq, lk, lv, lo, ln2, lg, lu, ld = lw
-            if w8:
-                lq, lk, lv, lo = lq.astype(jnp.bfloat16), lk.astype(jnp.bfloat16), lv.astype(jnp.bfloat16), lo.astype(jnp.bfloat16)
-                lg, lu, ld = lg.astype(jnp.bfloat16), lu.astype(jnp.bfloat16), ld.astype(jnp.bfloat16)
+    def fwd(x, n1, wqkv, wo, n2, wgu, wd):
+        for i in range(L):
             xf = x.astype(jnp.float32)
-            xn1 = rmsnorm(xf, ln1)
-            q = jnp.matmul(xn1, lq, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
-            k = jnp.matmul(xn1, lk, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
-            v = jnp.matmul(xn1, lv, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+            xn1 = rmsnorm(xf, n1[i])
+            qkv = jnp.matmul(xn1, deq(wqkv[i]), preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+            q, k, v = qkv[:, :D], qkv[:, D:2*D], qkv[:, 2*D:]
             sc = jnp.matmul(q, k.T, preferred_element_type=jnp.float32) * inv_sqrt_d
             prob = jax.nn.softmax(sc, axis=-1).astype(jnp.bfloat16)
             ctx = jnp.matmul(prob, v, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
-            attn_o = jnp.matmul(ctx, lo, preferred_element_type=jnp.float32)
-            h1 = xf + attn_o
-            xn2 = rmsnorm(h1, ln2)
-            gate = jnp.matmul(xn2, lg, preferred_element_type=jnp.float32)
-            up = jnp.matmul(xn2, lu, preferred_element_type=jnp.float32)
-            act = (jax.nn.silu(gate) * up).astype(jnp.bfloat16)
-            down = jnp.matmul(act, ld, preferred_element_type=jnp.float32)
-            return (h1 + down).astype(jnp.bfloat16), None
-        y, _ = jax.lax.scan(body, x0, (n1, wq, wk, wv, wo, n2, wg, wu, wd))
-        return y
+            h1 = xf + jnp.matmul(ctx, deq(wo[i]), preferred_element_type=jnp.float32)
+            xn2 = rmsnorm(h1, n2[i])
+            gu = jnp.matmul(xn2, deq(wgu[i]), preferred_element_type=jnp.float32)
+            act = (jax.nn.silu(gu[:, :F]) * gu[:, F:]).astype(jnp.bfloat16)
+            x = (h1 + jnp.matmul(act, deq(wd[i]), preferred_element_type=jnp.float32)).astype(jnp.bfloat16)
+        return x
 
-    ms = bench(fwd, (x0, n1, wq, wk, wv, wo, n2, wg, wu, wd), warmup=3, iters=iters)
+    ms = bench(fwd, (x0, n1, wqkv, wo, n2, wgu, wd), warmup=3, iters=iters)
     return ms, (seq * 1000.0) / ms
 
-for tag, seq, w8, iters in [
-    ("prefill_s512_bf16", 512, False, 15),
-    ("decode_b32_bf16", 32, False, 20),
-    ("decode_b32_w8", 32, True, 20),
-    ("decode_b1_bf16", 1, False, 30),
-    ("decode_b1_w8", 1, True, 30),
+for tag, seq, qbits, iters in [
+    ("prefill_s512_bf16", 512, 16, 15),
+    ("decode_b32_bf16", 32, 16, 20),
+    ("decode_b32_w8", 32, 8, 20),
+    ("decode_b32_w4", 32, 4, 20),
+    ("decode_b1_bf16", 1, 16, 30),
+    ("decode_b1_w8", 1, 8, 30),
+    ("decode_b1_w4", 1, 4, 30),
 ]:
-    ms, toks = run_llama16(seq, w8, iters)
+    ms, toks = run_llama16(seq, qbits, iters)
     res[f"{tag}_ms"] = ms
     res[f"{tag}_toks"] = toks
 
@@ -293,6 +303,9 @@ def parse_tenon_output(stdout):
         m = re.search(r"TPU_HBM_W8A16_GEMV 1x16384x16384 ms=([0-9.]+) eff_GBs=([0-9.]+)", line)
         if m:
             res["hbm_w8_ms"], res["hbm_w8_gbs"] = float(m.group(1)), float(m.group(2))
+        m = re.search(r"TPU_HBM_W4A16_GEMV 1x16384x16384 ms=([0-9.]+) eff_GBs=([0-9.]+)", line)
+        if m:
+            res["hbm_w4_ms"], res["hbm_w4_gbs"] = float(m.group(1)), float(m.group(2))
         m = re.search(r"DECLARATIVE_GPU_GRAPH_TPU llama3_ffn_b32 ms=([0-9.]+) eff_GBs=([0-9.]+)", line)
         if m:
             res["decl_ffn_ms"], res["decl_ffn_gbs"] = float(m.group(1)), float(m.group(2))
@@ -300,10 +313,12 @@ def parse_tenon_output(stdout):
             ("prefill_s512_bf16", "Llama3.2_1B_Prefill_S512_BF16"),
             ("decode_b32_bf16", "Llama3.2_1B_Decode_B32_BF16"),
             ("decode_b32_w8", "Llama3.2_1B_Decode_B32_W8A16"),
+            ("decode_b32_w4", "Llama3.2_1B_Decode_B32_W4A16"),
             ("decode_b1_bf16", "Llama3.2_1B_Decode_B1_BF16"),
             ("decode_b1_w8", "Llama3.2_1B_Decode_B1_W8A16"),
+            ("decode_b1_w4", "Llama3.2_1B_Decode_B1_W4A16"),
         ]:
-            m = re.search(rf"BENCH_TPU_FULL16 {pat}.*full_ms=([0-9.]+) tok_s=([0-9.]+)", line)
+            m = re.search(rf"BENCH_TPU_(?:FULL16|FUSED16) {pat}.*full_ms=([0-9.]+) tok_s=([0-9.]+)", line)
             if m:
                 res[f"{tag}_ms"], res[f"{tag}_toks"] = float(m.group(1)), float(m.group(2))
     return res
@@ -325,7 +340,7 @@ def main():
         print("TENON STDERR:", tp.stderr[-500:])
     r_tenon = parse_tenon_output(tp.stdout)
 
-    print("=== [2/4] Running JAX (jax.jit + lax.scan) in isolated subprocess ===")
+    print("=== [2/4] Running JAX (jax.jit unrolled+fused+W4A16) in isolated subprocess ===")
     r_jax = run_py_worker(JAX_WORKER, "JAX")
     print("JAX:", r_jax)
 
@@ -339,23 +354,25 @@ def main():
 
     rows = [r_tenon, r_jax, r_tf, r_pt]
     print("\n================ SAME-MACHINE TPU v5e-1 HEAD-TO-HEAD (Silicon Ceiling: 197 TFLOPS / 819 GB/s) ================")
-    hdr = f"{'Framework':<30} | {'MXU 4096^3 TFLOPS':<19} | {'HBM BF16 GB/s':<15} | {'HBM W8 GB/s':<15} | {'1B S=512 tok/s':<14} | {'1B B=32 BF16':<12} | {'1B B=32 W8':<12} | {'1B B=1 BF16':<11} | {'1B B=1 W8':<11}"
+    hdr = f"{'Framework':<28} | {'MXU 4096^3':<16} | {'HBM BF16':<14} | {'HBM W4':<14} | {'1B S=512':<11} | {'B=32 BF16':<10} | {'B=32 W8':<10} | {'B=32 W4':<10} | {'B=1 BF16':<9} | {'B=1 W8':<9} | {'B=1 W4':<9}"
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
         if "error" in r:
-            print(f"{r['framework']:<30} | ERROR: {r['error'][:95]}")
+            print(f"{r['framework']:<28} | ERROR: {r['error'][:95]}")
             continue
         print(
-            f"{r['framework']:<30} | "
-            f"{fmt(r.get('mxu_4096_tflops'), 'T', TPU_PEAK_TFLOPS):<19} | "
-            f"{fmt(r.get('hbm_bf16_gbs'), '', TPU_PEAK_GBS):<15} | "
-            f"{fmt(r.get('hbm_w8_gbs'), '', TPU_PEAK_GBS):<15} | "
-            f"{fmt(r.get('prefill_s512_bf16_toks')):<14} | "
-            f"{fmt(r.get('decode_b32_bf16_toks')):<12} | "
-            f"{fmt(r.get('decode_b32_w8_toks')):<12} | "
-            f"{fmt(r.get('decode_b1_bf16_toks')):<11} | "
-            f"{fmt(r.get('decode_b1_w8_toks')):<11}"
+            f"{r['framework']:<28} | "
+            f"{fmt(r.get('mxu_4096_tflops'), 'T', TPU_PEAK_TFLOPS):<16} | "
+            f"{fmt(r.get('hbm_bf16_gbs'), '', TPU_PEAK_GBS):<14} | "
+            f"{fmt(r.get('hbm_w4_gbs'), '', TPU_PEAK_GBS):<14} | "
+            f"{fmt(r.get('prefill_s512_bf16_toks')):<11} | "
+            f"{fmt(r.get('decode_b32_bf16_toks')):<10} | "
+            f"{fmt(r.get('decode_b32_w8_toks')):<10} | "
+            f"{fmt(r.get('decode_b32_w4_toks')):<10} | "
+            f"{fmt(r.get('decode_b1_bf16_toks')):<9} | "
+            f"{fmt(r.get('decode_b1_w8_toks')):<9} | "
+            f"{fmt(r.get('decode_b1_w4_toks')):<9}"
         )
 
 if __name__ == "__main__":

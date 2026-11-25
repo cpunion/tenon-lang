@@ -114,6 +114,11 @@ impl TpuBuffer {
         TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_BF16 }
     }
 
+    pub fn from_s8_2d(xs List[UInt8], rows Int, cols Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_create_2d(list_data_ptr(xs), TPU_S8, rows, cols) }
+        TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S8 }
+    }
+
     pub fn zeros_bf16_2d(rows Int, cols Int) TpuBuffer {
         let h = unsafe { tn_tpu_buf_zeros_2d(TPU_BF16, rows, cols) }
         TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_BF16 }
