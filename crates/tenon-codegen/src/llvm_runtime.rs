@@ -169,7 +169,7 @@ int64_t tenon_bytes_push(int64_t b, int64_t byte_val) {
         hdr->len = old_len + 1;
         return b;
     }
-    int64_t new_cap = cap_bytes * 2;
+    int64_t new_cap = (old_len >= cap_bytes) ? (cap_bytes * 2) : (old_len + 16);
     if (new_cap < old_len + 1) new_cap = old_len + 1;
     if (new_cap < 16) new_cap = 16;
     int64_t new_words = (new_cap + 7) / 8;

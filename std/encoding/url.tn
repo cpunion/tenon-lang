@@ -1,0 +1,119 @@
+// std/encoding/url.tn — Pure Tenon RFC 3986 URL Percent-Encoding & Query String Codec
+
+import "std/text/text.tn"
+import "std/text/builder.tn"
+
+pure fn is_unreserved_url_byte(b Int) Bool {
+    (b >= 65 && b <= 90) ||
+    (b >= 97 && b <= 122) ||
+    (b >= 48 && b <= 57) ||
+    b == 45 || b == 46 || b == 95 || b == 126
+}
+
+pure fn upper_hex(n Int) Int {
+    if n < 10 { 48 + n } else { 55 + n }
+}
+
+pure fn hex_nibble(c Int) Int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    -1
+}
+
+/// RFC 3986 percent-encodes arbitrary UTF-8 `Text` (keeps `A-Z a-z 0-9 - . _ ~`).
+pub pure fn url_encode(s Text) Text {
+    var tb = TextBuilder.new()
+    var i = 0
+    while i < len(s) {
+        let b = byte_at(s, i) & 255
+        if is_unreserved_url_byte(b) {
+            tb.push_byte(b)
+        } else {
+            tb.push_byte(37) // '%'
+            tb.push_byte(upper_hex((b >> 4) & 15))
+            tb.push_byte(upper_hex(b & 15))
+        }
+        i += 1
+    }
+    tb.finish()
+}
+
+/// Decodes RFC 3986 `%XX` sequences (and `+` as space when `plus_as_space` is true).
+pub pure fn url_decode(s Text, plus_as_space Bool) Result[Text, Text] {
+    let n = len(s)
+    var tb = TextBuilder.new()
+    var i = 0
+    while i < n {
+        let c = byte_at(s, i)
+        if c == 37 { // '%'
+            if i + 2 >= n {
+                let _ = tb.finish()
+                return Err("truncated percent-encoding in URL")
+            }
+            let hi = hex_nibble(byte_at(s, i + 1))
+            let lo = hex_nibble(byte_at(s, i + 2))
+            if hi < 0 || lo < 0 {
+                let _ = tb.finish()
+                return Err("invalid hex digit in URL percent-encoding")
+            }
+            tb.push_byte(((hi << 4) | lo) & 255)
+            i += 3
+        } else if plus_as_space && c == 43 { // '+'
+            tb.push_byte(32)
+            i += 1
+        } else {
+            tb.push_byte(c & 255)
+            i += 1
+        }
+    }
+    Ok(tb.finish())
+}
+
+pub record QueryPair {
+    key   Text
+    value Text
+}
+
+/// Parses `application/x-www-form-urlencoded` query string (`a=1&b=hello+world`).
+pub pure fn query_parse(q Text) Result[List[QueryPair], Text] {
+    var out List[QueryPair] = []
+    let n = len(q)
+    if n == 0 {
+        return Ok(out)
+    }
+    var pos = 0
+    while pos < n {
+        var amp = pos
+        while amp < n && byte_at(q, amp) != 38 { // '&'
+            amp += 1
+        }
+        var eq = pos
+        while eq < amp && byte_at(q, eq) != 61 { // '='
+            eq += 1
+        }
+        let rk = str_slice(q, pos, eq)
+        let rv = if eq < amp { str_slice(q, eq + 1, amp) } else { "" }
+        let dk = url_decode(rk, true)?
+        let dv = url_decode(rv, true)?
+        out = push(out, QueryPair { key = dk, value = dv })
+        pos = amp + 1
+    }
+    Ok(out)
+}
+
+/// Encodes `List[QueryPair]` into RFC 3986 query string.
+pub pure fn query_encode(pairs List[QueryPair]) Text {
+    var tb = TextBuilder.new()
+    var i = 0
+    while i < len(pairs) {
+        if i > 0 {
+            tb.push_byte(38) // '&'
+        }
+        tb.push_str(url_encode(pairs[i].key))
+        tb.push_byte(61) // '='
+        tb.push_str(url_encode(pairs[i].value))
+        i += 1
+    }
+    tb.finish()
+}

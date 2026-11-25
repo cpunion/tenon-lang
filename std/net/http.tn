@@ -725,6 +725,142 @@ pub fn http_serve_reactor(
     total_reqs.load(ORDER_SEQ_CST)
 }
 
+/// C10K Single-Thread Event-Driven Multiplexed HTTP/1.1 Server:
+/// Registers BOTH the listener socket and ALL active Keep-Alive client sockets directly into
+/// a single non-blocking OS `kqueue`/`epoll` Reactor event loop, servicing many concurrent
+/// persistent connections on 1 OS thread without blocking!
+pub fn http_serve_multiplexed(
+    addr Text,
+    port_out AtomicInt,
+    stop AtomicInt,
+    handler fn(HttpRequest) HttpResponse
+) Int {
+    let lfd = net_tcp_listen(addr)
+    if lfd < 0 {
+        port_out.store(-1, ORDER_SEQ_CST)
+        return -1
+    }
+    let port = net_tcp_local_port(lfd)
+    let _ = net_set_nonblocking(lfd, true)
+    let rfd = reactor_new()
+    // Token 0 identifies the listener socket; client sockets use token = cfd (>= 3).
+    let _ = reactor_add(rfd, lfd, EVENT_READ, 0)
+
+    var conn_fds List[Int] = []
+    var conn_bufs List[Text] = []
+    var served = 0
+
+    port_out.store(port, ORDER_SEQ_CST)
+
+    while stop.load(ORDER_SEQ_CST) == 0 {
+        let evs = reactor_wait(rfd, 15, 64)
+        var ei = 0
+        while ei < len(evs) {
+            let tok = event_token(evs[ei])
+            if tok == 0 {
+                var accepting = true
+                while accepting {
+                    let cfd = net_tcp_accept(lfd)
+                    if cfd >= 0 {
+                        let _ = net_set_nonblocking(cfd, true)
+                        let _ = net_set_nodelay(cfd, true)
+                        let _ = reactor_add(rfd, cfd, EVENT_READ, cfd)
+                        conn_fds = push(conn_fds, cfd)
+                        conn_bufs = push(conn_bufs, "")
+                    } else {
+                        accepting = false
+                    }
+                }
+            } else {
+                // Find active client slot by fd token
+                var slot = -1
+                var si = 0
+                while si < len(conn_fds) {
+                    if conn_fds[si] == tok {
+                        slot = si
+                        break
+                    }
+                    si += 1
+                }
+                if slot >= 0 {
+                    var should_close = false
+                    var reading = true
+                    while reading {
+                        let chunk = net_read_text(tok, 16384)
+                        if len(chunk) > 0 {
+                            conn_bufs[slot] = conn_bufs[slot] ++ chunk
+                        } else {
+                            if !net_last_would_block() {
+                                should_close = true
+                            }
+                            reading = false
+                        }
+                    }
+                    // Process all complete pipelined / Keep-Alive HTTP/1.1 requests buffered for this fd
+                    var draining = true
+                    while draining && !should_close {
+                        match parse_http_request(conn_bufs[slot]) {
+                            Some((req, consumed)) => {
+                                let req_ka = req.keep_alive
+                                var res = handler(req)
+                                if !req_ka {
+                                    res = HttpResponse {
+                                        status = res.status
+                                        reason = res.reason
+                                        headers = res.headers
+                                        body = res.body
+                                        keep_alive = false
+                                    }
+                                }
+                                let wire = encode_http_response(res)
+                                let wn = net_write_text(tok, wire)
+                                served += 1
+                                if wn < 0 || !res.keep_alive {
+                                    should_close = true
+                                } else {
+                                    let cur = conn_bufs[slot]
+                                    if consumed < len(cur) {
+                                        conn_bufs[slot] = str_slice(cur, consumed, len(cur))
+                                    } else {
+                                        conn_bufs[slot] = ""
+                                    }
+                                }
+                            }
+                            None => {
+                                draining = false
+                            }
+                        }
+                    }
+                    if should_close {
+                        let _ = reactor_del(rfd, tok)
+                        let _ = net_close(tok)
+                        let last = len(conn_fds) - 1
+                        if slot < last {
+                            conn_fds[slot] = conn_fds[last]
+                            conn_bufs[slot] = conn_bufs[last]
+                        }
+                        conn_fds = list_pop_shrink(conn_fds)
+                        conn_bufs = list_pop_shrink(conn_bufs)
+                    }
+                }
+            }
+            ei += 1
+        }
+    }
+
+    var ci = 0
+    while ci < len(conn_fds) {
+        let cfd = conn_fds[ci]
+        let _ = reactor_del(rfd, cfd)
+        let _ = net_close(cfd)
+        ci += 1
+    }
+    let _ = reactor_del(rfd, lfd)
+    let _ = reactor_close(rfd)
+    let _ = net_close(lfd)
+    served
+}
+
 // =========================================================================
 // High-Performance HTTP/1.1 Client (Persistent Keep-Alive + One-Shot Helpers)
 // =========================================================================

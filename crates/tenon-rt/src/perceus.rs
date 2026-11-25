@@ -399,7 +399,11 @@ pub extern "C" fn tenon_list_push(ptr: i64, val: i64) -> i64 {
             (*hdr).len = old_len + 1;
             return ptr;
         }
-        let new_cap = (old_len + 1).max((*hdr).cap * 2);
+        let new_cap = if old_len >= (*hdr).cap {
+            (old_len + 1).max((*hdr).cap * 2).max(4)
+        } else {
+            (old_len + 4).max(4)
+        };
         let fresh = tenon_rc_alloc(TAG_LIST, new_cap as i64) as *mut ObjHeader;
         (*fresh).len = old_len + 1;
         (*fresh).rc_mask = rc_mask;

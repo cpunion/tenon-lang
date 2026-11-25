@@ -119,7 +119,8 @@ test fn test_postgres_wire_v3_and_live_scram_extended_query_server() {
         // 7. Read Extended Query batch (Parse + Bind + Execute + Sync)
         let qreq = net_read(cfd, 2048)
         let ok_parse = bytes_len(qreq) > 0 && (bytes_get(qreq, 0) as Int) == 80 // 'P'
-        // 8. Send DataRow(["42", "50000"]) + ReadyForQuery('I')
+        // 8. Send RowDescription(["id", "price"]) + DataRow(["42", "50000"]) + ReadyForQuery('I')
+        let _ = net_write(cfd, pg_encode_row_desc(["id", "price"]))
         let _ = net_write(cfd, pg_encode_data_row([Some("42"), Some("50000")]))
         let _ = net_write(cfd, pg_encode_ready_for_query(73))
         // 9. Read Terminate
@@ -127,6 +128,12 @@ test fn test_postgres_wire_v3_and_live_scram_extended_query_server() {
         let _ = net_close(cfd)
         if ok_parse { 1 } else { 0 }
     })
+
+    // Verify SSLRequest wire frame encoding (length=8, code=80877103 = 0x04D2162F)
+    let ssl_req = pg_encode_ssl_request()
+    assert bytes_len(ssl_req) == 8
+    assert (bytes_read_u32_be(ssl_req, 0) as Int) == 8
+    assert (bytes_read_u32_be(ssl_req, 4) as Int) == 80877103
 
     let mut_cli = match pg_connect(f"127.0.0.1:{port}", "tenon", "s3cr3t", "trading") {
         Ok(c) => c
@@ -136,7 +143,7 @@ test fn test_postgres_wire_v3_and_live_scram_extended_query_server() {
         }
     }
     var cli = mut_cli
-    let rows = match cli.query_params("SELECT id, price FROM orders WHERE sym = $1", ["BTC-USD"]) {
+    let rows = match cli.query_named("SELECT id, price FROM orders WHERE sym = $1", ["BTC-USD"]) {
         Ok(rs) => rs
         Err(_) => {
             assert false
@@ -144,10 +151,10 @@ test fn test_postgres_wire_v3_and_live_scram_extended_query_server() {
         }
     }
     assert len(rows) == 1
-    assert len(rows[0]) == 2
-    // Hydrate raw DB text columns into statically refined `OrderRow` via auto-derived `.parse(...)`!
-    let id_val = match rows[0][0] { Some(s) => if s == "42" { 42 } else { 0 } None => 0 }
-    let px_val = match rows[0][1] { Some(s) => if s == "50000" { 50000 } else { 0 } None => 0 }
+    // Access columns by name via decoded RowDescription (`'T'`)!
+    let id_val = match rows[0].col_by_name("id") { Some(s) => if s == "42" { 42 } else { 0 } None => 0 }
+    let px_val = match rows[0].col_by_name("price") { Some(s) => if s == "50000" { 50000 } else { 0 } None => 0 }
+    assert match rows[0].col_by_name("missing") { None => true Some(_) => false }
     match OrderRow.parse(id_val, px_val) {
         Ok(ord) => {
             assert ord.id == 42 && ord.price == 50000

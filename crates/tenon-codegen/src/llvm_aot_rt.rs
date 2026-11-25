@@ -573,8 +573,9 @@ int64_t tenon_list_push(int64_t ptr, int64_t val) {
         obj->len = old_len + 1;
         return ptr;
     }
-    int64_t new_cap = obj->cap * 2;
+    int64_t new_cap = (old_len >= obj->cap) ? (obj->cap * 2) : (old_len + 4);
     if (new_cap < old_len + 1) new_cap = old_len + 1;
+    if (new_cap < 4) new_cap = 4;
     int64_t fp = tenon_rc_alloc(4, new_cap);
     TenonObj* fresh = (TenonObj*)(uintptr_t)fp;
     fresh->len = old_len + 1;
@@ -658,7 +659,7 @@ int64_t tenon_flat_list_push(int64_t ptr, int64_t elem_bytes, const void* val_pt
         obj->len = old_len + 1;
         return ptr;
     }
-    int64_t new_elems = cap_elems * 2;
+    int64_t new_elems = (old_len >= cap_elems) ? (cap_elems * 2) : (old_len + 4);
     if (new_elems < old_len + 1) new_elems = old_len + 1;
     if (new_elems < 4) new_elems = 4;
     int64_t new_words = (new_elems * elem_bytes + 7) / 8;

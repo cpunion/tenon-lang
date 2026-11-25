@@ -1,0 +1,127 @@
+// std/encoding/csv.tn — Pure Tenon RFC 4180 CSV Parser & Encoder
+// Handles quoted fields, escaped `""` quotes, embedded commas, and `\r\n` / `\n` line endings.
+
+import "std/text/text.tn"
+import "std/text/builder.tn"
+
+/// Parses full RFC 4180 CSV text into `List[List[Text]]` rows.
+pub pure fn csv_parse(src Text) List[List[Text]] {
+    let n = len(src)
+    var rows List[List[Text]] = []
+    if n == 0 {
+        return rows
+    }
+    var i = 0
+    while i < n {
+        var row List[Text] = []
+        var in_row = true
+        while in_row {
+            var tb = TextBuilder.new()
+            if i < n && byte_at(src, i) == 34 { // quoted field '"'
+                i += 1
+                while i < n {
+                    let c = byte_at(src, i)
+                    if c == 34 {
+                        if i + 1 < n && byte_at(src, i + 1) == 34 {
+                            tb.push_byte(34)
+                            i += 2
+                        } else {
+                            i += 1
+                            break
+                        }
+                    } else {
+                        tb.push_byte(c & 255)
+                        i += 1
+                    }
+                }
+                row = push(row, tb.finish())
+                if i < n && byte_at(src, i) == 44 { // ','
+                    i += 1
+                } else {
+                    in_row = false
+                }
+            } else {
+                while i < n {
+                    let c = byte_at(src, i)
+                    if c == 44 || c == 10 || c == 13 {
+                        break
+                    }
+                    tb.push_byte(c & 255)
+                    i += 1
+                }
+                row = push(row, tb.finish())
+                if i < n && byte_at(src, i) == 44 {
+                    i += 1
+                } else {
+                    in_row = false
+                }
+            }
+        }
+        // Consume line ending (`\r\n`, `\n`, or `\r`)
+        if i < n && byte_at(src, i) == 13 {
+            i += 1
+        }
+        if i < n && byte_at(src, i) == 10 {
+            i += 1
+        }
+        rows = push(rows, row)
+    }
+    rows
+}
+
+pure fn csv_needs_quotes(field Text) Bool {
+    var i = 0
+    while i < len(field) {
+        let c = byte_at(field, i)
+        if c == 44 || c == 34 || c == 10 || c == 13 {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+/// Encodes a single CSV row according to RFC 4180 (quoting fields containing `,`, `"`, or newlines).
+pub pure fn csv_encode_row(row List[Text]) Text {
+    var tb = TextBuilder.new()
+    var i = 0
+    while i < len(row) {
+        if i > 0 {
+            tb.push_byte(44)
+        }
+        let field = row[i]
+        if csv_needs_quotes(field) {
+            tb.push_byte(34)
+            var j = 0
+            while j < len(field) {
+                let c = byte_at(field, j)
+                if c == 34 {
+                    tb.push_byte(34)
+                    tb.push_byte(34)
+                } else {
+                    tb.push_byte(c & 255)
+                }
+                j += 1
+            }
+            tb.push_byte(34)
+        } else {
+            tb.push_str(field)
+        }
+        i += 1
+    }
+    tb.finish()
+}
+
+/// Encodes `List[List[Text]]` rows into RFC 4180 CSV text joined by `\n`.
+pub pure fn csv_encode(rows List[List[Text]]) Text {
+    var tb = TextBuilder.new()
+    var i = 0
+    while i < len(rows) {
+        if i > 0 {
+            tb.push_byte(10)
+        }
+        tb.push_str(csv_encode_row(rows[i]))
+        i += 1
+    }
+    tb.finish()
+}

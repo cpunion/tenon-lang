@@ -112,3 +112,45 @@ test fn http_reactor_server_and_keepalive_client_zero_leaks() {
     let served = srv.join()
     assert served == 12
 }
+
+test fn http_multiplexed_c10k_single_thread_concurrent_keepalive() {
+    let port_box = atomic_new(0)
+    let stop_flag = atomic_new(0)
+
+    let srv = thread_start(|| {
+        http_serve_multiplexed("127.0.0.1:0", port_box, stop_flag, |req| {
+            http_ok("mux:" ++ req.path)
+        })
+    })
+
+    var port = 0
+    while port == 0 {
+        port = port_box.load(ORDER_SEQ_CST)
+        if port == 0 {
+            thread_sleep_ms(2)
+        }
+    }
+    assert port > 0
+    let host = f"127.0.0.1:{int_to_text(port)}"
+
+    // Open 3 simultaneous Keep-Alive connections and interleave requests across ALL 3
+    // concurrently — proves the single-threaded Reactor truly multiplexes non-blocking sockets!
+    var c1 = match http_connect(host) { Ok(c) => c Err(_) => { assert false; HttpConn { fd = -1, host = "", buf = "" } } }
+    var c2 = match http_connect(host) { Ok(c) => c Err(_) => { assert false; HttpConn { fd = -1, host = "", buf = "" } } }
+    var c3 = match http_connect(host) { Ok(c) => c Err(_) => { assert false; HttpConn { fd = -1, host = "", buf = "" } } }
+
+    var round = 0
+    while round < 4 {
+        match c1.get("/a") { Ok(r) => { assert r.status == 200 && r.body == "mux:/a" } Err(_) => { assert false } }
+        match c2.get("/b") { Ok(r) => { assert r.status == 200 && r.body == "mux:/b" } Err(_) => { assert false } }
+        match c3.get("/c") { Ok(r) => { assert r.status == 200 && r.body == "mux:/c" } Err(_) => { assert false } }
+        round += 1
+    }
+    c1.close()
+    c2.close()
+    c3.close()
+
+    stop_flag.store(1, ORDER_SEQ_CST)
+    let served = srv.join()
+    assert served == 12
+}

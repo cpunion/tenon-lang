@@ -208,7 +208,11 @@ pub extern "C" fn tenon_bytes_push(b: i64, byte_val: i64) -> i64 {
             (*hdr).len = old_len + 1;
             return b;
         }
-        let new_cap_bytes = (old_len + 1).max(cap_bytes * 2).max(16);
+        let new_cap_bytes = if old_len >= cap_bytes {
+            (old_len + 1).max(cap_bytes * 2).max(16)
+        } else {
+            (old_len + 16).max(16)
+        };
         let new_words = new_cap_bytes.div_ceil(8).max(1);
         let fresh = tenon_rc_alloc(TAG_BYTES, new_words as i64) as *mut ObjHeader;
         (*fresh).len = old_len + 1;

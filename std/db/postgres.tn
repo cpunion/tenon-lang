@@ -400,6 +400,93 @@ pub pure fn pg_encode_startup(user Text, database Text) Bytes {
     push_bytes_all(msg, body)
 }
 
+/// Encodes PostgreSQL wire `SSLRequest` handshake frame (length=8, code=80877103).
+pub pure fn pg_encode_ssl_request() Bytes {
+    var msg = bytes_new(8)
+    msg = push_u32_be(msg, 8)
+    push_u32_be(msg, 80877103)
+}
+
+/// Encodes PostgreSQL Backend `RowDescription` (`'T'` = 84) frame from column names.
+pub pure fn pg_encode_row_desc(col_names List[Text]) Bytes {
+    var body = bytes_new(64)
+    body = push_u16_be(body, len(col_names))
+    var i = 0
+    while i < len(col_names) {
+        body = push_cstr(body, col_names[i])
+        // 18 bytes of column metadata (table_oid:4, attr:2, type_oid:4, typlen:2, typmod:4, fmt:2)
+        body = push_u32_be(body, 0)
+        body = push_u16_be(body, 0)
+        body = push_u32_be(body, 25) // TEXT OID
+        body = push_u16_be(body, 65535)
+        body = push_u32_be(body, 4294967295)
+        body = push_u16_be(body, 0)
+        i += 1
+    }
+    wrap_tagged_frame(84, body)
+}
+
+/// Decodes a PostgreSQL Backend `RowDescription` (`'T'` = 84) payload into column names.
+pub pure fn pg_decode_row_desc(payload Bytes) List[Text] {
+    let plen = bytes_len(payload)
+    if plen < 2 {
+        return []
+    }
+    let ncols = ((bytes_get(payload, 0) as Int) << 8) | (bytes_get(payload, 1) as Int)
+    var cols List[Text] = []
+    var pos = 2
+    var c = 0
+    while c < ncols && pos < plen {
+        var name_b = bytes_new(16)
+        while pos < plen && (bytes_get(payload, pos) as Int) != 0 {
+            name_b = bytes_push(name_b, bytes_get(payload, pos) as Int)
+            pos += 1
+        }
+        if pos < plen {
+            pos += 1 // skip NUL terminator
+        }
+        cols = push(cols, bytes_to_text(name_b))
+        pos += 18 // skip 18 bytes of OID/format metadata
+        c += 1
+    }
+    cols
+}
+
+pub record PgRow {
+    columns List[Text]
+    values  List[Option[Text]]
+}
+
+impl PgRow {
+    pub pure fn col_index(self, name Text) Int {
+        var i = 0
+        while i < len(self.columns) {
+            if self.columns[i] == name {
+                return i
+            }
+            i += 1
+        }
+        -1
+    }
+
+    pub pure fn col_by_name(self, name Text) Option[Text] {
+        let idx = self.col_index(name)
+        if idx >= 0 && idx < len(self.values) {
+            self.values[idx]
+        } else {
+            None
+        }
+    }
+
+    pub pure fn get(self, idx Int) Option[Text] {
+        if idx >= 0 && idx < len(self.values) {
+            self.values[idx]
+        } else {
+            None
+        }
+    }
+}
+
 pub pure fn pg_encode_query(sql Text) Bytes {
     wrap_tagged_frame(81, push_cstr(bytes_new(len(sql) + 1), sql))
 }
@@ -692,6 +779,32 @@ impl PgClient {
         batch = push_bytes_all(batch, pg_encode_sync())
         let _ = pg_send_bytes(self.fd, batch)?
         self.drain_until_ready()
+    }
+
+    /// Executes a parameterized Extended Query with `Describe` portal and returns named-column `PgRow`s!
+    pub fn query_named(inout self, sql Text, params List[Text]) Result[List[PgRow], Text] {
+        var batch = bytes_new(128)
+        batch = push_bytes_all(batch, pg_encode_parse("", sql))
+        batch = push_bytes_all(batch, pg_encode_bind("", "", params))
+        batch = push_bytes_all(batch, pg_encode_describe_portal(""))
+        batch = push_bytes_all(batch, pg_encode_execute("", 0))
+        batch = push_bytes_all(batch, pg_encode_sync())
+        let _ = pg_send_bytes(self.fd, batch)?
+        var cols List[Text] = []
+        var rows List[PgRow] = []
+        while true {
+            let f = pg_read_next_frame(self)?
+            if f.tag == 84 { // 'T' RowDescription
+                cols = pg_decode_row_desc(f.payload)
+            } else if f.tag == 68 { // 'D' DataRow
+                rows = push(rows, PgRow { columns = cols, values = pg_decode_data_row(f.payload) })
+            } else if f.tag == 90 { // 'Z' ReadyForQuery
+                return Ok(rows)
+            } else if f.tag == 69 { // 'E' ErrorResponse
+                return Err("postgres query error: " ++ bytes_to_text(f.payload))
+            }
+        }
+        Ok(rows)
     }
 
     pub fn begin(inout self) Result[Bool, Text] {

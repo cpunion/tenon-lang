@@ -1,0 +1,152 @@
+// std/stdlib_r3_test.tn — Production Standard Library R3 Suite
+// Verifies: std/crypto (SHA-256, SHA-1, HMAC, PBKDF2, Base64URL, JWT HS256),
+//           std/time (Hinnant O(1) civil calendar, RFC 3339, leap years 1900/2000/2024/2038),
+//           std/math/decimal (Decimal64 exact 10^8 fixed-point pricing & PnL),
+//           std/regex (Thompson NFA linear-time engine + ReDoS immunity),
+//           std/encoding/csv & std/encoding/url.
+
+import "std/crypto/crypto.tn"
+import "std/time/time.tn"
+import "std/math/decimal.tn"
+import "std/regex/regex.tn"
+import "std/encoding/csv.tn"
+import "std/encoding/url.tn"
+
+test fn std_crypto_hashes_hmac_pbkdf2_and_jwt_hs256() {
+    assert crypto_sha256_hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    assert crypto_sha1_hex("abc") == "a9993e364706816aba3e25717850c26c9cd0d89d"
+    assert crypto_hmac_sha256_hex("Jefe", "what do ya want for nothing?") == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    assert ct_eq("secret-token", "secret-token")
+    assert !ct_eq("secret-token", "secret-tokeN")
+
+    // PBKDF2-HMAC-SHA256 RFC 6070 vector (1 iteration: password="password", salt="salt")
+    let dk = crypto_pbkdf2_hmac_sha256("password", text_to_bytes("salt"), 1)
+    assert crypto_bytes_to_hex(dk) == "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+
+    // JWT HS256 sign & constant-time verify
+    let tok = jwt_sign_hs256("{\"sub\":\"trader-1\",\"role\":\"admin\"}", "super-secret-key")
+    match jwt_verify_hs256(tok, "super-secret-key") {
+        Ok(payload) => { assert payload == "{\"sub\":\"trader-1\",\"role\":\"admin\"}" }
+        Err(_) => { assert false }
+    }
+    // Tampered secret must fail verification
+    match jwt_verify_hs256(tok, "wrong-secret") {
+        Ok(_) => { assert false }
+        Err(_) => { assert true }
+    }
+}
+
+test fn std_time_hinnant_calendar_and_rfc3339() {
+    // Unix epoch 1970-01-01T00:00:00Z == 0
+    let epoch = unix_secs_to_datetime(0)
+    assert format_rfc3339(epoch) == "1970-01-01T00:00:00Z"
+    assert datetime_to_unix_secs(epoch) == 0
+
+    // Leap day 2024-02-29T12:34:56Z roundtrip
+    match parse_rfc3339("2024-02-29T12:34:56Z") {
+        Ok(dt) => {
+            assert dt.year == 2024 && dt.month == 2 && dt.day == 29
+            assert dt.hour == 12 && dt.minute == 34 && dt.second == 56
+            let ts = datetime_to_unix_secs(dt)
+            assert ts == 1709210096
+            assert format_rfc3339(unix_secs_to_datetime(ts)) == "2024-02-29T12:34:56Z"
+        }
+        Err(_) => { assert false }
+    }
+
+    // 1900 was NOT a leap year; 2000 WAS a leap year
+    assert !is_leap_year_gregorian(1900)
+    assert is_leap_year_gregorian(2000)
+    match parse_rfc3339("1900-02-29T00:00:00Z") {
+        Ok(_) => { assert false }
+        Err(_) => { assert true }
+    }
+    match parse_rfc3339("2000-02-29T23:59:59Z") {
+        Ok(dt2k) => { assert format_rfc3339(dt2k) == "2000-02-29T23:59:59Z" }
+        Err(_) => { assert false }
+    }
+}
+
+test fn std_math_decimal64_exact_financial_arithmetic() {
+    // Classic IEEE-754 bug: 0.1 + 0.2 == 0.3 EXACTLY in Decimal64!
+    let d1 = match dec_parse("0.1") { Ok(v) => v Err(_) => dec_zero() }
+    let d2 = match dec_parse("0.2") { Ok(v) => v Err(_) => dec_zero() }
+    let d3 = match dec_parse("0.3") { Ok(v) => v Err(_) => dec_zero() }
+    assert dec_eq(dec_add(d1, d2), d3)
+    assert dec_to_text(dec_add(d1, d2)) == "0.3"
+
+    // Crypto notional: 68425.75 * 1.25 = 85532.1875 (exact!)
+    let px = match dec_parse("68425.75") { Ok(v) => v Err(_) => dec_zero() }
+    let qty = match dec_parse("1.25") { Ok(v) => v Err(_) => dec_zero() }
+    let notional = dec_mul(px, qty)
+    assert dec_to_text(notional) == "85532.1875"
+
+    // Division: 100 / 4 = 25, 1 / 8 = 0.125, divide-by-zero returns Err
+    let q = match dec_div(dec_from_int(1), dec_from_int(8)) { Ok(v) => v Err(_) => dec_zero() }
+    assert dec_to_text(q) == "0.125"
+    match dec_div(px, dec_zero()) {
+        Ok(_) => { assert false }
+        Err(_) => { assert true }
+    }
+}
+
+test fn std_regex_thompson_nfa_and_redos_immunity() {
+    // Email-like pattern with classes, `+`, `?`, escaping, anchors
+    let re_id = match regex_compile("^[a-z][a-z0-9_]+@[a-z]+\\.[a-z]+$") {
+        Ok(r) => r
+        Err(_) => { assert false; Regex { states = [], classes = [], start = 0, anchor_start = false, anchor_end = false } }
+    }
+    assert regex_is_match(re_id, "alice_42@tenon.dev")
+    assert !regex_is_match(re_id, "42alice@tenon.dev")
+
+    // Alternation + grouping + find span
+    let re_ord = match regex_compile("(BUY|SELL)-\\d+") {
+        Ok(r) => r
+        Err(_) => { assert false; Regex { states = [], classes = [], start = 0, anchor_start = false, anchor_end = false } }
+    }
+    match regex_find(re_ord, "order #SELL-9081 filled") {
+        Some((s, e)) => {
+            assert str_slice("order #SELL-9081 filled", s, e) == "SELL-9081"
+        }
+        None => { assert false }
+    }
+
+    // ReDoS catastrophic backtracking test: `(a+)+b` against 32 'a's takes O(N*M) microseconds in Thompson NFA!
+    let re_evil = match regex_compile("^(a+)+b$") {
+        Ok(r) => r
+        Err(_) => { assert false; Regex { states = [], classes = [], start = 0, anchor_start = false, anchor_end = false } }
+    }
+    assert !regex_is_match(re_evil, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    assert regex_is_match(re_evil, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab")
+}
+
+test fn std_encoding_csv_and_url() {
+    let raw_csv = "sym,note,qty\r\nBTC,\"fast, \"\"safe\"\"\",10\nETH,spot,25"
+    let rows = csv_parse(raw_csv)
+    assert len(rows) == 3
+    assert rows[0][0] == "sym" && rows[0][2] == "qty"
+    assert rows[1][0] == "BTC" && rows[1][1] == "fast, \"safe\"" && rows[1][2] == "10"
+    assert rows[2][0] == "ETH" && rows[2][2] == "25"
+    let roundtrip = csv_parse(csv_encode(rows))
+    assert len(roundtrip) == 3 && roundtrip[1][1] == "fast, \"safe\""
+
+    // RFC 3986 URL percent-encoding + query roundtrip
+    let enc = url_encode("BTC/USD 100%+")
+    assert enc == "BTC%2FUSD%20100%25%2B"
+    match url_decode(enc, false) {
+        Ok(dec) => { assert dec == "BTC/USD 100%+" }
+        Err(_) => { assert false }
+    }
+    let qs = query_encode([
+        QueryPair { key = "pair", value = "BTC/USDT" },
+        QueryPair { key = "q", value = "a & b" }
+    ])
+    match query_parse(qs) {
+        Ok(ps) => {
+            assert len(ps) == 2
+            assert ps[0].key == "pair" && ps[0].value == "BTC/USDT"
+            assert ps[1].key == "q" && ps[1].value == "a & b"
+        }
+        Err(_) => { assert false }
+    }
+}

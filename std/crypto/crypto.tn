@@ -1,0 +1,450 @@
+// std/crypto/crypto.tn — Pure Tenon Cryptography & Encoding Library
+// Provides: SHA-256 (FIPS 180-4), HMAC-SHA-256 (RFC 2104), PBKDF2-HMAC-SHA-256 (RFC 2898),
+// SHA-1 (RFC 3174), Base64 / Base64URL (RFC 4648), constant-time comparison, and JWT HS256 (RFC 7519).
+// Zero external dependencies; Perceus RC leak-free (`live_objects == 0`).
+
+import "std/text/text.tn"
+import "std/text/builder.tn"
+
+pure fn cr_u32(x Int) Int {
+    x & 4294967295
+}
+
+pure fn cr_rotr32(x Int, n Int) Int {
+    let v = cr_u32(x)
+    cr_u32((v >> n) | (v << (32 - n)))
+}
+
+pure fn cr_rotl32(x Int, n Int) Int {
+    let v = cr_u32(x)
+    cr_u32((v << n) | (v >> (32 - n)))
+}
+
+pure fn cr_hex_digit(n Int) Int {
+    if n < 10 { 48 + n } else { 87 + n }
+}
+
+pub pure fn crypto_bytes_to_hex(data Bytes) Text {
+    let n = bytes_len(data)
+    var tb = TextBuilder.new()
+    var i = 0
+    while i < n {
+        let b = bytes_get(data, i) as Int
+        tb.push_byte(cr_hex_digit((b >> 4) & 15))
+        tb.push_byte(cr_hex_digit(b & 15))
+        i += 1
+    }
+    tb.finish()
+}
+
+/// Constant-time equality over two `Bytes` buffers (mitigates timing side-channels).
+pub pure fn ct_eq_bytes(a Bytes, b Bytes) Bool {
+    let la = bytes_len(a)
+    let lb = bytes_len(b)
+    var diff = la ^ lb
+    let n = if la < lb { la } else { lb }
+    var i = 0
+    while i < n {
+        let ba = bytes_get(a, i) as Int
+        let bb = bytes_get(b, i) as Int
+        diff = diff | (ba ^ bb)
+        i += 1
+    }
+    diff == 0
+}
+
+/// Constant-time equality over two `Text` strings.
+pub pure fn ct_eq(a Text, b Text) Bool {
+    ct_eq_bytes(text_to_bytes(a), text_to_bytes(b))
+}
+
+/// Pure Tenon FIPS 180-4 SHA-256 returning 32-byte `Bytes` digest.
+pub pure fn crypto_sha256_bytes(msg Bytes) Bytes {
+    let k List[Int] = [
+        1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221,
+        3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580,
+        3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+        2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895,
+        666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037,
+        2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+        430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779,
+        1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298
+    ]
+    let orig_len = bytes_len(msg)
+    let bit_len = orig_len * 8
+    var padded = bytes_new(orig_len + 72)
+    var i = 0
+    while i < orig_len {
+        padded = bytes_push(padded, bytes_get(msg, i) as Int)
+        i += 1
+    }
+    padded = bytes_push(padded, 128)
+    while (bytes_len(padded) % 64) != 56 {
+        padded = bytes_push(padded, 0)
+    }
+    var sh = 56
+    while sh >= 0 {
+        padded = bytes_push(padded, (bit_len >> sh) & 255)
+        sh -= 8
+    }
+
+    var h0 = 1779033703
+    var h1 = 3144134277
+    var h2 = 1013904242
+    var h3 = 2773480762
+    var h4 = 1359893119
+    var h5 = 2600822924
+    var h6 = 528734635
+    var h7 = 1541459225
+
+    var w List[Int] = list_filled(64, 0)
+    let total = bytes_len(padded)
+    var off = 0
+    while off < total {
+        var t = 0
+        while t < 16 {
+            let b0 = bytes_get(padded, off + t * 4) as Int
+            let b1 = bytes_get(padded, off + t * 4 + 1) as Int
+            let b2 = bytes_get(padded, off + t * 4 + 2) as Int
+            let b3 = bytes_get(padded, off + t * 4 + 3) as Int
+            w[t] = cr_u32((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+            t += 1
+        }
+        while t < 64 {
+            let wm15 = w[t - 15]
+            let s0 = cr_rotr32(wm15, 7) ^ cr_rotr32(wm15, 18) ^ (wm15 >> 3)
+            let wm2 = w[t - 2]
+            let s1 = cr_rotr32(wm2, 17) ^ cr_rotr32(wm2, 19) ^ (wm2 >> 10)
+            w[t] = cr_u32(w[t - 16] + s0 + w[t - 7] + s1)
+            t += 1
+        }
+        var a = h0
+        var b = h1
+        var c = h2
+        var d = h3
+        var e = h4
+        var f = h5
+        var g = h6
+        var hh = h7
+        var r = 0
+        while r < 64 {
+            let s1 = cr_rotr32(e, 6) ^ cr_rotr32(e, 11) ^ cr_rotr32(e, 25)
+            let ch = (e & f) ^ (cr_u32(~e) & g)
+            let t1 = cr_u32(hh + s1 + ch + k[r] + w[r])
+            let s0 = cr_rotr32(a, 2) ^ cr_rotr32(a, 13) ^ cr_rotr32(a, 22)
+            let maj = (a & b) ^ (a & c) ^ (b & c)
+            let t2 = cr_u32(s0 + maj)
+            hh = g
+            g = f
+            f = e
+            e = cr_u32(d + t1)
+            d = c
+            c = b
+            b = a
+            a = cr_u32(t1 + t2)
+            r += 1
+        }
+        h0 = cr_u32(h0 + a)
+        h1 = cr_u32(h1 + b)
+        h2 = cr_u32(h2 + c)
+        h3 = cr_u32(h3 + d)
+        h4 = cr_u32(h4 + e)
+        h5 = cr_u32(h5 + f)
+        h6 = cr_u32(h6 + g)
+        h7 = cr_u32(h7 + hh)
+        off += 64
+    }
+    var out = bytes_new(32)
+    let hs = [h0, h1, h2, h3, h4, h5, h6, h7]
+    var hi = 0
+    while hi < 8 {
+        let word = hs[hi]
+        out = bytes_push(out, (word >> 24) & 255)
+        out = bytes_push(out, (word >> 16) & 255)
+        out = bytes_push(out, (word >> 8) & 255)
+        out = bytes_push(out, word & 255)
+        hi += 1
+    }
+    out
+}
+
+pub pure fn crypto_sha256_hex(msg Text) Text {
+    crypto_bytes_to_hex(crypto_sha256_bytes(text_to_bytes(msg)))
+}
+
+/// Pure Tenon RFC 3174 SHA-1 returning 20-byte `Bytes` digest.
+pub pure fn crypto_sha1_bytes(msg Bytes) Bytes {
+    let orig_len = bytes_len(msg)
+    let bit_len = orig_len * 8
+    var padded = bytes_new(orig_len + 72)
+    var i = 0
+    while i < orig_len {
+        padded = bytes_push(padded, bytes_get(msg, i) as Int)
+        i += 1
+    }
+    padded = bytes_push(padded, 128)
+    while (bytes_len(padded) % 64) != 56 {
+        padded = bytes_push(padded, 0)
+    }
+    var sh = 56
+    while sh >= 0 {
+        padded = bytes_push(padded, (bit_len >> sh) & 255)
+        sh -= 8
+    }
+    var h0 = 1732584193
+    var h1 = 4023233417
+    var h2 = 2562383102
+    var h3 = 271733878
+    var h4 = 3285377520
+    var w List[Int] = list_filled(80, 0)
+    let total = bytes_len(padded)
+    var off = 0
+    while off < total {
+        var t = 0
+        while t < 16 {
+            let b0 = bytes_get(padded, off + t * 4) as Int
+            let b1 = bytes_get(padded, off + t * 4 + 1) as Int
+            let b2 = bytes_get(padded, off + t * 4 + 2) as Int
+            let b3 = bytes_get(padded, off + t * 4 + 3) as Int
+            w[t] = cr_u32((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+            t += 1
+        }
+        while t < 80 {
+            w[t] = cr_rotl32(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1)
+            t += 1
+        }
+        var a = h0
+        var b = h1
+        var c = h2
+        var d = h3
+        var e = h4
+        var r = 0
+        while r < 80 {
+            var f = 0
+            var k = 0
+            if r < 20 {
+                f = (b & c) | (cr_u32(~b) & d)
+                k = 1518500249
+            } else if r < 40 {
+                f = b ^ c ^ d
+                k = 1859775393
+            } else if r < 60 {
+                f = (b & c) | (b & d) | (c & d)
+                k = 2400959708
+            } else {
+                f = b ^ c ^ d
+                k = 3395469782
+            }
+            let tmp = cr_u32(cr_rotl32(a, 5) + f + e + k + w[r])
+            e = d
+            d = c
+            c = cr_rotl32(b, 30)
+            b = a
+            a = tmp
+            r += 1
+        }
+        h0 = cr_u32(h0 + a)
+        h1 = cr_u32(h1 + b)
+        h2 = cr_u32(h2 + c)
+        h3 = cr_u32(h3 + d)
+        h4 = cr_u32(h4 + e)
+        off += 64
+    }
+    var out = bytes_new(20)
+    let words = [h0, h1, h2, h3, h4]
+    var wi = 0
+    while wi < 5 {
+        let word = words[wi]
+        out = bytes_push(out, (word >> 24) & 255)
+        out = bytes_push(out, (word >> 16) & 255)
+        out = bytes_push(out, (word >> 8) & 255)
+        out = bytes_push(out, word & 255)
+        wi += 1
+    }
+    out
+}
+
+pub pure fn crypto_sha1_hex(msg Text) Text {
+    crypto_bytes_to_hex(crypto_sha1_bytes(text_to_bytes(msg)))
+}
+
+/// RFC 2104 HMAC-SHA-256 returning 32-byte `Bytes` MAC.
+pub pure fn crypto_hmac_sha256(key Bytes, msg Bytes) Bytes {
+    let kbuf = if bytes_len(key) > 64 { crypto_sha256_bytes(key) } else { key }
+    let klen = bytes_len(kbuf)
+    var ipad = bytes_new(64 + bytes_len(msg))
+    var opad = bytes_new(96)
+    var i = 0
+    while i < 64 {
+        let kb = if i < klen { bytes_get(kbuf, i) as Int } else { 0 }
+        ipad = bytes_push(ipad, kb ^ 54)
+        opad = bytes_push(opad, kb ^ 92)
+        i += 1
+    }
+    var m = 0
+    while m < bytes_len(msg) {
+        ipad = bytes_push(ipad, bytes_get(msg, m) as Int)
+        m += 1
+    }
+    let inner = crypto_sha256_bytes(ipad)
+    var j = 0
+    while j < 32 {
+        opad = bytes_push(opad, bytes_get(inner, j) as Int)
+        j += 1
+    }
+    crypto_sha256_bytes(opad)
+}
+
+pub pure fn crypto_hmac_sha256_hex(key Text, msg Text) Text {
+    crypto_bytes_to_hex(crypto_hmac_sha256(text_to_bytes(key), text_to_bytes(msg)))
+}
+
+/// RFC 2898 PBKDF2-HMAC-SHA-256 (32-byte derived key).
+pub pure fn crypto_pbkdf2_hmac_sha256(password Text, salt Bytes, iterations Int where self >= 1) Bytes {
+    let pwd_b = text_to_bytes(password)
+    var salt1 = bytes_new(bytes_len(salt) + 4)
+    var si = 0
+    while si < bytes_len(salt) {
+        salt1 = bytes_push(salt1, bytes_get(salt, si) as Int)
+        si += 1
+    }
+    salt1 = bytes_push(salt1, 0)
+    salt1 = bytes_push(salt1, 0)
+    salt1 = bytes_push(salt1, 0)
+    salt1 = bytes_push(salt1, 1)
+    var u = crypto_hmac_sha256(pwd_b, salt1)
+    var acc List[Int] = list_filled(32, 0)
+    var k = 0
+    while k < 32 {
+        acc[k] = bytes_get(u, k) as Int
+        k += 1
+    }
+    var it = 1
+    while it < iterations {
+        u = crypto_hmac_sha256(pwd_b, u)
+        var j = 0
+        while j < 32 {
+            acc[j] = acc[j] ^ (bytes_get(u, j) as Int)
+            j += 1
+        }
+        it += 1
+    }
+    var out = bytes_new(32)
+    var m = 0
+    while m < 32 {
+        out = bytes_push(out, acc[m])
+        m += 1
+    }
+    out
+}
+
+pure fn b64_encode_alpha(data Bytes, alphabet Text, pad Bool) Text {
+    let n = bytes_len(data)
+    var tb = TextBuilder.new()
+    var i = 0
+    while i < n {
+        let b0 = bytes_get(data, i) as Int
+        let has1 = i + 1 < n
+        let has2 = i + 2 < n
+        let b1 = if has1 { bytes_get(data, i + 1) as Int } else { 0 }
+        let b2 = if has2 { bytes_get(data, i + 2) as Int } else { 0 }
+        let triple = (b0 << 16) | (b1 << 8) | b2
+        tb.push_byte(byte_at(alphabet, (triple >> 18) & 63) & 255)
+        tb.push_byte(byte_at(alphabet, (triple >> 12) & 63) & 255)
+        if has1 {
+            tb.push_byte(byte_at(alphabet, (triple >> 6) & 63) & 255)
+        } else if pad {
+            tb.push_byte(61)
+        }
+        if has2 {
+            tb.push_byte(byte_at(alphabet, triple & 63) & 255)
+        } else if pad {
+            tb.push_byte(61)
+        }
+        i += 3
+    }
+    tb.finish()
+}
+
+pure fn b64_val_any(c Int) Int {
+    if c >= 65 && c <= 90 { return c - 65 }
+    if c >= 97 && c <= 122 { return c - 71 }
+    if c >= 48 && c <= 57 { return c + 4 }
+    if c == 43 || c == 45 { return 62 } // '+' or '-'
+    if c == 47 || c == 95 { return 63 } // '/' or '_'
+    -1
+}
+
+/// RFC 4648 Standard Base64 encode (with `=` padding).
+pub pure fn crypto_base64_encode(data Bytes) Text {
+    b64_encode_alpha(data, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", true)
+}
+
+/// RFC 4648 URL-safe Base64URL encode (unpadded, for JWT / OAuth2).
+pub pure fn base64url_encode(data Bytes) Text {
+    b64_encode_alpha(data, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", false)
+}
+
+/// Decodes Standard Base64 or URL-safe Base64URL (padded or unpadded).
+pub pure fn base64_decode_any(s Text) Bytes {
+    let n = len(s)
+    var out = bytes_new((n * 3) / 4 + 2)
+    var acc = 0
+    var bits = 0
+    var i = 0
+    while i < n {
+        let c = byte_at(s, i)
+        if c == 61 { break }
+        let v = b64_val_any(c)
+        if v >= 0 {
+            acc = (acc << 6) | v
+            bits += 6
+            if bits >= 8 {
+                bits -= 8
+                out = bytes_push(out, (acc >> bits) & 255)
+            }
+        }
+        i += 1
+    }
+    out
+}
+
+/// RFC 7519 JWT HS256 Signer: creates `base64url(header).base64url(payload).base64url(hmac_sha256)`.
+pub pure fn jwt_sign_hs256(payload_json Text, secret Text) Text {
+    let hdr_b64 = base64url_encode(text_to_bytes("{\"alg\":\"HS256\",\"typ\":\"JWT\"}"))
+    let pay_b64 = base64url_encode(text_to_bytes(payload_json))
+    let signing_input = hdr_b64 ++ "." ++ pay_b64
+    let sig = crypto_hmac_sha256(text_to_bytes(secret), text_to_bytes(signing_input))
+    signing_input ++ "." ++ base64url_encode(sig)
+}
+
+/// RFC 7519 JWT HS256 Verifier: constant-time HMAC verification returning decoded payload JSON.
+pub pure fn jwt_verify_hs256(token Text, secret Text) Result[Text, Text] {
+    let n = len(token)
+    var dot1 = -1
+    var dot2 = -1
+    var i = 0
+    while i < n {
+        if byte_at(token, i) == 46 {
+            if dot1 < 0 {
+                dot1 = i
+            } else if dot2 < 0 {
+                dot2 = i
+            } else {
+                return Err("malformed JWT: too many segments")
+            }
+        }
+        i += 1
+    }
+    if dot1 <= 0 || dot2 <= dot1 + 1 || dot2 + 1 >= n {
+        return Err("malformed JWT: expected header.payload.signature")
+    }
+    let signing_input = str_slice(token, 0, dot2)
+    let got_sig = str_slice(token, dot2 + 1, n)
+    let exp_sig = base64url_encode(crypto_hmac_sha256(text_to_bytes(secret), text_to_bytes(signing_input)))
+    if !ct_eq(got_sig, exp_sig) {
+        return Err("invalid JWT HS256 signature")
+    }
+    let pay_b64 = str_slice(token, dot1 + 1, dot2)
+    Ok(bytes_to_text(base64_decode_any(pay_b64)))
+}

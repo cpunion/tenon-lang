@@ -1,0 +1,164 @@
+// std/time/time.tn — Pure Tenon Civil Calendar, Unix Epoch & RFC 3339 Timestamps
+// Uses Howard Hinnant's exact O(1) Gregorian civil-date algorithms (handles 1900/2000/2024/2038+ leap years).
+
+import "std/text/text.tn"
+import "std/text/builder.tn"
+
+pub record DateTime {
+    year   Int
+    month  Int
+    day    Int
+    hour   Int
+    minute Int
+    second Int
+}
+
+pure fn floor_div(a Int, b Int where self > 0) Int {
+    if a >= 0 { a / b } else { -((-a + b - 1) / b) }
+}
+
+/// Howard Hinnant O(1) days since 1970-01-01 (proleptic Gregorian calendar).
+pub pure fn days_from_civil(year Int, month Int, day Int) Int {
+    let y = if month <= 2 { year - 1 } else { year }
+    let era = floor_div(y, 400)
+    let yoe = y - era * 400
+    let mp = if month > 2 { month - 3 } else { month + 9 }
+    let doy = (153 * mp + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+/// Howard Hinnant O(1) civil `(year, month, day)` from days since 1970-01-01.
+pub pure fn civil_from_days(z_in Int) (Int, Int, Int) {
+    let z = z_in + 719468
+    let era = floor_div(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y0 = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    let y = if m <= 2 { y0 + 1 } else { y0 }
+    (y, m, d)
+}
+
+pub pure fn is_leap_year_gregorian(y Int) Bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+pub pure fn days_in_month_gregorian(y Int, m Int) Int {
+    if m == 2 {
+        if is_leap_year_gregorian(y) { 29 } else { 28 }
+    } else if m == 4 || m == 6 || m == 9 || m == 11 {
+        30
+    } else {
+        31
+    }
+}
+
+pub pure fn datetime_to_unix_secs(dt DateTime) Int {
+    let days = days_from_civil(dt.year, dt.month, dt.day)
+    days * 86400 + dt.hour * 3600 + dt.minute * 60 + dt.second
+}
+
+pub pure fn unix_secs_to_datetime(ts Int) DateTime {
+    let days = floor_div(ts, 86400)
+    let rem = ts - days * 86400
+    let (y, m, d) = civil_from_days(days)
+    let h = rem / 3600
+    let min = (rem % 3600) / 60
+    let sec = rem % 60
+    DateTime { year = y, month = m, day = d, hour = h, minute = min, second = sec }
+}
+
+pure fn push_pad2(inout tb TextBuilder, v Int) {
+    let d1 = (v / 10) % 10
+    let d0 = v % 10
+    tb.push_byte(48 + d1)
+    tb.push_byte(48 + d0)
+}
+
+pure fn push_pad4(inout tb TextBuilder, v Int) {
+    tb.push_byte(48 + ((v / 1000) % 10))
+    tb.push_byte(48 + ((v / 100) % 10))
+    tb.push_byte(48 + ((v / 10) % 10))
+    tb.push_byte(48 + (v % 10))
+}
+
+/// Formats `DateTime` as canonical UTC RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
+pub pure fn format_rfc3339(dt DateTime) Text {
+    var tb = TextBuilder.new()
+    push_pad4(tb, dt.year)
+    tb.push_byte(45) // '-'
+    push_pad2(tb, dt.month)
+    tb.push_byte(45)
+    push_pad2(tb, dt.day)
+    tb.push_byte(84) // 'T'
+    push_pad2(tb, dt.hour)
+    tb.push_byte(58) // ':'
+    push_pad2(tb, dt.minute)
+    tb.push_byte(58)
+    push_pad2(tb, dt.second)
+    tb.push_byte(90) // 'Z'
+    tb.finish()
+}
+
+pure fn parse_fixed_digits(s Text, start Int, count Int) Result[Int, Text] {
+    if start < 0 || start + count > len(s) {
+        return Err("unexpected end of RFC 3339 timestamp")
+    }
+    var acc = 0
+    var i = 0
+    while i < count {
+        let b = byte_at(s, start + i)
+        if b < 48 || b > 57 {
+            return Err("expected ASCII digit in RFC 3339 timestamp")
+        }
+        acc = acc * 10 + (b - 48)
+        i += 1
+    }
+    Ok(acc)
+}
+
+/// Parses UTC RFC 3339 timestamp `YYYY-MM-DDTHH:MM:SSZ` with full Gregorian calendar validation.
+pub pure fn parse_rfc3339(s Text) Result[DateTime, Text] {
+    if len(s) != 20 {
+        return Err("expected 20-char UTC RFC 3339 timestamp `YYYY-MM-DDTHH:MM:SSZ`")
+    }
+    if byte_at(s, 4) != 45 || byte_at(s, 7) != 45 ||
+        (byte_at(s, 10) != 84 && byte_at(s, 10) != 116) ||
+        byte_at(s, 13) != 58 || byte_at(s, 16) != 58 ||
+        (byte_at(s, 19) != 90 && byte_at(s, 19) != 122)
+    {
+        return Err("invalid RFC 3339 separators")
+    }
+    let y = parse_fixed_digits(s, 0, 4)?
+    let mo = parse_fixed_digits(s, 5, 2)?
+    let d = parse_fixed_digits(s, 8, 2)?
+    let h = parse_fixed_digits(s, 11, 2)?
+    let mi = parse_fixed_digits(s, 14, 2)?
+    let se = parse_fixed_digits(s, 17, 2)?
+    if mo < 1 || mo > 12 {
+        return Err("month out of range 1..12")
+    }
+    if d < 1 || d > days_in_month_gregorian(y, mo) {
+        return Err("day out of range for month/year")
+    }
+    if h > 23 || mi > 59 || se > 59 {
+        return Err("time component out of range")
+    }
+    Ok(DateTime { year = y, month = mo, day = d, hour = h, minute = mi, second = se })
+}
+
+pub pure fn duration_from_secs_ms(secs Int, ms Int) Int {
+    secs * 1000 + ms
+}
+
+pub fn monotonic_ms() Int {
+    time_now_ms()
+}
+
+pub fn monotonic_ns() Int {
+    time_now_ns()
+}
