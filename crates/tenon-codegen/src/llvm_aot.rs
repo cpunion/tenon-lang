@@ -1403,6 +1403,9 @@ pub fn emit_llvm_ir_with_build_options(
         ir.push_str("@tenon_preempt_flag = external global i32\n");
         ir.push_str("declare void @tenon_sched_preempt_point() cold\n");
     }
+    if fn_defs.contains("@tenon_sched_spawn_owned") {
+        ir.push_str("declare i64 @tenon_sched_spawn_owned(i64)\n");
+    }
     for spec in CORE_SYSCALLS {
         let params = vec!["i64"; spec.arity].join(", ");
         ir.push_str(&format!("declare i64 @{}({})\n", spec.c_symbol, params));
@@ -7413,6 +7416,15 @@ impl<'a> LlvmFnGen<'a> {
                             avals.join(", ")
                         ));
                         self.flush_temps(&temps);
+                        return Ok(res);
+                    }
+                    if fname == "task_spawn" && args.len() == 1 {
+                        let cl = self.lower_expr_owned(&args[0].value, None)?;
+                        let res = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = call i64 @tenon_sched_spawn_owned(i64 {})\n",
+                            res, cl
+                        ));
                         return Ok(res);
                     }
                     if fname == "null_ptr" && args.is_empty() {

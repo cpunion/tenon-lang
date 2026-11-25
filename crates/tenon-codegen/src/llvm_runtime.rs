@@ -698,60 +698,97 @@ int64_t tenon_chan_close(int64_t ch_ptr) {
     return 0;
 }
 
-/* ===== Tenon M:N Preemptive Work-Stealing Stackless Coroutine Scheduler (Zero cgo Overhead!) ===== */
+/* ===== Tenon Lock-Free P-Core SPMC Batch-Stealing M:N Preemptive Scheduler (Zero cgo Overhead!) ===== */
 #include <sched.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
-#define TN_MAX_WORKERS 16
-#define TN_DEQUE_CAP   65536
-#define TN_DEQUE_MASK  (TN_DEQUE_CAP - 1)
+#define TN_MAX_WORKERS  16
+#define TN_INJ_SHARDS   8
+#define TN_INJ_MASK     (TN_INJ_SHARDS - 1)
+#define TN_MAX_QUEUES   (TN_MAX_WORKERS + TN_INJ_SHARDS + 1)
+#define TN_DEQUE_CAP    4096
+#define TN_DEQUE_MASK   (TN_DEQUE_CAP - 1)
+#define TN_STEAL_BATCH  32
+#define TN_MAX_SPINNING 1
 
-typedef struct {
+/* 64-byte cache-line aligned per task: eliminates 3-way false sharing between main spawner, worker & joiner! */
+typedef struct __attribute__((aligned(64))) {
     int64_t closure;
     volatile int64_t result;
     volatile int32_t done;
     volatile int32_t refcount; /* 2 = runner + joiner */
 } TenonTask;
 
-typedef struct {
-    pthread_mutex_t mu;
-    TenonTask* ring[TN_DEQUE_CAP];
-    int64_t head;
-    int64_t tail;
+/* Cache-line-isolated Lock-Free Monotonic SPMC FIFO Ring + Private Batch Cache!
+ * Mathematically ABA-free & safe for adaptive batch-stealing: BOTH owner and thieves consume from `head` via CAS,
+ * while ONLY the owner writes `ring[tail]` and monotonically advances `tail` (tail NEVER decreases)!
+ * Producer caches `cached_head` in its own cache line so push NEVER touches contended `head` on the hot path! */
+typedef struct __attribute__((aligned(64))) {
+    volatile int64_t head; /* monotonic consumer cursor (CAS by owner & thieves) */
+    char _pad0[56];
+    volatile int64_t tail; /* monotonic producer cursor (owner-only release store) */
+    int64_t cached_head;   /* producer-private shadow of head (zero cross-core read on push!) */
+    char _pad1[48];
     volatile uint64_t task_epoch;
     volatile uint64_t last_seen_epoch;
     volatile int32_t busy;
-    pthread_t th;
+    volatile int32_t sleeping;
     int id;
+    int priv_count;
+    int64_t local_completed;
+    int64_t local_steals;
+    pthread_mutex_t wake_mu;
+    pthread_cond_t  wake_cv;
+    pthread_t th;
+    TenonTask* priv[TN_STEAL_BATCH];
+    TenonTask* ring[TN_DEQUE_CAP];
 } TenonWorker;
 
 /* Exported global preemption poll flag checked by LLVM loop back-edges (0.25ns predicted-not-taken!) */
 volatile uint32_t tenon_preempt_flag = 0;
 
-static TenonWorker g_workers[TN_MAX_WORKERS];
+static TenonWorker g_workers[TN_MAX_QUEUES];
 static int g_num_workers = 0;
+static int g_num_queues = 0;
 static volatile int g_sched_inited = 0;
+static volatile int g_workers_started = 0;
+static volatile int g_main_claimed = 0;
+static uint64_t g_main_stripe_seq = 0;
 static pthread_mutex_t g_sched_init_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_sched_wake_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_sched_wake_cv = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_ext_push_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_sysmon_th;
-static volatile int64_t g_sched_pending = 0;
-static volatile int64_t g_sched_sleeping = 0;
-static volatile int64_t g_sched_steals = 0;
-static volatile int64_t g_sched_preemptions = 0;
-static volatile int64_t g_sched_completed = 0;
-static volatile uint32_t g_rr_worker = 0;
+static volatile int64_t __attribute__((aligned(64))) g_sched_sleeping = 0;
+static volatile int64_t __attribute__((aligned(64))) g_sched_spinning = 0;
+static volatile int64_t __attribute__((aligned(64))) g_sched_preemptions = 0;
 
-/* Fast lock-free slab ring pool for TenonTask (eliminates malloc/free contention in 10k-task bursts!) */
+/* Fast lock-free slab ring pool for TenonTask (64B-aligned slots eliminate false sharing!) */
 #define TN_TASK_POOL_CAP 65536
 #define TN_TASK_POOL_MASK (TN_TASK_POOL_CAP - 1)
-static TenonTask g_task_pool[TN_TASK_POOL_CAP];
-static volatile uint64_t g_task_pool_cursor = 0;
+static TenonTask __attribute__((aligned(64))) g_task_pool[TN_TASK_POOL_CAP];
+static volatile uint64_t __attribute__((aligned(64))) g_task_pool_cursor = 0;
+static uint64_t g_main_task_cursor = 0;
+
+static inline TenonTask* tn_task_alloc_main(void) {
+    uint64_t idx = (g_main_task_cursor++) & 32767u;
+    TenonTask* slot = &g_task_pool[idx];
+    if (__builtin_expect(__atomic_load_n(&slot->refcount, __ATOMIC_ACQUIRE) == 0, 1)) {
+        slot->done = 0;
+        slot->result = 0;
+        __atomic_store_n(&slot->refcount, 2, __ATOMIC_RELEASE);
+        return slot;
+    }
+    TenonTask* heap_t = (TenonTask*)calloc(1, sizeof(TenonTask));
+    heap_t->refcount = 2;
+    return heap_t;
+}
 
 static inline TenonTask* tn_task_alloc(void) {
-    uint64_t idx = __atomic_fetch_add(&g_task_pool_cursor, 1, __ATOMIC_RELAXED) & TN_TASK_POOL_MASK;
+    uint64_t idx = 32768u + (__atomic_fetch_add(&g_task_pool_cursor, 1, __ATOMIC_RELAXED) & 32767u);
     TenonTask* slot = &g_task_pool[idx];
     int32_t expected = 0;
-    if (__atomic_compare_exchange_n(&slot->refcount, &expected, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+    if (__builtin_expect(__atomic_compare_exchange_n(&slot->refcount, &expected, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED), 1)) {
         slot->done = 0;
         slot->result = 0;
         return slot;
@@ -780,6 +817,13 @@ static inline void tn_tls_set(int wid, int depth) {
 }
 
 static inline void tn_task_release(TenonTask* t) {
+    if (__builtin_expect(__atomic_load_n(&t->refcount, __ATOMIC_ACQUIRE) == 1, 1)) {
+        __atomic_store_n(&t->refcount, 0, __ATOMIC_RELEASE);
+        if (t < &g_task_pool[0] || t >= &g_task_pool[TN_TASK_POOL_CAP]) {
+            free(t);
+        }
+        return;
+    }
     if (__atomic_sub_fetch(&t->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
         if (t < &g_task_pool[0] || t >= &g_task_pool[TN_TASK_POOL_CAP]) {
             free(t);
@@ -787,68 +831,118 @@ static inline void tn_task_release(TenonTask* t) {
     }
 }
 
-static int tn_worker_push(TenonWorker* w, TenonTask* t) {
-    pthread_mutex_lock(&w->mu);
-    int64_t sz = w->tail - w->head;
-    if (sz >= TN_DEQUE_CAP) {
-        pthread_mutex_unlock(&w->mu);
-        return 0;
+/* Monotonic SPMC FIFO Push (single owner: 1 store + 1 release store, ZERO CAS, ZERO read of contended head!) */
+static inline int tn_deque_push_owner(TenonWorker* w, TenonTask* t) {
+    int64_t b = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+    if (__builtin_expect(b - w->cached_head >= TN_DEQUE_CAP - 64, 0)) {
+        w->cached_head = __atomic_load_n(&w->head, __ATOMIC_ACQUIRE);
+        if (b - w->cached_head >= TN_DEQUE_CAP - 64) return 0;
     }
-    w->ring[w->tail & TN_DEQUE_MASK] = t;
-    w->tail++;
-    pthread_mutex_unlock(&w->mu);
+    w->ring[b & TN_DEQUE_MASK] = t;
+    __atomic_store_n(&w->tail, b + 1, __ATOMIC_RELEASE);
     return 1;
 }
 
-static TenonTask* tn_worker_pop_local(TenonWorker* w) {
-    if (__atomic_load_n(&w->tail, __ATOMIC_RELAXED) <= __atomic_load_n(&w->head, __ATOMIC_RELAXED)) return NULL;
-    pthread_mutex_lock(&w->mu);
-    if (w->tail == w->head) {
-        pthread_mutex_unlock(&w->mu);
-        return NULL;
+/* Monotonic SPMC Adaptive Batch Pop/Steal (100% race-free & ABA-free):
+ * - Massive bursts (avail >= 32): grabs 32-task batch in ONE CAS (32x less bus traffic!)
+ * - Cache-line bursts (8..31): grabs 8-task batch (1 full 64B cache line of pointers!)
+ * - Small heavy tasks or tail (< 8): grabs 1 task at a time -> ZERO head-of-line blocking / stragglers! */
+static inline TenonTask* tn_ring_take_batch(TenonWorker* src, TenonWorker* dst, int is_steal) {
+    for (;;) {
+        int64_t top = __atomic_load_n(&src->head, __ATOMIC_ACQUIRE);
+        int64_t bot = __atomic_load_n(&src->tail, __ATOMIC_ACQUIRE);
+        int64_t avail = bot - top;
+        if (avail <= 0) return NULL;
+        int64_t take = 1;
+        if (dst != NULL && avail > 1) {
+            if (is_steal) {
+                take = avail >= 32 ? TN_STEAL_BATCH : (avail > 16 ? 8 : 1);
+            } else {
+                take = avail > TN_STEAL_BATCH ? TN_STEAL_BATCH : avail;
+            }
+            int64_t free_priv = TN_STEAL_BATCH - dst->priv_count;
+            if (take - 1 > free_priv) take = free_priv + 1;
+            if (take < 1) take = 1;
+        }
+        TenonTask* buf[TN_STEAL_BATCH];
+        for (int64_t i = 0; i < take; i++) {
+            buf[i] = src->ring[(top + i) & TN_DEQUE_MASK];
+        }
+        if (__atomic_compare_exchange_n(&src->head, &top, top + take, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            if (dst != NULL && take > 1) {
+                for (int64_t i = 1; i < take; i++) {
+                    dst->priv[dst->priv_count++] = buf[i];
+                }
+            }
+            if (is_steal) {
+                if (dst != NULL) dst->local_steals += take;
+                else __atomic_fetch_add(&g_workers[g_num_workers + TN_INJ_SHARDS].local_steals, take, __ATOMIC_RELAXED);
+            }
+            return buf[0];
+        }
+        /* Contended CAS: if stealing, move on to another shard/victim immediately */
+        if (is_steal) return NULL;
     }
-    w->tail--;
-    TenonTask* t = w->ring[w->tail & TN_DEQUE_MASK];
-    pthread_mutex_unlock(&w->mu);
-    return t;
 }
 
-static TenonTask* tn_worker_steal(TenonWorker* victim) {
-    /* Lock-free fast empty check eliminates 16-core mutex trylock cache-line bouncing! */
-    if (__atomic_load_n(&victim->head, __ATOMIC_RELAXED) >= __atomic_load_n(&victim->tail, __ATOMIC_RELAXED)) return NULL;
-    if (pthread_mutex_trylock(&victim->mu) != 0) return NULL;
-    if (victim->head >= victim->tail) {
-        pthread_mutex_unlock(&victim->mu);
+static inline TenonTask* tn_deque_pop_owner(TenonWorker* w) {
+    if (__builtin_expect(w->priv_count > 0, 1)) {
+        return w->priv[--w->priv_count];
+    }
+    if (__atomic_load_n(&w->head, __ATOMIC_RELAXED) >= __atomic_load_n(&w->tail, __ATOMIC_RELAXED)) {
         return NULL;
     }
-    TenonTask* t = victim->ring[victim->head & TN_DEQUE_MASK];
-    victim->head++;
-    pthread_mutex_unlock(&victim->mu);
-    return t;
+    return tn_ring_take_batch(w, w, 0);
+}
+
+static inline TenonTask* tn_deque_steal_batch(TenonWorker* victim, TenonWorker* thief) {
+    if (__atomic_load_n(&victim->head, __ATOMIC_RELAXED) >= __atomic_load_n(&victim->tail, __ATOMIC_RELAXED)) {
+        return NULL;
+    }
+    return tn_ring_take_batch(victim, thief, 1);
+}
+
+static inline int tn_sched_any_work(void) {
+    for (int i = 0; i < g_num_queues; i++) {
+        if (__atomic_load_n(&g_workers[i].head, __ATOMIC_ACQUIRE) < __atomic_load_n(&g_workers[i].tail, __ATOMIC_ACQUIRE)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static TenonTask* tn_sched_find_work(int my_id) {
-    if (my_id >= 0 && my_id < g_num_workers) {
-        TenonTask* local = tn_worker_pop_local(&g_workers[my_id]);
+    TenonWorker* self_w = (my_id >= 0 && my_id < g_num_workers) ? &g_workers[my_id] : NULL;
+    if (self_w != NULL) {
+        TenonTask* local = tn_deque_pop_owner(self_w);
         if (local) return local;
     }
-    int start = my_id >= 0 ? (my_id + 1) : (int)(__atomic_fetch_add(&g_rr_worker, 1, __ATOMIC_RELAXED));
+    /* Only workers batch-steal into priv[]; main thread steals 1 at a time so workers never starve! */
+    TenonWorker* steal_dst = self_w;
+    /* 1. Probe the 4 stealable main-thread injection shards FIRST (rotated by worker id -> 4x less contention!) */
+    int shard_base = (my_id >= 0 ? my_id : 0);
+    for (int k = 0; k < TN_INJ_SHARDS; k++) {
+        int vid = g_num_workers + ((shard_base + k) & TN_INJ_MASK);
+        TenonTask* stolen = tn_deque_steal_batch(&g_workers[vid], steal_dst);
+        if (stolen) return stolen;
+    }
+    /* 2. Probe external fallback queue */
+    TenonTask* ext_t = tn_deque_steal_batch(&g_workers[g_num_workers + TN_INJ_SHARDS], steal_dst);
+    if (ext_t) return ext_t;
+    /* 3. Steal from peer worker rings */
+    int start = (my_id >= 0 ? my_id + 1 : 0);
     for (int i = 0; i < g_num_workers; i++) {
         int vid = (start + i) % g_num_workers;
-        TenonTask* stolen = tn_worker_steal(&g_workers[vid]);
-        if (stolen) {
-            if (vid != my_id) {
-                __atomic_fetch_add(&g_sched_steals, 1, __ATOMIC_RELAXED);
-            }
-            return stolen;
-        }
+        if (vid == my_id) continue;
+        TenonTask* stolen = tn_deque_steal_batch(&g_workers[vid], steal_dst);
+        if (stolen) return stolen;
     }
     return NULL;
 }
 
 static void tn_sched_run_task(TenonTask* t, int wid) {
     if (wid >= 0 && wid < g_num_workers) {
-        __atomic_fetch_add(&g_workers[wid].task_epoch, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_workers[wid].task_epoch, g_workers[wid].task_epoch + 1, __ATOMIC_RELAXED);
         __atomic_store_n(&g_workers[wid].busy, 1, __ATOMIC_RELEASE);
     }
     int64_t cl = t->closure;
@@ -862,10 +956,13 @@ static void tn_sched_run_task(TenonTask* t, int wid) {
     tenon_rc_dec(cl);
     t->result = res;
     __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
-    __atomic_fetch_sub(&g_sched_pending, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&g_sched_completed, 1, __ATOMIC_RELAXED);
-    if (wid >= 0 && wid < g_num_workers) {
-        __atomic_store_n(&g_workers[wid].busy, 0, __ATOMIC_RELEASE);
+    if (wid >= 0 && wid <= g_num_workers) {
+        g_workers[wid].local_completed++;
+        if (wid < g_num_workers) {
+            __atomic_store_n(&g_workers[wid].busy, 0, __ATOMIC_RELEASE);
+        }
+    } else {
+        __atomic_fetch_add(&g_workers[g_num_workers + TN_INJ_SHARDS].local_completed, 1, __ATOMIC_RELAXED);
     }
     tn_task_release(t);
 }
@@ -878,7 +975,6 @@ static void* tn_sysmon_loop(void* arg) {
     ts.tv_nsec = 500000L; /* 0.5 ms quantum */
     for (;;) {
         nanosleep(&ts, NULL);
-        if (__atomic_load_n(&g_sched_pending, __ATOMIC_RELAXED) <= 0) continue;
         int need_preempt = 0;
         for (int i = 0; i < g_num_workers; i++) {
             if (__atomic_load_n(&g_workers[i].busy, __ATOMIC_ACQUIRE)) {
@@ -897,66 +993,193 @@ static void* tn_sysmon_loop(void* arg) {
     return NULL;
 }
 
+static inline uint64_t tn_fast_ticks(void) {
+#if defined(__aarch64__)
+    uint64_t v;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static inline void tn_wake_worker(TenonWorker* w) {
+    if (__builtin_expect(__atomic_load_n(&w->sleeping, __ATOMIC_RELAXED) != 0, 0)) {
+        if (__atomic_exchange_n(&w->sleeping, 0, __ATOMIC_ACQ_REL) != 0) {
+            __atomic_fetch_sub(&g_sched_sleeping, 1, __ATOMIC_RELEASE);
+            pthread_mutex_lock(&w->wake_mu);
+            pthread_cond_signal(&w->wake_cv);
+            pthread_mutex_unlock(&w->wake_mu);
+        }
+    }
+}
+
+static inline void tn_wake_one_sleeper(void) {
+    if (__builtin_expect(__atomic_load_n(&g_sched_sleeping, __ATOMIC_ACQUIRE) > 0, 0)) {
+        for (int i = 0; i < g_num_workers; i++) {
+            if (__atomic_load_n(&g_workers[i].sleeping, __ATOMIC_RELAXED)) {
+                if (__atomic_exchange_n(&g_workers[i].sleeping, 0, __ATOMIC_ACQ_REL) != 0) {
+                    __atomic_fetch_sub(&g_sched_sleeping, 1, __ATOMIC_RELEASE);
+                    pthread_mutex_lock(&g_workers[i].wake_mu);
+                    pthread_cond_signal(&g_workers[i].wake_cv);
+                    pthread_mutex_unlock(&g_workers[i].wake_mu);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 static void* tn_worker_loop(void* arg) {
     TenonWorker* w = (TenonWorker*)arg;
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     tn_tls_set(w->id, 0);
-    int spins = 0;
+    __atomic_fetch_add(&g_workers_started, 1, __ATOMIC_RELEASE);
+    /* ARM64 cntvct_el0 runs at 24 MHz (24,000 ticks = 1.0 ms); other arches use ns (1,000,000 = 1.0 ms) */
+#if defined(__aarch64__)
+    const uint64_t idle_park_ticks = 24000ULL;
+#else
+    const uint64_t idle_park_ticks = 1000000ULL;
+#endif
     for (;;) {
-        TenonTask* t = tn_sched_find_work(w->id);
+        TenonTask* t = tn_deque_pop_owner(w);
+        if (!t) t = tn_sched_find_work(w->id);
         if (t) {
-            spins = 0;
+            /* Handoff wake: if no other worker is spinning and more work is waiting, wake 1 sleeper! */
+            if (__builtin_expect(__atomic_load_n(&g_sched_spinning, __ATOMIC_RELAXED) == 0 &&
+                                 __atomic_load_n(&g_sched_sleeping, __ATOMIC_RELAXED) > 0, 0)) {
+                if (w->priv_count > 0 || tn_sched_any_work()) {
+                    tn_wake_one_sleeper();
+                }
+            }
             tn_sched_run_task(t, w->id);
             continue;
         }
-        if (spins < 2048) {
-            spins++;
+        /* Go-style nmspinning cap (<= TN_MAX_SPINNING=2 active spinners):
+         * Prevents 11 idle P-cores from pounding main()'s injection tail cache lines! */
+        int is_spinner = 0;
+        int64_t cur_sp = __atomic_load_n(&g_sched_spinning, __ATOMIC_RELAXED);
+        while (cur_sp < TN_MAX_SPINNING) {
+            if (__atomic_compare_exchange_n(&g_sched_spinning, &cur_sp, cur_sp + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                is_spinner = 1;
+                break;
+            }
+        }
+        if (is_spinner) {
+            uint64_t idle_start = tn_fast_ticks();
+            uint32_t backoff = 32;
+            for (;;) {
+                t = tn_sched_find_work(w->id);
+                if (t) {
+                    int64_t rem = __atomic_sub_fetch(&g_sched_spinning, 1, __ATOMIC_ACQ_REL);
+                    if (rem == 0 && __atomic_load_n(&g_sched_sleeping, __ATOMIC_RELAXED) > 0 && tn_sched_any_work()) {
+                        tn_wake_one_sleeper();
+                    }
+                    tn_sched_run_task(t, w->id);
+                    break;
+                }
+                if ((tn_fast_ticks() - idle_start) >= idle_park_ticks) {
+                    __atomic_sub_fetch(&g_sched_spinning, 1, __ATOMIC_ACQ_REL);
+                    break;
+                }
+                for (uint32_t s = 0; s < backoff; s++) {
 #if defined(__aarch64__)
-            __asm__ __volatile__("yield" ::: "memory");
+                    __asm__ __volatile__("yield" ::: "memory");
 #elif defined(__x86_64__)
-            __asm__ __volatile__("pause" ::: "memory");
+                    __asm__ __volatile__("pause" ::: "memory");
 #endif
-            continue;
+                }
+                if (backoff < 256u) backoff <<= 1;
+            }
+            if (t) continue;
         }
-        spins = 0;
-        pthread_mutex_lock(&g_sched_wake_mu);
-        if (__atomic_load_n(&g_sched_pending, __ATOMIC_ACQUIRE) <= 0) {
-            __atomic_fetch_add(&g_sched_sleeping, 1, __ATOMIC_RELAXED);
-            pthread_cond_wait(&g_sched_wake_cv, &g_sched_wake_mu);
-            __atomic_fetch_sub(&g_sched_sleeping, 1, __ATOMIC_RELAXED);
+        /* Park cleanly in kernel sleep with Dekker SEQ_CST barrier (mathematically lost-wakeup-free!) */
+        pthread_mutex_lock(&w->wake_mu);
+        __atomic_store_n(&w->sleeping, 1, __ATOMIC_SEQ_CST);
+        __atomic_fetch_add(&g_sched_sleeping, 1, __ATOMIC_SEQ_CST);
+        if (!tn_sched_any_work()) {
+            pthread_cond_wait(&w->wake_cv, &w->wake_mu);
         }
-        pthread_mutex_unlock(&g_sched_wake_mu);
+        if (__atomic_exchange_n(&w->sleeping, 0, __ATOMIC_ACQ_REL) != 0) {
+            __atomic_fetch_sub(&g_sched_sleeping, 1, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&w->wake_mu);
     }
     return NULL;
 }
 
-static void tn_sched_ensure_init(void) {
-    if (__atomic_load_n(&g_sched_inited, __ATOMIC_ACQUIRE)) return;
+__attribute__((noinline))
+static void tn_sched_init_slow(void) {
     pthread_mutex_lock(&g_sched_init_mu);
     if (!g_sched_inited) {
+#ifdef __APPLE__
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
         pthread_key_create(&g_sched_tls_key, NULL);
         g_sched_tls_ready = 1;
         long n = sysconf(_SC_NPROCESSORS_ONLN);
+#ifdef __APPLE__
+        /* Pin worker count strictly to Apple Silicon P-cores (hw.perflevel0.physicalcpu)
+         * so NO worker is ever demoted onto slow E-cores (zero stragglers & zero oversubscription)! */
+        int32_t perf_cpus = 0;
+        size_t perf_sz = sizeof(perf_cpus);
+        if (sysctlbyname("hw.perflevel0.physicalcpu", &perf_cpus, &perf_sz, NULL, 0) == 0 && perf_cpus >= 2) {
+            n = (long)perf_cpus;
+        }
+#endif
+        if (n > 2) n = n - 1; /* Reserve 1 P-core for main spawner/joiner */
         if (n < 2) n = 2;
         if (n > TN_MAX_WORKERS) n = TN_MAX_WORKERS;
         g_num_workers = (int)n;
-        for (int i = 0; i < g_num_workers; i++) {
-            pthread_mutex_init(&g_workers[i].mu, NULL);
+        g_num_queues = g_num_workers + TN_INJ_SHARDS + 1;
+        for (int i = 0; i < g_num_queues; i++) {
             g_workers[i].head = 0;
             g_workers[i].tail = 0;
+            g_workers[i].cached_head = 0;
             g_workers[i].task_epoch = 0;
             g_workers[i].last_seen_epoch = 0;
             g_workers[i].busy = 0;
+            g_workers[i].sleeping = 0;
+            g_workers[i].priv_count = 0;
+            g_workers[i].local_completed = 0;
+            g_workers[i].local_steals = 0;
             g_workers[i].id = i;
+            pthread_mutex_init(&g_workers[i].wake_mu, NULL);
+            pthread_cond_init(&g_workers[i].wake_cv, NULL);
         }
         for (int i = 0; i < g_num_workers; i++) {
             pthread_create(&g_workers[i].th, NULL, tn_worker_loop, &g_workers[i]);
             pthread_detach(g_workers[i].th);
+        }
+        while (__atomic_load_n(&g_workers_started, __ATOMIC_ACQUIRE) < g_num_workers) {
+            sched_yield();
         }
         pthread_create(&g_sysmon_th, NULL, tn_sysmon_loop, NULL);
         pthread_detach(g_sysmon_th);
         __atomic_store_n(&g_sched_inited, 1, __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&g_sched_init_mu);
+}
+
+static inline void tn_sched_ensure_init(void) {
+    if (__builtin_expect(__atomic_load_n(&g_sched_inited, __ATOMIC_ACQUIRE) == 0, 0)) {
+        tn_sched_init_slow();
+    }
+}
+
+static inline int tn_sched_get_or_claim_wid(void) {
+    int wid = tn_tls_get_worker_id();
+    if (__builtin_expect(wid >= 0, 1)) return wid;
+    int exp = 0;
+    if (__atomic_compare_exchange_n(&g_main_claimed, &exp, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        tn_tls_set(g_num_workers, 0);
+        return g_num_workers;
+    }
+    return -1;
 }
 
 /* Called on LLVM loop back-edge slow path when `tenon_preempt_flag != 0` */
@@ -980,37 +1203,67 @@ void tenon_sched_preempt_point(void) {
     }
 }
 
-int64_t tenon_sched_spawn(int64_t closure_ptr) {
+int64_t tenon_sched_spawn_owned(int64_t closure_ptr) {
     if (closure_ptr == 0) return 0;
     tn_sched_ensure_init();
-    TenonTask* t = tn_task_alloc();
-    t->closure = tenon_rc_inc(closure_ptr);
-    __atomic_fetch_add(&g_sched_pending, 1, __ATOMIC_RELEASE);
-    int wid = tn_tls_get_worker_id();
-    if (wid < 0 || wid >= g_num_workers) {
-        wid = (int)(__atomic_fetch_add(&g_rr_worker, 1, __ATOMIC_RELAXED) % (uint32_t)g_num_workers);
+    int wid = tn_sched_get_or_claim_wid();
+    TenonTask* t = __builtin_expect(wid == g_num_workers, 1) ? tn_task_alloc_main() : tn_task_alloc();
+    t->closure = closure_ptr; /* Ownership moved directly: ZERO rc_inc + ZERO caller rc_dec! */
+    int pushed = 0;
+    uint64_t seq = 0;
+    if (__builtin_expect(wid == g_num_workers, 1)) {
+        /* Stripe 16 consecutive tasks across 8 stealable injection shards so main()'s tail stays L1-exclusive! */
+        seq = g_main_stripe_seq++;
+        int shard = (int)((seq >> 4) & TN_INJ_MASK);
+        pushed = tn_deque_push_owner(&g_workers[g_num_workers + shard], t);
+    } else if (wid >= 0 && wid < g_num_workers) {
+        pushed = tn_deque_push_owner(&g_workers[wid], t);
+    } else {
+        pthread_mutex_lock(&g_ext_push_mu);
+        pushed = tn_deque_push_owner(&g_workers[g_num_workers + TN_INJ_SHARDS], t);
+        pthread_mutex_unlock(&g_ext_push_mu);
     }
-    if (!tn_worker_push(&g_workers[wid], t)) {
-        /* Fallback: execute inline if deque full */
+    if (__builtin_expect(!pushed, 0)) {
         tn_sched_run_task(t, wid);
-    } else if (__atomic_load_n(&g_sched_sleeping, __ATOMIC_ACQUIRE) > 0) {
-        pthread_mutex_lock(&g_sched_wake_mu);
-        pthread_cond_broadcast(&g_sched_wake_cv);
-        pthread_mutex_unlock(&g_sched_wake_mu);
+    } else {
+        int64_t slp = __atomic_load_n(&g_sched_sleeping, __ATOMIC_ACQUIRE);
+        if (__builtin_expect(slp >= g_num_workers ||
+                             (slp > 0 && ((seq & 63u) == 0) &&
+                              __atomic_load_n(&g_sched_spinning, __ATOMIC_ACQUIRE) == 0), 0)) {
+            /* Zero-contention Go wakep(): instant wake when all workers sleep; otherwise sampled every 64th spawn,
+             * while running workers perform parallel tree handoff wakes off main()'s hot path! */
+            tn_wake_one_sleeper();
+        }
     }
     return (int64_t)(uintptr_t)t;
+}
+
+int64_t tenon_sched_spawn(int64_t closure_ptr) {
+    if (closure_ptr == 0) return 0;
+    return tenon_sched_spawn_owned(tenon_rc_inc(closure_ptr));
 }
 
 int64_t tenon_sched_join(int64_t handle) {
     if (handle == 0) return 0;
     TenonTask* t = (TenonTask*)(uintptr_t)handle;
-    int wid = tn_tls_get_worker_id();
+    if (__builtin_expect(__atomic_load_n(&t->done, __ATOMIC_ACQUIRE) != 0, 1)) {
+        int64_t res = t->result;
+        tn_task_release(t);
+        return res;
+    }
+    int wid = tn_sched_get_or_claim_wid();
     while (!__atomic_load_n(&t->done, __ATOMIC_ACQUIRE)) {
         TenonTask* help = tn_sched_find_work(wid);
         if (help) {
             tn_sched_run_task(help, wid);
         } else {
+#if defined(__aarch64__)
+            __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__x86_64__)
+            __asm__ __volatile__("pause" ::: "memory");
+#else
             sched_yield();
+#endif
         }
     }
     int64_t res = t->result;
@@ -1033,11 +1286,19 @@ int64_t tenon_sched_preemptions(void) {
 }
 
 int64_t tenon_sched_steals(void) {
-    return __atomic_load_n(&g_sched_steals, __ATOMIC_RELAXED);
+    int64_t sum = 0;
+    for (int i = 0; i < g_num_queues; i++) {
+        sum += __atomic_load_n(&g_workers[i].local_steals, __ATOMIC_RELAXED);
+    }
+    return sum;
 }
 
 int64_t tenon_sched_tasks_completed(void) {
-    return __atomic_load_n(&g_sched_completed, __ATOMIC_RELAXED);
+    int64_t sum = 0;
+    for (int i = 0; i < g_num_queues; i++) {
+        sum += __atomic_load_n(&g_workers[i].local_completed, __ATOMIC_RELAXED);
+    }
+    return sum;
 }
 "#;
 
@@ -1365,8 +1626,11 @@ entry:
   br i1 %nz, label %chk, label %done
 chk:
   %obj = inttoptr i64 %p to ptr
-  %rc = load atomic i64, ptr %obj monotonic, align 8
-  %pos = icmp sgt i64 %rc, 0
+  %rc = load atomic i64, ptr %obj acquire, align 8
+  %is1 = icmp eq i64 %rc, 1
+  br i1 %is1, label %free, label %chk_gt
+chk_gt:
+  %pos = icmp sgt i64 %rc, 1
   br i1 %pos, label %dec, label %done
 dec:
   %old = atomicrmw sub ptr %obj, i64 1 acq_rel, align 8

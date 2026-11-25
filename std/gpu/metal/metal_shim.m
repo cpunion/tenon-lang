@@ -86,6 +86,21 @@ int64_t tn_metal_buf_create(int64_t data_ptr, int64_t byte_len) {
     }
 }
 
+/// Registers an externally-allocated `id<MTLBuffer>` (e.g., zero-copy `mmap` `newBufferWithBytesNoCopy`)
+/// into the shared Tenon `@linear GpuBuffer` handle table (takes +1 ARC reference via `__bridge`).
+int64_t tn_metal_wrap_buffer(void* mtl_buf_ptr) {
+    if (!ensure_metal_init() || mtl_buf_ptr == NULL) return 0;
+    @autoreleasepool {
+        int slot = -1;
+        for (int i = 1; i < MAX_HANDLES; i++) {
+            if (g_buffers[i] == nil) { slot = i; break; }
+        }
+        if (slot < 0) return 0;
+        g_buffers[slot] = (__bridge id<MTLBuffer>)mtl_buf_ptr;
+        return (int64_t)slot;
+    }
+}
+
 int64_t tn_metal_buf_read(int64_t handle, int64_t dst_ptr, int64_t byte_len) {
     if (handle <= 0 || handle >= MAX_HANDLES || g_buffers[handle] == nil || dst_ptr == 0 || byte_len <= 0) {
         return 0;

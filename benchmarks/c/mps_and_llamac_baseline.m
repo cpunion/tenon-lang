@@ -284,6 +284,40 @@ static const char* kStdMpsHelpersMSL =
 "  sum = simd_sum(sum);\n"
 "  if (lane == 0) y[row] = (half)sum;\n"
 "}\n"
+"// Apple MLX-style 4-row/simdgroup float4 Q4_0 matvec (unfused per-matrix dispatches)\n"
+"kernel void mlx_style_mv_q4_0(\n"
+"  device const half* x [[buffer(0)]], device const BlockQ4* w [[buffer(1)]], device half* y [[buffer(2)]],\n"
+"  constant uint2& p [[buffer(3)]], uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"  uint row0 = (tg_id * 2 + sg) * 4; if (row0 >= p.x) return;\n"
+"  uint nb = p.y >> 5;\n"
+"  device const BlockQ4* w0 = w + row0 * nb;\n"
+"  device const BlockQ4* w1 = w + min(row0+1, p.x-1) * nb;\n"
+"  device const BlockQ4* w2 = w + min(row0+2, p.x-1) * nb;\n"
+"  device const BlockQ4* w3 = w + min(row0+3, p.x-1) * nb;\n"
+"  float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;\n"
+"  for (uint b = lane; b < nb; b += 32) {\n"
+"    device const half* xb = x + (b << 5);\n"
+"    float s0=0, s1=0, s2=0, s3=0;\n"
+"    for (uint i = 0; i < 16; i++) {\n"
+"      float x0 = (float)xb[i], x1 = (float)xb[i+16];\n"
+"      uchar q0=w0[b].qs[i], q1=w1[b].qs[i], q2=w2[b].qs[i], q3=w3[b].qs[i];\n"
+"      s0 += x0*((float)(int)(q0&0xF)-8.0f) + x1*((float)(int)(q0>>4)-8.0f);\n"
+"      s1 += x0*((float)(int)(q1&0xF)-8.0f) + x1*((float)(int)(q1>>4)-8.0f);\n"
+"      s2 += x0*((float)(int)(q2&0xF)-8.0f) + x1*((float)(int)(q2>>4)-8.0f);\n"
+"      s3 += x0*((float)(int)(q3&0xF)-8.0f) + x1*((float)(int)(q3>>4)-8.0f);\n"
+"    }\n"
+"    r0 += (float)w0[b].d * s0; r1 += (float)w1[b].d * s1;\n"
+"    r2 += (float)w2[b].d * s2; r3 += (float)w3[b].d * s3;\n"
+"  }\n"
+"  r0 = simd_sum(r0); r1 = simd_sum(r1); r2 = simd_sum(r2); r3 = simd_sum(r3);\n"
+"  if (lane == 0) {\n"
+"    y[row0] = (half)r0;\n"
+"    if (row0+1 < p.x) y[row0+1] = (half)r1;\n"
+"    if (row0+2 < p.x) y[row0+2] = (half)r2;\n"
+"    if (row0+3 < p.x) y[row0+3] = (half)r3;\n"
+"  }\n"
+"}\n"
 "kernel void ggml_style_attn_qkt(\n"
 "  device const half* q [[buffer(0)]], device const half* kc [[buffer(1)]], device half* sc [[buffer(2)]],\n"
 "  constant uint4& p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]\n"
@@ -456,7 +490,7 @@ static void run_c_std_mps_fp16_bench(ModelCfg c, int prefill_len, int decode_ste
 }
 
 static void ggml_mv_q4(id<MTLCommandBuffer> cb, id<MTLComputePipelineState> pso,
-                       id<MTLBuffer> x, id<MTLBuffer> w, NSUInteger w_off, id<MTLBuffer> y, int out_d, int in_d) {
+                       id<MTLBuffer> x, id<MTLBuffer> w, NSUInteger w_off, id<MTLBuffer> y, int out_d, int in_d, int is_mlx) {
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e setComputePipelineState:pso];
     [e setBuffer:x offset:0 atIndex:0];
@@ -464,11 +498,15 @@ static void ggml_mv_q4(id<MTLCommandBuffer> cb, id<MTLComputePipelineState> pso,
     [e setBuffer:y offset:0 atIndex:2];
     uint32_t p[2] = { (uint32_t)out_d, (uint32_t)in_d };
     [e setBytes:p length:8 atIndex:3];
-    [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_d + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (is_mlx) {
+        [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_d + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    } else {
+        [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_d + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
     [e endEncoding];
 }
 
-static void run_llamac_metal_q4_bench(ModelCfg c, int prefill_len, int decode_steps) {
+static void run_metal_q4_baseline(ModelCfg c, int prefill_len, int decode_steps, int is_mlx) {
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         id<MTLCommandQueue> q = [dev newCommandQueue];
@@ -478,17 +516,17 @@ static void run_llamac_metal_q4_bench(ModelCfg c, int prefill_len, int decode_st
         id<MTLComputePipelineState> p_swig = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"std_swiglu"] error:&err];
         id<MTLComputePipelineState> p_add  = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"std_res_add"] error:&err];
         id<MTLComputePipelineState> p_rope = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"std_rope_kv"] error:&err];
-        id<MTLComputePipelineState> p_mvq4 = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"ggml_style_mv_q4_0"] error:&err];
+        id<MTLComputePipelineState> p_mvq4 = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:(is_mlx ? @"mlx_style_mv_q4_0" : @"ggml_style_mv_q4_0")] error:&err];
         id<MTLComputePipelineState> p_qkt  = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"ggml_style_attn_qkt"] error:&err];
         id<MTLComputePipelineState> p_pv   = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"ggml_style_attn_pv"] error:&err];
         MPSMatrixSoftMax* sm = [[MPSMatrixSoftMax alloc] initWithDevice:dev];
 
         int d = c.d_model, kv_dim = c.n_kv * c.d_head, d_ff = c.d_ff;
         MTLResourceOptions opt = MTLResourceStorageModeShared;
-        NSUInteger q_l = (NSUInteger)(d * d / 32) * 18;
-        NSUInteger kv_l = (NSUInteger)(kv_dim * d / 32) * 18;
-        NSUInteger ff_l = (NSUInteger)(d_ff * d / 32) * 18;
-        NSUInteger lm_b = (NSUInteger)(c.vocab * d / 32) * 18;
+        NSUInteger q_l = (NSUInteger)((size_t)d * d / 32) * 18;
+        NSUInteger kv_l = (NSUInteger)((size_t)kv_dim * d / 32) * 18;
+        NSUInteger ff_l = (NSUInteger)((size_t)d_ff * d / 32) * 18;
+        NSUInteger lm_b = (NSUInteger)((size_t)c.vocab * d / 32) * 18;
         id<MTLBuffer> b_norm = [dev newBufferWithLength:d*2 options:opt];
         id<MTLBuffer> b_wq   = [dev newBufferWithLength:(NSUInteger)c.n_layers*q_l options:opt];
         id<MTLBuffer> b_wk   = [dev newBufferWithLength:(NSUInteger)c.n_layers*kv_l options:opt];
@@ -529,9 +567,9 @@ static void run_llamac_metal_q4_bench(ModelCfg c, int prefill_len, int decode_st
                         [e1 setBuffer:b_xn offset:0 atIndex:2]; [e1 setBytes:&du length:4 atIndex:3];
                         [e1 dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)]; [e1 endEncoding];
 
-                        ggml_mv_q4(cb, p_mvq4, b_xn, b_wq, (NSUInteger)l*q_l, b_q, d, d);
-                        ggml_mv_q4(cb, p_mvq4, b_xn, b_wk, (NSUInteger)l*kv_l, b_k, kv_dim, d);
-                        ggml_mv_q4(cb, p_mvq4, b_xn, b_wv, (NSUInteger)l*kv_l, b_v, kv_dim, d);
+                        ggml_mv_q4(cb, p_mvq4, b_xn, b_wq, (NSUInteger)l*q_l, b_q, d, d, is_mlx);
+                        ggml_mv_q4(cb, p_mvq4, b_xn, b_wk, (NSUInteger)l*kv_l, b_k, kv_dim, d, is_mlx);
+                        ggml_mv_q4(cb, p_mvq4, b_xn, b_wv, (NSUInteger)l*kv_l, b_v, kv_dim, d, is_mlx);
 
                         NSUInteger kvc_off = (NSUInteger)l*kv_dim*c.max_seq*2;
                         id<MTLComputeCommandEncoder> er = [cb computeCommandEncoder];
@@ -557,7 +595,7 @@ static void run_llamac_metal_q4_bench(ModelCfg c, int prefill_len, int decode_st
                         [ep setBuffer:b_ctx offset:0 atIndex:2]; [ep setBytes:ap length:16 atIndex:3];
                         [ep dispatchThreads:MTLSizeMake((NSUInteger)c.d_head, (NSUInteger)c.n_heads, 1) threadsPerThreadgroup:MTLSizeMake(32,1,1)]; [ep endEncoding];
 
-                        ggml_mv_q4(cb, p_mvq4, b_ctx, b_wo, (NSUInteger)l*q_l, b_tmp, d, d);
+                        ggml_mv_q4(cb, p_mvq4, b_ctx, b_wo, (NSUInteger)l*q_l, b_tmp, d, d, is_mlx);
                         id<MTLComputeCommandEncoder> ea1 = [cb computeCommandEncoder];
                         [ea1 setComputePipelineState:p_add]; [ea1 setBuffer:b_x offset:0 atIndex:0]; [ea1 setBuffer:b_tmp offset:0 atIndex:1];
                         [ea1 dispatchThreads:MTLSizeMake(d,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; [ea1 endEncoding];
@@ -567,17 +605,17 @@ static void run_llamac_metal_q4_bench(ModelCfg c, int prefill_len, int decode_st
                         [e2 setBuffer:b_xn offset:0 atIndex:2]; [e2 setBytes:&du length:4 atIndex:3];
                         [e2 dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)]; [e2 endEncoding];
 
-                        ggml_mv_q4(cb, p_mvq4, b_xn, b_wg, (NSUInteger)l*ff_l, b_fg, d_ff, d);
-                        ggml_mv_q4(cb, p_mvq4, b_xn, b_wu, (NSUInteger)l*ff_l, b_fu, d_ff, d);
+                        ggml_mv_q4(cb, p_mvq4, b_xn, b_wg, (NSUInteger)l*ff_l, b_fg, d_ff, d, is_mlx);
+                        ggml_mv_q4(cb, p_mvq4, b_xn, b_wu, (NSUInteger)l*ff_l, b_fu, d_ff, d, is_mlx);
                         id<MTLComputeCommandEncoder> es = [cb computeCommandEncoder];
                         [es setComputePipelineState:p_swig]; [es setBuffer:b_fg offset:0 atIndex:0]; [es setBuffer:b_fu offset:0 atIndex:1]; [es setBuffer:b_fa offset:0 atIndex:2];
                         [es dispatchThreads:MTLSizeMake(d_ff,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; [es endEncoding];
-                        ggml_mv_q4(cb, p_mvq4, b_fa, b_wd, (NSUInteger)l*ff_l, b_tmp, d, d_ff);
+                        ggml_mv_q4(cb, p_mvq4, b_fa, b_wd, (NSUInteger)l*ff_l, b_tmp, d, d_ff, is_mlx);
                         id<MTLComputeCommandEncoder> ea2 = [cb computeCommandEncoder];
                         [ea2 setComputePipelineState:p_add]; [ea2 setBuffer:b_x offset:0 atIndex:0]; [ea2 setBuffer:b_tmp offset:0 atIndex:1];
                         [ea2 dispatchThreads:MTLSizeMake(d,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)]; [ea2 endEncoding];
                     }
-                    ggml_mv_q4(cb, p_mvq4, b_x, b_wlm, 0, b_log, c.vocab, d);
+                    ggml_mv_q4(cb, p_mvq4, b_x, b_wlm, 0, b_log, c.vocab, d, is_mlx);
                     [cb commit];
                     [cb waitUntilCompleted];
                 }
@@ -586,20 +624,27 @@ static void run_llamac_metal_q4_bench(ModelCfg c, int prefill_len, int decode_st
                 int64_t dt_ns = now_ns() - t0;
                 double ms = (double)dt_ns / 1e6 / runs;
                 double tps = (double)runs / ((double)dt_ns / 1e9);
-                printf("C_LLAMAC_METAL_Q4_0 %s decode_ms=%.3f decode_tok_s=%.1f\n", c.name, ms, tps);
+                printf("%s %s decode_ms=%.3f decode_tok_s=%.1f\n",
+                       is_mlx ? "C_MLX_METAL_Q4_0" : "C_LLAMAC_METAL_Q4_0", c.name, ms, tps);
             }
         }
     }
 }
 
 int main(void) {
-    ModelCfg m21 = { "Llama3_6L_21M",  4096, 512, 6,  8,  2, 64, 1536, 256 };
-    ModelCfg m85 = { "Llama3_12L_85M", 8192, 768, 12, 12, 4, 64, 2048, 256 };
+    ModelCfg m21 = { "Llama3_6L_21M",      4096,  512,  6,  8,  2, 64, 1536, 256 };
+    ModelCfg m85 = { "Llama3_12L_85M",     8192,  768, 12, 12,  4, 64, 2048, 256 };
+    ModelCfg m1b = { "Llama3.2_1B_1.24B", 32000, 2048, 16, 32,  8, 64, 8192, 128 };
     run_llamac_cpu_q4_bench(m21, 64, 32);
     run_llamac_cpu_q4_bench(m85, 64, 16);
     run_c_std_mps_fp16_bench(m21, 64, 64);
     run_c_std_mps_fp16_bench(m85, 64, 64);
-    run_llamac_metal_q4_bench(m21, 64, 64);
-    run_llamac_metal_q4_bench(m85, 64, 64);
+    run_c_std_mps_fp16_bench(m1b, 2, 16);
+    run_metal_q4_baseline(m21, 64, 64, 0);
+    run_metal_q4_baseline(m85, 64, 64, 0);
+    run_metal_q4_baseline(m1b, 2, 32, 0);
+    run_metal_q4_baseline(m21, 64, 64, 1);
+    run_metal_q4_baseline(m85, 64, 64, 1);
+    run_metal_q4_baseline(m1b, 2, 32, 1);
     return 0;
 }

@@ -21,6 +21,21 @@ type Vec3 struct {
 	X, Y, Z int64
 }
 
+type HeapPacket struct {
+	ID      int64
+	Payload []int64
+}
+
+//go:noinline
+func makeHeapPacket(seed int64) *HeapPacket {
+	xs := make([]int64, 4)
+	xs[0] = seed
+	xs[1] = seed*3 + 1
+	xs[2] = seed ^ 17
+	xs[3] = seed + 9
+	return &HeapPacket{ID: seed, Payload: xs}
+}
+
 func main() {
 	// 1. 10,000 Goroutines work-stealing benchmark
 	const N = 10000
@@ -70,8 +85,29 @@ func main() {
 	}
 	dStruct := time.Since(t2)
 
+	// 4. 1,600,000 Multi-Threaded Heap Allocations (16 goroutines x 50k packets x 2 heap objs each)
+	t3 := time.Now()
+	var heapTotal int64
+	var wg3 sync.WaitGroup
+	wg3.Add(16)
+	for g := 0; g < 16; g++ {
+		gid := int64(g)
+		go func(base int64) {
+			defer wg3.Done()
+			var s int64
+			for k := int64(0); k < 50000; k++ {
+				pkt := makeHeapPacket(base*100000 + k)
+				s += pkt.ID + pkt.Payload[1] + pkt.Payload[2]
+			}
+			atomic.AddInt64(&heapTotal, s)
+		}(gid)
+	}
+	wg3.Wait()
+	dHeap := time.Since(t3)
+
 	fmt.Printf("GO_BENCH gomaxprocs=%d\n", runtime.GOMAXPROCS(0))
 	fmt.Printf("GO_TASKS_10K ms=%.3f checksum=%d\n", float64(dTasks.Nanoseconds())/1e6, total)
 	fmt.Printf("GO_CGO_1M ms=%.3f ns_per_call=%.2f checksum=%d\n", float64(dFfi.Nanoseconds())/1e6, float64(dFfi.Nanoseconds())/float64(FFI), ffiAcc)
 	fmt.Printf("GO_MUT_STRUCT_50M ms=%.3f ns_per_iter=%.2f checksum=%d\n", float64(dStruct.Nanoseconds())/1e6, float64(dStruct.Nanoseconds())/float64(ITERS), p.X+p.Y+p.Z)
+	fmt.Printf("GO_MT_HEAP_1.6M ms=%.3f checksum=%d\n", float64(dHeap.Nanoseconds())/1e6, heapTotal)
 }

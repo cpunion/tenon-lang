@@ -14,15 +14,15 @@
 # 0. 可视化交互体验与旗舰应用（零 `--c-src` 参数、零外部 Shader 文件，全量内置 `@c_src` 与 `gpu_embedded_msl()`！）
 cargo build --release --bin tenon
 
-# (A0) PyTorch 风格精化验证 AI 库 & 超融合量化多架构 LLM 推理引擎（Tenon-Torch `std/nn`：AutogradTape + AMP `GradScaler` + 编译期 `Matrix[R, C, DType = Float16]` / 变长 `Tensor[...Shape]` + DLPack v1.0 / GGUF v3 / Safetensors + Apple MPS + 超融合 Metal Q4_0/Q8_0/FP16 推理，支持 Llama-3/Qwen2/Gemma-2/Mixtral Sparse MoE，M4 Max 上超越 C 封装 MPS 与 llama.cpp 风格 Metal/CPU 基线！）
+# (A0) PyTorch 风格精化验证 AI 库 & 零拷贝 mmap GGUF v3 超融合量化多架构 LLM 推理引擎（Tenon-Torch `std/nn`：AutogradTape + AMP `GradScaler` + 编译期 `Matrix[R, C, DType = Float16]` / 变长 `Tensor[...Shape]` + DLPack v1.0 / GGUF v3 `mmap` 零拷贝 `newBufferWithBytesNoCopy` / Safetensors + Apple MPS + 超融合 Metal Q4_0/Q8_0/FP16 推理，支持 Llama-3/Qwen2/Gemma-2/Mixtral Sparse MoE；M4 Max 完整 1.10B Llama-3.2-1B 达 433.8 tok/s Q4_0 / 308.2 tok/s Q8_0 / 188.8 tok/s FP16 @ 392.2 GB/s，全面超越 C 封装 MPS 19.4×、llama.cpp 风格 Metal 4.17× 与 MLX 风格 Metal 4.24×！）
 ./target/release/tenon test std/nn/nn_test.tn
 ./target/release/tenon check examples/showcase/bad_nn_shape.tn   # 负例：Matrix[4,8] @ Matrix[6,2] 编译期秒抓维度错误！
-./target/release/tenon build examples/showcase/tenon_ultra_llm_bench.tn -o /tmp/tn_ultra_bench && /tmp/tn_ultra_bench  # Llama-3/Qwen2/Gemma-2/Mixtral-MoE 超融合 Q4_0/Q8_0/FP16 + FlashDecoding 引擎（22M 达 1,310 tok/s，88M 达 598 tok/s！）
+./target/release/tenon build examples/showcase/tenon_ultra_llm_bench.tn -o /tmp/tn_ultra_bench && /tmp/tn_ultra_bench  # Llama-3/Qwen2/Gemma-2/Mixtral-MoE + 1.10B Llama-3.2-1B 零拷贝 mmap GGUF v3 基准
 ./target/release/tenon build examples/showcase/tenon_transformer_mps.tn -o /tmp/tenon_mps_tf && /tmp/tenon_mps_tf
 ./target/release/tenon build examples/showcase/tenon_torch_studio.tn -o /tmp/tenon_torch_studio && /tmp/tenon_torch_studio
 # 或无头截图预览（生成 /tmp/tenon_torch_studio.png）：TENON_TORCH_SMOKE=1 /tmp/tenon_torch_studio
 
-# (A0b) M:N 抢占式无栈协程工作窃取调度器（零 cgo 开销，~1.8ns C FFI）+ 非装箱栈上可变值记录 + 多后端 GPU（MSL/WGSL/CUDA/SPIR-V GLSL）+ C 头文件自动绑定 `tenon bindgen`
+# (A0b) P-Core SPMC 批量窃取 M:N 抢占式协程调度器（10K 任务 2.2ms 超越 Go、零 cgo 1.76ns C FFI 快 Go 9.1×）+ 无锁线程本地 Perceus 堆缓存（160 万并发堆分配 2.2ms 快 Go 5×+ 且 live_objects=0）+ 非装箱栈上可变值记录 + 多后端 GPU（MSL/WGSL/CUDA/SPIR-V GLSL）+ C 头文件自动绑定 `tenon bindgen`
 ./target/release/tenon build examples/dogfood/mn_preempt_sched_demo.tn -o /tmp/tn_mn_bench && /tmp/tn_mn_bench
 ./target/release/tenon build examples/showcase/tenon_transformer_mps.tn --emit-cuda /tmp/out.cu --emit-spirv-glsl /tmp/out.comp --debug -o /tmp/tn_dbg
 ./target/release/tenon bindgen /path/to/header.h -o /tmp/bindings.tn

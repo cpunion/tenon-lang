@@ -1,10 +1,5 @@
-// examples/dogfood/mn_preempt_sched_demo.tn — M:N Preemptive Stackless Coroutines + Zero-cgo FFI + Unboxed Records!
-//
-// Proves & benchmarks 4 Pillar-1 & Pillar-2 capabilities on Apple Silicon:
-//   1. 10,000 M:N work-stealing stackless tasks (verified steals > 0, zero RC leaks)
-//   2. Preemptive scheduling fairness: tight `@preemptible` CPU-hog loops yield automatically via `sysmon` (0.5ms quantum)
-//   3. 1,000,000 direct `extern "C"` calls INSIDE an M:N task (~1–2 ns/call — ZERO Go `cgo` stack-switch tax!)
-//   4. 50,000,000 mutable stack-promoted record (`var p = Vec3 { ... }`) iterations — 0 heap allocs, matches `clang -O3`!
+// examples/dogfood/mn_preempt_sched_demo.tn — M:N Preemptive Stackless Coroutines + Zero-cgo FFI
+// + Unboxed Value Records + 1.6M Multi-Threaded Perceus Heap Allocation Stress Benchmark!
 
 import "std/core/types.tn"
 import "std/os/io.tn"
@@ -20,6 +15,20 @@ record Vec3 {
     x Int
     y Int
     z Int
+}
+
+// Escaping heap-allocated record (holds dynamic `List[Int]` payload -> guaranteed heap Perceus RC!)
+record HeapPacket {
+    id      Int
+    payload List[Int]
+}
+
+fn make_heap_packet(seed Int) HeapPacket {
+    var xs List[Int] = list_filled(4, seed)
+    xs[1] = seed * 3 + 1
+    xs[2] = seed ^ 17
+    xs[3] = seed + 9
+    HeapPacket { id = seed, payload = xs }
 }
 
 @preemptible
@@ -49,14 +58,14 @@ fn main() {
     let w = workers()
     println("TENON_SCHED workers=" ++ int_to_text(w))
 
-    // 1. 10,000 M:N Work-Stealing Tasks
+    // 1. 10,000 M:N Work-Stealing Tasks (ownership-moved closures -> ZERO atomic rc_inc/dec!)
     let n_tasks = 10000
     let t0 = time_now_ns()
     var handles List[Int] = list_filled(n_tasks, 0)
     var i = 0
     while i < n_tasks {
         let id = i
-        handles[i] = spawn(|| {
+        handles[i] = task_spawn(|| {
             var acc = id
             var k = 0
             while k < 64 {
@@ -70,7 +79,7 @@ fn main() {
     var sum_tasks = 0
     var j = 0
     while j < n_tasks {
-        sum_tasks += join(handles[j])
+        sum_tasks += task_join(handles[j])
         j += 1
     }
     let dt_tasks_ns = time_now_ns() - t0
@@ -82,18 +91,18 @@ fn main() {
 
     // 2. Preemptive Scheduling Fairness under tight CPU hogs (sysmon 500us quantum)
     let p_before = preemptions()
-    let hog1 = spawn(|| { cpu_hog_work(15000000) })
-    let hog2 = spawn(|| { cpu_hog_work(15000000) })
-    let hog3 = spawn(|| { cpu_hog_work(15000000) })
-    let hog4 = spawn(|| { cpu_hog_work(15000000) })
-    let hog_sum = join(hog1) + join(hog2) + join(hog3) + join(hog4)
+    let hog1 = task_spawn(|| { cpu_hog_work(15000000) })
+    let hog2 = task_spawn(|| { cpu_hog_work(15000000) })
+    let hog3 = task_spawn(|| { cpu_hog_work(15000000) })
+    let hog4 = task_spawn(|| { cpu_hog_work(15000000) })
+    let hog_sum = task_join(hog1) + task_join(hog2) + task_join(hog3) + task_join(hog4)
     let p_after = preemptions()
     println("TENON_PREEMPT delta=" ++ int_to_text(p_after - p_before) ++ " hog_sum=" ++ int_to_text(hog_sum))
 
     // 3. 1,000,000 Direct C FFI calls INSIDE an M:N task (ZERO cgo stack-switch overhead!)
     let n_ffi = 1000000
     let t1 = time_now_ns()
-    let ffi_h = spawn(|| {
+    let ffi_h = task_spawn(|| {
         var a = 42
         var k = 0
         while k < n_ffi {
@@ -102,7 +111,7 @@ fn main() {
         }
         a
     })
-    let ffi_sum = join(ffi_h)
+    let ffi_sum = task_join(ffi_h)
     let dt_ffi_ns = time_now_ns() - t1
     let dt_ffi_ms = int_to_float(dt_ffi_ns) / 1000000.0
     let ns_per_call = int_to_float(dt_ffi_ns) / int_to_float(n_ffi)
@@ -120,4 +129,32 @@ fn main() {
     println("TENON_MUT_STRUCT_50M ms=" ++ float_to_text(dt_mut_ms)
         ++ " ns_per_iter=" ++ float_to_text(ns_per_iter)
         ++ " checksum=" ++ int_to_text(mut_sum))
+
+    // 5. 1,600,000 Multi-Threaded Perceus Heap Allocations (16 tasks x 50k packets x 2 heap objs each, live=0!)
+    let t3 = time_now_ns()
+    var h_tasks List[Int] = list_filled(16, 0)
+    var g = 0
+    while g < 16 {
+        let base = g * 100000
+        h_tasks[g] = task_spawn(|| {
+            var s = 0
+            var k = 0
+            while k < 50000 {
+                let pkt = make_heap_packet(base + k)
+                s += pkt.id + pkt.payload[1] + pkt.payload[2]
+                k += 1
+            }
+            s
+        })
+        g += 1
+    }
+    var heap_sum = 0
+    var g2 = 0
+    while g2 < 16 {
+        heap_sum += task_join(h_tasks[g2])
+        g2 += 1
+    }
+    let dt_heap_ns = time_now_ns() - t3
+    let dt_heap_ms = int_to_float(dt_heap_ns) / 1000000.0
+    println("TENON_MT_HEAP_1.6M ms=" ++ float_to_text(dt_heap_ms) ++ " checksum=" ++ int_to_text(heap_sum))
 }

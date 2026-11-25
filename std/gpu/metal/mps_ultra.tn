@@ -18,6 +18,7 @@ extern "C" {
     fn tn_ultra_quantize_q4_0_buf(f16_ptr Ptr[UInt8], n_elems Int) Int
     fn tn_ultra_quantize_q8_0_buf(f16_ptr Ptr[UInt8], n_elems Int) Int
     fn tn_ultra_embed(tok_h Int, emb_h Int, out_h Int, seq_len Int, d_model Int, vocab Int) Int
+    fn tn_ultra_embed_off(tok_h Int, emb_h Int, emb_off Int, out_h Int, seq_len Int, d_model Int, vocab Int) Int
     fn tn_ultra_rmsnorm(x_h Int, w_h Int, w_off Int, out_h Int, seq_len Int, d_model Int, gemma_mode Int) Int
     fn tn_ultra_rope_kv(
         qkv_h Int, q_out_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int,
@@ -61,6 +62,13 @@ extern "C" {
         idx_h Int, wt_h Int, slot Int, expert_stride_elems Int,
         out_dim Int, in_dim Int, quant_mode Int,
     ) Int
+    fn tn_ultra_write_gguf_v3(
+        path CStr, arch Int, qm Int,
+        vocab Int, d_model Int, n_layers Int,
+        n_heads Int, n_kv Int, d_head Int, d_ff Int,
+        max_seq Int, n_experts Int, buf_handles_ptr Ptr[UInt8],
+    ) Int
+    fn tn_ultra_mmap_gguf_file(path CStr, meta_out_ptr Ptr[UInt8]) Int
 }
 
 pub fn ultra_init() Bool {
@@ -89,6 +97,46 @@ pub pure fn ultra_weight_stride_bytes(n_elems Int, quant_mode Int) Int {
 
 pub fn ultra_embed(tok_h Int, emb_h Int, out_h Int, seq_len Int, d_model Int, vocab Int) Bool {
     unsafe { tn_ultra_embed(tok_h, emb_h, out_h, seq_len, d_model, vocab) != 0 }
+}
+
+pub fn ultra_embed_off(tok_h Int, emb_h Int, emb_off Int, out_h Int, seq_len Int, d_model Int, vocab Int) Bool {
+    unsafe { tn_ultra_embed_off(tok_h, emb_h, emb_off, out_h, seq_len, d_model, vocab) != 0 }
+}
+
+pub fn ultra_write_gguf_v3(
+    path Text, arch Int, qm Int,
+    vocab Int, d_model Int, n_layers Int,
+    n_heads Int, n_kv Int, d_head Int, d_ff Int,
+    max_seq Int, n_experts Int,
+) Int {
+    unsafe {
+        tn_ultra_write_gguf_v3(
+            text_cstr_ptr(path), arch, qm,
+            vocab, d_model, n_layers, n_heads, n_kv, d_head, d_ff,
+            max_seq, n_experts, null_ptr(),
+        )
+    }
+}
+
+pub fn ultra_export_gguf_v3_from_handles(
+    path Text, arch Int, qm Int,
+    vocab Int, d_model Int, n_layers Int,
+    n_heads Int, n_kv Int, d_head Int, d_ff Int,
+    max_seq Int, n_experts Int, handles List[Int],
+) Int {
+    unsafe {
+        tn_ultra_write_gguf_v3(
+            text_cstr_ptr(path), arch, qm,
+            vocab, d_model, n_layers, n_heads, n_kv, d_head, d_ff,
+            max_seq, n_experts, list_data_ptr(handles),
+        )
+    }
+}
+
+pub fn ultra_mmap_gguf_v3(path Text) List[Int] {
+    var meta List[Int] = list_filled(25, 0)
+    let _ = unsafe { tn_ultra_mmap_gguf_file(text_cstr_ptr(path), list_data_ptr(meta)) }
+    meta
 }
 
 pub fn ultra_rmsnorm(x_h Int, w_h Int, w_off Int, out_h Int, seq_len Int, d_model Int, gemma_mode Bool) Bool {

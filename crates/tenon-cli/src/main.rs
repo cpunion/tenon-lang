@@ -1960,7 +1960,17 @@ fn cmd_verify_proofs(args: &[String]) -> ExitCode {
 }
 
 fn map_c_type_to_tenon(raw: &str) -> String {
-    let s = raw.trim().replace("const ", "").trim().to_string();
+    let trimmed = raw.trim();
+    if trimmed == "const char*" || trimmed == "const char *" {
+        return "CStr".into();
+    }
+    let s = trimmed
+        .replace("const ", "")
+        .replace("restrict ", "")
+        .replace("__restrict ", "")
+        .replace("volatile ", "")
+        .trim()
+        .to_string();
     if s.ends_with('*') {
         let base = s.trim_end_matches('*').trim();
         return match base {
@@ -2025,7 +2035,29 @@ fn cmd_bindgen(args: &[String]) -> ExitCode {
     let mut li = 0usize;
     while li < lines.len() {
         let trimmed = lines[li].trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") {
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            li += 1;
+            continue;
+        }
+        // Parse integer `#define NAME 123` / `#define NAME 0x10` constants
+        if let Some(rest) = trimmed.strip_prefix("#define ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 2 && !parts[0].contains('(') {
+                let cname = parts[0];
+                let raw_val = parts[1].trim_matches(|c| c == '(' || c == ')').trim_end_matches(|c| c == 'u' || c == 'U' || c == 'l' || c == 'L');
+                let parsed = if let Some(hex) = raw_val.strip_prefix("0x").or_else(|| raw_val.strip_prefix("0X")) {
+                    i64::from_str_radix(hex, 16).ok()
+                } else {
+                    raw_val.parse::<i64>().ok()
+                };
+                if let Some(v) = parsed {
+                    out.push_str(&format!("pub const {} Int = {}\n", cname, v));
+                }
+            }
+            li += 1;
+            continue;
+        }
+        if trimmed.starts_with('#') {
             li += 1;
             continue;
         }
@@ -2047,9 +2079,10 @@ fn cmd_bindgen(args: &[String]) -> ExitCode {
                     }
                     break;
                 }
-                if let Some(decl) = fl.strip_suffix(';') {
+                let fl_no_comment = fl.split("/*").next().unwrap_or(fl).split("//").next().unwrap_or(fl).trim();
+                if let Some(decl) = fl_no_comment.strip_suffix(';') {
                     let parts: Vec<&str> = decl.split_whitespace().collect();
-                    if parts.len() >= 2 {
+                    if parts.len() >= 2 && !decl.contains('(') {
                         let raw_name = *parts.last().unwrap();
                         let ptr_stars = raw_name.chars().take_while(|&c| c == '*').count();
                         let fname = raw_name.trim_start_matches('*');

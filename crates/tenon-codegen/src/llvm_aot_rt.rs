@@ -4,6 +4,9 @@ pub(crate) const TENON_AOT_RUNTIME_C: &str = r#"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef TENON_THREAD_SAFE
+#include <pthread.h>
+#endif
 
 typedef struct {
     int64_t rc;
@@ -70,6 +73,207 @@ static TenonSlab* tenon_slab_new(size_t min_bytes, TenonSlab* prev) {
     return s;
 }
 
+#ifdef TENON_THREAD_SAFE
+/* ===== Lock-Free Per-Thread Perceus Heap Cache + Central Batch Pool (tcmalloc/mcache pattern) ===== */
+#define TENON_MT_MAX_CACHES  256
+#define TENON_MT_BATCH_SZ    32
+#define TENON_MT_CACHE_HI    64
+#define TENON_MT_CENTRAL_MAX 128
+
+typedef struct TenonBatchNode {
+    struct TenonBatchNode* next_batch;
+    TenonObj* list_head;
+    int count;
+} TenonBatchNode;
+
+typedef struct __attribute__((aligned(64))) {
+    TenonObj* freelist[TENON_FREELIST_MAX_CAP + 1];
+    int freelist_len[TENON_FREELIST_MAX_CAP + 1];
+    int64_t live_delta;
+    int64_t allocs_delta;
+    TenonSlab* arena_slab;
+    int arena_depth;
+    TenonArenaMark arena_marks[64];
+} TenonMtCache;
+
+static TenonMtCache* g_mt_caches[TENON_MT_MAX_CACHES];
+static volatile int g_mt_cache_count = 0;
+static pthread_key_t g_mt_cache_key;
+static pthread_once_t g_mt_cache_once = PTHREAD_ONCE_INIT;
+
+typedef struct __attribute__((aligned(64))) {
+    pthread_mutex_t mu;
+    TenonObj* batches[TENON_MT_CENTRAL_MAX];
+    int counts[TENON_MT_CENTRAL_MAX];
+    int n_batches;
+} TenonCentralBin;
+
+static TenonCentralBin g_mt_central[TENON_FREELIST_MAX_CAP + 1];
+
+static void tenon_mt_cache_dtor(void* p) {
+    TenonMtCache* c = (TenonMtCache*)p;
+    if (!c) return;
+    __atomic_add_fetch(&g_live, c->live_delta, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_allocs, c->allocs_delta, __ATOMIC_RELAXED);
+    c->live_delta = 0;
+    c->allocs_delta = 0;
+    for (int k = 1; k <= TENON_FREELIST_MAX_CAP; k++) {
+        TenonObj* cur = c->freelist[k];
+        while (cur) {
+            TenonObj* nxt = *(TenonObj**)cur;
+            free(cur);
+            cur = nxt;
+        }
+        c->freelist[k] = NULL;
+        c->freelist_len[k] = 0;
+    }
+    while (c->arena_slab) {
+        TenonSlab* prev = c->arena_slab->prev;
+        free(c->arena_slab);
+        c->arena_slab = prev;
+    }
+}
+
+static void tenon_mt_init_key(void) {
+    pthread_key_create(&g_mt_cache_key, tenon_mt_cache_dtor);
+    for (int k = 1; k <= TENON_FREELIST_MAX_CAP; k++) {
+        pthread_mutex_init(&g_mt_central[k].mu, NULL);
+        g_mt_central[k].n_batches = 0;
+    }
+}
+
+static TenonMtCache* tenon_mt_get_cache_slow(void) {
+    pthread_once(&g_mt_cache_once, tenon_mt_init_key);
+    TenonMtCache* c = (TenonMtCache*)pthread_getspecific(g_mt_cache_key);
+    if (c) return c;
+    c = (TenonMtCache*)calloc(1, sizeof(TenonMtCache));
+    if (!c) abort();
+    pthread_setspecific(g_mt_cache_key, c);
+    int slot = __atomic_fetch_add(&g_mt_cache_count, 1, __ATOMIC_ACQ_REL);
+    if (slot < TENON_MT_MAX_CACHES) {
+        __atomic_store_n(&g_mt_caches[slot], c, __ATOMIC_RELEASE);
+    }
+    return c;
+}
+
+static inline TenonMtCache* tenon_mt_get_cache(void) {
+    if (__builtin_expect(__atomic_load_n(&g_mt_cache_count, __ATOMIC_RELAXED) > 0, 1)) {
+        TenonMtCache* c = (TenonMtCache*)pthread_getspecific(g_mt_cache_key);
+        if (__builtin_expect(c != NULL, 1)) return c;
+    }
+    return tenon_mt_get_cache_slow();
+}
+
+static void tenon_mt_central_push(int cap, TenonObj* head, int count) {
+    TenonCentralBin* bin = &g_mt_central[cap];
+    pthread_mutex_lock(&bin->mu);
+    if (bin->n_batches < TENON_MT_CENTRAL_MAX) {
+        int idx = bin->n_batches++;
+        bin->batches[idx] = head;
+        bin->counts[idx] = count;
+        pthread_mutex_unlock(&bin->mu);
+        return;
+    }
+    pthread_mutex_unlock(&bin->mu);
+    /* Central pool full: return directly to OS allocator so memory stays strictly bounded */
+    while (head) {
+        TenonObj* nxt = *(TenonObj**)head;
+        free(head);
+        head = nxt;
+    }
+}
+
+static int tenon_mt_central_pop(int cap, TenonObj** out_head) {
+    TenonCentralBin* bin = &g_mt_central[cap];
+    if (__atomic_load_n(&bin->n_batches, __ATOMIC_RELAXED) <= 0) return 0;
+    pthread_mutex_lock(&bin->mu);
+    if (bin->n_batches <= 0) {
+        pthread_mutex_unlock(&bin->mu);
+        return 0;
+    }
+    int idx = --bin->n_batches;
+    *out_head = bin->batches[idx];
+    int cnt = bin->counts[idx];
+    pthread_mutex_unlock(&bin->mu);
+    return cnt;
+}
+
+static inline int64_t tenon_total_live(void) {
+    int64_t sum = __atomic_load_n(&g_live, __ATOMIC_ACQUIRE);
+    int n = __atomic_load_n(&g_mt_cache_count, __ATOMIC_ACQUIRE);
+    if (n > TENON_MT_MAX_CACHES) n = TENON_MT_MAX_CACHES;
+    for (int i = 0; i < n; i++) {
+        TenonMtCache* c = __atomic_load_n(&g_mt_caches[i], __ATOMIC_ACQUIRE);
+        if (c) sum += __atomic_load_n(&c->live_delta, __ATOMIC_RELAXED);
+    }
+    return sum;
+}
+
+static inline int64_t tenon_total_allocs(void) {
+    int64_t sum = __atomic_load_n(&g_allocs, __ATOMIC_ACQUIRE);
+    int n = __atomic_load_n(&g_mt_cache_count, __ATOMIC_ACQUIRE);
+    if (n > TENON_MT_MAX_CACHES) n = TENON_MT_MAX_CACHES;
+    for (int i = 0; i < n; i++) {
+        TenonMtCache* c = __atomic_load_n(&g_mt_caches[i], __ATOMIC_ACQUIRE);
+        if (c) sum += __atomic_load_n(&c->allocs_delta, __ATOMIC_RELAXED);
+    }
+    return sum;
+}
+
+int64_t tenon_arena_enter(void) {
+    TenonMtCache* c = tenon_mt_get_cache();
+    int idx = c->arena_depth;
+    if (idx < 64) {
+        c->arena_marks[idx].slab = c->arena_slab;
+        c->arena_marks[idx].used = c->arena_slab ? c->arena_slab->used : 0;
+    }
+    c->arena_depth++;
+    return (int64_t)idx;
+}
+
+void tenon_arena_exit(int64_t mark) {
+    TenonMtCache* c = tenon_mt_get_cache();
+    if (c->arena_depth <= 0) return;
+    c->arena_depth--;
+    int idx = (int)mark;
+    if (idx >= 0 && idx < 64) {
+        TenonSlab* target = c->arena_marks[idx].slab;
+        size_t saved_used = c->arena_marks[idx].used;
+        while (c->arena_slab && c->arena_slab != target) {
+            TenonSlab* prev = c->arena_slab->prev;
+            free(c->arena_slab);
+            c->arena_slab = prev;
+        }
+        if (c->arena_slab) c->arena_slab->used = saved_used;
+    }
+    if (c->arena_depth == 0 && c->arena_slab) {
+        while (c->arena_slab->prev) {
+            TenonSlab* prev = c->arena_slab->prev;
+            free(c->arena_slab);
+            c->arena_slab = prev;
+        }
+        c->arena_slab->used = 0;
+    }
+}
+
+static inline TenonObj* tenon_mt_arena_alloc_obj(TenonMtCache* c, int64_t tag, int64_t lu, int64_t cap) {
+    size_t bytes = (sizeof(TenonObj) + (size_t)cap * sizeof(int64_t) + 7u) & ~7u;
+    if (!c->arena_slab || c->arena_slab->used + bytes > c->arena_slab->cap) {
+        c->arena_slab = tenon_slab_new(bytes, c->arena_slab);
+    }
+    TenonObj* obj = (TenonObj*)(c->arena_slab->data + c->arena_slab->used);
+    c->arena_slab->used += bytes;
+    obj->rc = -2;
+    obj->tag = tag;
+    obj->len = lu;
+    obj->cap = cap;
+    obj->rc_mask = 0;
+    return obj;
+}
+#else
+static inline int64_t tenon_total_live(void) { return g_live; }
+static inline int64_t tenon_total_allocs(void) { return g_allocs; }
+
 int64_t tenon_arena_enter(void) {
     int idx = g_arena_depth;
     if (idx < 64) {
@@ -120,6 +324,7 @@ static inline TenonObj* tenon_arena_alloc_obj(int64_t tag, int64_t lu, int64_t c
     obj->rc_mask = 0;
     return obj;
 }
+#endif
 
 #ifdef TENON_USE_SYNC
 void tenon_drop_mutex_handle(int64_t raw);
@@ -129,15 +334,38 @@ void tenon_drop_channel_handle(int64_t raw, int is_rc);
 static inline TenonObj* tenon_rc_alloc_raw(int64_t tag, int64_t lu, int64_t cap) {
     TenonObj* obj;
 #ifdef TENON_THREAD_SAFE
-    obj = (TenonObj*)malloc(sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
-    if (!obj) abort();
+    TenonMtCache* c = tenon_mt_get_cache();
+    if (__builtin_expect(c->arena_depth > 0, 0)) {
+        return tenon_mt_arena_alloc_obj(c, tag, lu, cap);
+    }
+    if (__builtin_expect(cap >= 1 && cap <= TENON_FREELIST_MAX_CAP, 1)) {
+        obj = c->freelist[cap];
+        if (__builtin_expect(obj != NULL, 1)) {
+            c->freelist[cap] = *(TenonObj**)obj;
+            c->freelist_len[cap]--;
+        } else {
+            TenonObj* batch = NULL;
+            int got = tenon_mt_central_pop((int)cap, &batch);
+            if (got > 0) {
+                obj = batch;
+                c->freelist[cap] = *(TenonObj**)obj;
+                c->freelist_len[cap] = got - 1;
+            } else {
+                obj = (TenonObj*)malloc(sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
+                if (!obj) abort();
+            }
+        }
+    } else {
+        obj = (TenonObj*)malloc(sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
+        if (!obj) abort();
+    }
     obj->rc = 1;
     obj->tag = tag;
     obj->len = lu;
     obj->cap = cap;
     obj->rc_mask = 0;
-    __atomic_add_fetch(&g_live, 1, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&g_allocs, 1, __ATOMIC_RELAXED);
+    c->live_delta++;
+    c->allocs_delta++;
     return obj;
 #else
     if (__builtin_expect(g_arena_depth > 0, 0)) {
@@ -222,7 +450,29 @@ static void tenon_rc_free_slow(TenonObj* obj) {
     }
 #endif
 #ifdef TENON_THREAD_SAFE
-    __atomic_sub_fetch(&g_live, 1, __ATOMIC_RELAXED);
+    TenonMtCache* c = tenon_mt_get_cache();
+    c->live_delta--;
+    int64_t cap = obj->cap;
+    if (__builtin_expect(cap >= 1 && cap <= TENON_FREELIST_MAX_CAP, 1)) {
+        *(TenonObj**)obj = c->freelist[cap];
+        c->freelist[cap] = obj;
+        int n = ++c->freelist_len[cap];
+        if (__builtin_expect(n >= TENON_MT_CACHE_HI, 0)) {
+            /* Detach batch of TENON_MT_BATCH_SZ to central bin (1 lock per 128 frees!) */
+            TenonObj* bhead = c->freelist[cap];
+            TenonObj* cur = bhead;
+            for (int i = 1; i < TENON_MT_BATCH_SZ && cur; i++) {
+                cur = *(TenonObj**)cur;
+            }
+            if (cur) {
+                c->freelist[cap] = *(TenonObj**)cur;
+                *(TenonObj**)cur = NULL;
+                c->freelist_len[cap] -= TENON_MT_BATCH_SZ;
+                tenon_mt_central_push((int)cap, bhead, TENON_MT_BATCH_SZ);
+            }
+        }
+        return;
+    }
     free(obj);
 #else
     g_live--;
@@ -246,7 +496,12 @@ void tenon_rc_dec(int64_t ptr) {
     if (__builtin_expect(ptr == 0, 0)) return;
     TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
 #ifdef TENON_THREAD_SAFE
-    if (__builtin_expect(__atomic_load_n(&obj->rc, __ATOMIC_RELAXED) > 0, 1)) {
+    int64_t r = __atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(r == 1, 1)) {
+        tenon_rc_free_slow(obj);
+        return;
+    }
+    if (__builtin_expect(r > 1, 1)) {
         if (__builtin_expect(__atomic_sub_fetch(&obj->rc, 1, __ATOMIC_ACQ_REL) <= 0, 0)) {
             tenon_rc_free_slow(obj);
         }
@@ -761,13 +1016,15 @@ extern int64_t tenon_fn_main(void);
 pub(crate) const TENON_AOT_MAIN_STATS_C: &str = r#"
 int main(void) {
     int64_t res = tenon_fn_main();
+    int64_t tot_live = tenon_total_live();
+    int64_t tot_allocs = tenon_total_allocs();
     printf("main() => %lld\n", (long long)res);
-    if (g_allocs > 0 || g_polls > 0) {
+    if (tot_allocs > 0 || g_polls > 0) {
         printf("Perceus/Async stats: allocs=%lld, unique_reuse_hits=%lld, cow_clones=%lld, live_objects=%lld, async_polls=%lld, async_suspends=%lld\n",
-               (long long)g_allocs, (long long)g_reuse, (long long)g_cow,
-               (long long)g_live, (long long)g_polls, (long long)g_suspends);
+               (long long)tot_allocs, (long long)g_reuse, (long long)g_cow,
+               (long long)tot_live, (long long)g_polls, (long long)g_suspends);
     }
-    return g_live == 0 ? 0 : 2;
+    return tot_live == 0 ? 0 : 2;
 }
 "#;
 
