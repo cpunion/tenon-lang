@@ -1,0 +1,21 @@
+// examples/bootstrap/stage2/tenon_compiler_test.tn — Colocated Tests for Stage-2 Self-Hosting Pure-Tenon Compiler
+// (Same package directory as `tenon_compiler.tn`)
+
+test fn test_stage2_compiler_verifies_and_emits_llvm_ir() {
+    let ok_src = "pub pure fn safe_div(a Int, b Int where self >= 1) Int { return a / b }\npub pure fn main() Int { return safe_div(84, 2) }\n"
+    match s2_compile_to_llvm_ir(ok_src) {
+        Ok(ll) => {
+            assert ll.contains("define i64 @s2_safe_div(")
+            assert ll.contains("sdiv i64")
+            assert ll.contains("define i32 @main()")
+        }
+        Err(_) => { assert false }
+    }
+
+    // Fail-Closed negative control: Stage-2 pure-Tenon verifier rejects unproved division by zero!
+    let bad_src = "pub pure fn bad_div(a Int, b Int) Int { return a / b }\n"
+    match s2_compile_to_llvm_ir(bad_src) {
+        Ok(_) => { assert false }
+        Err(msg) => { assert msg.contains("E0401") }
+    }
+}

@@ -15,7 +15,7 @@ import "std/ui/openui.tn"
 import "std/ui/tui.tn"
 import "std/ui/layout.tn"
 import "std/ui/scene.tn"
-import "std/gpu/gpu.tn"
+import "std/gpu/metal/gpu.tn"
 
 pure fn px_ch(rgba Bytes, width Int, x Int, y Int, ch Int) Int {
     bytes_get(rgba, (y * width + x) * 4 + ch) as Int

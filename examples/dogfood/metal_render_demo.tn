@@ -7,7 +7,7 @@
 
 import "std/os/io.tn"
 import "std/text/text.tn"
-import "std/gpu/gpu.tn"
+import "std/gpu/metal/gpu.tn"
 
 pure fn px_channel(rgba Bytes, width Int, x Int, y Int, ch Int) Int {
     let offset = (y * width + x) * 4 + ch

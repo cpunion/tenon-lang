@@ -99,10 +99,101 @@ fn load_and_parse(path: &str) -> Result<tenon_syntax::Program, String> {
     load_program_with_imports(Path::new(path))
 }
 
+fn format_rich_diagnostic(file: &str, prog: &tenon_syntax::Program, d: &tenon_verify::Diagnostic) -> String {
+    let mut out = String::new();
+    let diag_file = prog
+        .source_files
+        .get(d.span.file_id as usize)
+        .map(|s| s.as_str())
+        .unwrap_or(file);
+    out.push_str(&format!(
+        "error[{}]: {}\n  --> {}:{}:{}\n",
+        d.code, d.message, diag_file, d.span.line, d.span.col
+    ));
+    if d.span.line > 0 {
+        if let Ok(src) = fs::read_to_string(diag_file) {
+            if let Some(src_line) = src.lines().nth(d.span.line - 1) {
+                let lno = format!("{}", d.span.line);
+                let pad = " ".repeat(lno.len());
+                let col_off = d.span.col.saturating_sub(1);
+                let width = d.span.end.saturating_sub(d.span.start).clamp(1, 32);
+                out.push_str(&format!("  {} |\n", pad));
+                out.push_str(&format!("  {} | {}\n", lno, src_line));
+                out.push_str(&format!("  {} | {}{}\n", pad, " ".repeat(col_off), "^".repeat(width)));
+            }
+        }
+    }
+    for n in &d.notes {
+        out.push_str(&format!("  = note: {}\n", n));
+    }
+    if !d.counterexample.is_empty() {
+        let pairs: Vec<String> = d
+            .counterexample
+            .iter()
+            .map(|(k, v)| format!("{} = {}", k, v))
+            .collect();
+        out.push_str(&format!("  = counterexample: {}\n", pairs.join(", ")));
+    }
+    out
+}
+
+fn emit_sarif_report(file: &str, prog: &tenon_syntax::Program, report: &tenon_verify::CheckReport) -> String {
+    let results: Vec<serde_json::Value> = report
+        .diagnostics
+        .iter()
+        .map(|d| {
+            let diag_file = prog
+                .source_files
+                .get(d.span.file_id as usize)
+                .map(|s| s.as_str())
+                .unwrap_or(file);
+            let mut msg = d.message.clone();
+            if !d.counterexample.is_empty() {
+                let pairs: Vec<String> = d
+                    .counterexample
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect();
+                msg.push_str(&format!(" (counterexample: {})", pairs.join(", ")));
+            }
+            serde_json::json!({
+                "ruleId": d.code,
+                "level": "error",
+                "message": { "text": msg },
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": { "uri": diag_file },
+                        "region": {
+                            "startLine": d.span.line.max(1),
+                            "startColumn": d.span.col.max(1)
+                        }
+                    }
+                }]
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "tenon",
+                    "version": "1.0.0",
+                    "informationUri": "https://github.com/cpunion/tenon-lang"
+                }
+            },
+            "results": results
+        }]
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
+}
+
 fn cmd_check(args: &[String]) -> ExitCode {
     let mut file_opt: Option<&str> = None;
     let mut emit_proofs: Option<PathBuf> = None;
     let mut emit_repro_test: Option<PathBuf> = None;
+    let mut format = "text".to_string();
     let as_json = args.iter().any(|a| a == "--json");
     let mut i = 0usize;
     while i < args.len() {
@@ -115,6 +206,10 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 emit_repro_test = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--format" if i + 1 < args.len() => {
+                format = args[i + 1].clone();
+                i += 2;
+            }
             "--json" => i += 1,
             s if !s.starts_with('-') && file_opt.is_none() => {
                 file_opt = Some(s);
@@ -124,7 +219,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
     }
     let Some(file) = file_opt else {
-        eprintln!("usage: tenon check <file.tn> [--json] [--emit-proofs <dir>] [--emit-repro-test <out.tn>]");
+        eprintln!("usage: tenon check <file.tn> [--json] [--format text|json|sarif] [--emit-proofs <dir>] [--emit-repro-test <out.tn>]");
         return ExitCode::from(2);
     };
 
@@ -159,7 +254,15 @@ fn cmd_check(args: &[String]) -> ExitCode {
             println!("Emitted counterexample regression test -> `{}`", rpath.display());
         }
     }
-    if as_json {
+    if format == "sarif" {
+        println!("{}", emit_sarif_report(file, &prog, &report));
+        return if report.ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
+    }
+    if as_json || format == "json" {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         return if report.ok {
             ExitCode::SUCCESS
@@ -196,16 +299,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
             l1_count
         );
         for d in &report.diagnostics {
-            eprintln!(
-                "  error[{}] {}:{}:{}: {}",
-                d.code, file, d.span.line, d.span.col, d.message
-            );
-            for n in &d.notes {
-                eprintln!("    note: {}", n);
-            }
-            if !d.counterexample.is_empty() {
-                eprintln!("    counterexample: {:?}", d.counterexample);
-            }
+            eprint!("{}", format_rich_diagnostic(file, &prog, d));
         }
     }
 

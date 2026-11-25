@@ -10,7 +10,7 @@
 import "std/os/io.tn"
 import "std/text/text.tn"
 import "std/gpu/tensor.tn"
-import "std/gpu/gpu.tn"
+import "std/gpu/metal/gpu.tn"
 
 @gpu_struct("std430")
 pub record MatMulDims {

@@ -1,7 +1,7 @@
 # Tenon 语言设计与技术方案（已拍板定稿）
 
 > **Working Codename**: `Tenon`（榫卯）—— 寓意**强约束精化类型、分层形式化验证、无别名污染的内存模型、系统级版本演化与可验证分布式协议**严丝合缝。  
-> **状态**: 核心架构已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md) & [ADR-0002](docs/adr/0002-interfaces-comptime-and-stdlib.md)），**极简语言核心 → 完整系统编程能力（S1/S2/S3：精确宽度整数与 `Float32`、`@repr(C)`/`@packed`/`@align`、零分配 `bitfield`、非标签 `union`、`unsafe` 裸指针/volatile、双向 C FFI + `--lib static|shared` + `--emit-header`、真实 OS 多线程/原子/互斥锁/MPMC Channel + MVS `Send` 边界检查 `E0810` + 条件原子 RC、原生 LLVM SIMD 向量 IR、DWARF `-g`、`tenon fmt`）→ Loom 风格目录即包（`tenon.toml`）+ Go/通配/选择性 `import` + `tenon test` 零泄漏测试框架 → 强大元编程系统（`comptime { ... }` / `comptime fn` / `comptime if` / `comptime for` / 声明式与类型化生成宏 `macro` / `gen!(...)` / 编译期反射）→ 高性能网络库（OS `kqueue`/`epoll` Reactor + 多线程 Keep-Alive HTTP/1.1 Server & Client `std/net/`）→ 元编程 Web 框架（`std/web/` + `@get`/`@post` 编译期路由扫描 + 自动 OpenAPI 3.1 + 精化类型 JSON 校验 `examples/web_app/`）→ 原生 LSP 语言服务器（`tenon lsp`）与 VS Code 扩展（`editors/vscode/`）已全部贯通**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 独立原生二进制，核心与多线程基准 0.97x–1.01x C `-O3`，4-worker HTTP/1.1 Keep-Alive 实测 59.6k RPS**）。
+> **状态**: 核心架构已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md)、[ADR-0002](docs/adr/0002-interfaces-comptime-and-stdlib.md) & [ADR-0003](docs/adr/0003-declarative-gpu-and-unified-ui.md)），**极简正交语言核心（零新增硬关键字）→ 完整系统编程能力（S1/S2/S3）→ 声明式 CPU/GPU 融合（`@gpu_struct` / `@kernel` / `@gpu_graph` 自动屏障与算子融合 + 单源 Apple Metal MSL / WebGPU WGSL 编译 + 零 Rust macOS Metal 硬件执行 + 依赖维度 `Tensor2D` 证明）→ OpenUI Lang + 统一 React 风格 VDOM（一份源码渲染 Web Wasm32 + 双缓冲 TUI + 原生 Metal GPU `tenon-gpui` Flexbox/SceneGraph）→ Stage-2 纯 Tenon 零 Rust 自举编译器（Lexer → Parser → L0 区间校验 → LLVM IR）→ 高性能网络/Web/数据库栈 & LSP 1.0**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 独立原生二进制**）。
 > **上游沉淀**: 综合 [`loom-lang`](../loom-lang)（984 PR 自举实践）、[`lang-research`](../lang-research)（2026-11 多语言可复现实验）与 [`dast-os-kernel`](../../dast.ai/dast-os-kernel/README.md)（227 轮分布式调和内核审计），并结合 2025–2026 全球最新编程语言与形式化验证进展形成的全新通用编程语言设计。
 
 ---
@@ -22,12 +22,23 @@ cargo run --bin tenon -- check examples/refinements/advanced_verification.tn --e
 cargo run --bin tenon -- verify-proofs target/proof_certs --solver auto
 cargo run --bin tenon -- build examples/refinements/advanced_verification.tn -o target/adv_ver_bin --opt O3 --checked-overflow --emit-mir target/adv.mir && ./target/adv_ver_bin
 
-# 2b. 生产级 Dogfooding & 自举实战（撮合风控引擎、`@checkfree`+`Decimal64` Go cgo 量化回测静态库、Wasm32 ESM 自动桥接 A2UI 核、Stage-0 词法格式化器 + Stage-1 纯 Tenon 递归下降解析器）
+# 2b. 生产级 Dogfooding、声明式 GPU（Apple Silicon Metal）、OpenUI/VDOM/TUI/GPUI 统一 UI 与 Stage-2 自举编译器
 cargo run --bin tenon -- build examples/dogfood/matching_engine.tn -o target/matching_bin --opt O3 && ./target/matching_bin
 cargo run --bin tenon -- build examples/bootstrap/tenon_lex_fmt.tn -o target/lex_fmt_bin  --opt O3 && ./target/lex_fmt_bin
 cargo run --bin tenon -- build examples/bootstrap/tenon_parser.tn  -o target/parser_bin   --opt O3 --emit-mir target/parser.mir && ./target/parser_bin
-cargo run --bin tenon -- build examples/dogfood/a2ui_wasm_kernel.tn --target wasm32 -o target/a2ui.wasm --emit-ts target/a2ui.d.ts --emit-mjs target/a2ui.mjs
-cargo run --bin tenon -- build examples/dogfood/a2ui_wasm_kernel.tn --target wasm32-wasip2 -o target/a2ui_wasi.wasm
+# Stage-2 纯 Tenon 自举编译器（0% Rust 编译链：Tenon -> LLVM IR -> clang -O3 原生可执行文件！）
+cargo run --bin tenon -- test  examples/bootstrap/stage2/tenon_compiler_test.tn
+cargo run --bin tenon -- build examples/bootstrap/stage2/tenon_compiler.tn -o target/stage2_compiler && ./target/stage2_compiler && clang -O3 /tmp/tenon_stage2_out.ll -o target/bootstrapped && ./target/bootstrapped
+# OpenUI Lang + 统一 React 风格 VDOM（Web Wasm32 + TUI 双缓冲 ANSI + 原生 Metal GPU `tenon-gpui` 三端合一！）
+cargo run --bin tenon -- test  std/ui/ui_test.tn && cargo run --bin tenon -- test std/ui/gpui_test.tn && cargo run --bin tenon -- test std/gpu/tensor_test.tn
+cargo run --bin tenon -- build examples/dogfood/openui_wasm_kernel.tn --target wasm32 -o target/openui.wasm --emit-ts target/openui.d.ts --emit-mjs target/openui.mjs
+cargo run --bin tenon -- build examples/dogfood/openui_tui_demo.tn -o target/openui_tui && ./target/openui_tui
+cargo run --bin tenon -- build examples/dogfood/unified_ui_demo.tn --c-src std/gpu/metal/metal_shim.m -o target/unified_ui && ./target/unified_ui
+# 零 Rust 声明式 GPU（@kernel/@gpu_graph/@gpu_struct -> MSL/WGSL + 真实 Apple Silicon Metal 硬件矩阵计算 & SDF 渲染）
+cargo run --bin tenon -- build examples/dogfood/metal_tensor_demo.tn --emit-msl /tmp/tenon_mlp.metal --emit-wgsl /tmp/tenon_mlp.wgsl --c-src std/gpu/metal/metal_shim.m -o target/metal_tensor && ./target/metal_tensor
+cargo run --bin tenon -- build examples/dogfood/metal_render_demo.tn --c-src std/gpu/metal/metal_shim.m -o target/metal_render && ./target/metal_render
+# Go cgo 量化回测静态库 & SARIF v2.1.0 源码高亮诊断
+cargo run --bin tenon -- check examples/refinements/bad_date.tn --format sarif
 cargo run --bin tenon -- build examples/dogfood/quant_backtest.tn --lib static --emit-header examples/dogfood/go_cgo_demo/quant.h --emit-go examples/dogfood/go_cgo_demo/quant_cgo.go -o examples/dogfood/go_cgo_demo/libquant.a
 # 标准库 / 工具链 CLI：`tenon test`, `tenon doc`, `tenon bench`, `tenon new`, `tenon pkg`
 cargo run --bin tenon -- test std/net && cargo run --bin tenon -- test std/db && cargo run --bin tenon -- test std/sync && cargo run --bin tenon -- test std/stdlib_r3_test.tn && cargo run --bin tenon -- test examples/web_app
