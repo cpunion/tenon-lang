@@ -1,0 +1,1249 @@
+// examples/bootstrap/stage3/tenon_selfhost.tn — Stage-3 True Fixed-Point Self-Hosting Tenon Compiler (0% Rust!)
+//
+// This pure-Tenon compiler compiles ITS OWN ENTIRE SOURCE CODE into LLVM 22 IR (.ll)!
+// Fixed-Point Bootstrap Proof:
+//   1. Stage 2 (built by Rust tenon):
+//      ./target/release/tenon build -o /tmp/tenon_s2 examples/bootstrap/stage3/tenon_selfhost.tn
+//   2. Stage 3 (compiled 100% by Stage 2, 0% Rust!):
+//      TENON_IN=examples/bootstrap/stage3/tenon_selfhost.tn TENON_OUT=/tmp/s3.ll /tmp/tenon_s2
+//      clang -O2 /tmp/s3.ll examples/bootstrap/stage3/stage3_rt.c -o /tmp/tenon_s3
+//   3. Stage 4 (compiled 100% by Stage 3, 0% Rust!):
+//      TENON_IN=examples/bootstrap/stage3/tenon_selfhost.tn TENON_OUT=/tmp/s4.ll /tmp/tenon_s3
+//      clang -O2 /tmp/s4.ll examples/bootstrap/stage3/stage3_rt.c -o /tmp/tenon_s4
+//   4. Fixed-point proof:
+//      shasum -a 256 /tmp/s3.ll /tmp/s4.ll          -> BIT-EXACT IDENTICAL!
+//      shasum -a 256 /tmp/tenon_s3 /tmp/tenon_s4    -> BIT-EXACT IDENTICAL!
+
+import "std/os/io.tn"
+import "std/text/text.tn"
+
+// =========================================================================
+// 1. Lexer
+//    Token kinds:
+//    0=EOF, 1=IDENT, 2=INT, 3=STR, 4=fn, 5=let, 6=var, 7=if, 8=else,
+//    9=while, 10=return, 11=pub, 12=pure, 13=inout, 14=where, 15=import,
+//    16=true, 17=false, 18=break, 19=continue,
+//    20='(', 21=')', 22='{', 23='}', 24='[', 25=']', 26=',', 27='=',
+//    28='+', 29='-', 30='*', 31='/', 32='%', 33='!', 34='&',
+//    40='==', 41='!=', 42='<', 43='<=', 44='>', 45='>=',
+//    46='&&', 47='||', 48='++', 49='+=', 50='-='
+// =========================================================================
+
+pure fn is_alpha(b Int) Bool {
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+pure fn is_digit(b Int) Bool {
+    b >= 48 && b <= 57
+}
+
+pure fn kw_kind(w Text) Int {
+    if w == "fn" { return 4 }
+    if w == "let" { return 5 }
+    if w == "var" { return 6 }
+    if w == "if" { return 7 }
+    if w == "else" { return 8 }
+    if w == "while" { return 9 }
+    if w == "return" { return 10 }
+    if w == "pub" { return 11 }
+    if w == "pure" { return 12 }
+    if w == "inout" { return 13 }
+    if w == "where" { return 14 }
+    if w == "import" { return 15 }
+    if w == "true" { return 16 }
+    if w == "false" { return 17 }
+    if w == "break" { return 18 }
+    if w == "continue" { return 19 }
+    return 1
+}
+
+fn lex_source(src Text, inout tk List[Int], inout tt List[Text], inout tv List[Int]) Int {
+    let n = len(src)
+    var i = 0
+    while i < n {
+        let b = byte_at(src, i) & 255
+        if b == 32 || b == 9 || b == 10 || b == 13 || b == 59 {
+            i += 1
+        } else if b == 47 && i + 1 < n && (byte_at(src, i + 1) & 255) == 47 {
+            while i < n && (byte_at(src, i) & 255) != 10 {
+                i += 1
+            }
+        } else if b == 34 {
+            i += 1
+            let sb = buf_new()
+            while i < n && (byte_at(src, i) & 255) != 34 {
+                let c = byte_at(src, i) & 255
+                if c == 92 && i + 1 < n {
+                    let nc = byte_at(src, i + 1) & 255
+                    if nc == 110 { let _ = buf_push_byte(sb, 10) }
+                    else if nc == 116 { let _ = buf_push_byte(sb, 9) }
+                    else if nc == 114 { let _ = buf_push_byte(sb, 13) }
+                    else { let _ = buf_push_byte(sb, nc) }
+                    i += 2
+                } else {
+                    let _ = buf_push_byte(sb, c)
+                    i += 1
+                }
+            }
+            if i < n { i += 1 }
+            tk = push(tk, 3)
+            tt = push(tt, buf_finish(sb))
+            tv = push(tv, 0)
+        } else if is_alpha(b) {
+            let st = i
+            i += 1
+            while i < n && (is_alpha(byte_at(src, i) & 255) || is_digit(byte_at(src, i) & 255)) {
+                i += 1
+            }
+            let w = str_slice(src, st, i)
+            tk = push(tk, kw_kind(w))
+            tt = push(tt, w)
+            tv = push(tv, 0)
+        } else if is_digit(b) {
+            let st = i
+            var v = 0
+            while i < n && is_digit(byte_at(src, i) & 255) {
+                v = v * 10 + ((byte_at(src, i) & 255) - 48)
+                i += 1
+            }
+            tk = push(tk, 2)
+            tt = push(tt, str_slice(src, st, i))
+            tv = push(tv, v)
+        } else {
+            let nb = if i + 1 < n { byte_at(src, i + 1) & 255 } else { 0 }
+            if b == 61 && nb == 61 {
+                tk = push(tk, 40); tt = push(tt, "=="); tv = push(tv, 0); i += 2
+            } else if b == 33 && nb == 61 {
+                tk = push(tk, 41); tt = push(tt, "!="); tv = push(tv, 0); i += 2
+            } else if b == 60 && nb == 61 {
+                tk = push(tk, 43); tt = push(tt, "<="); tv = push(tv, 0); i += 2
+            } else if b == 62 && nb == 61 {
+                tk = push(tk, 45); tt = push(tt, ">="); tv = push(tv, 0); i += 2
+            } else if b == 38 && nb == 38 {
+                tk = push(tk, 46); tt = push(tt, "&&"); tv = push(tv, 0); i += 2
+            } else if b == 124 && nb == 124 {
+                tk = push(tk, 47); tt = push(tt, "||"); tv = push(tv, 0); i += 2
+            } else if b == 43 && nb == 43 {
+                tk = push(tk, 48); tt = push(tt, "++"); tv = push(tv, 0); i += 2
+            } else if b == 43 && nb == 61 {
+                tk = push(tk, 49); tt = push(tt, "+="); tv = push(tv, 0); i += 2
+            } else if b == 45 && nb == 61 {
+                tk = push(tk, 50); tt = push(tt, "-="); tv = push(tv, 0); i += 2
+            } else {
+                var k = 0
+                if b == 40 { k = 20 }
+                else if b == 41 { k = 21 }
+                else if b == 123 { k = 22 }
+                else if b == 125 { k = 23 }
+                else if b == 91 { k = 24 }
+                else if b == 93 { k = 25 }
+                else if b == 44 { k = 26 }
+                else if b == 61 { k = 27 }
+                else if b == 43 { k = 28 }
+                else if b == 45 { k = 29 }
+                else if b == 42 { k = 30 }
+                else if b == 47 { k = 31 }
+                else if b == 37 { k = 32 }
+                else if b == 33 { k = 33 }
+                else if b == 38 { k = 34 }
+                else if b == 60 { k = 42 }
+                else if b == 62 { k = 44 }
+                tk = push(tk, k)
+                tt = push(tt, str_slice(src, i, i + 1))
+                tv = push(tv, 0)
+                i += 1
+            }
+        }
+    }
+    tk = push(tk, 0)
+    tt = push(tt, "")
+    tv = push(tv, 0)
+    return len(tk)
+}
+
+// =========================================================================
+// 2. Flat Arena AST + Parser (Zero Allocation Cycles, Self-Compilable!)
+//    Expr kinds:
+//      1=INT(ival), 2=STR(str), 3=VAR(str), 4=BIN(str=op, a=lhs, b=rhs),
+//      5=UN(str=op, a=inner), 6=CALL(str=name, a=arg_start, b=arg_cnt),
+//      7=INDEX(a=arr, b=idx), 8=IF(a=cond, b=then_expr, c=else_expr),
+//      9=EMPTY_LIST
+//    Stmt kinds:
+//      1=LET(str=name, a=expr, b=ty_kind), 2=ASSIGN(str=name, a=expr),
+//      3=IDX_ASSIGN(str=name, a=idx_expr, b=val_expr),
+//      4=IF(a=cond, b=then_head, c=else_head),
+//      5=WHILE(a=cond, b=body_head), 6=RETURN(a=expr),
+//      7=EXPR(a=expr), 8=BREAK, 9=CONTINUE
+//    Type kinds: 0=Int/Bool, 1=Text, 2=List[Int], 3=List[Text]
+// =========================================================================
+
+pure fn pk(tk List[Int], pos Int) Int {
+    if pos >= 0 && pos < len(tk) { return tk[pos] }
+    return 0
+}
+
+pure fn pt(tt List[Text], pos Int) Text {
+    if pos >= 0 && pos < len(tt) { return tt[pos] }
+    return ""
+}
+
+pure fn pv(tv List[Int], pos Int) Int {
+    if pos >= 0 && pos < len(tv) { return tv[pos] }
+    return 0
+}
+
+fn add_expr(
+    inout ek List[Int], inout ei List[Int], inout es List[Text],
+    inout ea List[Int], inout eb List[Int], inout ec List[Int],
+    k Int, iv Int, s Text, a Int, b Int, c Int,
+) Int {
+    let id = len(ek)
+    ek = push(ek, k)
+    ei = push(ei, iv)
+    es = push(es, s)
+    ea = push(ea, a)
+    eb = push(eb, b)
+    ec = push(ec, c)
+    return id
+}
+
+fn add_stmt(
+    inout sk List[Int], inout ss List[Text],
+    inout sa List[Int], inout sb List[Int], inout sc List[Int], inout sn List[Int],
+    k Int, s Text, a Int, b Int, c Int,
+) Int {
+    let id = len(sk)
+    sk = push(sk, k)
+    ss = push(ss, s)
+    sa = push(sa, a)
+    sb = push(sb, b)
+    sc = push(sc, c)
+    sn = push(sn, -1)
+    return id
+}
+
+fn parse_type_kind(tk List[Int], tt List[Text], inout pos Int) Int {
+    let tname = pt(tt, pos)
+    pos += 1
+    if tname == "Text" { return 1 }
+    if tname == "List" && pk(tk, pos) == 24 {
+        pos += 1
+        let elem = pt(tt, pos)
+        pos += 1
+        if pk(tk, pos) == 25 { pos += 1 }
+        if elem == "Text" { return 3 }
+        return 2
+    }
+    return 0
+}
+
+fn parse_primary(
+    tk List[Int], tt List[Text], tv List[Int], inout pos Int,
+    inout ek List[Int], inout ei List[Int], inout es List[Text],
+    inout ea List[Int], inout eb List[Int], inout ec List[Int],
+    inout call_args List[Int],
+) Int {
+    let k = pk(tk, pos)
+    if k == 2 {
+        let v = pv(tv, pos)
+        pos += 1
+        return add_expr(ek, ei, es, ea, eb, ec, 1, v, "", 0, 0, 0)
+    }
+    if k == 16 {
+        pos += 1
+        return add_expr(ek, ei, es, ea, eb, ec, 1, 1, "", 0, 0, 0)
+    }
+    if k == 17 {
+        pos += 1
+        return add_expr(ek, ei, es, ea, eb, ec, 1, 0, "", 0, 0, 0)
+    }
+    if k == 3 {
+        let s = pt(tt, pos)
+        pos += 1
+        return add_expr(ek, ei, es, ea, eb, ec, 2, 0, s, 0, 0, 0)
+    }
+    if k == 24 && pk(tk, pos + 1) == 25 {
+        pos += 2
+        return add_expr(ek, ei, es, ea, eb, ec, 9, 0, "", 0, 0, 0)
+    }
+    if k == 29 {
+        pos += 1
+        let inner = parse_primary(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        return add_expr(ek, ei, es, ea, eb, ec, 5, 0, "-", inner, 0, 0)
+    }
+    if k == 33 {
+        pos += 1
+        let inner = parse_primary(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        return add_expr(ek, ei, es, ea, eb, ec, 5, 0, "!", inner, 0, 0)
+    }
+    if k == 20 {
+        pos += 1
+        let e = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        if pk(tk, pos) == 21 { pos += 1 }
+        return e
+    }
+    if k == 7 {
+        // Value-producing `if c { a } else { b }` expression
+        pos += 1
+        let cond = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        if pk(tk, pos) == 22 { pos += 1 }
+        let te = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        if pk(tk, pos) == 23 { pos += 1 }
+        var ee = add_expr(ek, ei, es, ea, eb, ec, 1, 0, "", 0, 0, 0)
+        if pk(tk, pos) == 8 {
+            pos += 1
+            if pk(tk, pos) == 7 {
+                ee = parse_primary(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            } else {
+                if pk(tk, pos) == 22 { pos += 1 }
+                ee = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+                if pk(tk, pos) == 23 { pos += 1 }
+            }
+        }
+        return add_expr(ek, ei, es, ea, eb, ec, 8, 0, "", cond, te, ee)
+    }
+    if k == 1 {
+        let nm = pt(tt, pos)
+        pos += 1
+        var node = 0
+        if pk(tk, pos) == 20 {
+            pos += 1
+            var local_args List[Int] = []
+            while pk(tk, pos) != 21 && pk(tk, pos) != 0 {
+                let ae = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+                local_args = push(local_args, ae)
+                if pk(tk, pos) == 26 { pos += 1 }
+            }
+            if pk(tk, pos) == 21 { pos += 1 }
+            let astart = len(call_args)
+            var ai = 0
+            while ai < len(local_args) {
+                call_args = push(call_args, local_args[ai])
+                ai += 1
+            }
+            node = add_expr(ek, ei, es, ea, eb, ec, 6, 0, nm, astart, len(local_args), 0)
+        } else {
+            node = add_expr(ek, ei, es, ea, eb, ec, 3, 0, nm, 0, 0, 0)
+        }
+        while pk(tk, pos) == 24 {
+            pos += 1
+            let idx = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            if pk(tk, pos) == 25 { pos += 1 }
+            node = add_expr(ek, ei, es, ea, eb, ec, 7, 0, "", node, idx, 0)
+        }
+        return node
+    }
+    return add_expr(ek, ei, es, ea, eb, ec, 1, 0, "", 0, 0, 0)
+}
+
+fn parse_mul(
+    tk List[Int], tt List[Text], tv List[Int], inout pos Int,
+    inout ek List[Int], inout ei List[Int], inout es List[Text],
+    inout ea List[Int], inout eb List[Int], inout ec List[Int],
+    inout call_args List[Int],
+) Int {
+    var lhs = parse_primary(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+    while pk(tk, pos) == 30 || pk(tk, pos) == 31 || pk(tk, pos) == 32 || pk(tk, pos) == 34 {
+        let op = pt(tt, pos)
+        pos += 1
+        let rhs = parse_primary(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        lhs = add_expr(ek, ei, es, ea, eb, ec, 4, 0, op, lhs, rhs, 0)
+    }
+    return lhs
+}
+
+fn parse_add(
+    tk List[Int], tt List[Text], tv List[Int], inout pos Int,
+    inout ek List[Int], inout ei List[Int], inout es List[Text],
+    inout ea List[Int], inout eb List[Int], inout ec List[Int],
+    inout call_args List[Int],
+) Int {
+    var lhs = parse_mul(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+    while pk(tk, pos) == 28 || pk(tk, pos) == 29 || pk(tk, pos) == 48 {
+        let op = pt(tt, pos)
+        pos += 1
+        let rhs = parse_mul(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        lhs = add_expr(ek, ei, es, ea, eb, ec, 4, 0, op, lhs, rhs, 0)
+    }
+    return lhs
+}
+
+fn parse_cmp(
+    tk List[Int], tt List[Text], tv List[Int], inout pos Int,
+    inout ek List[Int], inout ei List[Int], inout es List[Text],
+    inout ea List[Int], inout eb List[Int], inout ec List[Int],
+    inout call_args List[Int],
+) Int {
+    var lhs = parse_add(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+    let k = pk(tk, pos)
+    if k >= 40 && k <= 45 {
+        let op = pt(tt, pos)
+        pos += 1
+        let rhs = parse_add(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        lhs = add_expr(ek, ei, es, ea, eb, ec, 4, 0, op, lhs, rhs, 0)
+    }
+    return lhs
+}
+
+fn parse_and(
+    tk List[Int], tt List[Text], tv List[Int], inout pos Int,
+    inout ek List[Int], inout ei List[Int], inout es List[Text],
+    inout ea List[Int], inout eb List[Int], inout ec List[Int],
+    inout call_args List[Int],
+) Int {
+    var lhs = parse_cmp(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+    while pk(tk, pos) == 46 {
+        pos += 1
+        let rhs = parse_cmp(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        lhs = add_expr(ek, ei, es, ea, eb, ec, 4, 0, "&&", lhs, rhs, 0)
+    }
+    return lhs
+}
+
+fn parse_or(
+    tk List[Int], tt List[Text], tv List[Int], inout pos Int,
+    inout ek List[Int], inout ei List[Int], inout es List[Text],
+    inout ea List[Int], inout eb List[Int], inout ec List[Int],
+    inout call_args List[Int],
+) Int {
+    var lhs = parse_and(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+    while pk(tk, pos) == 47 {
+        pos += 1
+        let rhs = parse_and(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        lhs = add_expr(ek, ei, es, ea, eb, ec, 4, 0, "||", lhs, rhs, 0)
+    }
+    return lhs
+}
+
+fn parse_block(
+    tk List[Int], tt List[Text], tv List[Int], inout pos Int,
+    inout ek List[Int], inout ei List[Int], inout es List[Text],
+    inout ea List[Int], inout eb List[Int], inout ec List[Int],
+    inout call_args List[Int],
+    inout sk List[Int], inout ss List[Text],
+    inout sa List[Int], inout sb List[Int], inout sc List[Int], inout sn List[Int],
+) Int {
+    if pk(tk, pos) == 22 { pos += 1 }
+    var head = -1
+    var tail = -1
+    while pk(tk, pos) != 23 && pk(tk, pos) != 0 {
+        let k = pk(tk, pos)
+        var sid = -1
+        if k == 5 || k == 6 {
+            pos += 1
+            let nm = pt(tt, pos)
+            pos += 1
+            var tyk = -1
+            if pk(tk, pos) == 1 {
+                tyk = parse_type_kind(tk, tt, pos)
+            }
+            if pk(tk, pos) == 27 { pos += 1 }
+            let val = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            sid = add_stmt(sk, ss, sa, sb, sc, sn, 1, nm, val, tyk, 0)
+        } else if k == 10 {
+            pos += 1
+            let val = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            sid = add_stmt(sk, ss, sa, sb, sc, sn, 6, "", val, 0, 0)
+        } else if k == 18 {
+            pos += 1
+            sid = add_stmt(sk, ss, sa, sb, sc, sn, 8, "", 0, 0, 0)
+        } else if k == 19 {
+            pos += 1
+            sid = add_stmt(sk, ss, sa, sb, sc, sn, 9, "", 0, 0, 0)
+        } else if k == 9 {
+            pos += 1
+            let cond = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            let body = parse_block(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn)
+            sid = add_stmt(sk, ss, sa, sb, sc, sn, 5, "", cond, body, 0)
+        } else if k == 7 {
+            pos += 1
+            let cond = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            let tb = parse_block(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn)
+            var eb_h = -1
+            if pk(tk, pos) == 8 {
+                pos += 1
+                if pk(tk, pos) == 7 {
+                    // `else if` -> parse single nested If statement
+                    pos += 1
+                    let c2 = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+                    let t2 = parse_block(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn)
+                    var e2 = -1
+                    if pk(tk, pos) == 8 {
+                        pos += 1
+                        if pk(tk, pos) == 7 {
+                            // General `else if` chain handled via helper
+                            e2 = parse_else_if_chain(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn)
+                        } else {
+                            e2 = parse_block(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn)
+                        }
+                    }
+                    eb_h = add_stmt(sk, ss, sa, sb, sc, sn, 4, "", c2, t2, e2)
+                } else {
+                    eb_h = parse_block(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn)
+                }
+            }
+            sid = add_stmt(sk, ss, sa, sb, sc, sn, 4, "", cond, tb, eb_h)
+        } else if k == 1 && (pk(tk, pos + 1) == 27 || pk(tk, pos + 1) == 49 || pk(tk, pos + 1) == 50) {
+            let nm = pt(tt, pos)
+            let opk = pk(tk, pos + 1)
+            pos += 2
+            let rhs = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            var val = rhs
+            if opk == 49 {
+                let lv = add_expr(ek, ei, es, ea, eb, ec, 3, 0, nm, 0, 0, 0)
+                val = add_expr(ek, ei, es, ea, eb, ec, 4, 0, "+", lv, rhs, 0)
+            } else if opk == 50 {
+                let lv = add_expr(ek, ei, es, ea, eb, ec, 3, 0, nm, 0, 0, 0)
+                val = add_expr(ek, ei, es, ea, eb, ec, 4, 0, "-", lv, rhs, 0)
+            }
+            sid = add_stmt(sk, ss, sa, sb, sc, sn, 2, nm, val, 0, 0)
+        } else if k == 1 && pk(tk, pos + 1) == 24 {
+            // Check `arr[idx] = val` vs expression statement
+            let save_pos = pos
+            let nm = pt(tt, pos)
+            pos += 2
+            let idx = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            if pk(tk, pos) == 25 && pk(tk, pos + 1) == 27 {
+                pos += 2
+                let val = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+                sid = add_stmt(sk, ss, sa, sb, sc, sn, 3, nm, idx, val, 0)
+            } else {
+                pos = save_pos
+                let e = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+                let skind = if pk(tk, pos) == 23 { 6 } else { 7 }
+                sid = add_stmt(sk, ss, sa, sb, sc, sn, skind, "", e, 0, 0)
+            }
+        } else {
+            let e = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            let skind = if pk(tk, pos) == 23 { 6 } else { 7 }
+            sid = add_stmt(sk, ss, sa, sb, sc, sn, skind, "", e, 0, 0)
+        }
+        if head == -1 {
+            head = sid
+        } else {
+            sn[tail] = sid
+        }
+        tail = sid
+    }
+    if pk(tk, pos) == 23 { pos += 1 }
+    return head
+}
+
+fn parse_else_if_chain(
+    tk List[Int], tt List[Text], tv List[Int], inout pos Int,
+    inout ek List[Int], inout ei List[Int], inout es List[Text],
+    inout ea List[Int], inout eb List[Int], inout ec List[Int],
+    inout call_args List[Int],
+    inout sk List[Int], inout ss List[Text],
+    inout sa List[Int], inout sb List[Int], inout sc List[Int], inout sn List[Int],
+) Int {
+    pos += 1 // consume 'if'
+    let cond = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+    let tb = parse_block(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn)
+    var eb_h = -1
+    if pk(tk, pos) == 8 {
+        pos += 1
+        if pk(tk, pos) == 7 {
+            eb_h = parse_else_if_chain(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn)
+        } else {
+            eb_h = parse_block(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn)
+        }
+    }
+    return add_stmt(sk, ss, sa, sb, sc, sn, 4, "", cond, tb, eb_h)
+}
+
+// =========================================================================
+// 3. L0 Interval & Division-by-Zero Static Verifier (Pure Tenon!)
+// =========================================================================
+
+pure fn lookup_int_env(names List[Text], vals List[Int], target Text, default_v Int) Int {
+    var i = len(names) - 1
+    while i >= 0 {
+        if names[i] == target { return vals[i] }
+        i -= 1
+    }
+    return default_v
+}
+
+pure fn eval_lo(
+    id Int, ek List[Int], ei List[Int], es List[Text], ea List[Int], eb List[Int],
+    en List[Text], elo List[Int], ehi List[Int],
+) Int {
+    let k = ek[id]
+    if k == 1 { return ei[id] }
+    if k == 3 { return lookup_int_env(en, elo, es[id], -1000000) }
+    if k == 4 {
+        let op = es[id]
+        let l1 = eval_lo(ea[id], ek, ei, es, ea, eb, en, elo, ehi)
+        let r1 = eval_lo(eb[id], ek, ei, es, ea, eb, en, elo, ehi)
+        let r2 = eval_hi(eb[id], ek, ei, es, ea, eb, en, elo, ehi)
+        if op == "+" { return l1 + r1 }
+        if op == "-" { return l1 - r2 }
+    }
+    return -1000000
+}
+
+pure fn eval_hi(
+    id Int, ek List[Int], ei List[Int], es List[Text], ea List[Int], eb List[Int],
+    en List[Text], elo List[Int], ehi List[Int],
+) Int {
+    let k = ek[id]
+    if k == 1 { return ei[id] }
+    if k == 3 { return lookup_int_env(en, ehi, es[id], 1000000) }
+    if k == 4 {
+        let op = es[id]
+        let l2 = eval_hi(ea[id], ek, ei, es, ea, eb, en, elo, ehi)
+        let r1 = eval_lo(eb[id], ek, ei, es, ea, eb, en, elo, ehi)
+        let r2 = eval_hi(eb[id], ek, ei, es, ea, eb, en, elo, ehi)
+        if op == "+" { return l2 + r2 }
+        if op == "-" { return l2 - r1 }
+    }
+    return 1000000
+}
+
+pure fn check_div_expr(
+    id Int, ek List[Int], ei List[Int], es List[Text], ea List[Int], eb List[Int], ec List[Int],
+    call_args List[Int], en List[Text], elo List[Int], ehi List[Int],
+) Text {
+    let k = ek[id]
+    if k == 4 {
+        let e1 = check_div_expr(ea[id], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+        if len(e1) > 0 { return e1 }
+        let e2 = check_div_expr(eb[id], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+        if len(e2) > 0 { return e2 }
+        if es[id] == "/" || es[id] == "%" {
+            let rlo = eval_lo(eb[id], ek, ei, es, ea, eb, en, elo, ehi)
+            let rhi = eval_hi(eb[id], ek, ei, es, ea, eb, en, elo, ehi)
+            if rlo <= 0 && rhi >= 0 {
+                return "E0401: unproved division by zero"
+            }
+        }
+    } else if k == 5 {
+        return check_div_expr(ea[id], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+    } else if k == 6 {
+        var i = 0
+        while i < eb[id] {
+            let e = check_div_expr(call_args[ea[id] + i], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+            if len(e) > 0 { return e }
+            i += 1
+        }
+    } else if k == 7 {
+        let e1 = check_div_expr(ea[id], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+        if len(e1) > 0 { return e1 }
+        return check_div_expr(eb[id], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+    } else if k == 8 {
+        let e1 = check_div_expr(ea[id], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+        if len(e1) > 0 { return e1 }
+        let e2 = check_div_expr(eb[id], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+        if len(e2) > 0 { return e2 }
+        return check_div_expr(ec[id], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+    }
+    return ""
+}
+
+fn verify_stmt_list(
+    head Int, ek List[Int], ei List[Int], es List[Text], ea List[Int], eb List[Int], ec List[Int],
+    call_args List[Int],
+    sk List[Int], ss List[Text], sa List[Int], sb List[Int], sc List[Int], sn List[Int],
+    inout en List[Text], inout elo List[Int], inout ehi List[Int],
+) Text {
+    var cur = head
+    while cur != -1 {
+        let k = sk[cur]
+        if k == 1 {
+            let err = check_div_expr(sa[cur], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+            if len(err) > 0 { return err }
+            let lo = eval_lo(sa[cur], ek, ei, es, ea, eb, en, elo, ehi)
+            let hi = eval_hi(sa[cur], ek, ei, es, ea, eb, en, elo, ehi)
+            en = push(en, ss[cur]); elo = push(elo, lo); ehi = push(ehi, hi)
+        } else if k == 2 || k == 6 || k == 7 {
+            let err = check_div_expr(sa[cur], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+            if len(err) > 0 { return err }
+            if k == 2 {
+                en = push(en, ss[cur]); elo = push(elo, -1000000); ehi = push(ehi, 1000000)
+            }
+        } else if k == 4 {
+            let e0 = check_div_expr(sa[cur], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+            if len(e0) > 0 { return e0 }
+            let e1 = verify_stmt_list(sb[cur], ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn, en, elo, ehi)
+            if len(e1) > 0 { return e1 }
+            let e2 = verify_stmt_list(sc[cur], ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn, en, elo, ehi)
+            if len(e2) > 0 { return e2 }
+        } else if k == 5 {
+            let e0 = check_div_expr(sa[cur], ek, ei, es, ea, eb, ec, call_args, en, elo, ehi)
+            if len(e0) > 0 { return e0 }
+            let e1 = verify_stmt_list(sb[cur], ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn, en, elo, ehi)
+            if len(e1) > 0 { return e1 }
+        }
+        cur = sn[cur]
+    }
+    return ""
+}
+
+// =========================================================================
+// 4. LLVM 22 IR Code Generator (Pure Tenon -> Real Native ARM64 Binary!)
+// =========================================================================
+
+pure fn find_fn_idx(fn_names List[Text], nm Text) Int {
+    var i = 0
+    while i < len(fn_names) {
+        if fn_names[i] == nm { return i }
+        i += 1
+    }
+    return -1
+}
+
+pure fn find_var_idx(vnames List[Text], nm Text) Int {
+    var i = len(vnames) - 1
+    while i >= 0 {
+        if vnames[i] == nm { return i }
+        i -= 1
+    }
+    return -1
+}
+
+pure fn infer_expr_ty(
+    id Int, ek List[Int], es List[Text], ea List[Int], eb List[Int], ec List[Int],
+    fn_names List[Text], fn_rty List[Int],
+    vnames List[Text], vty List[Int],
+) Int {
+    let k = ek[id]
+    if k == 2 { return 1 }
+    if k == 9 { return 2 }
+    if k == 3 {
+        let vi = find_var_idx(vnames, es[id])
+        if vi >= 0 { return vty[vi] }
+        return 0
+    }
+    if k == 4 {
+        if es[id] == "++" { return 1 }
+        return 0
+    }
+    if k == 6 {
+        let cn = es[id]
+        if cn == "str_slice" || cn == "int_to_text" || cn == "buf_finish" || cn == "sys_read_file" || cn == "sys_env" {
+            return 1
+        }
+        let fi = find_fn_idx(fn_names, cn)
+        if fi >= 0 { return fn_rty[fi] }
+        return 0
+    }
+    if k == 7 {
+        let aty = infer_expr_ty(ea[id], ek, es, ea, eb, ec, fn_names, fn_rty, vnames, vty)
+        if aty == 3 { return 1 }
+        return 0
+    }
+    if k == 8 {
+        return infer_expr_ty(eb[id], ek, es, ea, eb, ec, fn_names, fn_rty, vnames, vty)
+    }
+    return 0
+}
+
+pure fn hex_digit(n Int) Int {
+    if n < 10 { return 48 + n }
+    return 65 + (n - 10)
+}
+
+fn push_llvm_escaped_str(buf Int, s Text) Int {
+    let n = len(s)
+    var i = 0
+    while i < n {
+        let b = byte_at(s, i) & 255
+        if b >= 32 && b < 127 && b != 34 && b != 92 {
+            let _ = buf_push_byte(buf, b)
+        } else {
+            let _ = buf_push_byte(buf, 92)
+            let _ = buf_push_byte(buf, hex_digit(b / 16))
+            let _ = buf_push_byte(buf, hex_digit(b % 16))
+        }
+        i += 1
+    }
+    let _ = buf_push_str(buf, "\\00")
+    return 0
+}
+
+fn emit_expr_ir(
+    id Int, ir_buf Int, inout rseq Int, inout lseq Int,
+    ek List[Int], ei List[Int], es List[Text], ea List[Int], eb List[Int], ec List[Int],
+    call_args List[Int],
+    fn_names List[Text], fn_pstart List[Int], fn_pcnt List[Int], fn_rty List[Int],
+    p_inout List[Int],
+    vnames List[Text], vty List[Int],
+    inout str_lits List[Text],
+) Text {
+    let k = ek[id]
+    if k == 1 {
+        return int_to_text(ei[id])
+    }
+    if k == 2 {
+        let sid = len(str_lits)
+        str_lits = push(str_lits, es[id])
+        let dst = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = call i64 @s3_str_from_cstr(ptr @.str." ++ int_to_text(sid) ++ ", i64 " ++ int_to_text(len(es[id])) ++ ")\n")
+        return dst
+    }
+    if k == 9 {
+        let dst = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = call i64 @s3_list_new()\n")
+        return dst
+    }
+    if k == 3 {
+        let dst = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = load i64, ptr %var_" ++ es[id] ++ ", align 8\n")
+        return dst
+    }
+    if k == 5 {
+        let iv = emit_expr_ir(ea[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+        let dst = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        if es[id] == "-" {
+            let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = sub i64 0, " ++ iv ++ "\n")
+        } else {
+            let c1 = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ c1 ++ " = icmp eq i64 " ++ iv ++ ", 0\n")
+            let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = zext i1 " ++ c1 ++ " to i64\n")
+        }
+        return dst
+    }
+    if k == 7 {
+        let av = emit_expr_ir(ea[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+        let iv = emit_expr_ir(eb[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+        let dst = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = call i64 @s3_list_get(i64 " ++ av ++ ", i64 " ++ iv ++ ")\n")
+        return dst
+    }
+    if k == 8 {
+        let l_t = "ife_t_" ++ int_to_text(lseq)
+        let l_e = "ife_e_" ++ int_to_text(lseq)
+        let l_m = "ife_m_" ++ int_to_text(lseq)
+        let res_slot = "%ife_r_" ++ int_to_text(lseq)
+        lseq += 1
+        let _ = buf_push_str(ir_buf, "  " ++ res_slot ++ " = alloca i64, align 8\n")
+        let cv = emit_expr_ir(ea[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+        let c1 = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        let _ = buf_push_str(ir_buf, "  " ++ c1 ++ " = icmp ne i64 " ++ cv ++ ", 0\n  br i1 " ++ c1 ++ ", label %" ++ l_t ++ ", label %" ++ l_e ++ "\n" ++ l_t ++ ":\n")
+        let tv = emit_expr_ir(eb[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+        let _ = buf_push_str(ir_buf, "  store i64 " ++ tv ++ ", ptr " ++ res_slot ++ ", align 8\n  br label %" ++ l_m ++ "\n" ++ l_e ++ ":\n")
+        let ev = emit_expr_ir(ec[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+        let _ = buf_push_str(ir_buf, "  store i64 " ++ ev ++ ", ptr " ++ res_slot ++ ", align 8\n  br label %" ++ l_m ++ "\n" ++ l_m ++ ":\n")
+        let dst = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = load i64, ptr " ++ res_slot ++ ", align 8\n")
+        return dst
+    }
+    if k == 4 {
+        let op = es[id]
+        if op == "&&" || op == "||" {
+            let l_rhs = "sc_rhs_" ++ int_to_text(lseq)
+            let l_end = "sc_end_" ++ int_to_text(lseq)
+            let slot = "%sc_s_" ++ int_to_text(lseq)
+            lseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ slot ++ " = alloca i64, align 8\n")
+            let lv = emit_expr_ir(ea[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let c1 = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ c1 ++ " = icmp ne i64 " ++ lv ++ ", 0\n")
+            if op == "&&" {
+                let _ = buf_push_str(ir_buf, "  store i64 0, ptr " ++ slot ++ ", align 8\n  br i1 " ++ c1 ++ ", label %" ++ l_rhs ++ ", label %" ++ l_end ++ "\n")
+            } else {
+                let _ = buf_push_str(ir_buf, "  store i64 1, ptr " ++ slot ++ ", align 8\n  br i1 " ++ c1 ++ ", label %" ++ l_end ++ ", label %" ++ l_rhs ++ "\n")
+            }
+            let _ = buf_push_str(ir_buf, l_rhs ++ ":\n")
+            let rv = emit_expr_ir(eb[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let c2 = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let z2 = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ c2 ++ " = icmp ne i64 " ++ rv ++ ", 0\n  " ++ z2 ++ " = zext i1 " ++ c2 ++ " to i64\n  store i64 " ++ z2 ++ ", ptr " ++ slot ++ ", align 8\n  br label %" ++ l_end ++ "\n" ++ l_end ++ ":\n")
+            let dst = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = load i64, ptr " ++ slot ++ ", align 8\n")
+            return dst
+        }
+        let lv = emit_expr_ir(ea[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+        let rv = emit_expr_ir(eb[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+        let dst = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        if op == "++" {
+            let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = call i64 @s3_str_concat(i64 " ++ lv ++ ", i64 " ++ rv ++ ")\n")
+        } else if op == "+" {
+            let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = add i64 " ++ lv ++ ", " ++ rv ++ "\n")
+        } else if op == "-" {
+            let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = sub i64 " ++ lv ++ ", " ++ rv ++ "\n")
+        } else if op == "*" {
+            let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = mul i64 " ++ lv ++ ", " ++ rv ++ "\n")
+        } else if op == "/" {
+            let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = sdiv i64 " ++ lv ++ ", " ++ rv ++ "\n")
+        } else if op == "%" {
+            let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = srem i64 " ++ lv ++ ", " ++ rv ++ "\n")
+        } else if op == "&" {
+            let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = and i64 " ++ lv ++ ", " ++ rv ++ "\n")
+        } else if op == "==" || op == "!=" {
+            let lt = infer_expr_ty(ea[id], ek, es, ea, eb, ec, fn_names, fn_rty, vnames, vty)
+            let rt = infer_expr_ty(eb[id], ek, es, ea, eb, ec, fn_names, fn_rty, vnames, vty)
+            if lt == 1 || rt == 1 {
+                if op == "==" {
+                    let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = call i64 @s3_str_eq(i64 " ++ lv ++ ", i64 " ++ rv ++ ")\n")
+                } else {
+                    let eqr = "%t" ++ int_to_text(rseq)
+                    rseq += 1
+                    let _ = buf_push_str(ir_buf, "  " ++ eqr ++ " = call i64 @s3_str_eq(i64 " ++ lv ++ ", i64 " ++ rv ++ ")\n  " ++ dst ++ " = xor i64 " ++ eqr ++ ", 1\n")
+                }
+            } else {
+                let pred = if op == "==" { "eq" } else { "ne" }
+                let cmp = "%t" ++ int_to_text(rseq)
+                rseq += 1
+                let _ = buf_push_str(ir_buf, "  " ++ cmp ++ " = icmp " ++ pred ++ " i64 " ++ lv ++ ", " ++ rv ++ "\n  " ++ dst ++ " = zext i1 " ++ cmp ++ " to i64\n")
+            }
+        } else {
+            var pred = "sge"
+            if op == "<" { pred = "slt" }
+            else if op == "<=" { pred = "sle" }
+            else if op == ">" { pred = "sgt" }
+            let cmp = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ cmp ++ " = icmp " ++ pred ++ " i64 " ++ lv ++ ", " ++ rv ++ "\n  " ++ dst ++ " = zext i1 " ++ cmp ++ " to i64\n")
+        }
+        return dst
+    }
+    if k == 6 {
+        let cn = es[id]
+        let astart = ea[id]
+        let acnt = eb[id]
+        var target_sym = "@s3_" ++ cn
+        let fi = find_fn_idx(fn_names, cn)
+        if cn == "len" { target_sym = "@s3_len" }
+        else if cn == "byte_at" { target_sym = "@s3_byte_at" }
+        else if cn == "str_slice" { target_sym = "@s3_str_slice" }
+        else if cn == "int_to_text" { target_sym = "@s3_int_to_text" }
+        else if cn == "push" { target_sym = "@s3_list_push" }
+        else if cn == "buf_new" { target_sym = "@s3_buf_new" }
+        else if cn == "buf_push_str" { target_sym = "@s3_buf_push_str" }
+        else if cn == "buf_push_byte" { target_sym = "@s3_buf_push_byte" }
+        else if cn == "buf_finish" { target_sym = "@s3_buf_finish" }
+        else if cn == "println" { target_sym = "@s3_println" }
+        else if cn == "sys_read_file" { target_sym = "@s3_read_file" }
+        else if cn == "sys_write_file" { target_sym = "@s3_write_file" }
+        else if cn == "sys_env" { target_sym = "@s3_env" }
+
+        let ab = buf_new()
+        var ai = 0
+        while ai < acnt {
+            if ai > 0 { let _ = buf_push_str(ab, ", ") }
+            let aexpr = call_args[astart + ai]
+            let is_io = if fi >= 0 && ai < fn_pcnt[fi] { p_inout[fn_pstart[fi] + ai] == 1 } else { false }
+            if is_io {
+                let _ = buf_push_str(ab, "ptr %var_" ++ es[aexpr])
+            } else {
+                let av = emit_expr_ir(aexpr, ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+                let _ = buf_push_str(ab, "i64 " ++ av)
+            }
+            ai += 1
+        }
+        let dst = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = call i64 " ++ target_sym ++ "(" ++ buf_finish(ab) ++ ")\n")
+        return dst
+    }
+    return "0"
+}
+
+fn emit_stmt_list_ir(
+    head Int, alloca_buf Int, ir_buf Int, inout rseq Int, inout lseq Int,
+    ek List[Int], ei List[Int], es List[Text], ea List[Int], eb List[Int], ec List[Int],
+    call_args List[Int],
+    sk List[Int], ss List[Text], sa List[Int], sb List[Int], sc List[Int], sn List[Int],
+    fn_names List[Text], fn_pstart List[Int], fn_pcnt List[Int], fn_rty List[Int],
+    p_inout List[Int],
+    inout vnames List[Text], inout vty List[Int],
+    inout str_lits List[Text],
+    brk_lbl Text, cont_lbl Text,
+) Bool {
+    var cur = head
+    var term = false
+    while cur != -1 && !term {
+        let k = sk[cur]
+        if k == 1 {
+            let v = emit_expr_ir(sa[cur], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let nm = ss[cur]
+            if nm != "_" {
+                let tyk = if sb[cur] >= 0 { sb[cur] } else { infer_expr_ty(sa[cur], ek, es, ea, eb, ec, fn_names, fn_rty, vnames, vty) }
+                if find_var_idx(vnames, nm) < 0 {
+                    let _ = buf_push_str(alloca_buf, "  %var_" ++ nm ++ " = alloca i64, align 8\n")
+                    vnames = push(vnames, nm)
+                    vty = push(vty, tyk)
+                }
+                let _ = buf_push_str(ir_buf, "  store i64 " ++ v ++ ", ptr %var_" ++ nm ++ ", align 8\n")
+            }
+        } else if k == 2 {
+            let v = emit_expr_ir(sa[cur], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let _ = buf_push_str(ir_buf, "  store i64 " ++ v ++ ", ptr %var_" ++ ss[cur] ++ ", align 8\n")
+        } else if k == 3 {
+            let iv = emit_expr_ir(sa[cur], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let vv = emit_expr_ir(sb[cur], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let lv = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let nv = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ lv ++ " = load i64, ptr %var_" ++ ss[cur] ++ ", align 8\n  " ++ nv ++ " = call i64 @s3_list_set(i64 " ++ lv ++ ", i64 " ++ iv ++ ", i64 " ++ vv ++ ")\n")
+        } else if k == 6 {
+            let v = emit_expr_ir(sa[cur], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let _ = buf_push_str(ir_buf, "  ret i64 " ++ v ++ "\n")
+            term = true
+        } else if k == 7 {
+            let _ = emit_expr_ir(sa[cur], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+        } else if k == 8 {
+            let _ = buf_push_str(ir_buf, "  br label %" ++ brk_lbl ++ "\n")
+            term = true
+        } else if k == 9 {
+            let _ = buf_push_str(ir_buf, "  br label %" ++ cont_lbl ++ "\n")
+            term = true
+        } else if k == 5 {
+            let l_c = "wc_" ++ int_to_text(lseq)
+            let l_b = "wb_" ++ int_to_text(lseq)
+            let l_e = "we_" ++ int_to_text(lseq)
+            lseq += 1
+            let _ = buf_push_str(ir_buf, "  br label %" ++ l_c ++ "\n" ++ l_c ++ ":\n")
+            let cv = emit_expr_ir(sa[cur], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let c1 = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ c1 ++ " = icmp ne i64 " ++ cv ++ ", 0\n  br i1 " ++ c1 ++ ", label %" ++ l_b ++ ", label %" ++ l_e ++ "\n" ++ l_b ++ ":\n")
+            let bt = emit_stmt_list_ir(sb[cur], alloca_buf, ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits, l_e, l_c)
+            if !bt { let _ = buf_push_str(ir_buf, "  br label %" ++ l_c ++ "\n") }
+            let _ = buf_push_str(ir_buf, l_e ++ ":\n")
+        } else if k == 4 {
+            let l_t = "ift_" ++ int_to_text(lseq)
+            let l_e = "ife_" ++ int_to_text(lseq)
+            let l_m = "ifm_" ++ int_to_text(lseq)
+            lseq += 1
+            let cv = emit_expr_ir(sa[cur], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let c1 = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ c1 ++ " = icmp ne i64 " ++ cv ++ ", 0\n  br i1 " ++ c1 ++ ", label %" ++ l_t ++ ", label %" ++ l_e ++ "\n" ++ l_t ++ ":\n")
+            let tt_b = emit_stmt_list_ir(sb[cur], alloca_buf, ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits, brk_lbl, cont_lbl)
+            if !tt_b { let _ = buf_push_str(ir_buf, "  br label %" ++ l_m ++ "\n") }
+            let _ = buf_push_str(ir_buf, l_e ++ ":\n")
+            let et_b = emit_stmt_list_ir(sc[cur], alloca_buf, ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits, brk_lbl, cont_lbl)
+            if !et_b { let _ = buf_push_str(ir_buf, "  br label %" ++ l_m ++ "\n") }
+            if !tt_b || !et_b {
+                let _ = buf_push_str(ir_buf, l_m ++ ":\n")
+            } else {
+                term = true
+            }
+        }
+        cur = sn[cur]
+    }
+    return term
+}
+
+// =========================================================================
+// 5. Full Self-Hosting Compilation Pipeline & Driver
+// =========================================================================
+
+pub fn compile_tenon_file(src Text) Text {
+    var tk List[Int] = []
+    var tt List[Text] = []
+    var tv List[Int] = []
+    let _ = lex_source(src, tk, tt, tv)
+
+    var ek List[Int] = []
+    var ei List[Int] = []
+    var es List[Text] = []
+    var ea List[Int] = []
+    var eb List[Int] = []
+    var ec List[Int] = []
+    var call_args List[Int] = []
+
+    var sk List[Int] = []
+    var ss List[Text] = []
+    var sa List[Int] = []
+    var sb List[Int] = []
+    var sc List[Int] = []
+    var sn List[Int] = []
+
+    var fn_names List[Text] = []
+    var fn_pstart List[Int] = []
+    var fn_pcnt List[Int] = []
+    var fn_rty List[Int] = []
+    var fn_body List[Int] = []
+
+    var p_names List[Text] = []
+    var p_ty List[Int] = []
+    var p_inout List[Int] = []
+    var p_has_min List[Int] = []
+    var p_min List[Int] = []
+
+    var pos = 0
+    while pk(tk, pos) != 0 {
+        if pk(tk, pos) == 15 {
+            pos += 1
+            if pk(tk, pos) == 3 { pos += 1 }
+        } else if pk(tk, pos) == 11 || pk(tk, pos) == 12 {
+            pos += 1
+        } else if pk(tk, pos) == 4 {
+            pos += 1
+            let fname = pt(tt, pos)
+            pos += 1
+            if pk(tk, pos) == 20 { pos += 1 }
+            let ps = len(p_names)
+            var pc = 0
+            while pk(tk, pos) != 21 && pk(tk, pos) != 0 {
+                var is_io = 0
+                if pk(tk, pos) == 13 { is_io = 1; pos += 1 }
+                let pn = pt(tt, pos)
+                pos += 1
+                let pt_k = parse_type_kind(tk, tt, pos)
+                var hmin = 0
+                var mval = 0
+                if pk(tk, pos) == 14 {
+                    pos += 1
+                    if pk(tk, pos) == 1 { pos += 1 } // self
+                    let ck = pk(tk, pos)
+                    pos += 1
+                    let bv = pv(tv, pos)
+                    pos += 1
+                    if ck == 45 { hmin = 1; mval = bv }
+                    else if ck == 44 { hmin = 1; mval = bv + 1 }
+                }
+                p_names = push(p_names, pn)
+                p_ty = push(p_ty, pt_k)
+                p_inout = push(p_inout, is_io)
+                p_has_min = push(p_has_min, hmin)
+                p_min = push(p_min, mval)
+                pc += 1
+                if pk(tk, pos) == 26 { pos += 1 }
+            }
+            if pk(tk, pos) == 21 { pos += 1 }
+            var rty = 0
+            if pk(tk, pos) == 1 {
+                rty = parse_type_kind(tk, tt, pos)
+            }
+            let bh = parse_block(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn)
+            fn_names = push(fn_names, fname)
+            fn_pstart = push(fn_pstart, ps)
+            fn_pcnt = push(fn_pcnt, pc)
+            fn_rty = push(fn_rty, rty)
+            fn_body = push(fn_body, bh)
+        } else {
+            pos += 1
+        }
+    }
+
+    // L0 Interval & Division-by-Zero Verification Pass
+    var fi = 0
+    while fi < len(fn_names) {
+        var en List[Text] = []
+        var elo List[Int] = []
+        var ehi List[Int] = []
+        var pi = 0
+        while pi < fn_pcnt[fi] {
+            let idx = fn_pstart[fi] + pi
+            if p_has_min[idx] == 1 {
+                en = push(en, p_names[idx])
+                elo = push(elo, p_min[idx])
+                ehi = push(ehi, 1000000)
+            }
+            pi += 1
+        }
+        let verr = verify_stmt_list(fn_body[fi], ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn, en, elo, ehi)
+        if len(verr) > 0 {
+            return "ERR:" ++ fn_names[fi] ++ ":" ++ verr
+        }
+        fi += 1
+    }
+
+    // Emit LLVM 22 IR for all functions
+    let body_buf = buf_new()
+    var str_lits List[Text] = []
+    var fi2 = 0
+    while fi2 < len(fn_names) {
+        let fname = fn_names[fi2]
+        let ps = fn_pstart[fi2]
+        let pc = fn_pcnt[fi2]
+        let _ = buf_push_str(body_buf, "define i64 @s3_" ++ fname ++ "(")
+        var pi = 0
+        while pi < pc {
+            if pi > 0 { let _ = buf_push_str(body_buf, ", ") }
+            let idx = ps + pi
+            if p_inout[idx] == 1 {
+                let _ = buf_push_str(body_buf, "ptr %var_" ++ p_names[idx])
+            } else {
+                let _ = buf_push_str(body_buf, "i64 %arg_" ++ p_names[idx])
+            }
+            pi += 1
+        }
+        let _ = buf_push_str(body_buf, ") {\nentry:\n")
+        let fn_allocas = buf_new()
+        let fn_code = buf_new()
+        var vnames List[Text] = []
+        var vty List[Int] = []
+        var p2 = 0
+        while p2 < pc {
+            let idx = ps + p2
+            let pn = p_names[idx]
+            vnames = push(vnames, pn)
+            vty = push(vty, p_ty[idx])
+            if p_inout[idx] == 0 {
+                let _ = buf_push_str(fn_allocas, "  %var_" ++ pn ++ " = alloca i64, align 8\n  store i64 %arg_" ++ pn ++ ", ptr %var_" ++ pn ++ ", align 8\n")
+            }
+            p2 += 1
+        }
+        var rseq = 0
+        var lseq = 0
+        let term = emit_stmt_list_ir(fn_body[fi2], fn_allocas, fn_code, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, sk, ss, sa, sb, sc, sn, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits, "entry", "entry")
+        if !term {
+            let _ = buf_push_str(fn_code, "  ret i64 0\n")
+        }
+        let _ = buf_push_str(body_buf, buf_finish(fn_allocas))
+        let _ = buf_push_str(body_buf, buf_finish(fn_code))
+        let _ = buf_push_str(body_buf, "}\n\n")
+        fi2 += 1
+    }
+
+    let hdr = buf_new()
+    let _ = buf_push_str(hdr, "; Auto-generated by Tenon Stage-3 Self-Hosting Pure-Tenon Compiler (0% Rust!)\n")
+    let _ = buf_push_str(hdr, "declare i64 @s3_str_from_cstr(ptr, i64)\ndeclare i64 @s3_str_concat(i64, i64)\ndeclare i64 @s3_str_eq(i64, i64)\ndeclare i64 @s3_len(i64)\ndeclare i64 @s3_byte_at(i64, i64)\ndeclare i64 @s3_str_slice(i64, i64, i64)\ndeclare i64 @s3_int_to_text(i64)\ndeclare i64 @s3_list_new()\ndeclare i64 @s3_list_push(i64, i64)\ndeclare i64 @s3_list_get(i64, i64)\ndeclare i64 @s3_list_set(i64, i64, i64)\ndeclare i64 @s3_buf_new()\ndeclare i64 @s3_buf_push_str(i64, i64)\ndeclare i64 @s3_buf_push_byte(i64, i64)\ndeclare i64 @s3_buf_finish(i64)\ndeclare i64 @s3_println(i64)\ndeclare i64 @s3_read_file(i64)\ndeclare i64 @s3_write_file(i64, i64)\ndeclare i64 @s3_env(i64)\n\n")
+    var si = 0
+    while si < len(str_lits) {
+        let s = str_lits[si]
+        let _ = buf_push_str(hdr, "@.str." ++ int_to_text(si) ++ " = private unnamed_addr constant [" ++ int_to_text(len(s) + 1) ++ " x i8] c\"")
+        let _ = push_llvm_escaped_str(hdr, s)
+        let _ = buf_push_str(hdr, "\"\n")
+        si += 1
+    }
+    let _ = buf_push_str(hdr, "\n")
+    let _ = buf_push_str(hdr, buf_finish(body_buf))
+    return buf_finish(hdr)
+}
+
+pub fn main() Int {
+    let in_path = sys_env("TENON_IN")
+    let out_path = sys_env("TENON_OUT")
+    if len(in_path) == 0 {
+        let sample = "pub pure fn safe_div(a Int, b Int where self >= 1) Int { return a / b }\npub fn main() Int { let _ = println(\"Hello from Stage-3 Pure-Tenon Bootstrap!\"); return safe_div(84, 2) - 42 }\n"
+        let ll = compile_tenon_file(sample)
+        let _ = println("Tenon Stage-3 Self-Hosting Compiler OK (emitted " ++ int_to_text(len(ll)) ++ " B LLVM IR)")
+        return 0
+    }
+    let src = sys_read_file(in_path)
+    if len(src) == 0 {
+        let _ = println("ERROR: could not read " ++ in_path)
+        return 1
+    }
+    let ll = compile_tenon_file(src)
+    if len(ll) >= 4 && str_slice(ll, 0, 4) == "ERR:" {
+        let _ = println("VERIFY FAIL: " ++ ll)
+        return 2
+    }
+    if len(out_path) > 0 {
+        let _ = sys_write_file(out_path, ll)
+    }
+    let _ = println("Stage-3 Pure-Tenon Compiler: verified & emitted " ++ int_to_text(len(ll)) ++ " B LLVM IR -> " ++ out_path)
+    return 0
+}
