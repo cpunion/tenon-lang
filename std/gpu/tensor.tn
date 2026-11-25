@@ -74,9 +74,9 @@ pub pure fn nd_transpose_2d[DType](
     let total = rows * cols
     var out List[DType] = list_filled(total, t.data[0])
     var r = 0
-    while r < rows {
+    while r < rows invariant len(out) == total {
         var c = 0
-        while c < cols {
+        while c < cols invariant len(out) == total {
             out[c * rows + r] = t.data[r * cols + c]
             c += 1
         }
@@ -143,10 +143,10 @@ pub pure fn nd_broadcast_add_last(
     let zero Float32 = 0.0 as Float32
     var out List[Float32] = list_filled(total, zero)
     var row = 0
-    while row < leading {
+    while row < leading invariant len(out) == total {
         let base = row * dim
         var d = 0
-        while d < dim {
+        while d < dim invariant len(out) == total {
             out[base + d] = x.data[base + d] + bias.data[d]
             d += 1
         }
@@ -224,7 +224,7 @@ pub pure fn tensor2d_to_f16(a Tensor2D) Tensor2D[DType = Float16]
     let z Float16 = 0.0 as Float16
     var out List[Float16] = list_filled(total, z)
     var i = 0
-    while i < total {
+    while i < total invariant len(out) == total {
         out[i] = a.data[i] as Float16
         i += 1
     }
@@ -241,7 +241,7 @@ pub pure fn tensor2d_f16_to_f32(a Tensor2D[DType = Float16]) Tensor2D
     let z Float32 = 0.0 as Float32
     var out List[Float32] = list_filled(total, z)
     var i = 0
-    while i < total {
+    while i < total invariant len(out) == total {
         out[i] = a.data[i] as Float32
         i += 1
     }
@@ -305,12 +305,13 @@ pub pure fn tensor2d_matmul(a Tensor2D, b Tensor2D) Tensor2D
     let m = a.rows
     let k = a.cols
     let n = b.cols
+    let total = m * n
     let zero Float32 = 0.0 as Float32
-    var out List[Float32] = list_filled(m * n, zero)
+    var out List[Float32] = list_filled(total, zero)
     var i = 0
-    while i < m {
+    while i < m invariant len(out) == total {
         var j = 0
-        while j < n {
+        while j < n invariant len(out) == total {
             var acc Float32 = zero
             var p = 0
             while p < k {
@@ -338,7 +339,7 @@ pub pure fn tensor2d_add_relu(a Tensor2D, b Tensor2D) Tensor2D
     let zero Float32 = 0.0 as Float32
     var out List[Float32] = list_filled(total, zero)
     var i = 0
-    while i < total {
+    while i < total invariant len(out) == total {
         let s = a.data[i] + b.data[i]
         out[i] = if s > zero { s } else { zero }
         i += 1
