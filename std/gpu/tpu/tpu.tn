@@ -5,6 +5,7 @@
 // arrays (v2 / v4 / v5e / v5p / v6e Trillium). Enforces leak-free HBM lifetimes via `@linear`!
 
 import "std/core/types.tn"
+import "std/text/text.tn"
 
 pub const TPU_F32  Int = 0
 pub const TPU_BF16 Int = 1
@@ -120,9 +121,21 @@ impl TpuBuffer {
         TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S8 }
     }
 
-    pub fn from_s4_2d(packed_bytes List[UInt8], rows Int, cols Int) TpuBuffer {
-        let h = unsafe { tn_tpu_buf_create_2d(list_data_ptr(packed_bytes), TPU_S4, rows, cols) }
-        TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S4 }
+    pub fn from_s4_2d(s8_vals List[UInt8], rows Int, cols Int) TpuBuffer {
+        // Upload standard S8 (values in [-8..7]) then convert to native hardware TPU `i4` on-device via StableHLO!
+        let tmp_s8 = TpuBuffer.from_s8_2d(s8_vals, rows, cols)
+        let rs = int_to_text(rows)
+        let cs = int_to_text(cols)
+        let mlir = "module @tenon_s8_to_s4 {\n"
+            ++ "  func.func public @main(%w: tensor<" ++ rs ++ "x" ++ cs ++ "xi8>) -> tensor<" ++ rs ++ "x" ++ cs ++ "xi4> {\n"
+            ++ "    %q = stablehlo.convert %w : (tensor<" ++ rs ++ "x" ++ cs ++ "xi8>) -> tensor<" ++ rs ++ "x" ++ cs ++ "xi4>\n"
+            ++ "    return %q : tensor<" ++ rs ++ "x" ++ cs ++ "xi4>\n"
+            ++ "  }\n}\n"
+        var ex = TpuExecutable.compile_mlir(mlir)
+        let out = ex.run_many([tmp_s8.handle], rows * cols, TPU_S4)
+        let _ = tmp_s8.free()
+        let _ = ex.free()
+        out
     }
 
     pub fn zeros_bf16_2d(rows Int, cols Int) TpuBuffer {
@@ -136,8 +149,18 @@ impl TpuBuffer {
     }
 
     pub fn zeros_s4_2d(rows Int, cols Int) TpuBuffer {
-        let h = unsafe { tn_tpu_buf_zeros_2d(TPU_S4, rows, cols) }
-        TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S4 }
+        let rs = int_to_text(rows)
+        let cs = int_to_text(cols)
+        let mlir = "module @tenon_z_s4_2d {\n"
+            ++ "  func.func public @main() -> tensor<" ++ rs ++ "x" ++ cs ++ "xi4> {\n"
+            ++ "    %z = stablehlo.constant dense<0> : tensor<" ++ rs ++ "x" ++ cs ++ "xi4>\n"
+            ++ "    return %z : tensor<" ++ rs ++ "x" ++ cs ++ "xi4>\n"
+            ++ "  }\n}\n"
+        var ex = TpuExecutable.compile_mlir(mlir)
+        let empty List[Int] = []
+        let out = ex.run_many(empty, rows * cols, TPU_S4)
+        let _ = ex.free()
+        out
     }
 
     pub fn scalar_i32(val Int) TpuBuffer {
@@ -161,8 +184,19 @@ impl TpuBuffer {
     }
 
     pub fn zeros_s4_3d(d0 Int, d1 Int, d2 Int) TpuBuffer {
-        let h = unsafe { tn_tpu_buf_zeros_3d(TPU_S4, d0, d1, d2) }
-        TpuBuffer { handle = h, n_elems = d0 * d1 * d2, dtype = TPU_S4 }
+        let s0 = int_to_text(d0)
+        let s1 = int_to_text(d1)
+        let s2 = int_to_text(d2)
+        let mlir = "module @tenon_z_s4_3d {\n"
+            ++ "  func.func public @main() -> tensor<" ++ s0 ++ "x" ++ s1 ++ "x" ++ s2 ++ "xi4> {\n"
+            ++ "    %z = stablehlo.constant dense<0> : tensor<" ++ s0 ++ "x" ++ s1 ++ "x" ++ s2 ++ "xi4>\n"
+            ++ "    return %z : tensor<" ++ s0 ++ "x" ++ s1 ++ "x" ++ s2 ++ "xi4>\n"
+            ++ "  }\n}\n"
+        var ex = TpuExecutable.compile_mlir(mlir)
+        let empty List[Int] = []
+        let out = ex.run_many(empty, d0 * d1 * d2, TPU_S4)
+        let _ = ex.free()
+        out
     }
 
     pub fn read_f32(inout self, dst List[Float32]) Int {

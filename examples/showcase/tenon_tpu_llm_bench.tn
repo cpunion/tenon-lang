@@ -444,27 +444,24 @@ fn main() Int {
     let _ = mm_exec.free()
 
     // 1B. Exact Numerical Verification of Tenon Native Hardware `i4` (S4) W4A16 on real Google TPU MXU!
-    // OpenXLA PJRT_Buffer_Type_S4 packs two 4-bit two's-complement nibbles per byte (low=col 2j, high=col 2j+1).
-    var w4_packed List[UInt8] = list_filled(vk * (vn / 2), 0 as UInt8)
+    // Uploads standard S8 [-7..7] and converts on-device via StableHLO to native sub-byte TPU `i4` HBM layout.
+    var w4_vals List[UInt8] = list_filled(vk * vn, 0 as UInt8)
     var w4_ref List[Float] = list_filled(vk * vn, 0.0)
     var kr = 0
     while kr < vk {
         var jc = 0
-        while jc < (vn / 2) {
-            let lo = ((kr * 5 + jc * 3) % 15) - 7
-            let hi = ((kr * 7 + jc * 11) % 15) - 7
-            let lo_u = if lo < 0 { lo + 16 } else { lo }
-            let hi_u = if hi < 0 { hi + 16 } else { hi }
-            w4_packed[kr * (vn / 2) + jc] = (lo_u + hi_u * 16) as UInt8
-            w4_ref[kr * vn + jc * 2]     = int_to_float(lo) * 0.05
-            w4_ref[kr * vn + jc * 2 + 1] = int_to_float(hi) * 0.05
+        while jc < vn {
+            let v = ((kr * 5 + jc * 3) % 15) - 7
+            let vu = if v < 0 { v + 256 } else { v }
+            w4_vals[kr * vn + jc] = vu as UInt8
+            w4_ref[kr * vn + jc] = int_to_float(v) * 0.05
             jc += 1
         }
         kr += 1
     }
     var w4_exec = TpuExecutable.compile_mlir(shlo_w4a16_matmul(vm, vk, vn))
     let w4_a = TpuBuffer.from_bf16_2d(a_bf, vm, vk)
-    let w4_b = TpuBuffer.from_s4_2d(w4_packed, vk, vn)
+    let w4_b = TpuBuffer.from_s4_2d(w4_vals, vk, vn)
     let w4_sc = TpuBuffer.from_bf16_1d(f32_list_to_bf16(list_filled(vn, 0.05 as Float32)))
     var w4_c = w4_exec.run_3(w4_a.handle, w4_b.handle, w4_sc.handle, vm * vn, TPU_BF16)
     var w4_out_bf List[BFloat16] = list_filled(vm * vn, 0.0 as BFloat16)
