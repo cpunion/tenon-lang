@@ -518,6 +518,15 @@ pub extern "C" fn tenon_list_data_ptr(xs: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_gid_x() -> i64 { 0 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_gid_y() -> i64 { 0 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_gid_z() -> i64 { 0 }
+
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_text_cstr_ptr(s: i64) -> i64 {
     if s == 0 {
         return c"".as_ptr() as i64;

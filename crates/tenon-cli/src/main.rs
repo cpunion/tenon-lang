@@ -1423,6 +1423,8 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     let mut out_bin = "target/tenon_out".to_string();
     let mut opts = tenon_codegen::llvm_aot::BuildOptions::default();
     let mut emit_mir: Option<PathBuf> = None;
+    let mut emit_msl: Option<PathBuf> = None;
+    let mut emit_wgsl: Option<PathBuf> = None;
     let mut emit_ts: Option<PathBuf> = None;
     let mut emit_mjs: Option<PathBuf> = None;
     let mut emit_swift: Option<PathBuf> = None;
@@ -1442,6 +1444,14 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             }
             "--emit-mir" if i + 1 < args.len() => {
                 emit_mir = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-msl" if i + 1 < args.len() => {
+                emit_msl = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-wgsl" if i + 1 < args.len() => {
+                emit_wgsl = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--emit-header" if i + 1 < args.len() => {
@@ -1594,10 +1604,32 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     opts.apply_ssa_mir(&ssa_mir);
     if let Some(p) = &emit_mir {
         if let Some(parent) = p.parent() {
-            let _ = fs::create_dir_all(parent);
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
         }
         let _ = fs::write(p, tenon_mir::format_mir(&ssa_mir));
         println!("Emitted Tenon SSA/CFG MIR -> `{}`", p.display());
+    }
+    if let Some(p) = &emit_msl {
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let msl = tenon_codegen::gpu_shader::emit_msl(&prog, &report.mir);
+        let _ = fs::write(p, &msl);
+        println!("Emitted Apple Metal MSL ({} bytes) -> `{}`", msl.len(), p.display());
+    }
+    if let Some(p) = &emit_wgsl {
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let wgsl = tenon_codegen::gpu_shader::emit_wgsl(&prog, &report.mir);
+        let _ = fs::write(p, &wgsl);
+        println!("Emitted WebGPU WGSL ({} bytes) -> `{}`", wgsl.len(), p.display());
     }
     if opts
         .target_triple

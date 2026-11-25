@@ -520,6 +520,9 @@ int64_t tenon_list_data_ptr(int64_t xs) {
     if (xs == 0) return 0;
     return (int64_t)(uintptr_t)((TenonObj*)(uintptr_t)xs)->fields;
 }
+int64_t tenon_gpu_gid_x(void) { return 0; }
+int64_t tenon_gpu_gid_y(void) { return 0; }
+int64_t tenon_gpu_gid_z(void) { return 0; }
 int64_t tenon_float_bits(int64_t bits) {
     union { double d; int64_t i; } u;
     u.i = bits;

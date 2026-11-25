@@ -1,0 +1,192 @@
+// std/gpu/gpu.tn — Zero-Rust Native Metal GPU Runtime & `@linear` Typestate Handles (`tenon-gpu`)
+//
+// Zero Rust dependencies: links directly against macOS Metal.framework + Foundation.framework
+// via `std/gpu/metal_shim.m` and enforces leak-free VRAM/Pipeline lifecycles at compile time
+// using Tenon's `@linear` typestate verifier (`inout self` borrow vs by-value `self` consume)!
+
+import "std/core/types.tn"
+
+@link(framework = "Metal")
+@link(framework = "Foundation")
+extern "C" {
+    fn tn_metal_init() Int
+    fn tn_metal_device_name_cstr() Ptr[UInt8]
+    fn tn_metal_buf_create(data_ptr Ptr[UInt8], byte_len Int) Int
+    fn tn_metal_buf_read(handle Int, dst_ptr Ptr[UInt8], byte_len Int) Int
+    fn tn_metal_buf_free(handle Int) Int
+    fn tn_metal_compile_compute(msl_cstr Ptr[UInt8], fn_cstr Ptr[UInt8]) Int
+    fn tn_metal_pipe_free(handle Int) Int
+    fn tn_metal_dispatch_compute4(
+        pipe Int,
+        b0 Int,
+        b1 Int,
+        b2 Int,
+        b3 Int,
+        gx Int,
+        gy Int,
+        gz Int,
+    ) Int
+    fn tn_metal_render_quads_offscreen(
+        quads_ptr Ptr[UInt8],
+        quad_count Int,
+        width Int,
+        height Int,
+        out_rgba_ptr Ptr[UInt8],
+    ) Int
+}
+
+/// Bit-exact 48-byte GPU POD instance descriptor shared across CPU, Metal MSL, and WebGPU WGSL.
+@gpu_struct("std430")
+pub record QuadInstance {
+    x        Float32
+    y        Float32
+    w        Float32
+    h        Float32
+    r        Float32
+    g        Float32
+    b        Float32
+    a        Float32
+    radius   Float32
+    border_w Float32
+    br       Float32
+    bg       Float32
+}
+
+/// `@linear` GPU VRAM Buffer handle — statically guaranteed never to leak or be used after free!
+@linear
+pub record GpuBuffer {
+    handle   Int
+    byte_len Int
+}
+
+/// `@linear` GPU Compute Pipeline handle — must be explicitly destroyed after dispatching!
+@linear
+pub record GpuComputePipeline {
+    handle Int
+}
+
+/// `@linear` Batched 120fps Quad Render Pass — accumulates instanced quads (`inout self` borrow)
+/// and submits a single GPU draw call (`self` consume) into an RGBA8 framebuffer!
+@linear
+pub record GpuQuadPass {
+    floats     List[Float32]
+    quad_count Int
+}
+
+pub fn gpu_init() Bool {
+    unsafe { tn_metal_init() != 0 }
+}
+
+pub fn gpu_device_name() Text {
+    unsafe { cstr_to_text(tn_metal_device_name_cstr()) }
+}
+
+impl GpuBuffer {
+    pub fn from_f32_list(xs List[Float32]) GpuBuffer {
+        let nbytes = len(xs) * 4
+        let h = unsafe { tn_metal_buf_create(list_data_ptr(xs), nbytes) }
+        GpuBuffer { handle = h, byte_len = nbytes }
+    }
+
+    pub fn from_u32_list(xs List[UInt32]) GpuBuffer {
+        let nbytes = len(xs) * 4
+        let h = unsafe { tn_metal_buf_create(list_data_ptr(xs), nbytes) }
+        GpuBuffer { handle = h, byte_len = nbytes }
+    }
+
+    pub fn from_bytes(bs Bytes) GpuBuffer {
+        let nbytes = bytes_len(bs)
+        let h = unsafe { tn_metal_buf_create(bytes_ptr(bs), nbytes) }
+        GpuBuffer { handle = h, byte_len = nbytes }
+    }
+
+    pub fn uninit(byte_len Int where self > 0) GpuBuffer {
+        let h = unsafe { tn_metal_buf_create(null_ptr(), byte_len) }
+        GpuBuffer { handle = h, byte_len = byte_len }
+    }
+
+    /// Borrows `self` (`inout self`) and reads GPU compute results back into `out`.
+    pub fn read_into_f32(inout self, inout out List[Float32]) Int {
+        let nbytes = len(out) * 4
+        unsafe { tn_metal_buf_read(self.handle, list_data_ptr(out), nbytes) }
+    }
+
+    /// Consumes `self` (by-value) and releases the underlying Metal `MTLBuffer`.
+    pub fn destroy(self) {
+        let _ = unsafe { tn_metal_buf_free(self.handle) }
+    }
+}
+
+impl GpuComputePipeline {
+    pub fn compile_msl(msl_src Text, kernel_name Text) GpuComputePipeline {
+        let h = unsafe { tn_metal_compile_compute(text_cstr_ptr(msl_src), text_cstr_ptr(kernel_name)) }
+        GpuComputePipeline { handle = h }
+    }
+
+    /// Borrows pipeline & up to 4 buffers (`inout`) to dispatch a 3D compute grid on Metal GPU!
+    pub fn dispatch4(
+        inout self,
+        inout b0 GpuBuffer,
+        inout b1 GpuBuffer,
+        inout b2 GpuBuffer,
+        inout b3 GpuBuffer,
+        gx Int,
+        gy Int,
+        gz Int,
+    ) Bool {
+        unsafe {
+            tn_metal_dispatch_compute4(self.handle, b0.handle, b1.handle, b2.handle, b3.handle, gx, gy, gz) != 0
+        }
+    }
+
+    /// Consumes `self` and releases the Metal compute pipeline state.
+    pub fn destroy(self) {
+        let _ = unsafe { tn_metal_pipe_free(self.handle) }
+    }
+}
+
+impl GpuQuadPass {
+    pub fn begin() GpuQuadPass {
+        let empty List[Float32] = []
+        GpuQuadPass { floats = empty, quad_count = 0 }
+    }
+
+    /// Borrows `self` (`inout self`) and appends one SDF rounded-quad instance (12 Float32s = 48B).
+    pub fn push_quad(
+        inout self,
+        x Float32, y Float32, w Float32, h Float32,
+        r Float32, g Float32, b Float32, a Float32,
+        radius Float32, border_w Float32, br Float32, bg Float32,
+    ) {
+        self.floats = push(self.floats, x)
+        self.floats = push(self.floats, y)
+        self.floats = push(self.floats, w)
+        self.floats = push(self.floats, h)
+        self.floats = push(self.floats, r)
+        self.floats = push(self.floats, g)
+        self.floats = push(self.floats, b)
+        self.floats = push(self.floats, a)
+        self.floats = push(self.floats, radius)
+        self.floats = push(self.floats, border_w)
+        self.floats = push(self.floats, br)
+        self.floats = push(self.floats, bg)
+        self.quad_count = self.quad_count + 1
+    }
+
+    /// Consumes `self` and submits the entire batched quad pass in ONE instanced Metal GPU draw call,
+    /// returning the rendered `width * height * 4` RGBA8 framebuffer bytes!
+    pub fn submit_offscreen(self, width Int where 1 <= self && self <= 4096, height Int where 1 <= self && self <= 4096) Bytes {
+        let total = width * height * 4
+        var rgba = bytes_filled(total, 0)
+        let _ = unsafe {
+            tn_metal_render_quads_offscreen(
+                list_data_ptr(self.floats),
+                self.quad_count,
+                width,
+                height,
+                bytes_ptr(rgba),
+            )
+        }
+        rgba
+    }
+}

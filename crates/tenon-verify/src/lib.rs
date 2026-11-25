@@ -2,6 +2,7 @@ pub mod checker;
 pub(crate) mod checker_builtins;
 pub mod db;
 pub mod evolve;
+pub mod gpu_graph;
 pub mod l0;
 pub mod mir;
 pub mod modelcheck;
@@ -17,6 +18,7 @@ pub use evolve::{
     CompatVerdict, EvolutionLockEntry, EvolutionReport, append_evolution_lock, check_evolution,
     emit_expand_contract_sql,
 };
+pub use gpu_graph::{GpuFusionPlan, GpuGraphNode, GpuGraphPlan};
 pub use mir::{MirFnSummary, VerifiedMir};
 pub use smt::{
     ExportedProofCert, ProofAuditReport, begin_proof_recording, end_proof_recording,
@@ -2300,6 +2302,31 @@ pub pure fn bad_dims() Int {
         assert!(
             !tensor_bad_rep.ok,
             "expected mismatched Tensor2D matmul dimensions (2x3 * 4x2) to fail at compile time!"
+        );
+
+        // 4. `@gpu_graph` RAW/WAW hazard rejection (`E0841`)
+        let gpu_hazard = parse(
+            r#"
+@kernel("elementwise")
+pub fn scale_buf(src List[Float32], inout dst List[Float32]) {
+    let i = gpu_global_id_x()
+    dst[i] = src[i]
+}
+
+@gpu_graph
+pub fn bad_aliased_graph(a List[Float32]) List[Float32] {
+    var buf = a
+    scale_buf(buf, buf)
+    buf
+}
+"#,
+        )
+        .unwrap();
+        let gpu_haz_rep = check_program(&gpu_hazard);
+        assert!(
+            gpu_haz_rep.diagnostics.iter().any(|d| d.code == "E0841" || d.code == "E0820"),
+            "expected E0841/E0820 data hazard on aliased read+inout GPU buffer, got {:?}",
+            gpu_haz_rep.diagnostics
         );
     }
 }

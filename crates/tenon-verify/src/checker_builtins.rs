@@ -98,6 +98,9 @@ pub(crate) const BUILTIN_SIGS: &[BuiltinSig] = &[
     BuiltinSig { name: "text_to_bytes", arity: 1, is_pure: true, allocates: true, param_types: &["Text"], ret_type: "Bytes" },
     BuiltinSig { name: "bytes_ptr", arity: 1, is_pure: true, allocates: false, param_types: &["Bytes"], ret_type: "Ptr[UInt8]" },
     BuiltinSig { name: "list_data_ptr", arity: 1, is_pure: true, allocates: false, param_types: &["Any"], ret_type: "Ptr[UInt8]" },
+    BuiltinSig { name: "gpu_global_id_x", arity: 0, is_pure: true, allocates: false, param_types: &[], ret_type: "Int" },
+    BuiltinSig { name: "gpu_global_id_y", arity: 0, is_pure: true, allocates: false, param_types: &[], ret_type: "Int" },
+    BuiltinSig { name: "gpu_global_id_z", arity: 0, is_pure: true, allocates: false, param_types: &[], ret_type: "Int" },
     BuiltinSig { name: "text_cstr_ptr", arity: 1, is_pure: true, allocates: false, param_types: &["Text"], ret_type: "Ptr[UInt8]" },
     BuiltinSig { name: "cstr_to_text", arity: 1, is_pure: false, allocates: true, param_types: &["Any"], ret_type: "Text" },
     // S2: Layout intrinsics, raw pointers & unsafe memory ops

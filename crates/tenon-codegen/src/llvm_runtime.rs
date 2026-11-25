@@ -368,6 +368,10 @@ int64_t tenon_list_data_ptr(int64_t xs) {
     return (int64_t)(uintptr_t)((TenonObj*)(uintptr_t)xs)->fields;
 }
 
+int64_t tenon_gpu_gid_x(void) { return 0; }
+int64_t tenon_gpu_gid_y(void) { return 0; }
+int64_t tenon_gpu_gid_z(void) { return 0; }
+
 int64_t tenon_text_cstr_ptr(int64_t s) {
     if (s == 0) return (int64_t)(uintptr_t)"";
     return (int64_t)(uintptr_t)((TenonObj*)(uintptr_t)s)->fields;

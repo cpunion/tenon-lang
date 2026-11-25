@@ -1,0 +1,69 @@
+// examples/dogfood/metal_render_demo.tn — Live Apple Silicon Metal GPU Instanced Quad Render Demo!
+//
+// Zero Rust dependencies: uses `@linear` `GpuQuadPass` (`inout self` borrow `push_quad` +
+// by-value `self` consume `submit_offscreen`) to render 3 SDF rounded-corner UI quads in
+// ONE instanced Metal GPU draw call into a 256x128 RGBA8 texture, then reads back pixels
+// and verifies exact hardware-rendered RGB values!
+
+import "std/os/io.tn"
+import "std/text/text.tn"
+import "std/gpu/gpu.tn"
+
+pure fn px_channel(rgba Bytes, width Int, x Int, y Int, ch Int) Int {
+    let offset = (y * width + x) * 4 + ch
+    bytes_get(rgba, offset) as Int
+}
+
+pub fn main() Int {
+    if !gpu_init() {
+        println("ERROR: Metal GPU device unavailable")
+        return 1
+    }
+    println("=== Tenon Zero-Rust Native Metal GPU Quad Render Demo ===")
+    println("Metal GPU Device : " ++ gpu_device_name())
+
+    var pass = GpuQuadPass.begin()
+    // 1. Coral-red left panel (x=10..110, y=10..118): RGB ~(230, 51, 51)
+    pass.push_quad(
+        10.0 as Float32, 10.0 as Float32, 100.0 as Float32, 108.0 as Float32,
+        0.90 as Float32, 0.20 as Float32, 0.20 as Float32, 1.0 as Float32,
+        8.0 as Float32, 0.0 as Float32, 0.0 as Float32, 0.0 as Float32,
+    )
+    // 2. Emerald-green top-right tile (x=124..244, y=10..58): RGB ~(51, 204, 102)
+    pass.push_quad(
+        124.0 as Float32, 10.0 as Float32, 120.0 as Float32, 48.0 as Float32,
+        0.20 as Float32, 0.80 as Float32, 0.40 as Float32, 1.0 as Float32,
+        8.0 as Float32, 0.0 as Float32, 0.0 as Float32, 0.0 as Float32,
+    )
+    // 3. Sky-blue bottom-right tile (x=124..244, y=68..118): RGB ~(51, 128, 242)
+    pass.push_quad(
+        124.0 as Float32, 68.0 as Float32, 120.0 as Float32, 50.0 as Float32,
+        0.20 as Float32, 0.50 as Float32, 0.95 as Float32, 1.0 as Float32,
+        8.0 as Float32, 0.0 as Float32, 0.0 as Float32, 0.0 as Float32,
+    )
+
+    // Consumes `@linear GpuQuadPass` and executes instanced SDF render pass on Metal GPU!
+    let fb = pass.submit_offscreen(256, 128)
+
+    // Sample background (2, 2), red card (60, 60), green tile (180, 34), blue tile (180, 92)
+    let bg_r = px_channel(fb, 256, 2, 2, 0)
+    let bg_b = px_channel(fb, 256, 2, 2, 2)
+    let red_r = px_channel(fb, 256, 60, 60, 0)
+    let red_g = px_channel(fb, 256, 60, 60, 1)
+    let grn_r = px_channel(fb, 256, 180, 34, 0)
+    let grn_g = px_channel(fb, 256, 180, 34, 1)
+    let blu_b = px_channel(fb, 256, 180, 92, 2)
+
+    println("Rendered 256x128 RGBA8 (" ++ int_to_text(bytes_len(fb)) ++ " bytes, 3 SDF quads in 1 instanced draw call)")
+    println("  BG   (2,2)     R=" ++ int_to_text(bg_r) ++ " B=" ++ int_to_text(bg_b))
+    println("  Red  (60,60)   R=" ++ int_to_text(red_r) ++ " G=" ++ int_to_text(red_g))
+    println("  Grn  (180,34)  R=" ++ int_to_text(grn_r) ++ " G=" ++ int_to_text(grn_g))
+    println("  Blue (180,92)  B=" ++ int_to_text(blu_b))
+
+    if bg_b < 30 || red_r < 210 || red_g > 70 || grn_g < 190 || grn_r > 70 || blu_b < 225 {
+        println("ERROR: Unexpected GPU framebuffer pixel values!")
+        return 2
+    }
+    println("Hardware Metal GPU RGBA8 Readback: VERIFIED OK!")
+    0
+}

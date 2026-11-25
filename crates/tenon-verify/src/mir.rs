@@ -50,6 +50,9 @@ pub struct VerifiedMir {
     /// Functions verified to satisfy `@checkfree` (100% zero runtime bounds/overflow/div-zero/cast checks).
     #[serde(default)]
     pub checkfree_verified_fns: BTreeSet<String>,
+    /// Verified `@gpu_graph` pass DAGs, barrier schedules, VRAM aliasing, and kernel fusion plans.
+    #[serde(default)]
+    pub gpu_graphs: Vec<crate::gpu_graph::GpuGraphPlan>,
     /// Compact per-function verification summaries.
     #[serde(default)]
     pub fn_summaries: BTreeMap<String, MirFnSummary>,

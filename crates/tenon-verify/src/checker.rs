@@ -117,6 +117,7 @@ pub fn check_program(program: &Program) -> CheckReport {
         fip_verified_fns: ctx.fip_verified_fns,
         arena_verified_fns: ctx.arena_verified_fns,
         checkfree_verified_fns: ctx.checkfree_verified_fns,
+        gpu_graphs: ctx.gpu_graphs,
         fn_summaries: ctx.fn_summaries,
     };
 
@@ -332,6 +333,7 @@ struct CheckerCtx {
     refine_cast_types: BTreeMap<usize, TypeExpr>,
     non_escaping_vars: BTreeMap<String, BTreeSet<String>>,
     stack_promotable_vars: BTreeMap<String, BTreeSet<String>>,
+    gpu_graphs: Vec<crate::gpu_graph::GpuGraphPlan>,
     fn_summaries: BTreeMap<String, MirFnSummary>,
     proofs: Vec<ProofRecord>,
     diagnostics: Vec<Diagnostic>,
@@ -704,6 +706,7 @@ impl CheckerCtx {
             refine_cast_types: BTreeMap::new(),
             non_escaping_vars: BTreeMap::new(),
             stack_promotable_vars: BTreeMap::new(),
+            gpu_graphs: Vec::new(),
             fn_summaries: BTreeMap::new(),
             proofs: Vec::new(),
             diagnostics: Vec::new(),
@@ -2927,6 +2930,13 @@ impl CheckerCtx {
                 );
                 self.diagnostics.extend(lin_diags);
             }
+            if crate::gpu_graph::has_gpu_graph_attr(&f.attrs) {
+                let (plan, g_diags, g_proofs) =
+                    crate::gpu_graph::analyze_gpu_graph_fn(f, &self.all_fns);
+                self.diagnostics.extend(g_diags);
+                self.proofs.extend(g_proofs);
+                self.gpu_graphs.push(plan);
+            }
         }
         self.cur_type_params = prev_tp;
         self.cur_type_param_bounds = prev_bounds;
@@ -4250,12 +4260,14 @@ impl CheckerCtx {
                     // 2. Soundly widen variables mutated inside the loop before checking cond & body!
                     for mv in &mutated {
                         env.ints.remove(mv);
+                        let lk = format!("__len__{}", mv);
+                        env.ints.remove(&lk);
                         env.bools.remove(mv);
                         env.floats.remove(mv);
                         env.finite_floats.remove(mv);
                         env.nonzero_floats.remove(mv);
-                        env.diffs.retain(|(a, b), _| a != mv && b != mv);
-                        smt_premises.retain(|(p, _)| !expr_mentions_ident(p, mv));
+                        env.diffs.retain(|(a, b), _| a != mv && b != mv && a != &lk && b != &lk);
+                        smt_premises.retain(|(p, _)| !expr_mentions_ident(p, mv) && !expr_mentions_ident(p, &lk));
                         if let Some(mty) = var_types.get(mv).cloned() {
                             self.assume_type_facts(mv, &mty, env, smt_int_vars, smt_premises);
                         }

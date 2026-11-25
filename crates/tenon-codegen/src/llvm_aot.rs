@@ -6599,6 +6599,9 @@ impl<'a> LlvmFnGen<'a> {
                         self.flush_temps(&temps);
                         return Ok(res);
                     }
+                    if fname == "null_ptr" && args.is_empty() {
+                        return Ok("0".to_string());
+                    }
                     if fname == "ptr_is_null" && args.len() == 1 {
                         let mut temps = Vec::new();
                         let p = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
