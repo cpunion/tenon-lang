@@ -247,6 +247,10 @@ pub struct L0Env {
     pub bools: BTreeMap<String, bool>,
     /// Closed floating-point interval `[min, max]` for fast L0 float refinement checking.
     pub floats: BTreeMap<String, (f64, f64)>,
+    /// Float variables statically proved finite (non-NaN, non-Inf) via `is_finite(x)` or bounded intervals.
+    pub finite_floats: BTreeSet<String>,
+    /// Float variables statically proved strictly positive (`x > 0.0`) or strictly negative (`x < 0.0`).
+    pub nonzero_floats: BTreeSet<String>,
     /// Difference bounds `a - b <= c` stored as `(a, b) -> c`.
     pub diffs: BTreeMap<(String, String), i128>,
     /// Symbolic product lower bounds `var >= a * b` (used to prove 2D row-major `y * w + x < len(grid)` in L0!).
@@ -412,7 +416,86 @@ impl L0Env {
 
     pub fn set_float(&mut self, name: impl Into<String>, lo: f64, hi: f64) {
         if lo.is_finite() && hi.is_finite() && lo <= hi {
-            self.floats.insert(name.into(), (lo, hi));
+            let n = name.into();
+            self.finite_floats.insert(n.clone());
+            self.floats.insert(n, (lo, hi));
+        }
+    }
+
+    /// Static NaN/Inf-freedom evaluator for `is_finite(expr)` (Flexbox layout & GPU uniforms).
+    pub fn eval_is_finite(&self, expr: &Expr, self_var: Option<&str>) -> bool {
+        match &expr.kind {
+            ExprKind::Float(x) => x.is_finite(),
+            ExprKind::Int(_) => true,
+            ExprKind::Ident(_) | ExprKind::Field { .. } | ExprKind::Old(_) => {
+                if let Some(k) = expr_var_name(expr, self_var) {
+                    if self.finite_floats.contains(&k) {
+                        return true;
+                    }
+                    if let Some((lo, hi)) = self.floats.get(&k) {
+                        return lo.is_finite() && hi.is_finite();
+                    }
+                }
+                false
+            }
+            ExprKind::Cast { expr: inner, .. } => self.eval_is_finite(inner, self_var),
+            ExprKind::Unary { op: UnOp::Neg, expr: inner } => self.eval_is_finite(inner, self_var),
+            ExprKind::Binary { op, left, right } => match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                    self.eval_is_finite(left, self_var) && self.eval_is_finite(right, self_var)
+                }
+                BinOp::Div => {
+                    let denom_nz = self
+                        .eval_abs_float(right, self_var)
+                        .is_some_and(|(r0, r1)| r0 > 0.0 || r1 < 0.0)
+                        || expr_var_name(right, self_var)
+                            .is_some_and(|rv| self.nonzero_floats.contains(&rv))
+                        || self.eval_abs_int(right, self_var).non_zero;
+                    self.eval_is_finite(left, self_var)
+                        && self.eval_is_finite(right, self_var)
+                        && denom_nz
+                }
+                _ => false,
+            },
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Ident(fname) = &callee.kind {
+                    if fname == "int_to_float" && args.len() == 1 {
+                        return true;
+                    }
+                }
+                false
+            }
+            ExprKind::If { cond, then_block, else_branch } => {
+                let mut te = self.clone();
+                te.assume_expr(cond, self_var);
+                te.assume_float_expr(cond, self_var);
+                let ok_t = then_block
+                    .tail
+                    .as_deref()
+                    .is_some_and(|e| te.eval_is_finite(e, self_var));
+                if !ok_t {
+                    return false;
+                }
+                if let Some(eb) = else_branch {
+                    let mut ee = self.clone();
+                    let neg = Expr {
+                        kind: ExprKind::Unary {
+                            op: UnOp::Not,
+                            expr: cond.clone(),
+                        },
+                        span: cond.span,
+                    };
+                    ee.assume_expr(&neg, self_var);
+                    ee.eval_is_finite(eb, self_var)
+                } else {
+                    false
+                }
+            }
+            ExprKind::Block(b) => b
+                .tail
+                .as_deref()
+                .is_some_and(|e| self.eval_is_finite(e, self_var)),
+            _ => false,
         }
     }
 
@@ -474,8 +557,18 @@ impl L0Env {
                 ) {
                     let (cur_lo, cur_hi) = self.floats.get(&v).copied().unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
                     let (nlo, nhi) = match op {
-                        BinOp::Ge | BinOp::Gt => (cur_lo.max(r0), cur_hi),
-                        BinOp::Le | BinOp::Lt => (cur_lo, cur_hi.min(r1)),
+                        BinOp::Ge | BinOp::Gt => {
+                            if (*op == BinOp::Gt && r0 >= 0.0) || (*op == BinOp::Ge && r0 > 0.0) {
+                                self.nonzero_floats.insert(v.clone());
+                            }
+                            (cur_lo.max(r0), cur_hi)
+                        }
+                        BinOp::Le | BinOp::Lt => {
+                            if (*op == BinOp::Lt && r1 <= 0.0) || (*op == BinOp::Le && r1 < 0.0) {
+                                self.nonzero_floats.insert(v.clone());
+                            }
+                            (cur_lo, cur_hi.min(r1))
+                        }
                         BinOp::Eq => (cur_lo.max(r0), cur_hi.min(r1)),
                         _ => (cur_lo, cur_hi),
                     };
@@ -520,6 +613,11 @@ impl L0Env {
                 self.bools.insert(key, true);
             }
             ExprKind::Call { callee, args } => {
+                if matches!(&callee.kind, ExprKind::Ident(f) if f == "is_finite") && args.len() == 1 {
+                    if let Some(v) = expr_var_name(&args[0].value, self_var) {
+                        self.finite_floats.insert(v);
+                    }
+                }
                 if let Some(ck) = canonical_pred_call(callee, args, self_var) {
                     self.proved_calls.insert(ck);
                 }
@@ -1141,6 +1239,16 @@ impl L0Env {
                 _ => L0Result::Unknown,
             },
             ExprKind::Call { callee, args } => {
+                if matches!(&callee.kind, ExprKind::Ident(f) if f == "is_finite") && args.len() == 1 {
+                    if self.eval_is_finite(&args[0].value, self_var) {
+                        return L0Result::Proved;
+                    }
+                    if let ExprKind::Float(x) = args[0].value.kind {
+                        if !x.is_finite() {
+                            return L0Result::Disproved("floating-point literal is NaN or Inf".into());
+                        }
+                    }
+                }
                 if let Some(ck) = canonical_pred_call(callee, args, self_var) {
                     if self.proved_calls.contains(&ck) {
                         return L0Result::Proved;

@@ -1,0 +1,96 @@
+// std/gpu/tensor.tn — Dependent-Shape Tensor Primitives & Static Dimension Proofs
+//
+// Matrix dimensions (`rows`, `cols`) and backing data lengths (`len(data) == rows * cols`)
+// are verified at compile time via L0/Z3 contracts. Passing mismatched shapes to `tensor2d_matmul`
+// or `tensor2d_add_relu` is rejected BEFORE execution with a Z3 counterexample!
+
+import "std/core/types.tn"
+
+@gpu_struct("std430")
+pub record MatMulParams {
+    m UInt32
+    n UInt32
+    k UInt32
+    _pad UInt32
+}
+
+pub record Tensor2D {
+    rows Positive
+    cols Positive
+    data List[Float32]
+}
+
+pub pure fn tensor2d_zeros(
+    r Int where 1 <= self && self <= 4096,
+    c Int where 1 <= self && self <= 4096,
+) Tensor2D
+    ensures result.rows == r && result.cols == c && len(result.data) == r * c
+{
+    let n = r * c
+    let zero Float32 = 0.0 as Float32
+    let data List[Float32] = list_filled(n, zero)
+    Tensor2D { rows = r, cols = c, data = data }
+}
+
+pub pure fn tensor2d_from_data(
+    r Int where 1 <= self && self <= 4096,
+    c Int where 1 <= self && self <= 4096,
+    data List[Float32],
+) Tensor2D
+    requires len(data) == r * c
+    ensures result.rows == r && result.cols == c && len(result.data) == r * c
+{
+    Tensor2D { rows = r, cols = c, data = data }
+}
+
+/// Verified Matrix Multiplication `C[M, N] = A[M, K] * B[K, N]`.
+/// Statically enforces `a.cols == b.rows` and proves every 2D index access in bounds!
+pub pure fn tensor2d_matmul(a Tensor2D, b Tensor2D) Tensor2D
+    requires a.rows <= 4096 && a.cols <= 4096 && b.cols <= 4096
+    requires a.cols == b.rows
+    requires len(a.data) == a.rows * a.cols && len(b.data) == b.rows * b.cols
+    ensures result.rows == a.rows && result.cols == b.cols && len(result.data) == a.rows * b.cols
+{
+    let m = a.rows
+    let k = a.cols
+    let n = b.cols
+    let zero Float32 = 0.0 as Float32
+    var out List[Float32] = list_filled(m * n, zero)
+    var i = 0
+    while i < m {
+        var j = 0
+        while j < n {
+            var acc Float32 = zero
+            var p = 0
+            while p < k {
+                let av = a.data[i * k + p]
+                let bv = b.data[p * n + j]
+                acc = acc + av * bv
+                p += 1
+            }
+            out[i * n + j] = acc
+            j += 1
+        }
+        i += 1
+    }
+    Tensor2D { rows = m, cols = n, data = out }
+}
+
+/// Verified elementwise fused `ReLU(A + B)` with exact shape equality proof.
+pub pure fn tensor2d_add_relu(a Tensor2D, b Tensor2D) Tensor2D
+    requires a.rows <= 4096 && a.cols <= 4096
+    requires a.rows == b.rows && a.cols == b.cols
+    requires len(a.data) == a.rows * a.cols && len(b.data) == b.rows * b.cols
+    ensures result.rows == a.rows && result.cols == a.cols && len(result.data) == a.rows * a.cols
+{
+    let total = a.rows * a.cols
+    let zero Float32 = 0.0 as Float32
+    var out List[Float32] = list_filled(total, zero)
+    var i = 0
+    while i < total {
+        let s = a.data[i] + b.data[i]
+        out[i] = if s > zero { s } else { zero }
+        i += 1
+    }
+    Tensor2D { rows = a.rows, cols = a.cols, data = out }
+}

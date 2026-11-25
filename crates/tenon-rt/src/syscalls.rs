@@ -159,6 +159,11 @@ pub extern "C" fn tenon_float_is_nan(bits: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn tenon_float_is_finite(bits: i64) -> i64 {
+    if f64::from_bits(bits as u64).is_finite() { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_float_bits(bits: i64) -> i64 {
     let v = f64::from_bits(bits as u64);
     if v == 0.0 {

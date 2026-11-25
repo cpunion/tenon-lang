@@ -363,6 +363,11 @@ int64_t tenon_bytes_ptr(int64_t b) {
     return (int64_t)(uintptr_t)((TenonObj*)(uintptr_t)b)->fields;
 }
 
+int64_t tenon_list_data_ptr(int64_t xs) {
+    if (xs == 0) return 0;
+    return (int64_t)(uintptr_t)((TenonObj*)(uintptr_t)xs)->fields;
+}
+
 int64_t tenon_text_cstr_ptr(int64_t s) {
     if (s == 0) return (int64_t)(uintptr_t)"";
     return (int64_t)(uintptr_t)((TenonObj*)(uintptr_t)s)->fields;

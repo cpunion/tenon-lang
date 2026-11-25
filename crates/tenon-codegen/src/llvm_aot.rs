@@ -260,13 +260,24 @@ pub fn compile_with_options(
         _ => "-O3",
     };
 
-    // Collect `@link("lib")` attributes from `extern "C"` declarations
+    // Collect `@link("lib")` and `@link(framework = "Metal")` attributes from declarations
     let mut all_link_libs: Vec<String> = Vec::new();
+    let mut all_link_frameworks: Vec<String> = Vec::new();
     for item in &program.items {
-        if let Item::ExternFn(ef) = item {
-            for lib in extract_link_libs(&ef.attrs) {
+        let attrs_opt = match item {
+            Item::ExternFn(ef) => Some(&ef.attrs),
+            Item::Fn(f) => Some(&f.attrs),
+            _ => None,
+        };
+        if let Some(attrs) = attrs_opt {
+            for lib in extract_link_libs(attrs) {
                 if !all_link_libs.contains(&lib) {
                     all_link_libs.push(lib);
+                }
+            }
+            for fw in extract_link_frameworks(attrs) {
+                if !all_link_frameworks.contains(&fw) {
+                    all_link_frameworks.push(fw);
                 }
             }
         }
@@ -276,6 +287,11 @@ pub fn compile_with_options(
             all_link_libs.push(lib.clone());
         }
     }
+    let has_objc_sources = opts.extra_c_sources.iter().any(|p| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "m" || e == "mm")
+    });
 
     let res = match opts.output_kind {
         OutputKind::StaticLib => {
@@ -323,6 +339,9 @@ pub fn compile_with_options(
                 let eo = std::env::temp_dir().join(format!("tenon_ex_{}_{}_{}.o", pid, seq, idx));
                 let mut ce = Command::new("clang");
                 ce.arg(opt_flag).arg("-c");
+                if csrc.extension().and_then(|e| e.to_str()).is_some_and(|e| e == "m" || e == "mm") {
+                    ce.arg("-fobjc-arc");
+                }
                 if opts.debug_info {
                     ce.arg("-g");
                 }
@@ -379,8 +398,11 @@ pub fn compile_with_options(
             } else {
                 if opts.output_kind == OutputKind::SharedLib {
                     cmd.args(["-shared", "-fPIC"]);
-                } else if opt_flag == "-O3" && !opts.debug_info && opts.target_triple.is_none() {
+                } else if opt_flag == "-O3" && !opts.debug_info && opts.target_triple.is_none() && !has_objc_sources {
                     cmd.arg("-flto=thin");
+                }
+                if has_objc_sources {
+                    cmd.arg("-fobjc-arc");
                 }
                 cmd.args([
                     "-Wno-override-module",
@@ -400,6 +422,9 @@ pub fn compile_with_options(
                 }
                 for lib in &all_link_libs {
                     cmd.arg(format!("-l{}", lib));
+                }
+                for fw in &all_link_frameworks {
+                    cmd.args(["-framework", fw]);
                 }
             }
             cmd.args(["-o", output_path.to_str().unwrap()]);
@@ -5109,17 +5134,19 @@ impl<'a> LlvmFnGen<'a> {
                 if args.len() == 1
                     && matches!(
                         &callee.kind,
-                        ExprKind::Ident(f) if f == "text_cstr_ptr" || f == "bytes_ptr"
+                        ExprKind::Ident(f) if f == "text_cstr_ptr" || f == "bytes_ptr" || f == "list_data_ptr"
                     ) =>
             {
                 let ExprKind::Ident(fname) = &callee.kind else {
                     unreachable!()
                 };
-                // Keep the backing Text/Bytes temporary alive in caller's `temps`
-                // until the enclosing call completes (prevents UAF on dynamic strings)!
+                // Keep the backing Text/Bytes/List temporary alive in caller's `temps`
+                // until the enclosing call completes (prevents UAF on dynamic buffers)!
                 let arg_v = self.lower_expr_borrowed(&args[0].value, temps)?;
                 let csym = if fname == "text_cstr_ptr" {
                     "tenon_text_cstr_ptr"
+                } else if fname == "list_data_ptr" {
+                    "tenon_list_data_ptr"
                 } else {
                     "tenon_bytes_ptr"
                 };

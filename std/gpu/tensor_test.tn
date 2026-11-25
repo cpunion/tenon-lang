@@ -1,0 +1,37 @@
+// std/gpu/tensor_test.tn — Colocated Tests for Verified Dependent-Shape Tensors & FiniteFloat
+import "std/core/types.tn"
+import "std/gpu/tensor.tn"
+
+pure fn safe_flex_ratio(w NonNegFloat, count FiniteFloat where self > 0.0) FiniteFloat {
+    w / count
+}
+
+test fn test_tensor2d_matmul_and_add_relu_verified() {
+    // A: 2x3, B: 3x2 -> C: 2x2
+    let a_data List[Float32] = [1.0 as Float32, 2.0 as Float32, 3.0 as Float32, 4.0 as Float32, 5.0 as Float32, 6.0 as Float32]
+    let b_data List[Float32] = [7.0 as Float32, 8.0 as Float32, 9.0 as Float32, 10.0 as Float32, 11.0 as Float32, 12.0 as Float32]
+    let a = tensor2d_from_data(2, 3, a_data)
+    let b = tensor2d_from_data(3, 2, b_data)
+    let c = tensor2d_matmul(a, b)
+    assert c.rows == 2 && c.cols == 2 && len(c.data) == 4
+    // [1*7+2*9+3*11, 1*8+2*10+3*12] = [58, 64]
+    // [4*7+5*9+6*11, 4*8+5*10+6*12] = [139, 154]
+    assert float_to_int(c.data[0] as Float) == 58
+    assert float_to_int(c.data[1] as Float) == 64
+    assert float_to_int(c.data[2] as Float) == 139
+    assert float_to_int(c.data[3] as Float) == 154
+
+    // Bias with negative entries -> ReLU clamps negative sum to 0!
+    let bias_data List[Float32] = [(-100.0) as Float32, 6.0 as Float32, 1.0 as Float32, (-200.0) as Float32]
+    let bias = tensor2d_from_data(2, 2, bias_data)
+    let act = tensor2d_add_relu(c, bias)
+    assert float_to_int(act.data[0] as Float) == 0
+    assert float_to_int(act.data[1] as Float) == 70
+    assert float_to_int(act.data[2] as Float) == 140
+    assert float_to_int(act.data[3] as Float) == 0
+
+    // FiniteFloat NaN-free arithmetic check
+    let ratio = safe_flex_ratio(120.0, 3.0)
+    assert is_finite(ratio)
+    assert float_to_int(ratio) == 40
+}

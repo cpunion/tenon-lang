@@ -31,7 +31,7 @@ pub enum MirInst {
     BinOp { dst: MirVal, op: String, lhs: MirVal, rhs: MirVal, proved_no_overflow: bool },
     LoadIndex { dst: MirVal, target: MirVal, index: MirVal, proved_in_bounds: bool },
     StoreIndex { target: String, index: MirVal, val: MirVal, proved_in_bounds: bool },
-    AllocRecord { dst: MirVal, record: String, fields: Vec<(String, MirVal)>, stack_promoted: bool },
+    AllocRecord { dst: MirVal, record: String, fields: Vec<(String, MirVal)>, stack_promoted: bool, reuse_from: Option<String> },
     FieldLoad { dst: MirVal, target: MirVal, field: String },
     Call { dst: MirVal, callee: String, args: Vec<MirVal> },
     RcMove { var: String, span_start: usize },
@@ -66,6 +66,10 @@ pub struct MirFunction {
     /// Span start offsets of identifier reads proved to be Last-Use Moves (zero `rc_inc`/`rc_dec`).
     pub last_use_move_spans: BTreeSet<usize>,
     pub stack_promoted_locals: BTreeSet<String>,
+    /// FBIP drop-reuse pairs: `(block_idx, inst_idx) -> dropped_local_name` whose heap slot can be reused in-place.
+    pub fbip_reuse_pairs: BTreeMap<(usize, usize), String>,
+    pub folded_constants: usize,
+    pub dce_removed: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -346,6 +350,7 @@ impl<'a> FnLowerer<'a> {
                     record: name.clone(),
                     fields: fvs,
                     stack_promoted: stk,
+                    reuse_from: None,
                 });
                 d
             }
@@ -670,6 +675,9 @@ pub fn lower_program_to_ssa_mir(program: &Program, verified: &VerifiedMir) -> Mi
                 blocks: lowerer.blocks,
                 last_use_move_spans: BTreeSet::new(),
                 stack_promoted_locals: lowerer.stack_promoted,
+                fbip_reuse_pairs: BTreeMap::new(),
+                folded_constants: 0,
+                dce_removed: 0,
             };
             if !lowerer.has_try_or_closure_or_loop_break {
                 let dup_spans: BTreeSet<usize> = lowerer
@@ -680,6 +688,9 @@ pub fn lower_program_to_ssa_mir(program: &Program, verified: &VerifiedMir) -> Mi
                     .collect();
                 run_last_use_move_pass(&mut mf, &lowerer.non_movable, &dup_spans);
             }
+            run_const_fold_pass(&mut mf);
+            run_dce_pass(&mut mf);
+            run_fbip_reuse_pass(&mut mf);
             functions.push(mf);
         }
     }
@@ -787,6 +798,148 @@ pub fn run_last_use_move_pass(
     mf.last_use_move_spans = last_use_spans;
 }
 
+/// SSA Constant Folding pass: folds pure integer arithmetic/comparison `BinOp`s on constant operands.
+pub fn run_const_fold_pass(mf: &mut MirFunction) {
+    let mut const_ints: BTreeMap<MirVal, i64> = BTreeMap::new();
+    let mut folded = 0usize;
+    for bb in &mut mf.blocks {
+        for inst in &mut bb.insts {
+            match inst {
+                MirInst::ConstInt { dst, val } => {
+                    const_ints.insert(*dst, *val);
+                }
+                MirInst::BinOp { dst, op, lhs, rhs, .. } => {
+                    if let (Some(&a), Some(&b)) = (const_ints.get(lhs), const_ints.get(rhs)) {
+                        let dst_v = *dst;
+                        let folded_inst = match op.as_str() {
+                            "Add" | "+" => a.checked_add(b).map(|v| MirInst::ConstInt { dst: dst_v, val: v }),
+                            "Sub" | "-" => a.checked_sub(b).map(|v| MirInst::ConstInt { dst: dst_v, val: v }),
+                            "Mul" | "*" => a.checked_mul(b).map(|v| MirInst::ConstInt { dst: dst_v, val: v }),
+                            "Div" | "/" if b != 0 => a.checked_div(b).map(|v| MirInst::ConstInt { dst: dst_v, val: v }),
+                            "Mod" | "%" if b != 0 => a.checked_rem(b).map(|v| MirInst::ConstInt { dst: dst_v, val: v }),
+                            "Eq" | "==" => Some(MirInst::ConstBool { dst: dst_v, val: a == b }),
+                            "Ne" | "!=" => Some(MirInst::ConstBool { dst: dst_v, val: a != b }),
+                            "Lt" | "<" => Some(MirInst::ConstBool { dst: dst_v, val: a < b }),
+                            "Le" | "<=" => Some(MirInst::ConstBool { dst: dst_v, val: a <= b }),
+                            "Gt" | ">" => Some(MirInst::ConstBool { dst: dst_v, val: a > b }),
+                            "Ge" | ">=" => Some(MirInst::ConstBool { dst: dst_v, val: a >= b }),
+                            _ => None,
+                        };
+                        if let Some(new_inst) = folded_inst {
+                            if let MirInst::ConstInt { val, .. } = new_inst {
+                                const_ints.insert(dst_v, val);
+                            }
+                            *inst = new_inst;
+                            folded += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    mf.folded_constants = folded;
+}
+
+/// SSA Dead Code Elimination pass: removes unused pure `Const*` / `BinOp` / `FieldLoad` instructions.
+pub fn run_dce_pass(mf: &mut MirFunction) {
+    let mut removed = 0usize;
+    loop {
+        let mut used: BTreeSet<MirVal> = BTreeSet::new();
+        for bb in &mf.blocks {
+            for inst in &bb.insts {
+                match inst {
+                    MirInst::StoreLocal { val, .. } => { used.insert(*val); }
+                    MirInst::BinOp { lhs, rhs, .. } => { used.insert(*lhs); used.insert(*rhs); }
+                    MirInst::LoadIndex { target, index, .. } => { used.insert(*target); used.insert(*index); }
+                    MirInst::StoreIndex { index, val, .. } => { used.insert(*index); used.insert(*val); }
+                    MirInst::AllocRecord { fields, .. } => { for (_, v) in fields { used.insert(*v); } }
+                    MirInst::FieldLoad { target, .. } => { used.insert(*target); }
+                    MirInst::Call { args, .. } => { for a in args { used.insert(*a); } }
+                    _ => {}
+                }
+            }
+            match &bb.term {
+                MirTerminator::Branch { cond, .. } => { used.insert(*cond); }
+                MirTerminator::Return(Some(v)) => { used.insert(*v); }
+                _ => {}
+            }
+        }
+        let mut pass_removed = 0usize;
+        for bb in &mut mf.blocks {
+            let before = bb.insts.len();
+            bb.insts.retain(|inst| match inst {
+                MirInst::ConstInt { dst, .. }
+                | MirInst::ConstFloat { dst, .. }
+                | MirInst::ConstBool { dst, .. }
+                | MirInst::ConstText { dst, .. }
+                | MirInst::BinOp { dst, .. }
+                | MirInst::FieldLoad { dst, .. } => used.contains(dst),
+                _ => true,
+            });
+            pass_removed += before - bb.insts.len();
+        }
+        removed += pass_removed;
+        if pass_removed == 0 {
+            break;
+        }
+    }
+    mf.dce_removed = removed;
+}
+
+/// FBIP (Functional But In-Place) Drop-Reuse Pairing pass:
+/// pairs heap `AllocRecord` instructions with a preceding Last-Use Move of a local variable
+/// of the **exact same record type** in the same basic block so Perceus can reuse the allocation
+/// slot in-place with zero `malloc`.
+pub fn run_fbip_reuse_pass(mf: &mut MirFunction) {
+    let mut local_record_ty: BTreeMap<String, String> = BTreeMap::new();
+    for (pname, pty) in &mf.params {
+        local_record_ty.insert(pname.clone(), pty.clone());
+    }
+    let mut val_record_ty: BTreeMap<MirVal, String> = BTreeMap::new();
+    for bb in &mf.blocks {
+        for inst in &bb.insts {
+            match inst {
+                MirInst::AllocRecord { dst, record, .. } => {
+                    val_record_ty.insert(*dst, record.clone());
+                }
+                MirInst::StoreLocal { name, val } => {
+                    if let Some(rt) = val_record_ty.get(val) {
+                        local_record_ty.insert(name.clone(), rt.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut pairs = BTreeMap::new();
+    for (bi, bb) in mf.blocks.iter_mut().enumerate() {
+        let mut free_by_record: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (ii, inst) in bb.insts.iter_mut().enumerate() {
+            match inst {
+                MirInst::LoadLocal { name, is_last_use_move: true, .. } => {
+                    if let Some(rty) = local_record_ty.get(name) {
+                        let q = free_by_record.entry(rty.clone()).or_default();
+                        if !q.contains(name) {
+                            q.push(name.clone());
+                        }
+                    }
+                }
+                MirInst::AllocRecord { record, stack_promoted: false, reuse_from, .. } => {
+                    if let Some(q) = free_by_record.get_mut(record) {
+                        if let Some(donor) = q.pop() {
+                            *reuse_from = Some(donor.clone());
+                            pairs.insert((bi, ii), donor);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    mf.fbip_reuse_pairs = pairs;
+}
+
 /// Formats a `MirProgram` into human-readable SSA CFG text (`tenon build --emit-mir`).
 pub fn format_mir(mir: &MirProgram) -> String {
     let mut out = String::from("; Tenon Unified Typed SSA/CFG MIR (tenon-mir)\n\n");
@@ -832,8 +985,14 @@ pub fn format_mir(mir: &MirProgram) -> String {
                         let fl = if *proved_in_bounds { " unchecked" } else { " checked" };
                         out.push_str(&format!("    idx.store{} ${}[%{}] = %{}\n", fl, target, index.0, val.0));
                     }
-                    MirInst::AllocRecord { dst, record, fields, stack_promoted } => {
-                        let loc = if *stack_promoted { "stack.alloca" } else { "heap.rc" };
+                    MirInst::AllocRecord { dst, record, fields, stack_promoted, reuse_from } => {
+                        let loc = if *stack_promoted {
+                            "stack.alloca".to_string()
+                        } else if let Some(donor) = reuse_from {
+                            format!("reuse.rc(${})", donor)
+                        } else {
+                            "heap.rc".to_string()
+                        };
                         let fs: Vec<String> = fields.iter().map(|(k, v)| format!("{}=%{}", k, v.0)).collect();
                         out.push_str(&format!("    %{} = alloc.{} {} {{ {} }}\n", dst.0, loc, record, fs.join(", ")));
                     }
@@ -906,5 +1065,31 @@ pub fn score_loop(n Int where self >= 1 && self <= 16) Int {
         assert!(txt.contains("alloc.stack.alloca Pt"));
         assert!(txt.contains("idx.load unchecked"));
         assert!(txt.contains("move.local"));
+    }
+
+    #[test]
+    fn mir_constant_folding_dce_and_fbip_drop_reuse() {
+        let src = r#"
+pub record Node {
+    v Int
+}
+
+pub fn transform_node(n Node) Node {
+    let k = 10 + 20 * 3
+    let dead = 999 + 1
+    let nv = n.v + k
+    Node { v = nv }
+}
+"#;
+        let prog = tenon_syntax::parse(src).unwrap();
+        let rep = tenon_verify::check_program(&prog);
+        assert!(rep.ok, "verify failed: {:?}", rep.diagnostics);
+        let mir = lower_program_to_ssa_mir(&prog, &rep.mir);
+        let f = &mir.functions[0];
+        assert!(f.folded_constants >= 2, "expected const folding of 20*3 and 10+60, got {}", f.folded_constants);
+        assert!(f.dce_removed >= 1, "expected DCE to drop dead constants, got {}", f.dce_removed);
+        assert!(!f.fbip_reuse_pairs.is_empty(), "expected FBIP drop-reuse pairing for Node");
+        let txt = format_mir(&mir);
+        assert!(txt.contains("reuse.rc($n)"), "expected reuse.rc($n) in MIR:\n{}", txt);
     }
 }

@@ -1016,6 +1016,7 @@ impl LowerCtx {
                     if matches!(
                         fname.as_str(),
                         "float_is_nan"
+                            | "is_finite"
                             | "ptr_is_null"
                             | "atomic_cas"
                             | "chan_send"

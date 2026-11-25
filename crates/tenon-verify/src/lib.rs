@@ -2209,4 +2209,97 @@ pub pure fn sum_auto_inv(xs List[Int]) Int {
             grid_rep.proofs
         );
     }
+
+    #[test]
+    fn verifies_g1_gpu_struct_pod_layout_finite_float_and_tensor_shape_proofs() {
+        // 1. `@gpu_struct` positive (POD layout proof) vs negative (RC field -> E0830)
+        let gpu_ok = parse(
+            r#"
+@gpu_struct("std430")
+pub record QuadInstance {
+    x      Float32
+    y      Float32
+    w      Float32
+    h      Float32
+    r      Float32
+    g      Float32
+    b      Float32
+    a      Float32
+    radius Float32
+    _pad1  Float32
+    _pad2  Float32
+    _pad3  Float32
+}
+
+pub pure fn ok_quad() Int { 48 }
+"#,
+        )
+        .unwrap();
+        let gpu_ok_rep = check_program(&gpu_ok);
+        assert!(gpu_ok_rep.ok, "@gpu_struct positive failed: {:?}", gpu_ok_rep.diagnostics);
+        assert!(
+            gpu_ok_rep.proofs.iter().any(|p| p.obligation.contains("@gpu_struct(std430)") && p.obligation.contains("48B")),
+            "expected @gpu_struct 48B layout proof, got {:?}",
+            gpu_ok_rep.proofs
+        );
+
+        let gpu_bad = parse(
+            r#"
+@gpu_struct("std430")
+pub record BadGpuStruct {
+    label Text
+    items List[Float32]
+}
+"#,
+        )
+        .unwrap();
+        let gpu_bad_rep = check_program(&gpu_bad);
+        let e0830 = gpu_bad_rep.diagnostics.iter().filter(|d| d.code == "E0830").count();
+        assert!(e0830 >= 2, "expected >=2 E0830 diagnostics for RC fields in @gpu_struct, got {:?}", gpu_bad_rep.diagnostics);
+
+        // 2. `is_finite(x)` / `FiniteFloat` NaN-freedom positive & negative
+        let flt_ok = parse(
+            r#"
+pub type FiniteFloat = Float where is_finite(self)
+pub type NonNegFloat = Float where is_finite(self) && self >= 0.0
+
+pub pure fn flex_share(total NonNegFloat, n FiniteFloat where self > 0.0) FiniteFloat {
+    let half = total * 0.5
+    half / n
+}
+"#,
+        )
+        .unwrap();
+        let flt_ok_rep = check_program(&flt_ok);
+        assert!(flt_ok_rep.ok, "FiniteFloat positive failed: {:?}", flt_ok_rep.diagnostics);
+
+        // 3. Dependent-shape Tensor2D matmul: compile-time rejection of mismatched shapes (`2x3 * 4x2`)!
+        let tensor_bad = parse(
+            r#"
+pub record Tensor2D {
+    rows Int where self >= 1
+    cols Int where self >= 1
+    data List[Float32]
+}
+
+pub pure fn matmul_checked(a Tensor2D, b Tensor2D) Int
+    requires a.cols == b.rows
+{
+    a.rows * b.cols
+}
+
+pub pure fn bad_dims() Int {
+    let a = Tensor2D { rows = 2, cols = 3, data = list_filled(6, 1.0 as Float32) }
+    let b = Tensor2D { rows = 4, cols = 2, data = list_filled(8, 1.0 as Float32) }
+    matmul_checked(a, b)
+}
+"#,
+        )
+        .unwrap();
+        let tensor_bad_rep = check_program(&tensor_bad);
+        assert!(
+            !tensor_bad_rep.ok,
+            "expected mismatched Tensor2D matmul dimensions (2x3 * 4x2) to fail at compile time!"
+        );
+    }
 }

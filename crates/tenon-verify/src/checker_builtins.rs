@@ -31,6 +31,7 @@ pub(crate) const BUILTIN_SIGS: &[BuiltinSig] = &[
     BuiltinSig { name: "float_to_text", arity: 1, is_pure: true, allocates: true, param_types: &["Float"], ret_type: "Text" },
     BuiltinSig { name: "parse_float", arity: 1, is_pure: true, allocates: false, param_types: &["Text"], ret_type: "Float" },
     BuiltinSig { name: "float_is_nan", arity: 1, is_pure: true, allocates: false, param_types: &["Float"], ret_type: "Bool" },
+    BuiltinSig { name: "is_finite", arity: 1, is_pure: true, allocates: false, param_types: &["Float"], ret_type: "Bool" },
     BuiltinSig { name: "float_bits", arity: 1, is_pure: true, allocates: false, param_types: &["Float"], ret_type: "Int" },
     // 4 O(n) Byte buffer primitives (pure)
     BuiltinSig { name: "buf_new", arity: 0, is_pure: true, allocates: true, param_types: &[], ret_type: "Int" },
@@ -96,6 +97,7 @@ pub(crate) const BUILTIN_SIGS: &[BuiltinSig] = &[
     BuiltinSig { name: "bytes_to_text", arity: 1, is_pure: true, allocates: true, param_types: &["Bytes"], ret_type: "Text" },
     BuiltinSig { name: "text_to_bytes", arity: 1, is_pure: true, allocates: true, param_types: &["Text"], ret_type: "Bytes" },
     BuiltinSig { name: "bytes_ptr", arity: 1, is_pure: true, allocates: false, param_types: &["Bytes"], ret_type: "Ptr[UInt8]" },
+    BuiltinSig { name: "list_data_ptr", arity: 1, is_pure: true, allocates: false, param_types: &["Any"], ret_type: "Ptr[UInt8]" },
     BuiltinSig { name: "text_cstr_ptr", arity: 1, is_pure: true, allocates: false, param_types: &["Text"], ret_type: "Ptr[UInt8]" },
     BuiltinSig { name: "cstr_to_text", arity: 1, is_pure: false, allocates: true, param_types: &["Any"], ret_type: "Text" },
     // S2: Layout intrinsics, raw pointers & unsafe memory ops

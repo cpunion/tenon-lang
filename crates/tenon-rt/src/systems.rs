@@ -510,6 +510,14 @@ pub extern "C" fn tenon_bytes_ptr(b: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn tenon_list_data_ptr(xs: i64) -> i64 {
+    if xs == 0 {
+        return 0;
+    }
+    unsafe { fields_ptr(xs as *mut ObjHeader) as i64 }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_text_cstr_ptr(s: i64) -> i64 {
     if s == 0 {
         return c"".as_ptr() as i64;

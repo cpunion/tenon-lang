@@ -782,11 +782,110 @@ impl CheckerCtx {
                 }
             }
             match item {
+                Item::Record(r) => self.check_gpu_struct_decl(r),
                 Item::Bitfield(bf) => self.check_bitfield_decl(bf),
                 Item::Const(c) => self.check_const_decl(c),
                 Item::Fn(f) => self.check_fn(f),
                 Item::Impl(imp) => self.check_impl(imp),
                 _ => {}
+            }
+        }
+    }
+
+    fn is_gpu_pod_type(&self, ty: &TypeExpr, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let base = self.resolve_base_type(ty);
+        match base {
+            TypeExpr::Named { name, args, .. } => {
+                if let Some(sk) = ScalarKind::from_name(&name) {
+                    return sk.is_int() || sk.is_float();
+                }
+                if name == "SimdVec" {
+                    return true;
+                }
+                if name == "Array" && args.len() == 2 {
+                    return self.is_gpu_pod_type(&args[0], depth + 1);
+                }
+                if let Some(sub) = self.records.get(&name) {
+                    return tenon_syntax::has_gpu_struct(&sub.attrs)
+                        || tenon_syntax::has_repr_c(&sub.attrs);
+                }
+                false
+            }
+            TypeExpr::Array { elem, .. } => self.is_gpu_pod_type(&elem, depth + 1),
+            _ => false,
+        }
+    }
+
+    fn check_gpu_struct_decl(&mut self, rec: &RecordDecl) {
+        let Some(mode) = tenon_syntax::gpu_struct_mode(&rec.attrs) else {
+            return;
+        };
+        if !matches!(mode.as_str(), "std140" | "std430" | "metal") {
+            self.diagnostics.push(Diagnostic {
+                code: "E0830".into(),
+                message: format!(
+                    "`@gpu_struct` on `{}` has unsupported layout mode `{}` (expected `std140`, `std430`, or `metal`)",
+                    rec.name, mode
+                ),
+                span: rec.span,
+                notes: vec![],
+                counterexample: BTreeMap::new(),
+            });
+            return;
+        }
+        let mut bad = false;
+        for f in &rec.fields {
+            if !self.is_gpu_pod_type(&f.ty, 0) {
+                bad = true;
+                self.diagnostics.push(Diagnostic {
+                    code: "E0830".into(),
+                    message: format!(
+                        "`@gpu_struct` record `{}` field `{}` has non-POD / heap-managed type `{}`",
+                        rec.name,
+                        f.name,
+                        f.ty.display_name()
+                    ),
+                    span: f.span,
+                    notes: vec![
+                        "GPU structs must contain only POD scalar, fixed array, SimdVec, or nested `@gpu_struct` fields (zero RC pointers)".into(),
+                    ],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+        }
+        if !bad {
+            let mut eng = LayoutEngine::default();
+            for (k, r) in &self.records {
+                eng.records.insert(k.clone(), r.clone());
+            }
+            for (k, ta) in &self.type_aliases {
+                eng.aliases.insert(k.clone(), ta.base.clone());
+            }
+            if let Some(lay) = eng.struct_layout(&rec.name) {
+                if mode == "std140" && lay.size % 16 != 0 {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0830".into(),
+                        message: format!(
+                            "`@gpu_struct(\"std140\")` record `{}` size {}B is not 16-byte aligned",
+                            rec.name, lay.size
+                        ),
+                        span: rec.span,
+                        notes: vec!["add padding fields or switch to `@gpu_struct(\"std430\")`".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                } else {
+                    self.proofs.push(ProofRecord {
+                        obligation: format!(
+                            "@gpu_struct({}) POD & layout proof for `{}` ({}B, align {}B)",
+                            mode, rec.name, lay.size, lay.align
+                        ),
+                        tier: ProofTier::L0Fast,
+                        span: rec.span,
+                    });
+                }
             }
         }
     }
@@ -3489,6 +3588,9 @@ impl CheckerCtx {
                         if let Some((lo, hi)) = env.eval_abs_float(value, None) {
                             env.set_float(name.clone(), lo, hi);
                         }
+                        if env.eval_is_finite(value, None) {
+                            env.finite_floats.insert(name.clone());
+                        }
                         if self.expr_smt_encodable(value) {
                             let eq = Expr {
                                 kind: ExprKind::Binary {
@@ -3586,6 +3688,40 @@ impl CheckerCtx {
                                         },
                                         BTreeMap::new(),
                                     ));
+                                }
+                            }
+                        }
+                        ExprKind::Call { callee, args } => {
+                            // Modular Hoare-logic postcondition propagation:
+                            // For any verified function call `let x = f(a1, a2, ...)` with `ensures`,
+                            // instantiate `result -> x` and `param -> arg` into `env` & `smt_premises`!
+                            let fd_opt = match &callee.kind {
+                                ExprKind::Ident(fnm) => self.all_fns.get(fnm).cloned(),
+                                ExprKind::Field { target, field } => {
+                                    if let ExprKind::Ident(tname) = &target.kind {
+                                        self.resolve_assoc_method_sig(tname, field)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some(fdecl) = fd_opt {
+                                if !fdecl.ensures.is_empty() && fdecl.params.len() == args.len() {
+                                    let mut map = BTreeMap::new();
+                                    map.insert(
+                                        "result".to_string(),
+                                        Expr { kind: ExprKind::Ident(name.clone()), span: *span },
+                                    );
+                                    for (p, a) in fdecl.params.iter().zip(args.iter()) {
+                                        map.insert(p.name.clone(), a.value.clone());
+                                    }
+                                    for ens in &fdecl.ensures {
+                                        let inst = substitute_expr_idents(ens, &map);
+                                        env.assume_expr(&inst, None);
+                                        env.assume_float_expr(&inst, None);
+                                        smt_premises.push((inst, BTreeMap::new()));
+                                    }
                                 }
                             }
                         }
@@ -4116,6 +4252,8 @@ impl CheckerCtx {
                         env.ints.remove(mv);
                         env.bools.remove(mv);
                         env.floats.remove(mv);
+                        env.finite_floats.remove(mv);
+                        env.nonzero_floats.remove(mv);
                         env.diffs.retain(|(a, b), _| a != mv && b != mv);
                         smt_premises.retain(|(p, _)| !expr_mentions_ident(p, mv));
                         if let Some(mty) = var_types.get(mv).cloned() {
@@ -8312,6 +8450,24 @@ impl CheckerCtx {
                     None => {}
                 }
             }
+            // L0 symbolic finiteness & predicate check (handles `is_finite(self)` / `FiniteFloat`!)
+            {
+                let mut fenv = env.clone();
+                if env.eval_is_finite(expr, None) {
+                    fenv.finite_floats.insert("__val".into());
+                }
+                if let Some((lo, hi)) = env.eval_abs_float(expr, None) {
+                    fenv.floats.insert("__val".into(), (lo, hi));
+                }
+                if fenv.check_predicate(pred, Some("__val")) == L0Result::Proved {
+                    self.proofs.push(ProofRecord {
+                        obligation: format!("{} satisfies float refinement `{}`", context, name),
+                        tier: ProofTier::L0Fast,
+                        span,
+                    });
+                    return;
+                }
+            }
             // L0 symbolic float interval check (e.g. `(a + b) * 0.5` where `a, b in [0.0, 1.0]`)
             if let Some((lo, hi)) = env.eval_abs_float(expr, None) {
                 if check_float_refinement_l0(pred, lo) == Some(true)
@@ -9741,6 +9897,11 @@ fn check_float_refinement_l0(pred: &Expr, self_val: f64) -> Option<bool> {
         },
         ExprKind::Unary { op: UnOp::Not, expr: inner } => {
             check_float_refinement_l0(inner, self_val).map(|b| !b)
+        }
+        ExprKind::Call { callee, args }
+            if matches!(&callee.kind, ExprKind::Ident(f) if f == "is_finite") && args.len() == 1 =>
+        {
+            Some(eval_float_term(&args[0].value, self_val)?.is_finite())
         }
         _ => None,
     }

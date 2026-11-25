@@ -69,6 +69,7 @@ pub(crate) const CORE_SYSCALLS: &[CoreSyscallSpec] = &[
     CoreSyscallSpec { tenon_name: "float_to_text", c_symbol: "tenon_float_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
     CoreSyscallSpec { tenon_name: "parse_float", c_symbol: "tenon_parse_float", arity: 1, returns_rc: false, returns_text: false, returns_float: true, ret_ty: "Float" },
     CoreSyscallSpec { tenon_name: "float_is_nan", c_symbol: "tenon_float_is_nan", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
+    CoreSyscallSpec { tenon_name: "is_finite", c_symbol: "tenon_float_is_finite", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Bool" },
     CoreSyscallSpec { tenon_name: "float_bits", c_symbol: "tenon_float_bits", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     // 2. Minimal OS / I/O / FS / Process syscalls (10)
     CoreSyscallSpec { tenon_name: "sys_write_stdout", c_symbol: "tenon_sys_write_stdout", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
@@ -124,6 +125,7 @@ pub(crate) const CORE_SYSCALLS: &[CoreSyscallSpec] = &[
     CoreSyscallSpec { tenon_name: "bytes_to_text", c_symbol: "tenon_bytes_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
     CoreSyscallSpec { tenon_name: "text_to_bytes", c_symbol: "tenon_text_to_bytes", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "Bytes" },
     CoreSyscallSpec { tenon_name: "bytes_ptr", c_symbol: "tenon_bytes_ptr", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Ptr[UInt8]" },
+    CoreSyscallSpec { tenon_name: "list_data_ptr", c_symbol: "tenon_list_data_ptr", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Ptr[UInt8]" },
     CoreSyscallSpec { tenon_name: "text_cstr_ptr", c_symbol: "tenon_text_cstr_ptr", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "CStr" },
     CoreSyscallSpec { tenon_name: "cstr_to_text", c_symbol: "tenon_cstr_to_text", arity: 1, returns_rc: true, returns_text: true, returns_float: false, ret_ty: "Text" },
     // 6. S2 Raw memory ops
@@ -420,6 +422,7 @@ impl JitProgram {
         jit_builder.symbol("tenon_float_to_text", syscalls::tenon_float_to_text as *const u8);
         jit_builder.symbol("tenon_parse_float", syscalls::tenon_parse_float as *const u8);
         jit_builder.symbol("tenon_float_is_nan", syscalls::tenon_float_is_nan as *const u8);
+        jit_builder.symbol("tenon_float_is_finite", syscalls::tenon_float_is_finite as *const u8);
         jit_builder.symbol("tenon_float_bits", syscalls::tenon_float_bits as *const u8);
         jit_builder.symbol("tenon_sys_write_stdout", syscalls::tenon_sys_write_stdout as *const u8);
         jit_builder.symbol("tenon_sys_read_line", syscalls::tenon_sys_read_line as *const u8);
@@ -473,6 +476,7 @@ impl JitProgram {
         jit_builder.symbol("tenon_bytes_to_text", systems::tenon_bytes_to_text as *const u8);
         jit_builder.symbol("tenon_text_to_bytes", systems::tenon_text_to_bytes as *const u8);
         jit_builder.symbol("tenon_bytes_ptr", systems::tenon_bytes_ptr as *const u8);
+        jit_builder.symbol("tenon_list_data_ptr", systems::tenon_list_data_ptr as *const u8);
         jit_builder.symbol("tenon_text_cstr_ptr", systems::tenon_text_cstr_ptr as *const u8);
         jit_builder.symbol("tenon_cstr_to_text", systems::tenon_cstr_to_text as *const u8);
         jit_builder.symbol("tenon_cstruct_alloc", systems::tenon_cstruct_alloc as *const u8);

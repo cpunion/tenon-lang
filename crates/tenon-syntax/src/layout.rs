@@ -308,8 +308,29 @@ pub fn explicit_align_attr(attrs: &[Attr]) -> Option<usize> {
     None
 }
 
+pub fn has_gpu_struct(attrs: &[Attr]) -> bool {
+    attrs.iter().any(|a| a.name == "gpu_struct")
+}
+
+pub fn gpu_struct_mode(attrs: &[Attr]) -> Option<String> {
+    for a in attrs {
+        if a.name == "gpu_struct" {
+            if let Some(arg) = a.args.first() {
+                if let ExprKind::Str(s) | ExprKind::Ident(s) = &arg.value.kind {
+                    return Some(s.clone());
+                }
+            }
+            return Some("std430".to_string());
+        }
+    }
+    None
+}
+
 pub fn is_c_layout_attrs(attrs: &[Attr]) -> bool {
-    has_repr_c(attrs) || has_packed_attr(attrs) || explicit_align_attr(attrs).is_some()
+    has_repr_c(attrs)
+        || has_packed_attr(attrs)
+        || explicit_align_attr(attrs).is_some()
+        || has_gpu_struct(attrs)
 }
 
 pub fn extract_export_name(attrs: &[Attr], default_name: &str) -> Option<String> {
@@ -331,6 +352,9 @@ pub fn extract_link_libs(attrs: &[Attr]) -> Vec<String> {
     for a in attrs {
         if a.name == "link" {
             for arg in &a.args {
+                if arg.key.as_deref() == Some("framework") {
+                    continue;
+                }
                 if let ExprKind::Str(s) = &arg.value.kind {
                     libs.push(s.clone());
                 }
@@ -338,6 +362,22 @@ pub fn extract_link_libs(attrs: &[Attr]) -> Vec<String> {
         }
     }
     libs
+}
+
+pub fn extract_link_frameworks(attrs: &[Attr]) -> Vec<String> {
+    let mut fws = Vec::new();
+    for a in attrs {
+        if a.name == "link" {
+            for arg in &a.args {
+                if arg.key.as_deref() == Some("framework") {
+                    if let ExprKind::Str(s) = &arg.value.kind {
+                        fws.push(s.clone());
+                    }
+                }
+            }
+        }
+    }
+    fws
 }
 
 pub fn align_up(offset: usize, align: usize) -> usize {
@@ -491,11 +531,15 @@ impl LayoutEngine {
     fn struct_layout_depth(&self, name: &str, depth: usize) -> Option<StructByteLayout> {
         let rec = self.records.get(name)?;
         let is_packed = has_packed_attr(&rec.attrs);
-        let is_c_repr = has_repr_c(&rec.attrs) || is_packed || explicit_align_attr(&rec.attrs).is_some();
+        let gpu_mode = gpu_struct_mode(&rec.attrs);
+        let is_c_repr = has_repr_c(&rec.attrs)
+            || is_packed
+            || explicit_align_attr(&rec.attrs).is_some()
+            || gpu_mode.is_some();
         let explicit_align = explicit_align_attr(&rec.attrs);
 
         let mut offset = 0usize;
-        let mut max_align = 1usize;
+        let mut max_align = if gpu_mode.as_deref() == Some("std140") { 16 } else { 1 };
         let mut fields = Vec::with_capacity(rec.fields.len());
 
         for f in &rec.fields {

@@ -471,6 +471,12 @@ int64_t tenon_float_is_nan(int64_t bits) {
     return isnan(u.d) ? 1 : 0;
 }
 
+int64_t tenon_float_is_finite(int64_t bits) {
+    union { double d; int64_t i; } u;
+    u.i = bits;
+    return isfinite(u.d) ? 1 : 0;
+}
+
 int64_t tenon_float_bits(int64_t bits) {
     union { double d; int64_t i; } u;
     u.i = bits;

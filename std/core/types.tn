@@ -7,6 +7,8 @@ pub type NonZero     = Int where self != 0
 pub type ByteVal     = Int where 0 <= self && self <= 255
 pub type HexNibble   = Int where 0 <= self && self <= 15
 pub type MaxBytes    = Int where self >= 64
+pub type FiniteFloat = Float where is_finite(self)
+pub type NonNegFloat = Float where is_finite(self) && self >= 0.0
 
 pub record SliceRange {
     start NonNegative
