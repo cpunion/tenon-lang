@@ -14,10 +14,15 @@
 # 0. 可视化交互体验与旗舰应用（零 `--c-src` 参数、零外部 Shader 文件，全量内置 `@c_src` 与 `gpu_embedded_msl()`！）
 cargo build --release --bin tenon
 
-# (A0) PyTorch 风格精化验证 AI 库 & 零拷贝 mmap GGUF v3 超融合量化多架构 LLM 推理引擎（Tenon-Torch `std/nn`：AutogradTape + AMP `GradScaler` + 编译期 `Matrix[R, C, DType = Float16]` / 变长 `Tensor[...Shape]` + DLPack v1.0 / GGUF v3 `mmap` 零拷贝 `newBufferWithBytesNoCopy` / Safetensors + Apple MPS + 动态 4 KB 片上 SRAM 融合 `RMSNorm+GEMV` / `RMSNorm+Gate+Up+SwiGLU/GeGLU`（每层压缩至 5 个 Dispatch！）+ 零临时显存 `simdgroup_half8x8` 量化硬件 MMA Prefill + Split-K FlashDecoding + 多 Token GPU 链式解码；支持 Llama-3/Qwen2/Gemma-2/Mixtral Sparse MoE；M4 Max 实测 1.10B Llama-3.2-1B Q4_0 达 483 tok/s [2.07 ms/tok]、Q8_0 达 346 GB/s、FP16 达 383 GB/s，21M Q4_0 Decode 达 1,718 tok/s / Prefill 达 13,931 tok/s，Mixtral MoE 达 1,003 tok/s！）
+# (A0) PyTorch 风格精化验证 AI 库 & 三架构统一超融合量化 LLM 推理引擎（Apple Metal + NVIDIA CUDA + Google Cloud TPU！Tenon-Torch `std/nn`：AutogradTape + AMP `GradScaler` + 编译期 `Matrix[R, C, DType = Float16]` / 变长 `Tensor[...Shape]` + DLPack v1.0 / GGUF v3 `mmap` 零拷贝 / Safetensors）：
+#   - Apple M4 Max Metal (`std/gpu/metal/`): 动态 4 KB 片上 SRAM 融合 `RMSNorm+GEMV` / `RMSNorm+Gate+Up+SwiGLU/GeGLU`（每层 5 Dispatch）+ 零临时显存 `simdgroup_half8x8` 量化 Prefill -> 1.10B Llama-3.2-1B Q4_0 483 tok/s、Q8_0 346 GB/s、FP16 383 GB/s；21M Q4_0 Decode 1,718 tok/s / Prefill 13,931 tok/s；Mixtral MoE 1,003 tok/s
+#   - NVIDIA CUDA (`std/gpu/cuda/`): 零链接参数动态 `dlopen("libcuda.so.1")` + NVRTC/`nvcc` + 融合 SMEM `RMSNorm+GEMV/FFN` + 原生 **CUDA Graphs** -> RunPod **RTX 4090** 实测 FP16 GEMV 936.1 GB/s (92.9% 峰值！)、1.10B Q4_0 **706.9 tok/s** (1.41ms/tok)、1.10B FP16 **310.4 tok/s @ 767.1 GB/s**、21M Q4_0 **5,473.4 tok/s** (0.183ms/tok)
+#   - Google Cloud TPU (`std/gpu/tpu/`): **零 Python** 直连 `dlopen("libtpu.so")` 官方 PJRT C-API v0.116 + `--emit-stablehlo` / `gpu_embedded_stablehlo()` XLA MXU 编译器 -> **TPU v5e-1** 实测 BF16 MXU **152.1 TFLOPS** (77.2% 峰值！)、HBM **601.7 GB/s** (W8A16 INT8 提速 1.66×)、1.10B Llama-3 Prefill **51,440 tok/s** / B=32 Decode **5,543 tok/s** / B=1 Decode **170.4 tok/s**（全平台 `live_objects == 0` 零泄漏！）
 ./target/release/tenon test std/nn/nn_test.tn
 ./target/release/tenon check examples/showcase/bad_nn_shape.tn   # 负例：Matrix[4,8] @ Matrix[6,2] 编译期秒抓维度错误！
-./target/release/tenon build examples/showcase/tenon_ultra_llm_bench.tn -o /tmp/tn_ultra_bench && /tmp/tn_ultra_bench  # Llama-3/Qwen2/Gemma-2/Mixtral-MoE + 1.10B Llama-3.2-1B 零拷贝 mmap GGUF v3 基准
+./target/release/tenon build examples/showcase/tenon_ultra_llm_bench.tn -o /tmp/tn_ultra_bench && /tmp/tn_ultra_bench  # Apple Silicon Metal 1.10B Llama-3.2-1B + Qwen2/Gemma-2/Mixtral-MoE
+./target/release/tenon build examples/showcase/tenon_cuda_llm_bench.tn --emit-cuda /tmp/out.cu -o /tmp/tn_cuda_bench && /tmp/tn_cuda_bench  # NVIDIA CUDA (NVRTC + Q4/Q8/FP16 + CUDA Graphs)
+./target/release/tenon build examples/showcase/tenon_tpu_llm_bench.tn --emit-stablehlo /tmp/out.mlir -o /tmp/tn_tpu_bench && /tmp/tn_tpu_bench  # Google Cloud TPU (Direct libtpu.so PJRT C-API + StableHLO)
 ./target/release/tenon build examples/showcase/tenon_transformer_mps.tn -o /tmp/tenon_mps_tf && /tmp/tenon_mps_tf
 ./target/release/tenon build examples/showcase/tenon_torch_studio.tn -o /tmp/tenon_torch_studio && /tmp/tenon_torch_studio
 # 或无头截图预览（生成 /tmp/tenon_torch_studio.png）：TENON_TORCH_SMOKE=1 /tmp/tenon_torch_studio
