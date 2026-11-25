@@ -93,15 +93,10 @@ pub fn main() Int {
         println("ERROR: Metal GPU unavailable")
         return 1
     }
-    let env_msl = sys_env("TENON_MSL_PATH")
-    var msl_path = if len(env_msl) > 0 { env_msl } else { "/tmp/tiled.metal" }
-    var msl_src = sys_read_file(msl_path)
-    if !sys_file_ok() || len(msl_src) < 64 {
-        msl_path = "/tmp/tenon_tiled_mlp.metal"
-        msl_src = sys_read_file(msl_path)
-    }
-    if !sys_file_ok() || len(msl_src) < 64 {
-        println("Run with `--emit-msl /tmp/tiled.metal` (or set TENON_MSL_PATH) first!")
+    // Zero-glue embedded MSL! Compiler automatically embeds compiled `@kernel` + AST-fused `@gpu_graph` MSL right into the binary!
+    let msl_src = gpu_embedded_msl()
+    if len(msl_src) < 64 {
+        println("ERROR: Embedded MSL shader unavailable")
         return 1
     }
 
@@ -167,9 +162,9 @@ pub fn main() Int {
         matches += 1
         k += 1
     }
-    println("=== Tenon H1 Tiled Shared-Memory Metal + AST-Fused @gpu_graph Demo ===")
+    println("=== Tenon H1/I1 Zero-Glue Tiled Metal + AST-Fused @gpu_graph Demo ===")
     println("Metal GPU Device : " ++ gpu_device_name())
-    println("Loaded MSL Shader: " ++ msl_path ++ " (" ++ int_to_text(len(msl_src)) ++ " bytes)")
+    println("Embedded MSL     : " ++ int_to_text(len(msl_src)) ++ " bytes (0 external shader files, 0 --c-src flags!)")
     println("Verified Proofs  : E0842 barrier-uniform + E0843 race-free + AST-fused scale_bias__fused__relu_act")
     println("CPU == Metal GPU : " ++ int_to_text(matches) ++ "/16 bit-exact! [0]=" ++ int_to_text(float_to_int(gpu_out[0] as Float)) ++ ", [1]=" ++ int_to_text(float_to_int(gpu_out[1] as Float)) ++ ", [15]=" ++ int_to_text(float_to_int(gpu_out[15] as Float)))
     0

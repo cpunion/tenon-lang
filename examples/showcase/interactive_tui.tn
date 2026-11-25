@@ -17,6 +17,7 @@ import "std/ui/vdom.tn"
 import "std/ui/openui.tn"
 import "std/ui/tui.tn"
 
+@c_src("../../std/os/term_shim.c")
 extern "C" {
     fn tn_term_enter_raw() Int
     fn tn_term_leave_raw() Int

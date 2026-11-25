@@ -6,6 +6,7 @@
 
 import "std/core/types.tn"
 
+@c_src("metal_shim.m")
 @link(framework = "Metal")
 @link(framework = "Foundation")
 extern "C" {

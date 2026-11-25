@@ -262,7 +262,58 @@ pub fn compile_with_options(
         _ => "-O3",
     };
 
-    let has_objc_sources = opts.extra_c_sources.iter().any(|p| {
+    // Collect `@link("lib")`, `@link(framework = "Metal")`, and `@c_src("companion.m")` attributes
+    let mut all_link_libs: Vec<String> = Vec::new();
+    let mut all_link_frameworks: Vec<String> = Vec::new();
+    let mut all_c_sources: Vec<PathBuf> = Vec::new();
+    for item in &program.items {
+        let (attrs_opt, span_fid) = match item {
+            Item::ExternFn(ef) => (Some(&ef.attrs), ef.span.file_id),
+            Item::Fn(f) => (Some(&f.attrs), f.span.file_id),
+            _ => (None, 0),
+        };
+        if let Some(attrs) = attrs_opt {
+            for lib in extract_link_libs(attrs) {
+                if !all_link_libs.contains(&lib) {
+                    all_link_libs.push(lib);
+                }
+            }
+            for fw in extract_link_frameworks(attrs) {
+                if !all_link_frameworks.contains(&fw) {
+                    all_link_frameworks.push(fw);
+                }
+            }
+            let src_dir = program
+                .source_files
+                .get(span_fid as usize)
+                .and_then(|sf| Path::new(sf).parent().map(|p| p.to_path_buf()));
+            for rel in extract_c_sources(attrs) {
+                let candidate = if let Some(dir) = &src_dir {
+                    let p = dir.join(&rel);
+                    if p.exists() { p } else { PathBuf::from(&rel) }
+                } else {
+                    PathBuf::from(&rel)
+                };
+                let canon = fs::canonicalize(&candidate).unwrap_or(candidate);
+                if !all_c_sources.contains(&canon) {
+                    all_c_sources.push(canon);
+                }
+            }
+        }
+    }
+    for lib in &opts.link_libs {
+        if !all_link_libs.contains(lib) {
+            all_link_libs.push(lib.clone());
+        }
+    }
+    for csrc in &opts.extra_c_sources {
+        let canon = fs::canonicalize(csrc).unwrap_or_else(|_| csrc.clone());
+        if !all_c_sources.contains(&canon) {
+            all_c_sources.push(canon);
+        }
+    }
+
+    let has_objc_sources = all_c_sources.iter().any(|p| {
         p.extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e == "m" || e == "mm")
@@ -317,34 +368,6 @@ pub fn compile_with_options(
         tmp_rt.clone()
     };
 
-    // Collect `@link("lib")` and `@link(framework = "Metal")` attributes from declarations
-    let mut all_link_libs: Vec<String> = Vec::new();
-    let mut all_link_frameworks: Vec<String> = Vec::new();
-    for item in &program.items {
-        let attrs_opt = match item {
-            Item::ExternFn(ef) => Some(&ef.attrs),
-            Item::Fn(f) => Some(&f.attrs),
-            _ => None,
-        };
-        if let Some(attrs) = attrs_opt {
-            for lib in extract_link_libs(attrs) {
-                if !all_link_libs.contains(&lib) {
-                    all_link_libs.push(lib);
-                }
-            }
-            for fw in extract_link_frameworks(attrs) {
-                if !all_link_frameworks.contains(&fw) {
-                    all_link_frameworks.push(fw);
-                }
-            }
-        }
-    }
-    for lib in &opts.link_libs {
-        if !all_link_libs.contains(lib) {
-            all_link_libs.push(lib.clone());
-        }
-    }
-
     let res = match opts.output_kind {
         OutputKind::StaticLib => {
             let tmp_obj_ll = std::env::temp_dir().join(format!("tenon_ll_{}_{}.o", pid, seq));
@@ -387,7 +410,7 @@ pub fn compile_with_options(
                 ));
             }
 
-            for (idx, csrc) in opts.extra_c_sources.iter().enumerate() {
+            for (idx, csrc) in all_c_sources.iter().enumerate() {
                 let eo = std::env::temp_dir().join(format!("tenon_ex_{}_{}_{}.o", pid, seq, idx));
                 let mut ce = Command::new("clang");
                 ce.arg(opt_flag).arg("-c");
@@ -461,7 +484,7 @@ pub fn compile_with_options(
                     tmp_ll.to_str().unwrap(),
                     rt_input_path.to_str().unwrap(),
                 ]);
-                for csrc in &opts.extra_c_sources {
+                for csrc in &all_c_sources {
                     cmd.arg(csrc.to_str().unwrap());
                 }
                 for dir in &opts.link_dirs {

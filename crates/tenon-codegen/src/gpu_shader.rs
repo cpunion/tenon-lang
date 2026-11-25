@@ -980,6 +980,256 @@ pub fn emit_webgpu_host_mjs(program: &Program, verified: &VerifiedMir) -> String
     out
 }
 
+/// Replaces zero-argument `gpu_embedded_msl()` / `gpu_embedded_wgsl()` calls with compile-time
+/// synthesized MSL/WGSL string literals (including AST-fused `@gpu_graph` kernels), enabling
+/// zero-glue single-binary GPU execution with zero external shader files or Perceus leaks!
+pub fn inline_embedded_gpu_shaders(prog: &mut Program) {
+    let mut needs_msl = false;
+    let mut needs_wgsl = false;
+    for item in &prog.items {
+        match item {
+            Item::Fn(f) => scan_block_for_embedded_gpu(&f.body, &mut needs_msl, &mut needs_wgsl),
+            Item::Impl(imp) => {
+                for m in &imp.methods {
+                    scan_block_for_embedded_gpu(&m.body, &mut needs_msl, &mut needs_wgsl);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !needs_msl && !needs_wgsl {
+        return;
+    }
+
+    // Reconstruct `@gpu_graph` plans directly from AST (pure static analysis, <0.1ms, zero Z3 calls)
+    let mut all_fns = std::collections::BTreeMap::new();
+    for item in &prog.items {
+        if let Item::Fn(f) = item {
+            all_fns.insert(f.name.clone(), f.clone());
+        }
+    }
+    let mut mir = VerifiedMir::default();
+    for item in &prog.items {
+        if let Item::Fn(f) = item {
+            if tenon_verify::gpu_graph::has_gpu_graph_attr(&f.attrs) {
+                let (plan, _, _) = tenon_verify::gpu_graph::analyze_gpu_graph_fn(f, &all_fns);
+                mir.gpu_graphs.push(plan);
+            }
+        }
+    }
+
+    let msl_src = if needs_msl { Some(emit_msl(prog, &mir)) } else { None };
+    let wgsl_src = if needs_wgsl { Some(emit_wgsl(prog, &mir)) } else { None };
+
+    for item in &mut prog.items {
+        match item {
+            Item::Fn(f) => replace_block_embedded_gpu(&mut f.body, msl_src.as_deref(), wgsl_src.as_deref()),
+            Item::Impl(imp) => {
+                for m in &mut imp.methods {
+                    replace_block_embedded_gpu(&mut m.body, msl_src.as_deref(), wgsl_src.as_deref());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_block_for_embedded_gpu(blk: &Block, needs_msl: &mut bool, needs_wgsl: &mut bool) {
+    for s in &blk.stmts {
+        match s {
+            Stmt::Let { value, .. } | Stmt::Expr { expr: value, .. } => {
+                scan_expr_for_embedded_gpu(value, needs_msl, needs_wgsl);
+            }
+            Stmt::Assign { target, value, .. } => {
+                scan_expr_for_embedded_gpu(target, needs_msl, needs_wgsl);
+                scan_expr_for_embedded_gpu(value, needs_msl, needs_wgsl);
+            }
+            Stmt::Return { value: Some(v), .. } => scan_expr_for_embedded_gpu(v, needs_msl, needs_wgsl),
+            Stmt::Assert { cond, .. } => scan_expr_for_embedded_gpu(cond, needs_msl, needs_wgsl),
+            Stmt::While { cond, body, .. } => {
+                scan_expr_for_embedded_gpu(cond, needs_msl, needs_wgsl);
+                scan_block_for_embedded_gpu(body, needs_msl, needs_wgsl);
+            }
+            Stmt::For { iter, body, .. } => {
+                scan_expr_for_embedded_gpu(iter, needs_msl, needs_wgsl);
+                scan_block_for_embedded_gpu(body, needs_msl, needs_wgsl);
+            }
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+                scan_block_for_embedded_gpu(body, needs_msl, needs_wgsl);
+            }
+            _ => {}
+        }
+    }
+    if let Some(t) = &blk.tail {
+        scan_expr_for_embedded_gpu(t, needs_msl, needs_wgsl);
+    }
+}
+
+fn scan_expr_for_embedded_gpu(expr: &Expr, needs_msl: &mut bool, needs_wgsl: &mut bool) {
+    match &expr.kind {
+        ExprKind::Call { callee, args } => {
+            if args.is_empty() {
+                if let ExprKind::Ident(name) = &callee.kind {
+                    if name == "gpu_embedded_msl" {
+                        *needs_msl = true;
+                        return;
+                    }
+                    if name == "gpu_embedded_wgsl" {
+                        *needs_wgsl = true;
+                        return;
+                    }
+                }
+            }
+            scan_expr_for_embedded_gpu(callee, needs_msl, needs_wgsl);
+            for a in args {
+                scan_expr_for_embedded_gpu(&a.value, needs_msl, needs_wgsl);
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            scan_expr_for_embedded_gpu(left, needs_msl, needs_wgsl);
+            scan_expr_for_embedded_gpu(right, needs_msl, needs_wgsl);
+        }
+        ExprKind::Unary { expr: e, .. }
+        | ExprKind::Cast { expr: e, .. }
+        | ExprKind::Try(e)
+        | ExprKind::Field { target: e, .. }
+        | ExprKind::TupleIndex { target: e, .. } => scan_expr_for_embedded_gpu(e, needs_msl, needs_wgsl),
+        ExprKind::Index { target, index } => {
+            scan_expr_for_embedded_gpu(target, needs_msl, needs_wgsl);
+            scan_expr_for_embedded_gpu(index, needs_msl, needs_wgsl);
+        }
+        ExprKind::If { cond, then_block, else_branch } => {
+            scan_expr_for_embedded_gpu(cond, needs_msl, needs_wgsl);
+            scan_block_for_embedded_gpu(then_block, needs_msl, needs_wgsl);
+            if let Some(eb) = else_branch {
+                scan_expr_for_embedded_gpu(eb, needs_msl, needs_wgsl);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            scan_expr_for_embedded_gpu(scrutinee, needs_msl, needs_wgsl);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    scan_expr_for_embedded_gpu(g, needs_msl, needs_wgsl);
+                }
+                scan_expr_for_embedded_gpu(&arm.body, needs_msl, needs_wgsl);
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => scan_block_for_embedded_gpu(b, needs_msl, needs_wgsl),
+        ExprKind::List(es) | ExprKind::Tuple(es) => {
+            for e in es {
+                scan_expr_for_embedded_gpu(e, needs_msl, needs_wgsl);
+            }
+        }
+        ExprKind::RecordLit { fields, .. } => {
+            for (_, v) in fields {
+                scan_expr_for_embedded_gpu(v, needs_msl, needs_wgsl);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_block_embedded_gpu(blk: &mut Block, msl: Option<&str>, wgsl: Option<&str>) {
+    for s in &mut blk.stmts {
+        match s {
+            Stmt::Let { value, .. } | Stmt::Expr { expr: value, .. } => {
+                replace_expr_embedded_gpu(value, msl, wgsl);
+            }
+            Stmt::Assign { target, value, .. } => {
+                replace_expr_embedded_gpu(target, msl, wgsl);
+                replace_expr_embedded_gpu(value, msl, wgsl);
+            }
+            Stmt::Return { value: Some(v), .. } => replace_expr_embedded_gpu(v, msl, wgsl),
+            Stmt::Assert { cond, .. } => replace_expr_embedded_gpu(cond, msl, wgsl),
+            Stmt::While { cond, body, .. } => {
+                replace_expr_embedded_gpu(cond, msl, wgsl);
+                replace_block_embedded_gpu(body, msl, wgsl);
+            }
+            Stmt::For { iter, body, .. } => {
+                replace_expr_embedded_gpu(iter, msl, wgsl);
+                replace_block_embedded_gpu(body, msl, wgsl);
+            }
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+                replace_block_embedded_gpu(body, msl, wgsl);
+            }
+            _ => {}
+        }
+    }
+    if let Some(t) = &mut blk.tail {
+        replace_expr_embedded_gpu(t, msl, wgsl);
+    }
+}
+
+fn replace_expr_embedded_gpu(expr: &mut Expr, msl: Option<&str>, wgsl: Option<&str>) {
+    if let ExprKind::Call { callee, args } = &expr.kind {
+        if args.is_empty() {
+            if let ExprKind::Ident(name) = &callee.kind {
+                if name == "gpu_embedded_msl" {
+                    if let Some(s) = msl {
+                        expr.kind = ExprKind::Str(s.to_string());
+                        return;
+                    }
+                }
+                if name == "gpu_embedded_wgsl" {
+                    if let Some(s) = wgsl {
+                        expr.kind = ExprKind::Str(s.to_string());
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    match &mut expr.kind {
+        ExprKind::Call { callee, args } => {
+            replace_expr_embedded_gpu(callee, msl, wgsl);
+            for a in args {
+                replace_expr_embedded_gpu(&mut a.value, msl, wgsl);
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            replace_expr_embedded_gpu(left, msl, wgsl);
+            replace_expr_embedded_gpu(right, msl, wgsl);
+        }
+        ExprKind::Unary { expr: e, .. }
+        | ExprKind::Cast { expr: e, .. }
+        | ExprKind::Try(e)
+        | ExprKind::Field { target: e, .. }
+        | ExprKind::TupleIndex { target: e, .. } => replace_expr_embedded_gpu(e, msl, wgsl),
+        ExprKind::Index { target, index } => {
+            replace_expr_embedded_gpu(target, msl, wgsl);
+            replace_expr_embedded_gpu(index, msl, wgsl);
+        }
+        ExprKind::If { cond, then_block, else_branch } => {
+            replace_expr_embedded_gpu(cond, msl, wgsl);
+            replace_block_embedded_gpu(then_block, msl, wgsl);
+            if let Some(eb) = else_branch {
+                replace_expr_embedded_gpu(eb, msl, wgsl);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            replace_expr_embedded_gpu(scrutinee, msl, wgsl);
+            for arm in arms {
+                if let Some(g) = &mut arm.guard {
+                    replace_expr_embedded_gpu(g, msl, wgsl);
+                }
+                replace_expr_embedded_gpu(&mut arm.body, msl, wgsl);
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => replace_block_embedded_gpu(b, msl, wgsl),
+        ExprKind::List(es) | ExprKind::Tuple(es) => {
+            for e in es {
+                replace_expr_embedded_gpu(e, msl, wgsl);
+            }
+        }
+        ExprKind::RecordLit { fields, .. } => {
+            for (_, v) in fields {
+                replace_expr_embedded_gpu(v, msl, wgsl);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,5 +1376,21 @@ pub fn bad_race_write(x List[Float32], inout out List[Float32]) {
             "expected E0843 GPU data race error, got: {:?}",
             rep_race.diagnostics
         );
+
+        // Zero-glue `gpu_embedded_msl()` / `gpu_embedded_wgsl()` compile-time shader inlining
+        let emb_src = format!(
+            "{}\npub fn get_msl() Text {{ gpu_embedded_msl() }}\npub fn get_wgsl() Text {{ gpu_embedded_wgsl() }}\n",
+            src
+        );
+        let mut emb_prog = tenon_syntax::parse(&emb_src).unwrap();
+        inline_embedded_gpu_shaders(&mut emb_prog);
+        let has_inlined_msl = emb_prog.items.iter().any(|it| match it {
+            Item::Fn(f) if f.name == "get_msl" => matches!(
+                f.body.tail.as_deref().map(|e| &e.kind),
+                Some(ExprKind::Str(s)) if s.contains("scale_bias__fused__relu_act")
+            ),
+            _ => false,
+        });
+        assert!(has_inlined_msl, "expected gpu_embedded_msl() to inline AST-fused MSL");
     }
 }

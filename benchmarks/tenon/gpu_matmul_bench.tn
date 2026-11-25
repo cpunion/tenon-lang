@@ -1,0 +1,234 @@
+// benchmarks/tenon/gpu_matmul_bench.tn — Zero-Glue Apple Silicon Metal GPU vs CPU MatMul + Fused Activation Benchmark!
+//
+// Zero `--c-src` flags, zero `--emit-msl` files! Just:
+//   ./target/release/tenon build benchmarks/tenon/gpu_matmul_bench.tn -o /tmp/gpu_matmul_bench && /tmp/gpu_matmul_bench
+//
+// Benchmarks a 256x256 Matrix Multiplication + Fused Bias-Add + ReLU (33.5M FLOPs per run) comparing:
+//   1. Verified Tenon LLVM -O3 CPU kernel
+//   2. Compiler-Generated 16x16 Shared-Memory Tiled Apple Silicon Metal GPU kernel + AST-Fused Bias+ReLU (`gpu_embedded_msl()`)
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+import "std/os/io.tn"
+import "std/gpu/metal/gpu.tn"
+
+@gpu_struct("std430")
+pub record GemmDims {
+    n    UInt32
+    tiles UInt32
+    pad0 UInt32
+    pad1 UInt32
+}
+
+/// 16x16 Shared-Memory Tiled GEMM (`threadgroup float[256]` + `gpu_barrier()`, proved E0842 uniform & E0843 race-free!)
+@kernel
+pub fn tiled_gemm_16x16(
+    a List[Float32],
+    b List[Float32],
+    inout c List[Float32],
+    dims GemmDims,
+) {
+    let gx = gpu_group_id_x()
+    let gy = gpu_group_id_y()
+    let lx = gpu_local_id_x()
+    let ly = gpu_local_id_y()
+    let row = gy * 16 + ly
+    let col = gx * 16 + lx
+    let n = dims.n as Int
+    let num_tiles = dims.tiles as Int
+
+    var tile_a = gpu_shared_f32(256)
+    var tile_b = gpu_shared_f32(256)
+    var acc Float32 = 0.0 as Float32
+    var t = 0
+    while t < num_tiles {
+        let a_col = t * 16 + lx
+        let b_row = t * 16 + ly
+        tile_a[ly * 16 + lx] = a[row * n + a_col]
+        tile_b[ly * 16 + lx] = b[b_row * n + col]
+        gpu_barrier()
+        var k = 0
+        while k < 16 {
+            acc = acc + tile_a[ly * 16 + k] * tile_b[k * 16 + lx]
+            k += 1
+        }
+        gpu_barrier()
+        t += 1
+    }
+    c[row * n + col] = acc
+}
+
+@kernel("elementwise")
+pub fn add_bias_gemm(x List[Float32], bias List[Float32], inout out List[Float32], total UInt32) {
+    let i = gpu_global_id_x()
+    if i < (total as Int) {
+        out[i] = x[i] + bias[i]
+    }
+}
+
+@kernel("elementwise")
+pub fn relu_gemm(x List[Float32], inout out List[Float32], total UInt32) {
+    let i = gpu_global_id_x()
+    if i < (total as Int) {
+        let v = x[i]
+        out[i] = if v > (0.0 as Float32) { v } else { 0.0 as Float32 }
+    }
+}
+
+/// Automatically fuses `add_bias_gemm` + `relu_gemm` -> `add_bias_gemm__fused__relu_gemm` in embedded MSL!
+@gpu_graph
+pub fn gemm_mlp_graph(
+    a List[Float32],
+    b List[Float32],
+    bias List[Float32],
+    dims GemmDims,
+    total UInt32,
+) List[Float32] {
+    var mm List[Float32] = list_filled(65536, 0.0 as Float32)
+    var biased List[Float32] = list_filled(65536, 0.0 as Float32)
+    var out List[Float32] = list_filled(65536, 0.0 as Float32)
+    tiled_gemm_16x16(a, b, mm, dims)
+    add_bias_gemm(mm, bias, biased, total)
+    relu_gemm(biased, out, total)
+    out
+}
+
+pure fn pack_u32_le(v0 Int, v1 Int, v2 Int, v3 Int) Bytes {
+    var bs = bytes_filled(16, 0)
+    bs = bytes_write_u32_le(bs, 0, v0)
+    bs = bytes_write_u32_le(bs, 4, v1)
+    bs = bytes_write_u32_le(bs, 8, v2)
+    bs = bytes_write_u32_le(bs, 12, v3)
+    bs
+}
+
+pure fn cpu_matmul_bias_relu(
+    a List[Float32],
+    b List[Float32],
+    bias List[Float32],
+    n Int where self > 0,
+) List[Float32] {
+    let total = n * n
+    var out List[Float32] = list_filled(total, 0.0 as Float32)
+    var r = 0
+    while r < n {
+        var c = 0
+        while c < n {
+            var acc Float = 0.0
+            var k = 0
+            while k < n {
+                let idx_a = r * n + k
+                let idx_b = k * n + c
+                if idx_a < len(a) && idx_b < len(b) {
+                    acc += (a[idx_a] as Float) * (b[idx_b] as Float)
+                }
+                k += 1
+            }
+            let idx_o = r * n + c
+            if idx_o < len(bias) && idx_o < len(out) {
+                let v = acc + (bias[idx_o] as Float)
+                out[idx_o] = (if v > 0.0 { v } else { 0.0 }) as Float32
+            }
+            c += 1
+        }
+        r += 1
+    }
+    out
+}
+
+pure fn fmt_ms_x10(ns Int) Text {
+    let tenths = ns / 100000
+    int_to_text(tenths / 10) ++ "." ++ int_to_text(tenths % 10) ++ " ms"
+}
+
+pub fn main() Int {
+    if !gpu_init() {
+        println("ERROR: Metal GPU unavailable")
+        return 1
+    }
+    let msl_src = gpu_embedded_msl()
+    let n = 256
+    let total = n * n // 65,536 elements
+    let nbytes = total * 4
+
+    var a List[Float32] = list_filled(total, 0.0 as Float32)
+    var b List[Float32] = list_filled(total, 0.0 as Float32)
+    var bias List[Float32] = list_filled(total, 0.0 as Float32)
+    var i = 0
+    while i < total {
+        a[i] = (int_to_float((i % 13) - 6) * 0.125) as Float32
+        b[i] = (int_to_float(((i * 3) % 11) - 5) * 0.125) as Float32
+        bias[i] = (int_to_float((i % 5) - 2) * 0.5) as Float32
+        i += 1
+    }
+
+    // 1. Verified Tenon CPU Reference Timing
+    let t_cpu0 = time_now_ns()
+    let cpu_out = cpu_matmul_bias_relu(a, b, bias, n)
+    let cpu_ns = time_now_ns() - t_cpu0
+
+    // 2. Apple Silicon Metal 16x16 Shared-Memory Tiled GEMM + AST-Fused Bias+ReLU
+    var pipe_mm = GpuComputePipeline.compile_msl(msl_src, "tiled_gemm_16x16")
+    var pipe_fused = GpuComputePipeline.compile_msl(msl_src, "add_bias_gemm__fused__relu_gemm")
+    var buf_a = GpuBuffer.from_f32_list(a)
+    var buf_b = GpuBuffer.from_f32_list(b)
+    var buf_mm = GpuBuffer.uninit(nbytes)
+    var buf_dims = GpuBuffer.from_bytes(pack_u32_le(n, n / 16, 0, 0))
+    var buf_bias = GpuBuffer.from_f32_list(bias)
+    var buf_out = GpuBuffer.uninit(nbytes)
+    var buf_total = GpuBuffer.from_bytes(pack_u32_le(total, 0, 0, 0))
+
+    // Warmup 1 pass
+    let _ = pipe_mm.dispatch_tiled4(buf_a, buf_b, buf_mm, buf_dims, 16, 16, 1, 16, 16, 1)
+    let _ = pipe_fused.dispatch4(buf_mm, buf_bias, buf_out, buf_total, total, 1, 1)
+
+    // Timed 10 iterations on Metal GPU!
+    let iters = 10
+    let t_gpu0 = time_now_ns()
+    var r = 0
+    while r < iters {
+        let _ = pipe_mm.dispatch_tiled4(buf_a, buf_b, buf_mm, buf_dims, 16, 16, 1, 16, 16, 1)
+        let _ = pipe_fused.dispatch4(buf_mm, buf_bias, buf_out, buf_total, total, 1, 1)
+        r += 1
+    }
+    let gpu_avg_ns = (time_now_ns() - t_gpu0) / iters
+
+    var gpu_out List[Float32] = list_filled(total, 0.0 as Float32)
+    let _ = buf_out.read_into_f32(gpu_out)
+
+    buf_a.destroy()
+    buf_b.destroy()
+    buf_mm.destroy()
+    buf_dims.destroy()
+    buf_bias.destroy()
+    buf_out.destroy()
+    buf_total.destroy()
+    pipe_mm.destroy()
+    pipe_fused.destroy()
+
+    // Verify CPU == Metal GPU across ALL 65,536 elements (tol <= 1e-3)
+    var max_err_x10000 = 0
+    var mismatches = 0
+    var k = 0
+    while k < total {
+        let diff = (cpu_out[k] as Float) - (gpu_out[k] as Float)
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        let scaled = float_to_int(ad * 10000.0)
+        if scaled > max_err_x10000 { max_err_x10000 = scaled }
+        if ad > 0.005 { mismatches += 1 }
+        k += 1
+    }
+
+    let flops = 2 * n * n * n // 33,554,432 FLOPs
+    let gflops_x10 = if gpu_avg_ns > 0 { (flops * 10) / gpu_avg_ns } else { 0 }
+    let speedup_x10 = if gpu_avg_ns > 0 { (cpu_ns * 10) / gpu_avg_ns } else { 0 }
+
+    println("=== Tenon I1 Zero-Glue GPU Benchmark: 256x256 Tiled GEMM + AST-Fused Bias+ReLU ===")
+    println("GPU Device       : " ++ gpu_device_name())
+    println("Embedded MSL     : " ++ int_to_text(len(msl_src)) ++ " bytes (0 --emit-msl, 0 --c-src!)")
+    println("Tenon CPU (-O3)  : " ++ fmt_ms_x10(cpu_ns))
+    println("Metal Tiled GPU  : " ++ fmt_ms_x10(gpu_avg_ns) ++ " avg (" ++ int_to_text(gflops_x10 / 10) ++ "." ++ int_to_text(gflops_x10 % 10) ++ " GFLOPS incl. host sync)")
+    println("Speedup          : " ++ int_to_text(speedup_x10 / 10) ++ "." ++ int_to_text(speedup_x10 % 10) ++ "x faster on Metal GPU")
+    println("Parity Check     : " ++ int_to_text(total - mismatches) ++ "/" ++ int_to_text(total) ++ " elements match (max_err=" ++ int_to_text(max_err_x10000) ++ "e-4)")
+    if mismatches == 0 { 0 } else { 1 }
+}

@@ -380,6 +380,23 @@ pub fn extract_link_frameworks(attrs: &[Attr]) -> Vec<String> {
     fws
 }
 
+/// Extracts `@c_src("relative/or/repo/path.c|.m")` companion native sources attached to extern/fn items.
+pub fn extract_c_sources(attrs: &[Attr]) -> Vec<String> {
+    let mut srcs = Vec::new();
+    for a in attrs {
+        if a.name == "c_src" {
+            for arg in &a.args {
+                if let ExprKind::Str(s) = &arg.value.kind {
+                    if !srcs.contains(s) {
+                        srcs.push(s.clone());
+                    }
+                }
+            }
+        }
+    }
+    srcs
+}
+
 pub fn align_up(offset: usize, align: usize) -> usize {
     if align <= 1 {
         return offset;

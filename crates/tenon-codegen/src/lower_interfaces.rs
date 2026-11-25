@@ -5185,6 +5185,7 @@ pub fn prepare_program_for_codegen(program: &Program) -> PreparedProgram {
     if has_unexpanded_derive {
         expand_derives(&mut expanded);
     }
+    crate::gpu_shader::inline_embedded_gpu_shaders(&mut expanded);
 
     let layout = LayoutEngine::from_program(&expanded);
     let comptime_ctx = ComptimeContext::from_program(&expanded);

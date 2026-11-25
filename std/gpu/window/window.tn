@@ -4,6 +4,7 @@
 
 import "std/core/types.tn"
 
+@c_src("metal_window.m")
 @link(framework = "Cocoa")
 @link(framework = "Metal")
 @link(framework = "QuartzCore")
