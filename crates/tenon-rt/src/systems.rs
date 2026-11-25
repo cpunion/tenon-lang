@@ -1626,6 +1626,7 @@ pub extern "C" fn tenon_time_now_ns() -> i64 {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn handle_to_raw_fd(handle: i64) -> Option<i32> {
     let tbl = net_table().lock().unwrap();
     match tbl.get(&handle) {
