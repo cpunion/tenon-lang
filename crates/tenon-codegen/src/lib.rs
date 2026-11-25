@@ -1,5 +1,6 @@
 pub mod bindings;
 pub mod llvm_aot;
+pub(crate) mod llvm_aot_rt;
 pub mod llvm_runtime;
 pub mod lower_interfaces;
 pub use tenon_rt::perceus;

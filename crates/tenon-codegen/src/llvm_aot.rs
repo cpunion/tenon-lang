@@ -1,3 +1,8 @@
+use crate::llvm_aot_rt::{
+    TENON_AOT_HTTP_C, TENON_AOT_MAIN_CLI_C, TENON_AOT_MAIN_STATS_C, TENON_AOT_OS_C,
+    TENON_AOT_RUNTIME_C, TENON_INLINE_IR_HELPERS, TENON_NONATOMIC_RC_IR_HELPERS,
+    TENON_TBAA_METADATA,
+};
 use crate::llvm_runtime::{
     TENON_AOT_NET_C, TENON_AOT_SYNC_C, TENON_AOT_SYSTEMS_CORE_C, TENON_ATOMIC_RC_IR_HELPERS,
 };
@@ -46,6 +51,8 @@ pub struct BuildOptions {
     pub non_escaping_vars: BTreeMap<String, BTreeSet<String>>,
     /// Per-function local immutable scalar-only records proved safe for zero-malloc LLVM stack `alloca` promotion.
     pub stack_promotable_vars: BTreeMap<String, BTreeSet<String>>,
+    /// Per-function span offsets of owned RC local reads proved by `tenon-mir` liveness to be Last-Use Moves.
+    pub last_use_move_spans: BTreeMap<String, BTreeSet<usize>>,
     /// Emit checked signed integer overflow traps for arithmetic NOT statically proved overflow-free.
     pub checked_overflow: bool,
     /// Optional target triple override for cross-compilation (e.g. `x86_64-unknown-linux-gnu`).
@@ -67,6 +74,7 @@ impl Default for BuildOptions {
             proved_no_overflow: BTreeSet::new(),
             non_escaping_vars: BTreeMap::new(),
             stack_promotable_vars: BTreeMap::new(),
+            last_use_move_spans: BTreeMap::new(),
             checked_overflow: false,
             target_triple: None,
         }
@@ -80,6 +88,11 @@ impl BuildOptions {
         self.proved_no_overflow = mir.proved_no_overflow.clone();
         self.non_escaping_vars = mir.non_escaping_vars.clone();
         self.stack_promotable_vars = mir.stack_promotable_vars.clone();
+    }
+
+    /// Applies SSA/CFG liveness Last-Use Move spans from `tenon_mir::MirProgram`.
+    pub fn apply_ssa_mir(&mut self, mir: &tenon_mir::MirProgram) {
+        self.last_use_move_spans = tenon_mir::collect_last_use_move_spans(mir);
     }
 }
 
@@ -121,1183 +134,6 @@ struct LlvmFnMeta {
     ret_ty: Option<TypeExpr>,
     returns_rc: bool,
 }
-
-const TENON_AOT_RUNTIME_C: &str = r#"
-#include <math.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-typedef struct {
-    int64_t rc;
-    int64_t tag;
-    int64_t len;
-    int64_t cap;
-    uint64_t rc_mask;
-    int64_t fields[];
-} TenonObj;
-
-static int64_t g_live = 0;
-static int64_t g_allocs = 0;
-static int64_t g_reuse = 0;
-static int64_t g_cow = 0;
-static int64_t g_polls = 0;
-static int64_t g_suspends = 0;
-
-void tenon_rt_assert_fail(int64_t line) {
-    fprintf(stderr, "TENON ASSERTION FAILED at line %lld\n", (long long)line);
-    exit(1);
-}
-
-void tenon_rt_overflow_trap(int64_t line) {
-    fprintf(stderr, "TENON INTEGER OVERFLOW TRAP at line %lld\n", (long long)line);
-    exit(1);
-}
-
-int64_t tenon_rt_print_int(int64_t v) {
-    printf("%lld\n", (long long)v);
-    return v;
-}
-
-#define TENON_FREELIST_MAX_CAP 8
-#define TENON_FREELIST_LIMIT 512
-
-static TenonObj* g_freelist[TENON_FREELIST_MAX_CAP + 1] = {0};
-static int g_freelist_len[TENON_FREELIST_MAX_CAP + 1] = {0};
-
-/* Tier-2 Chunked 64 KiB Slab Arena (ADR-0001 D09: `@arena` zero-malloc bulk scope) */
-#define TENON_ARENA_SLAB_SIZE 65536
-typedef struct TenonSlab {
-    struct TenonSlab* prev;
-    size_t used;
-    size_t cap;
-    uint8_t data[];
-} TenonSlab;
-
-typedef struct {
-    TenonSlab* slab;
-    size_t used;
-} TenonArenaMark;
-
-static TenonSlab* g_arena_slab = NULL;
-static int g_arena_depth = 0;
-static TenonArenaMark g_arena_marks[64];
-
-static TenonSlab* tenon_slab_new(size_t min_bytes, TenonSlab* prev) {
-    size_t cap = min_bytes > TENON_ARENA_SLAB_SIZE ? min_bytes : TENON_ARENA_SLAB_SIZE;
-    TenonSlab* s = (TenonSlab*)malloc(sizeof(TenonSlab) + cap);
-    if (!s) abort();
-    s->prev = prev;
-    s->used = 0;
-    s->cap = cap;
-    return s;
-}
-
-int64_t tenon_arena_enter(void) {
-    int idx = g_arena_depth;
-    if (idx < 64) {
-        g_arena_marks[idx].slab = g_arena_slab;
-        g_arena_marks[idx].used = g_arena_slab ? g_arena_slab->used : 0;
-    }
-    g_arena_depth++;
-    return (int64_t)idx;
-}
-
-void tenon_arena_exit(int64_t mark) {
-    if (g_arena_depth <= 0) return;
-    g_arena_depth--;
-    int idx = (int)mark;
-    if (idx >= 0 && idx < 64) {
-        TenonSlab* target = g_arena_marks[idx].slab;
-        size_t saved_used = g_arena_marks[idx].used;
-        while (g_arena_slab && g_arena_slab != target) {
-            TenonSlab* prev = g_arena_slab->prev;
-            free(g_arena_slab);
-            g_arena_slab = prev;
-        }
-        if (g_arena_slab) {
-            g_arena_slab->used = saved_used;
-        }
-    }
-    if (g_arena_depth == 0 && g_arena_slab) {
-        while (g_arena_slab->prev) {
-            TenonSlab* prev = g_arena_slab->prev;
-            free(g_arena_slab);
-            g_arena_slab = prev;
-        }
-        g_arena_slab->used = 0;
-    }
-}
-
-static inline TenonObj* tenon_arena_alloc_obj(int64_t tag, int64_t lu, int64_t cap) {
-    size_t bytes = (sizeof(TenonObj) + (size_t)cap * sizeof(int64_t) + 7u) & ~7u;
-    if (!g_arena_slab || g_arena_slab->used + bytes > g_arena_slab->cap) {
-        g_arena_slab = tenon_slab_new(bytes, g_arena_slab);
-    }
-    TenonObj* obj = (TenonObj*)(g_arena_slab->data + g_arena_slab->used);
-    g_arena_slab->used += bytes;
-    obj->rc = -2; /* Immortal-in-arena sentinel: rc_inc/rc_dec skip in 1 branch, bulk-freed on arena_exit */
-    obj->tag = tag;
-    obj->len = lu;
-    obj->cap = cap;
-    obj->rc_mask = 0;
-    return obj;
-}
-
-#ifdef TENON_USE_SYNC
-void tenon_drop_mutex_handle(int64_t raw);
-void tenon_drop_channel_handle(int64_t raw, int is_rc);
-#endif
-
-static inline TenonObj* tenon_rc_alloc_raw(int64_t tag, int64_t lu, int64_t cap) {
-    TenonObj* obj;
-#ifdef TENON_THREAD_SAFE
-    obj = (TenonObj*)malloc(sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
-    if (!obj) abort();
-    obj->rc = 1;
-    obj->tag = tag;
-    obj->len = lu;
-    obj->cap = cap;
-    obj->rc_mask = 0;
-    __atomic_add_fetch(&g_live, 1, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&g_allocs, 1, __ATOMIC_RELAXED);
-    return obj;
-#else
-    if (__builtin_expect(g_arena_depth > 0, 0)) {
-        return tenon_arena_alloc_obj(tag, lu, cap);
-    }
-    if (__builtin_expect(cap >= 1 && cap <= TENON_FREELIST_MAX_CAP && g_freelist[cap] != NULL, 1)) {
-        obj = g_freelist[cap];
-        g_freelist[cap] = *(TenonObj**)obj;
-        g_freelist_len[cap]--;
-    } else {
-        obj = (TenonObj*)malloc(sizeof(TenonObj) + (size_t)cap * sizeof(int64_t));
-        if (!obj) abort();
-    }
-    obj->rc = 1;
-    obj->tag = tag;
-    obj->len = lu;
-    obj->cap = cap;
-    obj->rc_mask = 0;
-    g_live++;
-    g_allocs++;
-    return obj;
-#endif
-}
-
-int64_t tenon_rc_alloc(int64_t tag, int64_t len) {
-    int64_t lu = len < 0 ? 0 : len;
-    int64_t cap = lu < 1 ? 1 : lu;
-    TenonObj* obj = tenon_rc_alloc_raw(tag, lu, cap);
-    if (cap == 1) {
-        obj->fields[0] = 0;
-    } else if (cap == 2) {
-        obj->fields[0] = 0;
-        obj->fields[1] = 0;
-    } else {
-        memset(obj->fields, 0, (size_t)cap * sizeof(int64_t));
-    }
-    return (int64_t)(uintptr_t)obj;
-}
-
-void tenon_rc_set_rc_mask(int64_t ptr, int64_t mask) {
-    if (ptr == 0) return;
-    ((TenonObj*)(uintptr_t)ptr)->rc_mask = (uint64_t)mask;
-}
-
-int64_t tenon_rc_inc(int64_t ptr) {
-    if (__builtin_expect(ptr == 0, 0)) return 0;
-    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-#ifdef TENON_THREAD_SAFE
-    if (__builtin_expect(__atomic_load_n(&obj->rc, __ATOMIC_RELAXED) > 0, 1)) {
-        __atomic_add_fetch(&obj->rc, 1, __ATOMIC_RELAXED);
-    }
-#else
-    if (__builtin_expect(obj->rc > 0, 1)) {
-        obj->rc++;
-    }
-#endif
-    return ptr;
-}
-
-void tenon_rc_dec(int64_t ptr);
-
-__attribute__((noinline))
-static void tenon_rc_free_slow(TenonObj* obj) {
-    uint64_t mask = obj->rc_mask;
-    if (mask == UINT64_MAX) {
-        for (int64_t i = 0; i < obj->len; i++) {
-            if (obj->fields[i] != 0) tenon_rc_dec(obj->fields[i]);
-        }
-    } else if (mask != 0) {
-        int64_t n = obj->len < 64 ? obj->len : 64;
-        for (int64_t i = 0; i < n; i++) {
-            if ((mask & (1ULL << i)) && obj->fields[i] != 0) {
-                tenon_rc_dec(obj->fields[i]);
-            }
-        }
-    }
-#ifdef TENON_USE_SYNC
-    if (obj->tag == 14) {
-        tenon_drop_mutex_handle(obj->fields[0]);
-    } else if (obj->tag == 15) {
-        tenon_drop_channel_handle(obj->fields[0], obj->fields[1] != 0);
-    }
-#endif
-#ifdef TENON_THREAD_SAFE
-    __atomic_sub_fetch(&g_live, 1, __ATOMIC_RELAXED);
-    free(obj);
-#else
-    g_live--;
-    int64_t cap = obj->cap;
-    if (__builtin_expect(cap >= 1 && cap <= TENON_FREELIST_MAX_CAP && g_freelist_len[cap] < TENON_FREELIST_LIMIT, 1)) {
-        *(TenonObj**)obj = g_freelist[cap];
-        g_freelist[cap] = obj;
-        g_freelist_len[cap]++;
-        return;
-    }
-    free(obj);
-#endif
-}
-
-void tenon_rc_free_obj(int64_t ptr) {
-    if (__builtin_expect(ptr == 0, 0)) return;
-    tenon_rc_free_slow((TenonObj*)(uintptr_t)ptr);
-}
-
-void tenon_rc_dec(int64_t ptr) {
-    if (__builtin_expect(ptr == 0, 0)) return;
-    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-#ifdef TENON_THREAD_SAFE
-    if (__builtin_expect(__atomic_load_n(&obj->rc, __ATOMIC_RELAXED) > 0, 1)) {
-        if (__builtin_expect(__atomic_sub_fetch(&obj->rc, 1, __ATOMIC_ACQ_REL) <= 0, 0)) {
-            tenon_rc_free_slow(obj);
-        }
-    }
-#else
-    if (__builtin_expect(obj->rc > 0, 1)) {
-        if (__builtin_expect(--obj->rc <= 0, 0)) {
-            tenon_rc_free_slow(obj);
-        }
-    }
-#endif
-}
-
-__attribute__((noinline))
-static int64_t tenon_rc_cow_clone_slow(TenonObj* obj) {
-#ifdef TENON_THREAD_SAFE
-    __atomic_add_fetch(&g_cow, 1, __ATOMIC_RELAXED);
-#else
-    g_cow++;
-#endif
-    int is_byte_payload = (obj->tag == 5 || obj->tag == 10 || obj->tag == 12 || obj->tag == 16);
-    if (is_byte_payload) {
-        int64_t extra = obj->tag == 5 ? 1 : 0;
-        int64_t words = (obj->len + extra + 7) / 8;
-        if (words < 1) words = 1;
-        TenonObj* fresh = tenon_rc_alloc_raw(obj->tag, obj->len, words);
-        if (obj->len > 0) memcpy(fresh->fields, obj->fields, (size_t)obj->len);
-        if (extra) ((uint8_t*)fresh->fields)[obj->len] = 0;
-        tenon_rc_dec((int64_t)(uintptr_t)obj);
-        return (int64_t)(uintptr_t)fresh;
-    }
-    if (obj->tag == 17 || obj->tag == 18) {
-        int64_t eb = (obj->tag == 17) ? 16 : 32;
-        int64_t total_bytes = obj->len * eb;
-        int64_t words = (total_bytes + 7) / 8;
-        if (words < 2) words = 2;
-        TenonObj* fresh = tenon_rc_alloc_raw(obj->tag, obj->len, words);
-        if (total_bytes > 0) memcpy(fresh->fields, obj->fields, (size_t)total_bytes);
-        tenon_rc_dec((int64_t)(uintptr_t)obj);
-        return (int64_t)(uintptr_t)fresh;
-    }
-    int64_t cap = obj->len < 1 ? 1 : obj->len;
-    TenonObj* fresh = tenon_rc_alloc_raw(obj->tag, obj->len, cap);
-    uint64_t mask = obj->rc_mask;
-    fresh->rc_mask = mask;
-    memcpy(fresh->fields, obj->fields, (size_t)obj->len * sizeof(int64_t));
-    if (mask == UINT64_MAX) {
-        for (int64_t i = 0; i < obj->len; i++) {
-            if (obj->fields[i] != 0) tenon_rc_inc(obj->fields[i]);
-        }
-    } else if (mask != 0) {
-        int64_t n = obj->len < 64 ? obj->len : 64;
-        for (int64_t i = 0; i < n; i++) {
-            if ((mask & (1ULL << i)) && obj->fields[i] != 0) {
-                tenon_rc_inc(obj->fields[i]);
-            }
-        }
-    }
-    tenon_rc_dec((int64_t)(uintptr_t)obj);
-    return (int64_t)(uintptr_t)fresh;
-}
-
-int64_t tenon_rc_ensure_unique(int64_t ptr) {
-    if (__builtin_expect(ptr == 0, 0)) return 0;
-    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-#ifdef TENON_THREAD_SAFE
-    if (__builtin_expect(__atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE) == 1, 1)) {
-        return ptr;
-    }
-#else
-    if (__builtin_expect(obj->rc == 1, 1)) {
-        return ptr;
-    }
-#endif
-    return tenon_rc_cow_clone_slow(obj);
-}
-
-int64_t tenon_rc_get_field(int64_t ptr, int64_t idx) {
-    if (__builtin_expect(ptr == 0 || idx < 0, 0)) return 0;
-    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    if (__builtin_expect(idx >= obj->len, 0)) return 0;
-    return obj->fields[idx];
-}
-
-void tenon_rc_set_field(int64_t ptr, int64_t idx, int64_t val) {
-    if (__builtin_expect(ptr == 0 || idx < 0, 0)) return;
-    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    if (__builtin_expect(idx < obj->len, 1)) {
-        uint64_t mask = obj->rc_mask;
-        if (__builtin_expect(mask == 0, 1)) {
-            obj->fields[idx] = val;
-            return;
-        }
-        int64_t old = obj->fields[idx];
-        obj->fields[idx] = val;
-        if ((mask == UINT64_MAX || (idx < 64 && (mask & (1ULL << idx)))) && old != 0) {
-            tenon_rc_dec(old);
-        }
-    }
-}
-
-void tenon_rc_set_field_raw(int64_t ptr, int64_t idx, int64_t val) {
-    if (ptr == 0 || idx < 0) return;
-    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    if (idx < obj->len) {
-        obj->fields[idx] = val;
-    }
-}
-
-int64_t tenon_rc_get_tag(int64_t ptr) {
-    if (ptr == 0) return -1;
-    return ((TenonObj*)(uintptr_t)ptr)->tag;
-}
-
-int64_t tenon_rc_get_len(int64_t ptr) {
-    if (ptr == 0) return 0;
-    return ((TenonObj*)(uintptr_t)ptr)->len;
-}
-
-int64_t tenon_text_new(int64_t data_ptr, int64_t byte_len) {
-    int64_t blen = byte_len < 0 ? 0 : byte_len;
-    int64_t words = (blen + 8) / 8;
-    if (words < 1) words = 1;
-    TenonObj* obj = tenon_rc_alloc_raw(5, blen, words);
-    if (blen > 0 && data_ptr != 0) {
-        memcpy((void*)obj->fields, (const void*)(uintptr_t)data_ptr, (size_t)blen);
-    }
-    ((uint8_t*)obj->fields)[blen] = 0;
-    return (int64_t)(uintptr_t)obj;
-}
-
-int64_t tenon_text_eq(int64_t a, int64_t b) {
-    if (a == b) return 1;
-    if (a == 0 || b == 0) return 0;
-    TenonObj* ha = (TenonObj*)(uintptr_t)a;
-    TenonObj* hb = (TenonObj*)(uintptr_t)b;
-    if (ha->len != hb->len) return 0;
-    return memcmp((const void*)ha->fields, (const void*)hb->fields, (size_t)ha->len) == 0 ? 1 : 0;
-}
-
-int64_t tenon_byte_at(int64_t s, int64_t idx) {
-    if (s == 0 || idx < 0) return -1;
-    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
-    if (idx >= hdr->len) return -1;
-    return (int64_t)((const uint8_t*)hdr->fields)[idx];
-}
-
-int64_t tenon_str_slice(int64_t s, int64_t start, int64_t end) {
-    if (s == 0) return tenon_text_new(0, 0);
-    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
-    int64_t len = hdr->len;
-    int64_t st = start < 0 ? 0 : (start > len ? len : start);
-    int64_t en = end < 0 ? 0 : (end > len ? len : end);
-    if (st >= en) return tenon_text_new(0, 0);
-    const uint8_t* base = (const uint8_t*)hdr->fields;
-    return tenon_text_new((int64_t)(uintptr_t)(base + st), en - st);
-}
-
-int64_t tenon_byte_to_text(int64_t b) {
-    uint8_t ch = (uint8_t)(b & 0xFF);
-    return tenon_text_new((int64_t)(uintptr_t)&ch, 1);
-}
-
-int64_t tenon_str_concat(int64_t a, int64_t b) {
-    int64_t la = a ? ((TenonObj*)(uintptr_t)a)->len : 0;
-    int64_t lb = b ? ((TenonObj*)(uintptr_t)b)->len : 0;
-    int64_t total = la + lb;
-    int64_t words = (total + 8) / 8;
-    if (words < 1) words = 1;
-    TenonObj* obj = tenon_rc_alloc_raw(5, total, words);
-    uint8_t* dst = (uint8_t*)obj->fields;
-    if (la > 0) memcpy(dst, (const void*)((TenonObj*)(uintptr_t)a)->fields, (size_t)la);
-    if (lb > 0) memcpy(dst + la, (const void*)((TenonObj*)(uintptr_t)b)->fields, (size_t)lb);
-    dst[total] = 0;
-    return (int64_t)(uintptr_t)obj;
-}
-
-int64_t tenon_int_to_float(int64_t v) {
-    union { double d; int64_t i; } u;
-    u.d = (double)v;
-    return u.i;
-}
-
-int64_t tenon_float_to_int(int64_t bits) {
-    union { double d; int64_t i; } u;
-    u.i = bits;
-    return (int64_t)u.d;
-}
-
-int64_t tenon_float_to_text(int64_t bits) {
-    union { double d; int64_t i; } u;
-    u.i = bits;
-    double d = (u.d == 0.0) ? 0.0 : u.d;
-    char buf[64];
-    int n = snprintf(buf, sizeof(buf), "%.15g", d);
-    if (n < 0) n = 0;
-    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
-    return tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)n);
-}
-
-int64_t tenon_parse_float(int64_t s) {
-    union { double d; int64_t i; } u;
-    if (s == 0) { u.d = NAN; return u.i; }
-    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
-    size_t n = (size_t)hdr->len;
-    char tmp[128];
-    char* buf = n < sizeof(tmp) ? tmp : (char*)malloc(n + 1);
-    if (n > 0) memcpy(buf, (const void*)hdr->fields, n);
-    buf[n] = '\0';
-    char* end = NULL;
-    double v = strtod(buf, &end);
-    while (end && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) end++;
-    int ok = (end != buf && end && *end == '\0');
-    if (buf != tmp) free(buf);
-    u.d = ok ? v : NAN;
-    return u.i;
-}
-
-int64_t tenon_float_is_nan(int64_t bits) {
-    union { double d; int64_t i; } u;
-    u.i = bits;
-    return isnan(u.d) ? 1 : 0;
-}
-
-int64_t tenon_float_bits(int64_t bits) {
-    union { double d; int64_t i; } u;
-    u.i = bits;
-    if (u.d == 0.0) { u.d = 0.0; return u.i; }
-    return bits;
-}
-
-typedef struct {
-    uint8_t* data;
-    size_t len;
-    size_t cap;
-    uint8_t inline_buf[128];
-} TenonBuf;
-
-#ifdef TENON_THREAD_SAFE
-static _Thread_local TenonBuf* g_buf_cache = NULL;
-#else
-static TenonBuf* g_buf_cache = NULL;
-#endif
-
-int64_t tenon_buf_new(void) {
-    TenonBuf* b;
-    if (g_buf_cache) {
-        b = g_buf_cache;
-        g_buf_cache = NULL;
-    } else {
-        b = (TenonBuf*)malloc(sizeof(TenonBuf));
-    }
-    b->data = b->inline_buf;
-    b->cap = sizeof(b->inline_buf);
-    b->len = 0;
-    return (int64_t)(uintptr_t)b;
-}
-
-__attribute__((noinline))
-static void tenon_buf_grow(TenonBuf* b, size_t need) {
-    size_t nc = b->cap * 2;
-    while (nc < need) nc *= 2;
-    if (b->data == b->inline_buf) {
-        uint8_t* heap = (uint8_t*)malloc(nc);
-        if (b->len > 0) memcpy(heap, b->inline_buf, b->len);
-        b->data = heap;
-    } else {
-        b->data = (uint8_t*)realloc(b->data, nc);
-    }
-    b->cap = nc;
-}
-
-int64_t tenon_buf_push_str(int64_t h, int64_t s) {
-    if (__builtin_expect(h == 0 || s == 0, 0)) return 0;
-    TenonBuf* b = (TenonBuf*)(uintptr_t)h;
-    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
-    size_t n = (size_t)hdr->len;
-    if (n > 0) {
-        if (__builtin_expect(b->len + n > b->cap, 0)) tenon_buf_grow(b, b->len + n);
-        memcpy(b->data + b->len, (const void*)hdr->fields, n);
-        b->len += n;
-    }
-    return (int64_t)b->len;
-}
-
-int64_t tenon_buf_push_byte(int64_t h, int64_t byte_val) {
-    if (__builtin_expect(h == 0, 0)) return 0;
-    TenonBuf* b = (TenonBuf*)(uintptr_t)h;
-    if (__builtin_expect(b->len + 1 > b->cap, 0)) tenon_buf_grow(b, b->len + 1);
-    b->data[b->len++] = (uint8_t)(byte_val & 0xFF);
-    return (int64_t)b->len;
-}
-
-int64_t tenon_buf_finish(int64_t h) {
-    if (__builtin_expect(h == 0, 0)) return tenon_text_new(0, 0);
-    TenonBuf* b = (TenonBuf*)(uintptr_t)h;
-    int64_t res = tenon_text_new((int64_t)(uintptr_t)b->data, (int64_t)b->len);
-    if (b->data != b->inline_buf) free(b->data);
-    if (!g_buf_cache) {
-        g_buf_cache = b;
-    } else {
-        free(b);
-    }
-    return res;
-}
-
-int64_t tenon_list_push(int64_t ptr, int64_t val) {
-    if (ptr == 0) {
-        int64_t f = tenon_rc_alloc(4, 1);
-        tenon_rc_set_field(f, 0, val);
-        return f;
-    }
-    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    int64_t old_len = obj->len;
-    uint64_t mask = obj->rc_mask;
-#ifdef TENON_THREAD_SAFE
-    int shared = __atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE) > 1;
-#else
-    int shared = obj->rc > 1;
-#endif
-    if (!shared && old_len < obj->cap) {
-        g_reuse++;
-        obj->fields[old_len] = val;
-        obj->len = old_len + 1;
-        return ptr;
-    }
-    int64_t new_cap = obj->cap * 2;
-    if (new_cap < old_len + 1) new_cap = old_len + 1;
-    int64_t fp = tenon_rc_alloc(4, new_cap);
-    TenonObj* fresh = (TenonObj*)(uintptr_t)fp;
-    fresh->len = old_len + 1;
-    fresh->rc_mask = mask;
-    for (int64_t i = 0; i < old_len; i++) {
-        fresh->fields[i] = obj->fields[i];
-        if (shared && mask == UINT64_MAX && obj->fields[i] != 0) {
-            tenon_rc_inc(obj->fields[i]);
-        }
-    }
-    fresh->fields[old_len] = val;
-    if (shared) {
-        g_cow++;
-    } else {
-        g_reuse++;
-        obj->rc_mask = 0;
-    }
-    tenon_rc_dec(ptr);
-    return fp;
-}
-
-int64_t tenon_list_filled(int64_t len, int64_t init_val, int64_t elem_is_rc) {
-    int64_t n = len < 0 ? 0 : len;
-    int64_t cap = n < 1 ? 1 : n;
-    TenonObj* fresh = tenon_rc_alloc_raw(4, n, cap);
-    if (elem_is_rc != 0) {
-        fresh->rc_mask = UINT64_MAX;
-        if (init_val != 0 && n > 0) {
-            TenonObj* iv = (TenonObj*)(uintptr_t)init_val;
-#ifdef TENON_THREAD_SAFE
-            if (__atomic_load_n(&iv->rc, __ATOMIC_RELAXED) > 0) __atomic_add_fetch(&iv->rc, n, __ATOMIC_RELAXED);
-#else
-            if (iv->rc > 0) iv->rc += n;
-#endif
-        }
-    }
-    if (init_val == 0) {
-        memset(fresh->fields, 0, (size_t)n * sizeof(int64_t));
-    } else {
-        for (int64_t i = 0; i < n; i++) {
-            fresh->fields[i] = init_val;
-        }
-    }
-    return (int64_t)(uintptr_t)fresh;
-}
-
-int64_t tenon_flat_list_filled(int64_t len, int64_t elem_bytes, const void* init_ptr) {
-    int64_t n = len < 0 ? 0 : len;
-    int64_t tag = (elem_bytes == 16) ? 17 : 18;
-    int64_t total_bytes = n * elem_bytes;
-    int64_t words = (total_bytes + 7) / 8;
-    if (words < 4) words = 4;
-    TenonObj* fresh = tenon_rc_alloc_raw(tag, n, words);
-    uint8_t* dst = (uint8_t*)fresh->fields;
-    if (init_ptr == NULL) {
-        if (total_bytes > 0) memset(dst, 0, (size_t)total_bytes);
-    } else {
-        for (int64_t i = 0; i < n; i++) {
-            memcpy(dst + (size_t)(i * elem_bytes), init_ptr, (size_t)elem_bytes);
-        }
-    }
-    return (int64_t)(uintptr_t)fresh;
-}
-
-int64_t tenon_flat_list_push(int64_t ptr, int64_t elem_bytes, const void* val_ptr) {
-    int64_t tag = (elem_bytes == 16) ? 17 : 18;
-    if (ptr == 0) {
-        return tenon_flat_list_filled(1, elem_bytes, val_ptr);
-    }
-    TenonObj* obj = (TenonObj*)(uintptr_t)ptr;
-    int64_t old_len = obj->len;
-    int64_t cap_elems = (obj->cap * 8) / elem_bytes;
-#ifdef TENON_THREAD_SAFE
-    int shared = __atomic_load_n(&obj->rc, __ATOMIC_ACQUIRE) > 1;
-#else
-    int shared = obj->rc > 1;
-#endif
-    if (!shared && old_len < cap_elems) {
-        g_reuse++;
-        memcpy((uint8_t*)obj->fields + (size_t)(old_len * elem_bytes), val_ptr, (size_t)elem_bytes);
-        obj->len = old_len + 1;
-        return ptr;
-    }
-    int64_t new_elems = cap_elems * 2;
-    if (new_elems < old_len + 1) new_elems = old_len + 1;
-    if (new_elems < 4) new_elems = 4;
-    int64_t new_words = (new_elems * elem_bytes + 7) / 8;
-    TenonObj* fresh = tenon_rc_alloc_raw(tag, old_len + 1, new_words);
-    if (old_len > 0) {
-        memcpy(fresh->fields, obj->fields, (size_t)(old_len * elem_bytes));
-    }
-    memcpy((uint8_t*)fresh->fields + (size_t)(old_len * elem_bytes), val_ptr, (size_t)elem_bytes);
-    if (shared) g_cow++; else g_reuse++;
-    tenon_rc_dec(ptr);
-    return (int64_t)(uintptr_t)fresh;
-}
-
-int64_t tenon_list_pop_shrink(int64_t ptr) {
-    if (ptr == 0) return 0;
-    int64_t uniq = tenon_rc_ensure_unique(ptr);
-    TenonObj* hdr = (TenonObj*)(uintptr_t)uniq;
-    if (hdr->len > 0) {
-        int64_t last_idx = hdr->len - 1;
-        int64_t old = hdr->fields[last_idx];
-        hdr->fields[last_idx] = 0;
-        hdr->len = last_idx;
-        if (hdr->rc_mask == UINT64_MAX && old != 0) {
-            tenon_rc_dec(old);
-        }
-    }
-    return uniq;
-}
-
-int64_t tenon_async_frame_alloc(int64_t total_slots, int64_t poll_fn_ptr) {
-    int64_t slots = total_slots < 4 ? 4 : total_slots;
-    int64_t f = tenon_rc_alloc(6, slots);
-    tenon_rc_set_field(f, 0, 0);
-    tenon_rc_set_field(f, 1, poll_fn_ptr);
-    tenon_rc_set_field(f, 2, 0);
-    tenon_rc_set_field(f, 3, 0);
-    return f;
-}
-
-static int64_t tenon_async_yield_poll(int64_t frame) {
-    int64_t st = tenon_rc_get_field(frame, 0);
-    if (st == 0) {
-        tenon_rc_set_field(frame, 0, 1);
-        g_suspends++;
-        return 0;
-    } else {
-        int64_t val = tenon_rc_get_field(frame, 4);
-        tenon_rc_set_field(frame, 2, val);
-        tenon_rc_set_field(frame, 0, -1);
-        return 1;
-    }
-}
-
-int64_t tenon_async_yield_create(int64_t val) {
-    int64_t f = tenon_async_frame_alloc(5, (int64_t)(uintptr_t)&tenon_async_yield_poll);
-    tenon_rc_set_field(f, 4, val);
-    return f;
-}
-
-int64_t tenon_async_poll_frame(int64_t frame) {
-    if (frame == 0) return 1;
-    g_polls++;
-    int64_t pp = tenon_rc_get_field(frame, 1);
-    if (pp == 0) return 1;
-    int64_t (*poll_fn)(int64_t) = (int64_t (*)(int64_t))(uintptr_t)pp;
-    return poll_fn(frame);
-}
-
-int64_t tenon_async_block_on(int64_t frame) {
-    for (;;) {
-        if (tenon_async_poll_frame(frame) != 0) {
-            int64_t res = tenon_rc_get_field(frame, 2);
-            tenon_rc_dec(frame);
-            return res;
-        }
-    }
-}
-
-extern int64_t tenon_fn_main(void);
-"#;
-
-const TENON_AOT_MAIN_STATS_C: &str = r#"
-int main(void) {
-    int64_t res = tenon_fn_main();
-    printf("main() => %lld\n", (long long)res);
-    if (g_allocs > 0 || g_polls > 0) {
-        printf("Perceus/Async stats: allocs=%lld, unique_reuse_hits=%lld, cow_clones=%lld, live_objects=%lld, async_polls=%lld, async_suspends=%lld\n",
-               (long long)g_allocs, (long long)g_reuse, (long long)g_cow,
-               (long long)g_live, (long long)g_polls, (long long)g_suspends);
-    }
-    return g_live == 0 ? 0 : 2;
-}
-"#;
-
-const TENON_AOT_MAIN_CLI_C: &str = r#"
-int main(void) {
-    return (int)tenon_fn_main();
-}
-"#;
-
-const TENON_AOT_OS_C: &str = r#"
-#include <errno.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-static int g_stdin_eof = 0;
-static int g_file_ok = 1;
-static int64_t g_exec_exit_code = 0;
-
-static char* tenon_cstr_copy(int64_t s) {
-    if (s == 0) {
-        char* empty = (char*)malloc(1);
-        empty[0] = '\0';
-        return empty;
-    }
-    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
-    size_t n = (size_t)hdr->len;
-    char* out = (char*)malloc(n + 1);
-    if (n > 0) memcpy(out, (const void*)hdr->fields, n);
-    out[n] = '\0';
-    return out;
-}
-
-int64_t tenon_sys_write_stdout(int64_t s) {
-    if (s == 0) return 0;
-    TenonObj* hdr = (TenonObj*)(uintptr_t)s;
-    if (hdr->len > 0) {
-        fwrite((const void*)hdr->fields, 1, (size_t)hdr->len, stdout);
-        fflush(stdout);
-    }
-    return hdr->len;
-}
-
-int64_t tenon_sys_read_line(void) {
-    size_t cap = 256, len = 0;
-    char* buf = (char*)malloc(cap);
-    int ch;
-    while ((ch = fgetc(stdin)) != EOF) {
-        if (ch == '\n') break;
-        if (len + 1 >= cap) {
-            cap *= 2;
-            buf = (char*)realloc(buf, cap);
-        }
-        buf[len++] = (char)ch;
-    }
-    if (ch == EOF && len == 0) {
-        g_stdin_eof = 1;
-        free(buf);
-        return tenon_text_new(0, 0);
-    }
-    g_stdin_eof = 0;
-    if (len > 0 && buf[len - 1] == '\r') len--;
-    int64_t res = tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)len);
-    free(buf);
-    return res;
-}
-
-int64_t tenon_sys_is_eof(void) { return g_stdin_eof ? 1 : 0; }
-
-int64_t tenon_sys_env(int64_t key) {
-    char* k = tenon_cstr_copy(key);
-    const char* v = getenv(k);
-    free(k);
-    if (!v) return tenon_text_new(0, 0);
-    return tenon_text_new((int64_t)(uintptr_t)v, (int64_t)strlen(v));
-}
-
-int64_t tenon_sys_cwd(void) {
-    char buf[4096];
-    if (!getcwd(buf, sizeof(buf))) return tenon_text_new((int64_t)(uintptr_t)".", 1);
-    return tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)strlen(buf));
-}
-
-int64_t tenon_sys_read_file(int64_t path) {
-    char* p = tenon_cstr_copy(path);
-    FILE* f = fopen(p, "rb");
-    if (!f) {
-        g_file_ok = 0;
-        char msg[256];
-        int ml = snprintf(msg, sizeof(msg), "%s", strerror(errno));
-        free(p);
-        return tenon_text_new((int64_t)(uintptr_t)msg, (int64_t)ml);
-    }
-    free(p);
-    size_t cap = 4096, len = 0;
-    char* buf = (char*)malloc(cap);
-    size_t n;
-    while ((n = fread(buf + len, 1, cap - len, f)) > 0) {
-        len += n;
-        if (len == cap) {
-            cap *= 2;
-            buf = (char*)realloc(buf, cap);
-        }
-    }
-    fclose(f);
-    g_file_ok = 1;
-    int64_t res = tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)len);
-    free(buf);
-    return res;
-}
-
-int64_t tenon_sys_file_ok(void) { return g_file_ok ? 1 : 0; }
-
-int64_t tenon_sys_write_file(int64_t path, int64_t content) {
-    char* p = tenon_cstr_copy(path);
-    FILE* f = fopen(p, "wb");
-    free(p);
-    if (!f) {
-        g_file_ok = 0;
-        return 0;
-    }
-    int ok = 1;
-    if (content != 0) {
-        TenonObj* hdr = (TenonObj*)(uintptr_t)content;
-        if (hdr->len > 0) {
-            ok = fwrite((const void*)hdr->fields, 1, (size_t)hdr->len, f) == (size_t)hdr->len;
-        }
-    }
-    if (fclose(f) != 0) ok = 0;
-    g_file_ok = ok;
-    return ok ? 1 : 0;
-}
-
-int64_t tenon_sys_exec(int64_t cmd) {
-    char* c = tenon_cstr_copy(cmd);
-    size_t clen = strlen(c);
-    char* wrapped = (char*)malloc(clen + 16);
-    snprintf(wrapped, clen + 16, "%s 2>&1", c);
-    free(c);
-    FILE* fp = popen(wrapped, "r");
-    free(wrapped);
-    if (!fp) {
-        g_exec_exit_code = -1;
-        return tenon_text_new(0, 0);
-    }
-    size_t cap = 4096, len = 0;
-    char* buf = (char*)malloc(cap);
-    size_t n;
-    while ((n = fread(buf + len, 1, cap - len, fp)) > 0) {
-        len += n;
-        if (len == cap) {
-            cap *= 2;
-            buf = (char*)realloc(buf, cap);
-        }
-    }
-    int st = pclose(fp);
-    if (WIFEXITED(st)) g_exec_exit_code = WEXITSTATUS(st);
-    else g_exec_exit_code = -1;
-    int64_t res = tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)len);
-    free(buf);
-    return res;
-}
-
-int64_t tenon_sys_exec_exit_code(void) { return g_exec_exit_code; }
-"#;
-
-const TENON_AOT_HTTP_C: &str = r#"
-#include <curl/curl.h>
-#include <pthread.h>
-
-typedef struct HttpLineNode {
-    char* data;
-    size_t len;
-    struct HttpLineNode* next;
-} HttpLineNode;
-
-typedef struct {
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    HttpLineNode* head;
-    HttpLineNode* tail;
-    int done;
-    int eof;
-    int closed;
-    char* err;
-    char* method;
-    char* url;
-    char* headers;
-    char* body;
-    size_t body_len;
-    char* line_buf;
-    size_t line_len;
-    size_t line_cap;
-    char err_preview[4096];
-    size_t err_preview_len;
-    pthread_t th;
-} TenonHttpStream;
-
-static void http_push_line(TenonHttpStream* st, const char* data, size_t len) {
-    HttpLineNode* node = (HttpLineNode*)malloc(sizeof(HttpLineNode));
-    node->data = (char*)malloc(len + 1);
-    if (len > 0) memcpy(node->data, data, len);
-    node->data[len] = '\0';
-    node->len = len;
-    node->next = NULL;
-    pthread_mutex_lock(&st->mu);
-    if (!st->closed) {
-        if (st->tail) st->tail->next = node;
-        else st->head = node;
-        st->tail = node;
-        pthread_cond_signal(&st->cv);
-    } else {
-        free(node->data);
-        free(node);
-    }
-    pthread_mutex_unlock(&st->mu);
-}
-
-static size_t tenon_curl_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    size_t total = size * nmemb;
-    TenonHttpStream* st = (TenonHttpStream*)userdata;
-    if (st->err_preview_len < sizeof(st->err_preview) - 1) {
-        size_t take = sizeof(st->err_preview) - 1 - st->err_preview_len;
-        if (total < take) take = total;
-        memcpy(st->err_preview + st->err_preview_len, ptr, take);
-        st->err_preview_len += take;
-        st->err_preview[st->err_preview_len] = '\0';
-    }
-    if (st->line_len + total > st->line_cap) {
-        size_t nc = st->line_cap ? st->line_cap * 2 : 1024;
-        while (nc < st->line_len + total) nc *= 2;
-        st->line_buf = (char*)realloc(st->line_buf, nc);
-        st->line_cap = nc;
-    }
-    memcpy(st->line_buf + st->line_len, ptr, total);
-    st->line_len += total;
-
-    size_t start = 0;
-    for (size_t i = 0; i < st->line_len; i++) {
-        if (st->line_buf[i] == '\n') {
-            size_t llen = i - start;
-            if (llen > 0 && st->line_buf[start + llen - 1] == '\r') llen--;
-            http_push_line(st, st->line_buf + start, llen);
-            start = i + 1;
-        }
-    }
-    if (start > 0) {
-        size_t rem = st->line_len - start;
-        if (rem > 0) memmove(st->line_buf, st->line_buf + start, rem);
-        st->line_len = rem;
-    }
-    pthread_mutex_lock(&st->mu);
-    int closed = st->closed;
-    pthread_mutex_unlock(&st->mu);
-    return closed ? 0 : total;
-}
-
-static void* tenon_http_thread(void* arg) {
-    TenonHttpStream* st = (TenonHttpStream*)arg;
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        pthread_mutex_lock(&st->mu);
-        st->err = strdup("curl_easy_init failed");
-        st->done = 1;
-        pthread_cond_signal(&st->cv);
-        pthread_mutex_unlock(&st->mu);
-        return NULL;
-    }
-    struct curl_slist* slist = NULL;
-    char* p = st->headers;
-    while (p && *p) {
-        char* nl = strchr(p, '\n');
-        size_t l = nl ? (size_t)(nl - p) : strlen(p);
-        while (l > 0 && (p[l - 1] == '\r' || p[l - 1] == ' ')) l--;
-        if (l > 0) {
-            char* h = (char*)malloc(l + 1);
-            memcpy(h, p, l);
-            h[l] = '\0';
-            if (strchr(h, ':')) slist = curl_slist_append(slist, h);
-            free(h);
-        }
-        if (!nl) break;
-        p = nl + 1;
-    }
-    curl_easy_setopt(curl, CURLOPT_URL, st->url);
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, st->method[0] ? st->method : "POST");
-    if (slist) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
-    if (st->body_len > 0) {
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, st->body);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)st->body_len);
-    }
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, tenon_curl_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, st);
-
-    CURLcode res = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-    if (st->line_len > 0) {
-        size_t llen = st->line_len;
-        if (llen > 0 && st->line_buf[llen - 1] == '\r') llen--;
-        http_push_line(st, st->line_buf, llen);
-    }
-    pthread_mutex_lock(&st->mu);
-    if (res != CURLE_OK && !st->closed) {
-        const char* em = curl_easy_strerror(res);
-        size_t el = strlen(em) + 32;
-        st->err = (char*)malloc(el);
-        snprintf(st->err, el, "http request failed: %s", em);
-    } else if (http_code >= 400 && !st->err) {
-        size_t el = st->err_preview_len + 32;
-        st->err = (char*)malloc(el);
-        snprintf(st->err, el, "HTTP %ld: %s", http_code, st->err_preview);
-    }
-    st->done = 1;
-    pthread_cond_signal(&st->cv);
-    pthread_mutex_unlock(&st->mu);
-
-    if (slist) curl_slist_free_all(slist);
-    curl_easy_cleanup(curl);
-    return NULL;
-}
-
-int64_t tenon_sys_http_open(int64_t method, int64_t url, int64_t headers, int64_t body) {
-    TenonHttpStream* st = (TenonHttpStream*)calloc(1, sizeof(TenonHttpStream));
-    pthread_mutex_init(&st->mu, NULL);
-    pthread_cond_init(&st->cv, NULL);
-    st->method = tenon_cstr_copy(method);
-    st->url = tenon_cstr_copy(url);
-    st->headers = tenon_cstr_copy(headers);
-    if (body != 0) {
-        TenonObj* hdr = (TenonObj*)(uintptr_t)body;
-        st->body_len = (size_t)hdr->len;
-        st->body = (char*)malloc(st->body_len + 1);
-        if (st->body_len > 0) memcpy(st->body, (const void*)hdr->fields, st->body_len);
-        st->body[st->body_len] = '\0';
-    }
-    pthread_create(&st->th, NULL, tenon_http_thread, st);
-    return (int64_t)(uintptr_t)st;
-}
-
-int64_t tenon_sys_http_sse_open(int64_t url, int64_t bearer, int64_t body) {
-    char* b = tenon_cstr_copy(bearer);
-    size_t bl = strlen(b);
-    size_t hl = bl + 128;
-    char* h = (char*)malloc(hl);
-    if (bl > 0) snprintf(h, hl, "Content-Type: application/json\nAccept: text/event-stream\nAuthorization: Bearer %s\n", b);
-    else snprintf(h, hl, "Content-Type: application/json\nAccept: text/event-stream\n");
-    free(b);
-    int64_t m = tenon_text_new((int64_t)(uintptr_t)"POST", 4);
-    int64_t hs = tenon_text_new((int64_t)(uintptr_t)h, (int64_t)strlen(h));
-    free(h);
-    int64_t res = tenon_sys_http_open(m, url, hs, body);
-    tenon_rc_dec(m);
-    tenon_rc_dec(hs);
-    return res;
-}
-
-int64_t tenon_sys_http_sse_next_line(int64_t handle) {
-    if (handle == 0) return tenon_text_new(0, 0);
-    TenonHttpStream* st = (TenonHttpStream*)(uintptr_t)handle;
-    pthread_mutex_lock(&st->mu);
-    while (!st->head && !st->done) {
-        pthread_cond_wait(&st->cv, &st->mu);
-    }
-    if (!st->head) {
-        st->eof = 1;
-        pthread_mutex_unlock(&st->mu);
-        return tenon_text_new(0, 0);
-    }
-    HttpLineNode* node = st->head;
-    st->head = node->next;
-    if (!st->head) st->tail = NULL;
-    pthread_mutex_unlock(&st->mu);
-    int64_t res = tenon_text_new((int64_t)(uintptr_t)node->data, (int64_t)node->len);
-    free(node->data);
-    free(node);
-    return res;
-}
-
-int64_t tenon_sys_http_sse_eof(int64_t handle) {
-    if (handle == 0) return 1;
-    TenonHttpStream* st = (TenonHttpStream*)(uintptr_t)handle;
-    pthread_mutex_lock(&st->mu);
-    int e = st->eof;
-    pthread_mutex_unlock(&st->mu);
-    return e ? 1 : 0;
-}
-
-int64_t tenon_sys_http_sse_error(int64_t handle) {
-    if (handle == 0) return tenon_text_new(0, 0);
-    TenonHttpStream* st = (TenonHttpStream*)(uintptr_t)handle;
-    pthread_mutex_lock(&st->mu);
-    int64_t res = st->err ? tenon_text_new((int64_t)(uintptr_t)st->err, (int64_t)strlen(st->err)) : tenon_text_new(0, 0);
-    pthread_mutex_unlock(&st->mu);
-    return res;
-}
-
-int64_t tenon_sys_http_sse_close(int64_t handle) {
-    if (handle == 0) return 0;
-    TenonHttpStream* st = (TenonHttpStream*)(uintptr_t)handle;
-    pthread_mutex_lock(&st->mu);
-    st->closed = 1;
-    pthread_mutex_unlock(&st->mu);
-    pthread_join(st->th, NULL);
-    while (st->head) {
-        HttpLineNode* n = st->head;
-        st->head = n->next;
-        free(n->data);
-        free(n);
-    }
-    free(st->err);
-    free(st->method);
-    free(st->url);
-    free(st->headers);
-    free(st->body);
-    free(st->line_buf);
-    pthread_cond_destroy(&st->cv);
-    pthread_mutex_destroy(&st->mu);
-    free(st);
-    return 0;
-}
-"#;
 
 fn ir_uses_os_syscalls(ir: &str) -> bool {
     ir.contains("call i64 @tenon_sys_")
@@ -1595,343 +431,6 @@ pub fn compile_with_options(
     })
 }
 
-const TENON_NONATOMIC_RC_IR_HELPERS: &str = r#"
-define internal i64 @__tn_rc_inc(i64 %p) alwaysinline {
-entry:
-  %nz = icmp ne i64 %p, 0
-  br i1 %nz, label %chk, label %done
-chk:
-  %obj = inttoptr i64 %p to ptr
-  %rc = load i64, ptr %obj, align 8, !tbaa !6
-  %pos = icmp sgt i64 %rc, 0
-  br i1 %pos, label %inc, label %done
-inc:
-  %nrc = add nsw i64 %rc, 1
-  store i64 %nrc, ptr %obj, align 8, !tbaa !6
-  br label %done
-done:
-  ret i64 %p
-}
-
-define internal void @__tn_rc_dec(i64 %p) alwaysinline {
-entry:
-  %nz = icmp ne i64 %p, 0
-  br i1 %nz, label %chk, label %done
-chk:
-  %obj = inttoptr i64 %p to ptr
-  %rc = load i64, ptr %obj, align 8, !tbaa !6
-  %pos = icmp sgt i64 %rc, 0
-  br i1 %pos, label %dec, label %done
-dec:
-  %nrc = add nsw i64 %rc, -1
-  store i64 %nrc, ptr %obj, align 8, !tbaa !6
-  %zero = icmp sle i64 %nrc, 0
-  br i1 %zero, label %free, label %done
-free:
-  tail call void @tenon_rc_free_obj(i64 %p)
-  br label %done
-done:
-  ret void
-}
-
-define internal i64 @__tn_rc_ensure_unique(i64 %p) alwaysinline {
-entry:
-  %nz = icmp ne i64 %p, 0
-  br i1 %nz, label %chk, label %ret0
-chk:
-  %obj = inttoptr i64 %p to ptr
-  %rc = load i64, ptr %obj, align 8, !tbaa !6
-  %uniq = icmp eq i64 %rc, 1
-  br i1 %uniq, label %retp, label %slow
-slow:
-  %cow = tail call i64 @tenon_rc_ensure_unique(i64 %p)
-  ret i64 %cow
-retp:
-  ret i64 %p
-ret0:
-  ret i64 0
-}
-"#;
-
-const TENON_INLINE_IR_HELPERS: &str = r#"
-define internal void @__tn_rc_set_rc_mask(i64 %p, i64 %mask) alwaysinline {
-entry:
-  %nz = icmp ne i64 %p, 0
-  br i1 %nz, label %do, label %done
-do:
-  %obj = inttoptr i64 %p to ptr
-  %mp = getelementptr inbounds i8, ptr %obj, i64 32
-  store i64 %mask, ptr %mp, align 8, !tbaa !9
-  br label %done
-done:
-  ret void
-}
-
-define internal i64 @__tn_cstruct_data_ptr(i64 %p) alwaysinline nounwind willreturn memory(none) {
-entry:
-  %is0 = icmp eq i64 %p, 0
-  %d = add i64 %p, 40
-  %res = select i1 %is0, i64 0, i64 %d
-  ret i64 %res
-}
-
-define internal i64 @__tn_slot_get(i64 %p, i64 %idx) alwaysinline {
-entry:
-  %obj = inttoptr i64 %p to ptr
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
-  %v = load i64, ptr %fp, align 8, !tbaa !10
-  ret i64 %v
-}
-
-define internal void @__tn_slot_set_prim(i64 %p, i64 %idx, i64 %val) alwaysinline {
-entry:
-  %obj = inttoptr i64 %p to ptr
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
-  store i64 %val, ptr %fp, align 8, !tbaa !10
-  ret void
-}
-
-define internal void @__tn_slot_set_rc(i64 %p, i64 %idx, i64 %val) alwaysinline {
-entry:
-  %obj = inttoptr i64 %p to ptr
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
-  %old = load i64, ptr %fp, align 8, !tbaa !10
-  store i64 %val, ptr %fp, align 8, !tbaa !10
-  call void @__tn_rc_dec(i64 %old)
-  ret void
-}
-
-define internal i64 @__tn_list_get(i64 %p, i64 %idx) alwaysinline {
-entry:
-  %nz = icmp ne i64 %p, 0
-  br i1 %nz, label %chk, label %oob
-chk:
-  %obj = inttoptr i64 %p to ptr
-  %lp = getelementptr inbounds i8, ptr %obj, i64 16
-  %len = load i64, ptr %lp, align 8, !tbaa !8
-  %ok = icmp ult i64 %idx, %len
-  br i1 %ok, label %inb, label %oob
-inb:
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
-  %v = load i64, ptr %fp, align 8, !tbaa !10
-  ret i64 %v
-oob:
-  ret i64 0
-}
-
-define internal i64 @__tn_list_get_nonnull(i64 %p, i64 %idx) alwaysinline {
-entry:
-  %obj = inttoptr i64 %p to ptr
-  %lp = getelementptr inbounds i8, ptr %obj, i64 16
-  %len = load i64, ptr %lp, align 8, !tbaa !8
-  %ok = icmp ult i64 %idx, %len
-  br i1 %ok, label %inb, label %oob
-inb:
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
-  %v = load i64, ptr %fp, align 8, !tbaa !10
-  ret i64 %v
-oob:
-  ret i64 0
-}
-
-define internal i64 @__tn_list_get_unchecked(i64 %p, i64 %idx) alwaysinline {
-entry:
-  %obj = inttoptr i64 %p to ptr
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
-  %v = load i64, ptr %fp, align 8, !tbaa !10
-  ret i64 %v
-}
-
-define internal void @__tn_list_set_prim_unchecked(i64 %p, i64 %idx, i64 %val) alwaysinline {
-entry:
-  %obj = inttoptr i64 %p to ptr
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
-  store i64 %val, ptr %fp, align 8, !tbaa !10
-  ret void
-}
-
-define internal void @__tn_list_set_prim(i64 %p, i64 %idx, i64 %val) alwaysinline {
-entry:
-  %nz = icmp ne i64 %p, 0
-  br i1 %nz, label %chk, label %done
-chk:
-  %obj = inttoptr i64 %p to ptr
-  %lp = getelementptr inbounds i8, ptr %obj, i64 16
-  %len = load i64, ptr %lp, align 8, !tbaa !8
-  %ok = icmp ult i64 %idx, %len
-  br i1 %ok, label %inb, label %done
-inb:
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
-  store i64 %val, ptr %fp, align 8, !tbaa !10
-  br label %done
-done:
-  ret void
-}
-
-define internal void @__tn_list_set_prim_nonnull(i64 %p, i64 %idx, i64 %val) alwaysinline {
-entry:
-  %obj = inttoptr i64 %p to ptr
-  %lp = getelementptr inbounds i8, ptr %obj, i64 16
-  %len = load i64, ptr %lp, align 8, !tbaa !8
-  %ok = icmp ult i64 %idx, %len
-  br i1 %ok, label %inb, label %done
-inb:
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
-  store i64 %val, ptr %fp, align 8, !tbaa !10
-  br label %done
-done:
-  ret void
-}
-
-define internal void @__tn_list_set_rc(i64 %p, i64 %idx, i64 %val) alwaysinline {
-entry:
-  %nz = icmp ne i64 %p, 0
-  br i1 %nz, label %chk, label %done
-chk:
-  %obj = inttoptr i64 %p to ptr
-  %lp = getelementptr inbounds i8, ptr %obj, i64 16
-  %len = load i64, ptr %lp, align 8, !tbaa !8
-  %ok = icmp ult i64 %idx, %len
-  br i1 %ok, label %inb, label %done
-inb:
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %fp = getelementptr inbounds i64, ptr %base, i64 %idx
-  %old = load i64, ptr %fp, align 8, !tbaa !10
-  store i64 %val, ptr %fp, align 8, !tbaa !10
-  call void @__tn_rc_dec(i64 %old)
-  br label %done
-done:
-  ret void
-}
-
-define internal i64 @__tn_rc_len(i64 %p) alwaysinline {
-entry:
-  %nz = icmp ne i64 %p, 0
-  br i1 %nz, label %do, label %ret0
-do:
-  %obj = inttoptr i64 %p to ptr
-  %lp = getelementptr inbounds i8, ptr %obj, i64 16
-  %len = load i64, ptr %lp, align 8, !tbaa !8
-  ret i64 %len
-ret0:
-  ret i64 0
-}
-
-define internal i64 @__tn_rc_tag(i64 %p) alwaysinline {
-entry:
-  %nz = icmp ne i64 %p, 0
-  br i1 %nz, label %do, label %retm1
-do:
-  %obj = inttoptr i64 %p to ptr
-  %tp = getelementptr inbounds i8, ptr %obj, i64 8
-  %tag = load i64, ptr %tp, align 8, !tbaa !7
-  ret i64 %tag
-retm1:
-  ret i64 -1
-}
-
-define internal i64 @__tn_byte_at(i64 %s, i64 %idx) alwaysinline {
-entry:
-  %nz = icmp ne i64 %s, 0
-  br i1 %nz, label %chk, label %oob
-chk:
-  %obj = inttoptr i64 %s to ptr
-  %lp = getelementptr inbounds i8, ptr %obj, i64 16
-  %len = load i64, ptr %lp, align 8, !tbaa !8
-  %ok = icmp ult i64 %idx, %len
-  br i1 %ok, label %inb, label %oob
-inb:
-  %base = getelementptr inbounds i8, ptr %obj, i64 40
-  %bp = getelementptr inbounds i8, ptr %base, i64 %idx
-  %b = load i8, ptr %bp, align 1, !tbaa !10
-  %ext = zext i8 %b to i64
-  ret i64 %ext
-oob:
-  ret i64 -1
-}
-
-define internal i64 @__tn_buf_push_byte(i64 %h, i64 %byte_val) alwaysinline {
-entry:
-  %nz = icmp ne i64 %h, 0
-  br i1 %nz, label %chk, label %ret0
-chk:
-  %bp = inttoptr i64 %h to ptr
-  %lp = getelementptr inbounds i8, ptr %bp, i64 8
-  %cp = getelementptr inbounds i8, ptr %bp, i64 16
-  %len = load i64, ptr %lp, align 8
-  %cap = load i64, ptr %cp, align 8
-  %ok = icmp ult i64 %len, %cap
-  br i1 %ok, label %fast, label %slow
-fast:
-  %dp = load ptr, ptr %bp, align 8
-  %dst = getelementptr inbounds i8, ptr %dp, i64 %len
-  %b8 = trunc i64 %byte_val to i8
-  store i8 %b8, ptr %dst, align 1
-  %nlen = add nuw i64 %len, 1
-  store i64 %nlen, ptr %lp, align 8
-  ret i64 %nlen
-slow:
-  %r = tail call i64 @tenon_buf_push_byte(i64 %h, i64 %byte_val)
-  ret i64 %r
-ret0:
-  ret i64 0
-}
-
-define internal i64 @__tn_text_eq(i64 %a, i64 %b) alwaysinline {
-entry:
-  %same = icmp eq i64 %a, %b
-  br i1 %same, label %ret1, label %chk_nz
-chk_nz:
-  %anz = icmp ne i64 %a, 0
-  %bnz = icmp ne i64 %b, 0
-  %both = and i1 %anz, %bnz
-  br i1 %both, label %chk_len, label %ret0
-chk_len:
-  %pa = inttoptr i64 %a to ptr
-  %pb = inttoptr i64 %b to ptr
-  %la_p = getelementptr inbounds i8, ptr %pa, i64 16
-  %lb_p = getelementptr inbounds i8, ptr %pb, i64 16
-  %la = load i64, ptr %la_p, align 8, !tbaa !8
-  %lb = load i64, ptr %lb_p, align 8, !tbaa !8
-  %leq = icmp eq i64 %la, %lb
-  br i1 %leq, label %cmp_mem, label %ret0
-cmp_mem:
-  %ba = getelementptr inbounds i8, ptr %pa, i64 40
-  %bb = getelementptr inbounds i8, ptr %pb, i64 40
-  %mc = call i32 @memcmp(ptr %ba, ptr %bb, i64 %la)
-  %eq = icmp eq i32 %mc, 0
-  %res = zext i1 %eq to i64
-  ret i64 %res
-ret1:
-  ret i64 1
-ret0:
-  ret i64 0
-}
-"#;
-
-const TENON_TBAA_METADATA: &str = r#"
-!0 = !{!"Tenon TBAA"}
-!1 = !{!"tn_rc", !0, i64 0}
-!2 = !{!"tn_tag", !0, i64 0}
-!3 = !{!"tn_len", !0, i64 0}
-!4 = !{!"tn_mask", !0, i64 0}
-!5 = !{!"tn_field", !0, i64 0}
-!6 = !{!1, !1, i64 0}
-!7 = !{!2, !2, i64 0}
-!8 = !{!3, !3, i64 0}
-!9 = !{!4, !4, i64 0}
-!10 = !{!5, !5, i64 0}
-"#;
-
 fn llvm_c_abi_type(ty: &TypeExpr, aliases: &BTreeMap<String, TypeExpr>) -> &'static str {
     match resolve_alias_ty(ty, aliases) {
         TypeExpr::Named { name, .. } => match ScalarKind::from_name(&name) {
@@ -2058,6 +557,7 @@ pub fn emit_llvm_ir_with_build_options(
     let proved_no_overflow = &opts.proved_no_overflow;
     let non_escaping_vars = &opts.non_escaping_vars;
     let stack_promotable_vars = &opts.stack_promotable_vars;
+    let last_use_move_spans = &opts.last_use_move_spans;
     let checked_overflow = opts.checked_overflow;
     let target_triple = opts.target_triple.as_deref();
     let prepared = prepare_program_for_codegen(program);
@@ -2351,6 +851,7 @@ pub fn emit_llvm_ir_with_build_options(
             proved_no_overflow,
             non_escaping_vars,
             stack_promotable_vars,
+            last_use_move_spans,
             checked_overflow,
             &mut string_globals,
             &mut string_intern,
@@ -2389,6 +890,7 @@ pub fn emit_llvm_ir_with_build_options(
             proved_no_overflow,
             non_escaping_vars,
             stack_promotable_vars,
+            last_use_move_spans,
             checked_overflow,
             &mut string_globals,
             &mut string_intern,
@@ -2420,6 +922,7 @@ pub fn emit_llvm_ir_with_build_options(
             proved_no_overflow,
             non_escaping_vars,
             stack_promotable_vars,
+            last_use_move_spans,
             checked_overflow,
             &mut string_globals,
             &mut string_intern,
@@ -2686,6 +1189,7 @@ struct LlvmFnGen<'a> {
     proved_no_overflow: &'a BTreeSet<usize>,
     non_escaping_vars: &'a BTreeMap<String, BTreeSet<String>>,
     stack_promotable_vars: &'a BTreeMap<String, BTreeSet<String>>,
+    last_use_move_spans: &'a BTreeMap<String, BTreeSet<usize>>,
     checked_overflow: bool,
     string_globals: &'a mut Vec<(String, String)>,
     string_intern: &'a mut BTreeMap<String, String>,
@@ -2705,6 +1209,7 @@ struct LlvmFnGen<'a> {
     borrowed_rc_vars: BTreeSet<String>,
     always_unique_vars: BTreeSet<String>,
     cur_stack_promotable: BTreeSet<String>,
+    cur_last_use_move_spans: BTreeSet<usize>,
     active_arena_mark: Option<String>,
     rc_scopes: Vec<Vec<(String, String)>>,
     temp_rc_scopes: Vec<Vec<String>>,
@@ -2735,6 +1240,7 @@ impl<'a> LlvmFnGen<'a> {
         proved_no_overflow: &'a BTreeSet<usize>,
         non_escaping_vars: &'a BTreeMap<String, BTreeSet<String>>,
         stack_promotable_vars: &'a BTreeMap<String, BTreeSet<String>>,
+        last_use_move_spans: &'a BTreeMap<String, BTreeSet<usize>>,
         checked_overflow: bool,
         string_globals: &'a mut Vec<(String, String)>,
         string_intern: &'a mut BTreeMap<String, String>,
@@ -2761,6 +1267,7 @@ impl<'a> LlvmFnGen<'a> {
             proved_no_overflow,
             non_escaping_vars,
             stack_promotable_vars,
+            last_use_move_spans,
             checked_overflow,
             string_globals,
             string_intern,
@@ -2780,6 +1287,7 @@ impl<'a> LlvmFnGen<'a> {
             borrowed_rc_vars: BTreeSet::new(),
             always_unique_vars: BTreeSet::new(),
             cur_stack_promotable: BTreeSet::new(),
+            cur_last_use_move_spans: BTreeSet::new(),
             active_arena_mark: None,
             rc_scopes: Vec::new(),
             temp_rc_scopes: Vec::new(),
@@ -3353,6 +1861,104 @@ impl<'a> LlvmFnGen<'a> {
     fn flat_simd_list_info(&self, ty: &TypeExpr) -> Option<(&'static str, usize, i64)> {
         let elem = self.list_elem_ty(ty)?;
         self.simd_elem_info(&elem)
+    }
+
+    /// Returns `Some(is_signed)` if `ty` is a compact 4-byte scalar list
+    /// (`List[Int32]`, `List[UInt32]`, or `List[Float32]`, stored flat with tag 19, 4 bytes/elem).
+    fn flat_scalar4_list_info(&self, ty: &TypeExpr) -> Option<bool> {
+        let elem = self.list_elem_ty(ty)?;
+        self.scalar4_elem_info(&elem)
+    }
+
+    fn scalar4_elem_info(&self, ty: &TypeExpr) -> Option<bool> {
+        match resolve_alias_ty(ty, self.alias_bases) {
+            TypeExpr::Named { name, .. } => match name.as_str() {
+                "Int32" => Some(true),
+                "UInt32" | "Float32" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn emit_flat_scalar4_load(
+        &mut self,
+        list_val: &str,
+        idx_val: &str,
+        is_signed: bool,
+        is_safe: bool,
+    ) -> String {
+        let ext = if is_signed { "sext" } else { "zext" };
+        if is_safe {
+            let base = self.fresh_tmp();
+            let data = self.fresh_tmp();
+            let ep = self.fresh_tmp();
+            let v32 = self.fresh_tmp();
+            let res = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds i32, ptr {}, i64 {}\n  {} = load i32, ptr {}, align 4, !tbaa !7\n  {} = {} i32 {} to i64\n",
+                base, list_val, data, base, ep, data, idx_val, v32, ep, res, ext, v32
+            ));
+            res
+        } else {
+            self.slot_id += 1;
+            let rslot = format!("%fs4_{}", self.slot_id);
+            self.entry_allocas.push_str(&format!("  {} = alloca i64, align 8\n", rslot));
+            let chk_l = self.fresh_lbl("fs4_chk");
+            let ok_l = self.fresh_lbl("fs4_ok");
+            let oob_l = self.fresh_lbl("fs4_oob");
+            let end_l = self.fresh_lbl("fs4_end");
+            let nz = self.fresh_tmp();
+            let base = self.fresh_tmp();
+            let lp = self.fresh_tmp();
+            let len_v = self.fresh_tmp();
+            let in_b = self.fresh_tmp();
+            let data = self.fresh_tmp();
+            let ep = self.fresh_tmp();
+            let v32 = self.fresh_tmp();
+            let v64 = self.fresh_tmp();
+            let out = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = icmp ne i64 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 16\n  {} = load i64, ptr {}, align 8, !tbaa !8\n  {} = icmp ult i64 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds i32, ptr {}, i64 {}\n  {} = load i32, ptr {}, align 4, !tbaa !7\n  {} = {} i32 {} to i64\n  store i64 {}, ptr {}, align 8\n  br label %{}\n{}:\n  store i64 0, ptr {}, align 8\n  br label %{}\n{}:\n  {} = load i64, ptr {}, align 8\n",
+                nz, list_val, nz, chk_l, oob_l,
+                chk_l, base, list_val, lp, base, len_v, lp, in_b, idx_val, len_v, in_b, ok_l, oob_l,
+                ok_l, data, base, ep, data, idx_val, v32, ep, v64, ext, v32, v64, rslot, end_l,
+                oob_l, rslot, end_l,
+                end_l, out, rslot
+            ));
+            out
+        }
+    }
+
+    fn emit_flat_scalar4_store(
+        &mut self,
+        list_val: &str,
+        idx_val: &str,
+        val_i64: &str,
+        is_safe: bool,
+    ) {
+        let v32 = self.fresh_tmp();
+        self.code.push_str(&format!("  {} = trunc i64 {} to i32\n", v32, val_i64));
+        let base = self.fresh_tmp();
+        let data = self.fresh_tmp();
+        let ep = self.fresh_tmp();
+        if is_safe {
+            self.code.push_str(&format!(
+                "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds i32, ptr {}, i64 {}\n  store i32 {}, ptr {}, align 4, !tbaa !7\n",
+                base, list_val, data, base, ep, data, idx_val, v32, ep
+            ));
+        } else {
+            let ok_l = self.fresh_lbl("fs4s_ok");
+            let end_l = self.fresh_lbl("fs4s_end");
+            let lp = self.fresh_tmp();
+            let len_v = self.fresh_tmp();
+            let in_b = self.fresh_tmp();
+            self.code.push_str(&format!(
+                "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 16\n  {} = load i64, ptr {}, align 8, !tbaa !8\n  {} = icmp ult i64 {}, {}\n  br i1 {}, label %{}, label %{}\n{}:\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n  {} = getelementptr inbounds i32, ptr {}, i64 {}\n  store i32 {}, ptr {}, align 4, !tbaa !7\n  br label %{}\n{}:\n",
+                base, list_val, lp, base, len_v, lp, in_b, idx_val, len_v, in_b, ok_l, end_l,
+                ok_l, data, base, ep, data, idx_val, v32, ep, end_l, end_l
+            ));
+        }
     }
 
     fn simd_elem_info(&self, ty: &TypeExpr) -> Option<(&'static str, usize, i64)> {
@@ -4800,6 +3406,11 @@ impl<'a> LlvmFnGen<'a> {
             .get(&f.name)
             .cloned()
             .unwrap_or_default();
+        self.cur_last_use_move_spans = self
+            .last_use_move_spans
+            .get(&f.name)
+            .cloned()
+            .unwrap_or_default();
         if f.attrs.iter().any(|a| a.name == "arena") {
             let am = self.fresh_tmp();
             self.code
@@ -5300,6 +3911,26 @@ impl<'a> LlvmFnGen<'a> {
                                 ));
                                 self.flush_temps(&temps);
                                 res
+                            } else if target_ty
+                                .as_ref()
+                                .and_then(|t| self.flat_scalar4_list_info(t))
+                                .or_else(|| self.scalar4_elem_info(&self.infer_expr_type(&args[1].value)))
+                                .is_some()
+                            {
+                                let xs_val = self.load_ident_val(name)?;
+                                let mut temps = Vec::new();
+                                let vv = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                                let v32 = self.fresh_tmp();
+                                self.slot_id += 1;
+                                let vslot = format!("%fs4push_{}", self.slot_id);
+                                self.entry_allocas.push_str(&format!("  {} = alloca i32, align 4\n", vslot));
+                                let res = self.fresh_tmp();
+                                self.code.push_str(&format!(
+                                    "  {} = trunc i64 {} to i32\n  store i32 {}, ptr {}, align 4\n  {} = call i64 @tenon_flat_list_push(i64 {}, i64 4, ptr {})\n",
+                                    v32, vv, v32, vslot, res, xs_val, vslot
+                                ));
+                                self.flush_temps(&temps);
+                                res
                             } else {
                             let elem_is_rc = target_ty
                                 .as_ref()
@@ -5687,6 +4318,54 @@ impl<'a> LlvmFnGen<'a> {
                                             ok_l, data, base, ep, vec_ty, data, idx_v, vec_ty, vv, ep, end_l, end_l
                                         ));
                                     }
+                                    self.flush_temps(&temps);
+                                } else if let Some(is_signed) = self
+                                    .var_types
+                                    .get(vname)
+                                    .and_then(|t| self.flat_scalar4_list_info(t))
+                                {
+                                    let elem_ty = self
+                                        .var_types
+                                        .get(vname)
+                                        .and_then(|t| self.list_elem_ty(t));
+                                    let mut temps = Vec::new();
+                                    let rhs = self.lower_expr_borrowed(value, &mut temps)?;
+                                    let cur_list = self.load_ident_val(vname)?;
+                                    let is_always_uniq = self.always_unique_vars.contains(vname);
+                                    let uniq_list = if is_always_uniq {
+                                        cur_list
+                                    } else {
+                                        let u = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
+                                            u, cur_list
+                                        ));
+                                        let vslot = self.var_ptrs[vname].clone();
+                                        if self.inout_vars.contains(vname) {
+                                            let ai = self.fresh_tmp();
+                                            let ap = self.fresh_tmp();
+                                            self.code.push_str(&format!(
+                                                "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                                ai, vslot, ap, ai, u, ap
+                                            ));
+                                        } else {
+                                            self.code.push_str(&format!(
+                                                "  store i64 {}, ptr {}\n",
+                                                u, vslot
+                                            ));
+                                        }
+                                        u
+                                    };
+                                    let is_safe = self.proved_safe_indices.contains(&target.span.start);
+                                    let final_v = if *op == AssignOp::Set {
+                                        rhs
+                                    } else {
+                                        let cur = self.emit_flat_scalar4_load(&uniq_list, &idx_v, is_signed, is_safe);
+                                        let sk = elem_ty.as_ref().and_then(|t| scalar_kind_of_ty(t, self.alias_bases));
+                                        let is_flt = elem_ty.as_ref().is_some_and(|t| is_float_type_expr(t, self.alias_bases));
+                                        self.emit_compound_op(&cur, &rhs, *op, is_flt, sk)
+                                    };
+                                    self.emit_flat_scalar4_store(&uniq_list, &idx_v, &final_v, is_safe);
                                     self.flush_temps(&temps);
                                 } else {
                                     let elem_ty = self
@@ -6077,6 +4756,16 @@ impl<'a> LlvmFnGen<'a> {
                 }
                 let v = self.load_ident_val(s)?;
                 if self.is_rc_ident(s) {
+                    if self.owned_rc_vars.contains(s)
+                        && !self.inout_vars.contains(s)
+                        && expr.span.start > 0
+                        && self.cur_last_use_move_spans.contains(&expr.span.start)
+                    {
+                        if let Some(slot) = self.var_ptrs.get(s) {
+                            self.code.push_str(&format!("  store i64 0, ptr {}\n", slot));
+                        }
+                        return Ok(v);
+                    }
                     let inc = self.fresh_tmp();
                     self.code
                         .push_str(&format!("  {} = call i64 @__tn_rc_inc(i64 {})\n", inc, v));
@@ -6161,6 +4850,15 @@ impl<'a> LlvmFnGen<'a> {
                     ));
                     self.flush_temps(&temps);
                     return Ok(obj);
+                }
+                if let Some(is_signed) = self.flat_scalar4_list_info(&target_ty) {
+                    let mut temps = Vec::new();
+                    let t = self.lower_expr_borrowed(target, &mut temps)?;
+                    let i = self.lower_expr_borrowed(index, &mut temps)?;
+                    let is_safe = self.proved_safe_indices.contains(&expr.span.start);
+                    let res = self.emit_flat_scalar4_load(&t, &i, is_signed, is_safe);
+                    self.flush_temps(&temps);
+                    return Ok(res);
                 }
                 let elem_is_rc = self
                     .list_elem_ty(&target_ty)
@@ -6345,6 +5043,12 @@ impl<'a> LlvmFnGen<'a> {
                     ));
                     temps.push(obj.clone());
                     return Ok(obj);
+                }
+                if let Some(is_signed) = self.flat_scalar4_list_info(&target_ty) {
+                    let t = self.lower_expr_borrowed(target, temps)?;
+                    let i = self.lower_expr_borrowed(index, temps)?;
+                    let is_safe = self.proved_safe_indices.contains(&expr.span.start);
+                    return Ok(self.emit_flat_scalar4_load(&t, &i, is_signed, is_safe));
                 }
                 let is_proved_safe = self.proved_safe_indices.contains(&expr.span.start);
                 let is_nonnull = matches!(&target.kind, ExprKind::Ident(n) if self.always_unique_vars.contains(n));
@@ -6970,6 +5674,36 @@ impl<'a> LlvmFnGen<'a> {
                         self.code.push_str(&format!(
                             "  {} = getelementptr inbounds {}, ptr {}, i64 {}\n  store {} {}, ptr {}, align 8, !tbaa !7\n",
                             ep, vec_ty, data, idx, vec_ty, vv, ep
+                        ));
+                        self.flush_temps(&temps);
+                    }
+                    return Ok(obj);
+                }
+                if expected_ty
+                    .and_then(|t| self.flat_scalar4_list_info(t))
+                    .or_else(|| elems.first().and_then(|e| self.scalar4_elem_info(&self.infer_expr_type(e))))
+                    .is_some()
+                {
+                    let obj = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = call i64 @tenon_flat_list_filled(i64 {}, i64 4, ptr null)\n",
+                        obj,
+                        elems.len()
+                    ));
+                    let base = self.fresh_tmp();
+                    let data = self.fresh_tmp();
+                    self.code.push_str(&format!(
+                        "  {} = inttoptr i64 {} to ptr\n  {} = getelementptr inbounds i8, ptr {}, i64 40\n",
+                        base, obj, data, base
+                    ));
+                    for (idx, e) in elems.iter().enumerate() {
+                        let mut temps = Vec::new();
+                        let vv = self.lower_expr_borrowed(e, &mut temps)?;
+                        let v32 = self.fresh_tmp();
+                        let ep = self.fresh_tmp();
+                        self.code.push_str(&format!(
+                            "  {} = trunc i64 {} to i32\n  {} = getelementptr inbounds i32, ptr {}, i64 {}\n  store i32 {}, ptr {}, align 4, !tbaa !7\n",
+                            v32, vv, ep, data, idx, v32, ep
                         ));
                         self.flush_temps(&temps);
                     }
@@ -7982,6 +6716,27 @@ impl<'a> LlvmFnGen<'a> {
                             self.flush_temps(&temps);
                             return Ok(res);
                         }
+                        if self
+                            .flat_scalar4_list_info(&xs_ty)
+                            .or_else(|| expected_ty.and_then(|t| self.flat_scalar4_list_info(t)))
+                            .or_else(|| self.scalar4_elem_info(&self.infer_expr_type(&args[1].value)))
+                            .is_some()
+                        {
+                            let xs = self.lower_expr_owned(&args[0].value, expected_ty)?;
+                            let mut temps = Vec::new();
+                            let vv = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                            let v32 = self.fresh_tmp();
+                            self.slot_id += 1;
+                            let vslot = format!("%fs4push_{}", self.slot_id);
+                            self.entry_allocas.push_str(&format!("  {} = alloca i32, align 4\n", vslot));
+                            let res = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = trunc i64 {} to i32\n  store i32 {}, ptr {}, align 4\n  {} = call i64 @tenon_flat_list_push(i64 {}, i64 4, ptr {})\n",
+                                v32, vv, v32, vslot, res, xs, vslot
+                            ));
+                            self.flush_temps(&temps);
+                            return Ok(res);
+                        }
                         let elem_is_rc = self
                             .list_elem_ty(&xs_ty)
                             .is_some_and(|et| self.type_is_rc(&et))
@@ -8041,6 +6796,26 @@ impl<'a> LlvmFnGen<'a> {
                                 lf_len, lf_lp,
                                 lf_eq, lf_len, lf_exp,
                                 lf_eq
+                            ));
+                            self.flush_temps(&temps);
+                            return Ok(res);
+                        }
+                        if expected_ty
+                            .and_then(|t| self.flat_scalar4_list_info(t))
+                            .or_else(|| self.scalar4_elem_info(&self.infer_expr_type(&args[1].value)))
+                            .is_some()
+                        {
+                            let mut temps = Vec::new();
+                            let count_v = self.lower_expr_borrowed(&args[0].value, &mut temps)?;
+                            let vv = self.lower_expr_borrowed(&args[1].value, &mut temps)?;
+                            let v32 = self.fresh_tmp();
+                            self.slot_id += 1;
+                            let islot = format!("%fs4fill_{}", self.slot_id);
+                            self.entry_allocas.push_str(&format!("  {} = alloca i32, align 4\n", islot));
+                            let res = self.fresh_tmp();
+                            self.code.push_str(&format!(
+                                "  {} = trunc i64 {} to i32\n  store i32 {}, ptr {}, align 4\n  {} = call i64 @tenon_flat_list_filled(i64 {}, i64 4, ptr {})\n",
+                                v32, vv, v32, islot, res, count_v, islot
                             ));
                             self.flush_temps(&temps);
                             return Ok(res);
@@ -8516,1065 +7291,5 @@ fn sanitize(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tenon_syntax::parse;
-
-    #[test]
-    fn llvm_aot_compiles_and_runs_records_mutate_parse_and_stackless_async() {
-        let src = r#"
-pub type Year  = Int where 1 <= self && self <= 9999
-pub type Month = Int where 1 <= self && self <= 12
-
-pub pure fn is_leap_year(y Int) Bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
-}
-
-pub pure fn days_in_month(y Year, m Month) Int {
-    match m {
-        2 => if is_leap_year(y) { 29 } else { 28 }
-        4 | 6 | 9 | 11 => 30
-        _ => 31
-    }
-}
-
-pub record Date {
-    year  Year
-    month Month
-    day   Int where 1 <= self && self <= days_in_month(year, month)
-}
-
-pub fn shift_prev(inout d Date) {
-    mutate d {
-        d.year -= 1
-        if d.month == 2 && d.day == 29 && !is_leap_year(d.year) {
-            d.day = 28
-        }
-    }
-}
-
-pub async fn async_add(v Int) Int {
-    let a = await yield_val(v + 5)
-    let b = await yield_val(a + 7)
-    b
-}
-
-pub fn main() Int {
-    var d Date = Date { year = 2024, month = 2, day = 29 }
-    shift_prev(d)
-    assert d.year == 2023
-    assert d.day == 28
-
-    let ok_day = match Date.parse(2024, 2, 29) {
-        Ok(dt) => dt.day
-        Err(c) => -c
-    }
-    let bad_m = match Date.parse(2024, 13, 1) {
-        Ok(dt) => dt.day
-        Err(c) => -c
-    }
-    assert ok_day == 29
-    assert bad_m == -2
-
-    let ar = block_on(async_add(10))
-    assert ar == 22
-    ok_day + d.day + ar
-}
-"#;
-        let prog = parse(src).unwrap();
-        let bin = std::env::temp_dir().join(format!("tenon_llvm_aot_test_{}", std::process::id()));
-        let art = compile_to_native_binary(&prog, &bin, None, "O3").unwrap();
-        assert!(art.binary_bytes > 1024);
-
-        let run = Command::new(&bin).output().unwrap();
-        let _ = fs::remove_file(&bin);
-        let stdout = String::from_utf8_lossy(&run.stdout);
-        assert!(
-            run.status.success(),
-            "native LLVM binary failed: stdout={} stderr={}",
-            stdout,
-            String::from_utf8_lossy(&run.stderr)
-        );
-        assert!(stdout.contains("main() => 79"), "unexpected stdout: {}", stdout);
-        assert!(stdout.contains("live_objects=0"), "leaked objects: {}", stdout);
-        assert!(stdout.contains("async_suspends=2"), "missing suspensions: {}", stdout);
-    }
-
-    #[test]
-    fn llvm_aot_links_tenon_rt_and_runs_core_syscalls() {
-        let src = r#"
-pub record Msg {
-    tag Text
-    body Text
-}
-
-pub enum BoxVal {
-    BEmpty
-    BMsg(Msg)
-    BList(List[Msg])
-}
-
-pub fn build_msg(t Text, b Text) Msg {
-    Msg { tag = "[" ++ t ++ "]", body = b }
-}
-
-pub fn main() Int {
-    var xs List[Msg] = []
-    xs = push(xs, build_msg("OK", "hello tenon"))
-    let bv = BList(xs)
-    let out = match bv {
-        BList(items) => {
-            let m = items[0]
-            m.tag ++ " " ++ str_slice(m.body, 0, 5)
-        }
-        BMsg(m) => m.tag
-        BEmpty => ""
-    }
-    assert out == "[OK] hello"
-    let _ = sys_write_stdout(out ++ "\n")
-    0
-}
-"#;
-        let prog = parse(src).unwrap();
-        let bin = std::env::temp_dir().join(format!("tenon_llvm_rt_test_{}", std::process::id()));
-        let art = compile_to_native_binary(&prog, &bin, None, "O2").unwrap();
-        assert!(art.binary_bytes > 4096);
-
-        let run = Command::new(&bin).output().unwrap();
-        let _ = fs::remove_file(&bin);
-        let stdout = String::from_utf8_lossy(&run.stdout);
-        assert!(
-            run.status.success(),
-            "native LLVM+tenon_rt binary failed: stdout={} stderr={}",
-            stdout,
-            String::from_utf8_lossy(&run.stderr)
-        );
-        assert_eq!(stdout.trim(), "[OK] hello");
-    }
-
-    #[test]
-    fn llvm_aot_interfaces_static_monomorph_and_dyn_vtable_zero_leaks() {
-        let src = r#"
-pub interface Greeter {
-    pure fn greet(self, who Text) Text
-}
-
-pub interface Accumulator {
-    fn add(inout self, delta Int) Int
-    pure fn current(self) Int
-}
-
-pub record EnGreeter { prefix Text }
-pub record ZhGreeter { prefix Text }
-
-impl Greeter for EnGreeter {
-    pure fn greet(self, who Text) Text { self.prefix ++ " " ++ who }
-}
-
-impl Greeter for ZhGreeter {
-    pure fn greet(self, who Text) Text { self.prefix ++ ", " ++ who }
-}
-
-pub record Counter { val Int }
-
-impl Accumulator for Counter {
-    fn add(inout self, delta Int) Int {
-        self.val += delta
-        self.val
-    }
-    pure fn current(self) Int { self.val }
-}
-
-pub pure fn run_static[T Greeter](g T, name Text) Text {
-    g.greet(name)
-}
-
-pub pure fn run_dyn(g dyn Greeter, name Text) Text {
-    g.greet(name)
-}
-
-pub fn main() Int {
-    let en = EnGreeter { prefix = "Hello" }
-    let zh = ZhGreeter { prefix = "NiHao" }
-    assert run_static(en, "Tenon") == "Hello Tenon"
-    assert run_static(zh, "Tenon") == "NiHao, Tenon"
-
-    var list List[dyn Greeter] = []
-    list = push(list, en)
-    list = push(list, zh)
-    let b = buf_new()
-    let _ = buf_push_str(b, run_dyn(list[0], "World"))
-    let _ = buf_push_byte(b, 124)
-    let _ = buf_push_str(b, list[1].greet("World"))
-    let joined = buf_finish(b)
-    assert joined == "Hello World|NiHao, World"
-
-    var c dyn Accumulator = Counter { val = 10 }
-    let c2 dyn Accumulator = c
-    let v1 = c.add(5)
-    assert v1 == 15
-    assert c.current() == 15
-    assert c2.current() == 10
-    let _ = sys_write_stdout(joined ++ "\n")
-    0
-}
-"#;
-        let prog = parse(src).unwrap();
-        let bin = std::env::temp_dir().join(format!("tenon_llvm_dyn_test_{}", std::process::id()));
-        let art = compile_to_native_binary(&prog, &bin, None, "O3").unwrap();
-        assert!(art.binary_bytes > 4096);
-
-        let run = Command::new(&bin).output().unwrap();
-        let _ = fs::remove_file(&bin);
-        let stdout = String::from_utf8_lossy(&run.stdout);
-        assert!(
-            run.status.success(),
-            "native LLVM dyn/static interface binary failed: stdout={} stderr={}",
-            stdout,
-            String::from_utf8_lossy(&run.stderr)
-        );
-        assert_eq!(stdout.trim(), "Hello World|NiHao, World");
-    }
-
-    #[test]
-    fn llvm_aot_p0_expressiveness_zero_leaks() {
-        let src = r#"
-pub type NonNegative = Int where self >= 0
-
-pub interface Display {
-    pure fn display(self) Text
-}
-pub interface Eq {
-    pure fn eq(self, other Self) Bool
-}
-pub interface Hash {
-    pure fn hash(self) NonNegative
-}
-
-impl Display for Text {
-    pub pure fn display(self) Text { self }
-}
-impl Display for Float {
-    pub pure fn display(self) Text { float_to_text(self) }
-}
-impl Eq for Int {
-    pub pure fn eq(self, other Int) Bool { self == other }
-}
-impl Hash for Int {
-    pub pure fn hash(self) NonNegative { self & 9223372036854775807 }
-}
-impl Eq for Text {
-    pub pure fn eq(self, other Text) Bool { self == other }
-}
-impl Hash for Text {
-    pub pure fn hash(self) NonNegative { len(self) }
-}
-
-@derive(Eq, Hash)
-pub record TagPt {
-    x   Int
-    tag Text
-}
-
-pub enum Tree[T] {
-    Empty
-    Leaf(T)
-    Node(Tree[T], T, Tree[T])
-}
-
-pub pure fn sum_tree(t Tree[Int]) Int {
-    match t {
-        Empty => 0
-        Leaf(v) => v
-        Node(Leaf(a), v, Leaf(b)) => a + v + b
-        Node(l, v, r) => sum_tree(l) + v + sum_tree(r)
-    }
-}
-
-pub pure fn join_tree(t Tree[Text]) Text {
-    match t {
-        Empty => ""
-        Leaf(s) => s
-        Node(l, s, r) => join_tree(l) ++ s ++ join_tree(r)
-    }
-}
-
-pub pure fn make_greeter(prefix Text, bump Int) fn(Text) Text {
-    |who| prefix ++ who ++ if bump > 0 { "!" } else { "." }
-}
-
-pub pure fn try_chain_res(ok_flag Bool) Result[Int, Text] {
-    let alive = "keep_me_rc"
-    let first Result[Int, Text] = if ok_flag { Ok(10) } else { Err("fail:" ++ alive) }
-    let a = first?
-    let second Result[Int, Text] = Ok(a + len(alive))
-    let b = second?
-    Ok(b)
-}
-
-pub pure fn try_chain_opt(present Bool) Option[Int] {
-    let alive = "opt_rc"
-    let o Option[Int] = if present { Some(20) } else { None }
-    let v = o?
-    Some(v + len(alive))
-}
-
-pub fn main() Int {
-    var f = 2.0
-    f += 1.5
-    f *= 2.0
-    f /= 3.5
-    assert f == 2.0
-    assert float_to_int(3.9) == 3
-    assert int_to_float(5) == 5.0
-    assert parse_float("1.25") == 1.25
-    assert !float_is_nan(f)
-
-    let g = make_greeter("hi ", 1)
-    assert g("tenon") == "hi tenon!"
-
-    var acc = 0
-    for i in 0..8 {
-        if i == 2 { continue }
-        if i == 6 { break }
-        acc += i
-    }
-    assert acc == 13
-
-    let r = 1..5
-    var rsum = 0
-    for k in r { rsum += k }
-    assert rsum == 10
-
-    var lsum = 0
-    let ws = ["a", "bb", "ccc"]
-    for w in ws { lsum += len(w) }
-    assert lsum == 6
-
-    var bits = 4
-    bits <<= 2
-    bits >>= 1
-    bits |= 3
-    bits &= 10
-    bits ^= 6
-    bits *= 3
-    bits /= 4
-    assert bits == 9
-
-    assert match try_chain_res(true) { Ok(v) => v Err(_) => -1 } == 20
-    assert match try_chain_res(false) { Ok(_) => "" Err(e) => e } == "fail:keep_me_rc"
-    assert match try_chain_opt(true) { Some(v) => v None => -1 } == 26
-    assert match try_chain_opt(false) { Some(_) => 1 None => 0 } == 0
-
-    let tup = (7, "abc", 1.5)
-    let (tn, ts, tf) = tup
-    assert tn == 7 && ts == "abc" && tf == 1.5 && tup.0 == 7
-    let nested Option[Result[(Int, Text), Text]] = Some(Ok((4, "xy")))
-    let nv = match nested {
-        Some(Ok((n, s))) => n + len(s)
-        Some(Err(_)) => -1
-        None => -2
-    }
-    assert nv == 6
-
-    let it Tree[Int] = Node(Node(Leaf(1), 2, Leaf(3)), 4, Leaf(5))
-    assert sum_tree(it) == 15
-    let tt Tree[Text] = Node(Leaf("te"), "n", Leaf("on"))
-    assert join_tree(tt) == "tenon"
-
-    let fs = f"{ts}={tf}"
-    assert fs == "abc=1.5"
-
-    let p1 = TagPt { x = 1, tag = "k" }
-    let p2 = TagPt { x = 1, tag = "k" }
-    let p3 = TagPt { x = 2, tag = "k" }
-    assert p1 == p2 && p1 != p3
-    42
-}
-"#;
-        let prog = parse(src).unwrap();
-        let bin = std::env::temp_dir().join(format!("tenon_llvm_p0_test_{}", std::process::id()));
-        let art = compile_to_native_binary(&prog, &bin, None, "O3").unwrap();
-        assert!(art.binary_bytes > 4096);
-
-        let run = Command::new(&bin).output().unwrap();
-        let _ = fs::remove_file(&bin);
-        let stdout = String::from_utf8_lossy(&run.stdout);
-        assert!(
-            run.status.success(),
-            "native LLVM P0 expressiveness binary failed: stdout={} stderr={}",
-            stdout,
-            String::from_utf8_lossy(&run.stderr)
-        );
-        assert!(stdout.contains("main() => 42"), "unexpected stdout: {}", stdout);
-        assert!(stdout.contains("live_objects=0"), "leaked objects in LLVM AOT: {}", stdout);
-    }
-
-    #[test]
-    fn llvm_aot_systems_suite_simd_threads_tcp_zero_leaks() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let entry = repo_root.join("examples/systems_test.tn");
-        let prog = load_program_with_imports(&entry).unwrap();
-
-        let pid = std::process::id();
-        let bin = std::env::temp_dir().join(format!("tenon_llvm_systems_suite_{}", pid));
-        let ir_path = std::env::temp_dir().join(format!("tenon_llvm_systems_suite_{}.ll", pid));
-        let opts = BuildOptions {
-            opt_level: "O3".into(),
-            emit_ll_path: Some(ir_path.clone()),
-            ..Default::default()
-        };
-        let art = compile_with_options(&prog, &bin, &opts).unwrap();
-        assert!(art.binary_bytes > 4096);
-
-        let ir = fs::read_to_string(&ir_path).unwrap();
-        let _ = fs::remove_file(&ir_path);
-        assert!(
-            ir.contains("<4 x float>")
-                && ir.contains("@llvm.fma.v4f32")
-                && ir.contains("@llvm.vector.reduce.fadd.v4f32"),
-            "LLVM AOT must emit native SIMD vector IR for Float32x4"
-        );
-        assert!(ir.contains("<4 x double>"), "LLVM AOT must emit native SIMD vector IR for Float64x4");
-        assert!(ir.contains("<16 x i8>"), "LLVM AOT must emit native SIMD vector IR for UInt8x16");
-
-        let run = Command::new(&bin).output().unwrap();
-        let _ = fs::remove_file(&bin);
-        let stdout = String::from_utf8_lossy(&run.stdout);
-        assert!(
-            run.status.success(),
-            "native LLVM systems suite binary failed: stdout={} stderr={}",
-            stdout,
-            String::from_utf8_lossy(&run.stderr)
-        );
-        assert!(stdout.contains("main() => 1110"), "unexpected stdout: {}", stdout);
-        assert!(stdout.contains("live_objects=0"), "leaked objects in LLVM AOT: {}", stdout);
-    }
-
-    #[test]
-    fn llvm_aot_bidirectional_c_ffi_and_header_gen() {
-        let pid = std::process::id();
-        let tmp = std::env::temp_dir();
-
-        // Direction 1: Tenon calls real C code (`--c-src`) passing `@packed` and `@repr(C)` struct pointers!
-        let c_helper = tmp.join(format!("tenon_ffi_helper_{}.c", pid));
-        fs::write(
-            &c_helper,
-            r#"
-#include <stddef.h>
-#include <stdint.h>
-
-typedef struct __attribute__((packed)) PackedHdr {
-    uint8_t ver;
-    uint16_t port;
-    uint32_t seq;
-} PackedHdr;
-
-typedef struct CPoint {
-    uint8_t tag;
-    int32_t x;
-    float y;
-} CPoint;
-
-int64_t c_mutate_and_verify(const PackedHdr* h, CPoint* p) {
-    if (sizeof(PackedHdr) != 7 || offsetof(PackedHdr, seq) != 3) return -1;
-    if (sizeof(CPoint) != 12 || offsetof(CPoint, x) != 4 || offsetof(CPoint, y) != 8) return -2;
-    p->x += (int32_t)h->seq;
-    return (int64_t)h->ver * 10000 + (int64_t)h->port + (int64_t)p->tag;
-}
-"#,
-        )
-        .unwrap();
-
-        let tenon_caller = parse(
-            r#"
-@packed
-pub record PackedHdr {
-    ver  UInt8
-    port UInt16
-    seq  UInt32
-}
-
-@repr(C)
-pub record CPoint {
-    tag UInt8
-    x   Int32
-    y   Float32
-}
-
-extern "C" {
-    fn c_mutate_and_verify(h Ptr[PackedHdr], p MutPtr[CPoint]) Int64
-}
-
-pub fn main() Int {
-    let hdr = PackedHdr { ver = 4, port = 8080, seq = 100 }
-    var pt = CPoint { tag = 7, x = 23, y = 1.5 }
-    let res = unsafe {
-        c_mutate_and_verify(ptr_of(hdr), mut_ptr_of(pt))
-    }
-    assert res == 48087
-    assert pt.x == 123
-    (res as Int) + (pt.x as Int)
-}
-"#,
-        )
-        .unwrap();
-
-        let bin1 = tmp.join(format!("tenon_ffi_caller_{}", pid));
-        let opts1 = BuildOptions {
-            opt_level: "O2".into(),
-            extra_c_sources: vec![c_helper.clone()],
-            ..Default::default()
-        };
-        compile_with_options(&tenon_caller, &bin1, &opts1).unwrap();
-        let run1 = Command::new(&bin1).output().unwrap();
-        let _ = fs::remove_file(&bin1);
-        let _ = fs::remove_file(&c_helper);
-        let out1 = String::from_utf8_lossy(&run1.stdout);
-        assert!(
-            run1.status.success(),
-            "Tenon -> C FFI binary failed: stdout={} stderr={}",
-            out1,
-            String::from_utf8_lossy(&run1.stderr)
-        );
-        assert!(out1.contains("main() => 48210"), "unexpected Tenon->C output: {}", out1);
-        assert!(out1.contains("live_objects=0"), "Tenon->C leaked objects: {}", out1);
-
-        // Direction 2: C calls Tenon static library (`--lib static` + `--emit-header`) via `@export`!
-        let tenon_lib = parse(
-            r#"
-@repr(C)
-pub record CPoint {
-    tag UInt8
-    x   Int32
-    y   Float32
-}
-
-@export("tn_compute_point")
-pub fn compute_point(p Ptr[CPoint], scale Int32) Int32 {
-    unsafe {
-        let pt = ptr_read(p)
-        pt.x * scale + (pt.tag as Int32)
-    }
-}
-"#,
-        )
-        .unwrap();
-
-        let lib_path = tmp.join(format!("libtenon_export_{}.a", pid));
-        let hdr_path = tmp.join(format!("tenon_export_{}.h", pid));
-        let opts2 = BuildOptions {
-            opt_level: "O2".into(),
-            output_kind: OutputKind::StaticLib,
-            emit_header_path: Some(hdr_path.clone()),
-            ..Default::default()
-        };
-        compile_with_options(&tenon_lib, &lib_path, &opts2).unwrap();
-
-        let hdr_text = fs::read_to_string(&hdr_path).unwrap();
-        assert!(
-            hdr_text.contains("typedef struct CPoint")
-                && hdr_text.contains("extern int32_t tn_compute_point(const CPoint* p, int32_t scale);"),
-            "unexpected generated C header:\n{}",
-            hdr_text
-        );
-
-        let c_main = tmp.join(format!("tenon_c_driver_{}.c", pid));
-        let c_bin = tmp.join(format!("tenon_c_driver_{}", pid));
-        fs::write(
-            &c_main,
-            format!(
-                r#"
-#include <stdio.h>
-#include "{}"
-
-int main(void) {{
-    CPoint pt = {{ 5, 14, 2.5f }};
-    int32_t r = tn_compute_point(&pt, 3);
-    printf("c_to_tenon=%d\n", r);
-    return r == 47 ? 0 : 1;
-}}
-"#,
-                hdr_path.display()
-            ),
-        )
-        .unwrap();
-
-        let cc = Command::new("clang")
-            .args([
-                "-O2",
-                c_main.to_str().unwrap(),
-                lib_path.to_str().unwrap(),
-                "-o",
-                c_bin.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            cc.status.success(),
-            "clang linking libtenon_export.a failed: {}",
-            String::from_utf8_lossy(&cc.stderr)
-        );
-        let run2 = Command::new(&c_bin).output().unwrap();
-        let _ = fs::remove_file(&c_main);
-        let _ = fs::remove_file(&c_bin);
-        let _ = fs::remove_file(&lib_path);
-        let _ = fs::remove_file(&hdr_path);
-        let out2 = String::from_utf8_lossy(&run2.stdout);
-        assert!(
-            run2.status.success() && out2.contains("c_to_tenon=47"),
-            "C -> Tenon static library execution failed: status={:?} stdout={} stderr={}",
-            run2.status,
-            out2,
-            String::from_utf8_lossy(&run2.stderr)
-        );
-    }
-
-    #[test]
-    fn llvm_aot_dwarf_debug_info_emits_valid_metadata() {
-        let mut prog = parse(
-            r#"
-pub fn add_pair(a Int, b Int) Int {
-    let s = a + b
-    s * 2
-}
-
-pub fn main() Int {
-    add_pair(10, 11)
-}
-"#,
-        )
-        .unwrap();
-        prog.source_files.push("debug_demo.tn".into());
-
-        let pid = std::process::id();
-        let bin = std::env::temp_dir().join(format!("tenon_llvm_dbg_{}", pid));
-        let ir_path = std::env::temp_dir().join(format!("tenon_llvm_dbg_{}.ll", pid));
-        let opts = BuildOptions {
-            opt_level: "O0".into(),
-            debug_info: true,
-            emit_ll_path: Some(ir_path.clone()),
-            ..Default::default()
-        };
-        compile_with_options(&prog, &bin, &opts).unwrap();
-        let ir = fs::read_to_string(&ir_path).unwrap();
-        let _ = fs::remove_file(&ir_path);
-        assert!(ir.contains("!DICompileUnit"), "missing !DICompileUnit in DWARF IR");
-        assert!(ir.contains("!DIFile"), "missing !DIFile in DWARF IR");
-        assert!(ir.contains("!DISubprogram"), "missing !DISubprogram in DWARF IR");
-        assert!(ir.contains("!DILocation"), "missing !DILocation in DWARF IR");
-
-        let run = Command::new(&bin).output().unwrap();
-        let _ = fs::remove_file(&bin);
-        let stdout = String::from_utf8_lossy(&run.stdout);
-        assert!(
-            run.status.success() && stdout.contains("main() => 42"),
-            "DWARF -g binary failed: stdout={} stderr={}",
-            stdout,
-            String::from_utf8_lossy(&run.stderr)
-        );
-    }
-
-    #[test]
-    fn llvm_aot_web_app_and_modules_demo_zero_leaks() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pid = std::process::id();
-
-        let o3 = BuildOptions {
-            opt_level: "O3".into(),
-            ..Default::default()
-        };
-
-        // 1. Multi-package modules_demo/app (Go/glob/selective imports + comptime + typed macros)
-        let mod_prog = tenon_syntax::load_package(
-            &repo_root.join("examples/modules_demo/app"),
-            tenon_syntax::LoadMode::Production,
-        )
-        .expect("modules_demo/app must load");
-        let mod_bin = std::env::temp_dir().join(format!("tenon_llvm_mod_{}", pid));
-        compile_with_options(&mod_prog, &mod_bin, &o3).expect("modules_demo LLVM AOT build");
-        let run1 = Command::new(&mod_bin).output().unwrap();
-        let _ = fs::remove_file(&mod_bin);
-        let out1 = String::from_utf8_lossy(&run1.stdout);
-        assert!(
-            run1.status.success() && out1.contains("main() => 107"),
-            "modules_demo AOT failed: stdout={} stderr={}",
-            out1,
-            String::from_utf8_lossy(&run1.stderr)
-        );
-
-        // 2. Metaprogramming Web Framework (examples/web_app: kqueue + HTTP/1.1 Keep-Alive + @get/@post + OpenAPI + JSON refinement)
-        let web_prog = tenon_syntax::load_package(
-            &repo_root.join("examples/web_app"),
-            tenon_syntax::LoadMode::Production,
-        )
-        .expect("examples/web_app must load");
-        let web_bin = std::env::temp_dir().join(format!("tenon_llvm_web_{}", pid));
-        compile_with_options(&web_prog, &web_bin, &o3).expect("examples/web_app LLVM AOT build");
-        let run2 = Command::new(&web_bin).output().unwrap();
-        let _ = fs::remove_file(&web_bin);
-        let out2 = String::from_utf8_lossy(&run2.stdout);
-        assert!(
-            run2.status.success()
-                && out2.contains("main() => 200")
-                && out2.contains("live_objects=0"),
-            "web_app AOT failed: stdout={} stderr={}",
-            out2,
-            String::from_utf8_lossy(&run2.stderr)
-        );
-    }
-
-    #[test]
-    fn llvm_aot_advanced_verification_unchecked_indexing_ghost_erasure_and_zero_leaks() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let adv_path = repo_root.join("examples/refinements/advanced_verification.tn");
-        let prog = tenon_syntax::load_program_with_imports(&adv_path)
-            .expect("advanced_verification.tn must load");
-        let rep = tenon_verify::check_program(&prog);
-        assert!(
-            rep.ok,
-            "advanced_verification.tn must pass verification: {:?}",
-            rep.diagnostics
-        );
-        assert!(
-            rep.proved_safe_indices.len() >= 2,
-            "expected >= 2 proved in-bounds indices, got {:?}",
-            rep.proved_safe_indices
-        );
-
-        let pid = std::process::id();
-        let bin = std::env::temp_dir().join(format!("tenon_llvm_adv_ver_{}", pid));
-        let ir_path = std::env::temp_dir().join(format!("tenon_llvm_adv_ver_{}.ll", pid));
-        let opts = BuildOptions {
-            opt_level: "O3".into(),
-            emit_ll_path: Some(ir_path.clone()),
-            proved_safe_indices: rep.proved_safe_indices.clone(),
-            ..Default::default()
-        };
-        compile_with_options(&prog, &bin, &opts).expect("advanced_verification LLVM AOT build");
-        let ir = fs::read_to_string(&ir_path).unwrap();
-        let _ = fs::remove_file(&ir_path);
-        assert!(
-            ir.contains("call i64 @__tn_list_get_unchecked("),
-            "expected @__tn_list_get_unchecked call in LLVM IR"
-        );
-        assert!(
-            ir.contains("call void @__tn_list_set_prim_unchecked("),
-            "expected @__tn_list_set_prim_unchecked call in LLVM IR"
-        );
-        assert!(
-            !ir.contains("nonneg_product"),
-            "ghost lemma `nonneg_product` must be completely erased from LLVM IR"
-        );
-
-        let run = Command::new(&bin).output().unwrap();
-        let _ = fs::remove_file(&bin);
-        let out = String::from_utf8_lossy(&run.stdout);
-        assert!(
-            run.status.success()
-                && out.contains("main() => 102")
-                && out.contains("live_objects=0"),
-            "advanced_verification AOT failed: stdout={} stderr={}",
-            out,
-            String::from_utf8_lossy(&run.stderr)
-        );
-    }
-
-    #[test]
-    fn llvm_aot_checked_overflow_elides_proved_nsw_and_traps_unproved() {
-        let prog = parse(r#"
-pub type Small = Int where self >= 0 && self <= 1000
-
-pub pure fn safe_add(a Small, b Small) Int {
-    a + b
-}
-
-pub pure fn unchecked_add(a Int, b Int) Int {
-    a + b
-}
-
-pub fn main() Int {
-    let s = safe_add(10, 20)
-    let u = unchecked_add(10, 2)
-    s + u
-}
-"#)
-        .unwrap();
-        let rep = tenon_verify::check_program(&prog);
-        assert!(rep.ok, "verify failed: {:?}", rep.diagnostics);
-
-        let pid = std::process::id();
-        let bin = std::env::temp_dir().join(format!("tenon_llvm_ov_{}", pid));
-        let ir_path = std::env::temp_dir().join(format!("tenon_llvm_ov_{}.ll", pid));
-        let mut opts = BuildOptions {
-            opt_level: "O2".into(),
-            emit_ll_path: Some(ir_path.clone()),
-            checked_overflow: true,
-            ..Default::default()
-        };
-        opts.apply_verified_mir(&rep.mir);
-        compile_with_options(&prog, &bin, &opts).expect("checked overflow AOT build");
-        let ir = fs::read_to_string(&ir_path).unwrap();
-        let _ = fs::remove_file(&ir_path);
-        assert!(
-            ir.contains("add nsw i64"),
-            "expected `add nsw i64` for proved overflow-free `safe_add`"
-        );
-        assert!(
-            ir.contains("@llvm.sadd.with.overflow.i64"),
-            "expected `@llvm.sadd.with.overflow.i64` for unproved `unchecked_add`"
-        );
-        let run = Command::new(&bin).output().unwrap();
-        let _ = fs::remove_file(&bin);
-        let out = String::from_utf8_lossy(&run.stdout);
-        assert!(
-            run.status.success() && out.contains("main() => 42"),
-            "checked overflow run failed: stdout={} stderr={}",
-            out,
-            String::from_utf8_lossy(&run.stderr)
-        );
-
-        // Cross-compile object emission test (`x86_64-unknown-linux-gnu`)
-        let obj_path = std::env::temp_dir().join(format!("tenon_xcompile_{}.o", pid));
-        let mut xopts = BuildOptions {
-            opt_level: "O2".into(),
-            target_triple: Some("x86_64-unknown-linux-gnu".into()),
-            ..Default::default()
-        };
-        xopts.apply_verified_mir(&rep.mir);
-        compile_with_options(&prog, &obj_path, &xopts).expect("cross-compile x86_64-linux .o");
-        assert!(fs::metadata(&obj_path).unwrap().len() > 100);
-        let _ = fs::remove_file(&obj_path);
-    }
-
-    #[test]
-    fn llvm_aot_sqlite3_check_constraints_and_openssl_tls_zero_leaks() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pid = std::process::id();
-
-        // 1. Real SQLite3 `:memory:` DB with refinement-derived `CHECK(qty > 0)` constraint!
-        let sql_src = r#"
-import "std/db/sqlite.tn"
-
-pub fn main() Int {
-    let db = match sqlite_open(":memory:") {
-        Ok(d) => d
-        Err(_) => { return -1 }
-    }
-    let ddl = sql_create_table_ddl(
-        "orders",
-        ["id INTEGER PRIMARY KEY", "sym TEXT NOT NULL", "qty INTEGER NOT NULL", "px INTEGER NOT NULL"],
-        ["qty > 0", "px >= 1"]
-    )
-    match db.exec(ddl) {
-        Ok(_) => {}
-        Err(_) => { db.close(); return -2 }
-    }
-    let _ = db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (1, 'BTC', 10, 50000);")
-    let _ = db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (2, 'ETH', 25, 3000);")
-    // Invalid row (`qty = -5`) MUST be rejected by SQLite CHECK constraint!
-    let rejected = match db.exec("INSERT INTO orders(id, sym, qty, px) VALUES (3, 'BAD', -5, 100);") {
-        Ok(_) => 0
-        Err(_) => 1
-    }
-    let sum_qty = match db.query_int("SELECT SUM(qty) FROM orders;") {
-        Ok(v) => v
-        Err(_) => -3
-    }
-    let first_sym = match db.query_text("SELECT sym FROM orders WHERE id = 1;") {
-        Ok(s) => s
-        Err(_) => ""
-    }
-    db.close()
-    if rejected == 1 && first_sym == "BTC" { sum_qty } else { -99 }
-}
-"#;
-        let tmp_tn = repo_root.join(format!("target/tenon_sqlite_test_{}.tn", pid));
-        let _ = fs::create_dir_all(tmp_tn.parent().unwrap());
-        fs::write(&tmp_tn, sql_src).unwrap();
-        let sql_prog = tenon_syntax::load_program_with_imports(&tmp_tn).unwrap();
-        let _ = fs::remove_file(&tmp_tn);
-        let sql_rep = tenon_verify::check_program(&sql_prog);
-        assert!(sql_rep.ok, "sqlite test failed verification: {:?}", sql_rep.diagnostics);
-
-        let sql_bin = std::env::temp_dir().join(format!("tenon_llvm_sqlite_{}", pid));
-        let opts = BuildOptions {
-            opt_level: "O2".into(),
-            ..Default::default()
-        };
-        compile_with_options(&sql_prog, &sql_bin, &opts).expect("SQLite3 LLVM AOT link failed");
-        let run1 = Command::new(&sql_bin).output().unwrap();
-        let _ = fs::remove_file(&sql_bin);
-        let out1 = String::from_utf8_lossy(&run1.stdout);
-        assert!(
-            run1.status.success() && out1.contains("main() => 35") && out1.contains("live_objects=0"),
-            "SQLite3 AOT run failed: stdout={} stderr={}",
-            out1,
-            String::from_utf8_lossy(&run1.stderr)
-        );
-
-        // 2. Real OpenSSL TLS 1.3 loopback HTTPS handshake + GET/200 (`std/net/tls.tn`)
-        if let Ok(pc) = Command::new("pkg-config").args(["--libs-only-L", "openssl"]).output() {
-            if pc.status.success() {
-                let lflags = String::from_utf8_lossy(&pc.stdout);
-                let link_dirs: Vec<String> = lflags
-                    .split_whitespace()
-                    .filter_map(|t| t.strip_prefix("-L").map(|s| s.to_string()))
-                    .collect();
-                let cert_path = std::env::temp_dir().join(format!("tenon_tls_cert_{}.pem", pid));
-                let key_path = std::env::temp_dir().join(format!("tenon_tls_key_{}.pem", pid));
-                let gen_ok = Command::new("openssl")
-                    .args([
-                        "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                        "-keyout", &key_path.to_string_lossy(),
-                        "-out", &cert_path.to_string_lossy(),
-                        "-days", "1", "-subj", "/CN=localhost",
-                    ])
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-
-                let tls_src = if gen_ok {
-                    format!(
-                        r#"
-import "std/net/tls.tn"
-import "std/sync/sync.tn"
-
-pub fn main() Int {{
-    let ver = tls_openssl_version()
-    let sctx = match tls_server_context() {{ Ok(c) => c Err(_) => {{ return -1 }} }}
-    match sctx.load_cert_key("{}", "{}") {{
-        Ok(_) => {{}}
-        Err(_) => {{ sctx.close(); return -2 }}
-    }}
-    let cctx = match tls_client_context() {{ Ok(c) => c Err(_) => {{ sctx.close(); return -3 }} }}
-    let lfd = net_tcp_listen("127.0.0.1:0")
-    if lfd < 0 {{ cctx.close(); sctx.close(); return -4 }}
-    let port = net_tcp_local_port(lfd)
-    let srv = thread_spawn(|| {{
-        let cfd = net_tcp_accept(lfd)
-        if cfd < 0 {{ return -1 }}
-        let served = match sctx.accept_fd(cfd) {{
-            Ok(st) => {{
-                let n = https_serve_stream(st, |req| http_ok("tls:" ++ req.path))
-                st.close()
-                n
-            }}
-            Err(_) => -1
-        }}
-        let _ = net_close(cfd)
-        served
-    }})
-    let ok = match https_get_with_context(cctx, f"127.0.0.1:{{port}}", "localhost", "/secure") {{
-        Ok(res) => if res.status == 200 && res.body == "tls:/secure" && ver > 0 {{ 1 }} else {{ -5 }}
-        Err(_) => -6
-    }}
-    let srv_n = thread_join(srv)
-    let _ = net_close(lfd)
-    cctx.close()
-    sctx.close()
-    if ok == 1 && srv_n == 1 {{ 1 }} else {{ ok }}
-}}
-"#,
-                        cert_path.to_string_lossy().replace('\\', "\\\\"),
-                        key_path.to_string_lossy().replace('\\', "\\\\")
-                    )
-                } else {
-                    r#"
-import "std/net/tls.tn"
-pub fn main() Int {
-    let ver = tls_openssl_version()
-    match tls_client_context() {
-        Ok(ctx) => { ctx.close(); if ver > 0 { 1 } else { 0 } }
-        Err(_) => 0
-    }
-}
-"#.to_string()
-                };
-                let tmp_tls = repo_root.join(format!("target/tenon_tls_test_{}.tn", pid));
-                fs::write(&tmp_tls, tls_src).unwrap();
-                let tls_prog = tenon_syntax::load_program_with_imports(&tmp_tls).unwrap();
-                let _ = fs::remove_file(&tmp_tls);
-                let tls_rep = tenon_verify::check_program(&tls_prog);
-                assert!(tls_rep.ok, "tls test verify failed: {:?}", tls_rep.diagnostics);
-                let tls_bin = std::env::temp_dir().join(format!("tenon_llvm_tls_{}", pid));
-                let tls_opts = BuildOptions {
-                    opt_level: "O2".into(),
-                    link_dirs,
-                    ..Default::default()
-                };
-                compile_with_options(&tls_prog, &tls_bin, &tls_opts).expect("OpenSSL TLS LLVM AOT link failed");
-                let run2 = Command::new(&tls_bin).output().unwrap();
-                let _ = fs::remove_file(&tls_bin);
-                let _ = fs::remove_file(&cert_path);
-                let _ = fs::remove_file(&key_path);
-                let out2 = String::from_utf8_lossy(&run2.stdout);
-                assert!(
-                    run2.status.success() && out2.contains("main() => 1") && out2.contains("live_objects=0"),
-                    "OpenSSL TLS AOT run failed: stdout={} stderr={}",
-                    out2,
-                    String::from_utf8_lossy(&run2.stderr)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn llvm_aot_dogfood_matching_engine_and_tenon_docgen_zero_leaks() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let pid = std::process::id();
-
-        // 1. Dogfood #1: Verified Limit-Order-Book Matching Engine + Const Range[LO,HI] + forall Array + @fip + SQLite3
-        let me_prog = tenon_syntax::load_program_with_imports(
-            &repo_root.join("examples/dogfood/matching_engine.tn"),
-        )
-        .expect("matching_engine.tn must load");
-        let me_rep = tenon_verify::check_program(&me_prog);
-        assert!(me_rep.ok, "matching_engine verify failed: {:?}", me_rep.diagnostics);
-        assert!(me_rep.mir.fip_verified_fns.contains("adjust_order_qty"));
-        assert!(me_rep.mir.proved_safe_indices.len() >= 2);
-        let me_bin = std::env::temp_dir().join(format!("tenon_dogfood_me_{}", pid));
-        let mut opts = BuildOptions {
-            opt_level: "O3".into(),
-            ..Default::default()
-        };
-        opts.apply_verified_mir(&me_rep.mir);
-        compile_with_options(&me_prog, &me_bin, &opts).expect("matching_engine LLVM AOT build");
-        let run1 = Command::new(&me_bin).output().unwrap();
-        let _ = fs::remove_file(&me_bin);
-        let out1 = String::from_utf8_lossy(&run1.stdout);
-        assert!(
-            run1.status.success() && out1.contains("main() => 5730") && out1.contains("live_objects=0"),
-            "matching_engine AOT run failed: stdout={} stderr={}",
-            out1,
-            String::from_utf8_lossy(&run1.stderr)
-        );
-
-        // 2. Dogfood #2: Self-hosting Tenon API Documentation Generator (`tenon_docgen.tn`)
-        let doc_prog = tenon_syntax::load_program_with_imports(
-            &repo_root.join("examples/dogfood/tenon_docgen.tn"),
-        )
-        .expect("tenon_docgen.tn must load");
-        let doc_rep = tenon_verify::check_program(&doc_prog);
-        assert!(doc_rep.ok, "tenon_docgen verify failed: {:?}", doc_rep.diagnostics);
-        let doc_bin = std::env::temp_dir().join(format!("tenon_dogfood_doc_{}", pid));
-        let mut doc_opts = BuildOptions {
-            opt_level: "O3".into(),
-            ..Default::default()
-        };
-        doc_opts.apply_verified_mir(&doc_rep.mir);
-        compile_with_options(&doc_prog, &doc_bin, &doc_opts).expect("tenon_docgen LLVM AOT build");
-        let run2 = Command::new(&doc_bin).output().unwrap();
-        let _ = fs::remove_file(&doc_bin);
-        let out2 = String::from_utf8_lossy(&run2.stdout);
-        assert!(
-            run2.status.success() && out2.contains("main() => 4") && out2.contains("live_objects=0"),
-            "tenon_docgen AOT run failed: stdout={} stderr={}",
-            out2,
-            String::from_utf8_lossy(&run2.stderr)
-        );
-    }
-}
+#[path = "llvm_aot_tests.rs"]
+mod tests;

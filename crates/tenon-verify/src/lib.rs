@@ -1,4 +1,5 @@
 pub mod checker;
+pub(crate) mod checker_builtins;
 pub mod db;
 pub mod evolve;
 pub mod l0;

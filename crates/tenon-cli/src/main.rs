@@ -1422,6 +1422,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     let mut file_arg: Option<String> = None;
     let mut out_bin = "target/tenon_out".to_string();
     let mut opts = tenon_codegen::llvm_aot::BuildOptions::default();
+    let mut emit_mir: Option<PathBuf> = None;
     let mut emit_ts: Option<PathBuf> = None;
     let mut emit_swift: Option<PathBuf> = None;
     let mut emit_kotlin: Option<PathBuf> = None;
@@ -1436,6 +1437,10 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             }
             "--emit-llvm" if i + 1 < args.len() => {
                 opts.emit_ll_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-mir" if i + 1 < args.len() => {
+                emit_mir = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--emit-header" if i + 1 < args.len() => {
@@ -1571,6 +1576,15 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         println!("Emitted Go cgo bindings -> `{}`", p.display());
     }
     opts.apply_verified_mir(&report.mir);
+    let ssa_mir = tenon_mir::lower_program_to_ssa_mir(&prog, &report.mir);
+    opts.apply_ssa_mir(&ssa_mir);
+    if let Some(p) = &emit_mir {
+        if let Some(parent) = p.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(p, tenon_mir::format_mir(&ssa_mir));
+        println!("Emitted Tenon SSA/CFG MIR -> `{}`", p.display());
+    }
     if opts.target_triple.as_deref() == Some("wasm32") {
         if tenon_codegen::wasm_llvm::has_llvm_wasm32_toolchain() {
             return match tenon_codegen::wasm_llvm::compile_program_to_wasm32_llvm(
@@ -2031,6 +2045,8 @@ fn cmd_bench(args: &[String]) -> ExitCode {
     let bin = std::env::temp_dir().join(format!("tenon_bench_{}", std::process::id()));
     let mut opts = tenon_codegen::llvm_aot::BuildOptions::default();
     opts.apply_verified_mir(&report.mir);
+    let ssa_mir = tenon_mir::lower_program_to_ssa_mir(&prog, &report.mir);
+    opts.apply_ssa_mir(&ssa_mir);
     let art = match tenon_codegen::llvm_aot::compile_with_options(&prog, &bin, &opts) {
         Ok(a) => a,
         Err(e) => {

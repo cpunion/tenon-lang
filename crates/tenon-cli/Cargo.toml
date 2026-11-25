@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 tenon-syntax = { workspace = true }
 tenon-verify = { workspace = true }
+tenon-mir = { workspace = true }
 tenon-codegen = { workspace = true }
 tenon-dist = { workspace = true }
 serde_json = { workspace = true }

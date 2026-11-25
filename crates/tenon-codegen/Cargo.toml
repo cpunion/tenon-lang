@@ -8,6 +8,7 @@ license.workspace = true
 tenon-syntax.workspace = true
 tenon-rt.workspace = true
 tenon-verify.workspace = true
+tenon-mir.workspace = true
 cranelift-codegen.workspace = true
 cranelift-frontend.workspace = true
 cranelift-jit.workspace = true

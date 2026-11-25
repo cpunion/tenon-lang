@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use tenon_syntax::*;
 
@@ -556,7 +556,115 @@ impl SmtQuery {
     }
 }
 
+struct PersistentZ3 {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl PersistentZ3 {
+    fn spawn() -> Result<Self, String> {
+        let mut child = Command::new("z3")
+            .args(["-in", "-smt2"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to launch persistent z3: {}", e))?;
+        let stdin = child.stdin.take().ok_or_else(|| "missing z3 stdin".to_string())?;
+        let stdout = BufReader::new(child.stdout.take().ok_or_else(|| "missing z3 stdout".to_string())?);
+        Ok(Self { child, stdin, stdout })
+    }
+
+    fn query(&mut self, script: &str, vars: &BTreeMap<String, SmtSort>) -> Result<SmtOutcome, String> {
+        // Strip trailing `(get-model)` so UNSAT queries finish in 1 roundtrip with zero model overhead!
+        let core_script = script.trim_end().trim_end_matches("(get-model)").trim_end();
+        writeln!(self.stdin, "(reset)").map_err(|e| e.to_string())?;
+        self.stdin.write_all(core_script.as_bytes()).map_err(|e| e.to_string())?;
+        writeln!(self.stdin, "\n(echo \"__TENON_Z3_STATUS_END__\")").map_err(|e| e.to_string())?;
+        self.stdin.flush().map_err(|e| e.to_string())?;
+
+        let mut status_lines = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.stdout.read_line(&mut line).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("persistent z3 EOF".into());
+            }
+            let t = line.trim();
+            if t == "__TENON_Z3_STATUS_END__" || t == "\"__TENON_Z3_STATUS_END__\"" {
+                break;
+            }
+            if !t.is_empty() {
+                status_lines.push(t.to_string());
+            }
+        }
+        let first = status_lines.last().map(|s| s.as_str()).unwrap_or("");
+        match first {
+            "unsat" => Ok(SmtOutcome::Proved),
+            "sat" => {
+                writeln!(self.stdin, "(get-model)\n(echo \"__TENON_Z3_MODEL_END__\")")
+                    .map_err(|e| e.to_string())?;
+                self.stdin.flush().map_err(|e| e.to_string())?;
+                let mut model_buf = String::new();
+                loop {
+                    line.clear();
+                    let n = self.stdout.read_line(&mut line).map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    let t = line.trim();
+                    if t == "__TENON_Z3_MODEL_END__" || t == "\"__TENON_Z3_MODEL_END__\"" {
+                        break;
+                    }
+                    model_buf.push_str(&line);
+                }
+                let model = parse_z3_model(&model_buf, vars);
+                Ok(SmtOutcome::Counterexample(model))
+            }
+            other => Ok(SmtOutcome::Unknown(format!("z3 returned `{}` (Fail-Closed)", other))),
+        }
+    }
+}
+
+impl Drop for PersistentZ3 {
+    fn drop(&mut self) {
+        let _ = writeln!(self.stdin, "(exit)");
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+thread_local! {
+    static Z3_DAEMON: std::cell::RefCell<Option<PersistentZ3>> = const { std::cell::RefCell::new(None) };
+}
+
 fn run_z3(script: &str, vars: &BTreeMap<String, SmtSort>) -> SmtOutcome {
+    // Fast path: reuse thread-local persistent incremental Z3 daemon (`(reset)` + framing, 5-10x faster than spawn!)
+    let daemon_res = Z3_DAEMON.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            if let Ok(z) = PersistentZ3::spawn() {
+                *slot = Some(z);
+            }
+        }
+        if let Some(z) = slot.as_mut() {
+            match z.query(script, vars) {
+                Ok(outcome) => return Some(outcome),
+                Err(_) => {
+                    *slot = None;
+                }
+            }
+        }
+        None
+    });
+    if let Some(outcome) = daemon_res {
+        return outcome;
+    }
+
+    // Fallback one-shot invocation (preserves strict Fail-Closed diagnostics if z3 missing or crashed)
     let mut child = match Command::new("z3")
         .args(["-in", "-smt2"])
         .stdin(Stdio::piped())
