@@ -27,7 +27,7 @@ cargo build --release --bin tenon
 # (D) Tenon 编程体验交互导览（精化类型 + 无边界检查循环 + FiniteFloat + 无生命周期 MVS/mutate + @linear 事务 + 依赖维度 Tensor2D；文件内附 4 处「取消注释即被编译器秒抓 Bug」挑战！）
 ./target/release/tenon check examples/showcase/language_tour.tn && ./target/release/tenon run examples/showcase/language_tour.tn
 
-# 1. 全工作区自动化测试（74 项全量回归；注：macOS 若未在「系统设置 -> 隐私与安全性 -> 开发者工具」放行终端，syspolicyd 会对每个新链接 Mach-O 额外耗时 ~4s，放行后约 3~5 秒全绿）
+# 1. 全工作区自动化测试（74 项全量回归；macOS 默认通过 real clang 原生链接校验 + LLVM 22 `lli` 并行执行，全量约 2~3 秒全绿；设置 `TENON_TEST_NATIVE_EXEC=1` 可切回逐二进制直接执行）
 cargo test --workspace
 
 # 2. 精化类型别名复用 + 高阶形式化验证闭环 + 独立证明导出与审计 + 可执行反例转测试

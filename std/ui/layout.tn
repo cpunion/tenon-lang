@@ -39,14 +39,23 @@ pure fn intrinsic_height(node VNode) NonNegFloat {
     match node {
         VText(_) => 24.0
         VEl(el) => {
-            let k = vnode_prop_or(el, "data-ui", el.tag)
-            if k == "Header" { 56.0 }
-            else if k == "Row" { 82.0 }
-            else if k == "Metric" { 74.0 }
-            else if k == "BarChart" { 104.0 }
-            else if k == "Button" { 38.0 }
-            else if k == "Text" || k == "Badge" { 28.0 }
-            else { 64.0 }
+            let pending = vnode_prop_or(el, "data-pending", "")
+            if len(pending) > 0 {
+                if pending == "hdr" || pending == "header" { 56.0 }
+                else if pending == "kpis" || pending == "row" { 82.0 }
+                else if pending == "chart" { 104.0 }
+                else if pending == "btn" { 38.0 }
+                else { 64.0 }
+            } else {
+                let k = vnode_prop_or(el, "data-ui", el.tag)
+                if k == "Header" { 56.0 }
+                else if k == "Row" { 82.0 }
+                else if k == "Metric" { 74.0 }
+                else if k == "BarChart" { 104.0 }
+                else if k == "Button" { 38.0 }
+                else if k == "Text" || k == "Badge" { 28.0 }
+                else { 64.0 }
+            }
         }
     }
 }
@@ -76,6 +85,19 @@ pure fn layout_vnode_rec(
             })
         }
         VEl(el) => {
+            let pending = vnode_prop_or(el, "data-pending", "")
+            if len(pending) > 0 {
+                out = push(out, LayoutBox {
+                    kind = "Pending",
+                    key = el.key,
+                    rect = LayoutRect { x = x, y = y, w = w, h = h },
+                    label = pending,
+                    value = "",
+                    delta = "",
+                    extra = "",
+                })
+                return
+            }
             let k = vnode_prop_or(el, "data-ui", el.tag)
             if k == "Card" {
                 out = push(out, LayoutBox {

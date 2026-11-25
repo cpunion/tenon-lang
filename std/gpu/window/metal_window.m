@@ -35,13 +35,17 @@ static void push_event(int64_t kind, int64_t a, int64_t b) {
     g_ev_tail = next;
 }
 
+#define TN_MAX_INFLIGHT 3
+
 static NSWindow* g_window = nil;
 static CAMetalLayer* g_layer = nil;
 static id<MTLDevice> g_dev = nil;
 static id<MTLCommandQueue> g_queue = nil;
 static id<MTLRenderPipelineState> g_quad_pso = nil;
 static id<MTLRenderPipelineState> g_blit_pso = nil;
-static id<MTLTexture> g_text_tex = nil;
+static id<MTLTexture> g_text_tex[TN_MAX_INFLIGHT] = { nil, nil, nil };
+static dispatch_semaphore_t g_frame_sem = nil;
+static int g_frame_slot = 0;
 static uint8_t* g_text_pixels = NULL;
 static CGContextRef g_text_ctx = NULL;
 static int g_win_w = 840;
@@ -210,7 +214,13 @@ static void init_text_surface(int w, int h, float scale) {
                                                                               mipmapped:NO];
     td.usage = MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModeShared;
-    g_text_tex = [g_dev newTextureWithDescriptor:td];
+    for (int i = 0; i < TN_MAX_INFLIGHT; i++) {
+        g_text_tex[i] = [g_dev newTextureWithDescriptor:td];
+    }
+    if (g_frame_sem == nil) {
+        g_frame_sem = dispatch_semaphore_create(TN_MAX_INFLIGHT);
+    }
+    g_frame_slot = 0;
 }
 
 int64_t tn_win_open(int64_t title_cstr, int64_t width, int64_t height, int64_t headless) {
@@ -238,6 +248,7 @@ int64_t tn_win_open(int64_t title_cstr, int64_t width, int64_t height, int64_t h
             g_window = [[NSWindow alloc] initWithContentRect:rect styleMask:style backing:NSBackingStoreBuffered defer:NO];
             NSString* t = title_cstr ? [NSString stringWithUTF8String:(const char*)(uintptr_t)title_cstr] : @"Tenon GPUI";
             [g_window setTitle:t];
+            [g_window setBackgroundColor:[NSColor colorWithSRGBRed:11.0/255.0 green:17.0/255.0 blue:32.0/255.0 alpha:1.0]];
             [g_window center];
 
             g_delegate = [[TenonWinDelegate alloc] init];
@@ -249,6 +260,9 @@ int64_t tn_win_open(int64_t title_cstr, int64_t width, int64_t height, int64_t h
             g_layer.device = g_dev;
             g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
             g_layer.framebufferOnly = YES;
+            g_layer.opaque = YES;
+            g_layer.displaySyncEnabled = YES;
+            g_layer.maximumDrawableCount = TN_MAX_INFLIGHT;
             CGFloat backing = [g_window backingScaleFactor];
             g_scale = backing > 0.5 ? (float)backing : 2.0f;
             g_layer.contentsScale = g_scale;
@@ -311,14 +325,15 @@ int64_t tn_win_draw_text(
     }
 }
 
-static void encode_frame_into_tex(id<MTLTexture> target_tex, id<CAMetalDrawable> drawable_opt, const void* quads_ptr, int64_t quad_count, double bg_r, double bg_g, double bg_b) {
+static void encode_frame_into_tex(id<MTLTexture> target_tex, id<CAMetalDrawable> drawable_opt, int tex_slot, const void* quads_ptr, int64_t quad_count, double bg_r, double bg_g, double bg_b) {
     int pw = (int)(g_win_w * g_scale);
     int ph = (int)(g_win_h * g_scale);
-    if (g_text_tex != nil && g_text_pixels != NULL) {
-        [g_text_tex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)pw, (NSUInteger)ph)
-                      mipmapLevel:0
-                        withBytes:g_text_pixels
-                      bytesPerRow:(NSUInteger)(pw * 4)];
+    id<MTLTexture> text_tex = g_text_tex[tex_slot];
+    if (text_tex != nil && g_text_pixels != NULL) {
+        [text_tex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)pw, (NSUInteger)ph)
+                    mipmapLevel:0
+                      withBytes:g_text_pixels
+                    bytesPerRow:(NSUInteger)(pw * 4)];
     }
 
     MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -339,13 +354,18 @@ static void encode_frame_into_tex(id<MTLTexture> target_tex, id<CAMetalDrawable>
         [enc setVertexBytes:vp length:sizeof(vp) atIndex:1];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:(NSUInteger)quad_count];
     }
-    if (g_text_tex != nil) {
+    if (text_tex != nil) {
         [enc setRenderPipelineState:g_blit_pso];
-        [enc setFragmentTexture:g_text_tex atIndex:0];
+        [enc setFragmentTexture:text_tex atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
     }
     [enc endEncoding];
     if (drawable_opt != nil) {
+        dispatch_semaphore_t sem = g_frame_sem;
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            (void)cb;
+            if (sem != nil) dispatch_semaphore_signal(sem);
+        }];
         [cmd presentDrawable:drawable_opt];
         [cmd commit];
     } else {
@@ -357,9 +377,17 @@ static void encode_frame_into_tex(id<MTLTexture> target_tex, id<CAMetalDrawable>
 int64_t tn_win_present(int64_t quads_ptr, int64_t quad_count, int64_t bg_r255, int64_t bg_g255, int64_t bg_b255) {
     if (g_layer == nil) return 0;
     @autoreleasepool {
+        if (g_frame_sem != nil) {
+            dispatch_semaphore_wait(g_frame_sem, DISPATCH_TIME_FOREVER);
+        }
         id<CAMetalDrawable> drawable = [g_layer nextDrawable];
-        if (drawable == nil) return 0;
-        encode_frame_into_tex(drawable.texture, drawable, (const void*)(uintptr_t)quads_ptr, quad_count,
+        if (drawable == nil) {
+            if (g_frame_sem != nil) dispatch_semaphore_signal(g_frame_sem);
+            return 0;
+        }
+        int slot = g_frame_slot;
+        g_frame_slot = (g_frame_slot + 1) % TN_MAX_INFLIGHT;
+        encode_frame_into_tex(drawable.texture, drawable, slot, (const void*)(uintptr_t)quads_ptr, quad_count,
                               (double)bg_r255 / 255.0, (double)bg_g255 / 255.0, (double)bg_b255 / 255.0);
         return 1;
     }
@@ -378,7 +406,7 @@ int64_t tn_win_save_png(int64_t quads_ptr, int64_t quad_count, int64_t bg_r255, 
         td.storageMode = MTLStorageModeShared;
         id<MTLTexture> tex = [g_dev newTextureWithDescriptor:td];
         if (tex == nil) return 0;
-        encode_frame_into_tex(tex, nil, (const void*)(uintptr_t)quads_ptr, quad_count,
+        encode_frame_into_tex(tex, nil, 0, (const void*)(uintptr_t)quads_ptr, quad_count,
                               (double)bg_r255 / 255.0, (double)bg_g255 / 255.0, (double)bg_b255 / 255.0);
         uint8_t* px = (uint8_t*)malloc((size_t)(pw * ph * 4));
         if (!px) return 0;

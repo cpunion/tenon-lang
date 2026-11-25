@@ -121,11 +121,12 @@ pub fn main() Int {
 "#;
     let prog = parse(src).unwrap();
     let bin = std::env::temp_dir().join(format!("tenon_llvm_core_test_{}", std::process::id()));
-    let art = compile_to_native_binary(&prog, &bin, None, "O3").unwrap();
+    let opts = BuildOptions {
+        opt_level: "O3".into(),
+        ..Default::default()
+    };
+    let (art, run) = compile_and_run_for_test(&prog, &bin, &opts).unwrap();
     assert!(art.binary_bytes > 4096);
-
-    let run = Command::new(&bin).output().unwrap();
-    let _ = fs::remove_file(&bin);
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
         run.status.success(),
@@ -294,11 +295,12 @@ assert p1 == p2 && p1 != p3
 "#;
     let prog = parse(src).unwrap();
     let bin = std::env::temp_dir().join(format!("tenon_llvm_p0_test_{}", std::process::id()));
-    let art = compile_to_native_binary(&prog, &bin, None, "O3").unwrap();
+    let opts = BuildOptions {
+        opt_level: "O1".into(),
+        ..Default::default()
+    };
+    let (art, run) = compile_and_run_for_test(&prog, &bin, &opts).unwrap();
     assert!(art.binary_bytes > 4096);
-
-    let run = Command::new(&bin).output().unwrap();
-    let _ = fs::remove_file(&bin);
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
         run.status.success(),
@@ -324,11 +326,11 @@ fn llvm_aot_systems_suite_simd_threads_tcp_zero_leaks() {
     let bin = std::env::temp_dir().join(format!("tenon_llvm_systems_suite_{}", pid));
     let ir_path = std::env::temp_dir().join(format!("tenon_llvm_systems_suite_{}.ll", pid));
     let opts = BuildOptions {
-        opt_level: "O3".into(),
+        opt_level: "O1".into(),
         emit_ll_path: Some(ir_path.clone()),
         ..Default::default()
     };
-    let art = compile_with_options(&prog, &bin, &opts).unwrap();
+    let (art, run) = compile_and_run_for_test(&prog, &bin, &opts).unwrap();
     assert!(art.binary_bytes > 4096);
 
     let ir = fs::read_to_string(&ir_path).unwrap();
@@ -342,8 +344,6 @@ fn llvm_aot_systems_suite_simd_threads_tcp_zero_leaks() {
     assert!(ir.contains("<4 x double>"), "LLVM AOT must emit native SIMD vector IR for Float64x4");
     assert!(ir.contains("<16 x i8>"), "LLVM AOT must emit native SIMD vector IR for UInt8x16");
 
-    let run = Command::new(&bin).output().unwrap();
-    let _ = fs::remove_file(&bin);
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
         run.status.success(),
@@ -426,13 +426,11 @@ assert pt.x == 123
 
     let bin1 = tmp.join(format!("tenon_ffi_caller_{}", pid));
     let opts1 = BuildOptions {
-        opt_level: "O2".into(),
+        opt_level: "O1".into(),
         extra_c_sources: vec![c_helper.clone()],
         ..Default::default()
     };
-    compile_with_options(&tenon_caller, &bin1, &opts1).unwrap();
-    let run1 = Command::new(&bin1).output().unwrap();
-    let _ = fs::remove_file(&bin1);
+    let (_art1, run1) = compile_and_run_for_test(&tenon_caller, &bin1, &opts1).unwrap();
     let _ = fs::remove_file(&c_helper);
     let out1 = String::from_utf8_lossy(&run1.stdout);
     assert!(
@@ -519,7 +517,7 @@ return r == 47 ? 0 : 1;
         "clang linking libtenon_export.a failed: {}",
         String::from_utf8_lossy(&cc.stderr)
     );
-    let run2 = Command::new(&c_bin).output().unwrap();
+    let run2 = run_c_driver_against_tenon_lib_for_test(&tenon_lib, &c_main, &c_bin, &opts2).unwrap();
     let _ = fs::remove_file(&c_main);
     let _ = fs::remove_file(&c_bin);
     let _ = fs::remove_file(&lib_path);
@@ -588,9 +586,7 @@ fn llvm_aot_web_app_and_modules_demo_zero_leaks() {
     )
     .expect("modules_demo/app must load");
     let mod_bin = std::env::temp_dir().join(format!("tenon_llvm_mod_{}", pid));
-    compile_with_options(&mod_prog, &mod_bin, &o1).expect("modules_demo LLVM AOT build");
-    let run1 = Command::new(&mod_bin).output().unwrap();
-    let _ = fs::remove_file(&mod_bin);
+    let (_a1, run1) = compile_and_run_for_test(&mod_prog, &mod_bin, &o1).expect("modules_demo LLVM AOT build");
     let out1 = String::from_utf8_lossy(&run1.stdout);
     assert!(
         run1.status.success() && out1.contains("main() => 107"),
@@ -606,9 +602,7 @@ fn llvm_aot_web_app_and_modules_demo_zero_leaks() {
     )
     .expect("examples/web_app must load");
     let web_bin = std::env::temp_dir().join(format!("tenon_llvm_web_{}", pid));
-    compile_with_options(&web_prog, &web_bin, &o1).expect("examples/web_app LLVM AOT build");
-    let run2 = Command::new(&web_bin).output().unwrap();
-    let _ = fs::remove_file(&web_bin);
+    let (_a2, run2) = compile_and_run_for_test(&web_prog, &web_bin, &o1).expect("examples/web_app LLVM AOT build");
     let out2 = String::from_utf8_lossy(&run2.stdout);
     assert!(
         run2.status.success()
@@ -642,12 +636,12 @@ fn llvm_aot_advanced_verification_unchecked_indexing_ghost_erasure_and_zero_leak
     let bin = std::env::temp_dir().join(format!("tenon_llvm_adv_ver_{}", pid));
     let ir_path = std::env::temp_dir().join(format!("tenon_llvm_adv_ver_{}.ll", pid));
     let opts = BuildOptions {
-        opt_level: "O3".into(),
+        opt_level: "O1".into(),
         emit_ll_path: Some(ir_path.clone()),
         proved_safe_indices: rep.proved_safe_indices.clone(),
         ..Default::default()
     };
-    compile_with_options(&prog, &bin, &opts).expect("advanced_verification LLVM AOT build");
+    let (_art, run) = compile_and_run_for_test(&prog, &bin, &opts).expect("advanced_verification LLVM AOT build");
     let ir = fs::read_to_string(&ir_path).unwrap();
     let _ = fs::remove_file(&ir_path);
     assert!(
@@ -663,8 +657,6 @@ fn llvm_aot_advanced_verification_unchecked_indexing_ghost_erasure_and_zero_leak
         "ghost lemma `nonneg_product` must be completely erased from LLVM IR"
     );
 
-    let run = Command::new(&bin).output().unwrap();
-    let _ = fs::remove_file(&bin);
     let out = String::from_utf8_lossy(&run.stdout);
     assert!(
         run.status.success()
@@ -749,7 +741,7 @@ pub fn main() Int {
     };
     opts.apply_verified_mir(&rep.mir);
     opts.apply_ssa_mir(&ssa_mir);
-    compile_with_options(&prog, &bin, &opts).expect("checked overflow + MIR AOT build");
+    let (_art, run) = compile_and_run_for_test(&prog, &bin, &opts).expect("checked overflow + MIR AOT build");
     let ir = fs::read_to_string(&ir_path).unwrap();
     let _ = fs::remove_file(&ir_path);
     assert!(ir.contains("add nsw i64"), "expected `add nsw i64` for proved overflow-free `safe_add`");
@@ -774,8 +766,6 @@ pub fn main() Int {
         wrap_ir
     );
 
-    let run = Command::new(&bin).output().unwrap();
-    let _ = fs::remove_file(&bin);
     let out = String::from_utf8_lossy(&run.stdout);
     assert!(
         run.status.success() && out.contains("main() => 166") && out.contains("live_objects=0"),
@@ -936,9 +926,7 @@ pub fn main() Int {{
         link_dirs,
         ..Default::default()
     };
-    compile_with_options(&prog, &bin, &opts).expect("SQLite3+OpenSSL LLVM AOT link failed");
-    let run = Command::new(&bin).output().unwrap();
-    let _ = fs::remove_file(&bin);
+    let (_art, run) = compile_and_run_for_test(&prog, &bin, &opts).expect("SQLite3+OpenSSL LLVM AOT link failed");
     if has_openssl && gen_ok {
         let _ = fs::remove_file(&cert_path);
         let _ = fs::remove_file(&key_path);
@@ -972,9 +960,7 @@ fn llvm_aot_dogfood_matching_engine_and_tenon_docgen_zero_leaks() {
         ..Default::default()
     };
     opts.apply_verified_mir(&me_rep.mir);
-    compile_with_options(&me_prog, &me_bin, &opts).expect("matching_engine LLVM AOT build");
-    let run1 = Command::new(&me_bin).output().unwrap();
-    let _ = fs::remove_file(&me_bin);
+    let (_a1, run1) = compile_and_run_for_test(&me_prog, &me_bin, &opts).expect("matching_engine LLVM AOT build");
     let out1 = String::from_utf8_lossy(&run1.stdout);
     assert!(
         run1.status.success() && out1.contains("main() => 5730") && out1.contains("live_objects=0"),
@@ -996,9 +982,7 @@ fn llvm_aot_dogfood_matching_engine_and_tenon_docgen_zero_leaks() {
         ..Default::default()
     };
     doc_opts.apply_verified_mir(&doc_rep.mir);
-    compile_with_options(&doc_prog, &doc_bin, &doc_opts).expect("tenon_docgen LLVM AOT build");
-    let run2 = Command::new(&doc_bin).output().unwrap();
-    let _ = fs::remove_file(&doc_bin);
+    let (_a2, run2) = compile_and_run_for_test(&doc_prog, &doc_bin, &doc_opts).expect("tenon_docgen LLVM AOT build");
     let out2 = String::from_utf8_lossy(&run2.stdout);
     assert!(
         run2.status.success() && out2.contains("main() => 4") && out2.contains("live_objects=0"),

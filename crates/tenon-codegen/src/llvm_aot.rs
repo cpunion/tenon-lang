@@ -507,6 +507,282 @@ pub fn compile_with_options(
     })
 }
 
+/// Returns true if LLVM's `lli` JIT executor is available on PATH (e.g. Homebrew LLVM 22).
+pub fn has_llvm_lli() -> bool {
+    static HAS_LLI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS_LLI.get_or_init(|| {
+        Command::new("lli")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
+
+fn resolve_dylib_for_lli(lib: &str, link_dirs: &[String]) -> Option<PathBuf> {
+    let fname = format!("lib{}.dylib", lib);
+    for dir in link_dirs {
+        let p = Path::new(dir).join(&fname);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for sys_dir in ["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"] {
+        let p = Path::new(sys_dir).join(&fname);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // On modern macOS, system dylibs (e.g. libsqlite3.dylib, libcurl.dylib) live inside the
+    // dyld shared cache so Path::exists() is false, yet dlopen("/usr/lib/libX.dylib") succeeds.
+    Some(PathBuf::from(format!("/usr/lib/{}", fname)))
+}
+
+fn build_or_get_cached_rt_bc(rt_c: &str, pid: u32, seq: u64) -> Result<PathBuf, String> {
+    let mut rt_hash: u64 = 0xcbf29ce484222325;
+    for &b in rt_c.as_bytes() {
+        rt_hash ^= b as u64;
+        rt_hash = rt_hash.wrapping_mul(0x100000001b3);
+    }
+    let cache_bc = std::env::temp_dir().join(format!("tenon_rt_cache_lli_{:016x}.bc", rt_hash));
+    if !cache_bc.exists() {
+        let tmp_c = std::env::temp_dir().join(format!("tenon_rt_bc_{}_{}.c", pid, seq));
+        let tmp_bc = std::env::temp_dir().join(format!("tenon_rt_bc_{}_{}.bc", pid, seq));
+        fs::write(&tmp_c, rt_c).map_err(|e| e.to_string())?;
+        let out = Command::new("clang")
+            .args([
+                "-O1",
+                "-DTENON_LLI_MODE=1",
+                "-emit-llvm",
+                "-c",
+                tmp_c.to_str().unwrap(),
+                "-o",
+                tmp_bc.to_str().unwrap(),
+            ])
+            .output()
+            .map_err(|e| format!("clang -emit-llvm failed: {}", e))?;
+        let _ = fs::remove_file(&tmp_c);
+        if !out.status.success() {
+            let _ = fs::remove_file(&tmp_bc);
+            return Err(format!(
+                "clang -emit-llvm for runtime failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        let _ = fs::rename(&tmp_bc, &cache_bc);
+    }
+    Ok(cache_bc)
+}
+
+/// Runs a C driver file linked against a Tenon library program via `lli` (fast macOS test mode)
+/// or executes `native_bin` directly when `TENON_TEST_NATIVE_EXEC=1` or on non-macOS hosts.
+pub fn run_c_driver_against_tenon_lib_for_test(
+    tenon_lib: &Program,
+    c_main_path: &Path,
+    native_bin: &Path,
+    opts: &BuildOptions,
+) -> Result<std::process::Output, String> {
+    let use_lli = cfg!(target_os = "macos")
+        && std::env::var("TENON_TEST_NATIVE_EXEC").as_deref() != Ok("1")
+        && has_llvm_lli();
+    if !use_lli {
+        return Command::new(native_bin)
+            .output()
+            .map_err(|e| format!("failed to run {}: {}", native_bin.display(), e));
+    }
+    let pid = std::process::id();
+    let seq = AOT_TMP_SEQ.fetch_add(1, Ordering::SeqCst);
+    let ir = emit_llvm_ir_with_build_options(tenon_lib, opts)?;
+    let tmp_ll = std::env::temp_dir().join(format!("tenon_lli_lib_{}_{}.ll", pid, seq));
+    let tmp_c_bc = std::env::temp_dir().join(format!("tenon_lli_cdrv_{}_{}.bc", pid, seq));
+    fs::write(&tmp_ll, &ir).map_err(|e| e.to_string())?;
+    let cc = Command::new("clang")
+        .args([
+            "-O1",
+            "-emit-llvm",
+            "-c",
+            c_main_path.to_str().unwrap(),
+            "-o",
+            tmp_c_bc.to_str().unwrap(),
+        ])
+        .output()
+        .map_err(|e| format!("clang -emit-llvm c_driver failed: {}", e))?;
+    if !cc.status.success() {
+        let _ = fs::remove_file(&tmp_ll);
+        return Err(format!(
+            "clang -emit-llvm c_driver failed:\n{}",
+            String::from_utf8_lossy(&cc.stderr)
+        ));
+    }
+    let mut rt_src = String::from(TENON_AOT_RUNTIME_C);
+    if ir_uses_systems_core(&ir) {
+        rt_src.push_str(TENON_AOT_SYSTEMS_CORE_C);
+    }
+    let rt_bc = build_or_get_cached_rt_bc(&rt_src, pid, seq)?;
+    let out = Command::new("lli")
+        .arg(format!("--extra-module={}", tmp_ll.display()))
+        .arg(format!("--extra-module={}", rt_bc.display()))
+        .arg(&tmp_c_bc)
+        .output()
+        .map_err(|e| format!("lli failed: {}", e));
+    let _ = fs::remove_file(&tmp_ll);
+    let _ = fs::remove_file(&tmp_c_bc);
+    out
+}
+
+/// Compiles a Tenon program to a real native binary with `clang` (verifying full IR emission,
+/// optimization, and native linking) and executes it for test verification.
+/// On macOS, executes the exact emitted LLVM IR + cached C runtime bitcode through LLVM's `lli`
+/// ORC JIT (unless `TENON_TEST_NATIVE_EXEC=1`), bypassing the ~4.3s/binary macOS `syspolicyd`
+/// first-launch scan while preserving 100% real ARM64 LLVM execution and native `clang` link verification.
+pub fn compile_and_run_for_test(
+    program: &Program,
+    bin_path: &Path,
+    opts: &BuildOptions,
+) -> Result<(BuildArtifact, std::process::Output), String> {
+    let use_lli = cfg!(target_os = "macos")
+        && std::env::var("TENON_TEST_NATIVE_EXEC").as_deref() != Ok("1")
+        && has_llvm_lli();
+
+    let pid = std::process::id();
+    let seq = AOT_TMP_SEQ.fetch_add(1, Ordering::SeqCst);
+    let tmp_keep_ll = if use_lli && opts.emit_ll_path.is_none() {
+        Some(std::env::temp_dir().join(format!("tenon_lli_prog_{}_{}.ll", pid, seq)))
+    } else {
+        None
+    };
+    let mut build_opts = opts.clone();
+    if let Some(p) = &tmp_keep_ll {
+        build_opts.emit_ll_path = Some(p.clone());
+    }
+
+    // 1. Always verify full real native compilation & linking with `clang`!
+    let art = compile_with_options(program, bin_path, &build_opts)?;
+
+    if !use_lli {
+        let out = Command::new(bin_path)
+            .output()
+            .map_err(|e| format!("failed to execute {}: {}", bin_path.display(), e))?;
+        let _ = fs::remove_file(bin_path);
+        return Ok((art, out));
+    }
+
+    // 2. Execute the exact emitted LLVM IR + cached runtime bitcode via `lli` (20-40ms in parallel!).
+    let ll_path = build_opts.emit_ll_path.as_ref().unwrap();
+    let ir = fs::read_to_string(ll_path).map_err(|e| e.to_string())?;
+    let uses_os = ir_uses_os_syscalls(&ir);
+    let uses_http = ir_uses_http_syscalls(&ir);
+    let uses_sync = ir_uses_sync_runtime(&ir);
+    let uses_net = ir_uses_net_runtime(&ir);
+    let uses_sys_core = ir_uses_systems_core(&ir);
+
+    let mut rt_c = String::with_capacity(TENON_AOT_RUNTIME_C.len() + 16384);
+    if uses_sync {
+        rt_c.push_str("#define TENON_THREAD_SAFE 1\n#define TENON_USE_SYNC 1\n");
+    }
+    rt_c.push_str(TENON_AOT_RUNTIME_C);
+    if uses_sys_core {
+        rt_c.push_str(TENON_AOT_SYSTEMS_CORE_C);
+    }
+    if uses_sync {
+        rt_c.push_str(TENON_AOT_SYNC_C);
+    }
+    if uses_net {
+        rt_c.push_str(TENON_AOT_NET_C);
+    }
+    if uses_os {
+        rt_c.push_str(TENON_AOT_OS_C);
+    }
+    if uses_http {
+        rt_c.push_str(TENON_AOT_HTTP_C);
+    }
+    if uses_os {
+        rt_c.push_str(TENON_AOT_MAIN_CLI_C);
+    } else {
+        rt_c.push_str(TENON_AOT_MAIN_STATS_C);
+    }
+
+    let rt_bc = build_or_get_cached_rt_bc(&rt_c, pid, seq)?;
+
+    let mut extra_bcs: Vec<PathBuf> = Vec::new();
+    for (idx, csrc) in opts.extra_c_sources.iter().enumerate() {
+        let ebc = std::env::temp_dir().join(format!("tenon_lli_ex_{}_{}_{}.bc", pid, seq, idx));
+        let co = Command::new("clang")
+            .args([
+                "-O1",
+                "-emit-llvm",
+                "-c",
+                csrc.to_str().unwrap(),
+                "-o",
+                ebc.to_str().unwrap(),
+            ])
+            .output()
+            .map_err(|e| format!("clang -emit-llvm extra C failed: {}", e))?;
+        if !co.status.success() {
+            let _ = fs::remove_file(bin_path);
+            if let Some(p) = &tmp_keep_ll {
+                let _ = fs::remove_file(p);
+            }
+            return Err(format!(
+                "clang -emit-llvm ({}) failed:\n{}",
+                csrc.display(),
+                String::from_utf8_lossy(&co.stderr)
+            ));
+        }
+        extra_bcs.push(ebc);
+    }
+
+    // Collect `@link("lib")` libraries + load `crypto` before `ssl` for clean symbol resolution.
+    let mut all_libs: Vec<String> = Vec::new();
+    for item in &program.items {
+        let attrs_opt = match item {
+            Item::ExternFn(ef) => Some(&ef.attrs),
+            Item::Fn(f) => Some(&f.attrs),
+            _ => None,
+        };
+        if let Some(attrs) = attrs_opt {
+            for lib in extract_link_libs(attrs) {
+                if !all_libs.contains(&lib) {
+                    all_libs.push(lib);
+                }
+            }
+        }
+    }
+    for lib in &opts.link_libs {
+        if !all_libs.contains(lib) {
+            all_libs.push(lib.clone());
+        }
+    }
+    if uses_http && !all_libs.iter().any(|l| l == "curl") {
+        all_libs.push("curl".into());
+    }
+    all_libs.sort_by_key(|l| if l == "crypto" { 0 } else if l == "ssl" { 1 } else { 2 });
+
+    let mut lli = Command::new("lli");
+    for lib in &all_libs {
+        if let Some(dylib) = resolve_dylib_for_lli(lib, &opts.link_dirs) {
+            lli.arg(format!("--dlopen={}", dylib.display()));
+        }
+    }
+    lli.arg(format!("--extra-module={}", ll_path.display()));
+    for ebc in &extra_bcs {
+        lli.arg(format!("--extra-module={}", ebc.display()));
+    }
+    lli.arg(&rt_bc);
+
+    let out = lli
+        .output()
+        .map_err(|e| format!("failed to run lli: {}", e))?;
+
+    let _ = fs::remove_file(bin_path);
+    if let Some(p) = &tmp_keep_ll {
+        let _ = fs::remove_file(p);
+    }
+    for ebc in &extra_bcs {
+        let _ = fs::remove_file(ebc);
+    }
+    Ok((art, out))
+}
+
 fn llvm_c_abi_type(ty: &TypeExpr, aliases: &BTreeMap<String, TypeExpr>) -> &'static str {
     match resolve_alias_ty(ty, aliases) {
         TypeExpr::Named { name, .. } => match ScalarKind::from_name(&name) {

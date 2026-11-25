@@ -491,7 +491,7 @@ typedef struct {
     uint8_t inline_buf[128];
 } TenonBuf;
 
-#ifdef TENON_THREAD_SAFE
+#if defined(TENON_THREAD_SAFE) && !defined(TENON_LLI_MODE)
 static _Thread_local TenonBuf* g_buf_cache = NULL;
 #else
 static TenonBuf* g_buf_cache = NULL;
@@ -499,12 +499,17 @@ static TenonBuf* g_buf_cache = NULL;
 
 int64_t tenon_buf_new(void) {
     TenonBuf* b;
+#if defined(TENON_THREAD_SAFE) && defined(TENON_LLI_MODE)
+    b = __atomic_exchange_n(&g_buf_cache, NULL, __ATOMIC_ACQ_REL);
+    if (!b) b = (TenonBuf*)malloc(sizeof(TenonBuf));
+#else
     if (g_buf_cache) {
         b = g_buf_cache;
         g_buf_cache = NULL;
     } else {
         b = (TenonBuf*)malloc(sizeof(TenonBuf));
     }
+#endif
     b->data = b->inline_buf;
     b->cap = sizeof(b->inline_buf);
     b->len = 0;
@@ -551,11 +556,16 @@ int64_t tenon_buf_finish(int64_t h) {
     TenonBuf* b = (TenonBuf*)(uintptr_t)h;
     int64_t res = tenon_text_new((int64_t)(uintptr_t)b->data, (int64_t)b->len);
     if (b->data != b->inline_buf) free(b->data);
+#if defined(TENON_THREAD_SAFE) && defined(TENON_LLI_MODE)
+    TenonBuf* prev = __atomic_exchange_n(&g_buf_cache, b, __ATOMIC_ACQ_REL);
+    if (prev) free(prev);
+#else
     if (!g_buf_cache) {
         g_buf_cache = b;
     } else {
         free(b);
     }
+#endif
     return res;
 }
 

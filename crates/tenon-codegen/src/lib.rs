@@ -6007,7 +6007,7 @@ pub fn main() Int {
         let mut opts = llvm_aot::BuildOptions::default();
         opts.apply_verified_mir(&rep.mir);
         opts.emit_ll_path = Some(ll_path.clone());
-        llvm_aot::compile_with_options(&prog, &bin_path, &opts).unwrap();
+        let (_art, out) = llvm_aot::compile_and_run_for_test(&prog, &bin_path, &opts).unwrap();
 
         let ir = std::fs::read_to_string(&ll_path).unwrap();
         assert!(ir.contains("@tenon_arena_enter"), "expected @arena enter in LLVM IR");
@@ -6015,7 +6015,6 @@ pub fn main() Int {
         assert!(ir.contains("%stkrec_"), "expected stack-promoted record alloca in LLVM IR");
         assert!(ir.contains("@tenon_flat_list_filled"), "expected flat unboxed SIMD list in LLVM IR");
 
-        let out = std::process::Command::new(&bin_path).output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         // compute_in_arena(10) = 10*2 + (0..9)=45 = 65
         // simd_flat_dot() = (1*2+2*3+3*4+4*5)=40 + 7*(4*2)=56 = 96
@@ -6031,7 +6030,6 @@ pub fn main() Int {
             assert!(stdout.contains("live_objects=0"), "leaked objects: {}", stdout);
         }
         let _ = std::fs::remove_file(&ll_path);
-        let _ = std::fs::remove_file(&bin_path);
     }
 
     #[test]
@@ -6126,9 +6124,7 @@ pub fn fuzz_case_{idx}() Int {{
         let mut opts = llvm_aot::BuildOptions::default();
         opts.opt_level = "O0".into();
         opts.apply_verified_mir(&rep.mir);
-        llvm_aot::compile_with_options(&prog, &bin, &opts).unwrap();
-        let aot_out = std::process::Command::new(&bin).output().unwrap();
-        let _ = std::fs::remove_file(&bin);
+        let (_art, aot_out) = llvm_aot::compile_and_run_for_test(&prog, &bin, &opts).unwrap();
         let aot_stdout = String::from_utf8_lossy(&aot_out.stdout);
         assert!(
             aot_out.status.success()

@@ -699,7 +699,11 @@ pub(crate) const TENON_AOT_NET_C: &str = r#"
 #include <sys/epoll.h>
 #endif
 
+#ifdef TENON_LLI_MODE
+static _Atomic int tenon_last_eagain = 0;
+#else
 static _Thread_local int tenon_last_eagain = 0;
+#endif
 
 int64_t tenon_time_now_ns(void) {
     struct timespec ts;
