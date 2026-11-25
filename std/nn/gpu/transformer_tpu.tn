@@ -33,8 +33,8 @@ pub fn shlo_w8a16_matmul(m Int, k Int, n Int) Text {
     let ks = int_to_text(k)
     let ns = int_to_text(n)
     "module @tenon_tpu_w8a16 {\n"
-    ++ "  func.func public @main(%x: tensor<" ++ ms ++ "x" ++ ks ++ "xbf16>, %wq: tensor<" ++ ks ++ "x" ++ ns ++ "xs8>, %sc: tensor<" ++ ns ++ "xbf16>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xbf16> {\n"
-    ++ "    %wf = stablehlo.convert %wq : (tensor<" ++ ks ++ "x" ++ ns ++ "xs8>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>\n"
+    ++ "  func.func public @main(%x: tensor<" ++ ms ++ "x" ++ ks ++ "xbf16>, %wq: tensor<" ++ ks ++ "x" ++ ns ++ "xi8>, %sc: tensor<" ++ ns ++ "xbf16>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xbf16> {\n"
+    ++ "    %wf = stablehlo.convert %wq : (tensor<" ++ ks ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>\n"
     ++ "    %acc = stablehlo.dot_general %x, %wf, contracting_dims = [1] x [0] : (tensor<" ++ ms ++ "x" ++ ks ++ "xbf16>, tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xf32>\n"
     ++ "    %scf = stablehlo.convert %sc : (tensor<" ++ ns ++ "xbf16>) -> tensor<" ++ ns ++ "xf32>\n"
     ++ "    %scb = stablehlo.broadcast_in_dim %scf, dims = [1] : (tensor<" ++ ns ++ "xf32>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xf32>\n"

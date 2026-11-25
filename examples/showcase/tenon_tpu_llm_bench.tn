@@ -44,6 +44,7 @@ fn synth_f32(n Int, seed Int, scale Float) List[Float32] {
 fn bench_tpu_mxu_bf16(m Int, k Int, n Int, iters Int) Int {
     let mlir = shlo_bf16_matmul(m, k, n)
     var exec = TpuExecutable.compile_mlir(mlir)
+    assert(exec.handle > 0)
     let a = TpuBuffer.zeros_bf16_2d(m, k)
     let b = TpuBuffer.zeros_bf16_2d(k, n)
     // Warmup
@@ -81,6 +82,7 @@ fn bench_tpu_mxu_bf16(m Int, k Int, n Int, iters Int) Int {
 fn bench_tpu_w8a16_gemv(k Int, n Int, iters Int) Int {
     let mlir = shlo_w8a16_matmul(1, k, n)
     var exec = TpuExecutable.compile_mlir(mlir)
+    assert(exec.handle > 0)
     let x = TpuBuffer.zeros_bf16_2d(1, k)
     let wq = TpuBuffer.zeros_s8_2d(k, n)
     let sc_list = list_filled(n, 0.01 as Float32)
@@ -232,8 +234,8 @@ fn main() Int {
 
     // 2. TPU MXU Compute Roofline (BF16 TFLOPS) & HBM Bandwidth Roofline (BF16 & W8A16 INT8 GB/s)
     let _ = bench_tpu_mxu_bf16(4096, 4096, 4096, 50)
-    let _ = bench_tpu_mxu_bf16(1, 8192, 8192, 100)
-    let _ = bench_tpu_w8a16_gemv(8192, 8192, 100)
+    let _ = bench_tpu_mxu_bf16(1, 16384, 16384, 50)
+    let _ = bench_tpu_w8a16_gemv(16384, 16384, 50)
 
     // 3. Full XLA-Fused Llama-3.2-1B (16-layer d=2048 d_ff=8192) Prefill (S=512) & Batched/Single Decode on TPU!
     let _ = bench_tpu_llama3_layers("Llama3.2_1B_Prefill_S512_BF16", 512, 2048, 8192, 16, 20)
