@@ -1,7 +1,7 @@
 # Tenon 语言设计与技术方案（已拍板定稿）
 
 > **Working Codename**: `Tenon`（榫卯）—— 寓意**强约束精化类型、分层形式化验证、无别名污染的内存模型、系统级版本演化与可验证分布式协议**严丝合缝。  
-> **状态**: 核心架构已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md)、[ADR-0002](docs/adr/0002-interfaces-comptime-and-stdlib.md) & [ADR-0003](docs/adr/0003-declarative-gpu-and-unified-ui.md)），**极简正交语言核心（零新增硬关键字）→ 完整系统编程能力（S1/S2/S3）→ 声明式 CPU/GPU 融合（`@gpu_struct` / `@kernel` / `@gpu_graph` 自动屏障与算子融合 + 单源 Apple Metal MSL / WebGPU WGSL 编译 + 零 Rust macOS Metal 硬件执行 + 依赖维度 `Tensor2D` 证明）→ OpenUI Lang + 统一 React 风格 VDOM（一份源码渲染 Web Wasm32 + 双缓冲 TUI + 原生 Metal GPU `tenon-gpui` Flexbox/SceneGraph）→ Stage-2 纯 Tenon 零 Rust 自举编译器（Lexer → Parser → L0 区间校验 → LLVM IR）→ 高性能网络/Web/数据库栈 & LSP 1.0**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 独立原生二进制**）。
+> **状态**: 核心架构已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md)、[ADR-0002](docs/adr/0002-interfaces-comptime-and-stdlib.md) & [ADR-0003](docs/adr/0003-declarative-gpu-and-unified-ui.md)），**极简正交语言核心（零新增硬关键字）→ 完整系统编程能力（S1/S2/S3）→ 声明式 CPU/GPU 融合（`@gpu_struct` / `@kernel` / `@gpu_graph` 真正 AST 级 MSL+WGSL 算子融合、`gpu_shared_f32` + `gpu_barrier()` 与 `E0842`/`E0843` 静态并发安全证明、`--emit-webgpu` 浏览器 WebGPU ESM 桥、零 Rust Metal/Vulkan HAL、Const-Generic 依赖维度 `Matrix[R, C]`）→ OpenUI Lang + 统一 React 风格 VDOM（真增量 Surgical VDOM Patcher + OpenAI/Ollama SSE 流式生成 + 双缓冲信号安全 TUI + 原生 Metal GPU `tenon-gpui` 动态 R8 中英文 Glyph Atlas / 缩放 / 滚轮 / 悬停 / 量化 K 线桌面工作台）→ 自动循环累积不变量推导 + `.tenon-cache` 持久化验证缓存 → Stage-3 纯 Tenon 零 Rust 自举固定点编译器（`sha256(stage3.ll) == sha256(stage4.ll)` & `sha256(stage3.o) == sha256(stage4.o)`）→ LSP 1.5 实时证明/GPU 融合 CodeLens 与反例一键转测试**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 独立原生二进制**）。
 > **上游沉淀**: 综合 [`loom-lang`](../loom-lang)（984 PR 自举实践）、[`lang-research`](../lang-research)（2026-11 多语言可复现实验）与 [`dast-os-kernel`](../../dast.ai/dast-os-kernel/README.md)（227 轮分布式调和内核审计），并结合 2025–2026 全球最新编程语言与形式化验证进展形成的全新通用编程语言设计。
 
 ---
@@ -11,23 +11,39 @@
 前置依赖：Rust `stable`（已验证 `rustc 1.100.0`）、`z3`、LLVM `clang`（已验证 LLVM 22.1.8；可选 `node` 验证编译出的 `.wasm`）。
 
 ```bash
-# 0. 可视化交互体验四件套（强烈推荐：真实原生 Metal GPU 桌面窗口 + 浏览器 Web OpenUI Studio + 全屏交互 TUI + 语言编程体验导览）
+# 0. 可视化交互体验与旗舰应用（强烈推荐：零 Rust 原生 Metal GPU 量化 K 线 + GPUI Studio + Web Surgical VDOM + 交互 TUI + AI 生成 UI + Stage-3 自举固定点）
 cargo build --release --bin tenon
 
-# (A) 原生 macOS Apple Silicon Metal GUI 桌面窗口（OpenUI -> VDOM -> Flexbox -> 1 次实例化 SDF Draw Call + Retina CoreText）
+# (A1) 原生 macOS Apple Silicon Metal 量化 K 线与双均线回测工作台（48 根 OHLCV 蜡烛图 + MA5/MA16 + 资金曲线 + 悬停十字线 + R8 中英文 GPU Glyph Atlas）
+./target/release/tenon build --c-src std/gpu/window/metal_window.m -o /tmp/tenon_quant_kline examples/showcase/quant_kline_gpui.tn && /tmp/tenon_quant_kline
+# 或无头截图预览（生成 /tmp/tenon_quant_kline.png）：TENON_KLINE_SMOKE=1 /tmp/tenon_quant_kline
+
+# (A2) 原生 macOS Apple Silicon Metal GPUI Studio（动态 R8 中英文 Glyph Atlas + 可缩放窗口 + 滚轮/悬停 + AI Prompt 输入框流式生成 OpenUI）
 ./target/release/tenon build --c-src std/gpu/window/metal_window.m -o /tmp/tenon_metal_gui examples/showcase/metal_gui_app.tn && /tmp/tenon_metal_gui
 # 或无头截图预览（生成 /tmp/tenon_gpui_preview.png）：TENON_GUI_SMOKE=1 /tmp/tenon_metal_gui
 
-# (B) 真实浏览器交互式 OpenUI + Wasm32 VDOM Studio（实时编辑 OpenUI Lang、模拟 LLM 流式输出、拖动 $users 看最小 VDOM Patch 与 liveObjects=0）
+# (B) 真实浏览器交互式 OpenUI + Wasm32 Surgical VDOM Studio（0 innerHTML 整树重建 + OpenAI/Ollama 真 SSE 流式生成 UI + liveObjects=0）
 ./examples/showcase/web_openui_studio/launch.sh
 
-# (C) 全屏交互式 ANSI 终端 TUI（OpenUI -> VDOM -> 双缓冲极简 ANSI Diff；支持 +/- 调负载、1/2 切视图、s 重放 OpenUI 流式动画、q 退出）
+# (C) 全屏交互式 ANSI 终端 TUI（OpenUI -> VDOM -> 双缓冲极简 ANSI Diff + 信号安全光标自动恢复；支持 +/- 调负载、1/2 切视图、s 流式动画、q 退出）
 ./target/release/tenon build --c-src std/os/term_shim.c -o /tmp/tenon_tui examples/showcase/interactive_tui.tn && /tmp/tenon_tui
 
-# (D) Tenon 编程体验交互导览（精化类型 + 无边界检查循环 + FiniteFloat + 无生命周期 MVS/mutate + @linear 事务 + 依赖维度 Tensor2D；文件内附 4 处「取消注释即被编译器秒抓 Bug」挑战！）
+# (D) 统一三端 AI Generative UI 客户端（可选 TENON_LLM_BASE_URL 对接 OpenAI/Ollama 真 SSE，一份 OpenUI 同时驱动 Web + TUI + Metal SceneGraph）
+./target/release/tenon build -o /tmp/ai_openui_client examples/showcase/ai_openui_client.tn && /tmp/ai_openui_client
+
+# (E) Tenon 编程体验交互导览（零手写 invariant 循环自动证明 + Const-Generic Matrix[R, C] + FiniteFloat + MVS/mutate + @linear 事务）
 ./target/release/tenon check examples/showcase/language_tour.tn && ./target/release/tenon run examples/showcase/language_tour.tn
 
-# 1. 全工作区自动化测试（74 项全量回归；macOS 默认通过 real clang 原生链接校验 + LLVM 22 `lli` 并行执行，全量约 2~3 秒全绿；设置 `TENON_TEST_NATIVE_EXEC=1` 可切回逐二进制直接执行）
+# (F) 声明式 GPU 共享内存分块矩阵乘（Apple Silicon Metal 真硬件计算 + 真实 AST 级 MSL/WGSL 算子融合 + `--emit-webgpu` 浏览器 WebGPU ESM 桥）
+./target/release/tenon build --emit-msl /tmp/tiled.metal --emit-wgsl /tmp/tiled.wgsl --emit-webgpu /tmp/tiled_gpu.mjs --c-src std/gpu/metal/metal_shim.m -o /tmp/metal_tiled examples/dogfood/metal_tiled_matmul_demo.tn && /tmp/metal_tiled
+
+# (G) Stage-3 纯 Tenon 零 Rust 自举固定点证明（验证 sha256(stage3.ll) == sha256(stage4.ll) 与 sha256(stage3.o) == sha256(stage4.o) 完全比特一致！）
+./examples/bootstrap/stage3/verify_fixed_point.sh
+
+# (H) 脚手架模板一键创建项目（支持 cli / lib / web / gpui / openui-web / tui / gpu）
+./target/release/tenon new /tmp/my_gpu_app --template gpu
+
+# 1. 全工作区自动化测试（76 项全量回归；macOS 默认通过 real clang 原生链接校验 + LLVM 22 `lli` 并行执行，全量约 3 秒全绿；设置 `TENON_TEST_NATIVE_EXEC=1` 可切回逐二进制直接执行）
 cargo test --workspace
 
 # 2. 精化类型别名复用 + 高阶形式化验证闭环 + 独立证明导出与审计 + 可执行反例转测试

@@ -1350,6 +1350,35 @@ impl LspServer {
                     }
                 }
             }
+            // Quick Fix 3: Counterexample-to-Test — synthesize a runnable `test fn` from Z3 counterexample
+            if !d.counterexample.is_empty() {
+                let prog = self
+                    .analysis
+                    .get(uri)
+                    .and_then(|a| a.full_program.as_ref().or(a.raw_program.as_ref()));
+                let repro_src = tenon_verify::emit_repro_test_from_diagnostics(
+                    uri,
+                    prog,
+                    std::slice::from_ref(d),
+                );
+                let end_line = lines.len();
+                let insert_text = format!("\n{}", repro_src);
+                actions.push(json!({
+                    "title": format!("Generate Z3 counterexample unit test for `{}`", d.code),
+                    "kind": "quickfix",
+                    "edit": {
+                        "changes": {
+                            uri: [{
+                                "range": {
+                                    "start": { "line": end_line, "character": 0 },
+                                    "end": { "line": end_line, "character": 0 }
+                                },
+                                "newText": insert_text
+                            }]
+                        }
+                    }
+                }));
+            }
         }
         json!(actions)
     }
@@ -1591,18 +1620,67 @@ impl LspServer {
                 if let Some(rep) = &an.report {
                     let fn_start = f.span.start;
                     let fn_end = f.body.span.end.max(f.span.end);
-                    let proof_count = rep
-                        .proofs
+                    let mut l0_count = 0usize;
+                    let mut l1_count = 0usize;
+                    for p in &rep.proofs {
+                        if p.span.file_id == an.active_file_id
+                            && p.span.start >= fn_start
+                            && p.span.start <= fn_end
+                        {
+                            match p.tier {
+                                ProofTier::L0Fast => l0_count += 1,
+                                ProofTier::L1Smt => l1_count += 1,
+                            }
+                        }
+                    }
+                    let proof_count = l0_count + l1_count;
+                    let bounds_elided = rep
+                        .mir
+                        .proved_safe_indices
                         .iter()
-                        .filter(|p| {
-                            p.span.file_id == an.active_file_id
-                                && p.span.start >= fn_start
-                                && p.span.start <= fn_end
-                        })
+                        .filter(|&&off| off >= fn_start && off <= fn_end)
                         .count();
                     let mut badges = Vec::new();
                     if proof_count > 0 {
-                        badges.push(format!("✓ {} proof{}", proof_count, if proof_count == 1 { "" } else { "s" }));
+                        badges.push(format!(
+                            "✓ {} proof{} (L0:{}, L1:{})",
+                            proof_count,
+                            if proof_count == 1 { "" } else { "s" },
+                            l0_count,
+                            l1_count
+                        ));
+                    }
+                    if bounds_elided > 0 {
+                        badges.push(format!(
+                            "⚡ {} bounds check{} elided",
+                            bounds_elided,
+                            if bounds_elided == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if f.attrs.iter().any(|a| a.name == "kernel") {
+                        let has_gpu_err = rep.diagnostics.iter().any(|d| {
+                            (d.code == "E0842" || d.code == "E0843")
+                                && d.span.start >= fn_start
+                                && d.span.start <= fn_end
+                        });
+                        if !has_gpu_err {
+                            badges.push("⚡ @kernel: E0842 barrier-uniform · E0843 race-free (MSL + WGSL)".into());
+                        }
+                    }
+                    if let Some(plan) = rep.mir.gpu_graphs.iter().find(|g| g.fn_name == f.name) {
+                        let fused_summary = if plan.fusions.is_empty() {
+                            "0 fused".to_string()
+                        } else {
+                            let names: Vec<&str> = plan.fusions.iter().map(|fu| fu.fused_name.as_str()).collect();
+                            format!("{} fused ({})", plan.fusions.len(), names.join(", "))
+                        };
+                        badges.push(format!(
+                            "⚡ @gpu_graph: {} pass(es) · {} · {} barrier(s) · {} VRAM slot(s)",
+                            plan.nodes.len(),
+                            fused_summary,
+                            plan.barriers,
+                            plan.vram_slots_used
+                        ));
                     }
                     if rep.mir.checkfree_verified_fns.contains(&f.name) {
                         badges.push("⚡ @checkfree".into());
@@ -3048,6 +3126,104 @@ test fn test_safe_add() {
             lenses.iter().any(|l| l["command"]["title"].as_str().unwrap_or("").contains("@checkfree")),
             "expected @checkfree CodeLens badge, got {:?}",
             lenses
+        );
+    }
+
+    #[test]
+    fn lsp_h5_gpu_code_lens_and_counterexample_quickfix() {
+        let gpu_src = r#"@kernel("elementwise")
+pub pure fn add_bias(x List[Float32], b List[Float32], inout out List[Float32], n UInt32) {
+    let i = gpu_global_id_x() as Int
+    if i < (n as Int) {
+        out[i] = x[i] + b[i]
+    }
+}
+
+@kernel("elementwise")
+pub pure fn relu_act(x List[Float32], inout out List[Float32], n UInt32) {
+    let i = gpu_global_id_x() as Int
+    if i < (n as Int) {
+        let v = x[i]
+        out[i] = if v > (0.0 as Float32) { v } else { 0.0 as Float32 }
+    }
+}
+
+@gpu_graph
+pub pure fn mlp_graph(x List[Float32], b List[Float32], n UInt32) List[Float32] {
+    var biased List[Float32] = list_filled(16, 0.0 as Float32)
+    var out List[Float32] = list_filled(16, 0.0 as Float32)
+    add_bias(x, b, biased, n)
+    relu_act(biased, out, n)
+    out
+}
+"#;
+        let bad_src = r#"pub type Pos = Int where self > 0
+pub pure fn bad_pos(x Int where self >= 0) Pos {
+    x
+}
+"#;
+        let gpu_uri = "file:///tmp/tenon_lsp_h5_gpu.tn";
+        let bad_uri = "file:///tmp/tenon_lsp_h5_bad.tn";
+        let mut input = Vec::new();
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": gpu_uri, "languageId": "tenon", "version": 1, "text": gpu_src } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "textDocument/codeLens",
+            "params": { "textDocument": { "uri": gpu_uri } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": bad_uri, "languageId": "tenon", "version": 1, "text": bad_src } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "textDocument/codeAction",
+            "params": {
+                "textDocument": { "uri": bad_uri },
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 3, "character": 0 } },
+                "context": { "diagnostics": [] }
+            }
+        })));
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": null })));
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "method": "exit", "params": null })));
+
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        let mut server = LspServer::new();
+        assert!(server.run_loop(&mut reader, &mut output));
+
+        let msgs = read_all_messages(&output);
+        let lenses = msgs.iter().find(|m| m.get("id") == Some(&json!(2))).unwrap()["result"].as_array().unwrap();
+        assert!(
+            lenses.iter().any(|l| {
+                let t = l["command"]["title"].as_str().unwrap_or("");
+                t.contains("@kernel") && t.contains("E0842") && t.contains("E0843")
+            }),
+            "expected @kernel safety CodeLens, got {:?}",
+            lenses
+        );
+        assert!(
+            lenses.iter().any(|l| {
+                let t = l["command"]["title"].as_str().unwrap_or("");
+                t.contains("@gpu_graph") && t.contains("add_bias__fused__relu_act")
+            }),
+            "expected @gpu_graph fusion CodeLens, got {:?}",
+            lenses
+        );
+
+        let actions = msgs.iter().find(|m| m.get("id") == Some(&json!(3))).unwrap()["result"].as_array().unwrap();
+        assert!(
+            actions.iter().any(|a| {
+                a["title"].as_str().unwrap_or("").contains("counterexample unit test")
+                    && a["edit"]["changes"][bad_uri][0]["newText"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("test fn ")
+            }),
+            "expected Z3 counterexample unit test quickfix, got {:?}",
+            actions
         );
     }
 }

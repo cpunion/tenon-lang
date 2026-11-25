@@ -85,7 +85,8 @@ USAGE:
   tenon modelcheck [file.tn] [--export-tla <dir>] [--replay <trace.jsonl>] [--json]
                                                   Run L2-b protocol safety/liveness model checker & trace replay
   tenon pkg <lock|verify|tree|add|sync> [dir]     Manage `tenon.toml`, `tenon.lock` SHA-256 ledger & git deps
-  tenon new <name> [--cli|--lib|--web]            Scaffold a new Tenon project with tests & manifest
+  tenon new <name> [--template cli|lib|web|gpui|openui-web|tui|gpu]
+                                                  Scaffold a new verified Tenon project with tests & manifest
   tenon doc <file_or_dir> [-o <dir>] [--format md|html|both]
                                                   Generate Markdown & HTML API reference from verified AST
   tenon bench <file.tn> [--iters <N>]             Compile with LLVM -O3 and run timed benchmark iterations
@@ -1994,17 +1995,50 @@ fn cmd_pkg(args: &[String]) -> ExitCode {
 fn cmd_new(args: &[String]) -> ExitCode {
     let mut name_opt: Option<&str> = None;
     let mut template = "cli";
-    for a in args {
-        match a.as_str() {
-            "--web" => template = "web",
-            "--lib" => template = "lib",
-            "--cli" => template = "cli",
-            s if !s.starts_with('-') && name_opt.is_none() => name_opt = Some(s),
-            _ => {}
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--template" | "-t" if i + 1 < args.len() => {
+                template = args[i + 1].as_str();
+                i += 2;
+            }
+            "--web" => {
+                template = "web";
+                i += 1;
+            }
+            "--lib" => {
+                template = "lib";
+                i += 1;
+            }
+            "--cli" => {
+                template = "cli";
+                i += 1;
+            }
+            "--gpui" => {
+                template = "gpui";
+                i += 1;
+            }
+            "--openui-web" => {
+                template = "openui-web";
+                i += 1;
+            }
+            "--tui" => {
+                template = "tui";
+                i += 1;
+            }
+            "--gpu" => {
+                template = "gpu";
+                i += 1;
+            }
+            s if !s.starts_with('-') && name_opt.is_none() => {
+                name_opt = Some(s);
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
     let Some(name) = name_opt else {
-        eprintln!("usage: tenon new <project_dir> [--cli|--lib|--web]");
+        eprintln!("usage: tenon new <project_dir> [--template cli|lib|web|gpui|openui-web|tui|gpu]");
         return ExitCode::from(2);
     };
     let dir = PathBuf::from(name);
@@ -2040,7 +2074,44 @@ fn cmd_new(args: &[String]) -> ExitCode {
             let _ = fs::write(dir.join("main.tn"), web_src);
             let _ = fs::write(dir.join("main_test.tn"), test_src);
         }
-        _ => {
+        "gpui" => {
+            let gpui_src = format!(
+                "// {} — Native Apple Silicon Metal Desktop App (`tenon-gpui`)\n// Build & run:\n//   tenon build --c-src std/gpu/window/metal_window.m -o target/{} main.tn && ./target/{}\nimport \"std/core/types.tn\"\nimport \"std/ui/vdom.tn\"\nimport \"std/ui/openui.tn\"\nimport \"std/ui/layout.tn\"\nimport \"std/ui/scene.tn\"\nimport \"std/gpu/window/window.tn\"\n\npure fn push_q(inout buf List[Float32], q GpuQuad) {{\n    buf = push(buf, q.x)\n    buf = push(buf, q.y)\n    buf = push(buf, q.w)\n    buf = push(buf, q.h)\n    buf = push(buf, q.r)\n    buf = push(buf, q.g)\n    buf = push(buf, q.b)\n    buf = push(buf, q.a)\n    buf = push(buf, q.radius)\n    buf = push(buf, q.border_w)\n    buf = push(buf, q.br)\n    buf = push(buf, q.bg)\n}}\n\npub fn main() Int {{\n    let src = \"root = Card([hdr, row])\\nhdr = Header(\\\"{}\\\", \\\"Native Metal GPUI + R8 Glyph Atlas\\\")\\nrow = Row([m1, m2])\\nm1 = Metric(\\\"FPS\\\", \\\"120Hz\\\", \\\"VSync\\\")\\nm2 = Metric(\\\"Leaks\\\", \\\"0\\\", \\\"Perceus\\\")\\n\"\n    let doc = openui_parse_stream(src, true)\n    let vdom = openui_to_vdom(doc, ui_store_new())\n    let boxes = layout_vdom(vdom, 760.0, 440.0)\n    let scene = layout_to_scene(boxes, 760, 440)\n    let smoke = sys_env(\"TENON_GUI_SMOKE\") == \"1\"\n    if !win_open(\"{}\", 760, 440, smoke) {{ return 1 }}\n    var qf List[Float32] = []\n    var i = 0\n    while i < len(scene.quads) {{\n        push_q(qf, scene.quads[i])\n        i += 1\n    }}\n    win_begin_text()\n    win_draw_text(\"{} — Ready on \" ++ win_gpu_name(), 32, 24, 18, true, 248, 250, 252)\n    if smoke {{\n        let _ = win_save_png(qf, len(scene.quads), 11, 17, 32, \"/tmp/{}_preview.png\")\n        return 0\n    }}\n    let _ = win_present(qf, len(scene.quads), 11, 17, 32)\n    var running = true\n    while running {{\n        let ev = win_poll_event(16)\n        if ev.kind == 3 || (ev.kind == 1 && (ev.a == 27 || ev.a == 113)) {{ running = false }}\n    }}\n    0\n}}\n",
+                pkg_name, pkg_name, pkg_name, pkg_name, pkg_name, pkg_name, pkg_name
+            );
+            let _ = fs::write(dir.join("main.tn"), gpui_src);
+        }
+        "openui-web" => {
+            let wasm_src = format!(
+                "// {} — OpenUI + Wasm32 Surgical VDOM Kernel\n// Build:\n//   tenon build --target wasm32 --emit-mjs dist/app.mjs -o dist/app.wasm main.tn\nimport \"std/core/types.tn\"\nimport \"std/ui/vdom.tn\"\nimport \"std/ui/openui.tn\"\n\n@export\npub pure fn render_openui_html(src Text, value Text) Text {{\n    let doc = openui_parse_stream(src, true)\n    let store = ui_store_set(ui_store_new(), \"val\", value)\n    vnode_to_html(openui_to_vdom(doc, store))\n}}\n\n@export\npub pure fn diff_openui_json(src Text, old_val Text, new_val Text) Text {{\n    let doc = openui_parse_stream(src, true)\n    let t1 = openui_to_vdom(doc, ui_store_set(ui_store_new(), \"val\", old_val))\n    let t2 = openui_to_vdom(doc, ui_store_set(ui_store_new(), \"val\", new_val))\n    patches_to_json(diff_vdom(t1, t2))\n}}\n\npub fn main() Int {{ 0 }}\n",
+                pkg_name
+            );
+            let html_src = format!(
+                "<!doctype html>\n<html><head><meta charset=\"utf-8\"/><title>{} — Tenon OpenUI Web</title></head>\n<body style=\"background:#0b1120;color:#e2e8f0;font-family:system-ui;padding:24px\">\n<h1>{} (Tenon Wasm32 OpenUI)</h1>\n<div id=\"app\">Build with <code>tenon build --target wasm32 --emit-mjs dist/app.mjs -o dist/app.wasm main.tn</code></div>\n<script type=\"module\">\nimport {{ loadTenonWasm }} from './dist/app.mjs';\nconst api = await loadTenonWasm(await (await fetch('./dist/app.wasm')).arrayBuffer());\nconst src = 'root = Card([hdr, m1])\\nhdr = Header(\"{}\", \"Wasm32 ESM Bridge\")\\nm1 = Metric(\"Live\", $val, \"+100%\")\\n';\ndocument.getElementById('app').innerHTML = api.render_openui_html(src, '42');\n</script>\n</body></html>\n",
+                pkg_name, pkg_name, pkg_name
+            );
+            let _ = fs::write(dir.join("main.tn"), wasm_src);
+            let _ = fs::write(dir.join("index.html"), html_src);
+        }
+        "tui" => {
+            let tui_src = format!(
+                "// {} — Verified Double-Buffered ANSI TUI App\nimport \"std/core/types.tn\"\nimport \"std/ui/vdom.tn\"\nimport \"std/ui/openui.tn\"\nimport \"std/ui/tui.tn\"\n\npub fn main() Int {{\n    let src = \"root = Card([hdr, row])\\nhdr = Header(\\\"{}\\\", \\\"OpenUI -> VDOM -> Double-Buffered TUI\\\")\\nrow = Row([m1, m2])\\nm1 = Metric(\\\"Status\\\", $status, \\\"OK\\\")\\nm2 = Metric(\\\"Leaks\\\", \\\"0\\\", \\\"Perceus\\\")\\n\"\n    let doc = openui_parse_stream(src, true)\n    let b1 = render_vdom_to_tui(openui_to_vdom(doc, ui_store_set(ui_store_new(), \"status\", \"BOOT\")), 64, 14)\n    let b2 = render_vdom_to_tui(openui_to_vdom(doc, ui_store_set(ui_store_new(), \"status\", \"LIVE\")), 64, 14)\n    let diff = tui_diff_ansi(b1, b2)\n    println(tui_buffer_to_plain_text(b2))\n    println(\"ANSI minimal diff bytes = \" ++ int_to_text(len(diff)))\n    0\n}}\n",
+                pkg_name, pkg_name
+            );
+            let test_src = "test fn test_tui_main() {\n    assert main() == 0\n}\n";
+            let _ = fs::write(dir.join("main.tn"), tui_src);
+            let _ = fs::write(dir.join("main_test.tn"), test_src);
+        }
+        "gpu" => {
+            let gpu_src = format!(
+                "// {} — Single-Source Declarative GPU Compute App (`@kernel` + `@gpu_graph`)\n// Emit MSL + WGSL + Browser WebGPU ESM:\n//   tenon build --emit-msl dist/kernels.metal --emit-wgsl dist/kernels.wgsl --emit-webgpu dist/gpu.mjs -o target/{} main.tn\n\n@gpu_struct\npub record ScaleParams {{\n    n    UInt32\n    gain Float32\n}}\n\n@kernel(\"elementwise\")\npub pure fn scale_bias(x List[Float32], bias List[Float32], inout out List[Float32], total UInt32) {{\n    let i = gpu_global_id_x() as Int\n    if i < (total as Int) {{\n        out[i] = x[i] + bias[i]\n    }}\n}}\n\n@kernel(\"elementwise\")\npub pure fn relu_clamp(x List[Float32], inout out List[Float32], total UInt32) {{\n    let i = gpu_global_id_x() as Int\n    if i < (total as Int) {{\n        let v = x[i]\n        out[i] = if v > (0.0 as Float32) {{ v }} else {{ 0.0 as Float32 }}\n    }}\n}}\n\n@gpu_graph\npub pure fn fused_pipeline(x List[Float32], bias List[Float32], total UInt32) List[Float32] {{\n    var biased List[Float32] = list_filled(16, 0.0 as Float32)\n    var out List[Float32] = list_filled(16, 0.0 as Float32)\n    scale_bias(x, bias, biased, total)\n    relu_clamp(biased, out, total)\n    out\n}}\n\npub fn main() Int {{\n    let _ = sys_write_stdout(\"{}: verified @kernel (E0842/E0843) & fused @gpu_graph ready for MSL/WGSL/WebGPU!\\n\")\n    0\n}}\n",
+                pkg_name, pkg_name, pkg_name
+            );
+            let test_src = "test fn test_gpu_main() {\n    assert main() == 0\n}\n";
+            let _ = fs::write(dir.join("main.tn"), gpu_src);
+            let _ = fs::write(dir.join("main_test.tn"), test_src);
+        }
+        "cli" => {
             let cli_src = format!(
                 "// {} — Verified Tenon CLI Application\n\npub type Range[LO Int, HI Int] = Int where self >= LO && self <= HI\n\npub pure fn clamp_score(x Range[0, 100]) Range[0, 200] {{\n    x * 2\n}}\n\npub fn main() Int {{\n    clamp_score(21)\n}}\n",
                 pkg_name
@@ -2049,8 +2120,12 @@ fn cmd_new(args: &[String]) -> ExitCode {
             let _ = fs::write(dir.join("main.tn"), cli_src);
             let _ = fs::write(dir.join("main_test.tn"), test_src);
         }
+        other => {
+            eprintln!("unknown template `{}` (expected cli|lib|web|gpui|openui-web|tui|gpu)", other);
+            return ExitCode::from(2);
+        }
     }
-    println!("Created Tenon {} project -> `{}`", template, dir.display());
+    println!("Created Tenon `{}` project -> `{}`", template, dir.display());
     ExitCode::SUCCESS
 }
 
