@@ -41,10 +41,15 @@ extern "C" {
         n_heads Int, n_kv Int, d_head Int, max_seq Int, softcap Float,
     ) Int
     fn tn_cuda_ultra_argmax(logits_h Int, tok_pos_h Int, n_elems Int, inc_pos Int) Int
+    fn tn_cuda_ultra_silu_mul(g_h Int, u_h Int, o_h Int, n_elems Int) Int
     fn tn_cuda_ultra_mm(
         x_h Int, w_h Int, w_off Int, y_h Int,
         m Int, n Int, k Int, quant_mode Int, add_res Int,
     ) Int
+}
+
+extern "C" {
+    fn tn_cuda_has_cublas() Int
 }
 
 @linear
@@ -152,6 +157,14 @@ pub fn cuda_rope_flash_decode(
 pub fn cuda_argmax(logits_h Int, tok_pos_h Int, n_elems Int, inc_pos Bool) Bool {
     let ip = if inc_pos { 1 } else { 0 }
     unsafe { tn_cuda_ultra_argmax(logits_h, tok_pos_h, n_elems, ip) != 0 }
+}
+
+pub fn cuda_has_cublas() Bool {
+    unsafe { tn_cuda_has_cublas() != 0 }
+}
+
+pub fn cuda_silu_mul(g_h Int, u_h Int, o_h Int, n_elems Int) Bool {
+    unsafe { tn_cuda_ultra_silu_mul(g_h, u_h, o_h, n_elems) != 0 }
 }
 
 pub fn cuda_mm(x_h Int, w_h Int, w_off Int, y_h Int, m Int, n Int, k Int, quant_mode Int, add_res Bool) Bool {

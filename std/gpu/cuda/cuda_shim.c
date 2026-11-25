@@ -26,9 +26,19 @@ typedef uint64_t CUdeviceptr;
 
 typedef int nvrtcResult;
 typedef void* nvrtcProgram;
+typedef int cublasStatus_t;
+typedef void* cublasHandle_t;
 
 #define CUDA_SUCCESS 0
 #define NVRTC_SUCCESS 0
+#define CUBLAS_STATUS_SUCCESS 0
+#define CUBLAS_OP_N 0
+#define CUBLAS_OP_T 1
+#define CUDA_R_32F 0
+#define CUDA_R_16F 2
+#define CUDA_R_16BF 14
+#define CUBLAS_COMPUTE_32F 68
+#define CUBLAS_GEMM_DEFAULT_TENSOR_OP 99
 #define CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT 16
 #define CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE 36
 #define CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH 37
@@ -78,13 +88,24 @@ typedef nvrtcResult (*pfn_nvrtcGetProgramLogSize)(nvrtcProgram, size_t*);
 typedef nvrtcResult (*pfn_nvrtcGetProgramLog)(nvrtcProgram, char*);
 typedef nvrtcResult (*pfn_nvrtcDestroyProgram)(nvrtcProgram*);
 
+typedef cublasStatus_t (*pfn_cublasCreate_v2)(cublasHandle_t*);
+typedef cublasStatus_t (*pfn_cublasSetStream_v2)(cublasHandle_t, CUstream);
+typedef cublasStatus_t (*pfn_cublasGemmEx)(
+    cublasHandle_t, int, int, int, int, int,
+    const void*, const void*, int, int,
+    const void*, int, int,
+    const void*, void*, int, int,
+    int, int);
+
 typedef struct {
     int initialized;
     void* libcuda;
     void* libnvrtc;
+    void* libcublas;
     CUdevice dev;
     CUcontext ctx;
     CUstream stream;
+    cublasHandle_t cublas;
     char dev_name[128];
     int cc_major;
     int cc_minor;
@@ -130,6 +151,10 @@ typedef struct {
     pfn_nvrtcGetProgramLogSize nvrtcGetProgramLogSize;
     pfn_nvrtcGetProgramLog nvrtcGetProgramLog;
     pfn_nvrtcDestroyProgram nvrtcDestroyProgram;
+
+    pfn_cublasCreate_v2 cublasCreate;
+    pfn_cublasSetStream_v2 cublasSetStream;
+    pfn_cublasGemmEx cublasGemmEx;
 } TnCudaState;
 
 /* Shared across cuda_shim.c and cuda_ultra_shim.c */
@@ -260,6 +285,32 @@ int64_t tn_cuda_init(void) {
         g_tn_cuda.nvrtcGetProgramLogSize = (pfn_nvrtcGetProgramLogSize)dlsym(g_tn_cuda.libnvrtc, "nvrtcGetProgramLogSize");
         g_tn_cuda.nvrtcGetProgramLog = (pfn_nvrtcGetProgramLog)dlsym(g_tn_cuda.libnvrtc, "nvrtcGetProgramLog");
         g_tn_cuda.nvrtcDestroyProgram = (pfn_nvrtcDestroyProgram)dlsym(g_tn_cuda.libnvrtc, "nvrtcDestroyProgram");
+    }
+
+    /* Load cuBLAS dynamically for Tensor Core FP16/BF16 GEMM (ZERO static link flags!) */
+    const char* cublas_libs[] = {
+        "libcublas.so",
+        "libcublas.so.13",
+        "libcublas.so.12",
+        "/usr/local/cuda/lib64/libcublas.so",
+        "/usr/local/cuda/targets/x86_64-linux/lib/libcublas.so",
+        "/usr/local/lib/python3.12/dist-packages/nvidia/cublas/lib/libcublas.so.12",
+        "/usr/local/lib/python3.12/dist-packages/nvidia/cublas/lib/libcublas.so.13",
+        NULL
+    };
+    for (int i = 0; cublas_libs[i]; i++) {
+        g_tn_cuda.libcublas = dlopen(cublas_libs[i], RTLD_LAZY | RTLD_GLOBAL);
+        if (g_tn_cuda.libcublas) break;
+    }
+    if (g_tn_cuda.libcublas) {
+        g_tn_cuda.cublasCreate = (pfn_cublasCreate_v2)dlsym(g_tn_cuda.libcublas, "cublasCreate_v2");
+        g_tn_cuda.cublasSetStream = (pfn_cublasSetStream_v2)dlsym(g_tn_cuda.libcublas, "cublasSetStream_v2");
+        g_tn_cuda.cublasGemmEx = (pfn_cublasGemmEx)dlsym(g_tn_cuda.libcublas, "cublasGemmEx");
+        if (g_tn_cuda.cublasCreate && g_tn_cuda.cublasCreate(&g_tn_cuda.cublas) == CUBLAS_STATUS_SUCCESS) {
+            if (g_tn_cuda.cublasSetStream && g_tn_cuda.stream) {
+                g_tn_cuda.cublasSetStream(g_tn_cuda.cublas, g_tn_cuda.stream);
+            }
+        }
     }
 
     g_tn_cuda.initialized = 1;
@@ -590,4 +641,30 @@ int64_t tn_cuda_graph_free(int64_t gh) {
     if (g_tn_cuda.cuGraphExecDestroy) g_tn_cuda.cuGraphExecDestroy(g_tn_cuda_graphs[gh]);
     g_tn_cuda_graphs[gh] = NULL;
     return 1;
+}
+
+/* Tensor Core FP16 GEMM via dynamically loaded cuBLAS (`Y[M, N] = X[M, K] @ W[N, K]^T + beta * Y`) */
+int tn_cuda_cublas_gemm_f16(
+    CUdeviceptr x_ptr, CUdeviceptr w_ptr, CUdeviceptr y_ptr,
+    int m, int n, int k, int add_res
+) {
+    if (!g_tn_cuda.cublas || !g_tn_cuda.cublasGemmEx) return 0;
+    float alpha = 1.0f;
+    float beta = add_res ? 1.0f : 0.0f;
+    cublasStatus_t st = g_tn_cuda.cublasGemmEx(
+        g_tn_cuda.cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        (const void*)(uintptr_t)w_ptr, CUDA_R_16F, k,
+        (const void*)(uintptr_t)x_ptr, CUDA_R_16F, k,
+        &beta,
+        (void*)(uintptr_t)y_ptr, CUDA_R_16F, n,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+    return st == CUBLAS_STATUS_SUCCESS ? 1 : 0;
+}
+
+int64_t tn_cuda_has_cublas(void) {
+    return (g_tn_cuda.cublas && g_tn_cuda.cublasGemmEx) ? 1 : 0;
 }

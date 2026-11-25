@@ -24,6 +24,8 @@ extern "C" {
     fn tn_tpu_buf_create_1d(data_ptr Ptr[UInt8], dtype Int, d0 Int) Int
     fn tn_tpu_buf_create_2d(data_ptr Ptr[UInt8], dtype Int, d0 Int, d1 Int) Int
     fn tn_tpu_buf_create_3d(data_ptr Ptr[UInt8], dtype Int, d0 Int, d1 Int, d2 Int) Int
+    fn tn_tpu_buf_create_scalar_i32(val Int) Int
+    fn tn_tpu_buf_zeros_1d(dtype Int, d0 Int) Int
     fn tn_tpu_buf_zeros_2d(dtype Int, d0 Int, d1 Int) Int
     fn tn_tpu_buf_zeros_3d(dtype Int, d0 Int, d1 Int, d2 Int) Int
     fn tn_tpu_buf_read(handle Int, dst_ptr Ptr[UInt8], byte_len Int) Int
@@ -122,9 +124,24 @@ impl TpuBuffer {
         TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S8 }
     }
 
+    pub fn scalar_i32(val Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_create_scalar_i32(val) }
+        TpuBuffer { handle = h, n_elems = 1, dtype = TPU_S32 }
+    }
+
+    pub fn zeros_bf16_1d(d0 Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_zeros_1d(TPU_BF16, d0) }
+        TpuBuffer { handle = h, n_elems = d0, dtype = TPU_BF16 }
+    }
+
     pub fn zeros_bf16_3d(d0 Int, d1 Int, d2 Int) TpuBuffer {
         let h = unsafe { tn_tpu_buf_zeros_3d(TPU_BF16, d0, d1, d2) }
         TpuBuffer { handle = h, n_elems = d0 * d1 * d2, dtype = TPU_BF16 }
+    }
+
+    pub fn zeros_s8_3d(d0 Int, d1 Int, d2 Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_zeros_3d(TPU_S8, d0, d1, d2) }
+        TpuBuffer { handle = h, n_elems = d0 * d1 * d2, dtype = TPU_S8 }
     }
 
     pub fn read_f32(inout self, dst List[Float32]) Int {

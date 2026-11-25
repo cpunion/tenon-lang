@@ -263,6 +263,21 @@ int64_t tn_tpu_buf_create_3d(int64_t data_ptr, int64_t dtype, int64_t d0, int64_
     return tn_tpu_buf_create_nd((const void*)(uintptr_t)data_ptr, dtype, dims, 3);
 }
 
+int64_t tn_tpu_buf_create_scalar_i32(int64_t val) {
+    int32_t v = (int32_t)val;
+    return tn_tpu_buf_create_nd(&v, 3, NULL, 0);
+}
+
+int64_t tn_tpu_buf_zeros_1d(int64_t dtype, int64_t d0) {
+    size_t nbytes = (size_t)d0 * tn_dtype_bytes(dtype);
+    void* tmp = calloc(1, nbytes > 0 ? nbytes : 4);
+    if (!tmp) return 0;
+    int64_t dims[1] = { d0 };
+    int64_t h = tn_tpu_buf_create_nd(tmp, dtype, dims, 1);
+    free(tmp);
+    return h;
+}
+
 int64_t tn_tpu_buf_zeros_2d(int64_t dtype, int64_t d0, int64_t d1) {
     size_t nbytes = (size_t)d0 * (size_t)d1 * tn_dtype_bytes(dtype);
     void* tmp = calloc(1, nbytes > 0 ? nbytes : 4);

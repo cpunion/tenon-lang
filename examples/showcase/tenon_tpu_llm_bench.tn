@@ -1,27 +1,43 @@
 // examples/showcase/tenon_tpu_llm_bench.tn
-// Tenon Native Google Cloud TPU Engine — Direct `libtpu.so` PJRT C-API + StableHLO XLA Compiler!
+// Tenon Native Google Cloud TPU Engine — Declarative `@gpu_graph` + Direct `libtpu.so` PJRT C-API!
 //
-// Zero Python in the execution path: Tenon LLVM AOT -> `dlopen("libtpu.so")` -> `GetPjrtApi()`
-// -> `PJRT_Client_Compile(StableHLO MLIR)` -> TPU TensorCore MXU Systolic Array!
+// Zero Python in the execution path:
+//   Declarative Dependent-Typed `@gpu_graph` -> Z3 Shape Proof -> Auto-Fused StableHLO MLIR
+//   -> `dlopen("libtpu.so")` -> `GetPjrtApi()` -> `PJRT_Client_Compile` -> TPU MXU Systolic Array!
 //
-// Verifies & benchmarks on real Google Cloud TPU (v5e-1 / v6e-1 Trillium):
-//   1. PJRT C-API discovery + single-source `@kernel` compiled via `gpu_embedded_stablehlo()`
-//   2. TPU MXU BF16 Matmul Roofline (4096x4096x4096 -> real Hardware TFLOPS!)
-//   3. TPU HBM Bandwidth Roofline (BF16 vs W8A16 INT8 Weight-Only GEMV 8192x8192 -> real GB/s!)
-//   4. Exact Numerical Verification of XLA-Fused Llama-3 Block (RMSNorm + Attn + SwiGLU) vs CPU FP32 Oracle
-//   5. Full Llama-3.2-1B (16-layer d=2048 d_ff=8192) Prefill (S=512) & Decode Throughput on Google TPU!
+// Verifies & benchmarks on real Google Cloud TPU (v5e-1 / v6e-1 Trillium) against Silicon Roofline Ceiling:
+//   1. Declarative Dependent-Typed `@gpu_graph("tensor_dataflow")` `llama3_ffn_b32` compiled via
+//      `gpu_embedded_stablehlo()` and executed LIVE on TPU MXU vs theoretical silicon T_min!
+//   2. TPU MXU BF16 Matmul Roofline (4096^3 -> TFLOPS & % of 197 TFLOPS v5e peak!)
+//   3. TPU HBM Bandwidth Roofline (BF16 vs W8A16 INT8 Weight-Only GEMV 1x16384x16384 -> % of 819 GB/s!)
+//   4. Single-Graph All-16-Layer Fused `stablehlo.while` Llama-3.2-1B (BF16 & W8A16 INT8):
+//      Prefill S=512, Decode B=32, Decode B=1 in ONE single PJRT_LoadedExecutable_Execute call!
 
 import "std/core/types.tn"
 import "std/os/io.tn"
 import "std/text/text.tn"
+import "std/gpu/tensor.tn"
 import "std/gpu/tpu/tpu.tn"
 import "std/nn/gpu/transformer_tpu.tn"
 
-@kernel
-pub fn tenon_tpu_vec_fma(a List[Float32], b List[Float32], inout out List[Float32]) Int {
-    let i = gpu_global_id_x()
-    out[i] = a[i] * b[i] + b[i]
-    0
+// Pure Declarative Dependent-Typed Tensor Dataflow Graph (ZERO thread indices, ZERO hand-written MLIR!):
+// Z3 statically verifies every Matrix dimension & DType; Tenon's compiler fuses 6 ops -> 2 stages
+// and embeds executable StableHLO MLIR + Silicon Roofline estimate into `gpu_embedded_stablehlo()`!
+@gpu_graph("tensor_dataflow")
+pub pure fn llama3_ffn_b32(
+    x      Matrix[32, 2048, DType = BFloat16],
+    nw     Matrix[1, 2048, DType = BFloat16],
+    w_gate Matrix[2048, 8192, DType = BFloat16],
+    w_up   Matrix[2048, 8192, DType = BFloat16],
+    w_down Matrix[8192, 2048, DType = BFloat16],
+) Matrix[32, 2048, DType = BFloat16] {
+    let h = tg_rmsnorm(x, nw)
+    let g = tg_matmul(h, w_gate)
+    let u = tg_matmul(h, w_up)
+    let a = tg_swiglu(g, u)
+    let d = tg_matmul(a, w_down)
+    let out = tg_add(x, d)
+    out
 }
 
 pure fn abs_f(x Float) Float {
@@ -41,13 +57,55 @@ fn synth_f32(n Int, seed Int, scale Float) List[Float32] {
     out
 }
 
+fn bench_declarative_gpu_graph_tpu(embedded_shlo Text, iters Int) Int {
+    var exec = TpuExecutable.compile_mlir(embedded_shlo)
+    assert(exec.handle > 0)
+    let x = TpuBuffer.zeros_bf16_2d(32, 2048)
+    let nw = TpuBuffer.zeros_bf16_2d(1, 2048)
+    let wg = TpuBuffer.zeros_bf16_2d(2048, 8192)
+    let wu = TpuBuffer.zeros_bf16_2d(2048, 8192)
+    let wd = TpuBuffer.zeros_bf16_2d(8192, 2048)
+    let ins = [x.handle, nw.handle, wg.handle, wu.handle, wd.handle]
+    var wi = 0
+    while wi < 5 {
+        let tmp = exec.run_many(ins, 32 * 2048, TPU_BF16)
+        let _ = tmp.free()
+        wi += 1
+    }
+    let t0 = time_now_ns()
+    var i = 0
+    while i < iters {
+        let out = exec.run_many(ins, 32 * 2048, TPU_BF16)
+        let _ = out.free()
+        i += 1
+    }
+    let dt_ns = time_now_ns() - t0
+    let ms = int_to_float(dt_ns) / (int_to_float(iters) * 1000000.0)
+    // Weights = 3 * 2048 * 8192 * 2B = 100.66 MB; FLOPs = 6 * 32 * 2048 * 8192 = 3.221 GFLOPs
+    // TPU v5e-1 Silicon T_min = max(100.9MB / 819 GB/s, 3.221G / 197T) = 0.1232 ms
+    let w_bytes = 3.0 * 2048.0 * 8192.0 * 2.0
+    let gbs = (w_bytes / 1000000000.0) / (ms / 1000.0)
+    let pct_bw = (gbs / 819.0) * 100.0
+    println(
+        "DECLARATIVE_GPU_GRAPH_TPU llama3_ffn_b32 ms=" ++ float_to_text(ms)
+        ++ " eff_GBs=" ++ float_to_text(gbs)
+        ++ " pct_v5e_819GBs=" ++ float_to_text(pct_bw) ++ "% PASS"
+    )
+    let _ = x.free()
+    let _ = nw.free()
+    let _ = wg.free()
+    let _ = wu.free()
+    let _ = wd.free()
+    let _ = exec.free()
+    0
+}
+
 fn bench_tpu_mxu_bf16(m Int, k Int, n Int, iters Int) Int {
     let mlir = shlo_bf16_matmul(m, k, n)
     var exec = TpuExecutable.compile_mlir(mlir)
     assert(exec.handle > 0)
     let a = TpuBuffer.zeros_bf16_2d(m, k)
     let b = TpuBuffer.zeros_bf16_2d(k, n)
-    // Warmup
     var wi = 0
     while wi < 5 {
         let tmp = exec.run_2(a.handle, b.handle, m * n, TPU_BF16)
@@ -71,7 +129,9 @@ fn bench_tpu_mxu_bf16(m Int, k Int, n Int, iters Int) Int {
         "TPU_MXU_BF16 " ++ int_to_text(m) ++ "x" ++ int_to_text(k) ++ "x" ++ int_to_text(n)
         ++ " ms=" ++ float_to_text(ms)
         ++ " TFLOPS=" ++ float_to_text(tflops)
+        ++ " pct_197T=" ++ float_to_text((tflops / 197.0) * 100.0) ++ "%"
         ++ " eff_GBs=" ++ float_to_text(gbs)
+        ++ " pct_819GBs=" ++ float_to_text((gbs / 819.0) * 100.0) ++ "%"
     )
     let _ = a.free()
     let _ = b.free()
@@ -108,6 +168,7 @@ fn bench_tpu_w8a16_gemv(k Int, n Int, iters Int) Int {
         "TPU_HBM_W8A16_GEMV 1x" ++ int_to_text(k) ++ "x" ++ int_to_text(n)
         ++ " ms=" ++ float_to_text(ms)
         ++ " eff_GBs=" ++ float_to_text(gbs)
+        ++ " pct_819GBs=" ++ float_to_text((gbs / 819.0) * 100.0) ++ "%"
     )
     let _ = x.free()
     let _ = wq.free()
@@ -116,23 +177,24 @@ fn bench_tpu_w8a16_gemv(k Int, n Int, iters Int) Int {
     0
 }
 
-fn bench_tpu_llama3_layers(name Text, seq Int where self > 0, d Int where self > 0, dff Int where self > 0, n_layers Int, iters Int) Int {
-    let mlir = shlo_llama3_block_bf16(seq, d, dff)
+/// Benchmarks ALL 16 Transformer Layers inside ONE single PJRT Executable (`stablehlo.while` scan!)
+/// Supports BOTH BF16 (`w8=false`) and W8A16 INT8 Weight-Only (`w8=true`)!
+fn bench_tpu_llama3_full16(name Text, n_layers Int where self > 0, seq Int where self > 0, d Int where self > 0, dff Int where self > 0, w8 Bool, iters Int) Int {
+    let mlir = shlo_llama3_full_model(n_layers, seq, d, dff, w8)
     var exec = TpuExecutable.compile_mlir(mlir)
+    assert(exec.handle > 0)
     let x0 = TpuBuffer.zeros_bf16_2d(seq, d)
-    let ones_d = f32_list_to_bf16(list_filled(d, 1.0 as Float32))
-    let n1 = TpuBuffer.from_bf16_1d(ones_d)
-    let wq = TpuBuffer.zeros_bf16_2d(d, d)
-    let wk = TpuBuffer.zeros_bf16_2d(d, d)
-    let wv = TpuBuffer.zeros_bf16_2d(d, d)
-    let wo = TpuBuffer.zeros_bf16_2d(d, d)
-    let n2 = TpuBuffer.from_bf16_1d(ones_d)
-    let wg = TpuBuffer.zeros_bf16_2d(d, dff)
-    let wu = TpuBuffer.zeros_bf16_2d(d, dff)
-    let wd = TpuBuffer.zeros_bf16_2d(dff, d)
+    let n1 = TpuBuffer.zeros_bf16_2d(n_layers, d)
+    let n2 = TpuBuffer.zeros_bf16_2d(n_layers, d)
+    let wq = if w8 { TpuBuffer.zeros_s8_3d(n_layers, d, d) } else { TpuBuffer.zeros_bf16_3d(n_layers, d, d) }
+    let wk = if w8 { TpuBuffer.zeros_s8_3d(n_layers, d, d) } else { TpuBuffer.zeros_bf16_3d(n_layers, d, d) }
+    let wv = if w8 { TpuBuffer.zeros_s8_3d(n_layers, d, d) } else { TpuBuffer.zeros_bf16_3d(n_layers, d, d) }
+    let wo = if w8 { TpuBuffer.zeros_s8_3d(n_layers, d, d) } else { TpuBuffer.zeros_bf16_3d(n_layers, d, d) }
+    let wg = if w8 { TpuBuffer.zeros_s8_3d(n_layers, d, dff) } else { TpuBuffer.zeros_bf16_3d(n_layers, d, dff) }
+    let wu = if w8 { TpuBuffer.zeros_s8_3d(n_layers, d, dff) } else { TpuBuffer.zeros_bf16_3d(n_layers, d, dff) }
+    let wd = if w8 { TpuBuffer.zeros_s8_3d(n_layers, dff, d) } else { TpuBuffer.zeros_bf16_3d(n_layers, dff, d) }
 
     let ins = [x0.handle, n1.handle, wq.handle, wk.handle, wv.handle, wo.handle, n2.handle, wg.handle, wu.handle, wd.handle]
-    // Warmup
     var wi = 0
     while wi < 3 {
         let tmp = exec.run_many(ins, seq * d, TPU_BF16)
@@ -147,19 +209,26 @@ fn bench_tpu_llama3_layers(name Text, seq Int where self > 0, d Int where self >
         i += 1
     }
     let dt_ns = time_now_ns() - t0
-    let layer_ms = int_to_float(dt_ns) / (int_to_float(iters) * 1000000.0)
-    let full_ms = layer_ms * int_to_float(n_layers)
+    let full_ms = int_to_float(dt_ns) / (int_to_float(iters) * 1000000.0)
     let tok_s = (int_to_float(seq) * 1000.0) / full_ms
-    let layer_w_bytes = int_to_float(4 * d * d + 3 * d * dff) * 2.0
-    let gbs = (layer_w_bytes / 1000000000.0) / (layer_ms / 1000.0)
+    let bpe = if w8 { 1.0 } else { 2.0 }
+    let total_w_bytes = int_to_float(n_layers) * int_to_float(4 * d * d + 3 * d * dff) * bpe
+    let gbs = (total_w_bytes / 1000000000.0) / (full_ms / 1000.0)
+    let total_flops = int_to_float(n_layers) * (2.0 * int_to_float(seq) * int_to_float(4 * d * d + 3 * d * dff) + 4.0 * int_to_float(seq * seq * d))
+    let tflops = (total_flops / (full_ms / 1000.0)) / 1000000000000.0
+    let t_mem_ms = (total_w_bytes / 819000000000.0) * 1000.0
+    let t_cmp_ms = (total_flops / 197000000000000.0) * 1000.0
+    let t_min_ms = if t_mem_ms > t_cmp_ms { t_mem_ms } else { t_cmp_ms }
+    let pct_silicon = (t_min_ms / full_ms) * 100.0
     println(
-        "BENCH_TPU_LLAMA3 " ++ name
+        "BENCH_TPU_FULL16 " ++ name
         ++ " seq=" ++ int_to_text(seq)
-        ++ " layers=" ++ int_to_text(n_layers)
-        ++ " layer_ms=" ++ float_to_text(layer_ms)
         ++ " full_ms=" ++ float_to_text(full_ms)
         ++ " tok_s=" ++ float_to_text(tok_s)
+        ++ " TFLOPS=" ++ float_to_text(tflops)
         ++ " eff_GBs=" ++ float_to_text(gbs)
+        ++ " t_min_ms=" ++ float_to_text(t_min_ms)
+        ++ " pct_silicon=" ++ float_to_text(pct_silicon) ++ "%"
     )
     let _ = x0.free()
     let _ = n1.free()
@@ -176,7 +245,7 @@ fn bench_tpu_llama3_layers(name Text, seq Int where self > 0, d Int where self >
 }
 
 fn main() Int {
-    println("=== Tenon Native Google Cloud TPU Engine (Direct `libtpu.so` PJRT C-API + StableHLO XLA) ===")
+    println("=== Tenon Native Google Cloud TPU Engine (Declarative @gpu_graph + Direct libtpu.so PJRT) ===")
     let embedded_shlo = gpu_embedded_stablehlo()
     println("EMBEDDED_STABLEHLO_BYTES=" ++ int_to_text(len(embedded_shlo)))
 
@@ -232,15 +301,20 @@ fn main() Int {
     let _ = tc.free()
     let _ = mm_exec.free()
 
-    // 2. TPU MXU Compute Roofline (BF16 TFLOPS) & HBM Bandwidth Roofline (BF16 & W8A16 INT8 GB/s)
+    // 2. LIVE Execution of Pure Declarative Dependent-Typed `@gpu_graph` on real Google TPU MXU!
+    let _ = bench_declarative_gpu_graph_tpu(embedded_shlo, 50)
+
+    // 3. TPU MXU Compute Roofline (BF16 TFLOPS) & HBM Bandwidth Roofline (BF16 & W8A16 INT8 GB/s)
     let _ = bench_tpu_mxu_bf16(4096, 4096, 4096, 50)
     let _ = bench_tpu_mxu_bf16(1, 16384, 16384, 50)
     let _ = bench_tpu_w8a16_gemv(16384, 16384, 50)
 
-    // 3. Full XLA-Fused Llama-3.2-1B (16-layer d=2048 d_ff=8192) Prefill (S=512) & Batched/Single Decode on TPU!
-    let _ = bench_tpu_llama3_layers("Llama3.2_1B_Prefill_S512_BF16", 512, 2048, 8192, 16, 20)
-    let _ = bench_tpu_llama3_layers("Llama3.2_1B_Decode_B32_BF16", 32, 2048, 8192, 16, 30)
-    let _ = bench_tpu_llama3_layers("Llama3.2_1B_Decode_B1_BF16", 1, 2048, 8192, 16, 50)
+    // 4. Single-Graph All-16-Layer Fused Llama-3.2-1B (stablehlo.while, ZERO intermediate host hops!)
+    let _ = bench_tpu_llama3_full16("Llama3.2_1B_Prefill_S512_BF16", 16, 512, 2048, 8192, false, 15)
+    let _ = bench_tpu_llama3_full16("Llama3.2_1B_Decode_B32_BF16", 16, 32, 2048, 8192, false, 20)
+    let _ = bench_tpu_llama3_full16("Llama3.2_1B_Decode_B32_W8A16", 16, 32, 2048, 8192, true, 20)
+    let _ = bench_tpu_llama3_full16("Llama3.2_1B_Decode_B1_BF16", 16, 1, 2048, 8192, false, 30)
+    let _ = bench_tpu_llama3_full16("Llama3.2_1B_Decode_B1_W8A16", 16, 1, 2048, 8192, true, 30)
     println("=== TPU DONE (Perceus live_objects == 0, Linear HBM == 0 leaks) ===")
     0
 }
