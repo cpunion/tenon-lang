@@ -1,0 +1,44 @@
+// std/ui/gpui_app_test.tn — Unit Tests for Retained Interactive `tenon-gpui` Hit-Testing & Action Routing
+
+import "std/core/types.tn"
+import "std/ui/vdom.tn"
+import "std/ui/openui.tn"
+import "std/ui/layout.tn"
+import "std/ui/gpui_app.tn"
+
+test fn test_openui_automatic_button_hit_testing_and_focus() {
+    let src = "root = Card([hdr, btn1, btn2])\nhdr = Header(\"GPUI Router\", \"Zero manual hit_rect\")\nbtn1 = Button(\"Rebalance\", @rebalance)\nbtn2 = Button(\"Switch GPU\", @switch_gpu)\n"
+    let doc = openui_parse_stream(src, true)
+    let vdom = openui_to_vdom(doc, ui_store_new())
+    let boxes = layout_vdom(vdom, 760.0, 440.0)
+    let targets = gpui_extract_targets(boxes)
+
+    assert len(targets) == 2
+    let t0 = targets[0]
+    let t1 = targets[1]
+
+    // Clicking inside button 1 automatically routes `@rebalance`!
+    let ev1 = gpui_dispatch_click(targets, t0.x + 12, t0.y + 10)
+    let act1 = match ev1 {
+        Triggered(act) => act
+        NoAction => ""
+    }
+    assert act1 == "rebalance"
+
+    // Hovering inside button 2 automatically resolves `"switch_gpu"`!
+    let hov2 = gpui_hovered_action(targets, t1.x + 12, t1.y + 10)
+    assert hov2 == "switch_gpu"
+
+    // Clicking outside all buttons returns NoAction
+    let miss = gpui_dispatch_click(targets, 1, 1)
+    let missed = match miss {
+        NoAction => true
+        Triggered(_) => false
+    }
+    assert missed
+
+    // Tab / Shift-Tab focus cycling
+    assert gpui_focus_next(0, len(targets), false) == 1
+    assert gpui_focus_next(1, len(targets), false) == 0
+    assert gpui_focus_next(0, len(targets), true) == 1
+}

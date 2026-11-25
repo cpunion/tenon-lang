@@ -1,0 +1,102 @@
+// std/ui/gpui_app.tn — Retained Interactive Widget Hit-Testing & `@action` Event Router (`tenon-gpui`)
+//
+// Bridges declarative OpenUI / VDOM layouts (`layout_vdom`) directly into native Metal GPUI windows:
+//   - Automatically extracts clickable/hoverable `HitTarget` regions from `LayoutBox` geometry
+//   - Zero hand-coded pixel `hit_rect(...)` math for `Button(..., @action)` / `Metric` / `Card`
+//   - Supports reverse-Z hit-testing (topmost widget wins), hover tracking, and keyboard focus cycling!
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+import "std/ui/layout.tn"
+
+pub record HitTarget {
+    id     Text
+    kind   Text
+    action Text
+    x      Int
+    y      Int
+    w      Int
+    h      Int
+}
+
+pub enum GpuiActionEvent {
+    NoAction
+    Triggered(Text) // `@action` identifier from OpenUI/VDOM widget
+}
+
+pub pure fn gpui_point_in_target(t HitTarget, px Int, py Int) Bool {
+    px >= t.x && px <= t.x + t.w && py >= t.y && py <= t.y + t.h
+}
+
+/// Automatically extracts all interactive hit targets from a computed Flexbox `LayoutBox` list.
+pub pure fn gpui_extract_targets(boxes List[LayoutBox]) List[HitTarget] {
+    var out List[HitTarget] = []
+    var i = 0
+    while i < len(boxes) {
+        let bx = boxes[i]
+        let raw_act = if bx.kind == "Button" && len(bx.value) > 0 {
+            bx.value
+        } else if len(bx.extra) > 0 {
+            bx.extra
+        } else if bx.kind == "Button" {
+            bx.label
+        } else {
+            ""
+        }
+        let act = raw_act.strip_prefix("@").unwrap_or(raw_act)
+        if bx.kind == "Button" || len(act) > 0 {
+            let tid = if len(bx.key) > 0 { bx.key } else { bx.kind ++ "_" ++ int_to_text(i) }
+            out = push(out, HitTarget {
+                id = tid,
+                kind = bx.kind,
+                action = act,
+                x = float_to_int(bx.rect.x),
+                y = float_to_int(bx.rect.y),
+                w = float_to_int(bx.rect.w),
+                h = float_to_int(bx.rect.h),
+            })
+        }
+        i += 1
+    }
+    out
+}
+
+/// Performs reverse z-order hit testing so the topmost rendered widget wins.
+pub pure fn gpui_hit_test(targets List[HitTarget], px Int, py Int) Option[HitTarget] {
+    var i = len(targets)
+    while i > 0 {
+        i -= 1
+        let t = targets[i]
+        if gpui_point_in_target(t, px, py) {
+            return Some(t)
+        }
+    }
+    None
+}
+
+/// Dispatches a pointer click `(px, py)` directly to the matching OpenUI `@action` identifier.
+pub pure fn gpui_dispatch_click(targets List[HitTarget], px Int, py Int) GpuiActionEvent {
+    match gpui_hit_test(targets, px, py) {
+        Some(t) => if len(t.action) > 0 { Triggered(t.action) } else { NoAction }
+        None => NoAction
+    }
+}
+
+/// Returns the hovered widget's `@action` (or `""` if pointer is not over an interactive widget).
+pub pure fn gpui_hovered_action(targets List[HitTarget], px Int, py Int) Text {
+    match gpui_hit_test(targets, px, py) {
+        Some(t) => t.action
+        None => ""
+    }
+}
+
+/// Cycles keyboard focus index cleanly across interactive widgets (`Tab` / `Shift+Tab`).
+pub pure fn gpui_focus_next(current Int, count Int, reverse Bool) Int {
+    if count <= 0 { return -1 }
+    if current < 0 || current >= count { return 0 }
+    if reverse {
+        if current == 0 { count - 1 } else { current - 1 }
+    } else {
+        (current + 1) % count
+    }
+}
