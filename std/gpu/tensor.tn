@@ -302,10 +302,10 @@ pub pure fn tensor2d_matmul(a Tensor2D, b Tensor2D) Tensor2D
     requires len(a.data) == a.rows * a.cols && len(b.data) == b.rows * b.cols
     ensures result.rows == a.rows && result.cols == b.cols && len(result.data) == a.rows * b.cols
 {
+    let total = a.rows * b.cols
     let m = a.rows
     let k = a.cols
     let n = b.cols
-    let total = m * n
     let zero Float32 = 0.0 as Float32
     var out List[Float32] = list_filled(total, zero)
     var i = 0
@@ -325,7 +325,7 @@ pub pure fn tensor2d_matmul(a Tensor2D, b Tensor2D) Tensor2D
         }
         i += 1
     }
-    Tensor2D { rows = m, cols = n, data = out }
+    Tensor2D { rows = a.rows, cols = b.cols, data = out }
 }
 
 /// Verified elementwise fused `ReLU(A + B)` with exact shape equality proof.
