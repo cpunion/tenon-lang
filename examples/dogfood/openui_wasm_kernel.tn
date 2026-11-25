@@ -1,0 +1,35 @@
+// examples/dogfood/openui_wasm_kernel.tn — Single-Source OpenUI Lang + Reactive VDOM Kernel for Wasm32!
+//
+// Compiles directly via LLVM `wasm32-unknown-unknown` + Perceus linear-memory runtime into a tiny
+// `.wasm` module + zero-boilerplate `.mjs` ESM auto-object bridge (`--emit-mjs`), driving
+// streaming OpenUI Lang -> keyed VDOM JSON patches + SSR HTML in browsers & Node.js V8 with 0 leaks.
+
+import "std/ui/vdom.tn"
+import "std/ui/openui.tn"
+
+pub pure fn render_openui_html(openui_src Text, users_val Text) Text {
+    let doc = openui_parse_stream(openui_src, true)
+    let store = ui_store_set(ui_store_new(), "users", users_val)
+    let tree = openui_to_vdom(doc, store)
+    vnode_to_html(tree)
+}
+
+pub pure fn diff_openui_patches(openui_src Text, prev_users Text, next_users Text) Text {
+    let doc = openui_parse_stream(openui_src, true)
+    let prev_store = ui_store_set(ui_store_new(), "users", prev_users)
+    let next_store = ui_store_set(ui_store_new(), "users", next_users)
+    let prev_tree = openui_to_vdom(doc, prev_store)
+    let next_tree = openui_to_vdom(doc, next_store)
+    patches_to_json(diff_vdom(prev_tree, next_tree))
+}
+
+pub pure fn get_openui_prompt() Text {
+    openui_generate_system_prompt(openui_default_schemas())
+}
+
+pub fn main() Int {
+    let src = "root = Card([hdr, row, chart, btn])\nhdr = Header(\"Tenon OpenUI\", \"Wasm32 + VDOM\")\nrow = Row([m1, m2])\nm1 = Metric(\"Users\", $users, \"+14%\")\nm2 = Metric(\"Leaks\", \"0\", \"Perceus\")\nchart = BarChart([\"Q1\", \"Q2\", \"Q3\"], [90, 140, 210])\nbtn = Button(\"Refresh\", @refresh)\n"
+    let html = render_openui_html(src, "12,480")
+    let patch_json = diff_openui_patches(src, "12,480", "13,100")
+    len(html) + len(patch_json)
+}

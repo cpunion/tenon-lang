@@ -249,6 +249,10 @@ pub struct L0Env {
     pub floats: BTreeMap<String, (f64, f64)>,
     /// Difference bounds `a - b <= c` stored as `(a, b) -> c`.
     pub diffs: BTreeMap<(String, String), i128>,
+    /// Symbolic product lower bounds `var >= a * b` (used to prove 2D row-major `y * w + x < len(grid)` in L0!).
+    pub product_lbs: BTreeMap<String, Vec<(String, String)>>,
+    /// Element abstract integer intervals for refined `List[RefinedT]` / `[T; N]` bindings (`list_var -> AbsInt`).
+    pub elem_ints: BTreeMap<String, AbsInt>,
     /// Flow-sensitively assumed pure predicate calls (e.g. `is_safe_rel_path(p)`).
     pub proved_calls: BTreeSet<String>,
     /// Pure function declarations available for bounded CTFE and ensures summaries.
@@ -269,6 +273,124 @@ pub enum L0Result {
 impl L0Env {
     pub fn set_int(&mut self, name: impl Into<String>, val: AbsInt) {
         self.ints.insert(name.into(), val);
+    }
+
+    pub fn record_product_lb(&mut self, var: String, a: String, b: String) {
+        let entry = self.product_lbs.entry(var).or_default();
+        if !entry.iter().any(|(x, y)| (x == &a && y == &b) || (x == &b && y == &a)) {
+            entry.push((a, b));
+        }
+    }
+
+    fn var_lt(&self, a: &str, b: &str) -> bool {
+        if let Some(&d) = self.diffs.get(&(a.to_string(), b.to_string())) {
+            if d <= -1 {
+                return true;
+            }
+        }
+        // Check 1-hop transitivity: `a < mid` and `mid <= b`, or `a <= mid` and `mid < b`
+        for ((x, mid), &d1) in &self.diffs {
+            if x == a && d1 <= 0 {
+                if let Some(&d2) = self.diffs.get(&(mid.clone(), b.to_string())) {
+                    if d1 + d2 <= -1 {
+                        return true;
+                    }
+                }
+            }
+        }
+        let ai = self.get_int(a).interval;
+        let bi = self.get_int(b).interval;
+        ai.max < bi.min
+    }
+
+    fn var_non_neg(&self, v: &str) -> bool {
+        self.get_int(v).interval.min >= 0
+    }
+
+    /// Proves `row * stride + col < bound` when `bound >= stride * height` (or `height * stride`)
+    /// and `0 <= row < height && 0 <= col < stride`.
+    fn try_prove_2d_index_lt(&self, left: &Expr, right: &Expr, self_var: Option<&str>) -> bool {
+        // Decompose `left` as `(p1 * p2) + c` or `c + (p1 * p2)`
+        let (mul_a, mul_b, add_c) = match &left.kind {
+            ExprKind::Binary {
+                op: BinOp::Add,
+                left: l,
+                right: r,
+            } => {
+                if let ExprKind::Binary {
+                    op: BinOp::Mul,
+                    left: ma,
+                    right: mb,
+                } = &l.kind
+                {
+                    (ma.as_ref(), mb.as_ref(), r.as_ref())
+                } else if let ExprKind::Binary {
+                    op: BinOp::Mul,
+                    left: ma,
+                    right: mb,
+                } = &r.kind
+                {
+                    (ma.as_ref(), mb.as_ref(), l.as_ref())
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        };
+        let (Some(a), Some(b), Some(c)) = (
+            expr_var_name(mul_a, self_var),
+            expr_var_name(mul_b, self_var),
+            expr_var_name(add_c, self_var),
+        ) else {
+            return false;
+        };
+        if !self.var_non_neg(&a) || !self.var_non_neg(&b) || !self.var_non_neg(&c) {
+            return false;
+        }
+        // Gather candidate `(d1, d2)` products such that `right >= d1 * d2`
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        if let ExprKind::Binary {
+            op: BinOp::Mul,
+            left: ra,
+            right: rb,
+        } = &right.kind
+        {
+            if let (Some(x), Some(y)) =
+                (expr_var_name(ra, self_var), expr_var_name(rb, self_var))
+            {
+                candidates.push((x, y));
+            }
+        }
+        if let Some(rname) = expr_var_name(right, self_var) {
+            if let Some(prods) = self.product_lbs.get(&rname) {
+                candidates.extend(prods.iter().cloned());
+            }
+            // Also check vars `m` with `m <= rname` (diffs[(m, rname)] <= 0)
+            for ((m, target), &d) in &self.diffs {
+                if target == &rname && d <= 0 {
+                    if let Some(prods) = self.product_lbs.get(m) {
+                        candidates.extend(prods.iter().cloned());
+                    }
+                }
+            }
+        }
+        for (d1, d2) in candidates {
+            // Orientation 1: `stride` is `b`, `row` is `a`, `col` is `c` -> need `a < h && c < b`
+            if b == d1 && self.var_lt(&a, &d2) && self.var_lt(&c, &b) {
+                return true;
+            }
+            if b == d2 && self.var_lt(&a, &d1) && self.var_lt(&c, &b) {
+                return true;
+            }
+            // Orientation 2: `stride` is `a`, `row` is `b`, `col` is `c` -> need `b < h && c < a`
+            if a == d1 && self.var_lt(&b, &d2) && self.var_lt(&c, &a) {
+                return true;
+            }
+            if a == d2 && self.var_lt(&b, &d1) && self.var_lt(&c, &a) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn get_int(&self, name: &str) -> AbsInt {
@@ -538,6 +660,40 @@ impl L0Env {
             }
         }
 
+        // Symbolic product lower bounds: `var == a * b` / `var >= a * b` (and flipped `a * b == var` / `a * b <= var`)
+        if matches!(op, BinOp::Eq | BinOp::Ge) {
+            if let Some(lhs_v) = expr_var_name(left, self_var) {
+                if let ExprKind::Binary {
+                    op: BinOp::Mul,
+                    left: m1,
+                    right: m2,
+                } = &right.kind
+                {
+                    if let (Some(a), Some(b)) =
+                        (expr_var_name(m1, self_var), expr_var_name(m2, self_var))
+                    {
+                        self.record_product_lb(lhs_v, a, b);
+                    }
+                }
+            }
+        }
+        if matches!(op, BinOp::Eq | BinOp::Le) {
+            if let Some(rhs_v) = expr_var_name(right, self_var) {
+                if let ExprKind::Binary {
+                    op: BinOp::Mul,
+                    left: m1,
+                    right: m2,
+                } = &left.kind
+                {
+                    if let (Some(a), Some(b)) =
+                        (expr_var_name(m1, self_var), expr_var_name(m2, self_var))
+                    {
+                        self.record_product_lb(rhs_v, a, b);
+                    }
+                }
+            }
+        }
+
         // General interval refinement: `var <op> expr` refines `var` using `eval_abs_int(expr).interval`
         if let Some(var) = expr_var_name(left, self_var) {
             let ri = self.eval_abs_int(right, self_var).interval;
@@ -621,6 +777,14 @@ impl L0Env {
                         non_zero: false,
                     }
                 }
+            }
+            ExprKind::Index { target, .. } => {
+                if let Some(base) = expr_var_name(target, self_var) {
+                    if let Some(elem_abs) = self.elem_ints.get(&base) {
+                        return *elem_abs;
+                    }
+                }
+                AbsInt::top()
             }
             ExprKind::Field { target, field } => {
                 if let Some(base) = expr_var_name(target, self_var) {
@@ -1076,6 +1240,15 @@ impl L0Env {
                     _ => {}
                 }
             }
+        }
+
+        // 2b. 2D Row-Major Index In-Bounds Theorem:
+        // If `0 <= row < h` and `0 <= col < w`, then `row * w + col < w * h` (and `< bound` whenever `bound >= w * h`)!
+        if op == BinOp::Lt && self.try_prove_2d_index_lt(left, right, self_var) {
+            return L0Result::Proved;
+        }
+        if op == BinOp::Gt && self.try_prove_2d_index_lt(right, left, self_var) {
+            return L0Result::Proved;
         }
 
         // 3. Interval check

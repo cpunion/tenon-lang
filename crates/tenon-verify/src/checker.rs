@@ -2,7 +2,8 @@ use crate::l0::{AbsInt, Interval, L0Env, L0Result};
 use crate::mir::{
     MirFnSummary, VerifiedMir, access_paths_overlap, analyze_function_escapes,
     compute_stack_promotable_vars, extract_access_path, prove_binop_no_overflow,
-    verify_arena_function, verify_checkfree_function, verify_fip_function, verify_linear_tokens,
+    type_expr_to_linear_name, verify_arena_function, verify_checkfree_function,
+    verify_fip_function, verify_linear_tokens,
 };
 use crate::smt::{SmtOutcome, SmtQuery};
 use crate::sync_solver::{DistributedAppManifest, solve_distributed_manifest};
@@ -2698,23 +2699,133 @@ impl CheckerCtx {
                 let infer_linear_ty = |e: &Expr, lmap: &BTreeMap<String, String>| -> Option<String> {
                     match &e.kind {
                         ExprKind::RecordLit { name, .. } => Some(name.clone()),
-                        ExprKind::Ident(v) => lmap.get(v).cloned(),
-                        ExprKind::Call { callee, .. } => {
-                            if let ExprKind::Ident(fnm) = &callee.kind {
-                                self.all_fns.get(fnm).and_then(|fd| {
-                                    fd.ret_ty.as_ref().and_then(|rt| match rt {
-                                        TypeExpr::Named { name, .. } => Some(name.clone()),
-                                        _ => None,
+                        ExprKind::Ident(v) => lmap.get(v).cloned().or_else(|| {
+                            var_types
+                                .get(v)
+                                .and_then(|t| type_expr_to_linear_name(t, &self.linear_records))
+                        }),
+                        ExprKind::Try(inner) => {
+                            let base = match &inner.kind {
+                                ExprKind::Ident(v) => lmap.get(v).cloned(),
+                                _ => {
+                                    let t = self.infer_expr_type(inner, &var_types);
+                                    type_expr_to_linear_name(&t, &self.linear_records)
+                                }
+                            }?;
+                            base.strip_prefix("Result[")
+                                .or_else(|| base.strip_prefix("Option["))
+                                .and_then(|s| s.strip_suffix(']'))
+                                .map(|s| s.to_string())
+                        }
+                        ExprKind::Call { callee, args } => {
+                            match &callee.kind {
+                                ExprKind::Ident(fnm) => {
+                                    if (fnm == "Ok" || fnm == "Some") && args.len() == 1 {
+                                        let arg_t = self.infer_expr_type(&args[0].value, &var_types);
+                                        if let Some(an) = type_expr_to_linear_name(&arg_t, &self.linear_records) {
+                                            if self.linear_records.contains(&an) {
+                                                let wrap = if fnm == "Ok" { "Result" } else { "Option" };
+                                                return Some(format!("{}[{}]", wrap, an));
+                                            }
+                                        }
+                                    }
+                                    self.all_fns.get(fnm).and_then(|fd| {
+                                        fd.ret_ty
+                                            .as_ref()
+                                            .and_then(|rt| type_expr_to_linear_name(rt, &self.linear_records))
                                     })
-                                })
-                            } else {
-                                None
+                                }
+                                ExprKind::Field { target, field } => {
+                                    // Enum variant ctor `Result.Ok(tok)` / `Option.Some(tok)`
+                                    if (field == "Ok" || field == "Some") && args.len() == 1 {
+                                        let arg_t = self.infer_expr_type(&args[0].value, &var_types);
+                                        if let Some(an) = type_expr_to_linear_name(&arg_t, &self.linear_records) {
+                                            if self.linear_records.contains(&an) {
+                                                let wrap = if field == "Ok" { "Result" } else { "Option" };
+                                                return Some(format!("{}[{}]", wrap, an));
+                                            }
+                                        }
+                                    }
+                                    // Inherent method call `recv.method(...)` or assoc `Type.new(...)`
+                                    let recv_name = match &target.kind {
+                                        ExprKind::Ident(s) => lmap
+                                            .get(s)
+                                            .cloned()
+                                            .or_else(|| {
+                                                var_types.get(s).and_then(|t| {
+                                                    type_expr_to_linear_name(t, &self.linear_records)
+                                                })
+                                            })
+                                            .or_else(|| Some(s.clone())),
+                                        _ => {
+                                            let rt = self.infer_expr_type(target, &var_types);
+                                            type_expr_to_linear_name(&rt, &self.linear_records)
+                                        }
+                                    };
+                                    recv_name.and_then(|rty| {
+                                        self.resolve_method_sig(&named_ty(&rty), field)
+                                            .or_else(|| self.resolve_assoc_method_sig(&rty, field))
+                                            .or_else(|| self.all_fns.get(&format!("{}::{}", rty, field)).cloned())
+                                            .or_else(|| self.all_fns.get(&format!("{}.{}", rty, field)).cloned())
+                                            .and_then(|fd| {
+                                                fd.ret_ty.as_ref().and_then(|rt| {
+                                                    type_expr_to_linear_name(rt, &self.linear_records)
+                                                })
+                                            })
+                                    })
+                                }
+                                _ => None,
                             }
                         }
                         _ => None,
                     }
                 };
-                let lin_diags = verify_linear_tokens(f, &self.linear_records, &infer_linear_ty);
+                let is_param_borrowing =
+                    |call_expr: &Expr, param_idx: usize, lmap: &BTreeMap<String, String>| -> bool {
+                        let ExprKind::Call { callee, .. } = &call_expr.kind else {
+                            return false;
+                        };
+                        let fd_opt: Option<FnDecl> = match &callee.kind {
+                            ExprKind::Ident(fnm) => self.all_fns.get(fnm).cloned(),
+                            ExprKind::Field { target, field } => {
+                                let rty = match &target.kind {
+                                    ExprKind::Ident(s) => lmap
+                                        .get(s)
+                                        .cloned()
+                                        .or_else(|| {
+                                            var_types.get(s).and_then(|t| {
+                                                type_expr_to_linear_name(t, &self.linear_records)
+                                            })
+                                        })
+                                        .or_else(|| Some(s.clone())),
+                                    _ => {
+                                        let rt = self.infer_expr_type(target, &var_types);
+                                        type_expr_to_linear_name(&rt, &self.linear_records)
+                                    }
+                                };
+                                rty.and_then(|r| {
+                                    self.resolve_method_sig(&named_ty(&r), field)
+                                        .or_else(|| self.resolve_assoc_method_sig(&r, field))
+                                        .or_else(|| self.all_fns.get(&format!("{}::{}", r, field)).cloned())
+                                        .or_else(|| self.all_fns.get(&format!("{}.{}", r, field)).cloned())
+                                })
+                            }
+                            _ => None,
+                        };
+                        let Some(fd) = fd_opt else {
+                            return false;
+                        };
+                        if fd.attrs.iter().any(|a| a.name == "borrow") {
+                            return true;
+                        }
+                        fd.params.get(param_idx).is_some_and(|p| p.is_inout)
+                    };
+                let lin_diags = verify_linear_tokens(
+                    f,
+                    &self.linear_records,
+                    &infer_linear_ty,
+                    &is_param_borrowing,
+                );
                 self.diagnostics.extend(lin_diags);
             }
         }
@@ -3104,7 +3215,19 @@ impl CheckerCtx {
             env.fn_var_ret_tys.insert(var_name.to_string(), (**r).clone());
             return;
         }
-        if let TypeExpr::Named { name, .. } = ty {
+        if let TypeExpr::Array { elem, .. } = ty {
+            if let Some(eabs) = self.compute_elem_abs_int(elem, env) {
+                env.elem_ints.insert(var_name.to_string(), eabs);
+            }
+            return;
+        }
+        if let TypeExpr::Named { name, args, .. } = ty {
+            if name == "List" && args.len() == 1 {
+                if let Some(eabs) = self.compute_elem_abs_int(&args[0], env) {
+                    env.elem_ints.insert(var_name.to_string(), eabs);
+                }
+                return;
+            }
             if let Some(sk) = ScalarKind::from_name(name) {
                 if sk.is_int() {
                     smt_int_vars.insert(var_name.to_string());
@@ -3280,6 +3403,33 @@ impl CheckerCtx {
                                 let fabs = env.eval_abs_int(fexpr, None);
                                 env.set_int(fkey.clone(), fabs);
                                 smt_int_vars.insert(fkey.clone());
+                                if let Some(fp) = expr_simple_path(fexpr) {
+                                    env.diffs.insert((fkey.clone(), fp.clone()), 0);
+                                    env.diffs.insert((fp.clone(), fkey.clone()), 0);
+                                    let dst_lk = format!("__len__{}__{}", name, fname);
+                                    let src_lk = format!("__len__{}", fp.replace('.', "__"));
+                                    let labs = env.get_int(&src_lk);
+                                    env.set_int(dst_lk.clone(), labs);
+                                    env.diffs.insert((dst_lk.clone(), src_lk.clone()), 0);
+                                    env.diffs.insert((src_lk.clone(), dst_lk.clone()), 0);
+                                    if let Some(prods) = env.product_lbs.get(&src_lk).cloned() {
+                                        for (a, b) in prods {
+                                            env.record_product_lb(dst_lk.clone(), a, b);
+                                        }
+                                    }
+                                    smt_int_vars.insert(dst_lk.clone());
+                                    smt_premises.push((
+                                        Expr {
+                                            kind: ExprKind::Binary {
+                                                op: BinOp::Eq,
+                                                left: Box::new(Expr { kind: ExprKind::Ident(dst_lk), span: fexpr.span }),
+                                                right: Box::new(Expr { kind: ExprKind::Ident(src_lk), span: fexpr.span }),
+                                            },
+                                            span: fexpr.span,
+                                        },
+                                        BTreeMap::new(),
+                                    ));
+                                }
                                 let eq = Expr {
                                     kind: ExprKind::Binary {
                                         op: BinOp::Eq,
@@ -3386,6 +3536,23 @@ impl CheckerCtx {
                                 if let ExprKind::Ident(nvar) = &args[0].value.kind {
                                     env.diffs.insert((lk.clone(), nvar.clone()), 0);
                                     env.diffs.insert((nvar.clone(), lk.clone()), 0);
+                                    if let Some(prods) = env.product_lbs.get(nvar).cloned() {
+                                        for (a, b) in prods {
+                                            env.record_product_lb(lk.clone(), a, b);
+                                        }
+                                    }
+                                } else if let ExprKind::Binary {
+                                    op: BinOp::Mul,
+                                    left: ma,
+                                    right: mb,
+                                } = &args[0].value.kind
+                                {
+                                    if let (Some(a), Some(b)) = (
+                                        expr_simple_path(ma),
+                                        expr_simple_path(mb),
+                                    ) {
+                                        env.record_product_lb(lk.clone(), a, b);
+                                    }
                                 }
                                 if self.expr_smt_encodable(&args[0].value) {
                                     smt_premises.push((
@@ -3789,26 +3956,27 @@ impl CheckerCtx {
                             let list_ty = self.resolve_base_type(&self.infer_expr_type(list_expr, var_types));
                             if let TypeExpr::Named { name: ln, args: la, .. } = list_ty {
                                 if (ln == "List" || ln == "Bytes")
-                                    && matches!(&list_expr.kind, ExprKind::Ident(_))
+                                    && expr_simple_path(list_expr).is_some()
                                 {
+                                    let lpath = expr_simple_path(list_expr).unwrap();
+                                    if let Some(tier) = self.try_prove_list_index_in_bounds(
+                                        list_expr,
+                                        index,
+                                        env,
+                                        smt_int_vars,
+                                        smt_premises,
+                                    ) {
+                                        self.proved_safe_indices.insert(target.span.start);
+                                        self.proofs.push(ProofRecord {
+                                            obligation: format!(
+                                                "in-bounds index write `{}[...]`",
+                                                lpath
+                                            ),
+                                            tier,
+                                            span: target.span,
+                                        });
+                                    }
                                     if let ExprKind::Ident(lvar) = &list_expr.kind {
-                                        if let Some(tier) = self.try_prove_list_index_in_bounds(
-                                            lvar,
-                                            index,
-                                            env,
-                                            smt_int_vars,
-                                            smt_premises,
-                                        ) {
-                                            self.proved_safe_indices.insert(target.span.start);
-                                            self.proofs.push(ProofRecord {
-                                                obligation: format!(
-                                                    "in-bounds index write `{}[...]`",
-                                                    lvar
-                                                ),
-                                                tier,
-                                                span: target.span,
-                                            });
-                                        }
                                         // Track SSA array state `__arr__<lvar> = (store prev idx val)` for quantifier proofs!
                                         if ln == "List"
                                             && *op == AssignOp::Set
@@ -3936,9 +4104,14 @@ impl CheckerCtx {
                         );
                     }
 
-                    // 2. Soundly widen variables mutated inside the loop before checking cond & body!
+                    // 1b. Sound Canonical Counting Loop Auto-Invariant Synthesis (`0 <= i && i <= bound`):
+                    // Automatically infers sound invariants for canonical loops like `var i = 0; while i < n { ...; i += 1 }`
+                    // BEFORE widening mutated variables, so `@checkfree` and bounds-check elision work effortlessly!
                     let mut mutated = BTreeSet::new();
                     collect_mutated_vars_in_block(body, &mut mutated);
+                    let auto_invariants = self.synthesize_canonical_loop_invariants(cond, body, &mutated, env);
+
+                    // 2. Soundly widen variables mutated inside the loop before checking cond & body!
                     for mv in &mutated {
                         env.ints.remove(mv);
                         env.bools.remove(mv);
@@ -3961,7 +4134,7 @@ impl CheckerCtx {
                         saw_return,
                     );
 
-                    // 3. Inductive Hypothesis: inside body, assume `invariants` AND `cond`.
+                    // 3. Inductive Hypothesis: inside body, assume `invariants`, sound `auto_invariants`, AND `cond`.
                     let mut body_env = env.clone();
                     let mut body_vars = smt_int_vars.clone();
                     let mut body_premises = smt_premises.clone();
@@ -3969,7 +4142,7 @@ impl CheckerCtx {
                     let mut body_mut = mutable_vars.clone();
                     body_env.assume_expr(cond, None);
                     body_premises.push((cond.clone(), BTreeMap::new()));
-                    for inv in invariants {
+                    for inv in invariants.iter().chain(auto_invariants.iter()) {
                         body_env.assume_expr(inv, None);
                         body_env.assume_float_expr(inv, None);
                         body_premises.push((inv.clone(), BTreeMap::new()));
@@ -4080,13 +4253,13 @@ impl CheckerCtx {
                         }
                     }
 
-                    // 6. Post-Loop Exit Propagation: assume all proved `invariants`, plus `!cond` if no `break`!
-                    for inv in invariants {
+                    // 6. Post-Loop Exit Propagation: assume all proved `invariants` & `auto_invariants`, plus `!cond` if no `break`!
+                    for inv in invariants.iter().chain(auto_invariants.iter()) {
                         env.assume_expr(inv, None);
                         env.assume_float_expr(inv, None);
                         smt_premises.push((inv.clone(), BTreeMap::new()));
                     }
-                    if !invariants.is_empty() && !block_contains_break(body) {
+                    if (!invariants.is_empty() || !auto_invariants.is_empty()) && !block_contains_break(body) {
                         let neg_cond = Expr {
                             kind: ExprKind::Unary {
                                 op: UnOp::Not,
@@ -5421,9 +5594,9 @@ impl CheckerCtx {
                         });
                     }
                 } else if matches!(&tty, TypeExpr::Named { name, .. } if name == "List" || name == "Bytes") {
-                    if let ExprKind::Ident(list_var) = &target.kind {
+                    if let Some(lpath) = expr_simple_path(target) {
                         if let Some(tier) = self.try_prove_list_index_in_bounds(
-                            list_var,
+                            target,
                             index,
                             env,
                             smt_int_vars,
@@ -5433,7 +5606,7 @@ impl CheckerCtx {
                             self.proofs.push(ProofRecord {
                                 obligation: format!(
                                     "list index `{}[...]` proved in bounds `0 <= idx < len({})` (bounds-check elided)",
-                                    list_var, list_var
+                                    lpath, lpath
                                 ),
                                 tier,
                                 span: index.span,
@@ -8329,6 +8502,26 @@ impl CheckerCtx {
         if let Some(te) = tail_expr {
             let abs = env.eval_abs_int(te, None);
             check_env.set_int("result", abs);
+            if let ExprKind::RecordLit { fields, .. } = &te.kind {
+                for (fname, fexpr) in fields {
+                    let rf = format!("result.{}", fname);
+                    check_env.set_int(rf.clone(), env.eval_abs_int(fexpr, None));
+                    if let Some(fp) = expr_simple_path(fexpr) {
+                        check_env.diffs.insert((rf.clone(), fp.clone()), 0);
+                        check_env.diffs.insert((fp.clone(), rf.clone()), 0);
+                        let rlk = format!("__len__result__{}", fname);
+                        let slk = format!("__len__{}", fp.replace('.', "__"));
+                        check_env.set_int(rlk.clone(), env.get_int(&slk));
+                        check_env.diffs.insert((rlk.clone(), slk.clone()), 0);
+                        check_env.diffs.insert((slk.clone(), rlk.clone()), 0);
+                        if let Some(prods) = env.product_lbs.get(&slk).cloned() {
+                            for (a, b) in prods {
+                                check_env.record_product_lb(rlk.clone(), a, b);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         match check_env.check_predicate(ens, Some("result")) {
@@ -8371,7 +8564,22 @@ impl CheckerCtx {
             let _ = q.add_premise_expr(p, s);
         }
         if let Some(te) = tail_expr {
-            if let Ok(te_smt) = crate::smt::encode_expr(te, &BTreeMap::new()) {
+            if let ExprKind::RecordLit { fields, .. } = &te.kind {
+                for (fname, fexpr) in fields {
+                    let rf_smt = format!("result__{}", fname);
+                    if let Ok(fe_smt) = crate::smt::encode_expr(fexpr, &BTreeMap::new()) {
+                        q.declare_int(rf_smt.clone());
+                        q.premises.push(format!("(= {} {})", rf_smt, fe_smt));
+                    }
+                    if let Some(fp) = expr_simple_path(fexpr) {
+                        let rlk = format!("__len__result__{}", fname);
+                        let slk = format!("__len__{}", fp.replace('.', "__"));
+                        q.declare_int(rlk.clone());
+                        q.declare_int(slk.clone());
+                        q.premises.push(format!("(= {} {})", rlk, slk));
+                    }
+                }
+            } else if let Ok(te_smt) = crate::smt::encode_expr(te, &BTreeMap::new()) {
                 q.premises.push(format!("(= result {})", te_smt));
             } else if let Ok(body_smt) = crate::smt::encode_block(&f.body, &BTreeMap::new()) {
                 q.premises.push(format!("(= result {})", body_smt));
@@ -8412,9 +8620,52 @@ impl CheckerCtx {
         }
     }
 
+    fn compute_elem_abs_int(&self, elem_ty: &TypeExpr, base_env: &L0Env) -> Option<AbsInt> {
+        let mut tmp = L0Env {
+            pure_fns: base_env.pure_fns.clone(),
+            type_aliases: base_env.type_aliases.clone(),
+            ..Default::default()
+        };
+        let mut cur = elem_ty.clone();
+        let mut refined = false;
+        for _ in 0..8 {
+            let TypeExpr::Named { name, args, .. } = cur else {
+                break;
+            };
+            if let Some(sk) = ScalarKind::from_name(&name) {
+                if sk.is_int() {
+                    if let (Some(lo), Some(hi)) = (sk.min_i128(), sk.max_i128()) {
+                        if sk != ScalarKind::I64 {
+                            let prev = tmp.get_int("__elem__");
+                            tmp.set_int(
+                                "__elem__",
+                                prev.refine_interval(Interval { min: lo, max: hi }),
+                            );
+                            refined = true;
+                        }
+                    }
+                }
+                break;
+            } else if let Some(alias) = self.type_aliases.get(&name) {
+                if let Some(pred) = instantiate_alias_predicate(alias, &args) {
+                    tmp.assume_expr(&pred, Some("__elem__"));
+                    refined = true;
+                }
+                cur = alias.base.clone();
+            } else {
+                break;
+            }
+        }
+        if refined {
+            Some(tmp.get_int("__elem__"))
+        } else {
+            None
+        }
+    }
+
     fn try_prove_list_index_in_bounds(
         &self,
-        list_var: &str,
+        list_expr: &Expr,
         index: &Expr,
         env: &L0Env,
         smt_int_vars: &BTreeSet<String>,
@@ -8428,10 +8679,7 @@ impl CheckerCtx {
                 }),
                 args: vec![CallArg {
                     name: None,
-                    value: Expr {
-                        kind: ExprKind::Ident(list_var.to_string()),
-                        span: index.span,
-                    },
+                    value: list_expr.clone(),
                 }],
             },
             span: index.span,
@@ -8473,7 +8721,9 @@ impl CheckerCtx {
                 q.declare_int(v.clone());
             }
         }
-        q.declare_int(format!("__len__{}", list_var));
+        if let Some(lpath) = expr_simple_path(list_expr) {
+            q.declare_int(format!("__len__{}", lpath.replace('.', "__")));
+        }
         for (p, s) in smt_premises {
             let _ = q.add_premise_expr(p, s);
         }
@@ -8607,7 +8857,19 @@ impl CheckerCtx {
             env.fn_var_ret_tys.insert(var_name.to_string(), (**r).clone());
             return;
         }
-        if let TypeExpr::Named { name, .. } = ty {
+        if let TypeExpr::Array { elem, .. } = ty {
+            if let Some(eabs) = self.compute_elem_abs_int(elem, env) {
+                env.elem_ints.insert(var_name.to_string(), eabs);
+            }
+            return;
+        }
+        if let TypeExpr::Named { name, args, .. } = ty {
+            if name == "List" && args.len() == 1 {
+                if let Some(eabs) = self.compute_elem_abs_int(&args[0], env) {
+                    env.elem_ints.insert(var_name.to_string(), eabs);
+                }
+                return;
+            }
             if let Some(sk) = ScalarKind::from_name(name) {
                 if sk.is_int() {
                     smt_int_vars.insert(var_name.to_string());
@@ -9681,6 +9943,276 @@ fn inline_int_consts_in_expr(
             }
         }
         ExprKind::Block(b) => inline_int_consts_in_block(b, consts),
+        _ => {}
+    }
+}
+
+fn expr_simple_path(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Ident(s) => Some(s.clone()),
+        ExprKind::Field { target, field } => {
+            let base = expr_simple_path(target)?;
+            Some(format!("{}.{}", base, field))
+        }
+        _ => None,
+    }
+}
+
+impl CheckerCtx {
+    /// Soundly synthesizes canonical counting loop invariants (`0 <= i`, `i <= bound`)
+    /// for loops like `var i = 0; while i < bound { ...; i += 1 }` when `i` is only incremented
+    /// once per iteration by `+ 1` and never mutated via `inout`.
+    fn synthesize_canonical_loop_invariants(
+        &self,
+        cond: &Expr,
+        body: &Block,
+        mutated: &BTreeSet<String>,
+        pre_env: &L0Env,
+    ) -> Vec<Expr> {
+        let mut out = Vec::new();
+        let mut pairs: Vec<(String, Expr, Span)> = Vec::new();
+        collect_lt_loop_bounds(cond, &mut pairs);
+        for (iv, bound_expr, sp) in pairs {
+            if !mutated.contains(&iv) {
+                continue;
+            }
+            if mutated.iter().any(|m| expr_mentions_ident(&bound_expr, m)) {
+                continue;
+            }
+            let Some((inc_count, max_step)) = self.analyze_loop_counter_updates(body, &iv) else {
+                continue;
+            };
+            if inc_count == 0 {
+                continue;
+            }
+            let iv_expr = Expr {
+                kind: ExprKind::Ident(iv.clone()),
+                span: sp,
+            };
+            let init_abs = pre_env.eval_abs_int(&iv_expr, None);
+            if init_abs.interval.min >= 0 && inc_count == 1 && max_step == 1 {
+                out.push(Expr {
+                    kind: ExprKind::Binary {
+                        op: BinOp::Ge,
+                        left: Box::new(iv_expr.clone()),
+                        right: Box::new(Expr {
+                            kind: ExprKind::Int(0),
+                            span: sp,
+                        }),
+                    },
+                    span: sp,
+                });
+                let le_bound = Expr {
+                    kind: ExprKind::Binary {
+                        op: BinOp::Le,
+                        left: Box::new(iv_expr),
+                        right: Box::new(bound_expr),
+                    },
+                    span: sp,
+                };
+                if pre_env.check_predicate(&le_bound, None) == L0Result::Proved {
+                    out.push(le_bound);
+                }
+            }
+        }
+        out
+    }
+
+    fn analyze_loop_counter_updates(&self, blk: &Block, iv: &str) -> Option<(usize, i64)> {
+        let mut count = 0usize;
+        let mut max_step = 0i64;
+        for s in &blk.stmts {
+            match s {
+                Stmt::Assign { target, op, value, .. } => {
+                    if let ExprKind::Ident(v) = &target.kind {
+                        if v == iv {
+                            let step = match op {
+                                AssignOp::AddSet => match &value.kind {
+                                    ExprKind::Int(k) if *k >= 1 => Some(*k),
+                                    _ => None,
+                                },
+                                AssignOp::Set => match &value.kind {
+                                    ExprKind::Binary {
+                                        op: BinOp::Add,
+                                        left,
+                                        right,
+                                    } => match (&left.kind, &right.kind) {
+                                        (ExprKind::Ident(a), ExprKind::Int(k))
+                                            if a == iv && *k >= 1 =>
+                                        {
+                                            Some(*k)
+                                        }
+                                        (ExprKind::Int(k), ExprKind::Ident(a))
+                                            if a == iv && *k >= 1 =>
+                                        {
+                                            Some(*k)
+                                        }
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                },
+                                _ => None,
+                            }?;
+                            count += 1;
+                            max_step = max_step.max(step);
+                        }
+                    }
+                    if self.expr_mutates_via_inout(value, iv) {
+                        return None;
+                    }
+                }
+                Stmt::Mutate { target, body, .. } => {
+                    if target == iv {
+                        return None;
+                    }
+                    let (c, m) = self.analyze_loop_counter_updates(body, iv)?;
+                    count += c;
+                    max_step = max_step.max(m);
+                }
+                Stmt::Let { value, .. }
+                | Stmt::LetTuple { value, .. }
+                | Stmt::Expr { expr: value, .. }
+                | Stmt::Assert { cond: value, .. }
+                | Stmt::Return { value: Some(value), .. } => {
+                    let (c, m) = self.analyze_loop_counter_updates_expr(value, iv)?;
+                    count += c;
+                    max_step = max_step.max(m);
+                }
+                Stmt::While { cond, body, .. } => {
+                    if self.expr_mutates_via_inout(cond, iv) {
+                        return None;
+                    }
+                    let (c, m) = self.analyze_loop_counter_updates(body, iv)?;
+                    count += c;
+                    max_step = max_step.max(m);
+                }
+                Stmt::For { iter, body, .. } => {
+                    if self.expr_mutates_via_inout(iter, iv) {
+                        return None;
+                    }
+                    let (c, m) = self.analyze_loop_counter_updates(body, iv)?;
+                    count += c;
+                    max_step = max_step.max(m);
+                }
+                Stmt::Defer { body, .. } => {
+                    let (c, m) = self.analyze_loop_counter_updates(body, iv)?;
+                    count += c;
+                    max_step = max_step.max(m);
+                }
+                _ => {}
+            }
+        }
+        if let Some(t) = &blk.tail {
+            let (c, m) = self.analyze_loop_counter_updates_expr(t, iv)?;
+            count += c;
+            max_step = max_step.max(m);
+        }
+        Some((count, max_step))
+    }
+
+    fn analyze_loop_counter_updates_expr(&self, expr: &Expr, iv: &str) -> Option<(usize, i64)> {
+        if self.expr_mutates_via_inout(expr, iv) {
+            return None;
+        }
+        match &expr.kind {
+            ExprKind::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
+                let (ct, mt) = self.analyze_loop_counter_updates(then_block, iv)?;
+                let (ce, me) = if let Some(eb) = else_branch {
+                    self.analyze_loop_counter_updates_expr(eb, iv)?
+                } else {
+                    (0, 0)
+                };
+                // Sound upper bound: at most max(then, else) updates execute along any path.
+                Some((ct.max(ce), mt.max(me)))
+            }
+            ExprKind::Match { arms, .. } => {
+                let mut mc = 0usize;
+                let mut ms = 0i64;
+                for a in arms {
+                    let (c, s) = self.analyze_loop_counter_updates_expr(&a.body, iv)?;
+                    mc = mc.max(c);
+                    ms = ms.max(s);
+                }
+                Some((mc, ms))
+            }
+            ExprKind::Block(b) | ExprKind::Unsafe(b) => self.analyze_loop_counter_updates(b, iv),
+            _ => Some((0, 0)),
+        }
+    }
+
+    fn expr_mutates_via_inout(&self, expr: &Expr, iv: &str) -> bool {
+        match &expr.kind {
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Ident(fnm) = &callee.kind {
+                    if let Some(fd) = self.all_fns.get(fnm) {
+                        for (i, a) in args.iter().enumerate() {
+                            if fd.params.get(i).is_some_and(|p| p.is_inout)
+                                && matches!(&a.value.kind, ExprKind::Ident(v) if v == iv)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                self.expr_mutates_via_inout(callee, iv)
+                    || args.iter().any(|a| self.expr_mutates_via_inout(&a.value, iv))
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_mutates_via_inout(left, iv) || self.expr_mutates_via_inout(right, iv)
+            }
+            ExprKind::Unary { expr: e, .. }
+            | ExprKind::Try(e)
+            | ExprKind::Await(e)
+            | ExprKind::Cast { expr: e, .. }
+            | ExprKind::TryCast { expr: e, .. }
+            | ExprKind::Field { target: e, .. }
+            | ExprKind::TupleIndex { target: e, .. } => self.expr_mutates_via_inout(e, iv),
+            ExprKind::Index { target, index } => {
+                self.expr_mutates_via_inout(target, iv) || self.expr_mutates_via_inout(index, iv)
+            }
+            ExprKind::List(es) | ExprKind::Tuple(es) => {
+                es.iter().any(|e| self.expr_mutates_via_inout(e, iv))
+            }
+            ExprKind::RecordLit { fields, .. } => {
+                fields.iter().any(|(_, e)| self.expr_mutates_via_inout(e, iv))
+            }
+            _ => false,
+        }
+    }
+}
+
+fn collect_lt_loop_bounds(expr: &Expr, out: &mut Vec<(String, Expr, Span)>) {
+    match &expr.kind {
+        ExprKind::Binary {
+            op: BinOp::And,
+            left,
+            right,
+        } => {
+            collect_lt_loop_bounds(left, out);
+            collect_lt_loop_bounds(right, out);
+        }
+        ExprKind::Binary {
+            op: BinOp::Lt,
+            left,
+            right,
+        } => {
+            if let ExprKind::Ident(iv) = &left.kind {
+                out.push((iv.clone(), (**right).clone(), expr.span));
+            }
+        }
+        ExprKind::Binary {
+            op: BinOp::Gt,
+            left,
+            right,
+        } => {
+            if let ExprKind::Ident(iv) = &right.kind {
+                out.push((iv.clone(), (**left).clone(), expr.span));
+            }
+        }
         _ => {}
     }
 }

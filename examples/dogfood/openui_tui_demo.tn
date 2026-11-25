@@ -1,0 +1,35 @@
+// examples/dogfood/openui_tui_demo.tn — Live OpenUI Lang -> Unified VDOM -> Double-Buffered TUI Demo
+//
+// Compiles to a zero-Rust native LLVM -O3 executable that parses an OpenUI Lang stream,
+// evaluates forward references + `$var` state into a unified React-like VDOM, renders
+// Frame 1 and Frame 2 onto 2D TUI cell buffers, and prints the rendered TUI dashboard
+// plus minimal ANSI diff byte count.
+
+import "std/os/io.tn"
+import "std/text/text.tn"
+import "std/ui/vdom.tn"
+import "std/ui/openui.tn"
+import "std/ui/tui.tn"
+
+pub fn main() Int {
+    let openui_stream = "root = Card([hdr, kpis, chart, btn])\nhdr = Header(\"Tenon OpenUI Dashboard\", \"Unified VDOM -> Terminal TUI\")\nkpis = Row([m1, m2])\nm1 = Metric(\"Throughput\", $tps, \"+22%\")\nm2 = Metric(\"Memory Leaks\", \"0 objs\", \"Perceus\")\nchart = BarChart([\"Jan\", \"Feb\", \"Mar\"], [110, 165, 240])\nbtn = Button(\"Reload\", @reload)\n"
+
+    let doc = openui_parse_stream(openui_stream, true)
+    let state1 = ui_store_set(ui_store_new(), "tps", "182,400/s")
+    let state2 = ui_store_set(state1, "tps", "219,800/s")
+
+    let vdom1 = openui_to_vdom(doc, state1)
+    let vdom2 = openui_to_vdom(doc, state2)
+    let vdom_patches = diff_vdom(vdom1, vdom2)
+
+    let buf1 = render_vdom_to_tui(vdom1, 60, 14)
+    let buf2 = render_vdom_to_tui(vdom2, 60, 14)
+    let ansi_diff = tui_diff_ansi(buf1, buf2)
+
+    println("=== Tenon OpenUI -> Unified VDOM -> TUI (Frame 1) ===")
+    print(tui_buffer_to_plain_text(buf1))
+    println("=== Reactive State Update ($tps: 182,400/s -> 219,800/s) ===")
+    println("VDOM patches emitted : " ++ int_to_text(len(vdom_patches)))
+    println("TUI ANSI diff bytes  : " ++ int_to_text(len(ansi_diff)) ++ " bytes (of 840 cells)")
+    0
+}

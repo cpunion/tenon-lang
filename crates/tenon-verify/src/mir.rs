@@ -1177,13 +1177,60 @@ pub fn access_paths_overlap(a: &[String], b: &[String]) -> bool {
 }
 
 /// Verifies `@linear` / `@must_use` resource token linearity across a function body:
-/// every binding of a `@linear`/`@must_use` record type must be consumed exactly once
-/// (passed to a consuming function/method, moved into a struct/enum, or returned) before scope exit.
+/// Checks whether a linear type name represents either a direct `@linear` record `T`
+/// or a linear-carrying wrapper `Result[T]` / `Option[T]`.
+fn is_linear_ty_name(tname: &str, linear_records: &BTreeSet<String>) -> bool {
+    if linear_records.contains(tname) {
+        return true;
+    }
+    if let Some(inner) = tname
+        .strip_prefix("Result[")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        return linear_records.contains(inner);
+    }
+    if let Some(inner) = tname
+        .strip_prefix("Option[")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        return linear_records.contains(inner);
+    }
+    false
+}
+
+/// Extracts the inner linear type name from `Result[T]` / `Option[T]` when matching `Ok(v)` / `Some(v)`.
+fn unwrap_linear_wrapper_for_variant(scrut_ty: &str, variant_name: &str) -> Option<String> {
+    let short = variant_name.rsplit('.').next().unwrap_or(variant_name);
+    if short == "Ok" {
+        if let Some(inner) = scrut_ty
+            .strip_prefix("Result[")
+            .and_then(|s| s.strip_suffix(']'))
+        {
+            return Some(inner.to_string());
+        }
+    }
+    if short == "Some" {
+        if let Some(inner) = scrut_ty
+            .strip_prefix("Option[")
+            .and_then(|s| s.strip_suffix(']'))
+        {
+            return Some(inner.to_string());
+        }
+    }
+    None
+}
+
+/// Linear / Must-Use Typestate Verification (`@linear` / `@must_use`):
+/// every binding of a `@linear`/`@must_use` record type (or `Result[LinearT, E]` / `Option[LinearT]`)
+/// must be consumed exactly once (passed to a consuming function/method, matched & consumed,
+/// moved into a struct/enum, or returned) before scope exit.
+/// Borrowing via `inout` parameter or `@borrow` method keeps the resource live without consuming it.
 /// Emits `E0821` on dropped unconsumed tokens or use-after-consume.
 pub fn verify_linear_tokens(
     f: &FnDecl,
     linear_records: &BTreeSet<String>,
     infer_ty_name: &dyn Fn(&Expr, &BTreeMap<String, String>) -> Option<String>,
+    is_param_borrowing: &dyn Fn(&Expr, usize, &BTreeMap<String, String>) -> bool,
 ) -> Vec<Diagnostic> {
     if linear_records.is_empty() {
         return Vec::new();
@@ -1193,16 +1240,21 @@ pub fn verify_linear_tokens(
     let mut consumed: BTreeMap<String, (String, Span)> = BTreeMap::new();
     let mut var_ty_names: BTreeMap<String, String> = BTreeMap::new();
     let is_consumer_fn = f.attrs.iter().any(|a| a.name == "consume");
+    let is_borrow_fn = f.attrs.iter().any(|a| a.name == "borrow");
     for p in &f.params {
-        let tn = match &p.ty {
-            TypeExpr::Named { name, .. } => name.clone(),
-            _ => String::new(),
-        };
+        let tn = type_expr_to_linear_name(&p.ty, linear_records).unwrap_or_default();
         if !tn.is_empty() {
             var_ty_names.insert(p.name.clone(), tn.clone());
         }
-        let is_own_method = !tn.is_empty() && f.name.starts_with(&format!("{}.", tn));
-        if !p.is_inout && linear_records.contains(&tn) && !is_consumer_fn && !is_own_method {
+        let is_own_method = !tn.is_empty()
+            && (f.name.starts_with(&format!("{}.", tn))
+                || f.name.starts_with(&format!("{}::", tn)));
+        if !p.is_inout
+            && !is_borrow_fn
+            && is_linear_ty_name(&tn, linear_records)
+            && !is_consumer_fn
+            && !is_own_method
+        {
             live.insert(p.name.clone(), (tn, p.span));
         }
     }
@@ -1212,6 +1264,7 @@ pub fn verify_linear_tokens(
         &f.name,
         linear_records,
         infer_ty_name,
+        is_param_borrowing,
         &mut var_ty_names,
         &mut live,
         &mut consumed,
@@ -1240,12 +1293,33 @@ pub fn verify_linear_tokens(
     diags
 }
 
+pub fn type_expr_to_linear_name(
+    ty: &TypeExpr,
+    linear_records: &BTreeSet<String>,
+) -> Option<String> {
+    if let TypeExpr::Named { name, args, .. } = ty {
+        if linear_records.contains(name) {
+            return Some(name.clone());
+        }
+        if (name == "Result" || name == "Option") && !args.is_empty() {
+            if let TypeExpr::Named { name: inner, .. } = &args[0] {
+                if linear_records.contains(inner) {
+                    return Some(format!("{}[{}]", name, inner));
+                }
+            }
+        }
+        return Some(name.clone());
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_linear_block(
     blk: &Block,
     fn_name: &str,
     linear_records: &BTreeSet<String>,
     infer_ty_name: &dyn Fn(&Expr, &BTreeMap<String, String>) -> Option<String>,
+    is_param_borrowing: &dyn Fn(&Expr, usize, &BTreeMap<String, String>) -> bool,
     var_ty_names: &mut BTreeMap<String, String>,
     live: &mut BTreeMap<String, (String, Span)>,
     consumed: &mut BTreeMap<String, (String, Span)>,
@@ -1256,17 +1330,14 @@ fn check_linear_block(
     for s in &blk.stmts {
         match s {
             Stmt::Let { name, ty, value, span, .. } => {
-                consume_linear_expr(value, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+                consume_linear_expr(value, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, true, diags);
                 let tn = ty
                     .as_ref()
-                    .and_then(|t| match t {
-                        TypeExpr::Named { name, .. } => Some(name.clone()),
-                        _ => None,
-                    })
+                    .and_then(|t| type_expr_to_linear_name(t, linear_records))
                     .or_else(|| infer_ty_name(value, var_ty_names));
                 if let Some(tname) = tn {
                     var_ty_names.insert(name.clone(), tname.clone());
-                    if linear_records.contains(&tname) {
+                    if is_linear_ty_name(&tname, linear_records) {
                         if name == "_" {
                             diags.push(Diagnostic {
                                 code: "E0821".into(),
@@ -1287,7 +1358,7 @@ fn check_linear_block(
                 }
             }
             Stmt::Assign { target, value, .. } => {
-                consume_linear_expr(value, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+                consume_linear_expr(value, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, true, diags);
                 if let ExprKind::Ident(n) = &target.kind {
                     if let Some((ty, sp)) = live.get(n) {
                         diags.push(Diagnostic {
@@ -1305,7 +1376,7 @@ fn check_linear_block(
             }
             Stmt::Return { value, .. } => {
                 if let Some(v) = value {
-                    consume_linear_expr(v, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+                    consume_linear_expr(v, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, true, diags);
                 }
                 for (v, (ty, sp)) in live.iter() {
                     diags.push(Diagnostic {
@@ -1324,9 +1395,9 @@ fn check_linear_block(
                 return;
             }
             Stmt::Expr { expr, span } => {
-                consume_linear_expr(expr, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+                consume_linear_expr(expr, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, false, diags);
                 if let Some(tname) = infer_ty_name(expr, var_ty_names) {
-                    if linear_records.contains(&tname) {
+                    if is_linear_ty_name(&tname, linear_records) {
                         diags.push(Diagnostic {
                             code: "E0821".into(),
                             message: format!(
@@ -1341,27 +1412,27 @@ fn check_linear_block(
                 }
             }
             Stmt::Assert { cond, .. } => {
-                consume_linear_expr(cond, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+                consume_linear_expr(cond, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, false, diags);
             }
             Stmt::While { cond, body, .. } => {
-                consume_linear_expr(cond, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+                consume_linear_expr(cond, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, false, diags);
                 let mut r_sub = false;
-                check_linear_block(body, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, &mut r_sub, diags);
+                check_linear_block(body, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, &mut r_sub, diags);
             }
             Stmt::For { iter, body, .. } => {
-                consume_linear_expr(iter, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+                consume_linear_expr(iter, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, false, diags);
                 let mut r_sub = false;
-                check_linear_block(body, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, &mut r_sub, diags);
+                check_linear_block(body, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, &mut r_sub, diags);
             }
             Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
                 let mut r_sub = false;
-                check_linear_block(body, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, &mut r_sub, diags);
+                check_linear_block(body, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, &mut r_sub, diags);
             }
             _ => {}
         }
     }
     if let Some(t) = &blk.tail {
-        consume_linear_expr(t, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+        consume_linear_expr(t, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, true, diags);
     }
     for local in block_locals {
         if let Some((ty, sp)) = live.remove(&local) {
@@ -1390,6 +1461,7 @@ fn consume_linear_expr(
     fn_name: &str,
     linear_records: &BTreeSet<String>,
     infer_ty_name: &dyn Fn(&Expr, &BTreeMap<String, String>) -> Option<String>,
+    is_param_borrowing: &dyn Fn(&Expr, usize, &BTreeMap<String, String>) -> bool,
     var_ty_names: &mut BTreeMap<String, String>,
     live: &mut BTreeMap<String, (String, Span)>,
     consumed: &mut BTreeMap<String, (String, Span)>,
@@ -1417,43 +1489,184 @@ fn consume_linear_expr(
         }
         ExprKind::Field { target, .. } | ExprKind::TupleIndex { target, .. } => {
             // Reading a field (`tok.fd`) borrows the token; still reject use-after-consume!
-            consume_linear_expr(target, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+            consume_linear_expr(target, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, false, diags);
         }
         ExprKind::Call { callee, args } => {
-            // Method call `tok.close()` consumes receiver `tok`; free call `close(tok)` consumes arg `tok`.
+            // Distinguish borrowing (`inout` param / `@borrow` fn/method) vs consuming (by-value)!
             if let ExprKind::Field { target, .. } = &callee.kind {
-                consume_linear_expr(target, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+                let recv_borrows = is_param_borrowing(expr, 0, var_ty_names);
+                consume_linear_expr(target, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, !recv_borrows, diags);
+                for (i, a) in args.iter().enumerate() {
+                    let arg_borrows = is_param_borrowing(expr, i + 1, var_ty_names);
+                    consume_linear_expr(&a.value, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, !arg_borrows, diags);
+                }
             } else {
-                consume_linear_expr(callee, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
-            }
-            for a in args {
-                consume_linear_expr(&a.value, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+                consume_linear_expr(callee, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, false, diags);
+                for (i, a) in args.iter().enumerate() {
+                    let arg_borrows = is_param_borrowing(expr, i, var_ty_names);
+                    consume_linear_expr(&a.value, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, !arg_borrows, diags);
+                }
             }
         }
         ExprKind::RecordLit { fields, .. } => {
             for (_, v) in fields {
-                consume_linear_expr(v, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+                consume_linear_expr(v, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, true, diags);
             }
         }
         ExprKind::List(es) | ExprKind::Tuple(es) => {
             for e in es {
-                consume_linear_expr(e, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+                consume_linear_expr(e, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, true, diags);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            let scrut_ty = infer_ty_name(scrutinee, var_ty_names);
+            let scrut_is_linear = scrut_ty
+                .as_deref()
+                .is_some_and(|t| is_linear_ty_name(t, linear_records));
+            consume_linear_expr(
+                scrutinee,
+                fn_name,
+                linear_records,
+                infer_ty_name,
+                is_param_borrowing,
+                var_ty_names,
+                live,
+                consumed,
+                scrut_is_linear,
+                diags,
+            );
+            let pre_live = live.clone();
+            let mut merged_live: BTreeMap<String, (String, Span)> = BTreeMap::new();
+            let mut all_cons: Vec<BTreeMap<String, (String, Span)>> = Vec::new();
+            let mut any_non_returning = false;
+            for arm in arms {
+                let mut arm_live = pre_live.clone();
+                let mut arm_cons = consumed.clone();
+                let mut arm_tys = var_ty_names.clone();
+                let mut arm_locals: Vec<String> = Vec::new();
+                if let Some(ref sty) = scrut_ty {
+                    for pat in &arm.patterns {
+                        match pat {
+                            Pattern::Variant { name, binding: Some(b), span } => {
+                                if let Some(inner_lin) = unwrap_linear_wrapper_for_variant(sty, name) {
+                                    arm_tys.insert(b.clone(), inner_lin.clone());
+                                    if b == "_" {
+                                        diags.push(Diagnostic {
+                                            code: "E0821".into(),
+                                            message: format!(
+                                                "cannot discard `@linear` payload of `{}` in `match` inside `{}`",
+                                                inner_lin, fn_name
+                                            ),
+                                            span: *span,
+                                            notes: vec!["bind and explicitly consume or return the linear payload".into()],
+                                            counterexample: BTreeMap::new(),
+                                        });
+                                    } else {
+                                        arm_live.insert(b.clone(), (inner_lin, *span));
+                                        arm_cons.remove(b);
+                                        arm_locals.push(b.clone());
+                                    }
+                                }
+                            }
+                            Pattern::Ident(b, span) if scrut_is_linear => {
+                                arm_tys.insert(b.clone(), sty.clone());
+                                arm_live.insert(b.clone(), (sty.clone(), *span));
+                                arm_cons.remove(b);
+                                arm_locals.push(b.clone());
+                            }
+                            Pattern::Wildcard(span) if scrut_is_linear => {
+                                // Only flag wildcard discard if scrutinee is a direct linear type
+                                // (for Result[T]/Option[T], `_` may match Err/None after Ok/Some!)
+                                if linear_records.contains(sty) {
+                                    diags.push(Diagnostic {
+                                        code: "E0821".into(),
+                                        message: format!(
+                                            "cannot discard `@linear` value of type `{}` with `_` in `match` inside `{}`",
+                                            sty, fn_name
+                                        ),
+                                        span: *span,
+                                        notes: vec!["bind and consume the linear value".into()],
+                                        counterexample: BTreeMap::new(),
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let mut arm_ret = false;
+                if let ExprKind::Block(ablk) = &arm.body.kind {
+                    check_linear_block(
+                        ablk,
+                        fn_name,
+                        linear_records,
+                        infer_ty_name,
+                        is_param_borrowing,
+                        &mut arm_tys,
+                        &mut arm_live,
+                        &mut arm_cons,
+                        &mut arm_ret,
+                        diags,
+                    );
+                } else {
+                    consume_linear_expr(
+                        &arm.body,
+                        fn_name,
+                        linear_records,
+                        infer_ty_name,
+                        is_param_borrowing,
+                        &mut arm_tys,
+                        &mut arm_live,
+                        &mut arm_cons,
+                        in_move_pos,
+                        diags,
+                    );
+                }
+                if !arm_ret {
+                    for local in arm_locals {
+                        if let Some((ty, sp)) = arm_live.remove(&local) {
+                            diags.push(Diagnostic {
+                                code: "E0821".into(),
+                                message: format!(
+                                    "linear resource `{}` of type `{}` bound in `match` arm of `{}` is dropped without being consumed",
+                                    local, ty, fn_name
+                                ),
+                                span: sp,
+                                notes: vec![format!("consume or return `{}` inside the `match` arm", local)],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                    any_non_returning = true;
+                    merged_live.extend(arm_live);
+                    all_cons.push(arm_cons);
+                }
+            }
+            if any_non_returning {
+                for cmap in all_cons {
+                    for (k, v) in cmap {
+                        if !merged_live.contains_key(&k) {
+                            consumed.insert(k, v);
+                        }
+                    }
+                }
+                *live = merged_live;
             }
         }
         ExprKind::If { cond, then_block, else_branch } => {
-            consume_linear_expr(cond, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+            consume_linear_expr(cond, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, false, diags);
             let mut live_t = live.clone();
             let mut cons_t = consumed.clone();
             let mut ret_t = false;
-            check_linear_block(then_block, fn_name, linear_records, infer_ty_name, &mut var_ty_names.clone(), &mut live_t, &mut cons_t, &mut ret_t, diags);
+            check_linear_block(then_block, fn_name, linear_records, infer_ty_name, is_param_borrowing, &mut var_ty_names.clone(), &mut live_t, &mut cons_t, &mut ret_t, diags);
             if let Some(eb) = else_branch {
                 let mut live_e = live.clone();
                 let mut cons_e = consumed.clone();
                 let mut ret_e = false;
                 if let ExprKind::Block(eblk) = &eb.kind {
-                    check_linear_block(eblk, fn_name, linear_records, infer_ty_name, &mut var_ty_names.clone(), &mut live_e, &mut cons_e, &mut ret_e, diags);
+                    check_linear_block(eblk, fn_name, linear_records, infer_ty_name, is_param_borrowing, &mut var_ty_names.clone(), &mut live_e, &mut cons_e, &mut ret_e, diags);
                 } else {
-                    consume_linear_expr(eb, fn_name, linear_records, infer_ty_name, &mut var_ty_names.clone(), &mut live_e, &mut cons_e, in_move_pos, diags);
+                    consume_linear_expr(eb, fn_name, linear_records, infer_ty_name, is_param_borrowing, &mut var_ty_names.clone(), &mut live_e, &mut cons_e, in_move_pos, diags);
                 }
                 // After `if/else`, a token is still unconsumed if it remains live on EITHER non-returning branch.
                 let mut merged_live = BTreeMap::new();
@@ -1474,22 +1687,38 @@ fn consume_linear_expr(
                     }
                 }
                 *live = merged_live;
+            } else if !ret_t {
+                // `if cond { consume(tok) }` without `else` leaves `tok` consumed on one path and live on the other!
+                for (k, (ty, sp)) in live.iter() {
+                    if !live_t.contains_key(k) {
+                        diags.push(Diagnostic {
+                            code: "E0821".into(),
+                            message: format!(
+                                "linear resource `{}` of type `{}` is consumed inside `if` branch without `else` in `{}`",
+                                k, ty, fn_name
+                            ),
+                            span: *sp,
+                            notes: vec!["consume the resource on both `if` and `else` branches or return inside the `if` branch".into()],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                }
             }
         }
         ExprKind::Block(b) | ExprKind::Unsafe(b) => {
             let mut r = false;
-            check_linear_block(b, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, &mut r, diags);
+            check_linear_block(b, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, &mut r, diags);
         }
         ExprKind::Binary { left, right, .. } => {
-            consume_linear_expr(left, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
-            consume_linear_expr(right, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+            consume_linear_expr(left, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, false, diags);
+            consume_linear_expr(right, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, false, diags);
         }
         ExprKind::Unary { expr: e, .. }
         | ExprKind::Try(e)
         | ExprKind::Await(e)
         | ExprKind::Cast { expr: e, .. }
         | ExprKind::TryCast { expr: e, .. } => {
-            consume_linear_expr(e, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, in_move_pos, diags);
+            consume_linear_expr(e, fn_name, linear_records, infer_ty_name, is_param_borrowing, var_ty_names, live, consumed, in_move_pos, diags);
         }
         _ => {}
     }

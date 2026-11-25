@@ -1,0 +1,499 @@
+// std/ui/vdom.tn — Unified React-Like Virtual DOM for Web (Wasm32), Terminal (TUI), and Native GPU (`tenon-gpui`)
+//
+// Zero new keywords, 100% pure Tenon value types (Perceus COW + deterministic zero-leak RC).
+// A single `VNode` tree renders cleanly to:
+//   1. Web DOM via minimal keyed `VDomPatch` JSON stream (`diff_vdom` -> `patches_to_json`) or SSR HTML (`vnode_to_html`)
+//   2. Terminal TUI via double-buffered 2D cell grid (`std/ui/tui.tn`)
+//   3. Native GPU (`tenon-gpui`) via `@arena` Flexbox layout + batched `QuadInstance` scene graph (`std/ui/layout.tn`, `std/ui/scene.tn`)
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+import "std/text/builder.tn"
+
+pub record VProp {
+    name  Text
+    value Text
+}
+
+pub enum VNode {
+    VText(Text)
+    VEl(VElement)
+}
+
+pub record VElement {
+    tag      Text
+    key      Text
+    props    List[VProp]
+    children List[VNode]
+}
+
+pub record VDomPatch {
+    op    Text   // "replace" | "set_text" | "set_prop" | "remove_prop" | "insert_child" | "remove_child" | "move_child"
+    path  Text   // Slash-separated index path, e.g. "/" or "/0/2"
+    key   Text   // Prop name or child key
+    value Text   // New text, prop value, or serialized HTML/JSON node
+    index Int    // Child index for insert/remove/move
+}
+
+pub record UiStateEntry {
+    key   Text
+    value Text
+}
+
+pub record UiStore {
+    entries List[UiStateEntry]
+    version NonNegative
+}
+
+// =========================================================================
+// 1. Ergonomic React-like VDOM Constructors
+// =========================================================================
+
+pub pure fn vtext(s Text) VNode {
+    VText(s)
+}
+
+pub pure fn vprop(name Text, value Text) VProp {
+    VProp { name = name, value = value }
+}
+
+pub pure fn vel(tag Text, props List[VProp], children List[VNode]) VNode {
+    VEl(VElement { tag = tag, key = "", props = props, children = children })
+}
+
+pub pure fn vel_keyed(tag Text, key Text, props List[VProp], children List[VNode]) VNode {
+    VEl(VElement { tag = tag, key = key, props = props, children = children })
+}
+
+pub pure fn vnode_key(node VNode) Text {
+    match node {
+        VText(_) => ""
+        VEl(el) => el.key
+    }
+}
+
+pub pure fn vnode_prop(el VElement, name Text) Option[Text] {
+    var i = 0
+    while i < len(el.props) {
+        if el.props[i].name == name {
+            return Some(el.props[i].value)
+        }
+        i += 1
+    }
+    None
+}
+
+pub pure fn vnode_prop_or(el VElement, name Text, fallback Text) Text {
+    match vnode_prop(el, name) {
+        Some(v) => v
+        None => fallback
+    }
+}
+
+// =========================================================================
+// 2. Reactive State Store (`UiStore`) for `$var` Bindings & `@action` Events
+// =========================================================================
+
+pub pure fn ui_store_new() UiStore {
+    let empty List[UiStateEntry] = []
+    UiStore { entries = empty, version = 0 }
+}
+
+pub pure fn ui_store_get(store UiStore, key Text) Option[Text] {
+    var i = 0
+    while i < len(store.entries) {
+        if store.entries[i].key == key {
+            return Some(store.entries[i].value)
+        }
+        i += 1
+    }
+    None
+}
+
+pub pure fn ui_store_get_or(store UiStore, key Text, fallback Text) Text {
+    match ui_store_get(store, key) {
+        Some(v) => v
+        None => fallback
+    }
+}
+
+pub pure fn ui_store_set(store UiStore, key Text, value Text) UiStore {
+    var next List[UiStateEntry] = []
+    var found = false
+    var i = 0
+    while i < len(store.entries) {
+        let e = store.entries[i]
+        if e.key == key {
+            next = push(next, UiStateEntry { key = key, value = value })
+            found = true
+        } else {
+            next = push(next, e)
+        }
+        i += 1
+    }
+    if !found {
+        next = push(next, UiStateEntry { key = key, value = value })
+    }
+    UiStore { entries = next, version = store.version + 1 }
+}
+
+// =========================================================================
+// 3. Keyed Virtual DOM Differ (`diff_vdom`) — Bounded-Depth Total Termination
+// =========================================================================
+
+pure fn join_path(base Text, idx Int) Text {
+    if base == "/" {
+        "/" ++ int_to_text(idx)
+    } else {
+        base ++ "/" ++ int_to_text(idx)
+    }
+}
+
+pure fn find_prop_value(props List[VProp], name Text) Option[Text] {
+    var i = 0
+    while i < len(props) {
+        if props[i].name == name {
+            return Some(props[i].value)
+        }
+        i += 1
+    }
+    None
+}
+
+pure fn diff_props(path Text, old_props List[VProp], new_props List[VProp], inout out List[VDomPatch]) {
+    // 1. Detect added or changed props
+    var i = 0
+    while i < len(new_props) {
+        let np = new_props[i]
+        let changed = match find_prop_value(old_props, np.name) {
+            Some(ov) => ov != np.value
+            None => true
+        }
+        if changed {
+            out = push(out, VDomPatch {
+                op = "set_prop",
+                path = path,
+                key = np.name,
+                value = np.value,
+                index = 0,
+            })
+        }
+        i += 1
+    }
+    // 2. Detect removed props
+    var j = 0
+    while j < len(old_props) {
+        let op_prop = old_props[j]
+        let still_exists = match find_prop_value(new_props, op_prop.name) {
+            Some(_) => true
+            None => false
+        }
+        if !still_exists {
+            out = push(out, VDomPatch {
+                op = "remove_prop",
+                path = path,
+                key = op_prop.name,
+                value = "",
+                index = 0,
+            })
+        }
+        j += 1
+    }
+}
+
+pure fn find_child_by_key(children List[VNode], key Text) Int {
+    if len(key) == 0 {
+        return -1
+    }
+    var i = 0
+    while i < len(children) {
+        if vnode_key(children[i]) == key {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+pure fn diff_vdom_rec(old_node VNode, new_node VNode, path Text, depth Int, inout out List[VDomPatch]) {
+    if depth <= 0 {
+        out = push(out, VDomPatch {
+            op = "replace",
+            path = path,
+            key = vnode_key(new_node),
+            value = vnode_to_html(new_node),
+            index = 0,
+        })
+        return
+    }
+    match old_node {
+        VText(ot) => {
+            match new_node {
+                VText(nt) => {
+                    if ot != nt {
+                        out = push(out, VDomPatch {
+                            op = "set_text",
+                            path = path,
+                            key = "",
+                            value = nt,
+                            index = 0,
+                        })
+                    }
+                }
+                VEl(_) => {
+                    out = push(out, VDomPatch {
+                        op = "replace",
+                        path = path,
+                        key = vnode_key(new_node),
+                        value = vnode_to_html(new_node),
+                        index = 0,
+                    })
+                }
+            }
+        }
+        VEl(oel) => {
+            match new_node {
+                VText(_) => {
+                    out = push(out, VDomPatch {
+                        op = "replace",
+                        path = path,
+                        key = "",
+                        value = vnode_to_html(new_node),
+                        index = 0,
+                    })
+                }
+                VEl(nel) => {
+                    if oel.tag != nel.tag || oel.key != nel.key {
+                        out = push(out, VDomPatch {
+                            op = "replace",
+                            path = path,
+                            key = nel.key,
+                            value = vnode_to_html(new_node),
+                            index = 0,
+                        })
+                        return
+                    }
+                    diff_props(path, oel.props, nel.props, out)
+                    let old_n = len(oel.children)
+                    let new_n = len(nel.children)
+                    // Check if keyed reconciliation applies
+                    var any_keyed = false
+                    var kcheck = 0
+                    while kcheck < new_n {
+                        if len(vnode_key(nel.children[kcheck])) > 0 {
+                            any_keyed = true
+                        }
+                        kcheck += 1
+                    }
+                    if any_keyed {
+                        // Keyed child reconciliation (handles reorders, inserts, removals, in-place updates)
+                        var oi = 0
+                        while oi < old_n {
+                            let ok = vnode_key(oel.children[oi])
+                            if len(ok) > 0 && find_child_by_key(nel.children, ok) < 0 {
+                                out = push(out, VDomPatch {
+                                    op = "remove_child",
+                                    path = path,
+                                    key = ok,
+                                    value = "",
+                                    index = oi,
+                                })
+                            }
+                            oi += 1
+                        }
+                        var ni = 0
+                        while ni < new_n {
+                            let nc = nel.children[ni]
+                            let nk = vnode_key(nc)
+                            let prev_idx = find_child_by_key(oel.children, nk)
+                            if prev_idx >= 0 {
+                                if prev_idx != ni {
+                                    out = push(out, VDomPatch {
+                                        op = "move_child",
+                                        path = path,
+                                        key = nk,
+                                        value = int_to_text(prev_idx),
+                                        index = ni,
+                                    })
+                                }
+                                diff_vdom_rec(oel.children[prev_idx], nc, join_path(path, ni), depth - 1, out)
+                            } else if len(nk) == 0 && ni < old_n && len(vnode_key(oel.children[ni])) == 0 {
+                                diff_vdom_rec(oel.children[ni], nc, join_path(path, ni), depth - 1, out)
+                            } else {
+                                out = push(out, VDomPatch {
+                                    op = "insert_child",
+                                    path = path,
+                                    key = nk,
+                                    value = vnode_to_html(nc),
+                                    index = ni,
+                                })
+                            }
+                            ni += 1
+                        }
+                    } else {
+                        // Positional child reconciliation
+                        let common = if old_n < new_n { old_n } else { new_n }
+                        var ci = 0
+                        while ci < common {
+                            diff_vdom_rec(oel.children[ci], nel.children[ci], join_path(path, ci), depth - 1, out)
+                            ci += 1
+                        }
+                        var ins = common
+                        while ins < new_n {
+                            out = push(out, VDomPatch {
+                                op = "insert_child",
+                                path = path,
+                                key = vnode_key(nel.children[ins]),
+                                value = vnode_to_html(nel.children[ins]),
+                                index = ins,
+                            })
+                            ins += 1
+                        }
+                        var rem = old_n - 1
+                        while rem >= new_n {
+                            out = push(out, VDomPatch {
+                                op = "remove_child",
+                                path = path,
+                                key = "",
+                                value = "",
+                                index = rem,
+                            })
+                            rem -= 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Computes minimal keyed Virtual DOM patch list transforming `old_tree` into `new_tree`.
+pub pure fn diff_vdom(old_tree VNode, new_tree VNode) List[VDomPatch] {
+    var patches List[VDomPatch] = []
+    diff_vdom_rec(old_tree, new_tree, "/", 64, patches)
+    patches
+}
+
+// =========================================================================
+// 4. Web HTML Serializer & JSON Patch Emitter (Zero-Copy `TextBuilder`)
+// =========================================================================
+
+pure fn push_html_escaped(inout tb TextBuilder, s Text) {
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let b = byte_at(s, i) & 255
+        if b == 38 {       // '&'
+            tb.push_str("&amp;")
+        } else if b == 60 { // '<'
+            tb.push_str("&lt;")
+        } else if b == 62 { // '>'
+            tb.push_str("&gt;")
+        } else if b == 34 { // '"'
+            tb.push_str("&quot;")
+        } else {
+            tb.push_byte(b)
+        }
+        i += 1
+    }
+}
+
+pure fn push_json_escaped(inout tb TextBuilder, s Text) {
+    tb.push_byte(34)
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let b = byte_at(s, i) & 255
+        if b == 34 {        // '"'
+            tb.push_str("\\\"")
+        } else if b == 92 { // '\\'
+            tb.push_str("\\\\")
+        } else if b == 10 { // '\n'
+            tb.push_str("\\n")
+        } else if b == 13 { // '\r'
+            tb.push_str("\\r")
+        } else if b == 9 {  // '\t'
+            tb.push_str("\\t")
+        } else {
+            tb.push_byte(b)
+        }
+        i += 1
+    }
+    tb.push_byte(34)
+}
+
+pure fn vnode_to_html_rec(node VNode, depth Int, inout tb TextBuilder) {
+    if depth <= 0 {
+        return
+    }
+    match node {
+        VText(t) => push_html_escaped(tb, t)
+        VEl(el) => {
+            tb.push_byte(60) // '<'
+            tb.push_str(el.tag)
+            if len(el.key) > 0 {
+                tb.push_str(" data-key=\"")
+                push_html_escaped(tb, el.key)
+                tb.push_byte(34)
+            }
+            var pi = 0
+            while pi < len(el.props) {
+                tb.push_byte(32)
+                tb.push_str(el.props[pi].name)
+                tb.push_str("=\"")
+                push_html_escaped(tb, el.props[pi].value)
+                tb.push_byte(34)
+                pi += 1
+            }
+            tb.push_byte(62) // '>'
+            var ci = 0
+            while ci < len(el.children) {
+                vnode_to_html_rec(el.children[ci], depth - 1, tb)
+                ci += 1
+            }
+            tb.push_str("</")
+            tb.push_str(el.tag)
+            tb.push_byte(62)
+        }
+    }
+}
+
+/// Renders a unified `VNode` tree to safe HTML (SSR / Web innerHTML / Wasm32 hydration).
+pub pure fn vnode_to_html(node VNode) Text {
+    var tb = TextBuilder.new()
+    vnode_to_html_rec(node, 64, tb)
+    tb.finish()
+}
+
+/// Serializes `List[VDomPatch]` into a compact JSON array for browser / Wasm32 DOM patching.
+pub pure fn patches_to_json(patches List[VDomPatch]) Text {
+    var tb = TextBuilder.new()
+    tb.push_byte(91) // '['
+    var i = 0
+    while i < len(patches) {
+        if i > 0 {
+            tb.push_byte(44) // ','
+        }
+        let p = patches[i]
+        tb.push_str("{\"op\":")
+        push_json_escaped(tb, p.op)
+        tb.push_str(",\"path\":")
+        push_json_escaped(tb, p.path)
+        if len(p.key) > 0 {
+            tb.push_str(",\"key\":")
+            push_json_escaped(tb, p.key)
+        }
+        if len(p.value) > 0 {
+            tb.push_str(",\"value\":")
+            push_json_escaped(tb, p.value)
+        }
+        if p.op == "insert_child" || p.op == "remove_child" || p.op == "move_child" {
+            tb.push_str(",\"index\":")
+            tb.push_str(int_to_text(p.index))
+        }
+        tb.push_byte(125) // '}'
+        i += 1
+    }
+    tb.push_byte(93) // ']'
+    tb.finish()
+}

@@ -1,0 +1,590 @@
+// std/ui/openui.tn — Native OpenUI Lang (`thesysdev/openui`) Streaming Parser, Evaluator & Schema Generator
+//
+// Implements the compact line-oriented OpenUI Lang DSL (up to 67% fewer LLM tokens than JSON):
+//   root = Card([header, kpis, chart, refresh_btn])
+//   header = Header("Monthly Revenue", "Q1-Q2 2026")
+//   kpis = Row([m1, m2])
+//   m1 = Metric("MRR", "$42,800", "+18%")
+//   m2 = Metric("Active Users", $users, "+9%")
+//   chart = BarChart(["Jan", "Feb", "Mar"], [120, 150, 195])
+//   refresh_btn = Button("Refresh", @refresh)
+//
+// Features:
+//   - Progressive streaming resilience (`openui_parse_stream(src, is_complete)` ignores trailing partial lines while streaming)
+//   - Forward-reference hoisting (`root` references identifiers defined on later lines)
+//   - Reactive `$var` state resolution against `UiStore` & `@action` event wiring
+//   - Statically bounded evaluation depth (`max_depth`) preventing LLM-emitted reference cycles from overflowing the stack
+//   - Auto LLM System Prompt generator from component schema registry (`openui_generate_system_prompt`)
+//   - Direct lowering into unified `VNode` (`openui_to_vdom`) -> renders to Web, TUI, and Native Metal GPU!
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+import "std/text/builder.tn"
+import "std/ui/vdom.tn"
+
+pub enum OpenUiExpr {
+    OString(Text)
+    ONumber(Text)
+    OBool(Bool)
+    ORef(Text)              // Forward/backward identifier reference (e.g. `header`)
+    OStateVar(Text)         // Reactive state reference `$active_users`
+    OAction(Text)           // Event action handler `@refresh`
+    OList(List[OpenUiExpr]) // `[item1, item2, ...]`
+    OCall(OpenUiCall)       // `Card([header, chart])`
+}
+
+pub record OpenUiCall {
+    name Text
+    args List[OpenUiExpr]
+}
+
+pub record OpenUiStatement {
+    id   Text
+    expr OpenUiExpr
+}
+
+pub record OpenUiDoc {
+    statements     List[OpenUiStatement]
+    root_id        Text
+    is_complete    Bool
+    skipped_lines  NonNegative
+}
+
+pub record OpenUiComponentSchema {
+    name        Text
+    args_spec   Text
+    description Text
+}
+
+// =========================================================================
+// 1. Streaming Line-Oriented OpenUI Lang Lexer & Recursive-Descent Parser
+// =========================================================================
+
+pure fn is_ws_byte(b Int) Bool {
+    b == 32 || b == 9 || b == 13
+}
+
+pure fn is_ident_start(b Int) Bool {
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+pure fn is_ident_cont(b Int) Bool {
+    is_ident_start(b) || (b >= 48 && b <= 57) || b == 45
+}
+
+pure fn oui_is_digit(b Int) Bool {
+    b >= 48 && b <= 57
+}
+
+pure fn skip_ws(s Text, pos Int, end Int) Int {
+    var i = pos
+    while i < end && is_ws_byte(byte_at(s, i) & 255) {
+        i += 1
+    }
+    i
+}
+
+record ParseExprRes {
+    ok   Bool
+    expr OpenUiExpr
+    next Int
+}
+
+pure fn parse_err_expr(pos Int) ParseExprRes {
+    ParseExprRes { ok = false, expr = OString(""), next = pos }
+}
+
+pure fn parse_openui_string(s Text, pos Int, end Int) ParseExprRes {
+    if pos >= end || (byte_at(s, pos) & 255) != 34 {
+        return parse_err_expr(pos)
+    }
+    var i = pos + 1
+    var tb = TextBuilder.new()
+    while i < end {
+        let b = byte_at(s, i) & 255
+        if b == 34 { // closing '"'
+            return ParseExprRes { ok = true, expr = OString(tb.finish()), next = i + 1 }
+        }
+        if b == 92 && i + 1 < end { // escape '\'
+            let nb = byte_at(s, i + 1) & 255
+            if nb == 110 { tb.push_byte(10) }
+            else if nb == 116 { tb.push_byte(9) }
+            else if nb == 114 { tb.push_byte(13) }
+            else { tb.push_byte(nb) }
+            i += 2
+        } else {
+            tb.push_byte(b)
+            i += 1
+        }
+    }
+    // Unterminated string (common on partial streaming line)
+    let _ = tb.finish()
+    parse_err_expr(pos)
+}
+
+pure fn parse_openui_expr(s Text, pos Int, end Int, depth Int) ParseExprRes {
+    if depth <= 0 {
+        return parse_err_expr(pos)
+    }
+    let p = skip_ws(s, pos, end)
+    if p >= end {
+        return parse_err_expr(p)
+    }
+    let b = byte_at(s, p) & 255
+
+    // String literal `"..."`
+    if b == 34 {
+        return parse_openui_string(s, p, end)
+    }
+
+    // List literal `[a, b, ...]`
+    if b == 91 {
+        var items List[OpenUiExpr] = []
+        var cur = skip_ws(s, p + 1, end)
+        if cur < end && (byte_at(s, cur) & 255) == 93 {
+            return ParseExprRes { ok = true, expr = OList(items), next = cur + 1 }
+        }
+        while cur < end {
+            let item_res = parse_openui_expr(s, cur, end, depth - 1)
+            if !item_res.ok {
+                return parse_err_expr(p)
+            }
+            items = push(items, item_res.expr)
+            cur = skip_ws(s, item_res.next, end)
+            if cur >= end {
+                return parse_err_expr(p)
+            }
+            let sep = byte_at(s, cur) & 255
+            if sep == 44 { // ','
+                cur = skip_ws(s, cur + 1, end)
+                if cur < end && (byte_at(s, cur) & 255) == 93 {
+                    return ParseExprRes { ok = true, expr = OList(items), next = cur + 1 }
+                }
+            } else if sep == 93 { // ']'
+                return ParseExprRes { ok = true, expr = OList(items), next = cur + 1 }
+            } else {
+                return parse_err_expr(p)
+            }
+        }
+        return parse_err_expr(p)
+    }
+
+    // State variable `$var`
+    if b == 36 { // '$'
+        var i = p + 1
+        while i < end && is_ident_cont(byte_at(s, i) & 255) {
+            i += 1
+        }
+        if i == p + 1 {
+            return parse_err_expr(p)
+        }
+        return ParseExprRes { ok = true, expr = OStateVar(str_slice(s, p + 1, i)), next = i }
+    }
+
+    // Action event `@action`
+    if b == 64 { // '@'
+        var i = p + 1
+        while i < end && is_ident_cont(byte_at(s, i) & 255) {
+            i += 1
+        }
+        if i == p + 1 {
+            return parse_err_expr(p)
+        }
+        return ParseExprRes { ok = true, expr = OAction(str_slice(s, p + 1, i)), next = i }
+    }
+
+    // Number literal `-123.45`
+    if oui_is_digit(b) || (b == 45 && p + 1 < end && oui_is_digit(byte_at(s, p + 1) & 255)) {
+        var i = if b == 45 { p + 1 } else { p }
+        while i < end && oui_is_digit(byte_at(s, i) & 255) {
+            i += 1
+        }
+        if i < end && (byte_at(s, i) & 255) == 46 {
+            i += 1
+            while i < end && oui_is_digit(byte_at(s, i) & 255) {
+                i += 1
+            }
+        }
+        return ParseExprRes { ok = true, expr = ONumber(str_slice(s, p, i)), next = i }
+    }
+
+    // Identifier, Bool, or Component Call `Name(arg1, arg2)`
+    if is_ident_start(b) {
+        var i = p + 1
+        while i < end && is_ident_cont(byte_at(s, i) & 255) {
+            i += 1
+        }
+        let ident = str_slice(s, p, i)
+        let after = skip_ws(s, i, end)
+        if after < end && (byte_at(s, after) & 255) == 40 { // '(' -> component call
+            var args List[OpenUiExpr] = []
+            var cur = skip_ws(s, after + 1, end)
+            if cur < end && (byte_at(s, cur) & 255) == 41 {
+                return ParseExprRes {
+                    ok = true,
+                    expr = OCall(OpenUiCall { name = ident, args = args }),
+                    next = cur + 1,
+                }
+            }
+            while cur < end {
+                let arg_res = parse_openui_expr(s, cur, end, depth - 1)
+                if !arg_res.ok {
+                    return parse_err_expr(p)
+                }
+                args = push(args, arg_res.expr)
+                cur = skip_ws(s, arg_res.next, end)
+                if cur >= end {
+                    return parse_err_expr(p)
+                }
+                let sep = byte_at(s, cur) & 255
+                if sep == 44 { // ','
+                    cur = skip_ws(s, cur + 1, end)
+                    if cur < end && (byte_at(s, cur) & 255) == 41 {
+                        return ParseExprRes {
+                            ok = true,
+                            expr = OCall(OpenUiCall { name = ident, args = args }),
+                            next = cur + 1,
+                        }
+                    }
+                } else if sep == 41 { // ')'
+                    return ParseExprRes {
+                        ok = true,
+                        expr = OCall(OpenUiCall { name = ident, args = args }),
+                        next = cur + 1,
+                    }
+                } else {
+                    return parse_err_expr(p)
+                }
+            }
+            return parse_err_expr(p)
+        }
+        if ident == "true" {
+            return ParseExprRes { ok = true, expr = OBool(true), next = i }
+        }
+        if ident == "false" {
+            return ParseExprRes { ok = true, expr = OBool(false), next = i }
+        }
+        return ParseExprRes { ok = true, expr = ORef(ident), next = i }
+    }
+
+    parse_err_expr(p)
+}
+
+/// Parses an OpenUI Lang streaming buffer (`is_complete = false` while LLM is still streaming tokens).
+/// Automatically skips blank lines, `//` comments, markdown code fences, and trailing unfinished streaming lines.
+pub pure fn openui_parse_stream(src Text, is_complete Bool) OpenUiDoc {
+    var stmts List[OpenUiStatement] = []
+    var root_id = ""
+    var skipped NonNegative = 0
+    let n = len(src)
+    var line_start = 0
+
+    while line_start < n {
+        var line_end = line_start
+        while line_end < n && (byte_at(src, line_end) & 255) != 10 {
+            line_end += 1
+        }
+        let has_newline = line_end < n
+        let p0 = skip_ws(src, line_start, line_end)
+
+        // Skip empty lines, comments `//` / `#`, or markdown fences ```
+        var skip_this = p0 >= line_end
+        if !skip_this {
+            let ch0 = byte_at(src, p0) & 255
+            if ch0 == 35 || ch0 == 96 || (ch0 == 47 && p0 + 1 < line_end && (byte_at(src, p0 + 1) & 255) == 47) {
+                skip_this = true
+            }
+        }
+
+        if !skip_this {
+            // While streaming (`!is_complete`), only commit a line without trailing newline if it parses cleanly
+            var id_end = p0
+            if is_ident_start(byte_at(src, p0) & 255) {
+                id_end = p0 + 1
+                while id_end < line_end && is_ident_cont(byte_at(src, id_end) & 255) {
+                    id_end += 1
+                }
+            }
+            let eq_pos = skip_ws(src, id_end, line_end)
+            if id_end > p0 && eq_pos < line_end && (byte_at(src, eq_pos) & 255) == 61 { // '='
+                let id = str_slice(src, p0, id_end)
+                let res = parse_openui_expr(src, eq_pos + 1, line_end, 32)
+                let trailing = skip_ws(src, res.next, line_end)
+                if res.ok && trailing >= line_end {
+                    if len(root_id) == 0 {
+                        root_id = id
+                    }
+                    // Replace existing binding with same id (progressive update) or append
+                    var replaced = false
+                    var next_stmts List[OpenUiStatement] = []
+                    var si = 0
+                    while si < len(stmts) {
+                        if stmts[si].id == id {
+                            next_stmts = push(next_stmts, OpenUiStatement { id = id, expr = res.expr })
+                            replaced = true
+                        } else {
+                            next_stmts = push(next_stmts, stmts[si])
+                        }
+                        si += 1
+                    }
+                    if !replaced {
+                        next_stmts = push(next_stmts, OpenUiStatement { id = id, expr = res.expr })
+                    }
+                    stmts = next_stmts
+                } else {
+                    if is_complete || has_newline {
+                        skipped += 1
+                    }
+                }
+            } else {
+                if is_complete || has_newline {
+                    skipped += 1
+                }
+            }
+        }
+        line_start = if has_newline { line_end + 1 } else { n }
+    }
+
+    // Prefer explicit `root` binding if present
+    var ri = 0
+    while ri < len(stmts) {
+        if stmts[ri].id == "root" {
+            root_id = "root"
+        }
+        ri += 1
+    }
+
+    OpenUiDoc {
+        statements = stmts,
+        root_id = root_id,
+        is_complete = is_complete,
+        skipped_lines = skipped,
+    }
+}
+
+// =========================================================================
+// 2. Forward-Reference Hoisting & Bounded-Depth VDOM Evaluation
+// =========================================================================
+
+pure fn doc_lookup(doc OpenUiDoc, id Text) Option[OpenUiExpr] {
+    var i = 0
+    while i < len(doc.statements) {
+        if doc.statements[i].id == id {
+            return Some(doc.statements[i].expr)
+        }
+        i += 1
+    }
+    None
+}
+
+pure fn eval_to_text(doc OpenUiDoc, expr OpenUiExpr, store UiStore, depth Int) Text {
+    if depth <= 0 {
+        return ""
+    }
+    match expr {
+        OString(s) => s
+        ONumber(n) => n
+        OBool(b) => if b { "true" } else { "false" }
+        OStateVar(k) => ui_store_get_or(store, k, "$" ++ k)
+        OAction(a) => "@" ++ a
+        ORef(id) => {
+            match doc_lookup(doc, id) {
+                Some(target) => eval_to_text(doc, target, store, depth - 1)
+                None => ""
+            }
+        }
+        OList(items) => {
+            var tb = TextBuilder.new()
+            var i = 0
+            while i < len(items) {
+                if i > 0 { tb.push_str(",") }
+                tb.push_str(eval_to_text(doc, items[i], store, depth - 1))
+                i += 1
+            }
+            tb.finish()
+        }
+        OCall(c) => c.name
+    }
+}
+
+pure fn eval_to_vnodes(doc OpenUiDoc, expr OpenUiExpr, store UiStore, depth Int) List[VNode] {
+    var out List[VNode] = []
+    if depth <= 0 {
+        return out
+    }
+    match expr {
+        OList(items) => {
+            var i = 0
+            while i < len(items) {
+                out = push(out, eval_expr_to_vnode(doc, items[i], "", store, depth - 1))
+                i += 1
+            }
+            out
+        }
+        ORef(id) => {
+            match doc_lookup(doc, id) {
+                Some(target) => eval_to_vnodes(doc, target, store, depth - 1)
+                None => out
+            }
+        }
+        _ => {
+            out = push(out, eval_expr_to_vnode(doc, expr, "", store, depth - 1))
+            out
+        }
+    }
+}
+
+pure fn eval_expr_to_vnode(doc OpenUiDoc, expr OpenUiExpr, key Text, store UiStore, depth Int) VNode {
+    if depth <= 0 {
+        return vel_keyed("span", key, [vprop("data-cycle", "true")], [vtext("[cycle-guarded]")])
+    }
+    match expr {
+        OString(s) => vtext(s)
+        ONumber(n) => vtext(n)
+        OBool(b) => vtext(if b { "true" } else { "false" })
+        OStateVar(k) => vtext(ui_store_get_or(store, k, "$" ++ k))
+        OAction(a) => vel_keyed("span", key, [vprop("data-action", a)], [vtext("@" ++ a)])
+        ORef(id) => {
+            match doc_lookup(doc, id) {
+                Some(target) => eval_expr_to_vnode(doc, target, id, store, depth - 1)
+                None => vel_keyed("span", id, [vprop("data-pending", id)], [vtext("...")])
+            }
+        }
+        OList(items) => {
+            var children List[VNode] = []
+            var i = 0
+            while i < len(items) {
+                children = push(children, eval_expr_to_vnode(doc, items[i], "", store, depth - 1))
+                i += 1
+            }
+            vel_keyed("div", key, [vprop("data-ui", "List"), vprop("direction", "column")], children)
+        }
+        OCall(call) => {
+            let cname = call.name
+            if cname == "Card" {
+                let kids = if len(call.args) >= 1 {
+                    eval_to_vnodes(doc, call.args[0], store, depth - 1)
+                } else {
+                    let e List[VNode] = []
+                    e
+                }
+                vel_keyed("section", key, [vprop("data-ui", "Card"), vprop("direction", "column")], kids)
+            } else if cname == "Row" || cname == "Column" || cname == "Stack" {
+                let dir = if cname == "Row" { "row" } else { "column" }
+                let kids = if len(call.args) >= 1 {
+                    eval_to_vnodes(doc, call.args[0], store, depth - 1)
+                } else {
+                    let e List[VNode] = []
+                    e
+                }
+                vel_keyed("div", key, [vprop("data-ui", cname), vprop("direction", dir)], kids)
+            } else if cname == "Header" {
+                let title = if len(call.args) >= 1 { eval_to_text(doc, call.args[0], store, depth - 1) } else { "" }
+                let subtitle = if len(call.args) >= 2 { eval_to_text(doc, call.args[1], store, depth - 1) } else { "" }
+                var kids List[VNode] = [vel("h2", [vprop("data-ui", "Title")], [vtext(title)])]
+                if len(subtitle) > 0 {
+                    kids = push(kids, vel("p", [vprop("data-ui", "Subtitle")], [vtext(subtitle)]))
+                }
+                vel_keyed("header", key, [vprop("data-ui", "Header"), vprop("title", title), vprop("subtitle", subtitle)], kids)
+            } else if cname == "Metric" {
+                let label = if len(call.args) >= 1 { eval_to_text(doc, call.args[0], store, depth - 1) } else { "" }
+                let val = if len(call.args) >= 2 { eval_to_text(doc, call.args[1], store, depth - 1) } else { "" }
+                let delta = if len(call.args) >= 3 { eval_to_text(doc, call.args[2], store, depth - 1) } else { "" }
+                let props = [
+                    vprop("data-ui", "Metric"),
+                    vprop("label", label),
+                    vprop("value", val),
+                    vprop("delta", delta),
+                ]
+                let kids = [
+                    vel("span", [vprop("data-role", "label")], [vtext(label)]),
+                    vel("strong", [vprop("data-role", "value")], [vtext(val)]),
+                    vel("em", [vprop("data-role", "delta")], [vtext(delta)]),
+                ]
+                vel_keyed("div", key, props, kids)
+            } else if cname == "BarChart" {
+                let labels = if len(call.args) >= 1 { eval_to_text(doc, call.args[0], store, depth - 1) } else { "" }
+                let values = if len(call.args) >= 2 { eval_to_text(doc, call.args[1], store, depth - 1) } else { "" }
+                vel_keyed(
+                    "div",
+                    key,
+                    [vprop("data-ui", "BarChart"), vprop("labels", labels), vprop("values", values)],
+                    [vtext("BarChart(" ++ labels ++ " | " ++ values ++ ")")],
+                )
+            } else if cname == "Button" {
+                let label = if len(call.args) >= 1 { eval_to_text(doc, call.args[0], store, depth - 1) } else { "Button" }
+                let action = if len(call.args) >= 2 { eval_to_text(doc, call.args[1], store, depth - 1) } else { "" }
+                vel_keyed(
+                    "button",
+                    key,
+                    [vprop("data-ui", "Button"), vprop("data-action", action)],
+                    [vtext(label)],
+                )
+            } else if cname == "Text" || cname == "Badge" {
+                let txt = if len(call.args) >= 1 { eval_to_text(doc, call.args[0], store, depth - 1) } else { "" }
+                let tag = if cname == "Badge" { "span" } else { "p" }
+                vel_keyed(tag, key, [vprop("data-ui", cname)], [vtext(txt)])
+            } else {
+                // Generic custom component fallback
+                var kids List[VNode] = []
+                var ai = 0
+                while ai < len(call.args) {
+                    kids = push(kids, eval_expr_to_vnode(doc, call.args[ai], "", store, depth - 1))
+                    ai += 1
+                }
+                vel_keyed("div", key, [vprop("data-ui", cname)], kids)
+            }
+        }
+    }
+}
+
+/// Evaluates an `OpenUiDoc` (with forward-reference hoisting & cycle guard) into a unified `VNode`.
+pub pure fn openui_to_vdom(doc OpenUiDoc, store UiStore) VNode {
+    if len(doc.root_id) == 0 {
+        let empty_p List[VProp] = [vprop("data-ui", "Empty")]
+        let empty_c List[VNode] = []
+        return vel("div", empty_p, empty_c)
+    }
+    match doc_lookup(doc, doc.root_id) {
+        Some(root_expr) => eval_expr_to_vnode(doc, root_expr, doc.root_id, store, 32)
+        None => vel("div", [vprop("data-ui", "Empty")], [vtext("...")])
+    }
+}
+
+// =========================================================================
+// 3. Component Schema Registry & LLM System Prompt Generator
+// =========================================================================
+
+pub pure fn openui_default_schemas() List[OpenUiComponentSchema] {
+    [
+        OpenUiComponentSchema { name = "Card", args_spec = "(children List)", description = "Container panel grouping child components vertically" },
+        OpenUiComponentSchema { name = "Row", args_spec = "(children List)", description = "Horizontal flexbox layout container" },
+        OpenUiComponentSchema { name = "Column", args_spec = "(children List)", description = "Vertical flexbox layout container" },
+        OpenUiComponentSchema { name = "Header", args_spec = "(title Text, subtitle Text)", description = "Section header with title and optional subtitle" },
+        OpenUiComponentSchema { name = "Metric", args_spec = "(label Text, value Text, delta Text)", description = "KPI metric readout tile" },
+        OpenUiComponentSchema { name = "BarChart", args_spec = "(labels List[Text], values List[Number])", description = "Categorical bar chart" },
+        OpenUiComponentSchema { name = "Button", args_spec = "(label Text, action @Event)", description = "Interactive button dispatching an @action event" },
+        OpenUiComponentSchema { name = "Text", args_spec = "(body Text)", description = "Paragraph body text" },
+        OpenUiComponentSchema { name = "Badge", args_spec = "(label Text)", description = "Compact status pill badge" },
+    ]
+}
+
+/// Generates an OpenUI Lang LLM System Prompt describing syntax rules and registered components.
+pub pure fn openui_generate_system_prompt(schemas List[OpenUiComponentSchema]) Text {
+    var tb = TextBuilder.new()
+    tb.push_str("Respond ONLY in OpenUI Lang (one `id = Component(...)` assignment per line, starting with `root = ...`).\n")
+    tb.push_str("Forward references are hoisted; use `$var` for reactive state and `@action` for click events.\n")
+    tb.push_str("Available components:\n")
+    var i = 0
+    while i < len(schemas) {
+        let s = schemas[i]
+        tb.push_str("- ")
+        tb.push_str(s.name)
+        tb.push_str(s.args_spec)
+        tb.push_str(": ")
+        tb.push_str(s.description)
+        tb.push_byte(10)
+        i += 1
+    }
+    tb.finish()
+}

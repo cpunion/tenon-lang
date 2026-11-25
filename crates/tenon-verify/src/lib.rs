@@ -1996,4 +1996,217 @@ pub async fn bad_await_in_mutate_and_lock() Int {
             crit_rep.diagnostics
         );
     }
+
+    #[test]
+    fn verifies_g0_contextual_keywords_linear_borrow_match_2d_bounds_and_auto_invariants() {
+        // 1. De-reserved domain keywords work cleanly as ordinary variable/field/param/pattern names
+        let kw_prog = parse(
+            r#"
+pub record LayoutBox {
+    bounds Int
+    output Int
+    view Int
+    stream Int
+    protocol Int
+    reactive Int
+    subscriber Int
+    policy Int
+    from Int
+    bind Int
+}
+
+pub pure fn use_domain_names(protocol Int, view Int, bounds Int, output Int, stream Int) Int {
+    let reactive = protocol + view
+    let subscriber = bounds + output
+    let policy = stream + reactive
+    let box = LayoutBox {
+        bounds = bounds,
+        output = output,
+        view = view,
+        stream = stream,
+        protocol = protocol,
+        reactive = reactive,
+        subscriber = subscriber,
+        policy = policy,
+        from = 1,
+        bind = 2,
+    }
+    match Some(box.view) {
+        Some(from) => from + box.protocol + box.bounds + box.output + box.stream + box.bind,
+        None => 0,
+    }
+}
+"#,
+        )
+        .unwrap();
+        let kw_rep = check_program(&kw_prog);
+        assert!(kw_rep.ok, "contextual keywords failed: {:?}", kw_rep.diagnostics);
+
+        // 2. `@linear` borrow (`inout self` / `@borrow`) vs consume (by-value) + `Result[LinearT, E]` in `match`
+        let lin_borrow_ok = parse(
+            r#"
+@linear
+pub record RenderPass {
+    draws Int
+}
+
+impl RenderPass {
+    pub fn draw(inout self, count Int) {
+        self.draws = self.draws + count
+    }
+
+    pub fn end_pass(self) Int {
+        self.draws
+    }
+}
+
+@borrow
+pub fn inspect_pass(p RenderPass) Int {
+    p.draws
+}
+
+pub fn open_pass(ok Bool) Result[RenderPass, Int] {
+    if ok {
+        Ok(RenderPass { draws = 0 })
+    } else {
+        Err(1)
+    }
+}
+
+pub fn good_render(ok Bool) Int {
+    let res = open_pass(ok)
+    match res {
+        Ok(p) => {
+            var pass = p
+            pass.draw(3)
+            let d = inspect_pass(pass)
+            pass.draw(2)
+            pass.end_pass() + d
+        },
+        Err(e) => e,
+    }
+}
+"#,
+        )
+        .unwrap();
+        let lin_borrow_rep = check_program(&lin_borrow_ok);
+        assert!(
+            lin_borrow_rep.ok,
+            "linear borrow + match Result[LinearT, E] positive failed: {:?}",
+            lin_borrow_rep.diagnostics
+        );
+
+        // Negative control: dropping linear payload inside `match Result.Ok(p)` OR using after `end_pass()` -> E0821
+        let lin_borrow_bad = parse(
+            r#"
+@linear
+pub record RenderPass {
+    draws Int
+}
+
+impl RenderPass {
+    pub fn draw(inout self, count Int) {
+        self.draws = self.draws + count
+    }
+
+    pub fn end_pass(self) Int {
+        self.draws
+    }
+}
+
+pub fn open_pass() Result[RenderPass, Int] {
+    Ok(RenderPass { draws = 0 })
+}
+
+pub fn bad_drop_in_match() Int {
+    match open_pass() {
+        Ok(p) => {
+            var pass = p
+            pass.draw(1)
+            42
+        },
+        Err(e) => e,
+    }
+}
+
+pub fn bad_use_after_end() Int {
+    var pass = RenderPass { draws = 0 }
+    let n = pass.end_pass()
+    pass.draw(1)
+    n
+}
+"#,
+        )
+        .unwrap();
+        let lin_bad_rep = check_program(&lin_borrow_bad);
+        let e0821_count = lin_bad_rep.diagnostics.iter().filter(|d| d.code == "E0821").count();
+        assert!(
+            e0821_count >= 2,
+            "expected >=2 E0821 errors (dropped in match + use after consume), got {:?}",
+            lin_bad_rep.diagnostics
+        );
+
+        // 3. 2D grid bounds (`0 <= y < h && 0 <= x < w => 0 <= y * w + x < len(grid)`) + canonical loop auto-invariants + `List[RefinedT]`
+        let grid_prog = parse(
+            r#"
+pub type PosInt = Int where self > 0
+
+pub record Grid2D {
+    width Int where self > 0
+    height Int where self > 0
+    cells List[PosInt]
+}
+
+pub pure fn grid_read_and_div(
+    grid List[PosInt],
+    w Int where 1 <= self && self <= 1024,
+    h Int where 1 <= self && self <= 1024,
+) Int
+    requires len(grid) == w * h
+{
+    var acc = 0
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w {
+            let cell = grid[y * w + x]
+            acc = acc + 1000 / cell
+            x += 1
+        }
+        y += 1
+    }
+    acc
+}
+
+pub pure fn sum_auto_inv(xs List[Int]) Int {
+    var total = 0
+    var i = 0
+    while i < len(xs) {
+        total = total + xs[i]
+        i += 1
+    }
+    total
+}
+"#,
+        )
+        .unwrap();
+        let grid_rep = check_program(&grid_prog);
+        assert!(
+            grid_rep.ok,
+            "2D grid + List[PosInt] + auto-invariants failed: {:?}",
+            grid_rep.diagnostics
+        );
+        // Both `grid[y * w + x]` AND `xs[i]` must be proved safe without manual `invariant` annotations!
+        assert!(
+            grid_rep.mir.proved_safe_indices.len() >= 2,
+            "expected >=2 proved safe indices (2D grid + auto-inv loop), got {:?}",
+            grid_rep.mir.proved_safe_indices
+        );
+        // `1000 / cell` must also be proved nonzero from `List[PosInt]` (no E0401)!
+        assert!(
+            grid_rep.proofs.iter().any(|p| p.obligation.contains("!= 0") || p.obligation.contains("div")),
+            "expected `1000 / cell` nonzero divisor proof via List[PosInt], proofs={:?}",
+            grid_rep.proofs
+        );
+    }
 }

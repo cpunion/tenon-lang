@@ -145,68 +145,56 @@ impl Parser {
         }
     }
 
+    fn contextual_ident_str(kind: &TokenKind) -> Option<&'static str> {
+        match kind {
+            TokenKind::Output => Some("output"),
+            TokenKind::Bounds => Some("bounds"),
+            TokenKind::Policy => Some("policy"),
+            TokenKind::View => Some("view"),
+            TokenKind::Stream => Some("stream"),
+            TokenKind::Pacing => Some("pacing"),
+            TokenKind::From => Some("from"),
+            TokenKind::Archive => Some("archive"),
+            TokenKind::Retain => Some("retain"),
+            TokenKind::Type => Some("type"),
+            TokenKind::Bind => Some("bind"),
+            TokenKind::Old => Some("old"),
+            TokenKind::Evolution => Some("evolution"),
+            TokenKind::AllowLoss => Some("allow_loss"),
+            TokenKind::LockLattice => Some("lock_lattice"),
+            TokenKind::Protocol => Some("protocol"),
+            TokenKind::Satisfies => Some("satisfies"),
+            TokenKind::Laws => Some("laws"),
+            TokenKind::FaultModel => Some("fault_model"),
+            TokenKind::Reactive => Some("reactive"),
+            TokenKind::Subscriber => Some("subscriber"),
+            TokenKind::LocalStorage => Some("local_storage"),
+            _ => None,
+        }
+    }
+
+    fn contextual_expr_ident_str(kind: &TokenKind) -> Option<&'static str> {
+        match kind {
+            TokenKind::Type | TokenKind::Old => None,
+            other => Self::contextual_ident_str(other),
+        }
+    }
+
     fn expect_ident(&mut self) -> Result<(String, Span), ParseError> {
         self.skip_newlines();
         let tok = self.peek().clone();
-        match tok.kind {
-            TokenKind::Ident(s) => {
-                self.bump();
-                Ok((s, tok.span))
-            }
-            // Allow contextual keywords as field/attribute identifiers
-            TokenKind::Output => {
-                self.bump();
-                Ok(("output".into(), tok.span))
-            }
-            TokenKind::Bounds => {
-                self.bump();
-                Ok(("bounds".into(), tok.span))
-            }
-            TokenKind::Policy => {
-                self.bump();
-                Ok(("policy".into(), tok.span))
-            }
-            TokenKind::View => {
-                self.bump();
-                Ok(("view".into(), tok.span))
-            }
-            TokenKind::Stream => {
-                self.bump();
-                Ok(("stream".into(), tok.span))
-            }
-            TokenKind::Pacing => {
-                self.bump();
-                Ok(("pacing".into(), tok.span))
-            }
-            TokenKind::From => {
-                self.bump();
-                Ok(("from".into(), tok.span))
-            }
-            TokenKind::Archive => {
-                self.bump();
-                Ok(("archive".into(), tok.span))
-            }
-            TokenKind::Retain => {
-                self.bump();
-                Ok(("retain".into(), tok.span))
-            }
-            TokenKind::Type => {
-                self.bump();
-                Ok(("type".into(), tok.span))
-            }
-            TokenKind::Bind => {
-                self.bump();
-                Ok(("bind".into(), tok.span))
-            }
-            TokenKind::Old => {
-                self.bump();
-                Ok(("old".into(), tok.span))
-            }
-            _ => Err(ParseError {
-                message: format!("expected identifier, found {:?}", tok.kind),
-                span: tok.span,
-            }),
+        if let TokenKind::Ident(s) = tok.kind {
+            self.bump();
+            return Ok((s, tok.span));
         }
+        if let Some(kw) = Self::contextual_ident_str(&tok.kind) {
+            self.bump();
+            return Ok((kw.into(), tok.span));
+        }
+        Err(ParseError {
+            message: format!("expected identifier, found {:?}", tok.kind),
+            span: tok.span,
+        })
     }
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
@@ -248,7 +236,8 @@ impl Parser {
                         break;
                     }
                     // Check `key = expr`
-                    let is_named = matches!(self.peek().kind, TokenKind::Ident(_) | TokenKind::Bounds | TokenKind::Policy | TokenKind::View | TokenKind::Stream | TokenKind::Pacing | TokenKind::Output | TokenKind::Type | TokenKind::From)
+                    let is_named = (matches!(self.peek().kind, TokenKind::Ident(_))
+                        || Self::contextual_ident_str(&self.peek().kind).is_some())
                         && self.peek_ahead_non_nl(1).kind == TokenKind::Eq;
                     if is_named {
                         let (k, _) = self.expect_ident()?;
@@ -2973,10 +2962,9 @@ impl Parser {
                         if self.peek().kind == TokenKind::RParen {
                             break self.bump().span;
                         }
-                        let is_named = matches!(
-                            self.peek().kind,
-                            TokenKind::Ident(_) | TokenKind::From | TokenKind::Output
-                        ) && self.peek_ahead_non_nl(1).kind == TokenKind::Eq;
+                        let is_named = (matches!(self.peek().kind, TokenKind::Ident(_))
+                            || Self::contextual_ident_str(&self.peek().kind).is_some())
+                            && self.peek_ahead_non_nl(1).kind == TokenKind::Eq;
                         if is_named {
                             let (k, _) = self.expect_ident()?;
                             self.expect(TokenKind::Eq)?;
@@ -3205,16 +3193,7 @@ impl Parser {
                     })
                 }
             }
-            TokenKind::View
-            | TokenKind::Stream
-            | TokenKind::Policy
-            | TokenKind::Bounds
-            | TokenKind::From
-            | TokenKind::Output
-            | TokenKind::Pacing
-            | TokenKind::Bind
-            | TokenKind::Archive
-            | TokenKind::Retain => {
+            ref k if Self::contextual_expr_ident_str(k).is_some() => {
                 let (name, span) = self.expect_ident()?;
                 Ok(Expr {
                     kind: ExprKind::Ident(name),
@@ -3652,6 +3631,10 @@ impl Parser {
                         return Ok(Pattern::Tuple(pats, start.merge(end)));
                     }
                 }
+            }
+            ref k if Self::contextual_expr_ident_str(k).is_some() => {
+                let (name, span) = self.expect_ident()?;
+                Ok(Pattern::Ident(name, span))
             }
             TokenKind::Ident(s) => {
                 self.bump();

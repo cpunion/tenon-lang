@@ -324,17 +324,17 @@ int64_t tenon_float_to_text(int64_t bits) {
 }
 int64_t tenon_parse_float(int64_t s) { (void)s; return 0; }
 
-typedef struct { uint8_t* data; size_t len; size_t cap; } TenonBuf;
+typedef struct { uint8_t* data; uint32_t _pad0; uint64_t len; uint64_t cap; } TenonBuf;
 int64_t tenon_buf_new(void) {
     TenonBuf* b = (TenonBuf*)wasm_alloc(sizeof(TenonBuf));
-    b->cap = 128; b->len = 0; b->data = (uint8_t*)wasm_alloc(128);
+    b->_pad0 = 0; b->cap = 128; b->len = 0; b->data = (uint8_t*)wasm_alloc(128);
     return (int64_t)(uintptr_t)b;
 }
-static void wasm_buf_grow(TenonBuf* b, size_t need) {
-    size_t nc = b->cap * 2;
+static void wasm_buf_grow(TenonBuf* b, uint64_t need) {
+    uint64_t nc = b->cap * 2;
     while (nc < need) nc *= 2;
-    uint8_t* nd = (uint8_t*)wasm_alloc(nc);
-    if (b->len > 0) memcpy(nd, b->data, b->len);
+    uint8_t* nd = (uint8_t*)wasm_alloc((size_t)nc);
+    if (b->len > 0) memcpy(nd, b->data, (size_t)b->len);
     b->data = nd; b->cap = nc;
 }
 int64_t tenon_buf_push_str(int64_t h, int64_t s) {
@@ -483,7 +483,9 @@ int64_t tenon_bytes_push(int64_t b, int64_t bv) {
         hdr->len = old_len + 1;
         return b;
     }
-    int64_t nc = hdr->cap * 16; if (nc < old_len + 1) nc = old_len + 1; if (nc < 16) nc = 16;
+    int64_t nc = (old_len < hdr->cap * 8) ? (hdr->cap * 8) : (hdr->cap * 16);
+    if (nc < old_len + 1) nc = old_len + 1;
+    if (nc < 16) nc = 16;
     TenonObj* fresh = tenon_rc_alloc_raw(10, old_len + 1, (nc + 7) / 8);
     if (old_len > 0) memcpy(fresh->fields, hdr->fields, (size_t)old_len);
     ((uint8_t*)fresh->fields)[old_len] = (uint8_t)(bv & 0xFF);
@@ -502,6 +504,20 @@ int64_t tenon_bytes_to_text(int64_t b) {
     if (b == 0) return tenon_text_new(0, 0);
     TenonObj* hdr = (TenonObj*)(uintptr_t)b;
     return tenon_text_new((int64_t)(uintptr_t)hdr->fields, hdr->len);
+}
+int64_t tenon_float_is_nan(int64_t bits) {
+    union { double d; int64_t i; } u;
+    u.i = bits;
+    return (u.d != u.d) ? 1 : 0;
+}
+int64_t tenon_float_bits(int64_t bits) {
+    union { double d; int64_t i; } u;
+    u.i = bits;
+    if (u.d == 0.0) { u.d = 0.0; return u.i; }
+    return bits;
+}
+int32_t tenon_memcmp_i64(const void* a, const void* b, int64_t n) {
+    return (int32_t)memcmp(a, b, (size_t)n);
 }
 
 /* ===== JS/TS <-> Wasm32 Linear Memory Bridge Exports ===== */
@@ -557,6 +573,11 @@ pub fn compile_program_to_wasm32_llvm(
     wopts.target_triple = Some("wasm32-unknown-unknown".into());
     wopts.debug_info = false;
     let mut ir = emit_llvm_ir_with_build_options(program, &wopts)?;
+    // On wasm32, C `memcmp` takes 32-bit `size_t` (i32), while `__tn_text_eq` passes `i64 %la`.
+    // Route through `tenon_memcmp_i64(ptr, ptr, i64)` so wasm-ld has zero signature mismatches!
+    ir = ir
+        .replace("declare i32 @memcmp(ptr, ptr, i64)", "declare i32 @tenon_memcmp_i64(ptr, ptr, i64)")
+        .replace("call i32 @memcmp(ptr %ba, ptr %bb, i64 %la)", "call i32 @tenon_memcmp_i64(ptr %ba, ptr %bb, i64 %la)");
 
     // Collect exported `pub fn`s and `main` so C wrappers can re-export them with Wasm `export_name`.
     let prepared = prepare_program_for_codegen(program);

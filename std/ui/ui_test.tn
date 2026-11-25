@@ -1,0 +1,89 @@
+// std/ui/ui_test.tn — Colocated Tests for Unified VDOM, OpenUI Lang Streaming, and Double-Buffered TUI
+import "std/ui/vdom.tn"
+import "std/ui/openui.tn"
+import "std/ui/tui.tn"
+
+test fn test_vdom_keyed_diff_and_json_patches() {
+    let old_tree = vel("ul", [vprop("class", "list")], [
+        vel_keyed("li", "a", [], [vtext("Alpha")]),
+        vel_keyed("li", "b", [], [vtext("Beta")]),
+    ])
+    let new_tree = vel("ul", [vprop("class", "list active")], [
+        vel_keyed("li", "b", [], [vtext("Beta Updated")]),
+        vel_keyed("li", "a", [], [vtext("Alpha")]),
+        vel_keyed("li", "c", [], [vtext("Gamma")]),
+    ])
+    let patches = diff_vdom(old_tree, new_tree)
+    let json = patches_to_json(patches)
+    assert len(patches) >= 4
+    assert json.contains("\"op\":\"set_prop\"")
+    assert json.contains("\"op\":\"move_child\"")
+    assert json.contains("\"op\":\"set_text\"")
+    assert json.contains("\"op\":\"insert_child\"")
+    let html = vnode_to_html(new_tree)
+    assert html.contains("data-key=\"c\"")
+    assert html.contains("Beta Updated")
+}
+
+test fn test_openui_streaming_hoisting_state_cycle_and_prompt() {
+    // 1. Partial streaming chunk (last line truncated mid-string) must parse completed lines cleanly!
+    let chunk1 = "root = Card([hdr, kpis])\nhdr = Header(\"Revenue\", \"Live\")\nkpis = Row([m1])\nm1 = Metric(\"MRR\", \"$42k\", \"+18%\")\nm2 = Metric(\"Truncated"
+    let doc1 = openui_parse_stream(chunk1, false)
+    assert len(doc1.statements) == 4
+    assert doc1.root_id == "root"
+
+    // 2. Full OpenUI stream with `$users` state binding & `@refresh` action + forward references
+    let full_src = "root = Card([hdr, kpis, chart, btn])\nhdr = Header(\"Monthly Revenue\", \"Q1-Q2 2026\")\nkpis = Row([m1, m2])\nm1 = Metric(\"MRR\", \"$42,800\", \"+18%\")\nm2 = Metric(\"Users\", $users, \"+9%\")\nchart = BarChart([\"Jan\", \"Feb\", \"Mar\"], [120, 150, 195])\nbtn = Button(\"Refresh\", @refresh)\n"
+    let doc2 = openui_parse_stream(full_src, true)
+    var store = ui_store_new()
+    store = ui_store_set(store, "users", "12,480")
+    let vtree1 = openui_to_vdom(doc2, store)
+    let html1 = vnode_to_html(vtree1)
+    assert html1.contains("Monthly Revenue")
+    assert html1.contains("12,480")
+    assert html1.contains("data-action=\"@refresh\"")
+
+    // 3. Reactive update (`$users` changes -> minimal single `set_text` + `set_prop` VDOM diff!)
+    let store2 = ui_store_set(store, "users", "12,999")
+    let vtree2 = openui_to_vdom(doc2, store2)
+    let patches = diff_vdom(vtree1, vtree2)
+    let pjson = patches_to_json(patches)
+    assert len(patches) >= 1 && len(patches) <= 4
+    assert pjson.contains("12,999")
+
+    // 4. LLM cycle protection (`a -> b -> a` terminates safely without stack overflow)
+    let cyclic = "root = Card([b])\nb = Card([root])\n"
+    let cyc_doc = openui_parse_stream(cyclic, true)
+    let cyc_html = vnode_to_html(openui_to_vdom(cyc_doc, store))
+    assert cyc_html.contains("cycle-guarded")
+
+    // 5. Auto LLM System Prompt generation
+    let prompt = openui_generate_system_prompt(openui_default_schemas())
+    assert prompt.contains("OpenUI Lang")
+    assert prompt.contains("BarChart")
+    assert prompt.contains("$var")
+}
+
+test fn test_tui_double_buffered_grid_and_ansi_diff() {
+    let src = "root = Card([hdr, kpis, chart, btn])\nhdr = Header(\"Tenon TUI\", \"OpenUI -> VDOM -> ANSI\")\nkpis = Row([m1, m2])\nm1 = Metric(\"TPS\", $tps, \"+12%\")\nm2 = Metric(\"Leaks\", \"0\", \"100%\")\nchart = BarChart([\"Jan\", \"Feb\"], [80, 160])\nbtn = Button(\"Run\", @run)\n"
+    let doc = openui_parse_stream(src, true)
+    let s1 = ui_store_set(ui_store_new(), "tps", "145k")
+    let s2 = ui_store_set(s1, "tps", "188k")
+
+    let frame1 = render_vdom_to_tui(openui_to_vdom(doc, s1), 54, 14)
+    let frame2 = render_vdom_to_tui(openui_to_vdom(doc, s2), 54, 14)
+
+    let plain1 = tui_buffer_to_plain_text(frame1)
+    assert plain1.contains("Tenon TUI")
+    assert plain1.contains("145k")
+    assert plain1.contains("[ Run ]")
+    assert plain1.contains("####")
+
+    // Diff between frame1 and frame2 must be tiny (only the changed digits `145k` -> `188k`)!
+    let ansi_diff = tui_diff_ansi(frame1, frame2)
+    assert len(ansi_diff) > 0 && len(ansi_diff) < 120
+    assert ansi_diff.contains("88")
+    // Diff of identical frames must emit 0 bytes!
+    let empty_diff = tui_diff_ansi(frame2, frame2)
+    assert len(empty_diff) == 0
+}

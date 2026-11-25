@@ -1281,6 +1281,14 @@ pub fn encode_expr_with_reals(
                         let resolved = subst.get(var).map(|s| s.as_str()).unwrap_or(var.as_str());
                         return Ok(smt_ident(&format!("__len__{}", resolved)));
                     }
+                    if let ExprKind::Field { target, field } = &args[0].value.kind {
+                        if let ExprKind::Ident(base) = &target.kind {
+                            let resolved_base = subst.get(base).map(|s| s.as_str()).unwrap_or(base.as_str());
+                            let full = format!("{}.{}", resolved_base, field);
+                            let resolved = subst.get(&full).map(|s| s.as_str()).unwrap_or(full.as_str());
+                            return Ok(smt_ident(&format!("__len__{}", resolved.replace('.', "__"))));
+                        }
+                    }
                 }
                 if fname == "__smt_const_array" && args.len() == 1 {
                     let v_s = encode_expr_with_reals(&args[0].value, subst, real_vars)?;
