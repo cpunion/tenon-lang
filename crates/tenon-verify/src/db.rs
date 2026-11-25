@@ -271,6 +271,40 @@ impl IncrementalDb {
     }
 }
 
+/// Persistent disk verification cache (`.tenon-cache/verify_v1.json`) keyed by full structural
+/// SHA-256 hash (`program_full_hash`). Returns `(CheckReport, cache_hit)`.
+pub fn check_program_cached_on_disk(
+    prog: &Program,
+    cache_dir: &std::path::Path,
+) -> (CheckReport, bool) {
+    let key = format!("v1_{}", program_full_hash(prog));
+    let cache_file = cache_dir.join("verify_v1.json");
+    let mut map: BTreeMap<String, CheckReport> = std::fs::read_to_string(&cache_file)
+        .ok()
+        .and_then(|txt| serde_json::from_str(&txt).ok())
+        .unwrap_or_default();
+
+    if let Some(cached) = map.get(&key).cloned() {
+        return (cached, true);
+    }
+
+    let report = check_program(prog);
+    if report.ok {
+        if map.len() >= 64 {
+            map.clear();
+        }
+        map.insert(key, report.clone());
+        let _ = std::fs::create_dir_all(cache_dir);
+        if let Ok(json) = serde_json::to_string(&map) {
+            let tmp = cache_dir.join(format!("verify_v1_{}.tmp", std::process::id()));
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &cache_file);
+            }
+        }
+    }
+    (report, false)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);

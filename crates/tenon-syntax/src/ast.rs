@@ -867,6 +867,14 @@ pub fn instantiate_alias_predicate(ta: &TypeAliasDecl, args: &[TypeExpr]) -> Opt
                             span: *span,
                         },
                     );
+                } else if !name.is_empty() && name != tp {
+                    const_map.insert(
+                        tp.clone(),
+                        Expr {
+                            kind: ExprKind::Ident(name.clone()),
+                            span: *span,
+                        },
+                    );
                 }
             }
         }

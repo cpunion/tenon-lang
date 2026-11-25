@@ -13,7 +13,10 @@ pub use checker::{
     CastVerdict, CheckReport, Diagnostic, ProofRecord, ProofTier, check_program,
     check_type_subsumption, emit_repro_test_from_diagnostics,
 };
-pub use db::{IncrementalDb, QueryStats, program_full_hash, program_signature_hash};
+pub use db::{
+    IncrementalDb, QueryStats, check_program_cached_on_disk, program_full_hash,
+    program_signature_hash,
+};
 pub use evolve::{
     CompatVerdict, EvolutionLockEntry, EvolutionReport, append_evolution_lock, check_evolution,
     emit_expand_contract_sql,
@@ -2328,5 +2331,72 @@ pub fn bad_aliased_graph(a List[Float32]) List[Float32] {
             "expected E0841/E0820 data hazard on aliased read+inout GPU buffer, got {:?}",
             gpu_haz_rep.diagnostics
         );
+    }
+
+    #[test]
+    fn verifies_h3_const_generic_matrix_auto_accumulator_invariants_and_disk_cache() {
+        // 1. Auto-synthesized accumulator loop invariant (NO manual `invariant` clause!)
+        let src = r#"
+pub type Positive = Int where self >= 1
+pub type Percentage = Int where 0 <= self && self <= 100
+
+pub record Tensor2D {
+    rows Positive
+    cols Positive
+    data List[Float32]
+}
+
+pub type Matrix[R Int, C Int] = Tensor2D where self.rows == R && self.cols == C && len(self.data) == R * C
+
+pub pure fn average_no_manual_inv(scores List[Percentage]) Percentage
+    requires len(scores) >= 1 && len(scores) <= 10000
+{
+    var sum = 0
+    var i = 0
+    while i < len(scores) {
+        sum = sum + scores[i]
+        i += 1
+    }
+    sum / len(scores)
+}
+
+pub pure fn mat_mul_2x3_3x2(a Matrix[2, 3], b Matrix[3, 2]) Matrix[2, 2] {
+    var out List[Float32] = list_filled(4, 0.0 as Float32)
+    Tensor2D { rows = 2, cols = 2, data = out }
+}
+
+pub pure fn ok_matrix_call(a Matrix[2, 3], b Matrix[3, 2]) Int {
+    let c = mat_mul_2x3_3x2(a, b)
+    c.rows + c.cols
+}
+"#;
+        let prog = parse(src).unwrap();
+        let rep = check_program(&prog);
+        assert!(
+            rep.ok,
+            "expected H3 auto-synthesized accumulator invariant & const-generic Matrix[R,C] to verify: {:?}",
+            rep.diagnostics
+        );
+
+        // 2. Negative control: mismatched const-generic Matrix[4, 2] passed where Matrix[3, 2] expected!
+        let bad_src = format!(
+            "{}\npub pure fn bad_matrix_call(a Matrix[2, 3], wrong Matrix[4, 2]) Int {{\n    let c = mat_mul_2x3_3x2(a, wrong)\n    c.rows\n}}\n",
+            src
+        );
+        let bad_rep = check_program(&parse(&bad_src).unwrap());
+        assert!(
+            !bad_rep.ok,
+            "expected Matrix[4, 2] passed as Matrix[3, 2] to fail static verification!"
+        );
+
+        // 3. Persistent disk verification cache (miss -> hit with identical proofs)
+        let cache_dir = std::env::temp_dir().join(format!("tenon_h3_cache_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let (r1, hit1) = check_program_cached_on_disk(&prog, &cache_dir);
+        let (r2, hit2) = check_program_cached_on_disk(&prog, &cache_dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        assert!(r1.ok && !hit1, "first disk cache lookup should be a miss");
+        assert!(r2.ok && hit2, "second disk cache lookup should be a hit");
+        assert_eq!(r1.proofs.len(), r2.proofs.len());
     }
 }

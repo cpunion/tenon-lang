@@ -23,14 +23,15 @@ import "std/gpu/tensor.tn"
 
 pub type Percentage = Int where 0 <= self && self <= 100
 
-/// Notice: NO manual `invariant` needed — Tenon auto-synthesizes `0 <= i <= len(scores)`,
-/// eliminates every bounds check, and proves `len(scores) > 0` makes integer division trap-free!
+/// Notice: ZERO manual `invariant` needed — Tenon auto-synthesizes `0 <= i <= len(scores)`
+/// AND `0 <= sum <= 100 * i` from `List[Percentage]`, eliminates every bounds check, and proves
+/// `len(scores) > 0` makes integer division trap-free!
 pub pure fn average_score(scores List[Percentage]) Percentage
     requires len(scores) >= 1 && len(scores) <= 10000
 {
     var sum = 0
     var i = 0
-    while i < len(scores) invariant 0 <= i && i <= len(scores) && 0 <= sum && sum <= 100 * i {
+    while i < len(scores) {
         sum = sum + scores[i]
         i += 1
     }

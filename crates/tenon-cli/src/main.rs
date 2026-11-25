@@ -231,10 +231,18 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
     };
 
+    let use_disk_cache = emit_proofs.is_none()
+        && emit_repro_test.is_none()
+        && std::env::var("TENON_NO_CACHE").as_deref() != Ok("1");
     if emit_proofs.is_some() {
         tenon_verify::begin_proof_recording();
     }
-    let report = check_program(&prog);
+    let (report, disk_cache_hit) = if use_disk_cache {
+        tenon_verify::check_program_cached_on_disk(&prog, Path::new(".tenon-cache"))
+    } else {
+        (check_program(&prog), false)
+    };
+    let _ = disk_cache_hit;
     if let Some(pdir) = emit_proofs {
         let certs = tenon_verify::end_proof_recording();
         match tenon_verify::export_proof_certificates(&pdir, &certs) {

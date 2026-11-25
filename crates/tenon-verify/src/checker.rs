@@ -8651,6 +8651,90 @@ impl CheckerCtx {
             return;
         }
 
+        // Record-level refinement alias fast path (e.g. `type Matrix[R, C] = Tensor2D where self.rows == R && self.cols == C`):
+        // Supports both `Ident(v)` (using `v.field` directly) and `RecordLit { fields }` (substituting `self.field` -> field value)!
+        let pred_uses_self_field = expr_mentions_self_field(pred);
+        if pred_uses_self_field {
+            let (l0_res, l1_goal, l1_subst) = match &expr.kind {
+                ExprKind::Ident(vname) => {
+                    let mut s = BTreeMap::new();
+                    s.insert("self".into(), vname.clone());
+                    (env.check_predicate(pred, Some(vname)), pred.clone(), s)
+                }
+                ExprKind::RecordLit { fields, .. } => {
+                    let rewritten = substitute_self_fields_from_lit(pred, fields);
+                    (env.check_predicate(&rewritten, None), rewritten, BTreeMap::new())
+                }
+                _ => (L0Result::Unknown, pred.clone(), BTreeMap::new()),
+            };
+            match l0_res {
+                L0Result::Proved => {
+                    self.proofs.push(ProofRecord {
+                        obligation: format!("{} satisfies `{}`", context, name),
+                        tier: ProofTier::L0Fast,
+                        span,
+                    });
+                    return;
+                }
+                L0Result::Disproved(reason) => {
+                    self.diagnostics.push(Diagnostic {
+                        code: "E0410".into(),
+                        message: format!("{} violates refinement type `{}`", context, name),
+                        span,
+                        notes: vec![reason],
+                        counterexample: BTreeMap::new(),
+                    });
+                    return;
+                }
+                L0Result::Unknown => {
+                    let mut q = SmtQuery::new(self.smt_pure_fns.clone());
+                    for v in smt_int_vars {
+                        if !self.cur_real_vars.contains(v) {
+                            q.declare_int(v.clone());
+                        }
+                    }
+                    for rv in &self.cur_real_vars {
+                        q.declare_real(rv.clone());
+                    }
+                    for (p, s) in smt_premises {
+                        let _ = q.add_premise_expr(p, s);
+                    }
+                    if let Err(e) = q.set_goal_expr(&l1_goal, &l1_subst) {
+                        self.diagnostics.push(Diagnostic {
+                            code: "E0411".into(),
+                            message: format!("unproved refinement `{}` for {} (Fail-Closed)", name, context),
+                            span,
+                            notes: vec![e],
+                            counterexample: BTreeMap::new(),
+                        });
+                        return;
+                    }
+                    match q.solve() {
+                        SmtOutcome::Proved => self.proofs.push(ProofRecord {
+                            obligation: format!("{} satisfies `{}`", context, name),
+                            tier: ProofTier::L1Smt,
+                            span,
+                        }),
+                        SmtOutcome::Counterexample(ce) => self.diagnostics.push(Diagnostic {
+                            code: "E0410".into(),
+                            message: format!("{} may violate refinement type `{}`", context, name),
+                            span,
+                            notes: vec!["counterexample found by L1 SMT (Z3)".into()],
+                            counterexample: ce,
+                        }),
+                        SmtOutcome::Unknown(msg) => self.diagnostics.push(Diagnostic {
+                            code: "E0411".into(),
+                            message: format!("unproved refinement `{}` for {} (Fail-Closed)", name, context),
+                            span,
+                            notes: vec![msg],
+                            counterexample: BTreeMap::new(),
+                        }),
+                    }
+                    return;
+                }
+            }
+        }
+
         let mut check_env = env.clone();
         let abs = env.eval_abs_int(expr, None);
         check_env.set_int("__val", abs);
@@ -10237,6 +10321,64 @@ fn expr_simple_path(expr: &Expr) -> Option<String> {
     }
 }
 
+fn expr_mentions_self_field(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Field { target, .. } => {
+            matches!(&target.kind, ExprKind::Ident(s) if s == "self") || expr_mentions_self_field(target)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            expr_mentions_self_field(left) || expr_mentions_self_field(right)
+        }
+        ExprKind::Unary { expr: inner, .. } | ExprKind::Cast { expr: inner, .. } => {
+            expr_mentions_self_field(inner)
+        }
+        ExprKind::Call { callee, args } => {
+            expr_mentions_self_field(callee) || args.iter().any(|a| expr_mentions_self_field(&a.value))
+        }
+        ExprKind::Index { target, index } => {
+            expr_mentions_self_field(target) || expr_mentions_self_field(index)
+        }
+        _ => false,
+    }
+}
+
+fn substitute_self_fields_from_lit(expr: &Expr, fields: &[(String, Expr)]) -> Expr {
+    let kind = match &expr.kind {
+        ExprKind::Field { target, field } => {
+            if matches!(&target.kind, ExprKind::Ident(s) if s == "self") {
+                if let Some((_, fval)) = fields.iter().find(|(k, _)| k == field) {
+                    return fval.clone();
+                }
+            }
+            ExprKind::Field {
+                target: Box::new(substitute_self_fields_from_lit(target, fields)),
+                field: field.clone(),
+            }
+        }
+        ExprKind::Binary { op, left, right } => ExprKind::Binary {
+            op: *op,
+            left: Box::new(substitute_self_fields_from_lit(left, fields)),
+            right: Box::new(substitute_self_fields_from_lit(right, fields)),
+        },
+        ExprKind::Unary { op, expr: inner } => ExprKind::Unary {
+            op: *op,
+            expr: Box::new(substitute_self_fields_from_lit(inner, fields)),
+        },
+        ExprKind::Call { callee, args } => ExprKind::Call {
+            callee: Box::new(substitute_self_fields_from_lit(callee, fields)),
+            args: args
+                .iter()
+                .map(|a| CallArg {
+                    name: a.name.clone(),
+                    value: substitute_self_fields_from_lit(&a.value, fields),
+                })
+                .collect(),
+        },
+        _ => expr.kind.clone(),
+    };
+    Expr { kind, span: expr.span }
+}
+
 impl CheckerCtx {
     /// Soundly synthesizes canonical counting loop invariants (`0 <= i`, `i <= bound`)
     /// for loops like `var i = 0; while i < bound { ...; i += 1 }` when `i` is only incremented
@@ -10284,7 +10426,7 @@ impl CheckerCtx {
                 let le_bound = Expr {
                     kind: ExprKind::Binary {
                         op: BinOp::Le,
-                        left: Box::new(iv_expr),
+                        left: Box::new(iv_expr.clone()),
                         right: Box::new(bound_expr),
                     },
                     span: sp,
@@ -10292,9 +10434,175 @@ impl CheckerCtx {
                 if pre_env.check_predicate(&le_bound, None) == L0Result::Proved {
                     out.push(le_bound);
                 }
+                // H3 Auto-Invariant Synthesis for Accumulators:
+                // For `var sum = s0; while i < bound { sum = sum + xs[i]; i += 1 }` where `xs` has
+                // refined element bounds `[lo, hi]` (e.g. `List[Percentage]` -> `[0, 100]`), soundly
+                // synthesize `s0 + lo * i <= sum` and `sum <= s0 + hi * i`!
+                self.synthesize_accumulator_invariants(body, &iv, mutated, pre_env, sp, &mut out);
             }
         }
         out
+    }
+
+    fn synthesize_accumulator_invariants(
+        &self,
+        body: &Block,
+        iv: &str,
+        mutated: &BTreeSet<String>,
+        pre_env: &L0Env,
+        sp: Span,
+        out: &mut Vec<Expr>,
+    ) {
+        let mut updates: BTreeMap<String, Vec<Expr>> = BTreeMap::new();
+        for s in &body.stmts {
+            if let Stmt::Assign { target, op, value, .. } = s {
+                if let ExprKind::Ident(v) = &target.kind {
+                    if v == iv {
+                        continue;
+                    }
+                    let delta = match op {
+                        AssignOp::AddSet => Some(value.clone()),
+                        AssignOp::Set => match &value.kind {
+                            ExprKind::Binary { op: BinOp::Add, left, right } => {
+                                if matches!(&left.kind, ExprKind::Ident(a) if a == v) {
+                                    Some((**right).clone())
+                                } else if matches!(&right.kind, ExprKind::Ident(a) if a == v) {
+                                    Some((**left).clone())
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(d) = delta {
+                        updates.entry(v.clone()).or_default().push(d);
+                    } else {
+                        // Non-additive mutation disqualifies `v` as a simple accumulator
+                        updates.insert(v.clone(), vec![]);
+                    }
+                }
+            }
+        }
+        for (acc, deltas) in updates {
+            if deltas.len() != 1 {
+                continue;
+            }
+            // Ensure `acc` is not mutated elsewhere inside nested blocks/if/while
+            if self.count_var_assignments_in_block(body, &acc) != 1 {
+                continue;
+            }
+            let init_abs = pre_env.get_int(&acc);
+            if init_abs.interval.min != init_abs.interval.max {
+                continue;
+            }
+            let Ok(s0) = i64::try_from(init_abs.interval.min) else { continue };
+            let delta = &deltas[0];
+            // Determine sound per-iteration bounds `[lo, hi]` for `delta`
+            let bounds: Option<(i64, i64)> = if let ExprKind::Index { target, index } = &delta.kind {
+                if let ExprKind::Ident(arr) = &target.kind {
+                    if !mutated.contains(arr) && matches!(&index.kind, ExprKind::Ident(idx) if idx == iv) {
+                        pre_env.elem_ints.get(arr).and_then(|eabs| {
+                            let lo = i64::try_from(eabs.interval.min).ok()?;
+                            let hi = i64::try_from(eabs.interval.max).ok()?;
+                            if lo > i64::MIN / 2 && hi < i64::MAX / 2 { Some((lo, hi)) } else { None }
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else if !mutated.iter().any(|m| expr_mentions_ident(delta, m)) {
+                let dabs = pre_env.eval_abs_int(delta, None);
+                let lo = i64::try_from(dabs.interval.min).ok();
+                let hi = i64::try_from(dabs.interval.max).ok();
+                match (lo, hi) {
+                    (Some(l), Some(h)) if l > i64::MIN / 2 && h < i64::MAX / 2 => Some((l, h)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let Some((lo, hi)) = bounds else { continue };
+            let acc_e = Expr { kind: ExprKind::Ident(acc.clone()), span: sp };
+            let iv_e = Expr { kind: ExprKind::Ident(iv.to_string()), span: sp };
+            let make_lin = |base: i64, coeff: i64| -> Expr {
+                let mul = if coeff == 0 {
+                    Expr { kind: ExprKind::Int(0), span: sp }
+                } else if coeff == 1 {
+                    iv_e.clone()
+                } else {
+                    Expr {
+                        kind: ExprKind::Binary {
+                            op: BinOp::Mul,
+                            left: Box::new(Expr { kind: ExprKind::Int(coeff), span: sp }),
+                            right: Box::new(iv_e.clone()),
+                        },
+                        span: sp,
+                    }
+                };
+                if base == 0 {
+                    mul
+                } else if coeff == 0 {
+                    Expr { kind: ExprKind::Int(base), span: sp }
+                } else {
+                    Expr {
+                        kind: ExprKind::Binary {
+                            op: BinOp::Add,
+                            left: Box::new(Expr { kind: ExprKind::Int(base), span: sp }),
+                            right: Box::new(mul),
+                        },
+                        span: sp,
+                    }
+                }
+            };
+            out.push(Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Le,
+                    left: Box::new(make_lin(s0, lo)),
+                    right: Box::new(acc_e.clone()),
+                },
+                span: sp,
+            });
+            out.push(Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Le,
+                    left: Box::new(acc_e),
+                    right: Box::new(make_lin(s0, hi)),
+                },
+                span: sp,
+            });
+        }
+    }
+
+    fn count_var_assignments_in_block(&self, blk: &Block, var: &str) -> usize {
+        let mut n = 0;
+        for s in &blk.stmts {
+            match s {
+                Stmt::Assign { target, .. } => {
+                    if matches!(&target.kind, ExprKind::Ident(v) if v == var) {
+                        n += 1;
+                    }
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+                    n += self.count_var_assignments_in_block(body, var);
+                }
+                Stmt::Expr { expr, .. } => {
+                    if let ExprKind::If { then_block, else_branch, .. } = &expr.kind {
+                        n += self.count_var_assignments_in_block(then_block, var);
+                        if let Some(eb) = else_branch {
+                            if let ExprKind::Block(b) = &eb.kind {
+                                n += self.count_var_assignments_in_block(b, var);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        n
     }
 
     fn analyze_loop_counter_updates(&self, blk: &Block, iv: &str) -> Option<(usize, i64)> {

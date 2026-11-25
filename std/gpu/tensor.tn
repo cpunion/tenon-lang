@@ -20,6 +20,10 @@ pub record Tensor2D {
     data List[Float32]
 }
 
+/// Const-Generic Dependent-Shape Matrix Type Alias (`Matrix[R, C]`):
+/// Encodes exact row/column dimensions & backing length right in the type signature!
+pub type Matrix[R Int, C Int] = Tensor2D where self.rows == R && self.cols == C && len(self.data) == R * C
+
 pub pure fn tensor2d_zeros(
     r Int where 1 <= self && self <= 4096,
     c Int where 1 <= self && self <= 4096,
