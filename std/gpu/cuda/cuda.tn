@@ -1,0 +1,124 @@
+// std/gpu/cuda/cuda.tn — Zero-Link-Flag Native NVIDIA CUDA Driver + NVRTC HAL (`@linear` VRAM Handles)
+//
+// Works on ANY NVIDIA GPU (RTX 4090 / 5090 / L40S / A100 / H100 / H200 / B200) via dynamic
+// `dlopen("libcuda.so.1")` + `dlopen("libnvrtc.so")` / `nvcc` JIT. Enforces zero VRAM leaks at
+// compile time using Tenon's `@linear` typestate verifier!
+
+import "std/core/types.tn"
+
+@c_src("cuda_shim.c")
+extern "C" {
+    fn tn_cuda_init() Int
+    fn tn_cuda_device_name_cstr() Ptr[UInt8]
+    fn tn_cuda_compute_cap() Int
+    fn tn_cuda_sm_count() Int
+    fn tn_cuda_vram_mb() Int
+    fn tn_cuda_peak_gbs() Float
+    fn tn_cuda_buf_uninit(byte_len Int) Int
+    fn tn_cuda_buf_create(data_ptr Ptr[UInt8], byte_len Int) Int
+    fn tn_cuda_buf_upload(handle Int, src_ptr Ptr[UInt8], byte_len Int) Int
+    fn tn_cuda_buf_read(handle Int, dst_ptr Ptr[UInt8], byte_len Int) Int
+    fn tn_cuda_buf_free(handle Int) Int
+    fn tn_cuda_compile_kernel(cu_cstr Ptr[UInt8], fn_cstr Ptr[UInt8]) Int
+    fn tn_cuda_kernel_free(k_h Int) Int
+    fn tn_cuda_launch_3buf_u32(
+        k_h Int, b0 Int, b1 Int, b2 Int, n_arg Int,
+        gx Int, gy Int, gz Int, bx Int, by Int, bz Int,
+    ) Int
+    fn tn_cuda_sync() Int
+}
+
+@linear
+pub record CudaBuffer {
+    handle   Int
+    byte_len Int
+}
+
+@linear
+pub record CudaKernel {
+    handle Int
+}
+
+pub fn cuda_init() Bool {
+    unsafe { tn_cuda_init() != 0 }
+}
+
+pub fn cuda_device_name() Text {
+    unsafe { cstr_to_text(tn_cuda_device_name_cstr()) }
+}
+
+pub fn cuda_compute_cap() Int {
+    unsafe { tn_cuda_compute_cap() }
+}
+
+pub fn cuda_sm_count() Int {
+    unsafe { tn_cuda_sm_count() }
+}
+
+pub fn cuda_vram_mb() Int {
+    unsafe { tn_cuda_vram_mb() }
+}
+
+pub fn cuda_peak_gbs() Float {
+    unsafe { tn_cuda_peak_gbs() }
+}
+
+pub fn cuda_sync() Bool {
+    unsafe { tn_cuda_sync() != 0 }
+}
+
+impl CudaBuffer {
+    pub fn uninit(byte_len Int) CudaBuffer {
+        let h = unsafe { tn_cuda_buf_uninit(byte_len) }
+        CudaBuffer { handle = h, byte_len = byte_len }
+    }
+
+    pub fn from_f32_list(xs List[Float32]) CudaBuffer {
+        let nbytes = len(xs) * 4
+        let h = unsafe { tn_cuda_buf_create(list_data_ptr(xs), nbytes) }
+        CudaBuffer { handle = h, byte_len = nbytes }
+    }
+
+    pub fn from_f16_list(xs List[Float16]) CudaBuffer {
+        let nbytes = len(xs) * 2
+        let h = unsafe { tn_cuda_buf_create(list_data_ptr(xs), nbytes) }
+        CudaBuffer { handle = h, byte_len = nbytes }
+    }
+
+    pub fn from_u32_list(xs List[UInt32]) CudaBuffer {
+        let nbytes = len(xs) * 4
+        let h = unsafe { tn_cuda_buf_create(list_data_ptr(xs), nbytes) }
+        CudaBuffer { handle = h, byte_len = nbytes }
+    }
+
+    pub fn read_f32(inout self, inout dst List[Float32]) Int {
+        unsafe { tn_cuda_buf_read(self.handle, list_data_ptr(dst), len(dst) * 4) }
+    }
+
+    pub fn read_f16(inout self, inout dst List[Float16]) Int {
+        unsafe { tn_cuda_buf_read(self.handle, list_data_ptr(dst), len(dst) * 2) }
+    }
+
+    pub fn free(self) Int {
+        unsafe { tn_cuda_buf_free(self.handle) }
+    }
+}
+
+impl CudaKernel {
+    pub fn compile(cu_src Text, fn_name Text) CudaKernel {
+        let h = unsafe { tn_cuda_compile_kernel(text_cstr_ptr(cu_src), text_cstr_ptr(fn_name)) }
+        CudaKernel { handle = h }
+    }
+
+    pub fn launch_3buf_u32(
+        inout self,
+        b0 Int, b1 Int, b2 Int, n_arg Int,
+        gx Int, gy Int, gz Int, bx Int, by Int, bz Int,
+    ) Bool {
+        unsafe { tn_cuda_launch_3buf_u32(self.handle, b0, b1, b2, n_arg, gx, gy, gz, bx, by, bz) != 0 }
+    }
+
+    pub fn free(self) Int {
+        unsafe { tn_cuda_kernel_free(self.handle) }
+    }
+}

@@ -1,0 +1,167 @@
+// std/gpu/tpu/tpu.tn — Zero-Python, Zero-Link-Flag Native Google Cloud TPU PJRT C-API + StableHLO HAL
+//
+// Directly calls `libtpu.so` (`GetPjrtApi()`) via `std/gpu/tpu/pjrt_tpu_shim.c` and compiles Tenon
+// StableHLO MLIR graphs directly through Google's XLA TPU compiler onto TPU TensorCore MXU systolic
+// arrays (v2 / v4 / v5e / v5p / v6e Trillium). Enforces leak-free HBM lifetimes via `@linear`!
+
+import "std/core/types.tn"
+
+pub const TPU_F32  Int = 0
+pub const TPU_BF16 Int = 1
+pub const TPU_F16  Int = 2
+pub const TPU_S32  Int = 3
+pub const TPU_S8   Int = 4
+
+@c_src("pjrt_tpu_shim.c")
+extern "C" {
+    fn tn_tpu_init() Int
+    fn tn_tpu_platform_name_cstr() Ptr[UInt8]
+    fn tn_tpu_device_kind_cstr() Ptr[UInt8]
+    fn tn_tpu_platform_ver_cstr() Ptr[UInt8]
+    fn tn_tpu_device_count() Int
+    fn tn_tpu_pjrt_major() Int
+    fn tn_tpu_pjrt_minor() Int
+    fn tn_tpu_buf_create_1d(data_ptr Ptr[UInt8], dtype Int, d0 Int) Int
+    fn tn_tpu_buf_create_2d(data_ptr Ptr[UInt8], dtype Int, d0 Int, d1 Int) Int
+    fn tn_tpu_buf_create_3d(data_ptr Ptr[UInt8], dtype Int, d0 Int, d1 Int, d2 Int) Int
+    fn tn_tpu_buf_zeros_2d(dtype Int, d0 Int, d1 Int) Int
+    fn tn_tpu_buf_zeros_3d(dtype Int, d0 Int, d1 Int, d2 Int) Int
+    fn tn_tpu_buf_read(handle Int, dst_ptr Ptr[UInt8], byte_len Int) Int
+    fn tn_tpu_buf_free(handle Int) Int
+    fn tn_tpu_compile_mlir(mlir_cstr Ptr[UInt8]) Int
+    fn tn_tpu_exec_free(exec_h Int) Int
+    fn tn_tpu_exec_2(exec_h Int, b0 Int, b1 Int) Int
+    fn tn_tpu_exec_3(exec_h Int, b0 Int, b1 Int, b2 Int) Int
+    fn tn_tpu_exec_many(exec_h Int, in_handles_ptr Ptr[UInt8], n_in Int, out_handles_ptr Ptr[UInt8], max_out Int) Int
+    fn tn_tpu_f32_to_bf16(src_f32_ptr Ptr[UInt8], dst_bf16_ptr Ptr[UInt8], n Int) Int
+    fn tn_tpu_bf16_to_f32(src_bf16_ptr Ptr[UInt8], dst_f32_ptr Ptr[UInt8], n Int) Int
+}
+
+@linear
+pub record TpuBuffer {
+    handle   Int
+    n_elems  Int
+    dtype    Int
+}
+
+@linear
+pub record TpuExecutable {
+    handle Int
+}
+
+pub fn tpu_init() Bool {
+    unsafe { tn_tpu_init() != 0 }
+}
+
+pub fn tpu_platform_name() Text {
+    unsafe { cstr_to_text(tn_tpu_platform_name_cstr()) }
+}
+
+pub fn tpu_device_kind() Text {
+    unsafe { cstr_to_text(tn_tpu_device_kind_cstr()) }
+}
+
+pub fn tpu_platform_version() Text {
+    unsafe { cstr_to_text(tn_tpu_platform_ver_cstr()) }
+}
+
+pub fn tpu_device_count() Int {
+    unsafe { tn_tpu_device_count() }
+}
+
+pub fn tpu_pjrt_major() Int {
+    unsafe { tn_tpu_pjrt_major() }
+}
+
+pub fn tpu_pjrt_minor() Int {
+    unsafe { tn_tpu_pjrt_minor() }
+}
+
+pub fn f32_list_to_bf16(xs List[Float32]) List[BFloat16] {
+    var out List[BFloat16] = list_filled(len(xs), 0.0 as BFloat16)
+    let _ = unsafe { tn_tpu_f32_to_bf16(list_data_ptr(xs), list_data_ptr(out), len(xs)) }
+    out
+}
+
+pub fn bf16_list_to_f32(xs List[BFloat16]) List[Float32] {
+    var out List[Float32] = list_filled(len(xs), 0.0 as Float32)
+    let _ = unsafe { tn_tpu_bf16_to_f32(list_data_ptr(xs), list_data_ptr(out), len(xs)) }
+    out
+}
+
+impl TpuBuffer {
+    pub fn from_f32_1d(xs List[Float32]) TpuBuffer {
+        let n = len(xs)
+        let h = unsafe { tn_tpu_buf_create_1d(list_data_ptr(xs), TPU_F32, n) }
+        TpuBuffer { handle = h, n_elems = n, dtype = TPU_F32 }
+    }
+
+    pub fn from_f32_2d(xs List[Float32], rows Int, cols Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_create_2d(list_data_ptr(xs), TPU_F32, rows, cols) }
+        TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_F32 }
+    }
+
+    pub fn from_bf16_1d(xs List[BFloat16]) TpuBuffer {
+        let n = len(xs)
+        let h = unsafe { tn_tpu_buf_create_1d(list_data_ptr(xs), TPU_BF16, n) }
+        TpuBuffer { handle = h, n_elems = n, dtype = TPU_BF16 }
+    }
+
+    pub fn from_bf16_2d(xs List[BFloat16], rows Int, cols Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_create_2d(list_data_ptr(xs), TPU_BF16, rows, cols) }
+        TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_BF16 }
+    }
+
+    pub fn zeros_bf16_2d(rows Int, cols Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_zeros_2d(TPU_BF16, rows, cols) }
+        TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_BF16 }
+    }
+
+    pub fn zeros_s8_2d(rows Int, cols Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_zeros_2d(TPU_S8, rows, cols) }
+        TpuBuffer { handle = h, n_elems = rows * cols, dtype = TPU_S8 }
+    }
+
+    pub fn zeros_bf16_3d(d0 Int, d1 Int, d2 Int) TpuBuffer {
+        let h = unsafe { tn_tpu_buf_zeros_3d(TPU_BF16, d0, d1, d2) }
+        TpuBuffer { handle = h, n_elems = d0 * d1 * d2, dtype = TPU_BF16 }
+    }
+
+    pub fn read_f32(inout self, dst List[Float32]) Int {
+        unsafe { tn_tpu_buf_read(self.handle, list_data_ptr(dst), len(dst) * 4) }
+    }
+
+    pub fn read_bf16(inout self, dst List[BFloat16]) Int {
+        unsafe { tn_tpu_buf_read(self.handle, list_data_ptr(dst), len(dst) * 2) }
+    }
+
+    pub fn free(self) Int {
+        unsafe { tn_tpu_buf_free(self.handle) }
+    }
+}
+
+impl TpuExecutable {
+    pub fn compile_mlir(mlir_src Text) TpuExecutable {
+        let h = unsafe { tn_tpu_compile_mlir(text_cstr_ptr(mlir_src)) }
+        TpuExecutable { handle = h }
+    }
+
+    pub fn run_2(inout self, b0 Int, b1 Int, out_elems Int, out_dtype Int) TpuBuffer {
+        let oh = unsafe { tn_tpu_exec_2(self.handle, b0, b1) }
+        TpuBuffer { handle = oh, n_elems = out_elems, dtype = out_dtype }
+    }
+
+    pub fn run_3(inout self, b0 Int, b1 Int, b2 Int, out_elems Int, out_dtype Int) TpuBuffer {
+        let oh = unsafe { tn_tpu_exec_3(self.handle, b0, b1, b2) }
+        TpuBuffer { handle = oh, n_elems = out_elems, dtype = out_dtype }
+    }
+
+    pub fn run_many(inout self, in_handles List[Int], out_elems Int, out_dtype Int) TpuBuffer {
+        let oh = unsafe { tn_tpu_exec_many(self.handle, list_data_ptr(in_handles), len(in_handles), null_ptr(), 0) }
+        TpuBuffer { handle = oh, n_elems = out_elems, dtype = out_dtype }
+    }
+
+    pub fn free(self) Int {
+        unsafe { tn_tpu_exec_free(self.handle) }
+    }
+}

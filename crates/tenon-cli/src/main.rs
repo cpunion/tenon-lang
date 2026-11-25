@@ -1955,6 +1955,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     let mut emit_webgpu: Option<PathBuf> = None;
     let mut emit_cuda: Option<PathBuf> = None;
     let mut emit_spirv_glsl: Option<PathBuf> = None;
+    let mut emit_stablehlo: Option<PathBuf> = None;
     let mut emit_ts: Option<PathBuf> = None;
     let mut emit_mjs: Option<PathBuf> = None;
     let mut emit_swift: Option<PathBuf> = None;
@@ -2005,6 +2006,10 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             }
             "--emit-spirv-glsl" if i + 1 < args.len() => {
                 emit_spirv_glsl = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-stablehlo" if i + 1 < args.len() => {
+                emit_stablehlo = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--emit-header" if i + 1 < args.len() => {
@@ -2359,6 +2364,16 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         let glsl = tenon_codegen::gpu_shader::emit_spirv_glsl(&prog, &report.mir);
         let _ = fs::write(p, &glsl);
         println!("Emitted Vulkan 1.3 GLSL/SPIR-V ({} bytes) -> `{}`", glsl.len(), p.display());
+    }
+    if let Some(p) = &emit_stablehlo {
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let mlir = tenon_codegen::gpu_shader::emit_stablehlo(&prog, &report.mir);
+        let _ = fs::write(p, &mlir);
+        println!("Emitted Google TPU / XLA StableHLO MLIR ({} bytes) -> `{}`", mlir.len(), p.display());
     }
     if let Some(p) = &emit_webgpu {
         if let Some(parent) = p.parent() {

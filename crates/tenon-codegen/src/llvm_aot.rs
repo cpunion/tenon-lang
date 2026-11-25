@@ -367,11 +367,17 @@ pub fn compile_with_options(
         rt_hash ^= b as u64;
         rt_hash = rt_hash.wrapping_mul(0x100000001b3);
     }
+    let has_thin_lto_linker = cfg!(target_os = "macos")
+        || Command::new("ld.lld")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
     let use_thin_lto = opts.output_kind == OutputKind::Executable
         && opt_flag == "-O3"
         && !opts.debug_info
         && opts.target_triple.is_none()
-        && !has_objc_sources;
+        && !has_objc_sources
+        && has_thin_lto_linker;
     let rt_cache_key = format!(
         "tenon_rt_cache_{:016x}_{}_{}_{}_{}.o",
         rt_hash,
@@ -581,6 +587,9 @@ pub fn compile_with_options(
                     cmd.args(["-shared", "-fPIC"]);
                 } else if use_thin_lto {
                     cmd.arg("-flto=thin");
+                    if cfg!(target_os = "linux") && opts.linker.is_none() {
+                        cmd.arg("-fuse-ld=lld");
+                    }
                 }
                 if has_objc_sources {
                     cmd.arg("-fobjc-arc");
@@ -600,6 +609,9 @@ pub fn compile_with_options(
                     cmd.args(["-lcurl", "-lpthread"]);
                 } else if uses_sync && !is_freestanding {
                     cmd.arg("-lpthread");
+                }
+                if cfg!(target_os = "linux") && is_host_target && !is_freestanding {
+                    cmd.args(["-lm", "-ldl"]);
                 }
                 for lib in &all_link_libs {
                     cmd.arg(format!("-l{}", lib));

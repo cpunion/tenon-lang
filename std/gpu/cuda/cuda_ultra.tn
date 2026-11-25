@@ -1,0 +1,160 @@
+// std/gpu/cuda/cuda_ultra.tn — Tenon Ultra-Fused Quantized (Q4_0 / Q8_0 / FP16) NVIDIA CUDA LLM Engine
+//
+// Exposes dynamic-SMEM Fused RMSNorm+GEMV, Fused RMSNorm+Gate+Up+SwiGLU/GeGLU, Race-Free
+// Fused RoPE+KV+FlashDecoding, On-GPU Argmax, Direct Quantized Prefill GEMM, and Native
+// CUDA Graphs (`CudaGraph`) for near-zero CPU launch overhead!
+
+import "std/core/types.tn"
+import "std/gpu/cuda/cuda.tn"
+
+pub const CUDA_QUANT_FP16 Int = 0
+pub const CUDA_QUANT_Q8_0 Int = 1
+pub const CUDA_QUANT_Q4_0 Int = 2
+
+@c_src("cuda_ultra_shim.c")
+extern "C" {
+    fn tn_cuda_ultra_init() Int
+    fn tn_cuda_quantize_q4_0_buf(f16_ptr Ptr[UInt8], n_elems Int) Int
+    fn tn_cuda_quantize_q8_0_buf(f16_ptr Ptr[UInt8], n_elems Int) Int
+    fn tn_cuda_buf_write_u32_pair(h Int, v0 Int, v1 Int) Int
+    fn tn_cuda_buf_read_u32_0(h Int) Int
+    fn tn_cuda_graph_begin() Int
+    fn tn_cuda_graph_end() Int
+    fn tn_cuda_graph_launch(gh Int) Int
+    fn tn_cuda_graph_free(gh Int) Int
+    fn tn_cuda_ultra_embed(tok_h Int, emb_h Int, emb_off Int, out_h Int, seq_len Int, d_model Int, vocab Int) Int
+    fn tn_cuda_ultra_rmsnorm(x_h Int, w_h Int, w_off Int, out_h Int, seq_len Int, d_model Int, gemma_mode Int) Int
+    fn tn_cuda_ultra_gemv(
+        x_h Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
+        out_dim Int, in_dim Int, quant_mode Int, add_res Int, has_bias Int,
+    ) Int
+    fn tn_cuda_ultra_norm_gemv(
+        x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
+        out_dim Int, in_dim Int, quant_mode Int, gemma_mode Int, has_bias Int,
+    ) Int
+    fn tn_cuda_ultra_norm_ffn(
+        x_h Int, nw_h Int, nw_off Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int,
+        out_h Int, d_ff Int, in_dim Int, quant_mode Int, is_geglu Int, gemma_mode Int,
+    ) Int
+    fn tn_cuda_ultra_rope_flash_decode(
+        qkv_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_h Int, tok_pos_h Int,
+        n_heads Int, n_kv Int, d_head Int, max_seq Int, softcap Float,
+    ) Int
+    fn tn_cuda_ultra_argmax(logits_h Int, tok_pos_h Int, n_elems Int, inc_pos Int) Int
+    fn tn_cuda_ultra_mm(
+        x_h Int, w_h Int, w_off Int, y_h Int,
+        m Int, n Int, k Int, quant_mode Int, add_res Int,
+    ) Int
+}
+
+@linear
+pub record CudaGraph {
+    handle Int
+}
+
+pub fn cuda_ultra_init() Bool {
+    unsafe { tn_cuda_ultra_init() != 0 }
+}
+
+pub fn cuda_weight_stride_bytes(n_elems Int, quant_mode Int) Int {
+    if quant_mode == CUDA_QUANT_Q4_0 {
+        (n_elems / 32) * 18
+    } else if quant_mode == CUDA_QUANT_Q8_0 {
+        (n_elems / 32) * 34
+    } else {
+        n_elems * 2
+    }
+}
+
+pub fn cuda_upload_quantized_f16(xs List[Float16], quant_mode Int) CudaBuffer {
+    let n = len(xs)
+    if quant_mode == CUDA_QUANT_Q4_0 {
+        let h = unsafe { tn_cuda_quantize_q4_0_buf(list_data_ptr(xs), n) }
+        CudaBuffer { handle = h, byte_len = (n / 32) * 18 }
+    } else if quant_mode == CUDA_QUANT_Q8_0 {
+        let h = unsafe { tn_cuda_quantize_q8_0_buf(list_data_ptr(xs), n) }
+        CudaBuffer { handle = h, byte_len = (n / 32) * 34 }
+    } else {
+        CudaBuffer.from_f16_list(xs)
+    }
+}
+
+pub fn cuda_write_tok_pos(tok_pos_h Int, tok_id Int, pos Int) Bool {
+    unsafe { tn_cuda_buf_write_u32_pair(tok_pos_h, tok_id, pos) != 0 }
+}
+
+pub fn cuda_read_tok(tok_pos_h Int) Int {
+    unsafe { tn_cuda_buf_read_u32_0(tok_pos_h) }
+}
+
+pub fn cuda_graph_begin() Bool {
+    unsafe { tn_cuda_graph_begin() != 0 }
+}
+
+pub fn cuda_graph_end() CudaGraph {
+    let gh = unsafe { tn_cuda_graph_end() }
+    CudaGraph { handle = gh }
+}
+
+impl CudaGraph {
+    pub fn launch(inout self) Bool {
+        unsafe { tn_cuda_graph_launch(self.handle) != 0 }
+    }
+
+    pub fn free(self) Int {
+        unsafe { tn_cuda_graph_free(self.handle) }
+    }
+}
+
+pub fn cuda_embed(tok_h Int, emb_h Int, emb_off Int, out_h Int, seq_len Int, d_model Int, vocab Int) Bool {
+    unsafe { tn_cuda_ultra_embed(tok_h, emb_h, emb_off, out_h, seq_len, d_model, vocab) != 0 }
+}
+
+pub fn cuda_rmsnorm(x_h Int, w_h Int, w_off Int, out_h Int, seq_len Int, d_model Int, gemma_mode Bool) Bool {
+    let gm = if gemma_mode { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_rmsnorm(x_h, w_h, w_off, out_h, seq_len, d_model, gm) != 0 }
+}
+
+pub fn cuda_gemv(
+    x_h Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
+    out_dim Int, in_dim Int, quant_mode Int, add_res Bool, has_bias Bool,
+) Bool {
+    let ar = if add_res { 1 } else { 0 }
+    let hb = if has_bias { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_gemv(x_h, w_h, w_off, y_h, b_h, b_off, out_dim, in_dim, quant_mode, ar, hb) != 0 }
+}
+
+pub fn cuda_norm_gemv(
+    x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
+    out_dim Int, in_dim Int, quant_mode Int, gemma_mode Bool, has_bias Bool,
+) Bool {
+    let gm = if gemma_mode { 1 } else { 0 }
+    let hb = if has_bias { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_norm_gemv(x_h, nw_h, nw_off, w_h, w_off, y_h, b_h, b_off, out_dim, in_dim, quant_mode, gm, hb) != 0 }
+}
+
+pub fn cuda_norm_ffn(
+    x_h Int, nw_h Int, nw_off Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int,
+    out_h Int, d_ff Int, in_dim Int, quant_mode Int, is_geglu Bool, gemma_mode Bool,
+) Bool {
+    let ig = if is_geglu { 1 } else { 0 }
+    let gm = if gemma_mode { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_norm_ffn(x_h, nw_h, nw_off, wg_h, wg_off, wu_h, wu_off, out_h, d_ff, in_dim, quant_mode, ig, gm) != 0 }
+}
+
+pub fn cuda_rope_flash_decode(
+    qkv_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_h Int, tok_pos_h Int,
+    n_heads Int, n_kv Int, d_head Int, max_seq Int, softcap Float,
+) Bool {
+    unsafe { tn_cuda_ultra_rope_flash_decode(qkv_h, kc_h, kc_off, vc_h, vc_off, ctx_h, tok_pos_h, n_heads, n_kv, d_head, max_seq, softcap) != 0 }
+}
+
+pub fn cuda_argmax(logits_h Int, tok_pos_h Int, n_elems Int, inc_pos Bool) Bool {
+    let ip = if inc_pos { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_argmax(logits_h, tok_pos_h, n_elems, ip) != 0 }
+}
+
+pub fn cuda_mm(x_h Int, w_h Int, w_off Int, y_h Int, m Int, n Int, k Int, quant_mode Int, add_res Bool) Bool {
+    let ar = if add_res { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_mm(x_h, w_h, w_off, y_h, m, n, k, quant_mode, ar) != 0 }
+}

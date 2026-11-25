@@ -117,6 +117,8 @@ pub(crate) const BUILTIN_SIGS: &[BuiltinSig] = &[
     BuiltinSig { name: "gpu_tanh", arity: 1, is_pure: true, allocates: false, param_types: &["Float32"], ret_type: "Float32" },
     BuiltinSig { name: "gpu_embedded_msl", arity: 0, is_pure: true, allocates: false, param_types: &[], ret_type: "Text" },
     BuiltinSig { name: "gpu_embedded_wgsl", arity: 0, is_pure: true, allocates: false, param_types: &[], ret_type: "Text" },
+    BuiltinSig { name: "gpu_embedded_cuda", arity: 0, is_pure: true, allocates: false, param_types: &[], ret_type: "Text" },
+    BuiltinSig { name: "gpu_embedded_stablehlo", arity: 0, is_pure: true, allocates: false, param_types: &[], ret_type: "Text" },
     BuiltinSig { name: "text_cstr_ptr", arity: 1, is_pure: true, allocates: false, param_types: &["Text"], ret_type: "Ptr[UInt8]" },
     BuiltinSig { name: "cstr_to_text", arity: 1, is_pure: false, allocates: true, param_types: &["Any"], ret_type: "Text" },
     // S2: Layout intrinsics, raw pointers & unsafe memory ops
