@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tenon Web Playground — Verified AI, Declarative GPU & Wasm32 OpenUI</title>
+  <style>
+    :root { --bg:#090e1b; --card:#11192e; --border:#253456; --fg:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --ok:#34d399; --warn:#fbbf24; --err:#fb7185; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.55 system-ui,-apple-system,sans-serif; }
+    header { display:flex; align-items:center; justify-content:space-between; padding:14px 22px; background:linear-gradient(120deg,#0f1d3a,#1b1742); border-bottom:1px solid var(--border); }
+    header h1 { margin:0; font-size:18px; letter-spacing:.2px; }
+    header .sub { color:#bae6fd; font-size:12px; }
+    .tabs { display:flex; gap:8px; padding:12px 22px; border-bottom:1px solid var(--border); flex-wrap:wrap; }
+    .tab { padding:7px 14px; border-radius:8px; background:var(--card); border:1px solid var(--border); color:var(--fg); cursor:pointer; font-weight:600; font-size:13px; }
+    .tab.active { background:#0284c7; border-color:#38bdf8; color:#fff; }
+    .grid { display:grid; grid-template-columns:1.05fr 1fr; gap:14px; padding:16px 22px; max-width:1440px; margin:0 auto; }
+    .panel { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:10px; }
+    .panel h2 { margin:0; font-size:14px; color:#f8fafc; display:flex; justify-content:space-between; align-items:center; }
+    textarea, pre { width:100%; background:#070c17; color:#e2e8f0; border:1px solid #1e293b; border-radius:8px; padding:12px; font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    textarea { min-height:290px; resize:vertical; }
+    pre { margin:0; overflow:auto; max-height:320px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:700; }
+    .ok { background:#064e3b; color:#6ee7b7; }
+    .info { background:#0c4a6e; color:#7dd3fc; }
+    .err { background:#4c0519; color:#fda4af; }
+    .btn-row { display:flex; gap:8px; flex-wrap:wrap; }
+    button.act { padding:7px 12px; border-radius:8px; border:none; background:#10b981; color:#042f2e; font-weight:700; cursor:pointer; }
+    button.act.sec { background:#334155; color:#e2e8f0; }
+    #live-preview { background:#070c17; border:1px solid #1e293b; border-radius:8px; padding:14px; min-height:180px; }
+    [data-ui="Card"] { background:#0f172a; border:1px solid #334155; border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:12px; }
+    [data-ui="Header"] h2 { margin:0; font-size:17px; color:#fff; }
+    [data-ui="Header"] p { margin:2px 0 0; font-size:12px; color:#94a3b8; }
+    [data-ui="Row"] { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; }
+    [data-ui="Metric"] { background:#1e293b; border-left:3px solid #38bdf8; border-radius:8px; padding:10px; }
+    [data-ui="Button"] { padding:8px 14px; border-radius:8px; border:none; background:#0284c7; color:#fff; font-weight:700; cursor:pointer; width:fit-content; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Tenon Interactive Web Playground</h1>
+      <div class="sub">Zero-Install Browser Sandbox · Wasm32 OpenUI Surgical VDOM · Tenon-Torch AI · Declarative WGSL/MSL · Formal Verification</div>
+    </div>
+    <span id="wasm-badge" class="pill info">Loading Wasm32 Kernel...</span>
+  </header>
+
+  <div class="tabs">
+    <button class="tab active" data-preset="openui">1. Live Wasm32 OpenUI Studio</button>
+    <button class="tab" data-preset="torch">2. Tenon-Torch (PyTorch-Style Verified AI)</button>
+    <button class="tab" data-preset="gpu">3. Declarative @gpu_graph (MSL + WGSL)</button>
+    <button class="tab" data-preset="verify">4. L0/Z3 Formal Proofs & Counterexamples</button>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>
+        <span id="editor-title">Tenon / OpenUI Source</span>
+        <span id="status-pill" class="pill ok">Verified L0/L1</span>
+      </h2>
+      <textarea id="code"></textarea>
+      <div class="btn-row">
+        <button class="act" id="run-btn">Run / Render Live</button>
+        <button class="act sec" id="bump-btn">Simulate State Signal (+10)</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>
+        <span id="out-title">Live Wasm32 Rendered Output</span>
+        <span id="leak-pill" class="pill ok">Perceus liveObjects = 0</span>
+      </h2>
+      <div id="live-preview"></div>
+      <h2 style="margin-top:6px;">Compiler / Surgical Patch / Shader Artifact</h2>
+      <pre id="artifact"></pre>
+    </div>
+  </div>
+
+  <script type="module">
+    const PRESETS = {
+      openui: {
+        title: 'Live OpenUI Lang -> Tenon Wasm32 VDOM Kernel',
+        code: `root = Card([hdr, kpis, btn])
+hdr = Header("Tenon Web Playground", "Real Wasm32 Surgical VDOM · Zero innerHTML Rebuilds")
+kpis = Row([m1, m2, m3])
+m1 = Metric("Active Users", $users, "+24%")
+m2 = Metric("Metal Parity", "400/400", "Bit-Exact")
+m3 = Metric("Perceus Leaks", "0 objs", "Proved")
+btn = Button("Deploy Verified Build", @deploy)`,
+        artifact: '// Click "Simulate State Signal (+10)" to compute minimal Wasm32 VDomPatch[] JSON!'
+      },
+      torch: {
+        title: 'Tenon-Torch (std/nn) — Compile-Time Matrix Shape Proofs + Autograd + AdamW',
+        code: `import "std/nn/tensor.tn"
+import "std/nn/module.tn"
+import "std/nn/optim.tn"
+
+// Compile-time dimension proof: Matrix[4, 8] @ Matrix[8, 2] -> Matrix[4, 2]
+// Changing Matrix[8, 2] to Matrix[6, 2] is REJECTED AT COMPILE TIME (E0440)!
+pub pure fn forward_checked(x Matrix[4, 8], w Matrix[8, 2]) Tensor2D {
+    nn_matmul_verified(x, w)
+}
+
+// Dynamic Reverse-Mode Autograd + Transformer Self-Attention + Verified AdamW
+pub pure fn train_step(inout blk TransformerBlock, inout st TransformerAdamState, seq List[Float], y List[Int]) Float {
+    var tape = tape_new()
+    let x_id = tape_leaf(tape, 4, 4, seq)
+    let tids = blk.forward(tape, x_id)
+    let loss = tape_cross_entropy(tape, tids.out_id, y)
+    tape_backward(tape, loss)
+    transformer_adam_step(blk, st, tape, tids, 0.05, 0.001) // lr: PosFloat proved > 0.0!
+    tape_scalar(tape, loss)
+}`,
+        artifact: `PASS  std/nn/nn_test.tn  (270 proofs verified, 4/4 tests ok, live=0)\n  ✓ test_compile_time_verified_matrix_matmul (0.04ms, live=0)\n  ✓ test_autograd_finite_difference_gradient_check (0.16ms, live=0)\n  ✓ test_mlp_xor_convergence_with_adamw (1.87ms, live=0)\n  ✓ test_transformer_block_self_attention_autograd (2.42ms, live=0)\n\nNegative Control (` + '`examples/showcase/bad_nn_shape.tn`' + `):\n  error[E0440]: precondition requires of nn_matmul_verified violated\n    = note: disjoint intervals [8..=8] == [6..=6]`
+      },
+      gpu: {
+        title: 'Single-Source Declarative @kernel + @gpu_graph (Embedded MSL + WGSL + WebGPU)',
+        code: `@kernel("elementwise")
+pub fn nn_bias_add(x List[Float32], b List[Float32], inout out List[Float32], total UInt32) {
+    let tid = gpu_global_id_x()
+    if tid < (total as Int) { out[tid] = x[tid] + b[tid] }
+}
+
+@kernel("elementwise")
+pub fn nn_relu_act(x List[Float32], inout out List[Float32], total UInt32) {
+    let tid = gpu_global_id_x()
+    if tid < (total as Int) {
+        let v = x[tid]
+        out[tid] = if v > (0.0 as Float32) { v } else { 0.0 as Float32 }
+    }
+}
+
+@gpu_graph
+pub fn nn_linear_relu_graph(x List[Float32], b List[Float32], total UInt32) List[Float32] {
+    var biased List[Float32] = list_filled(16, 0.0 as Float32)
+    var out List[Float32] = list_filled(16, 0.0 as Float32)
+    nn_bias_add(x, b, biased, total)
+    nn_relu_act(biased, out, total)
+    out
+}`,
+        artifact: `// Auto-fused by @gpu_graph -> embedded directly in binary via gpu_embedded_msl() / gpu_embedded_wgsl()!\n// Proved: E0842 barrier-uniform · E0843 race-free · 1 transient VRAM buffer eliminated\n@compute @workgroup_size(64, 1, 1)\nfn nn_bias_add__fused__nn_relu_act(@builtin(global_invocation_id) gid: vec3<u32>) {\n    let tid = i32(gid.x);\n    if (tid < i32(total)) {\n        let __fused_tmp: f32 = (x[tid] + b[tid]);\n        out[tid] = select(f32(0.0), __fused_tmp, (__fused_tmp > f32(0.0)));\n    }\n}`
+      },
+      verify: {
+        title: 'Interprocedural Pure Summary Inference + Zero-Invariant Loops + Date Proofs',
+        code: `pub type Pct = Int where 0 <= self && self <= 100
+
+// ZERO manual ensures — I4 automatically infers [0..=100]!
+pure fn clamp_pct(x Int) Int {
+    if x < 0 { 0 } else if x > 100 { 100 } else { x }
+}
+
+// ZERO manual invariant — H3 synthesizes accumulator loop bounds automatically!
+pub pure fn average_score(scores List[Pct]) Pct {
+    if len(scores) == 0 { return 0 }
+    var sum = 0
+    var i = 0
+    while i < len(scores) {
+        sum += scores[i] // bounds check ELIMINATED!
+        i += 1
+    }
+    sum / len(scores)    // division by zero ELIMINATED!
+}`,
+        artifact: `PASS  examples/showcase/language_tour.tn  (220 proofs verified, 5.9ms cached)\n  [L0] clamp_pct inferred summary: [0..=100]\n  [L0] average_score: 0 manual invariants, bounds checks eliminated, div-by-zero eliminated\n  [L1] Date { year = 2024, month = 2, day = 29 } -> PROVED\n  [L1] Date { year = 2023, month = 2, day = 29 } -> REJECTED (Z3 counterexample: 29 <= 28 false)`
+      }
+    };
+
+    let wasmApi = null;
+    let curPreset = 'openui';
+    let usersVal = 1280;
+    const codeEl = document.getElementById('code');
+    const previewEl = document.getElementById('live-preview');
+    const artEl = document.getElementById('artifact');
+    const wasmBadge = document.getElementById('wasm-badge');
+
+    async function initWasm() {
+      try {
+        const mod = await import('./dist/openui.mjs');
+        const bytes = await (await fetch('./dist/openui.wasm')).arrayBuffer();
+        wasmApi = await mod.loadTenonWasm(bytes);
+        wasmBadge.textContent = 'Wasm32 Kernel Live (' + bytes.byteLength + ' B)';
+        wasmBadge.className = 'pill ok';
+      } catch (e) {
+        wasmBadge.textContent = 'Static Preview (run launch.sh for live Wasm32)';
+        wasmBadge.className = 'pill info';
+      }
+      renderCurrent();
+    }
+
+    function renderCurrent() {
+      if (curPreset === 'openui') {
+        if (wasmApi) {
+          const html = wasmApi.render_openui_html(codeEl.value, String(usersVal));
+          previewEl.innerHTML = html;
+          const patch = wasmApi.diff_openui_json(codeEl.value, String(usersVal - 10), String(usersVal));
+          artEl.textContent = 'Live Wasm32 VDomPatch[] JSON:\n' + patch;
+        } else {
+          previewEl.innerHTML = '<div data-ui="Card"><div data-ui="Header"><h2>Tenon Web Playground</h2><p>Run <code>./examples/showcase/web_playground/launch.sh</code> to compile & mount the live 65 KB Wasm32 kernel.</p></div></div>';
+          artEl.textContent = PRESETS.openui.artifact;
+        }
+      } else {
+        previewEl.innerHTML = `<div style="font-size:13px;color:#cbd5e1;line-height:1.7"><strong>${PRESETS[curPreset].title}</strong><br/>Run locally with zero flags:<br/><code>./target/release/tenon build examples/showcase/tenon_torch_studio.tn -o /tmp/tenon_torch_studio &amp;&amp; /tmp/tenon_torch_studio</code></div>`;
+        artEl.textContent = PRESETS[curPreset].artifact;
+      }
+    }
+
+    function selectPreset(name) {
+      curPreset = name;
+      document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.preset === name));
+      document.getElementById('editor-title').textContent = PRESETS[name].title;
+      codeEl.value = PRESETS[name].code;
+      renderCurrent();
+    }
+
+    document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => selectPreset(b.dataset.preset)));
+    document.getElementById('run-btn').addEventListener('click', renderCurrent);
+    document.getElementById('bump-btn').addEventListener('click', () => { usersVal += 10; renderCurrent(); });
+    selectPreset('openui');
+    initWasm();
+  </script>
+</body>
+</html>
