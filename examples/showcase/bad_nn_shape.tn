@@ -1,0 +1,18 @@
+// examples/showcase/bad_nn_shape.tn — Negative Compile-Time Verification Demo for Tenon-Torch!
+//
+// In PyTorch, multiplying a `[4, 8]` activation matrix by a `[6, 2]` weight matrix crashes at RUNTIME
+// (`RuntimeError: mat1 and mat2 shapes cannot be multiplied (4x8 and 6x2)`).
+//
+// In Tenon, running `./target/release/tenon check examples/showcase/bad_nn_shape.tn` catches the
+// exact dimension mismatch AT COMPILE TIME before running a single instruction!
+
+import "std/core/types.tn"
+import "std/gpu/tensor.tn"
+import "std/nn/tensor.tn"
+
+pub pure fn broken_linear_layer(x Matrix[4, 8], w Matrix[6, 2]) Tensor2D {
+    // Compile-time FAIL-CLOSED error: requires `a.cols == b.rows` (8 != 6)!
+    nn_matmul_verified(x, w)
+}
+
+pub fn main() Int { 0 }

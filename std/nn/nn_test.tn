@@ -1,0 +1,141 @@
+// std/nn/nn_test.tn — Tenon-Torch Verification & Autograd Numerical Gradient Check Test Suite
+
+import "std/core/types.tn"
+import "std/gpu/tensor.tn"
+import "std/nn/tensor.tn"
+import "std/nn/module.tn"
+import "std/nn/optim.tn"
+
+pure fn eval_mlp_loss(x List[Float], y List[Int], l1 Linear, l2 Linear) Float {
+    var tape = tape_new()
+    let x_id = tape_leaf(tape, 4, 2, x)
+    let h1 = l1.forward(tape, x_id)
+    let a1 = tape_gelu(tape, h1.out_id)
+    let h2 = l2.forward(tape, a1)
+    let loss_id = tape_cross_entropy(tape, h2.out_id, y)
+    tape_scalar(tape, loss_id)
+}
+
+test fn test_compile_time_verified_matrix_matmul() {
+    let a Matrix[2, 3] = Tensor2D {
+        rows = 2,
+        cols = 3,
+        data = [
+            1.0 as Float32, 2.0 as Float32, 3.0 as Float32,
+            4.0 as Float32, 5.0 as Float32, 6.0 as Float32,
+        ],
+    }
+    let b Matrix[3, 2] = Tensor2D {
+        rows = 3,
+        cols = 2,
+        data = [
+            7.0 as Float32, 8.0 as Float32,
+            9.0 as Float32, 10.0 as Float32,
+            11.0 as Float32, 12.0 as Float32,
+        ],
+    }
+    let c = nn_matmul_verified(a, b)
+    assert c.rows == 2 && c.cols == 2
+    assert float_to_int(c.data[0] as Float) == 58
+    assert float_to_int(c.data[3] as Float) == 154
+}
+
+test fn test_autograd_finite_difference_gradient_check() {
+    // 4-sample XOR dataset
+    let x List[Float] = [
+        -1.0, -1.0,
+        -1.0,  1.0,
+         1.0, -1.0,
+         1.0,  1.0,
+    ]
+    let y List[Int] = [0, 1, 1, 0]
+    let l1 = Linear.new(2, 4, 7)
+    let l2 = Linear.new(4, 2, 19)
+
+    var tape = tape_new()
+    let x_id = tape_leaf(tape, 4, 2, x)
+    let h1 = l1.forward(tape, x_id)
+    let a1 = tape_gelu(tape, h1.out_id)
+    let h2 = l2.forward(tape, a1)
+    let loss_id = tape_cross_entropy(tape, h2.out_id, y)
+    tape_backward(tape, loss_id)
+
+    let g_w1 = tape_grad(tape, h1.w_id)
+    let eps = 0.0001
+    var wi = 0
+    while wi < len(l1.weight) {
+        var l1p = l1
+        var l1m = l1
+        l1p.weight[wi] = l1.weight[wi] + eps
+        l1m.weight[wi] = l1.weight[wi] - eps
+        let num_g = (eval_mlp_loss(x, y, l1p, l2) - eval_mlp_loss(x, y, l1m, l2)) / (2.0 * eps)
+        let diff = nn_abs(g_w1[wi] - num_g)
+        assert diff < 0.001
+        wi += 1
+    }
+}
+
+test fn test_mlp_xor_convergence_with_adamw() {
+    let x List[Float] = [
+        -1.0, -1.0,
+        -1.0,  1.0,
+         1.0, -1.0,
+         1.0,  1.0,
+    ]
+    let y List[Int] = [0, 1, 1, 0]
+    var l1 = Linear.new(2, 8, 42)
+    var l2 = Linear.new(8, 2, 99)
+    var st1 = linear_adam_new(l1)
+    var st2 = linear_adam_new(l2)
+
+    let init_loss = eval_mlp_loss(x, y, l1, l2)
+    var ep = 0
+    while ep < 60 {
+        var tape = tape_new()
+        let x_id = tape_leaf(tape, 4, 2, x)
+        let h1 = l1.forward(tape, x_id)
+        let a1 = tape_gelu(tape, h1.out_id)
+        let h2 = l2.forward(tape, a1)
+        let loss_id = tape_cross_entropy(tape, h2.out_id, y)
+        tape_backward(tape, loss_id)
+        linear_adam_step(l1, st1, tape, h1, 0.08, 0.001)
+        linear_adam_step(l2, st2, tape, h2, 0.08, 0.001)
+        ep += 1
+    }
+    let final_loss = eval_mlp_loss(x, y, l1, l2)
+    assert final_loss < init_loss * 0.25
+    assert final_loss < 0.15
+}
+
+test fn test_transformer_block_self_attention_autograd() {
+    // 3 tokens x d_model=4 sequence
+    let seq List[Float] = [
+        1.0, 0.2, -0.5, 0.3,
+       -0.4, 1.1,  0.2, -0.8,
+        0.5, -0.6, 1.2, 0.4,
+    ]
+    let targets List[Int] = [0, 1, 0]
+    var blk = TransformerBlock.new(4, 8, 17)
+    var head = Linear.new(4, 2, 71)
+    var st_blk = transformer_adam_new(blk)
+    var st_h = linear_adam_new(head)
+
+    var first_loss = 0.0
+    var last_loss = 0.0
+    var ep = 0
+    while ep < 25 {
+        var tape = tape_new()
+        let x_id = tape_leaf(tape, 3, 4, seq)
+        let tids = blk.forward(tape, x_id)
+        let h_ids = head.forward(tape, tids.out_id)
+        let loss_id = tape_cross_entropy(tape, h_ids.out_id, targets)
+        let lval = tape_scalar(tape, loss_id)
+        if ep == 0 { first_loss = lval }
+        last_loss = lval
+        tape_backward(tape, loss_id)
+        transformer_adam_step(blk, st_blk, tape, tids, 0.05, 0.0)
+        linear_adam_step(head, st_h, tape, h_ids, 0.05, 0.0)
+        ep += 1
+    }
+    assert last_loss < first_loss * 0.4
+}

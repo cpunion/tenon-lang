@@ -1,0 +1,253 @@
+// std/nn/gpu_ops.tn — Single-Source Apple Silicon Metal GPU Forward Kernels & Auto-Fused `@gpu_graph` for Tenon-Torch!
+//
+// Zero `--c-src` flags, zero external `.metal` files (`gpu_embedded_msl()`):
+//   - `@kernel nn_matmul_kernel`: general `[B, In] @ [In, Out]` matrix multiply on Metal GPU
+//   - `@kernel nn_bias_add` + `@kernel nn_relu_act`: automatically AST-fused by `@gpu_graph` into
+//     `nn_bias_add__fused__nn_relu_act` (eliminating transient VRAM traffic!)
+//   - `@linear GpuBuffer` & `GpuComputePipeline`: statically verified zero VRAM leaks!
+
+import "std/core/types.tn"
+import "std/gpu/metal/gpu.tn"
+
+@gpu_struct("std430")
+pub record NnLinearDims {
+    batch   UInt32
+    in_dim  UInt32
+    out_dim UInt32
+    pad     UInt32
+}
+
+@kernel
+pub fn nn_matmul_kernel(
+    x List[Float32],
+    w List[Float32],
+    inout out List[Float32],
+    dims NnLinearDims,
+) {
+    let tid = gpu_global_id_x()
+    let b = dims.batch as Int
+    let in_d = dims.in_dim as Int
+    let out_d = dims.out_dim as Int
+    let total = b * out_d
+    if tid < total && out_d > 0 {
+        let row = tid / out_d
+        let col = tid % out_d
+        var acc Float32 = 0.0 as Float32
+        var k = 0
+        while k < in_d {
+            acc = acc + x[row * in_d + k] * w[k * out_d + col]
+            k += 1
+        }
+        out[tid] = acc
+    }
+}
+
+@kernel("elementwise")
+pub fn nn_bias_add(
+    x List[Float32],
+    bias_exp List[Float32],
+    inout out List[Float32],
+    total UInt32,
+) {
+    let tid = gpu_global_id_x()
+    if tid < (total as Int) {
+        out[tid] = x[tid] + bias_exp[tid]
+    }
+}
+
+@kernel("elementwise")
+pub fn nn_relu_act(
+    x List[Float32],
+    inout out List[Float32],
+    total UInt32,
+) {
+    let tid = gpu_global_id_x()
+    if tid < (total as Int) {
+        let v = x[tid]
+        out[tid] = if v > (0.0 as Float32) { v } else { 0.0 as Float32 }
+    }
+}
+
+/// Compiler proves DAG acyclicity + E0842/E0843 safety and AST-fuses `nn_bias_add__fused__nn_relu_act`
+/// directly into `gpu_embedded_msl()`!
+@gpu_graph
+pub fn nn_linear_relu_graph(
+    x List[Float32],
+    w List[Float32],
+    bias_exp List[Float32],
+    dims NnLinearDims,
+    total UInt32,
+) List[Float32] {
+    var mm List[Float32] = list_filled(16, 0.0 as Float32)
+    var biased List[Float32] = list_filled(16, 0.0 as Float32)
+    var out List[Float32] = list_filled(16, 0.0 as Float32)
+    nn_matmul_kernel(x, w, mm, dims)
+    nn_bias_add(mm, bias_exp, biased, total)
+    nn_relu_act(biased, out, total)
+    out
+}
+
+pure fn nn_pack_u32_le(v0 Int, v1 Int, v2 Int, v3 Int) Bytes {
+    var bs = bytes_filled(16, 0)
+    bs = bytes_write_u32_le(bs, 0, v0)
+    bs = bytes_write_u32_le(bs, 4, v1)
+    bs = bytes_write_u32_le(bs, 8, v2)
+    bs = bytes_write_u32_le(bs, 12, v3)
+    bs
+}
+
+pure fn to_f32_list(xs List[Float]) List[Float32] {
+    var out List[Float32] = []
+    var i = 0
+    while i < len(xs) {
+        out = push(out, xs[i] as Float32)
+        i += 1
+    }
+    out
+}
+
+pure fn expand_bias_f32(bias List[Float], batch Int, out_dim Int) List[Float32] {
+    var out List[Float32] = []
+    var r = 0
+    while r < batch {
+        var c = 0
+        while c < out_dim {
+            let bv = if c < len(bias) { bias[c] } else { 0.0 }
+            out = push(out, bv as Float32)
+            c += 1
+        }
+        r += 1
+    }
+    out
+}
+
+/// Runs a Linear (`x @ w + b`) + optional AST-fused ReLU forward pass on Apple Silicon Metal GPU!
+pub fn metal_linear_forward(
+    x List[Float],
+    w List[Float],
+    bias List[Float],
+    batch Int where self >= 1,
+    in_dim Int where self >= 1,
+    out_dim Int where self >= 1,
+    apply_relu Bool,
+) Result[List[Float], Text] {
+    let msl = gpu_embedded_msl()
+    if len(msl) < 64 { return Err("embedded MSL unavailable") }
+    let total = batch * out_dim
+    let nbytes = total * 4
+    let xf = to_f32_list(x)
+    let wf = to_f32_list(w)
+    let bf = expand_bias_f32(bias, batch, out_dim)
+
+    var pipe_mm = GpuComputePipeline.compile_msl(msl, "nn_matmul_kernel")
+    let second_name = if apply_relu { "nn_bias_add__fused__nn_relu_act" } else { "nn_bias_add" }
+    var pipe_post = GpuComputePipeline.compile_msl(msl, second_name)
+
+    var buf_x = GpuBuffer.from_f32_list(xf)
+    var buf_w = GpuBuffer.from_f32_list(wf)
+    var buf_mm = GpuBuffer.uninit(nbytes)
+    var buf_dims = GpuBuffer.from_bytes(nn_pack_u32_le(batch, in_dim, out_dim, 0))
+    var buf_b = GpuBuffer.from_f32_list(bf)
+    var buf_out = GpuBuffer.uninit(nbytes)
+    var buf_tot = GpuBuffer.from_bytes(nn_pack_u32_le(total, 0, 0, 0))
+
+    let ok1 = pipe_mm.dispatch4(buf_x, buf_w, buf_mm, buf_dims, total, 1, 1)
+    let ok2 = pipe_post.dispatch4(buf_mm, buf_b, buf_out, buf_tot, total, 1, 1)
+
+    var out_f32 List[Float32] = list_filled(total, 0.0 as Float32)
+    let rb = buf_out.read_into_f32(out_f32)
+
+    buf_x.destroy()
+    buf_w.destroy()
+    buf_mm.destroy()
+    buf_dims.destroy()
+    buf_b.destroy()
+    buf_out.destroy()
+    buf_tot.destroy()
+    pipe_mm.destroy()
+    pipe_post.destroy()
+
+    if !ok1 || !ok2 || rb != nbytes {
+        return Err("Metal GPU dispatch failed")
+    }
+    var res List[Float] = []
+    var i = 0
+    while i < len(out_f32) {
+        res = push(res, out_f32[i] as Float)
+        i += 1
+    }
+    Ok(res)
+}
+
+/// Runs a complete 2-layer `Linear(in->hid) -> Fused Bias+ReLU -> Linear(hid->out) -> Bias` forward pass
+/// on Apple Silicon Metal GPU, returning `(logits, dispatch_us)` with zero VRAM leaks!
+pub fn metal_mlp2_forward_timed(
+    x List[Float],
+    w1 List[Float], b1 List[Float],
+    w2 List[Float], b2 List[Float],
+    batch Int where self >= 1,
+    in_dim Int where self >= 1,
+    hid_dim Int where self >= 1,
+    out_dim Int where self >= 1,
+) Result[(List[Float], Int), Text] {
+    let msl = gpu_embedded_msl()
+    if len(msl) < 64 { return Err("embedded MSL unavailable") }
+    let tot1 = batch * hid_dim
+    let tot2 = batch * out_dim
+    var pipe_mm = GpuComputePipeline.compile_msl(msl, "nn_matmul_kernel")
+    var pipe_fused = GpuComputePipeline.compile_msl(msl, "nn_bias_add__fused__nn_relu_act")
+    var pipe_bias = GpuComputePipeline.compile_msl(msl, "nn_bias_add")
+
+    let t0 = time_now_ns()
+    var buf_x = GpuBuffer.from_f32_list(to_f32_list(x))
+    var buf_w1 = GpuBuffer.from_f32_list(to_f32_list(w1))
+    var buf_b1 = GpuBuffer.from_f32_list(expand_bias_f32(b1, batch, hid_dim))
+    var buf_mm1 = GpuBuffer.uninit(tot1 * 4)
+    var buf_h1 = GpuBuffer.uninit(tot1 * 4)
+    var buf_d1 = GpuBuffer.from_bytes(nn_pack_u32_le(batch, in_dim, hid_dim, 0))
+    var buf_t1 = GpuBuffer.from_bytes(nn_pack_u32_le(tot1, 0, 0, 0))
+
+    var buf_w2 = GpuBuffer.from_f32_list(to_f32_list(w2))
+    var buf_b2 = GpuBuffer.from_f32_list(expand_bias_f32(b2, batch, out_dim))
+    var buf_mm2 = GpuBuffer.uninit(tot2 * 4)
+    var buf_out = GpuBuffer.uninit(tot2 * 4)
+    var buf_d2 = GpuBuffer.from_bytes(nn_pack_u32_le(batch, hid_dim, out_dim, 0))
+    var buf_t2 = GpuBuffer.from_bytes(nn_pack_u32_le(tot2, 0, 0, 0))
+
+    let ok1 = pipe_mm.dispatch4(buf_x, buf_w1, buf_mm1, buf_d1, tot1, 1, 1)
+    let ok2 = pipe_fused.dispatch4(buf_mm1, buf_b1, buf_h1, buf_t1, tot1, 1, 1)
+    let ok3 = pipe_mm.dispatch4(buf_h1, buf_w2, buf_mm2, buf_d2, tot2, 1, 1)
+    let ok4 = pipe_bias.dispatch4(buf_mm2, buf_b2, buf_out, buf_t2, tot2, 1, 1)
+
+    var out_f32 List[Float32] = list_filled(tot2, 0.0 as Float32)
+    let rb = buf_out.read_into_f32(out_f32)
+    let elapsed_us = (time_now_ns() - t0) / 1000
+
+    buf_x.destroy()
+    buf_w1.destroy()
+    buf_b1.destroy()
+    buf_mm1.destroy()
+    buf_h1.destroy()
+    buf_d1.destroy()
+    buf_t1.destroy()
+    buf_w2.destroy()
+    buf_b2.destroy()
+    buf_mm2.destroy()
+    buf_out.destroy()
+    buf_d2.destroy()
+    buf_t2.destroy()
+    pipe_mm.destroy()
+    pipe_fused.destroy()
+    pipe_bias.destroy()
+
+    if !ok1 || !ok2 || !ok3 || !ok4 || rb != tot2 * 4 {
+        return Err("Metal 2-layer MLP dispatch failed")
+    }
+    var res List[Float] = []
+    var i = 0
+    while i < len(out_f32) {
+        res = push(res, out_f32[i] as Float)
+        i += 1
+    }
+    Ok((res, elapsed_us))
+}

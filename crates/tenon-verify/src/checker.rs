@@ -8538,8 +8538,21 @@ impl CheckerCtx {
         };
         let pred = &pred_owned;
 
-        // Float refinement verification: L0 constant -> L0 float interval -> L1 Z3 `Real`!
+        // Float refinement verification: L0 constant -> L0 branch -> L0 float interval -> L1 Z3 `Real`!
         if self.is_float_ty(ty) {
+            if let ExprKind::If { then_block, else_branch: Some(eb), .. } = &expr.kind {
+                if then_block.stmts.is_empty() {
+                    if let Some(then_e) = &then_block.tail {
+                        let diag_before = self.diagnostics.len();
+                        self.check_expr_satisfies_type(then_e, ty, env, smt_int_vars, smt_premises, context, span);
+                        self.check_expr_satisfies_type(eb, ty, env, smt_int_vars, smt_premises, context, span);
+                        if self.diagnostics.len() == diag_before {
+                            return;
+                        }
+                        self.diagnostics.truncate(diag_before);
+                    }
+                }
+            }
             if let Some(fval) = eval_const_float(expr, &self.consts) {
                 match check_float_refinement_l0(pred, fval) {
                     Some(true) => {
@@ -8566,16 +8579,27 @@ impl CheckerCtx {
                     None => {}
                 }
             }
+            // Strip `is_finite(self)` conjuncts when L0 already proves `expr` is finite (so Z3 `Real` proves `self > 0.0` etc. cleanly!)
+            let expr_is_finite = env.eval_is_finite(expr, None);
+            let stripped_pred_owned: Option<Expr> = if expr_is_finite {
+                strip_is_finite_conjuncts(pred)
+            } else {
+                None
+            };
+            let effective_pred: &Expr = match &stripped_pred_owned {
+                Some(ep) => ep,
+                None => pred,
+            };
             // L0 symbolic finiteness & predicate check (handles `is_finite(self)` / `FiniteFloat`!)
             {
                 let mut fenv = env.clone();
-                if env.eval_is_finite(expr, None) {
+                if expr_is_finite {
                     fenv.finite_floats.insert("__val".into());
                 }
                 if let Some((lo, hi)) = env.eval_abs_float(expr, None) {
                     fenv.floats.insert("__val".into(), (lo, hi));
                 }
-                if fenv.check_predicate(pred, Some("__val")) == L0Result::Proved {
+                if fenv.check_predicate(effective_pred, Some("__val")) == L0Result::Proved {
                     self.proofs.push(ProofRecord {
                         obligation: format!("{} satisfies float refinement `{}`", context, name),
                         tier: ProofTier::L0Fast,
@@ -8586,8 +8610,8 @@ impl CheckerCtx {
             }
             // L0 symbolic float interval check (e.g. `(a + b) * 0.5` where `a, b in [0.0, 1.0]`)
             if let Some((lo, hi)) = env.eval_abs_float(expr, None) {
-                if check_float_refinement_l0(pred, lo) == Some(true)
-                    && check_float_refinement_l0(pred, hi) == Some(true)
+                if check_float_refinement_l0(effective_pred, lo) == Some(true)
+                    && check_float_refinement_l0(effective_pred, hi) == Some(true)
                 {
                     self.proofs.push(ProofRecord {
                         obligation: format!("{} satisfies float refinement `{}` (interval [{}, {}])", context, name, lo, hi),
@@ -8610,7 +8634,8 @@ impl CheckerCtx {
                 }
                 q.declare_real("__val");
                 for (p, s) in smt_premises {
-                    let _ = q.add_premise_expr(p, s);
+                    let p_clean = strip_is_finite_conjuncts(p);
+                    let _ = q.add_premise_expr(p_clean.as_ref().unwrap_or(p), s);
                 }
                 let eq = Expr {
                     kind: ExprKind::Binary {
@@ -8623,7 +8648,7 @@ impl CheckerCtx {
                 if q.add_premise_expr(&eq, &BTreeMap::new()).is_ok() {
                     let mut subst = BTreeMap::new();
                     subst.insert("self".into(), "__val".into());
-                    if q.set_goal_expr(pred, &subst).is_ok() {
+                    if q.set_goal_expr(effective_pred, &subst).is_ok() {
                         match q.solve() {
                             SmtOutcome::Proved => {
                                 self.proofs.push(ProofRecord {
@@ -10801,5 +10826,44 @@ fn collect_lt_loop_bounds(expr: &Expr, out: &mut Vec<(String, Expr, Span)>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Removes `is_finite(...)` conjuncts from a float predicate once finiteness is already proved in L0,
+/// so Z3's `Real` theory (where all reals are finite) can cleanly prove inequalities like `self > 0.0`.
+fn strip_is_finite_conjuncts(expr: &Expr) -> Option<Expr> {
+    fn is_finite_call(e: &Expr) -> bool {
+        matches!(
+            &e.kind,
+            ExprKind::Call { callee, args }
+                if args.len() == 1
+                    && matches!(&callee.kind, ExprKind::Ident(f) if f == "is_finite")
+        )
+    }
+    match &expr.kind {
+        _ if is_finite_call(expr) => Some(Expr { kind: ExprKind::Bool(true), span: expr.span }),
+        ExprKind::Binary { op: BinOp::And, left, right } => {
+            let l = strip_is_finite_conjuncts(left);
+            let r = strip_is_finite_conjuncts(right);
+            if is_finite_call(left) {
+                return Some(r.unwrap_or_else(|| (**right).clone()));
+            }
+            if is_finite_call(right) {
+                return Some(l.unwrap_or_else(|| (**left).clone()));
+            }
+            if l.is_some() || r.is_some() {
+                Some(Expr {
+                    kind: ExprKind::Binary {
+                        op: BinOp::And,
+                        left: Box::new(l.unwrap_or_else(|| (**left).clone())),
+                        right: Box::new(r.unwrap_or_else(|| (**right).clone())),
+                    },
+                    span: expr.span,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }

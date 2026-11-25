@@ -1,0 +1,165 @@
+// std/nn/optim.tn — Verified `SGD` & `AdamW` Optimizers (`torch.optim` style)
+//
+// Hyperparameters are statically refined (`lr: PosFloat`, `eps: PosFloat`, `beta1/beta2: UnitInterval`,
+// `weight_decay: NonNegFloat`), guaranteeing zero division-by-zero and zero NaN updates at compile time!
+
+import "std/core/types.tn"
+import "std/nn/tensor.tn"
+import "std/nn/module.tn"
+
+pub record AdamWParamState {
+    m    List[Float]
+    v    List[Float]
+    step Int
+}
+
+pub pure fn adamw_state_new(n Int) AdamWParamState {
+    var m List[Float] = []
+    var v List[Float] = []
+    var i = 0
+    while i < n {
+        m = push(m, 0.0)
+        v = push(v, 0.0)
+        i += 1
+    }
+    AdamWParamState { m = m, v = v, step = 0 }
+}
+
+pure fn pow_f(base Float, exp_i Int) Float {
+    var r = 1.0
+    var i = 0
+    while i < exp_i {
+        r = r * base
+        i += 1
+    }
+    r
+}
+
+/// Verified SGD with optional weight decay (`p = p * (1 - lr * wd) - lr * grad`).
+pub pure fn sgd_step(
+    inout param List[Float],
+    grad List[Float],
+    lr PosFloat,
+    weight_decay NonNegFloat,
+) {
+    let decay = 1.0 - lr * weight_decay
+    var i = 0
+    while i < len(param) && i < len(grad) {
+        let g = if grad[i] > 5.0 { 5.0 } else if grad[i] < -5.0 { -5.0 } else { grad[i] }
+        param[i] = param[i] * decay - lr * g
+        i += 1
+    }
+}
+
+/// Verified PyTorch `AdamW` decoupled weight decay step (`eps: PosFloat` proves denominator `> 0.0`!).
+pub pure fn adamw_step(
+    inout param List[Float],
+    grad List[Float],
+    inout st AdamWParamState,
+    lr PosFloat,
+    beta1 UnitInterval,
+    beta2 UnitInterval,
+    eps PosFloat,
+    weight_decay NonNegFloat,
+) {
+    st.step += 1
+    let b1_corr = nn_max(0.0001, 1.0 - pow_f(beta1, st.step))
+    let b2_corr = nn_max(0.0001, 1.0 - pow_f(beta2, st.step))
+    let decay = 1.0 - lr * weight_decay
+
+    var i = 0
+    while i < len(param) && i < len(grad) && i < len(st.m) && i < len(st.v) {
+        let raw_g = grad[i]
+        let g = if raw_g > 5.0 { 5.0 } else if raw_g < -5.0 { -5.0 } else { raw_g }
+        let nm = beta1 * st.m[i] + (1.0 - beta1) * g
+        let nv = beta2 * st.v[i] + (1.0 - beta2) * g * g
+        st.m[i] = nm
+        st.v[i] = nv
+        let m_hat = nm / b1_corr
+        let v_hat = nv / b2_corr
+        let denom = nn_sqrt(v_hat) + eps
+        param[i] = param[i] * decay - lr * (m_hat / denom)
+        i += 1
+    }
+}
+
+pub record LinearAdamState {
+    w_st AdamWParamState
+    b_st AdamWParamState
+}
+
+pub pure fn linear_adam_new(lin Linear) LinearAdamState {
+    LinearAdamState {
+        w_st = adamw_state_new(len(lin.weight)),
+        b_st = adamw_state_new(len(lin.bias)),
+    }
+}
+
+pub pure fn linear_adam_step(
+    inout lin Linear,
+    inout st LinearAdamState,
+    tape AutogradTape,
+    ids LinearIds,
+    lr PosFloat,
+    weight_decay NonNegFloat,
+) {
+    adamw_step(lin.weight, tape_grad(tape, ids.w_id), st.w_st, lr, 0.9, 0.999, 0.00000001, weight_decay)
+    adamw_step(lin.bias, tape_grad(tape, ids.b_id), st.b_st, lr, 0.9, 0.999, 0.00000001, 0.0)
+}
+
+pub record SelfAttnAdamState {
+    q LinearAdamState
+    k LinearAdamState
+    v LinearAdamState
+    o LinearAdamState
+}
+
+pub pure fn self_attn_adam_new(attn SelfAttention) SelfAttnAdamState {
+    SelfAttnAdamState {
+        q = linear_adam_new(attn.wq),
+        k = linear_adam_new(attn.wk),
+        v = linear_adam_new(attn.wv),
+        o = linear_adam_new(attn.wo),
+    }
+}
+
+pub pure fn self_attn_adam_step(
+    inout attn SelfAttention,
+    inout st SelfAttnAdamState,
+    tape AutogradTape,
+    ids AttnIds,
+    lr PosFloat,
+    weight_decay NonNegFloat,
+) {
+    linear_adam_step(attn.wq, st.q, tape, ids.q_ids, lr, weight_decay)
+    linear_adam_step(attn.wk, st.k, tape, ids.k_ids, lr, weight_decay)
+    linear_adam_step(attn.wv, st.v, tape, ids.v_ids, lr, weight_decay)
+    linear_adam_step(attn.wo, st.o, tape, ids.o_ids, lr, weight_decay)
+}
+
+pub record TransformerAdamState {
+    attn SelfAttnAdamState
+    ff1  LinearAdamState
+    ff2  LinearAdamState
+}
+
+pub pure fn transformer_adam_new(blk TransformerBlock) TransformerAdamState {
+    TransformerAdamState {
+        attn = self_attn_adam_new(blk.attn),
+        ff1 = linear_adam_new(blk.ff1),
+        ff2 = linear_adam_new(blk.ff2),
+    }
+}
+
+pub pure fn transformer_adam_step(
+    inout blk TransformerBlock,
+    inout st TransformerAdamState,
+    tape AutogradTape,
+    ids TransformerIds,
+    lr PosFloat,
+    weight_decay NonNegFloat,
+) {
+    self_attn_adam_step(blk.attn, st.attn, tape, ids.attn_ids, lr, weight_decay)
+    linear_adam_step(blk.ff1, st.ff1, tape, ids.ff1_ids, lr, weight_decay)
+    linear_adam_step(blk.ff2, st.ff2, tape, ids.ff2_ids, lr, weight_decay)
+}

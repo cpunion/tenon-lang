@@ -1,0 +1,152 @@
+// std/nn/module.tn — PyTorch-Style Composable Neural Modules (`Linear`, `SelfAttention`, `TransformerBlock`)
+//
+// Builds directly on `AutogradTape` (`std/nn/tensor.tn`) with deterministic Xavier/He initialization,
+// statically verified positive dimensions (`Dim = Int where self >= 1`), and full end-to-end autograd!
+
+import "std/core/types.tn"
+import "std/nn/tensor.tn"
+
+/// Deterministic LCG pseudo-random generator in `[-1.0, 1.0]` for reproducible neural weight init.
+pure fn det_weight(seed Int, idx Int, scale Float) Float {
+    let h = ((seed * 1103515245 + idx * 12345 + 98765) % 20001) - 10000
+    (int_to_float(h) / 10000.0) * scale
+}
+
+pub record Linear {
+    in_features  Dim
+    out_features Dim
+    weight       List[Float] // shape [in_features, out_features]
+    bias         List[Float] // shape [1, out_features]
+}
+
+pub record LinearIds {
+    out_id Int
+    w_id   Int
+    b_id   Int
+}
+
+impl Linear {
+    pub pure fn new(in_f Dim, out_f Dim, seed Int) Linear {
+        // Xavier/Glorot scale: sqrt(2 / (in_f + out_f))
+        let scale = nn_sqrt(2.0 / int_to_float(in_f + out_f))
+        var w List[Float] = []
+        let total = in_f * out_f
+        var i = 0
+        while i < total {
+            w = push(w, det_weight(seed, i, scale))
+            i += 1
+        }
+        var b List[Float] = []
+        var j = 0
+        while j < out_f {
+            b = push(b, 0.0)
+            j += 1
+        }
+        Linear { in_features = in_f, out_features = out_f, weight = w, bias = b }
+    }
+
+    pub pure fn forward(self, inout tape AutogradTape, x_id Int) LinearIds {
+        let w_id = tape_leaf(tape, self.in_features, self.out_features, self.weight)
+        let b_id = tape_leaf(tape, 1, self.out_features, self.bias)
+        let mm = tape_matmul(tape, x_id, w_id)
+        let out_id = tape_add_bias(tape, mm, b_id)
+        LinearIds { out_id = out_id, w_id = w_id, b_id = b_id }
+    }
+}
+
+/// PyTorch-style Scaled Dot-Product Self-Attention:
+///   `Q = X @ W_Q`, `K = X @ W_K`, `V = X @ W_V`
+///   `Attn = Softmax((Q @ K^T) / sqrt(d_model))`
+///   `Out = (Attn @ V) @ W_O`
+pub record SelfAttention {
+    d_model Dim
+    wq      Linear
+    wk      Linear
+    wv      Linear
+    wo      Linear
+}
+
+pub record AttnIds {
+    out_id  Int
+    attn_id Int
+    q_ids   LinearIds
+    k_ids   LinearIds
+    v_ids   LinearIds
+    o_ids   LinearIds
+}
+
+impl SelfAttention {
+    pub pure fn new(d_model Dim, seed Int) SelfAttention {
+        SelfAttention {
+            d_model = d_model,
+            wq = Linear.new(d_model, d_model, seed + 11),
+            wk = Linear.new(d_model, d_model, seed + 23),
+            wv = Linear.new(d_model, d_model, seed + 37),
+            wo = Linear.new(d_model, d_model, seed + 53),
+        }
+    }
+
+    pub pure fn forward(self, inout tape AutogradTape, x_id Int) AttnIds {
+        let q = self.wq.forward(tape, x_id)
+        let k = self.wk.forward(tape, x_id)
+        let v = self.wv.forward(tape, x_id)
+        let kt = tape_transpose(tape, k.out_id)
+        let raw_scores = tape_matmul(tape, q.out_id, kt)
+        let inv_sqrt = 1.0 / nn_sqrt(int_to_float(self.d_model))
+        let scaled = tape_scale(tape, raw_scores, inv_sqrt)
+        let attn = tape_softmax(tape, scaled)
+        let ctx = tape_matmul(tape, attn, v.out_id)
+        let o = self.wo.forward(tape, ctx)
+        AttnIds {
+            out_id = o.out_id,
+            attn_id = attn,
+            q_ids = q,
+            k_ids = k,
+            v_ids = v,
+            o_ids = o,
+        }
+    }
+}
+
+/// Pre-Norm Residual Transformer Block (`x + Attn(LN(x))` -> `h + FFN(LN(h))`)
+pub record TransformerBlock {
+    d_model Dim
+    attn    SelfAttention
+    ff1     Linear
+    ff2     Linear
+}
+
+pub record TransformerIds {
+    out_id   Int
+    attn_ids AttnIds
+    ff1_ids  LinearIds
+    ff2_ids  LinearIds
+}
+
+impl TransformerBlock {
+    pub pure fn new(d_model Dim, d_ff Dim, seed Int) TransformerBlock {
+        TransformerBlock {
+            d_model = d_model,
+            attn = SelfAttention.new(d_model, seed + 101),
+            ff1 = Linear.new(d_model, d_ff, seed + 211),
+            ff2 = Linear.new(d_ff, d_model, seed + 307),
+        }
+    }
+
+    pub pure fn forward(self, inout tape AutogradTape, x_id Int) TransformerIds {
+        let ln1 = tape_layer_norm(tape, x_id, 0.00001)
+        let aids = self.attn.forward(tape, ln1)
+        let res1 = tape_add(tape, x_id, aids.out_id)
+        let ln2 = tape_layer_norm(tape, res1, 0.00001)
+        let f1 = self.ff1.forward(tape, ln2)
+        let act = tape_gelu(tape, f1.out_id)
+        let f2 = self.ff2.forward(tape, act)
+        let res2 = tape_add(tape, res1, f2.out_id)
+        TransformerIds {
+            out_id = res2,
+            attn_ids = aids,
+            ff1_ids = f1,
+            ff2_ids = f2,
+        }
+    }
+}
