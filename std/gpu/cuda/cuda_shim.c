@@ -344,96 +344,97 @@ int64_t tn_cuda_buf_free(int64_t handle) {
     return 1;
 }
 
-/* Compile CUDA C++ source -> PTX via nvcc (full headers/WMMA/dp4a) or NVRTC fallback, then load CUmodule. */
+/* Compile CUDA C++ source -> PTX/CUBIN via nvcc (checking /usr/local/cuda/bin/nvcc) OR NVRTC! */
 CUmodule tn_cuda_compile_module(const char* cu_src, int prefer_nvcc) {
     if (!g_tn_cuda.initialized && !tn_cuda_init()) return NULL;
     char* ptx = NULL;
     size_t ptx_len = 0;
 
-    if (!prefer_nvcc && g_tn_cuda.nvrtcCreateProgram && g_tn_cuda.nvrtcCompileProgram) {
-        nvrtcProgram prog = NULL;
-        if (g_tn_cuda.nvrtcCreateProgram(&prog, cu_src, "tenon_kernel.cu", 0, NULL, NULL) == NVRTC_SUCCESS) {
-            char arch_opt[64];
-            snprintf(arch_opt, sizeof(arch_opt), "--gpu-architecture=compute_%d%d", g_tn_cuda.cc_major, g_tn_cuda.cc_minor);
-            const char* opts[3] = { arch_opt, "--use_fast_math", "-I/usr/local/cuda/include" };
-            nvrtcResult cr = g_tn_cuda.nvrtcCompileProgram(prog, 3, opts);
-            if (cr != NVRTC_SUCCESS) {
-                /* Retry with compute_80 for maximum driver compatibility */
-                const char* opts2[3] = { "--gpu-architecture=compute_80", "--use_fast_math", "-I/usr/local/cuda/include" };
-                cr = g_tn_cuda.nvrtcCompileProgram(prog, 3, opts2);
-            }
-            if (cr == NVRTC_SUCCESS) {
-                g_tn_cuda.nvrtcGetPTXSize(prog, &ptx_len);
-                ptx = (char*)malloc(ptx_len + 1);
-                if (ptx) {
-                    g_tn_cuda.nvrtcGetPTX(prog, ptx);
-                    ptx[ptx_len] = '\0';
+    for (int pass = 0; pass < 2 && !ptx; pass++) {
+        int try_nvcc = (pass == 0) ? prefer_nvcc : !prefer_nvcc;
+        if (!try_nvcc && g_tn_cuda.nvrtcCreateProgram && g_tn_cuda.nvrtcCompileProgram) {
+            nvrtcProgram prog = NULL;
+            if (g_tn_cuda.nvrtcCreateProgram(&prog, cu_src, "tenon_kernel.cu", 0, NULL, NULL) == NVRTC_SUCCESS) {
+                char arch_opt[64];
+                snprintf(arch_opt, sizeof(arch_opt), "--gpu-architecture=compute_%d%d", g_tn_cuda.cc_major, g_tn_cuda.cc_minor);
+                const char* opts[5] = {
+                    arch_opt, "--use_fast_math",
+                    "-I/usr/local/cuda/include",
+                    "-I/usr/local/cuda/targets/x86_64-linux/include",
+                    "-I/usr/include"
+                };
+                nvrtcResult cr = g_tn_cuda.nvrtcCompileProgram(prog, 5, opts);
+                if (cr != NVRTC_SUCCESS) {
+                    const char* opts2[4] = {
+                        "--gpu-architecture=compute_80", "--use_fast_math",
+                        "-I/usr/local/cuda/include",
+                        "-I/usr/local/cuda/targets/x86_64-linux/include"
+                    };
+                    cr = g_tn_cuda.nvrtcCompileProgram(prog, 4, opts2);
                 }
-            } else {
-                size_t lsz = 0;
-                g_tn_cuda.nvrtcGetProgramLogSize(prog, &lsz);
-                if (lsz > 1) {
-                    char* log = (char*)malloc(lsz + 1);
-                    if (log) {
-                        g_tn_cuda.nvrtcGetProgramLog(prog, log);
-                        log[lsz] = '\0';
-                        fprintf(stderr, "[tenon-cuda] NVRTC note: %s\n", log);
-                        free(log);
+                if (cr == NVRTC_SUCCESS) {
+                    g_tn_cuda.nvrtcGetPTXSize(prog, &ptx_len);
+                    ptx = (char*)malloc(ptx_len + 1);
+                    if (ptx) {
+                        g_tn_cuda.nvrtcGetPTX(prog, ptx);
+                        ptx[ptx_len] = '\0';
                     }
-                }
-            }
-            g_tn_cuda.nvrtcDestroyProgram(&prog);
-        }
-    }
-
-    if (!ptx) {
-#if !defined(_WIN32)
-        char cu_path[128], out_path[128], cmd[512];
-        int pid = (int)getpid();
-        static int seq = 0;
-        int id = ++seq;
-        snprintf(cu_path, sizeof(cu_path), "/tmp/tenon_cuda_%d_%d.cu", pid, id);
-        snprintf(out_path, sizeof(out_path), "/tmp/tenon_cuda_%d_%d.cubin", pid, id);
-        FILE* f = fopen(cu_path, "wb");
-        if (f) {
-            fwrite(cu_src, 1, strlen(cu_src), f);
-            fclose(f);
-            int arch_num = g_tn_cuda.cc_major * 10 + g_tn_cuda.cc_minor;
-            /* Use cubin directly for native SASS on exact GPU SM! */
-            snprintf(cmd, sizeof(cmd),
-                "nvcc -O3 --use_fast_math -arch=sm_%d --cubin %s -o %s 2>/tmp/tenon_nvcc.err || "
-                "nvcc -O3 --use_fast_math -arch=compute_%d --ptx %s -o %s 2>>/tmp/tenon_nvcc.err",
-                arch_num, cu_path, out_path, arch_num, cu_path, out_path);
-            int rc = system(cmd);
-            if (rc == 0) {
-                FILE* pf = fopen(out_path, "rb");
-                if (pf) {
-                    fseek(pf, 0, SEEK_END);
-                    long sz = ftell(pf);
-                    fseek(pf, 0, SEEK_SET);
-                    if (sz > 0) {
-                        ptx = (char*)malloc((size_t)sz + 1);
-                        if (ptx) {
-                            ptx_len = fread(ptx, 1, (size_t)sz, pf);
-                            ptx[ptx_len] = '\0';
+                } else {
+                    size_t lsz = 0;
+                    g_tn_cuda.nvrtcGetProgramLogSize(prog, &lsz);
+                    if (lsz > 1) {
+                        char* log = (char*)malloc(lsz + 1);
+                        if (log) {
+                            g_tn_cuda.nvrtcGetProgramLog(prog, log);
+                            log[lsz] = '\0';
+                            fprintf(stderr, "[tenon-cuda] NVRTC note: %s\n", log);
+                            free(log);
                         }
                     }
-                    fclose(pf);
                 }
-            } else {
-                FILE* ef = fopen("/tmp/tenon_nvcc.err", "rb");
-                if (ef) {
-                    char errbuf[2048];
-                    size_t n = fread(errbuf, 1, sizeof(errbuf) - 1, ef);
-                    errbuf[n] = '\0';
-                    fprintf(stderr, "[tenon-cuda] nvcc compile error:\n%s\n", errbuf);
-                    fclose(ef);
-                }
+                g_tn_cuda.nvrtcDestroyProgram(&prog);
             }
-            unlink(cu_path);
-            unlink(out_path);
-        }
+        } else if (try_nvcc) {
+#if !defined(_WIN32)
+            const char* nvcc_bin = "nvcc";
+            if (access("/usr/local/cuda/bin/nvcc", X_OK) == 0) nvcc_bin = "/usr/local/cuda/bin/nvcc";
+            char cu_path[128], out_path[128], cmd[768];
+            int pid = (int)getpid();
+            static int seq = 0;
+            int id = ++seq;
+            snprintf(cu_path, sizeof(cu_path), "/tmp/tenon_cuda_%d_%d.cu", pid, id);
+            snprintf(out_path, sizeof(out_path), "/tmp/tenon_cuda_%d_%d.cubin", pid, id);
+            FILE* f = fopen(cu_path, "wb");
+            if (f) {
+                fwrite(cu_src, 1, strlen(cu_src), f);
+                fclose(f);
+                int arch_num = g_tn_cuda.cc_major * 10 + g_tn_cuda.cc_minor;
+                snprintf(cmd, sizeof(cmd),
+                    "%s -O3 --use_fast_math -arch=sm_%d --cubin %s -o %s 2>/tmp/tenon_nvcc.err || "
+                    "%s -O3 --use_fast_math -arch=compute_%d --ptx %s -o %s 2>>/tmp/tenon_nvcc.err",
+                    nvcc_bin, arch_num, cu_path, out_path, nvcc_bin, arch_num, cu_path, out_path);
+                int rc = system(cmd);
+                if (rc == 0) {
+                    FILE* pf = fopen(out_path, "rb");
+                    if (pf) {
+                        fseek(pf, 0, SEEK_END);
+                        long sz = ftell(pf);
+                        fseek(pf, 0, SEEK_SET);
+                        if (sz > 0) {
+                            ptx = (char*)malloc((size_t)sz + 1);
+                            if (ptx) {
+                                ptx_len = fread(ptx, 1, (size_t)sz, pf);
+                                ptx[ptx_len] = '\0';
+                            }
+                        }
+                        fclose(pf);
+                    }
+                }
+                unlink(cu_path);
+                unlink(out_path);
+            }
 #endif
+        }
     }
 
     if (!ptx) return NULL;

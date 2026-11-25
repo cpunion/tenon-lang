@@ -156,9 +156,7 @@ int64_t tn_tpu_init(void) {
 
     PJRT_Client_Create_Args ca;
     memset(&ca, 0, sizeof(ca));
-    /* Note: older plugins (e.g. PJRT v0.5x-v0.6x) check struct_size against fields they know;
-       using offsetof(client) + sizeof(client) works cleanly across ALL PJRT v0.30..v0.90+! */
-    ca.struct_size = (size_t)((const char*)&ca.client - (const char*)&ca) + sizeof(ca.client);
+    ca.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
     if (!tn_pjrt_check(g_api->PJRT_Client_Create(&ca), "PJRT_Client_Create")) return 0;
     g_client = ca.client;
     if (!g_client) return 0;
@@ -405,11 +403,11 @@ int64_t tn_tpu_exec_many(int64_t exec_h, int64_t in_handles_ptr, int64_t n_in, i
 
     PJRT_ExecuteOptions opts;
     memset(&opts, 0, sizeof(opts));
-    opts.struct_size = (size_t)((const char*)&opts.launch_id - (const char*)&opts) + sizeof(opts.launch_id);
+    opts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
 
     PJRT_LoadedExecutable_Execute_Args ea;
     memset(&ea, 0, sizeof(ea));
-    ea.struct_size = (size_t)((const char*)&ea.execute_device - (const char*)&ea) + sizeof(ea.execute_device);
+    ea.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
     ea.executable = g_tpu_execs[exec_h].exec;
     ea.options = &opts;
     ea.argument_lists = arg_lists;
