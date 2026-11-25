@@ -29,12 +29,35 @@ echo "  -> ARM64 Machine Code (.o) Fixed Point: BIT-EXACT IDENTICAL!"
 echo "=== [Stage-4 End-to-End Target Compilation + L0 Div-Zero Rejection] ==="
 /tmp/tenon_s4
 cat > /tmp/s4_good.tn << 'EOF'
-pub pure fn safe_ratio(total Int, count Int where self >= 1) Int {
+pub type Positive = Int where self >= 1
+
+pub enum Mode {
+    Fast
+    Safe
+    Turbo
+}
+
+pub record Point {
+    x Int
+    y Int
+}
+
+pub pure fn safe_ratio(total Int, count Positive) Int {
     return total / count
 }
+
 pub fn main() Int {
-    let r = safe_ratio(126, 3)
-    let _ = println("Stage-4 Native ARM64 Target Output: " ++ int_to_text(r))
+    let p = Point { x = 84, y = 42 }
+    let m = Turbo
+    let bonus = match m {
+        Fast => 1
+        Safe => 2
+        Turbo => 3
+        _ => 0
+    }
+    let r = safe_ratio(p.x + p.y, bonus)
+    assert r == 42
+    let _ = println("Stage-4 Native ARM64 Target (type+record+enum+match+assert): " ++ int_to_text(r))
     return 0
 }
 EOF

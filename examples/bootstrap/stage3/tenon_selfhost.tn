@@ -54,6 +54,11 @@ pure fn kw_kind(w Text) Int {
     if w == "false" { return 17 }
     if w == "break" { return 18 }
     if w == "continue" { return 19 }
+    if w == "type" { return 51 }
+    if w == "record" { return 52 }
+    if w == "enum" { return 53 }
+    if w == "match" { return 54 }
+    if w == "assert" { return 55 }
     return 1
 }
 
@@ -129,6 +134,8 @@ fn lex_source(src Text, inout tk List[Int], inout tt List[Text], inout tv List[I
                 tk = push(tk, 49); tt = push(tt, "+="); tv = push(tv, 0); i += 2
             } else if b == 45 && nb == 61 {
                 tk = push(tk, 50); tt = push(tt, "-="); tv = push(tv, 0); i += 2
+            } else if b == 61 && nb == 62 {
+                tk = push(tk, 56); tt = push(tt, "=>"); tv = push(tv, 0); i += 2
             } else {
                 var k = 0
                 if b == 40 { k = 20 }
@@ -146,6 +153,7 @@ fn lex_source(src Text, inout tk List[Int], inout tt List[Text], inout tv List[I
                 else if b == 37 { k = 32 }
                 else if b == 33 { k = 33 }
                 else if b == 38 { k = 34 }
+                else if b == 46 { k = 35 }
                 else if b == 60 { k = 42 }
                 else if b == 62 { k = 44 }
                 tk = push(tk, k)
@@ -302,6 +310,42 @@ fn parse_primary(
         }
         return add_expr(ek, ei, es, ea, eb, ec, 8, 0, "", cond, te, ee)
     }
+    if k == 54 {
+        // `match scrut { pat1 => body1, pat2 => body2, _ => default }` desugared to nested `if` exprs!
+        pos += 1
+        let scrut = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+        if pk(tk, pos) == 22 { pos += 1 }
+        var pats List[Int] = []
+        var bodies List[Int] = []
+        var wild_body = add_expr(ek, ei, es, ea, eb, ec, 1, 0, "", 0, 0, 0)
+        while pk(tk, pos) != 23 && pk(tk, pos) != 0 {
+            let is_wild = pk(tk, pos) == 1 && pt(tt, pos) == "_"
+            var pat_e = -1
+            if is_wild {
+                pos += 1
+            } else {
+                pat_e = parse_primary(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            }
+            if pk(tk, pos) == 56 { pos += 1 }
+            let body_e = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            if pk(tk, pos) == 26 { pos += 1 }
+            if is_wild {
+                wild_body = body_e
+            } else {
+                pats = push(pats, pat_e)
+                bodies = push(bodies, body_e)
+            }
+        }
+        if pk(tk, pos) == 23 { pos += 1 }
+        var res = wild_body
+        var mi = len(pats) - 1
+        while mi >= 0 {
+            let cmp_e = add_expr(ek, ei, es, ea, eb, ec, 4, 0, "==", scrut, pats[mi], 0)
+            res = add_expr(ek, ei, es, ea, eb, ec, 8, 0, "", cmp_e, bodies[mi], res)
+            mi -= 1
+        }
+        return res
+    }
     if k == 1 {
         let nm = pt(tt, pos)
         pos += 1
@@ -322,14 +366,40 @@ fn parse_primary(
                 ai += 1
             }
             node = add_expr(ek, ei, es, ea, eb, ec, 6, 0, nm, astart, len(local_args), 0)
+        } else if len(nm) > 0 && (byte_at(nm, 0) & 255) >= 65 && (byte_at(nm, 0) & 255) <= 90 && pk(tk, pos) == 22 && pk(tk, pos + 1) == 1 && pk(tk, pos + 2) == 27 {
+            // Record literal `Point { x = 10, y = 20 }` (record names start with uppercase A-Z)
+            pos += 1
+            var fvals List[Int] = []
+            while pk(tk, pos) != 23 && pk(tk, pos) != 0 {
+                pos += 1 // field name
+                if pk(tk, pos) == 27 { pos += 1 }
+                let fv = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+                fvals = push(fvals, fv)
+                if pk(tk, pos) == 26 { pos += 1 }
+            }
+            if pk(tk, pos) == 23 { pos += 1 }
+            let fstart = len(call_args)
+            var fi = 0
+            while fi < len(fvals) {
+                call_args = push(call_args, fvals[fi])
+                fi += 1
+            }
+            node = add_expr(ek, ei, es, ea, eb, ec, 10, len(fvals), nm, fstart, len(fvals), 0)
         } else {
             node = add_expr(ek, ei, es, ea, eb, ec, 3, 0, nm, 0, 0, 0)
         }
-        while pk(tk, pos) == 24 {
-            pos += 1
-            let idx = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
-            if pk(tk, pos) == 25 { pos += 1 }
-            node = add_expr(ek, ei, es, ea, eb, ec, 7, 0, "", node, idx, 0)
+        while pk(tk, pos) == 24 || pk(tk, pos) == 35 {
+            if pk(tk, pos) == 24 {
+                pos += 1
+                let idx = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+                if pk(tk, pos) == 25 { pos += 1 }
+                node = add_expr(ek, ei, es, ea, eb, ec, 7, 0, "", node, idx, 0)
+            } else {
+                pos += 1
+                let fnm = pt(tt, pos)
+                pos += 1
+                node = add_expr(ek, ei, es, ea, eb, ec, 11, 0, fnm, node, 0, 0)
+            }
         }
         return node
     }
@@ -450,6 +520,10 @@ fn parse_block(
         } else if k == 19 {
             pos += 1
             sid = add_stmt(sk, ss, sa, sb, sc, sn, 9, "", 0, 0, 0)
+        } else if k == 55 {
+            pos += 1
+            let cond = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
+            sid = add_stmt(sk, ss, sa, sb, sc, sn, 10, "", cond, 0, 0)
         } else if k == 9 {
             pos += 1
             let cond = parse_or(tk, tt, tv, pos, ek, ei, es, ea, eb, ec, call_args)
@@ -789,6 +863,29 @@ fn emit_expr_ir(
         let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = call i64 @s3_list_new()\n")
         return dst
     }
+    if k == 10 {
+        let fstart = ea[id]
+        let fcnt = eb[id]
+        let obj = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        let _ = buf_push_str(ir_buf, "  " ++ obj ++ " = call i64 @s3_rec_alloc(i64 " ++ int_to_text(fcnt) ++ ")\n")
+        var fi = 0
+        while fi < fcnt {
+            let fv = emit_expr_ir(call_args[fstart + fi], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let tmp = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ tmp ++ " = call i64 @s3_rec_set(i64 " ++ obj ++ ", i64 " ++ int_to_text(fi) ++ ", i64 " ++ fv ++ ")\n")
+            fi += 1
+        }
+        return obj
+    }
+    if k == 11 {
+        let rv = emit_expr_ir(ea[id], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+        let dst = "%t" ++ int_to_text(rseq)
+        rseq += 1
+        let _ = buf_push_str(ir_buf, "  " ++ dst ++ " = call i64 @s3_rec_get(i64 " ++ rv ++ ", i64 " ++ int_to_text(ei[id]) ++ ")\n")
+        return dst
+    }
     if k == 3 {
         let dst = "%t" ++ int_to_text(rseq)
         rseq += 1
@@ -1004,6 +1101,11 @@ fn emit_stmt_list_ir(
         } else if k == 9 {
             let _ = buf_push_str(ir_buf, "  br label %" ++ cont_lbl ++ "\n")
             term = true
+        } else if k == 10 {
+            let cv = emit_expr_ir(sa[cur], ir_buf, rseq, lseq, ek, ei, es, ea, eb, ec, call_args, fn_names, fn_pstart, fn_pcnt, fn_rty, p_inout, vnames, vty, str_lits)
+            let av = "%t" ++ int_to_text(rseq)
+            rseq += 1
+            let _ = buf_push_str(ir_buf, "  " ++ av ++ " = call i64 @s3_assert(i64 " ++ cv ++ ")\n")
         } else if k == 5 {
             let l_c = "wc_" ++ int_to_text(lseq)
             let l_b = "wb_" ++ int_to_text(lseq)
@@ -1079,6 +1181,14 @@ pub fn compile_tenon_file(src Text) Text {
     var p_has_min List[Int] = []
     var p_min List[Int] = []
 
+    // I3: Self-hosted Type Aliases (`type Pos = Int where self >= 1`), Enums & Records!
+    var ta_names List[Text] = []
+    var ta_min List[Int] = []
+    var enum_names List[Text] = []
+    var enum_vals List[Int] = []
+    var field_names List[Text] = []
+    var field_offs List[Int] = []
+
     var pos = 0
     while pk(tk, pos) != 0 {
         if pk(tk, pos) == 15 {
@@ -1086,6 +1196,66 @@ pub fn compile_tenon_file(src Text) Text {
             if pk(tk, pos) == 3 { pos += 1 }
         } else if pk(tk, pos) == 11 || pk(tk, pos) == 12 {
             pos += 1
+        } else if pk(tk, pos) == 51 {
+            // `type Positive = Int where self >= 1`
+            pos += 1
+            let tnm = pt(tt, pos)
+            pos += 1
+            if pk(tk, pos) == 27 { pos += 1 }
+            let _ = parse_type_kind(tk, tt, pos)
+            if pk(tk, pos) == 14 {
+                pos += 1
+                if pk(tk, pos) == 1 { pos += 1 } // self
+                let ck = pk(tk, pos)
+                pos += 1
+                let bv = pv(tv, pos)
+                pos += 1
+                if ck == 45 {
+                    ta_names = push(ta_names, tnm)
+                    ta_min = push(ta_min, bv)
+                } else if ck == 44 {
+                    ta_names = push(ta_names, tnm)
+                    ta_min = push(ta_min, bv + 1)
+                }
+            }
+        } else if pk(tk, pos) == 53 {
+            // `enum Mode { Fast, Safe, Turbo }`
+            pos += 1
+            pos += 1 // enum name
+            if pk(tk, pos) == 22 { pos += 1 }
+            var tag_i = 0
+            while pk(tk, pos) != 23 && pk(tk, pos) != 0 {
+                if pk(tk, pos) == 1 {
+                    enum_names = push(enum_names, pt(tt, pos))
+                    enum_vals = push(enum_vals, tag_i)
+                    tag_i += 1
+                    pos += 1
+                } else {
+                    pos += 1
+                }
+            }
+            if pk(tk, pos) == 23 { pos += 1 }
+        } else if pk(tk, pos) == 52 {
+            // `record Point { x Int, y Int }`
+            pos += 1
+            pos += 1 // record name
+            if pk(tk, pos) == 22 { pos += 1 }
+            var fidx = 0
+            while pk(tk, pos) != 23 && pk(tk, pos) != 0 {
+                if pk(tk, pos) == 1 {
+                    field_names = push(field_names, pt(tt, pos))
+                    field_offs = push(field_offs, fidx)
+                    fidx += 1
+                    pos += 1
+                    if pk(tk, pos) == 1 {
+                        let _ = parse_type_kind(tk, tt, pos)
+                    }
+                    if pk(tk, pos) == 26 { pos += 1 }
+                } else {
+                    pos += 1
+                }
+            }
+            if pk(tk, pos) == 23 { pos += 1 }
         } else if pk(tk, pos) == 4 {
             pos += 1
             let fname = pt(tt, pos)
@@ -1098,9 +1268,18 @@ pub fn compile_tenon_file(src Text) Text {
                 if pk(tk, pos) == 13 { is_io = 1; pos += 1 }
                 let pn = pt(tt, pos)
                 pos += 1
+                let raw_tname = pt(tt, pos)
                 let pt_k = parse_type_kind(tk, tt, pos)
                 var hmin = 0
                 var mval = 0
+                var tai = 0
+                while tai < len(ta_names) {
+                    if ta_names[tai] == raw_tname {
+                        hmin = 1
+                        mval = ta_min[tai]
+                    }
+                    tai += 1
+                }
                 if pk(tk, pos) == 14 {
                     pos += 1
                     if pk(tk, pos) == 1 { pos += 1 } // self
@@ -1133,6 +1312,30 @@ pub fn compile_tenon_file(src Text) Text {
         } else {
             pos += 1
         }
+    }
+
+    // I3 Desugaring Pass: resolve enum variant tags & record field offsets directly in AST!
+    var ei_idx = 0
+    while ei_idx < len(ek) {
+        if ek[ei_idx] == 3 {
+            var evi = 0
+            while evi < len(enum_names) {
+                if enum_names[evi] == es[ei_idx] {
+                    ek[ei_idx] = 1
+                    ei[ei_idx] = enum_vals[evi]
+                }
+                evi += 1
+            }
+        } else if ek[ei_idx] == 11 {
+            var ffi = 0
+            while ffi < len(field_names) {
+                if field_names[ffi] == es[ei_idx] {
+                    ei[ei_idx] = field_offs[ffi]
+                }
+                ffi += 1
+            }
+        }
+        ei_idx += 1
     }
 
     // L0 Interval & Division-by-Zero Verification Pass
@@ -1208,7 +1411,7 @@ pub fn compile_tenon_file(src Text) Text {
 
     let hdr = buf_new()
     let _ = buf_push_str(hdr, "; Auto-generated by Tenon Stage-3 Self-Hosting Pure-Tenon Compiler (0% Rust!)\n")
-    let _ = buf_push_str(hdr, "declare i64 @s3_str_from_cstr(ptr, i64)\ndeclare i64 @s3_str_concat(i64, i64)\ndeclare i64 @s3_str_eq(i64, i64)\ndeclare i64 @s3_len(i64)\ndeclare i64 @s3_byte_at(i64, i64)\ndeclare i64 @s3_str_slice(i64, i64, i64)\ndeclare i64 @s3_int_to_text(i64)\ndeclare i64 @s3_list_new()\ndeclare i64 @s3_list_push(i64, i64)\ndeclare i64 @s3_list_get(i64, i64)\ndeclare i64 @s3_list_set(i64, i64, i64)\ndeclare i64 @s3_buf_new()\ndeclare i64 @s3_buf_push_str(i64, i64)\ndeclare i64 @s3_buf_push_byte(i64, i64)\ndeclare i64 @s3_buf_finish(i64)\ndeclare i64 @s3_println(i64)\ndeclare i64 @s3_read_file(i64)\ndeclare i64 @s3_write_file(i64, i64)\ndeclare i64 @s3_env(i64)\n\n")
+    let _ = buf_push_str(hdr, "declare i64 @s3_str_from_cstr(ptr, i64)\ndeclare i64 @s3_str_concat(i64, i64)\ndeclare i64 @s3_str_eq(i64, i64)\ndeclare i64 @s3_len(i64)\ndeclare i64 @s3_byte_at(i64, i64)\ndeclare i64 @s3_str_slice(i64, i64, i64)\ndeclare i64 @s3_int_to_text(i64)\ndeclare i64 @s3_list_new()\ndeclare i64 @s3_list_push(i64, i64)\ndeclare i64 @s3_list_get(i64, i64)\ndeclare i64 @s3_list_set(i64, i64, i64)\ndeclare i64 @s3_buf_new()\ndeclare i64 @s3_buf_push_str(i64, i64)\ndeclare i64 @s3_buf_push_byte(i64, i64)\ndeclare i64 @s3_buf_finish(i64)\ndeclare i64 @s3_println(i64)\ndeclare i64 @s3_read_file(i64)\ndeclare i64 @s3_write_file(i64, i64)\ndeclare i64 @s3_env(i64)\ndeclare i64 @s3_assert(i64)\ndeclare i64 @s3_rec_alloc(i64)\ndeclare i64 @s3_rec_get(i64, i64)\ndeclare i64 @s3_rec_set(i64, i64, i64)\n\n")
     var si = 0
     while si < len(str_lits) {
         let s = str_lits[si]

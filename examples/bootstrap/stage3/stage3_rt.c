@@ -216,6 +216,37 @@ int64_t s3_env(int64_t key_val) {
     return v ? s3_str_from_cstr(v, (int64_t)strlen(v)) : s3_str_from_cstr("", 0);
 }
 
+int64_t s3_assert(int64_t cond) {
+    if (!cond) {
+        fprintf(stderr, "Stage-3 runtime assertion failed!\n");
+        exit(1);
+    }
+    return 0;
+}
+
+int64_t s3_rec_alloc(int64_t nfields) {
+    int64_t n = nfields > 0 ? nfields : 1;
+    S3Obj* o = (S3Obj*)malloc(sizeof(S3Obj) + (size_t)n * sizeof(int64_t));
+    o->tag = 3;
+    o->len = n;
+    o->cap = n;
+    memset(o->data, 0, (size_t)n * sizeof(int64_t));
+    return (int64_t)(uintptr_t)o;
+}
+
+int64_t s3_rec_get(int64_t rec, int64_t idx) {
+    S3Obj* o = (S3Obj*)(uintptr_t)rec;
+    if (!o || idx < 0 || idx >= o->len) return 0;
+    return ((int64_t*)o->data)[idx];
+}
+
+int64_t s3_rec_set(int64_t rec, int64_t idx, int64_t val) {
+    S3Obj* o = (S3Obj*)(uintptr_t)rec;
+    if (!o || idx < 0 || idx >= o->len) return rec;
+    ((int64_t*)o->data)[idx] = val;
+    return rec;
+}
+
 extern int64_t s3_main(void);
 
 int main(int argc, char** argv) {
