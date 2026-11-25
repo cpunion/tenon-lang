@@ -1,0 +1,15 @@
+{
+  "llvm-target": "wasm32-unknown-unknown",
+  "cpu": "generic",
+  "os": "baremetal",
+  "arch": "wasm32",
+  "pointer-bits": 32,
+  "freestanding": true,
+  "binary-format": "wasm",
+  "build-tags": [
+    "wasm",
+    "wasm32",
+    "baremetal"
+  ],
+  "description": "Freestanding WebAssembly 32-bit (Zero-WASI Browser/Edge)"
+}

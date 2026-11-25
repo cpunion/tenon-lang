@@ -1,0 +1,15 @@
+{
+  "llvm-target": "x86_64-pc-windows-msvc",
+  "cpu": "x86-64-v2",
+  "os": "windows",
+  "arch": "x86_64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "pe-coff",
+  "build-tags": [
+    "windows",
+    "x86_64",
+    "msvc"
+  ],
+  "description": "Windows 10/11 x86_64 (PE/COFF MSVC ABI)"
+}

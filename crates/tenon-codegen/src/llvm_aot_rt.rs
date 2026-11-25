@@ -633,6 +633,25 @@ int64_t tenon_text_new(int64_t data_ptr, int64_t byte_len) {
     return (int64_t)(uintptr_t)obj;
 }
 
+const char* tenon_text_data_ptr(int64_t ptr) {
+    if (ptr == 0) return "";
+    return (const char*)((TenonObj*)(uintptr_t)ptr)->fields;
+}
+
+int64_t tenon_text_byte_len(int64_t ptr) {
+    if (ptr == 0) return 0;
+    return ((TenonObj*)(uintptr_t)ptr)->len;
+}
+
+void* tenon_obj_fields_ptr(int64_t ptr) {
+    if (ptr == 0) return NULL;
+    return (void*)((TenonObj*)(uintptr_t)ptr)->fields;
+}
+
+int64_t tenon_rt_live_objects(void) {
+    return tenon_total_live();
+}
+
 int64_t tenon_text_eq(int64_t a, int64_t b) {
     if (a == b) return 1;
     if (a == 0 || b == 0) return 0;

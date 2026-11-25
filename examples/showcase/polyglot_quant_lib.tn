@@ -1,0 +1,85 @@
+// examples/showcase/polyglot_quant_lib.tn
+//
+// ONE verified Tenon source file -> ZERO PyO3 / N-API / JNI / cbindgen boilerplate!
+// Compile once with:
+//   tenon build examples/showcase/polyglot_quant_lib.tn --export all --export-dir target/polyglot_quant
+// Generates ready-to-import native extensions & safe wrappers for:
+//   Python 3 (.so + .pyi), Node.js N-API (.node + .d.ts), Swift 6 (.swift + modulemap),
+//   Java & Kotlin / Android JNI (.dylib + .java + .kt), C++17 (.hpp), Rust (.rs), Zig (.zig), Go (.go)!
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+
+pub record Portfolio {
+    ticker Text
+    shares Int
+    avg_price Float
+}
+
+impl Portfolio {
+    pub fn market_value(self, spot Float) Float {
+        int_to_float(self.shares) * spot
+    }
+
+    pub fn pnl(self, spot Float) Float {
+        int_to_float(self.shares) * (spot - self.avg_price)
+    }
+
+    pub fn summary(self) Text {
+        self.ticker ++ ":" ++ int_to_text(self.shares)
+    }
+}
+
+@export
+pub fn fib_fast(n Int) Int {
+    if n <= 1 {
+        return n
+    }
+    var a = 0
+    var b = 1
+    var i = 2
+    while i <= n {
+        let nxt = a + b
+        a = b
+        b = nxt
+        i += 1
+    }
+    b
+}
+
+@export
+pub fn vwap_delta(spot Float, avg_price Float, shares Int) Float {
+    (spot - avg_price) * int_to_float(shares)
+}
+
+@export
+pub fn format_order(symbol Text, qty Int) Text {
+    "ORDER[" ++ symbol ++ "]x" ++ int_to_text(qty)
+}
+
+@export
+pub fn sum_int_list(xs List[Int]) Int {
+    var acc = 0
+    var i = 0
+    while i < len(xs) {
+        acc += xs[i]
+        i += 1
+    }
+    acc
+}
+
+@export
+pub fn scale_float_list(xs List[Float], factor Float) List[Float] {
+    var out List[Float] = list_filled(len(xs), 0.0)
+    var i = 0
+    while i < len(xs) {
+        out[i] = xs[i] * factor
+        i += 1
+    }
+    out
+}
+
+@export
+pub fn make_portfolio(ticker Text, shares Int, avg_price Float) Portfolio {
+    Portfolio { ticker = ticker, shares = shares, avg_price = avg_price }
+}

@@ -1,0 +1,15 @@
+{
+  "llvm-target": "aarch64-pc-windows-msvc",
+  "cpu": "generic",
+  "os": "windows",
+  "arch": "arm64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "pe-coff",
+  "build-tags": [
+    "windows",
+    "arm64",
+    "msvc"
+  ],
+  "description": "Windows on ARM64 / Snapdragon X (PE/COFF MSVC ABI)"
+}

@@ -1,0 +1,16 @@
+{
+  "llvm-target": "x86_64-apple-darwin",
+  "cpu": "x86-64-v2",
+  "os": "macos",
+  "arch": "x86_64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "mach-o",
+  "build-tags": [
+    "macos",
+    "darwin",
+    "x86_64",
+    "unix"
+  ],
+  "description": "Intel macOS (Mach-O x86_64)"
+}

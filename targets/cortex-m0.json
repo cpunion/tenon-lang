@@ -1,0 +1,11 @@
+{
+  "inherits": [
+    "cortex-m"
+  ],
+  "llvm-target": "thumbv6m-none-eabi",
+  "cpu": "cortex-m0",
+  "build-tags": [
+    "cortex-m0"
+  ],
+  "description": "ARM Cortex-M0 Bare-Metal MCU (Thumb-1, ELF32)"
+}

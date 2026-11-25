@@ -659,7 +659,11 @@ pub fn compile_program_to_wasm32_llvm(
         .target_triple
         .as_deref()
         .is_some_and(|t| t.contains("wasi"));
-    if is_wasi {
+    let has_main = program
+        .items
+        .iter()
+        .any(|it| matches!(it, Item::Fn(f) if f.name == "main"));
+    if is_wasi && has_main {
         exports_c.push_str(
             "__attribute__((export_name(\"_start\")))\nvoid _start(void) { (void)tenon_fn_main(); }\n",
         );

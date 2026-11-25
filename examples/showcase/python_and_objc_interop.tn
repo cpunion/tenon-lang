@@ -1,0 +1,166 @@
+// examples/showcase/python_and_objc_interop.tn
+//
+// Demonstrates Mojo-grade (and beyond!) foreign ecosystem integration from native LLVM-compiled Tenon:
+//   1. Seamless Python 3 stdlib/ecosystem calls (`math`, `json`, `collections`) with ZERO build flags
+//   2. Zero-copy `memoryview` sharing of Tenon `List[Float32]` buffers directly with Python
+//   3. BEYOND MOJO: Dynamically subclassing a Python class in Tenon & injecting native LLVM-compiled
+//      `@export` Tenon methods that read Python `self` attributes and execute at native machine speed!
+//   4. Apple Foundation Objective-C / Swift `@objc` object calls AND dynamic ObjC subclassing!
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+import "std/os/io.tn"
+import "std/interop/python.tn"
+import "std/interop/objc.tn"
+
+// Native LLVM-compiled Tenon methods injected directly onto a Python subclass!
+@export
+pub fn tenon_py_fast_score(py_self Int, x Int, y Int) Int {
+    let self_obj = PyObj { handle = py_self }
+    let mult_obj = self_obj.attr("multiplier")
+    let mult = mult_obj.to_int()
+    mult_obj.drop()
+    mult * (x * x + y * y)
+}
+
+@export
+pub fn tenon_py_fast_alpha(py_self Int, price Float, vol Float) Float {
+    let self_obj = PyObj { handle = py_self }
+    let scale_obj = self_obj.attr("risk_scale")
+    let scale = scale_obj.to_float()
+    scale_obj.drop()
+    price * vol * scale
+}
+
+// Native LLVM-compiled Tenon method injected directly onto a dynamic Objective-C NSObject subclass!
+@export
+pub fn tenon_objc_compute_risk(objc_self Int, exposure Int) Int {
+    let _ = objc_self
+    exposure * 7 + 42
+}
+
+fn main() {
+    println("=== Tenon Seamless Foreign Ecosystem Interop & Object Extension ===")
+
+    // -------------------------------------------------------------------------
+    // 1. Seamless Python 3 Ecosystem Calls (`math`, `json`, `collections`, `sys`)
+    // -------------------------------------------------------------------------
+    let ok = py_init()
+    assert(ok)
+
+    let sys_mod = py_import("sys")
+    let py_ver = sys_mod.attr("version")
+    let ver_str = py_ver.to_text()
+    println("[1] Loaded CPython dynamically (zero link flags): " ++ ver_str)
+    py_ver.drop()
+    sys_mod.drop()
+
+    let math_mod = py_import("math")
+    let f144 = py_float(144.0)
+    let r_sqrt = math_mod.method1("sqrt", f144)
+    let sqrt_val = r_sqrt.to_float()
+    println("[1] Python math.sqrt(144.0) = " ++ float_to_text(sqrt_val))
+    assert(sqrt_val > 11.99 && sqrt_val < 12.01)
+    r_sqrt.drop()
+    f144.drop()
+    math_mod.drop()
+
+    let json_mod = py_import("json")
+    let d = py_dict_new()
+    let k1 = py_str("lang")
+    let v1 = py_str("Tenon")
+    let k2 = py_str("speedup")
+    let v2 = py_int(467)
+    let _ = d.set_item(k1, v1)
+    let _ = d.set_item(k2, v2)
+    let jres = json_mod.method1("dumps", d)
+    let jtxt = jres.to_text()
+    println("[1] Python json.dumps(dict) = " ++ jtxt)
+    jres.drop()
+    k1.drop()
+    v1.drop()
+    k2.drop()
+    v2.drop()
+    d.drop()
+    json_mod.drop()
+
+    // -------------------------------------------------------------------------
+    // 2. Zero-Copy `memoryview` Sharing of Native Tenon Float32 Buffer -> Python
+    // -------------------------------------------------------------------------
+    var buf List[Float32] = list_filled(4, 0.0 as Float32)
+    buf[0] = 1.5 as Float32
+    buf[1] = 2.5 as Float32
+    buf[2] = 3.5 as Float32
+    buf[3] = 4.5 as Float32
+    let mv = py_memoryview_from_f32_list(buf, true)
+    let _ = py_set_global("tenon_mv", mv)
+    let _ = py_exec("import struct; vals = list(struct.unpack('4f', tenon_mv)); struct.pack_into('f', tenon_mv, 8, 99.25)")
+    let py_sum_obj = py_eval("sum(vals)")
+    let py_sum = py_sum_obj.to_float()
+    println("[2] Zero-copy memoryview -> Python read sum=" ++ float_to_text(py_sum)
+        ++ ", Python mutated buf[2] in-place -> Tenon sees " ++ float_to_text(buf[2] as Float))
+    assert(py_sum > 11.99 && py_sum < 12.01)
+    assert((buf[2] as Float) > 99.2 && (buf[2] as Float) < 99.3)
+    py_sum_obj.drop()
+    mv.drop()
+
+    // -------------------------------------------------------------------------
+    // 3. BEYOND MOJO: Subclass a Python Class & Inject Native LLVM Tenon Methods!
+    // -------------------------------------------------------------------------
+    let _ = py_exec("class BaseStrategy:\n    def __init__(self, name, mult, risk_scale):\n        self.name = name\n        self.multiplier = mult\n        self.risk_scale = risk_scale\n    def describe(self):\n        return f'{self.name}(m={self.multiplier})'\n")
+    let base_cls = py_eval("BaseStrategy")
+    let sub_cls = py_subclass(base_cls, "TenonAccelStrategy")
+    let a1 = sub_cls.attach_exported_method("fast_score", "tenon_py_fast_score", 3)
+    let a2 = sub_cls.attach_exported_float_method("fast_alpha", "tenon_py_fast_alpha", 3)
+    assert(a1 && a2)
+    let _ = py_set_global("TenonAccelStrategy", sub_cls)
+
+    let inst = py_eval("TenonAccelStrategy('BTC-Quant', 3, 0.5)")
+    assert(inst.is_instance(base_cls))
+    let desc = py_eval("TenonAccelStrategy('BTC-Quant', 3, 0.5).describe()")
+    let score_obj = py_eval("TenonAccelStrategy('BTC-Quant', 3, 0.5).fast_score(5, 12)")
+    let alpha_obj = py_eval("TenonAccelStrategy('BTC-Quant', 3, 0.5).fast_alpha(100.0, 0.25)")
+    let score = score_obj.to_int()
+    let alpha = alpha_obj.to_float()
+    println("[3] Python subclass TenonAccelStrategy(BaseStrategy): isinstance=true, describe="
+        ++ desc.to_text()
+        ++ ", native fast_score(5,12)=" ++ int_to_text(score)
+        ++ ", native fast_alpha(100,0.25)=" ++ float_to_text(alpha))
+    assert(score == 507)
+    assert(alpha > 12.49 && alpha < 12.51)
+    alpha_obj.drop()
+    score_obj.drop()
+    desc.drop()
+    inst.drop()
+    sub_cls.drop()
+    base_cls.drop()
+
+    // -------------------------------------------------------------------------
+    // 4. Apple Foundation Objective-C / Swift `@objc` Interop & Dynamic Subclassing!
+    // -------------------------------------------------------------------------
+    let ns_pi_cls = objc_class("NSProcessInfo")
+    let pi = ns_pi_cls.send0_obj("processInfo")
+    let os_ver = pi.send0_obj("operatingSystemVersionString")
+    println("[4] Apple Foundation NSProcessInfo.operatingSystemVersionString = " ++ os_ver.to_text())
+    os_ver.drop()
+    pi.drop()
+
+    let ns_s = objc_nsstring("hello apple foundation")
+    let ns_up = ns_s.send0_obj("uppercaseString")
+    let ns_len = ns_up.send0_int("length")
+    println("[4] Apple NSString.uppercaseString = " ++ ns_up.to_text() ++ " (len=" ++ int_to_text(ns_len) ++ ")")
+    assert(ns_len == 22)
+    ns_up.drop()
+    ns_s.drop()
+
+    let sub_objc = objc_subclass_with_method("NSObject", "TenonObjcWorker", "computeRisk:", "tenon_objc_compute_risk")
+    let worker_raw = sub_objc.send0_obj("alloc")
+    let worker = worker_raw.send0_obj("init")
+    let risk = worker.send1_int("computeRisk:", 100)
+    println("[4] Dynamic ObjC subclass TenonObjcWorker : NSObject -> [worker computeRisk:100] = " ++ int_to_text(risk))
+    assert(risk == 742)
+    worker.drop()
+    worker_raw.drop()
+
+    println("=== ALL POLYGLOT IMPORT & FOREIGN SUBCLASSING CHECKS PASSED! ===")
+}

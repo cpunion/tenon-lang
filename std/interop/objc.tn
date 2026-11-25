@@ -1,0 +1,59 @@
+// std/interop/objc.tn — Apple macOS/iOS Objective-C & Swift `@objc` Dynamic Object Interop!
+
+import "std/core/types.tn"
+
+@link(framework = "Foundation")
+@c_src("objc_shim.m")
+extern "C" {
+    fn tn_objc_class(name CStr) Int
+    fn tn_objc_nsstring(s CStr, n Int) Int
+    fn tn_objc_to_text(obj Int) Text
+    fn tn_objc_release(obj Int)
+    fn tn_objc_send0_obj(target Int, sel CStr) Int
+    fn tn_objc_send0_int(target Int, sel CStr) Int
+    fn tn_objc_send1_obj(target Int, sel CStr, arg Int) Int
+    fn tn_objc_send1_int(target Int, sel CStr, arg Int) Int
+    fn tn_objc_subclass_with_method(base CStr, name CStr, sel CStr, c_sym CStr) Int
+}
+
+pub record ObjcObj {
+    handle Int
+}
+
+pub fn objc_class(name Text) ObjcObj {
+    ObjcObj { handle = unsafe { tn_objc_class(text_cstr_ptr(name)) } }
+}
+
+pub fn objc_nsstring(s Text) ObjcObj {
+    ObjcObj { handle = unsafe { tn_objc_nsstring(text_cstr_ptr(s), len(s)) } }
+}
+
+pub fn objc_subclass_with_method(base_cls Text, new_cls Text, sel Text, export_sym Text) ObjcObj {
+    ObjcObj {
+        handle = unsafe {
+            tn_objc_subclass_with_method(
+                text_cstr_ptr(base_cls),
+                text_cstr_ptr(new_cls),
+                text_cstr_ptr(sel),
+                text_cstr_ptr(export_sym),
+            )
+        }
+    }
+}
+
+impl ObjcObj {
+    pub fn to_text(self) Text { unsafe { tn_objc_to_text(self.handle) } }
+    pub fn drop(self) { unsafe { tn_objc_release(self.handle) } }
+    pub fn send0_obj(self, sel Text) ObjcObj {
+        ObjcObj { handle = unsafe { tn_objc_send0_obj(self.handle, text_cstr_ptr(sel)) } }
+    }
+    pub fn send0_int(self, sel Text) Int {
+        unsafe { tn_objc_send0_int(self.handle, text_cstr_ptr(sel)) }
+    }
+    pub fn send1_obj(self, sel Text, arg ObjcObj) ObjcObj {
+        ObjcObj { handle = unsafe { tn_objc_send1_obj(self.handle, text_cstr_ptr(sel), arg.handle) } }
+    }
+    pub fn send1_int(self, sel Text, arg Int) Int {
+        unsafe { tn_objc_send1_int(self.handle, text_cstr_ptr(sel), arg) }
+    }
+}

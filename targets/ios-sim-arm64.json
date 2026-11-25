@@ -1,0 +1,16 @@
+{
+  "llvm-target": "arm64-apple-ios15.0-simulator",
+  "cpu": "apple-m1",
+  "os": "ios",
+  "arch": "arm64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "mach-o",
+  "build-tags": [
+    "ios",
+    "simulator",
+    "arm64",
+    "mobile"
+  ],
+  "description": "Apple iOS Simulator ARM64"
+}

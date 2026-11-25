@@ -1,0 +1,20 @@
+{
+  "llvm-target": "riscv64-unknown-linux-gnu",
+  "cpu": "generic-rv64",
+  "os": "linux",
+  "arch": "riscv64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "elf",
+  "cflags": [
+    "-march=rv64gc",
+    "-mabi=lp64d"
+  ],
+  "build-tags": [
+    "linux",
+    "riscv64",
+    "unix",
+    "elf"
+  ],
+  "description": "Linux RISC-V 64-bit GC (ELF64)"
+}

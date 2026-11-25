@@ -1,0 +1,25 @@
+{
+  "llvm-target": "riscv32-unknown-none-elf",
+  "cpu": "generic-rv32",
+  "os": "baremetal",
+  "arch": "riscv32",
+  "pointer-bits": 32,
+  "freestanding": true,
+  "linker": "ld.lld",
+  "binary-format": "elf",
+  "cflags": [
+    "-march=rv32imac",
+    "-mabi=ilp32",
+    "-fno-exceptions",
+    "-ffunction-sections",
+    "-fdata-sections"
+  ],
+  "ldflags": [
+    "--gc-sections"
+  ],
+  "build-tags": [
+    "riscv32",
+    "baremetal"
+  ],
+  "description": "RISC-V 32-bit IMAC Bare-Metal Embedded (ELF32)"
+}

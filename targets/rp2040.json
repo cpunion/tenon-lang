@@ -1,0 +1,13 @@
+{
+  "inherits": [
+    "cortex-m0"
+  ],
+  "cpu": "cortex-m0plus",
+  "binary-format": "uf2",
+  "flash-method": "msd",
+  "build-tags": [
+    "rp2040",
+    "pico"
+  ],
+  "description": "Raspberry Pi Pico / RP2040 Dual Cortex-M0+ (UF2)"
+}

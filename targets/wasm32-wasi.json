@@ -1,0 +1,15 @@
+{
+  "llvm-target": "wasm32-unknown-wasip1",
+  "cpu": "generic",
+  "os": "wasi",
+  "arch": "wasm32",
+  "pointer-bits": 32,
+  "freestanding": false,
+  "binary-format": "wasm",
+  "build-tags": [
+    "wasm",
+    "wasm32",
+    "wasi"
+  ],
+  "description": "WebAssembly 32-bit WASI Preview 1/2 + Browser ESM Bridge"
+}

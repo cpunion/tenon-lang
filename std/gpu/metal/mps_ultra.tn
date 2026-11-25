@@ -28,6 +28,12 @@ extern "C" {
         q_heads_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_h Int,
         n_heads Int, n_kv Int, d_head Int, kv_len Int, max_seq Int, softcap Float,
     ) Int
+    fn tn_ultra_rope_flash_decode(
+        qkv_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_h Int,
+        n_heads Int, n_kv Int, d_head Int, pos Int, max_seq Int, softcap Float,
+    ) Int
+    fn tn_ultra_argmax_f16(logits_h Int, out_tok_h Int, n_elems Int) Int
+    fn tn_ultra_read_u32_0(buf_h Int) Int
     fn tn_ultra_gemv(
         x_h Int, x_off Int,
         w_h Int, w_off Int,
@@ -155,6 +161,21 @@ pub fn ultra_flash_decode(
     n_heads Int, n_kv Int, d_head Int, kv_len Int, max_seq Int, softcap Float,
 ) Bool {
     unsafe { tn_ultra_flash_decode(q_heads_h, kc_h, kc_off, vc_h, vc_off, ctx_h, n_heads, n_kv, d_head, kv_len, max_seq, softcap) != 0 }
+}
+
+pub fn ultra_rope_flash_decode(
+    qkv_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_h Int,
+    n_heads Int, n_kv Int, d_head Int, pos Int, max_seq Int, softcap Float,
+) Bool {
+    unsafe { tn_ultra_rope_flash_decode(qkv_h, kc_h, kc_off, vc_h, vc_off, ctx_h, n_heads, n_kv, d_head, pos, max_seq, softcap) != 0 }
+}
+
+pub fn ultra_gpu_argmax_f16(logits_h Int, out_tok_h Int, n_elems Int) Bool {
+    unsafe { tn_ultra_argmax_f16(logits_h, out_tok_h, n_elems) != 0 }
+}
+
+pub fn ultra_read_u32_0(buf_h Int) Int {
+    unsafe { tn_ultra_read_u32_0(buf_h) }
 }
 
 pub fn ultra_gemv(

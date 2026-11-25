@@ -1,0 +1,19 @@
+{
+  "llvm-target": "x86_64-linux-android28",
+  "cpu": "x86-64-v2",
+  "os": "android",
+  "arch": "x86_64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "elf",
+  "cflags": [
+    "-fPIC"
+  ],
+  "build-tags": [
+    "android",
+    "x86_64",
+    "mobile",
+    "jni"
+  ],
+  "description": "Android API 28+ x86_64 Emulator/Tablet"
+}

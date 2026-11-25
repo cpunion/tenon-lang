@@ -5,6 +5,8 @@ pub(crate) mod llvm_aot_rt;
 pub mod llvm_runtime;
 pub mod lower_interfaces;
 pub use tenon_rt::perceus;
+pub mod polyglot;
+pub mod targets;
 pub mod wasm_client;
 pub mod wasm_general;
 pub mod wasm_llvm;

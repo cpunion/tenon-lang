@@ -1,0 +1,17 @@
+{
+  "llvm-target": "arm64-apple-ios15.0",
+  "cpu": "apple-a14",
+  "os": "ios",
+  "arch": "arm64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "mach-o",
+  "build-tags": [
+    "ios",
+    "darwin",
+    "arm64",
+    "mobile",
+    "metal"
+  ],
+  "description": "Apple iOS Device ARM64 (iPhone/iPad XCFramework-ready)"
+}

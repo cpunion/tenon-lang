@@ -1,0 +1,12 @@
+{
+  "inherits": [
+    "cortex-m"
+  ],
+  "llvm-target": "thumbv7em-none-eabi",
+  "cpu": "cortex-m4",
+  "build-tags": [
+    "cortex-m4",
+    "dsp"
+  ],
+  "description": "ARM Cortex-M4 Bare-Metal MCU (Thumb-2 + DSP, ELF32)"
+}

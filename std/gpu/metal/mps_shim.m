@@ -22,6 +22,7 @@ extern void* tn_metal_raw_buffer(int64_t handle);
 extern void* tn_metal_raw_pipeline(int64_t handle);
 
 static id<MTLCommandBuffer> g_mps_batch_cmd = nil;
+static id<MTLComputeCommandEncoder> g_mps_batch_enc = nil;
 
 // Small fixed cache for MPSMatrixMultiplication & MPSMatrixVectorMultiplication objects
 #define MPS_MM_CACHE_SIZE 128
@@ -178,13 +179,29 @@ int64_t tn_mps_batch_begin(void) {
     return g_mps_batch_cmd != nil ? 1 : 0;
 }
 
+void tn_mps_flush_compute_encoder(void) {
+    if (g_mps_batch_enc != nil) {
+        [g_mps_batch_enc endEncoding];
+        g_mps_batch_enc = nil;
+    }
+}
+
 void* tn_mps_active_cmd_buffer(void) {
     return (__bridge void*)g_mps_batch_cmd;
+}
+
+void* tn_mps_active_compute_encoder(void) {
+    if (g_mps_batch_cmd == nil) return NULL;
+    if (g_mps_batch_enc == nil) {
+        g_mps_batch_enc = [g_mps_batch_cmd computeCommandEncoder];
+    }
+    return (__bridge void*)g_mps_batch_enc;
 }
 
 int64_t tn_mps_batch_commit(void) {
     if (g_mps_batch_cmd == nil) return 0;
     @autoreleasepool {
+        tn_mps_flush_compute_encoder();
         id<MTLCommandBuffer> cmd = g_mps_batch_cmd;
         g_mps_batch_cmd = nil;
         [cmd commit];
@@ -232,6 +249,7 @@ int64_t tn_mps_gemm_ex(
             MPSVector* vecY = [[MPSVector alloc] initWithBuffer:mc offset:(NSUInteger)off_c descriptor:dvy];
             MPSMatrixVectorMultiplication* mv = get_cached_mv(dev, n, k, is_f16, alpha, beta);
             int local_cmd = (g_mps_batch_cmd == nil);
+            if (!local_cmd) tn_mps_flush_compute_encoder();
             id<MTLCommandBuffer> cmd = local_cmd ? [q commandBuffer] : g_mps_batch_cmd;
             [mv encodeToCommandBuffer:cmd inputMatrix:matB inputVector:vecX resultVector:vecY];
             if (local_cmd) {
@@ -271,6 +289,7 @@ int64_t tn_mps_gemm_ex(
         MPSMatrixMultiplication* mm = get_cached_mm(dev, m, n, k, 1, tr_a, tr_b, is_f16, alpha, beta);
 
         int local_cmd = (g_mps_batch_cmd == nil);
+        if (!local_cmd) tn_mps_flush_compute_encoder();
         id<MTLCommandBuffer> cmd = local_cmd ? [q commandBuffer] : g_mps_batch_cmd;
         [mm encodeToCommandBuffer:cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
         if (local_cmd) {
@@ -331,6 +350,7 @@ int64_t tn_mps_batched_gemm_f16(
 
         MPSMatrixMultiplication* mm = get_cached_mm(dev, m, n, k, batch, 0, tr_b, 1, alpha, beta);
         int local_cmd = (g_mps_batch_cmd == nil);
+        if (!local_cmd) tn_mps_flush_compute_encoder();
         id<MTLCommandBuffer> cmd = local_cmd ? [q commandBuffer] : g_mps_batch_cmd;
         [mm encodeToCommandBuffer:cmd leftMatrix:matA rightMatrix:matB resultMatrix:matC];
         if (local_cmd) {
@@ -376,6 +396,7 @@ int64_t tn_mps_softmax_ex(
         MPSMatrix* mDst = [[MPSMatrix alloc] initWithBuffer:md offset:(NSUInteger)off_dst descriptor:dd];
 
         int local_cmd = (g_mps_batch_cmd == nil);
+        if (!local_cmd) tn_mps_flush_compute_encoder();
         id<MTLCommandBuffer> cmd = local_cmd ? [q commandBuffer] : g_mps_batch_cmd;
         [g_mps_softmax encodeToCommandBuffer:cmd inputMatrix:mSrc resultMatrix:mDst];
         if (local_cmd) {
@@ -406,7 +427,9 @@ int64_t tn_mps_dispatch_kernel6(
     @autoreleasepool {
         int local_cmd = (g_mps_batch_cmd == nil);
         id<MTLCommandBuffer> cmd = local_cmd ? [q commandBuffer] : g_mps_batch_cmd;
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = local_cmd
+            ? [cmd computeCommandEncoder]
+            : (__bridge id<MTLComputeCommandEncoder>)tn_mps_active_compute_encoder();
         [enc setComputePipelineState:pso];
 
         int64_t bs[6] = { b0, b1, b2, b3, b4, b5 };
@@ -426,9 +449,8 @@ int64_t tn_mps_dispatch_kernel6(
         while (tx * ty > maxT && tx > 1) tx /= 2;
         MTLSize tg = MTLSizeMake(tx, ty, 1);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-        [enc endEncoding];
-
         if (local_cmd) {
+            [enc endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
             return ([cmd status] == MTLCommandBufferStatusCompleted) ? 1 : 0;
@@ -450,6 +472,7 @@ int64_t tn_mps_blit_copy(
 
     @autoreleasepool {
         int local_cmd = (g_mps_batch_cmd == nil);
+        if (!local_cmd) tn_mps_flush_compute_encoder();
         id<MTLCommandBuffer> cmd = local_cmd ? [q commandBuffer] : g_mps_batch_cmd;
         id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
         [blit copyFromBuffer:ms

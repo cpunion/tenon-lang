@@ -1,0 +1,17 @@
+{
+  "llvm-target": "aarch64-unknown-linux-gnu",
+  "cpu": "generic",
+  "os": "linux",
+  "arch": "arm64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "elf",
+  "build-tags": [
+    "linux",
+    "arm64",
+    "aarch64",
+    "unix",
+    "elf"
+  ],
+  "description": "Linux ARM64 / AWS Graviton / Raspberry Pi 5 (ELF64)"
+}

@@ -1,0 +1,40 @@
+// examples/showcase/embedded_sensor_pid.tn
+//
+// Zero-OS, zero-libc, Z3-verified bare-metal embedded PID controller & CRC16 kernel.
+// Cross-compiles cleanly to ALL 21 Tenon targets:
+//   macOS / Linux / Windows (arm64, x86_64, riscv64), iOS, Android, Wasm32,
+//   ARM Cortex-M0/M4/M7, RP2040, STM32F4, RISC-V ESP32-C3!
+
+@export
+pub fn clamp_pwm(duty Int, lo Int, hi Int) Int {
+    if duty < lo {
+        return lo
+    }
+    if duty > hi {
+        return hi
+    }
+    duty
+}
+
+@export
+pub fn pid_step(setpoint Int, measured Int, integral Int, prev_err Int, kp Int, ki Int, kd Int) Int {
+    let err = setpoint - measured
+    let deriv = err - prev_err
+    let raw = (kp * err + ki * integral + kd * deriv) / 100
+    clamp_pwm(raw, -1000, 1000)
+}
+
+@export
+pub fn crc16_step(crc Int, byte_val Int) Int {
+    var c = crc ^ (byte_val & 255)
+    var b = 0
+    while b < 8 {
+        if (c & 1) != 0 {
+            c = (c >> 1) ^ 40961
+        } else {
+            c = c >> 1
+        }
+        b += 1
+    }
+    c & 65535
+}

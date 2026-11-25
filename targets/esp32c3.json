@@ -1,0 +1,16 @@
+{
+  "inherits": [
+    "riscv32"
+  ],
+  "cflags": [
+    "-march=rv32imc",
+    "-mabi=ilp32"
+  ],
+  "binary-format": "esp32c3",
+  "flash-method": "esptool",
+  "build-tags": [
+    "esp32c3",
+    "esp"
+  ],
+  "description": "Espressif ESP32-C3 Wi-Fi/BLE RISC-V MCU (RV32IMC)"
+}

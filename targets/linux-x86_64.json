@@ -1,0 +1,16 @@
+{
+  "llvm-target": "x86_64-unknown-linux-gnu",
+  "cpu": "x86-64-v2",
+  "os": "linux",
+  "arch": "x86_64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "elf",
+  "build-tags": [
+    "linux",
+    "x86_64",
+    "unix",
+    "elf"
+  ],
+  "description": "Linux x86_64 Server/Desktop (ELF64 GNU/glibc)"
+}

@@ -1,0 +1,24 @@
+{
+  "os": "baremetal",
+  "arch": "arm",
+  "pointer-bits": 32,
+  "freestanding": true,
+  "linker": "ld.lld",
+  "binary-format": "elf",
+  "cflags": [
+    "-mthumb",
+    "-mfloat-abi=soft",
+    "-fno-exceptions",
+    "-ffunction-sections",
+    "-fdata-sections"
+  ],
+  "ldflags": [
+    "--gc-sections"
+  ],
+  "build-tags": [
+    "cortexm",
+    "baremetal",
+    "arm"
+  ],
+  "description": "Base ARM Cortex-M Bare-Metal Profile"
+}

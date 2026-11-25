@@ -285,9 +285,9 @@ fn main() {
     // 6. FULL 1.24B-Param `Llama-3.2-1B` (`d=2048, 16L, 32H/8KV, d_ff=8192, vocab=32000`)
     //    Zero-Copy `mmap` GGUF v3 -> Metal `newBufferWithBytesNoCopy` Bandwidth-Saturated Benchmark!
     // -------------------------------------------------------------------------
-    bench_mmap_1b("Llama3.2_1B_1.24B_Q4_0", QUANT_Q4_0, "/tmp/tenon_llama32_1b_q4.gguf", 32)
-    bench_mmap_1b("Llama3.2_1B_1.24B_Q8_0", QUANT_Q8_0, "/tmp/tenon_llama32_1b_q8.gguf", 32)
-    bench_mmap_1b("Llama3.2_1B_1.24B_FP16", QUANT_FP16, "/tmp/tenon_llama32_1b_f16.gguf", 24)
+    bench_mmap_1b("Llama3.2_1B_1.24B_Q4_0", QUANT_Q4_0, "/tmp/tenon_llama32_1b.gguf", 32)
+    bench_mmap_1b("Llama3.2_1B_1.24B_Q8_0", QUANT_Q8_0, "/tmp/tenon_llama32_1b.gguf", 32)
+    bench_mmap_1b("Llama3.2_1B_1.24B_FP16", QUANT_FP16, "/tmp/tenon_llama32_1b.gguf", 24)
 
     println("=== DONE (Perceus live_objects == 0, Linear VRAM == 0 leaks) ===")
 }
@@ -300,16 +300,17 @@ fn bench_mmap_1b(name Text, qm Int, path Text, decode_steps Int) {
     let active_bytes = ultra_active_bytes_per_token(model.cfg)
     let params = ultra_param_count(model.cfg)
 
-    // Warmup
-    let _ = model.decode_step(7, 0)
-    let _ = model.decode_step(11, 1)
+    // Warmup (faults mmap pages into unified memory & warms GPU frequency state)
+    let _ = model.decode_step_greedy(7, 0)
+    let _ = model.decode_step_greedy(11, 1)
+    let _ = model.decode_step_greedy(15, 2)
+    let _ = model.decode_step_greedy(19, 3)
 
     let t0 = time_now_ns()
     var tok = 13
     var s = 0
     while s < decode_steps {
-        let logits = model.decode_step(tok, 2 + s)
-        tok = ultra_argmax_f16(logits, 0, model.cfg.vocab_size)
+        tok = model.decode_step_greedy(tok, 4 + s)
         s += 1
     }
     let dt_ns = time_now_ns() - t0

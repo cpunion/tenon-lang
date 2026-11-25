@@ -1,0 +1,19 @@
+{
+  "llvm-target": "aarch64-linux-android28",
+  "cpu": "generic",
+  "os": "android",
+  "arch": "arm64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "elf",
+  "cflags": [
+    "-fPIC"
+  ],
+  "build-tags": [
+    "android",
+    "arm64",
+    "mobile",
+    "jni"
+  ],
+  "description": "Android API 28+ ARM64-v8a (ELF64 JNI-ready)"
+}

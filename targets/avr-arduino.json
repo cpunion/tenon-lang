@@ -1,0 +1,19 @@
+{
+  "llvm-target": "avr-unknown-unknown",
+  "cpu": "atmega328p",
+  "os": "baremetal",
+  "arch": "avr",
+  "pointer-bits": 16,
+  "freestanding": true,
+  "binary-format": "elf",
+  "cflags": [
+    "-mmcu=atmega328p",
+    "-fno-exceptions"
+  ],
+  "build-tags": [
+    "avr",
+    "arduino",
+    "baremetal"
+  ],
+  "description": "Arduino Uno / ATmega328P 8-bit AVR MCU"
+}

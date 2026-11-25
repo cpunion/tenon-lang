@@ -12,6 +12,7 @@ use crate::perceus::{
     RC_MASK_ALL, TAG_CLOSURE, TAG_CSTRUCT, TAG_DYN, TAG_ENUM_BASE, TAG_ERR, TAG_LIST, TAG_NONE,
     TAG_OK, TAG_RECORD_BASE, TAG_SOME, TAG_TUPLE,
 };
+use crate::targets::{ResolvedTarget, TENON_AOT_FREESTANDING_RT_C};
 use crate::{
     CORE_SYSCALLS, generic_ty, is_consuming_cow_builtin, is_f32_type_expr, is_float_type_expr,
     is_rc_type_expr, is_text_type_expr, named_ty, parse_syscall_ret_ty, resolve_alias_ty,
@@ -31,6 +32,7 @@ pub enum OutputKind {
     Executable,
     StaticLib,
     SharedLib,
+    Object,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +59,12 @@ pub struct BuildOptions {
     pub checked_overflow: bool,
     /// Optional target triple override for cross-compilation (e.g. `x86_64-unknown-linux-gnu`).
     pub target_triple: Option<String>,
+    /// Optional resolved declarative target spec (from `targets/*.json` or built-in registry).
+    pub resolved_target: Option<ResolvedTarget>,
+    /// Optional cross-compilation sysroot directory (`--sysroot`).
+    pub sysroot: Option<PathBuf>,
+    /// Optional explicit linker override (`-fuse-ld=...`).
+    pub linker: Option<String>,
 }
 
 impl Default for BuildOptions {
@@ -77,6 +85,9 @@ impl Default for BuildOptions {
             last_use_move_spans: BTreeMap::new(),
             checked_overflow: false,
             target_triple: None,
+            resolved_target: None,
+            sysroot: None,
+            linker: None,
         }
     }
 }
@@ -218,31 +229,52 @@ pub fn compile_with_options(
     let uses_net = ir_uses_net_runtime(&ir);
     let uses_sys_core = ir_uses_systems_core(&ir);
 
+    let is_freestanding = opts
+        .resolved_target
+        .as_ref()
+        .is_some_and(|t| t.freestanding);
+    let is_host_target = opts
+        .resolved_target
+        .as_ref()
+        .map(|t| t.is_host())
+        .unwrap_or_else(|| opts.target_triple.is_none());
+    let target_clang_args: Vec<String> = if let Some(rt) = &opts.resolved_target {
+        rt.clang_compile_args()
+    } else if let Some(triple) = &opts.target_triple {
+        vec![format!("--target={}", triple)]
+    } else {
+        Vec::new()
+    };
+
     let mut rt_c = String::with_capacity(TENON_AOT_RUNTIME_C.len() + 16384);
-    if uses_sync {
-        rt_c.push_str("#define TENON_THREAD_SAFE 1\n#define TENON_USE_SYNC 1\n");
-    }
-    rt_c.push_str(TENON_AOT_RUNTIME_C);
-    if uses_sys_core {
-        rt_c.push_str(TENON_AOT_SYSTEMS_CORE_C);
-    }
-    if uses_sync {
-        rt_c.push_str(TENON_AOT_SYNC_C);
-    }
-    if uses_net {
-        rt_c.push_str(TENON_AOT_NET_C);
-    }
-    if uses_os {
-        rt_c.push_str(TENON_AOT_OS_C);
-    }
-    if uses_http {
-        rt_c.push_str(TENON_AOT_HTTP_C);
-    }
-    if opts.output_kind == OutputKind::Executable {
+    if is_freestanding {
+        rt_c.push_str(TENON_AOT_FREESTANDING_RT_C);
+    } else {
+        if uses_sync {
+            rt_c.push_str("#define TENON_THREAD_SAFE 1\n#define TENON_USE_SYNC 1\n");
+        }
+        rt_c.push_str(TENON_AOT_RUNTIME_C);
+        if uses_sys_core {
+            rt_c.push_str(TENON_AOT_SYSTEMS_CORE_C);
+        }
+        if uses_sync {
+            rt_c.push_str(TENON_AOT_SYNC_C);
+        }
+        if uses_net {
+            rt_c.push_str(TENON_AOT_NET_C);
+        }
         if uses_os {
-            rt_c.push_str(TENON_AOT_MAIN_CLI_C);
-        } else {
-            rt_c.push_str(TENON_AOT_MAIN_STATS_C);
+            rt_c.push_str(TENON_AOT_OS_C);
+        }
+        if uses_http {
+            rt_c.push_str(TENON_AOT_HTTP_C);
+        }
+        if opts.output_kind == OutputKind::Executable {
+            if uses_os {
+                rt_c.push_str(TENON_AOT_MAIN_CLI_C);
+            } else {
+                rt_c.push_str(TENON_AOT_MAIN_STATS_C);
+            }
         }
     }
     fs::write(&tmp_rt, &rt_c).map_err(|e| e.to_string())?;
@@ -342,7 +374,7 @@ pub fn compile_with_options(
         opts.target_triple.as_deref().unwrap_or("host").replace(['/', ':', ' '], "_")
     );
     let rt_cache_obj = std::env::temp_dir().join(&rt_cache_key);
-    let rt_input_path = if opts.output_kind != OutputKind::SharedLib {
+    let rt_input_path = if opts.output_kind == OutputKind::Executable && is_host_target {
         if !rt_cache_obj.exists() {
             let rt_tmp_obj = std::env::temp_dir().join(format!("tenon_rt_build_{}_{}.o", pid, seq));
             let mut crt = Command::new("clang");
@@ -350,8 +382,11 @@ pub fn compile_with_options(
             if use_thin_lto {
                 crt.arg("-flto=thin");
             }
-            if let Some(triple) = &opts.target_triple {
-                crt.arg(format!("--target={}", triple));
+            for ta in &target_clang_args {
+                crt.arg(ta);
+            }
+            if let Some(sr) = &opts.sysroot {
+                crt.arg("--sysroot").arg(sr);
             }
             if opts.debug_info {
                 crt.arg("-g");
@@ -371,6 +406,29 @@ pub fn compile_with_options(
     };
 
     let res = match opts.output_kind {
+        OutputKind::Object => {
+            let mut c1 = Command::new("clang");
+            c1.arg(opt_flag).arg("-c").arg("-Wno-override-module");
+            for ta in &target_clang_args {
+                c1.arg(ta);
+            }
+            if let Some(sr) = &opts.sysroot {
+                c1.arg("--sysroot").arg(sr);
+            }
+            if opts.debug_info {
+                c1.arg("-g");
+            }
+            c1.args([tmp_ll.to_str().unwrap(), "-o", output_path.to_str().unwrap()]);
+            let o1 = c1.output().map_err(|e| format!("clang failed: {}", e))?;
+            if !o1.status.success() {
+                Err(format!(
+                    "LLVM clang -c (target object) failed:\n{}",
+                    String::from_utf8_lossy(&o1.stderr)
+                ))
+            } else {
+                Ok(())
+            }
+        }
         OutputKind::StaticLib => {
             let tmp_obj_ll = std::env::temp_dir().join(format!("tenon_ll_{}_{}.o", pid, seq));
             let tmp_obj_rt = std::env::temp_dir().join(format!("tenon_rt_{}_{}.o", pid, seq));
@@ -378,8 +436,11 @@ pub fn compile_with_options(
 
             let mut c1 = Command::new("clang");
             c1.arg(opt_flag).arg("-c").arg("-Wno-override-module");
-            if let Some(triple) = &opts.target_triple {
-                c1.arg(format!("--target={}", triple));
+            for ta in &target_clang_args {
+                c1.arg(ta);
+            }
+            if let Some(sr) = &opts.sysroot {
+                c1.arg("--sysroot").arg(sr);
             }
             if opts.debug_info {
                 c1.arg("-g");
@@ -395,27 +456,42 @@ pub fn compile_with_options(
                 ));
             }
 
-            let mut c2 = Command::new("clang");
-            c2.arg(opt_flag).arg("-c");
-            if opts.debug_info {
-                c2.arg("-g");
-            }
-            c2.args([tmp_rt.to_str().unwrap(), "-o", tmp_obj_rt.to_str().unwrap()]);
-            let o2 = c2.output().map_err(|e| format!("clang failed: {}", e))?;
-            if !o2.status.success() {
-                let _ = fs::remove_file(&tmp_ll);
-                let _ = fs::remove_file(&tmp_rt);
-                let _ = fs::remove_file(&tmp_obj_ll);
-                return Err(format!(
-                    "LLVM clang -c (RT) failed:\n{}",
-                    String::from_utf8_lossy(&o2.stderr)
-                ));
+            let compile_rt = is_host_target || is_freestanding || opts.sysroot.is_some();
+            if compile_rt {
+                let mut c2 = Command::new("clang");
+                c2.arg(opt_flag).arg("-c");
+                for ta in &target_clang_args {
+                    c2.arg(ta);
+                }
+                if let Some(sr) = &opts.sysroot {
+                    c2.arg("--sysroot").arg(sr);
+                }
+                if opts.debug_info {
+                    c2.arg("-g");
+                }
+                c2.args([tmp_rt.to_str().unwrap(), "-o", tmp_obj_rt.to_str().unwrap()]);
+                let o2 = c2.output().map_err(|e| format!("clang failed: {}", e))?;
+                if !o2.status.success() {
+                    let _ = fs::remove_file(&tmp_ll);
+                    let _ = fs::remove_file(&tmp_rt);
+                    let _ = fs::remove_file(&tmp_obj_ll);
+                    return Err(format!(
+                        "LLVM clang -c (RT) failed:\n{}",
+                        String::from_utf8_lossy(&o2.stderr)
+                    ));
+                }
             }
 
             for (idx, csrc) in all_c_sources.iter().enumerate() {
                 let eo = std::env::temp_dir().join(format!("tenon_ex_{}_{}_{}.o", pid, seq, idx));
                 let mut ce = Command::new("clang");
                 ce.arg(opt_flag).arg("-c");
+                for ta in &target_clang_args {
+                    ce.arg(ta);
+                }
+                if let Some(sr) = &opts.sysroot {
+                    ce.arg("--sysroot").arg(sr);
+                }
                 if csrc.extension().and_then(|e| e.to_str()).is_some_and(|e| e == "m" || e == "mm") {
                     ce.arg("-fobjc-arc");
                 }
@@ -435,13 +511,22 @@ pub fn compile_with_options(
             }
 
             let _ = fs::remove_file(output_path);
-            let mut ar = Command::new("ar");
-            ar.args([
-                "rcs",
-                output_path.to_str().unwrap(),
-                tmp_obj_ll.to_str().unwrap(),
-                tmp_obj_rt.to_str().unwrap(),
-            ]);
+            let ar_tool = if !is_host_target {
+                if Command::new("llvm-ar").arg("--version").output().is_ok_and(|o| o.status.success()) {
+                    "llvm-ar"
+                } else if Path::new("/opt/homebrew/opt/llvm/bin/llvm-ar").exists() {
+                    "/opt/homebrew/opt/llvm/bin/llvm-ar"
+                } else {
+                    "ar"
+                }
+            } else {
+                "ar"
+            };
+            let mut ar = Command::new(ar_tool);
+            ar.args(["rcs", output_path.to_str().unwrap(), tmp_obj_ll.to_str().unwrap()]);
+            if compile_rt {
+                ar.arg(tmp_obj_rt.to_str().unwrap());
+            }
             for eo in &extra_objs {
                 ar.arg(eo.to_str().unwrap());
             }
@@ -464,8 +549,14 @@ pub fn compile_with_options(
                 .is_some_and(|e| e == "o" || e == "obj");
             let mut cmd = Command::new("clang");
             cmd.arg(opt_flag);
-            if let Some(triple) = &opts.target_triple {
-                cmd.arg(format!("--target={}", triple));
+            for ta in &target_clang_args {
+                cmd.arg(ta);
+            }
+            if let Some(sr) = &opts.sysroot {
+                cmd.arg("--sysroot").arg(sr);
+            }
+            if let Some(ld) = &opts.linker {
+                cmd.arg(format!("-fuse-ld={}", ld));
             }
             if opts.debug_info {
                 cmd.arg("-g");
@@ -494,7 +585,7 @@ pub fn compile_with_options(
                 }
                 if uses_http {
                     cmd.args(["-lcurl", "-lpthread"]);
-                } else if uses_sync {
+                } else if uses_sync && !is_freestanding {
                     cmd.arg("-lpthread");
                 }
                 for lib in &all_link_libs {
@@ -502,6 +593,11 @@ pub fn compile_with_options(
                 }
                 for fw in &all_link_frameworks {
                     cmd.args(["-framework", fw]);
+                }
+                if let Some(rt) = &opts.resolved_target {
+                    for ldf in &rt.ldflags {
+                        cmd.arg(format!("-Wl,{}", ldf));
+                    }
                 }
             }
             cmd.args(["-o", output_path.to_str().unwrap()]);
@@ -1238,7 +1334,15 @@ pub fn emit_llvm_ir_with_build_options(
             &mut dbg_locs,
             &mut next_md_id,
         );
-        fn_defs.push_str(&cg.emit_sync_fn(f)?);
+        let is_user_pub_method = f.is_pub
+            && f.name.starts_with("__m__")
+            && (f.span.file_id == 0
+                || program.file_packages.get(f.span.file_id as usize).copied() == Some(1)
+                || program
+                    .source_files
+                    .get(f.span.file_id as usize)
+                    .is_some_and(|p| !p.contains("/std/") && !p.starts_with("std/")));
+        fn_defs.push_str(&cg.emit_sync_fn(f, is_user_pub_method)?);
         fn_defs.push('\n');
         if let Some(cname) = extract_export_name(&f.attrs, &f.name) {
             fn_defs.push_str(&emit_export_wrapper(f, &cname, &alias_bases));
@@ -4041,7 +4145,7 @@ impl<'a> LlvmFnGen<'a> {
         named_ty("Any")
     }
 
-    fn emit_sync_fn(&mut self, f: &FnDecl) -> Result<String, String> {
+    fn emit_sync_fn(&mut self, f: &FnDecl, export_external: bool) -> Result<String, String> {
         let mut param_list = Vec::new();
         for (i, p) in f.params.iter().enumerate() {
             let pname = format!("%arg_{}", i);
@@ -4095,7 +4199,11 @@ impl<'a> LlvmFnGen<'a> {
             self.code.push_str(&format!("  ret i64 {}{}\n", ret_val, dbg));
         }
 
-        let linkage = if f.name == "main" { "" } else { "internal " };
+        let linkage = if f.name == "main" || export_external {
+            ""
+        } else {
+            "internal "
+        };
         let mut fn_attrs = String::new();
         for attr in &f.attrs {
             if attr.name == "inline" {
@@ -4117,6 +4225,26 @@ impl<'a> LlvmFnGen<'a> {
             .debug_sp_id
             .map(|id| format!(" !dbg !{}", id))
             .unwrap_or_default();
+        if self.debug_sp_id.is_some() {
+            // LLVM 22 requires every inlinable `call` inside a `!DISubprogram` function to carry `!dbg !LOC`,
+            // otherwise LLVM strips the module's DWARF metadata. Propagate the nearest source `!dbg` location!
+            let default_loc = self.dbg_suffix(f.span);
+            let mut cur_dbg = default_loc.clone();
+            let mut fixed = String::with_capacity(self.code.len() + 256);
+            for line in self.code.lines() {
+                if let Some(pos) = line.rfind(", !dbg !") {
+                    cur_dbg = line[pos..].to_string();
+                    fixed.push_str(line);
+                } else if line.contains("call ") && !cur_dbg.is_empty() {
+                    fixed.push_str(line);
+                    fixed.push_str(&cur_dbg);
+                } else {
+                    fixed.push_str(line);
+                }
+                fixed.push('\n');
+            }
+            self.code = fixed;
+        }
         Ok(format!(
             "define {}i64 @tenon_fn_{}({}){}{} {{\nentry:\n{}{}}}\n",
             linkage,

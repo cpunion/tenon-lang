@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
 tenon-syntax.workspace = true
 tenon-rt.workspace = true
 tenon-verify.workspace = true

@@ -43,6 +43,7 @@ async fn main() -> ExitCode {
         "cluster-demo" => cmd_cluster_demo(&args[2..]).await,
         "agent" => cmd_agent(&args[2..]).await,
         "build" => cmd_build_aot(&args[2..]),
+        "targets" => cmd_targets(&args[2..]),
         "build-wasm" => cmd_build_wasm(&args[2..]),
         "verify-proofs" => cmd_verify_proofs(&args[2..]),
         "pkg" => cmd_pkg(&args[2..]),
@@ -76,16 +77,23 @@ USAGE:
   tenon run <file.tn>                             Verify and execute `main()` via Cranelift native JIT
   tenon test [file.tn|pkg_dir] [--filter <substr>] [-r|--recursive] [--no-leak-check]
                                                   Verify and run `test fn` tests with per-test Perceus zero-leak checks
-  tenon build <file.tn> -o <out> [--opt O0|O2|O3] [--target <triple|wasm32>] [--lib static|shared]
-        [--checked-overflow] [--emit-header <h>] [--emit-llvm <ll>] [--emit-ts <dts>]
-        [--emit-swift <sw>] [--emit-kotlin <kt>] [--emit-go <go>] [-g|--debug] [-l <lib>] [-L <dir>] [--c-src <c>]
-                                                  Verify (Fail-Closed) & AOT-compile to native/Wasm32/C-ABI libraries
+  tenon build <file.tn> -o <out> [--opt O0|O2|O3] [--target <name|triple|json>] [--lib static|shared|obj]
+        [--sysroot <dir>] [--linker <ld>] [--checked-overflow] [--emit-header <h>] [--emit-llvm <ll>]
+        [--export python|node|swift|java|kotlin|cpp|rust|zig|go|all] [--export-dir <dir>]
+        [--emit-python <dir>] [--emit-napi <dir>] [--emit-cpp <hpp>] [--emit-jni <c>] [--emit-java <java>]
+        [--emit-swift <sw>] [--emit-kotlin <kt>] [--emit-rust <rs>] [--emit-zig <zig>] [--emit-go <go>]
+        [-g|--debug] [-l <lib>] [-L <dir>] [--c-src <c>]
+                                                  Verify (Fail-Closed) & AOT-compile to native/cross/embedded/Wasm/polyglot libs
+  tenon targets                                   List built-in cross-compilation targets (OS/arch/mobile/Wasm/embedded MCUs)
+  tenon bindgen <header.h> [-o <out.tn>] [-I <dir>] [-D <MACRO>] [--lib <name>]
+                                                  Generate verified Tenon FFI bindings via Clang AST JSON
   tenon build-wasm <app.tn> [-o <out.wasm>]       Compile declarative .tn view/pacing to binary WebAssembly store
   tenon evolve check <v1.tn> <v2.tn> [--lock <file>] [--emit-migration <sql>] [--json]
                                                   Verify schema evolution compatibility, ledger & Expand-Contract SQL
   tenon modelcheck [file.tn] [--export-tla <dir>] [--replay <trace.jsonl>] [--json]
                                                   Run L2-b protocol safety/liveness model checker & trace replay
-  tenon pkg <lock|verify|tree|add|sync> [dir]     Manage `tenon.toml`, `tenon.lock` SHA-256 ledger & git deps
+  tenon pkg <init|lock|verify|tree|add|sync|publish|search> [dir]
+                                                  Manage `tenon.toml`, `tenon.lock` SHA-256 ledger, git deps & local registry
   tenon new <name> [--template cli|lib|web|gpui|openui-web|tui|gpu]
                                                   Scaffold a new verified Tenon project with tests & manifest
   tenon doc <file_or_dir> [-o <dir>] [--format md|html|both]
@@ -1583,6 +1591,360 @@ fn cmd_build_wasm(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn cmd_targets(_args: &[String]) -> ExitCode {
+    let list = tenon_codegen::targets::list_builtin_targets();
+    println!("Tenon Declarative Cross-Compilation Targets ({} built-in; custom `.json` with `inherits` & raw LLVM triples also supported):", list.len());
+    println!(
+        "  {:<22} {:<10} {:<30} {:<12} {}",
+        "TARGET", "CATEGORY", "LLVM TRIPLE", "RUNTIME", "DESCRIPTION"
+    );
+    println!("  {}", "-".repeat(104));
+    for t in list {
+        println!(
+            "  {:<22} {:<10} {:<30} {:<12} {}",
+            t.name,
+            t.category,
+            t.llvm_target,
+            if t.freestanding { "freestanding" } else { "hosted" },
+            t.description
+        );
+    }
+    println!("\nUsage examples:");
+    println!("  tenon build app.tn --target linux-x86_64 --lib obj -o app_linux_x64.o");
+    println!("  tenon build fw.tn  --target esp32c3 --lib static -o libfw_esp32c3.a");
+    println!("  tenon build fw.tn  --target rp2040 --lib static -o libfw_rp2040.a");
+    println!("  tenon build mod.tn --target targets/custom_board.json --lib obj -o mod.o");
+    ExitCode::SUCCESS
+}
+
+fn to_pascal_case(s: &str) -> String {
+    let mut out = String::new();
+    let mut upper = true;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            if upper {
+                out.push(c.to_ascii_uppercase());
+                upper = false;
+            } else {
+                out.push(c);
+            }
+        } else {
+            upper = true;
+        }
+    }
+    if out.is_empty() { "TenonLib".into() } else { out }
+}
+
+fn detect_python_includes() -> Vec<String> {
+    for tool in ["python3-config", "/opt/homebrew/bin/python3-config"] {
+        if let Ok(out) = std::process::Command::new(tool).arg("--includes").output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout);
+                let flags: Vec<String> = s.split_whitespace().map(|x| x.to_string()).collect();
+                if !flags.is_empty() {
+                    return flags;
+                }
+            }
+        }
+    }
+    if let Ok(out) = std::process::Command::new("python3")
+        .args(["-c", "import sysconfig; print(sysconfig.get_path('include'))"])
+        .output()
+    {
+        if out.status.success() {
+            let inc = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !inc.is_empty() {
+                return vec![format!("-I{}", inc)];
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn detect_jdk_include_dirs() -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> = Vec::new();
+    if let Ok(jh) = std::env::var("JAVA_HOME") {
+        homes.push(PathBuf::from(jh));
+    }
+    if let Ok(out) = std::process::Command::new("/usr/libexec/java_home").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                homes.push(PathBuf::from(s));
+            }
+        }
+    }
+    for cand in [
+        "/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home",
+        "/usr/local/opt/openjdk/libexec/openjdk.jdk/Contents/Home",
+        "/usr/lib/jvm/default-java",
+    ] {
+        homes.push(PathBuf::from(cand));
+    }
+    for home in homes {
+        let inc = home.join("include");
+        if inc.join("jni.h").exists() {
+            let mut dirs = vec![inc.clone()];
+            for sub in ["darwin", "linux", "win32"] {
+                let sd = inc.join(sub);
+                if sd.exists() {
+                    dirs.push(sd);
+                }
+            }
+            return dirs;
+        }
+    }
+    Vec::new()
+}
+
+fn run_polyglot_export(
+    prog: &tenon_syntax::Program,
+    file: &str,
+    export_spec: &str,
+    export_dir: &Path,
+    base_opts: &tenon_codegen::llvm_aot::BuildOptions,
+) -> Result<(), String> {
+    fs::create_dir_all(export_dir).map_err(|e| e.to_string())?;
+    let mod_stem = Path::new(file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tenon_mod");
+    let mod_name: String = mod_stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    let class_name = to_pascal_case(&mod_name);
+
+    let wants: Vec<String> = export_spec
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let want_all = wants.iter().any(|w| w == "all");
+    let has = |k: &str| want_all || wants.iter().any(|w| w == k);
+
+    // 1. Always build core verified static library `lib<mod>.a` + C ABI header `<mod>.h`
+    let static_lib_path = export_dir.join(format!("lib{}.a", mod_name));
+    let header_path = export_dir.join(format!("{}.h", mod_name));
+    let mut lib_opts = base_opts.clone();
+    lib_opts.output_kind = tenon_codegen::llvm_aot::OutputKind::StaticLib;
+    lib_opts.emit_header_path = Some(header_path.clone());
+    let art = tenon_codegen::llvm_aot::compile_with_options(prog, &static_lib_path, &lib_opts)?;
+    println!(
+        "  [core]   `{}` ({} bytes) + `{}`",
+        static_lib_path.display(),
+        art.binary_bytes,
+        header_path.display()
+    );
+
+    let is_macos = cfg!(target_os = "macos");
+    let opt_flag = match base_opts.opt_level.as_str() {
+        "O0" | "-O0" => "-O0",
+        "O1" | "-O1" => "-O1",
+        "O2" | "-O2" => "-O2",
+        _ => "-O3",
+    };
+
+    // 2. Python 3 Native C-API Extension (`.so` + `.pyi`) — ZERO boilerplate, exceeding PyO3!
+    if has("python") || has("py") {
+        let py_c = export_dir.join(format!("{}_pyext.c", mod_name));
+        let py_i = export_dir.join(format!("{}.pyi", mod_name));
+        let py_so = export_dir.join(format!("{}.so", mod_name));
+        fs::write(&py_c, tenon_codegen::polyglot::emit_python_c_ext(prog, &mod_name))
+            .map_err(|e| e.to_string())?;
+        fs::write(&py_i, tenon_codegen::polyglot::emit_python_pyi(prog, &mod_name))
+            .map_err(|e| e.to_string())?;
+        let py_incs = detect_python_includes();
+        if !py_incs.is_empty() {
+            let mut cmd = std::process::Command::new("clang");
+            cmd.args([opt_flag, "-shared", "-fPIC"]);
+            for inc in &py_incs {
+                cmd.arg(inc);
+            }
+            if is_macos {
+                cmd.args(["-undefined", "dynamic_lookup"]);
+            }
+            cmd.args([
+                py_c.to_str().unwrap(),
+                static_lib_path.to_str().unwrap(),
+                "-o",
+                py_so.to_str().unwrap(),
+            ]);
+            let out = cmd.output().map_err(|e| format!("clang python ext failed: {}", e))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "Python native extension build failed:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            let sz = fs::metadata(&py_so).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "  [python] `{}` ({} bytes native C-API `.so`) + `{}`",
+                py_so.display(),
+                sz,
+                py_i.display()
+            );
+        } else {
+            println!(
+                "  [python] emitted `{}` + `{}` (install python3 headers to compile `.so`)",
+                py_c.display(),
+                py_i.display()
+            );
+        }
+    }
+
+    // 3. Node.js Zero-`node-gyp` N-API v8 Native Addon (`.node` + `.d.ts`)
+    if has("node") || has("nodejs") || has("napi") {
+        let napi_c = export_dir.join(format!("{}_napi.c", mod_name));
+        let napi_dts = export_dir.join(format!("{}.d.ts", mod_name));
+        let napi_node = export_dir.join(format!("{}.node", mod_name));
+        fs::write(&napi_c, tenon_codegen::polyglot::emit_napi_c_addon(prog, &mod_name))
+            .map_err(|e| e.to_string())?;
+        fs::write(&napi_dts, tenon_codegen::polyglot::emit_napi_dts(prog, &mod_name))
+            .map_err(|e| e.to_string())?;
+        let mut cmd = std::process::Command::new("clang");
+        cmd.args([opt_flag, "-shared", "-fPIC"]);
+        if is_macos {
+            cmd.args(["-undefined", "dynamic_lookup"]);
+        }
+        cmd.args([
+            napi_c.to_str().unwrap(),
+            static_lib_path.to_str().unwrap(),
+            "-o",
+            napi_node.to_str().unwrap(),
+        ]);
+        let out = cmd.output().map_err(|e| format!("clang N-API addon failed: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "Node.js N-API addon build failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        let sz = fs::metadata(&napi_node).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "  [node]   `{}` ({} bytes zero-node-gyp N-API `.node`) + `{}`",
+            napi_node.display(),
+            sz,
+            napi_dts.display()
+        );
+    }
+
+    // 4. Swift 6 (macOS / iOS) Native Wrapper + `module.modulemap`
+    if has("swift") {
+        let sw_path = export_dir.join(format!("{}.swift", class_name));
+        let mm_path = export_dir.join("module.modulemap");
+        fs::write(&sw_path, tenon_codegen::polyglot::emit_swift_rich_bindings(prog))
+            .map_err(|e| e.to_string())?;
+        fs::write(
+            &mm_path,
+            tenon_codegen::polyglot::emit_swift_modulemap(&mod_name, &format!("{}.h", mod_name)),
+        )
+        .map_err(|e| e.to_string())?;
+        println!("  [swift]  `{}` + `{}`", sw_path.display(), mm_path.display());
+    }
+
+    // 5. Java & Kotlin / Android JNI Shared Library + Java/Kotlin Bindings
+    if has("java") || has("kotlin") || has("android") || has("jni") {
+        let jni_lib_stem = format!("{}_jni", mod_name);
+        let jni_c = export_dir.join(format!("{}.c", jni_lib_stem));
+        let java_src = export_dir.join(format!("{}.java", class_name));
+        let kt_src = export_dir.join(format!("{}.kt", class_name));
+        fs::write(&jni_c, tenon_codegen::polyglot::emit_jni_c_bridge(prog, "", &class_name))
+            .map_err(|e| e.to_string())?;
+        fs::write(
+            &java_src,
+            tenon_codegen::polyglot::emit_java_bindings(prog, "", &class_name, &jni_lib_stem),
+        )
+        .map_err(|e| e.to_string())?;
+        fs::write(
+            &kt_src,
+            tenon_codegen::bindings::emit_kotlin_bindings(prog, "com.tenon.generated"),
+        )
+        .map_err(|e| e.to_string())?;
+
+        let jdk_incs = detect_jdk_include_dirs();
+        if !jdk_incs.is_empty() {
+            let dylib_ext = if is_macos { "dylib" } else { "so" };
+            let jni_lib = export_dir.join(format!("lib{}.{}", jni_lib_stem, dylib_ext));
+            let mut cmd = std::process::Command::new("clang");
+            cmd.args([opt_flag, "-shared", "-fPIC"]);
+            for d in &jdk_incs {
+                cmd.arg(format!("-I{}", d.display()));
+            }
+            cmd.args([
+                jni_c.to_str().unwrap(),
+                static_lib_path.to_str().unwrap(),
+                "-o",
+                jni_lib.to_str().unwrap(),
+            ]);
+            let out = cmd.output().map_err(|e| format!("clang JNI build failed: {}", e))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "Java/Kotlin JNI library build failed:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            let sz = fs::metadata(&jni_lib).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "  [jni]    `{}` ({} bytes) + `{}` + `{}`",
+                jni_lib.display(),
+                sz,
+                java_src.display(),
+                kt_src.display()
+            );
+        } else {
+            println!(
+                "  [jni]    emitted `{}` + `{}` + `{}` (set JAVA_HOME to compile JNI library)",
+                jni_c.display(),
+                java_src.display(),
+                kt_src.display()
+            );
+        }
+    }
+
+    // 6. C++17 RAII Header
+    if has("cpp") || has("c++") || has("cxx") {
+        let hpp = export_dir.join(format!("{}.hpp", mod_name));
+        fs::write(&hpp, tenon_codegen::polyglot::emit_cpp_header(prog, &mod_name))
+            .map_err(|e| e.to_string())?;
+        println!("  [cpp]    `{}`", hpp.display());
+    }
+
+    // 7. Safe Rust Wrapper
+    if has("rust") || has("rs") {
+        let rs = export_dir.join(format!("{}.rs", mod_name));
+        fs::write(&rs, tenon_codegen::polyglot::emit_rust_bindings(prog, &mod_name))
+            .map_err(|e| e.to_string())?;
+        println!("  [rust]   `{}`", rs.display());
+    }
+
+    // 8. Zig Wrapper
+    if has("zig") {
+        let zg = export_dir.join(format!("{}.zig", mod_name));
+        fs::write(&zg, tenon_codegen::polyglot::emit_zig_bindings(prog))
+            .map_err(|e| e.to_string())?;
+        println!("  [zig]    `{}`", zg.display());
+    }
+
+    // 9. Go cgo Bindings
+    if has("go") || has("golang") {
+        let go_f = export_dir.join(format!("{}.go", mod_name));
+        fs::write(
+            &go_f,
+            tenon_codegen::bindings::emit_go_cgo_bindings(
+                prog,
+                &mod_name,
+                &format!("{}.h", mod_name),
+                &mod_name,
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+        println!("  [go]     `{}`", go_f.display());
+    }
+
+    Ok(())
+}
+
 fn cmd_build_aot(args: &[String]) -> ExitCode {
     let mut file_arg: Option<String> = None;
     let mut out_bin = "target/tenon_out".to_string();
@@ -1598,6 +1960,17 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     let mut emit_swift: Option<PathBuf> = None;
     let mut emit_kotlin: Option<PathBuf> = None;
     let mut emit_go: Option<PathBuf> = None;
+    let mut emit_python: Option<PathBuf> = None;
+    let mut emit_napi: Option<PathBuf> = None;
+    let mut emit_cpp: Option<PathBuf> = None;
+    let mut emit_jni: Option<PathBuf> = None;
+    let mut emit_java: Option<PathBuf> = None;
+    let mut emit_rust: Option<PathBuf> = None;
+    let mut emit_zig: Option<PathBuf> = None;
+    let mut emit_modulemap: Option<PathBuf> = None;
+    let mut export_langs: Option<String> = None;
+    let mut export_dir: Option<PathBuf> = None;
+    let mut target_spec: Option<String> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -1658,6 +2031,46 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 emit_go = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--emit-python" if i + 1 < args.len() => {
+                emit_python = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-napi" if i + 1 < args.len() => {
+                emit_napi = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-cpp" if i + 1 < args.len() => {
+                emit_cpp = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-jni" if i + 1 < args.len() => {
+                emit_jni = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-java" if i + 1 < args.len() => {
+                emit_java = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-rust" if i + 1 < args.len() => {
+                emit_rust = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-zig" if i + 1 < args.len() => {
+                emit_zig = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-modulemap" if i + 1 < args.len() => {
+                emit_modulemap = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--export" if i + 1 < args.len() => {
+                export_langs = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--export-dir" if i + 1 < args.len() => {
+                export_dir = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
             "--opt" if i + 1 < args.len() => {
                 opts.opt_level = args[i + 1].clone();
                 i += 2;
@@ -1666,8 +2079,9 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 opts.output_kind = match args[i + 1].as_str() {
                     "static" => tenon_codegen::llvm_aot::OutputKind::StaticLib,
                     "shared" | "dylib" | "so" => tenon_codegen::llvm_aot::OutputKind::SharedLib,
+                    "obj" | "object" => tenon_codegen::llvm_aot::OutputKind::Object,
                     other => {
-                        eprintln!("unknown --lib kind `{}` (expected `static` or `shared`)", other);
+                        eprintln!("unknown --lib kind `{}` (expected `static`, `shared`, or `obj`)", other);
                         return ExitCode::from(2);
                     }
                 };
@@ -1682,7 +2096,15 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 i += 1;
             }
             "--target" if i + 1 < args.len() => {
-                opts.target_triple = Some(args[i + 1].clone());
+                target_spec = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--sysroot" if i + 1 < args.len() => {
+                opts.sysroot = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--linker" if i + 1 < args.len() => {
+                opts.linker = Some(args[i + 1].clone());
                 i += 2;
             }
             "-l" if i + 1 < args.len() => {
@@ -1717,10 +2139,31 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     }
     let Some(file) = file_arg else {
         eprintln!(
-            "usage: tenon build <file.tn> [-o <out>] [--opt O3] [--lib static|shared] [--emit-header <h>] [--emit-llvm <ll>] [-g] [-l <lib>] [-L <dir>] [--c-src <c>]"
+            "usage: tenon build <file.tn> [-o <out>] [--opt O3] [--target <name|triple|json>] [--lib static|shared|obj] [--export python|node|swift|java|kotlin|cpp|rust|zig|go|all] [--export-dir <dir>] [-g]"
         );
         return ExitCode::from(2);
     };
+
+    if let Some(tspec) = &target_spec {
+        match tenon_codegen::targets::resolve_target(tspec) {
+            Ok(rt) => {
+                opts.target_triple = Some(rt.llvm_target.clone());
+                opts.resolved_target = Some(rt);
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if opts.output_kind == tenon_codegen::llvm_aot::OutputKind::Executable
+        && Path::new(&out_bin)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "o" || e == "obj")
+    {
+        opts.output_kind = tenon_codegen::llvm_aot::OutputKind::Object;
+    }
 
     let prog = match load_and_parse(&file) {
         Ok(p) => p,
@@ -1741,6 +2184,13 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    let mod_stem = Path::new(&file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tenon_mod")
+        .to_string();
+    let class_name = to_pascal_case(&mod_stem);
+
     if let Some(p) = &emit_ts {
         let _ = fs::write(p, tenon_codegen::bindings::emit_typescript_bindings(&prog));
         println!("Emitted TypeScript bindings -> `{}`", p.display());
@@ -1755,12 +2205,61 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         println!("Emitted Wasm32 ESM Auto-Bridge -> `{}`", p.display());
     }
     if let Some(p) = &emit_swift {
-        let _ = fs::write(p, tenon_codegen::bindings::emit_swift_bindings(&prog));
-        println!("Emitted Swift C-ABI bindings -> `{}`", p.display());
+        let _ = fs::write(p, tenon_codegen::polyglot::emit_swift_rich_bindings(&prog));
+        println!("Emitted Swift 6 Native Bridge -> `{}`", p.display());
+    }
+    if let Some(p) = &emit_modulemap {
+        let hdr = opts
+            .emit_header_path
+            .as_ref()
+            .and_then(|h| h.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{}.h", mod_stem));
+        let _ = fs::write(p, tenon_codegen::polyglot::emit_swift_modulemap(&mod_stem, &hdr));
+        println!("Emitted Swift module.modulemap -> `{}`", p.display());
     }
     if let Some(p) = &emit_kotlin {
         let _ = fs::write(p, tenon_codegen::bindings::emit_kotlin_bindings(&prog, "com.tenon.generated"));
         println!("Emitted Kotlin bindings -> `{}`", p.display());
+    }
+    if let Some(p) = &emit_java {
+        let _ = fs::write(
+            p,
+            tenon_codegen::polyglot::emit_java_bindings(&prog, "", &class_name, &format!("{}_jni", mod_stem)),
+        );
+        println!("Emitted Java JNI class -> `{}`", p.display());
+    }
+    if let Some(p) = &emit_jni {
+        let _ = fs::write(p, tenon_codegen::polyglot::emit_jni_c_bridge(&prog, "", &class_name));
+        println!("Emitted JNI C glue -> `{}`", p.display());
+    }
+    if let Some(p) = &emit_cpp {
+        let _ = fs::write(p, tenon_codegen::polyglot::emit_cpp_header(&prog, &mod_stem));
+        println!("Emitted C++17 RAII header -> `{}`", p.display());
+    }
+    if let Some(p) = &emit_rust {
+        let _ = fs::write(p, tenon_codegen::polyglot::emit_rust_bindings(&prog, &mod_stem));
+        println!("Emitted Safe Rust bindings -> `{}`", p.display());
+    }
+    if let Some(p) = &emit_zig {
+        let _ = fs::write(p, tenon_codegen::polyglot::emit_zig_bindings(&prog));
+        println!("Emitted Zig FFI bindings -> `{}`", p.display());
+    }
+    if let Some(dir) = &emit_python {
+        let _ = fs::create_dir_all(dir);
+        let c_p = dir.join(format!("{}_pyext.c", mod_stem));
+        let i_p = dir.join(format!("{}.pyi", mod_stem));
+        let _ = fs::write(&c_p, tenon_codegen::polyglot::emit_python_c_ext(&prog, &mod_stem));
+        let _ = fs::write(&i_p, tenon_codegen::polyglot::emit_python_pyi(&prog, &mod_stem));
+        println!("Emitted Python C-API extension -> `{}` + `{}`", c_p.display(), i_p.display());
+    }
+    if let Some(dir) = &emit_napi {
+        let _ = fs::create_dir_all(dir);
+        let c_p = dir.join(format!("{}_napi.c", mod_stem));
+        let d_p = dir.join(format!("{}.d.ts", mod_stem));
+        let _ = fs::write(&c_p, tenon_codegen::polyglot::emit_napi_c_addon(&prog, &mod_stem));
+        let _ = fs::write(&d_p, tenon_codegen::polyglot::emit_napi_dts(&prog, &mod_stem));
+        println!("Emitted Node-API v8 addon -> `{}` + `{}`", c_p.display(), d_p.display());
     }
     if let Some(p) = &emit_go {
         let hdr = opts
@@ -1782,6 +2281,28 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     opts.apply_verified_mir(&report.mir);
     let ssa_mir = tenon_mir::lower_program_to_ssa_mir(&prog, &report.mir);
     opts.apply_ssa_mir(&ssa_mir);
+
+    if let Some(exp_spec) = &export_langs {
+        let out_dir = export_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("target/export_{}", mod_stem)));
+        println!(
+            "Polyglot Export `{}` ({} proofs verified) -> `{}`:",
+            file,
+            report.proofs.len(),
+            out_dir.display()
+        );
+        return match run_polyglot_export(&prog, &file, exp_spec, &out_dir, &opts) {
+            Ok(()) => {
+                println!("Polyglot Export Complete (all targets share deterministic Perceus RC, live_objects == 0).");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Polyglot export failed: {}", e);
+                ExitCode::from(1)
+            }
+        };
+    }
     if let Some(p) = &emit_mir {
         if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1841,11 +2362,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         let _ = fs::write(p, &mjs);
         println!("Emitted Browser WebGPU ESM Host ({} bytes) -> `{}`", mjs.len(), p.display());
     }
-    if opts
-        .target_triple
-        .as_deref()
-        .is_some_and(|t| t == "wasm32" || t == "wasm32-wasip2" || t == "wasi")
-    {
+    if opts.resolved_target.as_ref().is_some_and(|t| t.is_wasm()) {
         if tenon_codegen::wasm_llvm::has_llvm_wasm32_toolchain() {
             return match tenon_codegen::wasm_llvm::compile_program_to_wasm32_llvm(
                 &prog,
@@ -1893,9 +2410,15 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 tenon_codegen::llvm_aot::OutputKind::Executable => "native binary",
                 tenon_codegen::llvm_aot::OutputKind::StaticLib => "static library",
                 tenon_codegen::llvm_aot::OutputKind::SharedLib => "shared library",
+                tenon_codegen::llvm_aot::OutputKind::Object => "relocatable object",
             };
+            let target_info = opts
+                .resolved_target
+                .as_ref()
+                .map(|rt| format!(", target={}{}", rt.llvm_target, if rt.freestanding { " [freestanding]" } else { "" }))
+                .unwrap_or_default();
             println!(
-                "LLVM AOT Built `{}` -> `{}` ({} bytes {}, {} bytes LLVM IR, opt={}, debug={}, {} proofs verified, {} bounds checks eliminated, {} overflow-free ops)",
+                "LLVM AOT Built `{}` -> `{}` ({} bytes {}, {} bytes LLVM IR, opt={}, debug={}{}, {} proofs verified, {} bounds checks eliminated, {} overflow-free ops)",
                 file,
                 art.output_path,
                 art.binary_bytes,
@@ -1903,6 +2426,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 art.llvm_ir_bytes,
                 art.opt_level,
                 opts.debug_info,
+                target_info,
                 report.proofs.len(),
                 report.mir.proved_safe_indices.len(),
                 report.mir.proved_no_overflow.len()
@@ -1999,31 +2523,374 @@ fn map_c_type_to_tenon(raw: &str) -> String {
     }
 }
 
-/// Automatic C `.h` header importer (`tenon bindgen <header.h> [-o <out.tn>]`):
-/// translates C `struct` layouts into `@repr(C)` Tenon records and C prototypes into `extern "C"` blocks!
+fn sanitize_tenon_param(name: &str, idx: usize) -> String {
+    if name.is_empty()
+        || matches!(
+            name,
+            "fn" | "let" | "var" | "if" | "else" | "match" | "while" | "for" | "in" | "return"
+                | "record" | "enum" | "type" | "pub" | "import" | "impl" | "extern" | "unsafe"
+                | "true" | "false" | "and" | "or" | "not" | "as" | "is" | "where" | "self"
+        )
+    {
+        format!("arg{}", idx)
+    } else {
+        name.to_string()
+    }
+}
+
+fn map_clang_qual_type(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.contains("(*)") || trimmed.contains("(*)(") {
+        return "Ptr[CVoid]".into();
+    }
+    if let Some(br) = trimmed.find('[') {
+        let base = trimmed[..br].trim();
+        return format!("Ptr[{}]", map_clang_qual_type(base));
+    }
+    if trimmed == "const char *" || trimmed == "const char*" {
+        return "CStr".into();
+    }
+    map_c_type_to_tenon(trimmed)
+}
+
+fn try_bindgen_via_clang_ast(
+    hpath: &str,
+    include_dirs: &[String],
+    defines: &[String],
+    link_lib: Option<&str>,
+    sysroot: Option<&str>,
+) -> Result<(String, usize, usize, usize), String> {
+    let mut cmd = std::process::Command::new("clang");
+    cmd.args(["-x", "c", "-Xclang", "-ast-dump=json", "-fsyntax-only", "-Wno-everything"]);
+    if let Some(sr) = sysroot {
+        cmd.args(["-isysroot", sr]);
+    } else if cfg!(target_os = "macos") {
+        if let Ok(sdk) = std::process::Command::new("xcrun").arg("--show-sdk-path").output() {
+            if sdk.status.success() {
+                let p = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
+                if !p.is_empty() {
+                    cmd.args(["-isysroot", &p]);
+                }
+            }
+        }
+    }
+    for inc in include_dirs {
+        cmd.arg(format!("-I{}", inc));
+    }
+    for def in defines {
+        cmd.arg(format!("-D{}", def));
+    }
+    cmd.arg(hpath);
+    let out = cmd.output().map_err(|e| format!("failed to run clang: {}", e))?;
+    if out.stdout.is_empty() {
+        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+    }
+    let root: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("invalid clang AST JSON: {}", e))?;
+    let Some(inner) = root.get("inner").and_then(|v| v.as_array()) else {
+        return Err("clang AST JSON missing top-level `inner` array".into());
+    };
+
+    let target_canon = fs::canonicalize(hpath)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| hpath.to_string());
+    let target_base = Path::new(hpath)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(hpath)
+        .to_string();
+
+    let mut cur_file = String::new();
+    let mut seen_structs = std::collections::BTreeSet::new();
+    let mut seen_enums = std::collections::BTreeSet::new();
+    let mut seen_fns = std::collections::BTreeSet::new();
+    let mut consts: Vec<String> = Vec::new();
+    let mut records: Vec<String> = Vec::new();
+    let mut extern_fns: Vec<String> = Vec::new();
+
+    for node in inner {
+        if let Some(f) = node
+            .get("loc")
+            .and_then(|l| l.get("file").or_else(|| l.get("expansionLoc").and_then(|e| e.get("file"))))
+            .and_then(|v| v.as_str())
+        {
+            cur_file = f.to_string();
+        }
+        let in_target = cur_file == hpath
+            || cur_file == target_canon
+            || Path::new(&cur_file)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == target_base);
+        if !in_target {
+            continue;
+        }
+        let kind = node.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        match kind {
+            "EnumDecl" => {
+                if let Some(items) = node.get("inner").and_then(|v| v.as_array()) {
+                    let mut next_val: i64 = 0;
+                    for ec in items {
+                        if ec.get("kind").and_then(|k| k.as_str()) == Some("EnumConstantDecl") {
+                            if let Some(ename) = ec.get("name").and_then(|n| n.as_str()) {
+                                if let Some(val) = ec
+                                    .get("inner")
+                                    .and_then(|a| a.as_array())
+                                    .and_then(|a| a.first())
+                                    .and_then(|x| {
+                                        x.get("value")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<i64>().ok())
+                                            .or_else(|| {
+                                                x.get("inner")
+                                                    .and_then(|b| b.as_array())
+                                                    .and_then(|b| b.first())
+                                                    .and_then(|y| y.get("value"))
+                                                    .and_then(|v| v.as_str())
+                                                    .and_then(|s| s.parse::<i64>().ok())
+                                            })
+                                    })
+                                {
+                                    next_val = val;
+                                }
+                                if seen_enums.insert(ename.to_string()) {
+                                    consts.push(format!("pub const {} Int = {}", ename, next_val));
+                                }
+                                next_val += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            "RecordDecl" => {
+                let tag_used = node.get("tagUsed").and_then(|t| t.as_str()).unwrap_or("struct");
+                if tag_used != "struct" {
+                    continue;
+                }
+                let Some(sname) = node.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                if sname.is_empty() || sname.starts_with('_') {
+                    continue;
+                }
+                let Some(fields_arr) = node.get("inner").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                let mut fields = Vec::new();
+                for fd in fields_arr {
+                    if fd.get("kind").and_then(|k| k.as_str()) == Some("FieldDecl") {
+                        if let Some(fname) = fd.get("name").and_then(|n| n.as_str()) {
+                            let qt = fd
+                                .get("type")
+                                .and_then(|t| t.get("desugaredQualType").or_else(|| t.get("qualType")))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("int64_t");
+                            fields.push((sanitize_tenon_param(fname, fields.len()), map_clang_qual_type(qt)));
+                        }
+                    }
+                }
+                if !fields.is_empty() && seen_structs.insert(sname.to_string()) {
+                    let mut s = format!("@repr(C)\npub record {} {{\n", sname);
+                    for (fnm, fty) in fields {
+                        s.push_str(&format!("    {} {}\n", fnm, fty));
+                    }
+                    s.push_str("}\n");
+                    records.push(s);
+                }
+            }
+            "FunctionDecl" => {
+                let Some(fname) = node.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                if fname.is_empty() || fname.starts_with("__") || node.get("isImplicit").and_then(|b| b.as_bool()) == Some(true) {
+                    continue;
+                }
+                if node.get("storageClass").and_then(|s| s.as_str()) == Some("static") {
+                    continue;
+                }
+                if !seen_fns.insert(fname.to_string()) {
+                    continue;
+                }
+                let sig_str = node
+                    .get("type")
+                    .and_then(|t| t.get("qualType"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("void ()");
+                let raw_ret = sig_str.split('(').next().unwrap_or("void").trim();
+                let tenon_ret = map_clang_qual_type(raw_ret);
+                let mut tparams = Vec::new();
+                if let Some(children) = node.get("inner").and_then(|v| v.as_array()) {
+                    for (pi, ch) in children.iter().enumerate() {
+                        if ch.get("kind").and_then(|k| k.as_str()) == Some("ParmVarDecl") {
+                            let pname = ch.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            let pqt = ch
+                                .get("type")
+                                .and_then(|t| t.get("desugaredQualType").or_else(|| t.get("qualType")))
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("int64_t");
+                            tparams.push(format!(
+                                "{} {}",
+                                sanitize_tenon_param(pname, pi),
+                                map_clang_qual_type(pqt)
+                            ));
+                        }
+                    }
+                }
+                if node.get("variadic").and_then(|b| b.as_bool()) == Some(true) {
+                    tparams.push("...".into());
+                }
+                let ret_part = if tenon_ret == "CVoid" {
+                    String::new()
+                } else {
+                    format!(" {}", tenon_ret)
+                };
+                extern_fns.push(format!("    pub fn {}({}){}", fname, tparams.join(", "), ret_part));
+            }
+            _ => {}
+        }
+    }
+
+    // Also harvest integer `#define` constants from the direct target header
+    if let Ok(raw_src) = fs::read_to_string(hpath) {
+        for line in raw_src.lines() {
+            if let Some(rest) = line.trim().strip_prefix("#define ") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() >= 2 && !parts[0].contains('(') && !parts[0].starts_with('_') {
+                    let raw_val = parts[1]
+                        .trim_matches(|c| c == '(' || c == ')')
+                        .trim_end_matches(|c| matches!(c, 'u' | 'U' | 'l' | 'L'));
+                    let parsed = if let Some(hex) = raw_val.strip_prefix("0x").or_else(|| raw_val.strip_prefix("0X")) {
+                        i64::from_str_radix(hex, 16).ok()
+                    } else {
+                        raw_val.parse::<i64>().ok()
+                    };
+                    if let Some(v) = parsed {
+                        if seen_enums.insert(parts[0].to_string()) {
+                            consts.push(format!("pub const {} Int = {}", parts[0], v));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut rendered = format!(
+        "// Auto-generated by `tenon bindgen` (Clang AST JSON) from `{}`\n\n",
+        hpath
+    );
+    for c in &consts {
+        rendered.push_str(c);
+        rendered.push('\n');
+    }
+    if !consts.is_empty() {
+        rendered.push('\n');
+    }
+    for r in &records {
+        rendered.push_str(r);
+        rendered.push('\n');
+    }
+    if !extern_fns.is_empty() {
+        if let Some(lib) = link_lib {
+            rendered.push_str(&format!("@link(\"{}\")\n", lib));
+        }
+        rendered.push_str("extern \"C\" {\n");
+        for ef in &extern_fns {
+            rendered.push_str(ef);
+            rendered.push('\n');
+        }
+        rendered.push_str("}\n");
+    }
+    Ok((rendered, records.len(), extern_fns.len(), consts.len()))
+}
+
+/// Industrial Clang AST JSON C `.h` header importer (`tenon bindgen <header.h> [-o <out.tn>] [-I <dir>] [-D <MACRO>] [--lib <name>]`):
+/// translates C structs/enums/constants/prototypes into `@repr(C)` Tenon records & `extern "C"` blocks!
 fn cmd_bindgen(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: tenon bindgen <header.h> [-o <out.tn>]");
+        eprintln!("usage: tenon bindgen <header.h> [-o <out.tn>] [-I <dir>] [-D <MACRO>] [--lib <name>] [--sysroot <dir>] [--no-clang]");
         return ExitCode::from(2);
     }
     let mut header_path: Option<String> = None;
     let mut out_path: Option<String> = None;
+    let mut include_dirs: Vec<String> = Vec::new();
+    let mut defines: Vec<String> = Vec::new();
+    let mut link_lib: Option<String> = None;
+    let mut sysroot: Option<String> = None;
+    let mut no_clang = false;
+
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "-o" && i + 1 < args.len() {
-            out_path = Some(args[i + 1].clone());
-            i += 2;
-        } else if header_path.is_none() {
-            header_path = Some(args[i].clone());
-            i += 1;
-        } else {
-            i += 1;
+        match args[i].as_str() {
+            "-o" if i + 1 < args.len() => {
+                out_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "-I" if i + 1 < args.len() => {
+                include_dirs.push(args[i + 1].clone());
+                i += 2;
+            }
+            "-D" if i + 1 < args.len() => {
+                defines.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--lib" if i + 1 < args.len() => {
+                link_lib = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--sysroot" if i + 1 < args.len() => {
+                sysroot = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--no-clang" => {
+                no_clang = true;
+                i += 1;
+            }
+            s if s.starts_with("-I") && s.len() > 2 => {
+                include_dirs.push(s[2..].to_string());
+                i += 1;
+            }
+            s if s.starts_with("-D") && s.len() > 2 => {
+                defines.push(s[2..].to_string());
+                i += 1;
+            }
+            s if !s.starts_with('-') && header_path.is_none() => {
+                header_path = Some(s.to_string());
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
     let Some(hpath) = header_path else {
-        eprintln!("usage: tenon bindgen <header.h> [-o <out.tn>]");
+        eprintln!("usage: tenon bindgen <header.h> [-o <out.tn>] [-I <dir>] [-D <MACRO>] [--lib <name>]");
         return ExitCode::from(2);
     };
+
+    if !no_clang {
+        if let Ok((rendered, nrec, nfn, nconst)) = try_bindgen_via_clang_ast(
+            &hpath,
+            &include_dirs,
+            &defines,
+            link_lib.as_deref(),
+            sysroot.as_deref(),
+        ) {
+            if nrec + nfn + nconst > 0 {
+                if let Some(op) = out_path {
+                    if let Err(e) = fs::write(&op, &rendered) {
+                        eprintln!("error: failed to write `{}`: {}", op, e);
+                        return ExitCode::from(1);
+                    }
+                    println!(
+                        "Generated Tenon C bindings via Clang AST ({} record(s), {} fn(s), {} const(s)) -> `{}`",
+                        nrec, nfn, nconst, op
+                    );
+                } else {
+                    print!("{}", rendered);
+                }
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
+
     let Ok(src) = fs::read_to_string(&hpath) else {
         eprintln!("error: failed to read C header `{}`", hpath);
         return ExitCode::from(1);
@@ -2179,12 +3046,185 @@ fn cmd_bindgen(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn default_registry_dir() -> PathBuf {
+    if let Ok(r) = std::env::var("TENON_REGISTRY") {
+        return PathBuf::from(r);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".tenon").join("registry")
+}
+
+fn fnv_hex_dir(dir: &Path) -> String {
+    let mut h1: u64 = 0xcbf29ce484222325;
+    let mut h2: u64 = 0x9e3779b97f4a7c15;
+    let mut stack = vec![dir.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(d) = stack.pop() {
+        if let Ok(rd) = fs::read_dir(&d) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    if p.file_name().and_then(|n| n.to_str()) != Some(".git") {
+                        stack.push(p);
+                    }
+                } else if p.extension().and_then(|e| e.to_str()).is_some_and(|e| e == "tn" || e == "toml") {
+                    files.push(p);
+                }
+            }
+        }
+    }
+    files.sort();
+    for f in files {
+        if let Ok(bytes) = fs::read(&f) {
+            for &b in &bytes {
+                h1 ^= b as u64;
+                h1 = h1.wrapping_mul(0x100000001b3);
+                h2 = h2.wrapping_mul(0xbf58476d1ce4e5b9) ^ (b as u64);
+            }
+        }
+    }
+    format!("{:016x}{:016x}", h1, h2)
+}
+
+fn copy_pkg_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for ent in fs::read_dir(src)? {
+        let ent = ent?;
+        let p = ent.path();
+        let name = ent.file_name();
+        if name == ".git" || name == "target" || name == ".tenon-cache" {
+            continue;
+        }
+        let target = dst.join(name);
+        if p.is_dir() {
+            copy_pkg_tree(&p, &target)?;
+        } else {
+            fs::copy(&p, &target)?;
+        }
+    }
+    Ok(())
+}
+
 fn cmd_pkg(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: tenon pkg <lock|verify|tree|add> [dir]");
+        eprintln!("usage: tenon pkg <init|lock|verify|tree|add|sync|publish|search|check> [dir]");
         return ExitCode::from(2);
     }
     match args[0].as_str() {
+        "init" => {
+            let dir = PathBuf::from(args.get(1).filter(|a| !a.starts_with('-')).map(|s| s.as_str()).unwrap_or("."));
+            let _ = fs::create_dir_all(&dir);
+            let name = args
+                .windows(2)
+                .find(|w| w[0] == "--name")
+                .map(|w| w[1].clone())
+                .unwrap_or_else(|| {
+                    dir.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("tenon_pkg")
+                        .to_string()
+                });
+            let toml = dir.join("tenon.toml");
+            if !toml.exists() {
+                let _ = fs::write(&toml, format!("[package]\nname = \"{}\"\nversion = \"0.1.0\"\n", name));
+            }
+            let lib = dir.join("lib.tn");
+            if !lib.exists() {
+                let _ = fs::write(&lib, "@export\npub fn pkg_version() Int { 1 }\n");
+            }
+            println!("Initialized Tenon package `{}` in `{}`", name, dir.display());
+            ExitCode::SUCCESS
+        }
+        "publish" => {
+            let dir = PathBuf::from(args.get(1).filter(|a| !a.starts_with('-')).map(|s| s.as_str()).unwrap_or("."));
+            let reg = args
+                .windows(2)
+                .find(|w| w[0] == "--registry")
+                .map(|w| PathBuf::from(&w[1]))
+                .unwrap_or_else(default_registry_dir);
+            let toml_path = dir.join("tenon.toml");
+            let Ok(toml_src) = fs::read_to_string(&toml_path) else {
+                eprintln!("error: missing `{}`", toml_path.display());
+                return ExitCode::from(1);
+            };
+            let mut pkg_name = String::new();
+            let mut pkg_ver = "0.1.0".to_string();
+            for line in toml_src.lines() {
+                let t = line.trim();
+                if let Some(v) = t.strip_prefix("name =") {
+                    pkg_name = v.trim().trim_matches('"').to_string();
+                } else if let Some(v) = t.strip_prefix("version =") {
+                    pkg_ver = v.trim().trim_matches('"').to_string();
+                }
+            }
+            if pkg_name.is_empty() {
+                eprintln!("error: `tenon.toml` missing package `name`");
+                return ExitCode::from(1);
+            }
+            let digest = fnv_hex_dir(&dir);
+            let pkg_dst = reg.join("packages").join(&pkg_name).join(&pkg_ver);
+            if let Err(e) = copy_pkg_tree(&dir, &pkg_dst) {
+                eprintln!("error: failed to publish package files: {}", e);
+                return ExitCode::from(1);
+            }
+            let idx_path = reg.join("index.json");
+            let mut entries: Vec<serde_json::Value> = fs::read_to_string(&idx_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            entries.retain(|e| {
+                !(e.get("name").and_then(|v| v.as_str()) == Some(pkg_name.as_str())
+                    && e.get("version").and_then(|v| v.as_str()) == Some(pkg_ver.as_str()))
+            });
+            entries.push(serde_json::json!({
+                "name": pkg_name,
+                "version": pkg_ver,
+                "digest": digest,
+                "path": pkg_dst.display().to_string(),
+            }));
+            let _ = fs::create_dir_all(&reg);
+            let _ = fs::write(&idx_path, serde_json::to_string_pretty(&entries).unwrap());
+            println!(
+                "Published `{}@{}` (digest={}) -> `{}`",
+                pkg_name,
+                pkg_ver,
+                &digest[..16],
+                pkg_dst.display()
+            );
+            ExitCode::SUCCESS
+        }
+        "search" => {
+            let query = args
+                .get(1)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            let reg = args
+                .windows(2)
+                .find(|w| w[0] == "--registry")
+                .map(|w| PathBuf::from(&w[1]))
+                .unwrap_or_else(default_registry_dir);
+            let idx_path = reg.join("index.json");
+            let entries: Vec<serde_json::Value> = fs::read_to_string(&idx_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let mut found = 0usize;
+            for e in entries {
+                let nm = e.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let ver = e.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                let dig = e.get("digest").and_then(|v| v.as_str()).unwrap_or("");
+                let pth = e.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                if query.is_empty() || nm.to_ascii_lowercase().contains(&query) {
+                    println!("  {:<24} {:<10} digest={}  path={}", nm, ver, &dig[..dig.len().min(16)], pth);
+                    found += 1;
+                }
+            }
+            if found == 0 {
+                println!("No packages matching `{}` in registry `{}`.", query, reg.display());
+            }
+            ExitCode::SUCCESS
+        }
         "lock" => {
             let dir = PathBuf::from(args.get(1).map(|s| s.as_str()).unwrap_or("."));
             match tenon_syntax::generate_lockfile(&dir) {
