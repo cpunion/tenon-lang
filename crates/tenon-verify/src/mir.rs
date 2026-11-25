@@ -662,10 +662,11 @@ fn check_fip_expr(
     }
 }
 
-/// Identifies local immutable `let x = Rec { ... }` bindings whose record type contains only
-/// scalar (non-RC) fields and whose ONLY uses in `f.body` are field reads `x.field`.
+/// Identifies local `let`/`var x = Rec { ... }` bindings whose record type contains only
+/// scalar (non-RC) fields and whose ONLY uses in `f.body` are field reads `x.field` or
+/// in-place scalar field writes `x.field = ...`.
 /// Such locals are 100% sound to promote directly onto the LLVM stack (`alloca`), eliminating
-/// heap allocation, `rc_inc`/`rc_dec`, and enabling LLVM SROA into CPU registers.
+/// heap allocation, `rc_inc`/`rc_dec`, and enabling LLVM SROA into CPU registers!
 pub fn compute_stack_promotable_vars(
     f: &FnDecl,
     non_escaping: &BTreeSet<String>,
@@ -687,8 +688,8 @@ fn collect_stack_candidates(
 ) {
     for s in &blk.stmts {
         match s {
-            Stmt::Let { name, is_mut, value, .. } => {
-                if !is_mut && non_escaping.contains(name) {
+            Stmt::Let { name, value, .. } => {
+                if non_escaping.contains(name) {
                     if let ExprKind::RecordLit { name: rname, .. } = &value.kind {
                         if scalar_only_records.contains(rname) {
                             if !candidates.insert(name.clone()) {
@@ -704,12 +705,9 @@ fn collect_stack_candidates(
                 }
             }
             Stmt::Assign { target, .. } => {
+                // Whole-record reassignment (`x = ...`) disqualifies; in-place scalar field mutation (`x.f = ...`) is 100% stack-safe!
                 if let ExprKind::Ident(n) = &target.kind {
                     disqualified.insert(n.clone());
-                } else if let ExprKind::Field { target: obj, .. } = &target.kind {
-                    if let ExprKind::Ident(n) = &obj.kind {
-                        disqualified.insert(n.clone());
-                    }
                 }
             }
             Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {

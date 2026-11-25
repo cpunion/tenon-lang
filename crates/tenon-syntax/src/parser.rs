@@ -2780,12 +2780,20 @@ impl Parser {
 
     fn parse_add(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_mul()?;
-        while let Some(op) = match self.peek().kind {
-            TokenKind::Plus => Some(BinOp::Add),
-            TokenKind::Minus => Some(BinOp::Sub),
-            TokenKind::PlusPlus => Some(BinOp::Concat),
-            _ => None,
-        } {
+        loop {
+            let op_opt = match self.peek().kind {
+                TokenKind::Plus => Some(BinOp::Add),
+                TokenKind::Minus => Some(BinOp::Sub),
+                TokenKind::PlusPlus => Some(BinOp::Concat),
+                TokenKind::Newline if self.peek_ahead_non_nl(0).kind == TokenKind::PlusPlus => {
+                    self.skip_newlines();
+                    Some(BinOp::Concat)
+                }
+                _ => None,
+            };
+            let Some(op) = op_opt else {
+                break;
+            };
             self.bump();
             self.skip_newlines();
             let right = self.parse_mul()?;

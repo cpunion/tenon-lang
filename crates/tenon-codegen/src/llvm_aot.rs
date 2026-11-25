@@ -148,6 +148,8 @@ fn ir_uses_sync_runtime(ir: &str) -> bool {
         || ir.contains("call i64 @tenon_atomic_")
         || ir.contains("call i64 @tenon_mutex_")
         || ir.contains("call i64 @tenon_chan_")
+        || ir.contains("@tenon_sched_")
+        || ir.contains("@tenon_preempt_flag")
 }
 
 fn ir_uses_net_runtime(ir: &str) -> bool {
@@ -1397,6 +1399,10 @@ pub fn emit_llvm_ir_with_build_options(
     ir.push_str("declare i64 @tenon_async_block_on(i64)\n");
     ir.push_str("declare i64 @tenon_cstruct_alloc(i64)\n");
     ir.push_str("declare i64 @tenon_cstruct_data_ptr(i64)\n");
+    if fn_defs.contains("@tenon_preempt_flag") {
+        ir.push_str("@tenon_preempt_flag = external global i32\n");
+        ir.push_str("declare void @tenon_sched_preempt_point() cold\n");
+    }
     for spec in CORE_SYSCALLS {
         let params = vec!["i64"; spec.arity].join(", ");
         ir.push_str(&format!("declare i64 @{}({})\n", spec.c_symbol, params));
@@ -1593,6 +1599,7 @@ struct LlvmFnGen<'a> {
     fn_returns_rc: bool,
     fn_ret_ty: Option<TypeExpr>,
     self_var: Option<String>,
+    cur_fn_preemptible: bool,
     terminated: bool,
 }
 
@@ -1671,6 +1678,7 @@ impl<'a> LlvmFnGen<'a> {
             fn_returns_rc: false,
             fn_ret_ty: None,
             self_var: None,
+            cur_fn_preemptible: false,
             terminated: false,
         }
     }
@@ -4063,6 +4071,8 @@ impl<'a> LlvmFnGen<'a> {
             .get(&f.name)
             .cloned()
             .unwrap_or_default();
+        self.cur_fn_preemptible = f.attrs.iter().any(|a| a.name == "preemptible")
+            || f.name.starts_with("__closure_");
         if f.attrs.iter().any(|a| a.name == "arena") {
             let am = self.fresh_tmp();
             self.code
@@ -4834,22 +4844,31 @@ impl<'a> LlvmFnGen<'a> {
                                         .push_str(&format!("  {} = load i64, ptr {}\n", val, slot));
                                     val
                                 };
-                                let uniq = self.fresh_tmp();
-                                self.code.push_str(&format!(
-                                    "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
-                                    uniq, cur_h
-                                ));
-                                if is_inout {
-                                    let addr_i = self.fresh_tmp();
-                                    let addr_p = self.fresh_tmp();
-                                    self.code.push_str(&format!(
-                                        "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
-                                        addr_i, slot, addr_p, addr_i, uniq, addr_p
-                                    ));
+                                let is_always_uniq = self.always_unique_vars.contains(vname)
+                                    || self.cur_stack_promotable.contains(vname);
+                                let uniq = if is_always_uniq {
+                                    cur_h
                                 } else {
-                                    self.code
-                                        .push_str(&format!("  store i64 {}, ptr {}\n", uniq, slot));
-                                }
+                                    let u = self.fresh_tmp();
+                                    self.code.push_str(&format!(
+                                        "  {} = call i64 @__tn_rc_ensure_unique(i64 {})\n",
+                                        u, cur_h
+                                    ));
+                                    if is_inout {
+                                        let addr_i = self.fresh_tmp();
+                                        let addr_p = self.fresh_tmp();
+                                        self.code.push_str(&format!(
+                                            "  {} = load i64, ptr {}\n  {} = inttoptr i64 {} to ptr\n  store i64 {}, ptr {}\n",
+                                            addr_i, slot, addr_p, addr_i, u, addr_p
+                                        ));
+                                    } else {
+                                        self.code.push_str(&format!(
+                                            "  store i64 {}, ptr {}\n",
+                                            u, slot
+                                        ));
+                                    }
+                                    u
+                                };
                                 let sk = field_ty.and_then(|t| scalar_kind_of_ty(t, self.alias_bases));
                                 let is_flt = field_ty
                                     .is_some_and(|t| is_float_type_expr(t, self.alias_bases))
@@ -5389,7 +5408,17 @@ impl<'a> LlvmFnGen<'a> {
                     let _ = self.lower_block(body, false, None)?;
                     self.loop_stack.pop();
                     if !self.terminated {
-                        self.code.push_str(&format!("  br label %{}\n", hdr));
+                        if self.cur_fn_preemptible {
+                            let pf = self.fresh_tmp();
+                            let need = self.fresh_tmp();
+                            let pslow = self.fresh_lbl("preempt_slow");
+                            self.code.push_str(&format!(
+                                "  {} = load atomic i32, ptr @tenon_preempt_flag monotonic, align 4\n  {} = icmp ne i32 {}, 0\n  br i1 {}, label %{}, label %{}\n{}:\n  call void @tenon_sched_preempt_point()\n  br label %{}\n",
+                                pf, need, pf, need, pslow, hdr, pslow, hdr
+                            ));
+                        } else {
+                            self.code.push_str(&format!("  br label %{}\n", hdr));
+                        }
                     }
                     self.terminated = false;
                     self.code.push_str(&format!("{}:\n", ex));

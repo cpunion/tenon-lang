@@ -527,6 +527,10 @@ impl L0Env {
                 let k = resolve_self(s, self_var);
                 self.floats.get(&k).copied()
             }
+            ExprKind::Field { .. } => {
+                let k = expr_var_name(expr, self_var)?;
+                self.floats.get(&k).copied()
+            }
             ExprKind::Old(inner) => {
                 let k = expr_var_name(expr, self_var)?;
                 self.floats.get(&k).copied().or_else(|| self.eval_abs_float(inner, self_var))

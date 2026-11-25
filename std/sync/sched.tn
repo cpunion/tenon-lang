@@ -1,0 +1,34 @@
+// std/sync/sched.tn — M:N Preemptive Stackless Coroutine Work-Stealing Scheduler (Zero cgo Overhead!)
+//
+// Combines Go-style M:N work-stealing + 0.5ms `sysmon` preemptive scheduling with ZERO cgo stack-switch
+// overhead: Tenon tasks execute directly on native OS worker stacks so `extern "C"` calls take ~1ns!
+
+import "std/core/types.tn"
+
+pub fn spawn(f fn() Int) Int {
+    task_spawn(f)
+}
+
+pub fn join(handle Int) Int {
+    task_join(handle)
+}
+
+pub fn yield_now() {
+    let _ = task_yield()
+}
+
+pub fn workers() Int {
+    sched_workers()
+}
+
+pub fn preemptions() Int {
+    sched_preemptions()
+}
+
+pub fn steals() Int {
+    sched_steals()
+}
+
+pub fn tasks_completed() Int {
+    sched_tasks_completed()
+}

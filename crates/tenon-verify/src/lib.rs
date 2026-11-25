@@ -2562,4 +2562,54 @@ pub pure fn accept_fp16_pos_and_named(a Matrix[4, 8, Float16], b Matrix[4, 8, DT
             rep_reshape.diagnostics
         );
     }
+
+    #[test]
+    fn verifies_mutable_stack_promotion_and_float_field_refinement() {
+        let src = r#"
+pub type PosFloat = Float where self > 0.0
+
+pub record Vec3 {
+    x Int
+    y Int
+    z Int
+}
+
+pub record Scaler {
+    scale PosFloat
+    factor PosFloat
+}
+
+pub pure fn mut_record_unboxed(n Int) Int {
+    var p = Vec3 { x = 1, y = 2, z = 3 }
+    var i = 0
+    while i < n {
+        p.x = p.x + p.y
+        p.y = p.y + 1
+        p.z = p.z + p.x
+        i += 1
+    }
+    p.x + p.y + p.z
+}
+
+pub pure fn scaler_step(s Scaler) PosFloat {
+    s.scale * s.factor
+}
+"#;
+        let rep = check_program(&parse(src).unwrap());
+        assert!(
+            rep.ok,
+            "expected mutable record & float field refinement to verify cleanly: {:?}",
+            rep.diagnostics
+        );
+        let promoted = rep
+            .mir
+            .stack_promotable_vars
+            .get("mut_record_unboxed")
+            .expect("mut_record_unboxed should have stack_promotable_vars");
+        assert!(
+            promoted.contains("p"),
+            "expected mutable non-escaping scalar record `p` to be stack-promoted, got {:?}",
+            promoted
+        );
+    }
 }

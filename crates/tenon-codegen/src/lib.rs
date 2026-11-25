@@ -157,6 +157,13 @@ pub(crate) const CORE_SYSCALLS: &[CoreSyscallSpec] = &[
     CoreSyscallSpec { tenon_name: "thread_join", c_symbol: "tenon_thread_join", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     CoreSyscallSpec { tenon_name: "thread_sleep_ms", c_symbol: "tenon_thread_sleep_ms", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     CoreSyscallSpec { tenon_name: "thread_hw_concurrency", c_symbol: "tenon_thread_hw_concurrency", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "task_spawn", c_symbol: "tenon_sched_spawn", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "task_join", c_symbol: "tenon_sched_join", arity: 1, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "task_yield", c_symbol: "tenon_sched_yield", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "sched_workers", c_symbol: "tenon_sched_workers", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "sched_preemptions", c_symbol: "tenon_sched_preemptions", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "sched_steals", c_symbol: "tenon_sched_steals", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
+    CoreSyscallSpec { tenon_name: "sched_tasks_completed", c_symbol: "tenon_sched_tasks_completed", arity: 0, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     CoreSyscallSpec { tenon_name: "atomic_new", c_symbol: "tenon_atomic_new", arity: 1, returns_rc: true, returns_text: false, returns_float: false, ret_ty: "AtomicInt" },
     CoreSyscallSpec { tenon_name: "atomic_load", c_symbol: "tenon_atomic_load", arity: 2, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
     CoreSyscallSpec { tenon_name: "atomic_store", c_symbol: "tenon_atomic_store", arity: 3, returns_rc: false, returns_text: false, returns_float: false, ret_ty: "Int" },
@@ -535,6 +542,13 @@ impl JitProgram {
         jit_builder.symbol("tenon_thread_join", systems::tenon_thread_join as *const u8);
         jit_builder.symbol("tenon_thread_sleep_ms", systems::tenon_thread_sleep_ms as *const u8);
         jit_builder.symbol("tenon_thread_hw_concurrency", systems::tenon_thread_hw_concurrency as *const u8);
+        jit_builder.symbol("tenon_sched_spawn", systems::tenon_sched_spawn as *const u8);
+        jit_builder.symbol("tenon_sched_join", systems::tenon_sched_join as *const u8);
+        jit_builder.symbol("tenon_sched_yield", systems::tenon_sched_yield as *const u8);
+        jit_builder.symbol("tenon_sched_workers", systems::tenon_sched_workers as *const u8);
+        jit_builder.symbol("tenon_sched_preemptions", systems::tenon_sched_preemptions as *const u8);
+        jit_builder.symbol("tenon_sched_steals", systems::tenon_sched_steals as *const u8);
+        jit_builder.symbol("tenon_sched_tasks_completed", systems::tenon_sched_tasks_completed as *const u8);
         jit_builder.symbol("tenon_atomic_new", systems::tenon_atomic_new as *const u8);
         jit_builder.symbol("tenon_atomic_load", systems::tenon_atomic_load as *const u8);
         jit_builder.symbol("tenon_atomic_store", systems::tenon_atomic_store as *const u8);
@@ -5003,6 +5017,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             }
                         };
                         return Ok(out);
+                    }
+                    if fname == "null_ptr" && args.is_empty() {
+                        return Ok(self.builder.ins().iconst(types::I64, 0));
                     }
                     if fname == "ptr_is_null" && args.len() == 1 {
                         let mut temps = Vec::new();

@@ -50,6 +50,7 @@ async fn main() -> ExitCode {
         "doc" => cmd_doc(&args[2..]),
         "bench" => cmd_bench(&args[2..]),
         "fmt" => cmd_fmt(&args[2..]),
+        "bindgen" => cmd_bindgen(&args[2..]),
         "lsp" => lsp::run_lsp_stdio(),
         "-h" | "--help" | "help" => {
             print_usage();
@@ -1590,6 +1591,8 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     let mut emit_msl: Option<PathBuf> = None;
     let mut emit_wgsl: Option<PathBuf> = None;
     let mut emit_webgpu: Option<PathBuf> = None;
+    let mut emit_cuda: Option<PathBuf> = None;
+    let mut emit_spirv_glsl: Option<PathBuf> = None;
     let mut emit_ts: Option<PathBuf> = None;
     let mut emit_mjs: Option<PathBuf> = None;
     let mut emit_swift: Option<PathBuf> = None;
@@ -1621,6 +1624,14 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             }
             "--emit-webgpu" if i + 1 < args.len() => {
                 emit_webgpu = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-cuda" if i + 1 < args.len() => {
+                emit_cuda = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-spirv-glsl" if i + 1 < args.len() => {
+                emit_spirv_glsl = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--emit-header" if i + 1 < args.len() => {
@@ -1800,6 +1811,26 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         let _ = fs::write(p, &wgsl);
         println!("Emitted WebGPU WGSL ({} bytes) -> `{}`", wgsl.len(), p.display());
     }
+    if let Some(p) = &emit_cuda {
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let cuda = tenon_codegen::gpu_shader::emit_cuda(&prog, &report.mir);
+        let _ = fs::write(p, &cuda);
+        println!("Emitted NVIDIA CUDA C++/PTX ({} bytes) -> `{}`", cuda.len(), p.display());
+    }
+    if let Some(p) = &emit_spirv_glsl {
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let glsl = tenon_codegen::gpu_shader::emit_spirv_glsl(&prog, &report.mir);
+        let _ = fs::write(p, &glsl);
+        println!("Emitted Vulkan 1.3 GLSL/SPIR-V ({} bytes) -> `{}`", glsl.len(), p.display());
+    }
     if let Some(p) = &emit_webgpu {
         if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1926,6 +1957,193 @@ fn cmd_verify_proofs(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn map_c_type_to_tenon(raw: &str) -> String {
+    let s = raw.trim().replace("const ", "").trim().to_string();
+    if s.ends_with('*') {
+        let base = s.trim_end_matches('*').trim();
+        return match base {
+            "char" => "Ptr[UInt8]".into(),
+            "void" => "Ptr[CVoid]".into(),
+            other => format!("Ptr[{}]", map_c_type_to_tenon(other)),
+        };
+    }
+    match s.as_str() {
+        "void" => "CVoid".into(),
+        "bool" | "_Bool" => "Bool".into(),
+        "int8_t" | "signed char" => "Int8".into(),
+        "uint8_t" | "unsigned char" | "char" => "UInt8".into(),
+        "int16_t" | "short" => "Int16".into(),
+        "uint16_t" | "unsigned short" => "UInt16".into(),
+        "int32_t" | "int" => "Int32".into(),
+        "uint32_t" | "unsigned int" | "unsigned" => "UInt32".into(),
+        "int64_t" | "long" | "long long" => "Int64".into(),
+        "uint64_t" | "unsigned long" | "unsigned long long" => "UInt64".into(),
+        "size_t" => "USize".into(),
+        "ssize_t" | "ptrdiff_t" => "ISize".into(),
+        "float" => "Float32".into(),
+        "double" => "Float64".into(),
+        "_Float16" | "__fp16" => "Float16".into(),
+        other => other.trim_start_matches("struct ").to_string(),
+    }
+}
+
+/// Automatic C `.h` header importer (`tenon bindgen <header.h> [-o <out.tn>]`):
+/// translates C `struct` layouts into `@repr(C)` Tenon records and C prototypes into `extern "C"` blocks!
+fn cmd_bindgen(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: tenon bindgen <header.h> [-o <out.tn>]");
+        return ExitCode::from(2);
+    }
+    let mut header_path: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-o" && i + 1 < args.len() {
+            out_path = Some(args[i + 1].clone());
+            i += 2;
+        } else if header_path.is_none() {
+            header_path = Some(args[i].clone());
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    let Some(hpath) = header_path else {
+        eprintln!("usage: tenon bindgen <header.h> [-o <out.tn>]");
+        return ExitCode::from(2);
+    };
+    let Ok(src) = fs::read_to_string(&hpath) else {
+        eprintln!("error: failed to read C header `{}`", hpath);
+        return ExitCode::from(1);
+    };
+
+    let mut out = format!("// Auto-generated by `tenon bindgen` from `{}`\n\n", hpath);
+    let mut extern_fns: Vec<String> = Vec::new();
+    let lines: Vec<&str> = src.lines().collect();
+    let mut li = 0usize;
+    while li < lines.len() {
+        let trimmed = lines[li].trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") {
+            li += 1;
+            continue;
+        }
+        // Parse `typedef struct { ... } Name;` or `struct Name { ... };`
+        if (trimmed.starts_with("typedef struct") || trimmed.starts_with("struct ")) && trimmed.contains('{') {
+            let mut fields = Vec::new();
+            let mut sname = trimmed
+                .strip_prefix("struct ")
+                .and_then(|r| r.split('{').next())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            li += 1;
+            while li < lines.len() {
+                let fl = lines[li].trim();
+                if fl.starts_with('}') {
+                    let after = fl.trim_start_matches('}').trim().trim_end_matches(';').trim();
+                    if !after.is_empty() {
+                        sname = after.to_string();
+                    }
+                    break;
+                }
+                if let Some(decl) = fl.strip_suffix(';') {
+                    let parts: Vec<&str> = decl.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let raw_name = *parts.last().unwrap();
+                        let ptr_stars = raw_name.chars().take_while(|&c| c == '*').count();
+                        let fname = raw_name.trim_start_matches('*');
+                        let mut cty = parts[..parts.len() - 1].join(" ");
+                        for _ in 0..ptr_stars {
+                            cty.push('*');
+                        }
+                        fields.push((fname.to_string(), map_c_type_to_tenon(&cty)));
+                    }
+                }
+                li += 1;
+            }
+            if !sname.is_empty() {
+                out.push_str("@repr(C)\npub record ");
+                out.push_str(&sname);
+                out.push_str(" {\n");
+                for (fnm, fty) in &fields {
+                    out.push_str(&format!("    {} {}\n", fnm, fty));
+                }
+                out.push_str("}\n\n");
+            }
+            li += 1;
+            continue;
+        }
+        // Parse function prototype: `ret_type fn_name(params...);`
+        if trimmed.ends_with(';') && trimmed.contains('(') && trimmed.contains(')') && !trimmed.starts_with("typedef") {
+            let no_semi = trimmed.trim_end_matches(';').trim();
+            if let Some(lp) = no_semi.find('(') {
+                if let Some(rp) = no_semi.rfind(')') {
+                    let head = no_semi[..lp].trim().trim_start_matches("extern ").trim();
+                    let params_str = no_semi[lp + 1..rp].trim();
+                    let hparts: Vec<&str> = head.split_whitespace().collect();
+                    if hparts.len() >= 2 {
+                        let raw_fn = *hparts.last().unwrap();
+                        let ptr_stars = raw_fn.chars().take_while(|&c| c == '*').count();
+                        let fname = raw_fn.trim_start_matches('*');
+                        let mut rty = hparts[..hparts.len() - 1].join(" ");
+                        for _ in 0..ptr_stars {
+                            rty.push('*');
+                        }
+                        let tenon_ret = map_c_type_to_tenon(&rty);
+                        let mut tparams = Vec::new();
+                        if !params_str.is_empty() && params_str != "void" {
+                            for (pi, pseg) in params_str.split(',').enumerate() {
+                                let pseg = pseg.trim();
+                                if pseg == "..." {
+                                    tparams.push("...".to_string());
+                                    continue;
+                                }
+                                let pparts: Vec<&str> = pseg.split_whitespace().collect();
+                                if pparts.len() >= 2 {
+                                    let rpn = *pparts.last().unwrap();
+                                    let ps = rpn.chars().take_while(|&c| c == '*').count();
+                                    let pn = rpn.trim_start_matches('*');
+                                    let mut pty = pparts[..pparts.len() - 1].join(" ");
+                                    for _ in 0..ps {
+                                        pty.push('*');
+                                    }
+                                    tparams.push(format!("{} {}", pn, map_c_type_to_tenon(&pty)));
+                                } else {
+                                    tparams.push(format!("arg{} {}", pi, map_c_type_to_tenon(pseg)));
+                                }
+                            }
+                        }
+                        let ret_part = if tenon_ret == "CVoid" {
+                            String::new()
+                        } else {
+                            format!(" {}", tenon_ret)
+                        };
+                        extern_fns.push(format!("    pub fn {}({}){}", fname, tparams.join(", "), ret_part));
+                    }
+                }
+            }
+        }
+        li += 1;
+    }
+    if !extern_fns.is_empty() {
+        out.push_str("extern \"C\" {\n");
+        for ef in &extern_fns {
+            out.push_str(ef);
+            out.push('\n');
+        }
+        out.push_str("}\n");
+    }
+    if let Some(op) = out_path {
+        if let Err(e) = fs::write(&op, &out) {
+            eprintln!("error: failed to write `{}`: {}", op, e);
+            return ExitCode::from(1);
+        }
+        println!("Generated Tenon C bindings ({} fn(s)) -> `{}`", extern_fns.len(), op);
+    } else {
+        print!("{}", out);
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_pkg(args: &[String]) -> ExitCode {

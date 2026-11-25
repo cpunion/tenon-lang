@@ -1,0 +1,77 @@
+// std/nn/dlpack.tn — Bit-Exact DLPack v1.0 Zero-Copy Tensor ABI (PyTorch / NumPy / MLX / JAX Interop)
+//
+// Exact `@repr(C)` layout matching `dlpack/dlpack.h` so Tenon `List[Float16]`, `List[BFloat16]`,
+// `List[Float32]`, and Metal `MTLBuffer` pointers can be exchanged with PyTorch, NumPy, and Apple MLX
+// with ZERO memory copies!
+
+import "std/core/types.tn"
+
+pub const kDLCPU Int32 = 1 as Int32
+pub const kDLCUDA Int32 = 2 as Int32
+pub const kDLMetal Int32 = 8 as Int32
+pub const kDLVulkan Int32 = 7 as Int32
+pub const kDLWebGPU Int32 = 15 as Int32
+
+pub const kDLInt UInt8 = 0 as UInt8
+pub const kDLUInt UInt8 = 1 as UInt8
+pub const kDLFloat UInt8 = 2 as UInt8
+pub const kDLBfloat UInt8 = 4 as UInt8
+
+@repr(C)
+pub record DLDevice {
+    device_type Int32
+    device_id   Int32
+}
+
+@repr(C)
+pub record DLDataType {
+    code  UInt8
+    bits  UInt8
+    lanes UInt16
+}
+
+@repr(C)
+pub record DLTensor {
+    data        Ptr[UInt8]
+    device      DLDevice
+    ndim        Int32
+    _pad        Int32
+    dtype       DLDataType
+    shape       Ptr[Int64]
+    strides     Ptr[Int64]
+    byte_offset UInt64
+}
+
+pub pure fn dl_dtype_f16() DLDataType {
+    DLDataType { code = kDLFloat, bits = 16 as UInt8, lanes = 1 as UInt16 }
+}
+
+pub pure fn dl_dtype_bf16() DLDataType {
+    DLDataType { code = kDLBfloat, bits = 16 as UInt8, lanes = 1 as UInt16 }
+}
+
+pub pure fn dl_dtype_f32() DLDataType {
+    DLDataType { code = kDLFloat, bits = 32 as UInt8, lanes = 1 as UInt16 }
+}
+
+pub pure fn dl_device_cpu() DLDevice {
+    DLDevice { device_type = kDLCPU, device_id = 0 as Int32 }
+}
+
+pub pure fn dl_device_metal() DLDevice {
+    DLDevice { device_type = kDLMetal, device_id = 0 as Int32 }
+}
+
+/// Zero-copy wraps a Tenon 2-byte flat `List[Float16]` into a standard DLPack v1.0 `DLTensor`.
+pub fn dlpack_from_f16_list(xs List[Float16], shape List[Int64]) DLTensor {
+    DLTensor {
+        data = list_data_ptr(xs),
+        device = dl_device_cpu(),
+        ndim = len(shape) as Int32,
+        _pad = 0 as Int32,
+        dtype = dl_dtype_f16(),
+        shape = list_data_ptr(shape) as Ptr[Int64],
+        strides = null_ptr(),
+        byte_offset = 0 as UInt64,
+    }
+}

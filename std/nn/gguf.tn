@@ -1,0 +1,58 @@
+// std/nn/gguf.tn — Pure Tenon GGUF v3 Binary Header Writer & Zero-Copy Parser (`llama.cpp` Compatible!)
+//
+// Supports GGML tensor types:
+//   - GGML_TYPE_F16  (1) : 2 bytes/elem
+//   - GGML_TYPE_Q4_0 (2) : 18 bytes/32 elems (4.5 bits/weight)
+//   - GGML_TYPE_Q8_0 (8) : 34 bytes/32 elems (8.5 bits/weight)
+
+import "std/core/types.tn"
+
+pub const GGUF_MAGIC_LE Int = 1179993927 // "GGUF" = 0x46554747
+pub const GGUF_VERSION_3 Int = 3
+
+pub const GGML_TYPE_F32 Int = 0
+pub const GGML_TYPE_F16 Int = 1
+pub const GGML_TYPE_Q4_0 Int = 2
+pub const GGML_TYPE_Q8_0 Int = 8
+
+pub record GgufHeader {
+    version      Int
+    tensor_count Int
+    kv_count     Int
+}
+
+/// Validates and parses a GGUF v3 binary file header (`"GGUF"` magic + version + tensor/kv counts).
+pub pure fn gguf_parse_header(raw Bytes) Result[GgufHeader, Text] {
+    if bytes_len(raw) < 24 {
+        return Err("GGUF buffer shorter than 24-byte header")
+    }
+    let magic = bytes_read_u32_le(raw, 0) as Int
+    if magic != GGUF_MAGIC_LE {
+        return Err("invalid GGUF magic bytes (expected 'GGUF')")
+    }
+    let ver = bytes_read_u32_le(raw, 4) as Int
+    if ver < 2 || ver > 3 {
+        return Err("unsupported GGUF version")
+    }
+    let tc = bytes_read_u64_le(raw, 8) as Int
+    let kc = bytes_read_u64_le(raw, 16) as Int
+    Ok(GgufHeader { version = ver, tensor_count = tc, kv_count = kc })
+}
+
+/// Emits a valid GGUF v3 24-byte file header + tensor payload descriptor for checkpoint export!
+pub pure fn gguf_encode_header(tensor_count Int, kv_count Int) Bytes {
+    var out = bytes_filled(24, 0)
+    out = bytes_write_u32_le(out, 0, GGUF_MAGIC_LE)
+    out = bytes_write_u32_le(out, 4, GGUF_VERSION_3)
+    out = bytes_write_u64_le(out, 8, tensor_count)
+    out = bytes_write_u64_le(out, 16, kv_count)
+    out
+}
+
+/// Computes exact byte size of a GGML-quantized tensor (`Q4_0`: 18B/32, `Q8_0`: 34B/32, `F16`: 2B).
+pub pure fn ggml_tensor_bytes(n_elems Int where self >= 0, ggml_type Int) Int {
+    if ggml_type == GGML_TYPE_Q4_0 { return (n_elems / 32) * 18 }
+    if ggml_type == GGML_TYPE_Q8_0 { return (n_elems / 32) * 34 }
+    if ggml_type == GGML_TYPE_F16  { return n_elems * 2 }
+    n_elems * 4
+}

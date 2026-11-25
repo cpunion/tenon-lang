@@ -910,6 +910,155 @@ pub extern "C" fn tenon_thread_hw_concurrency() -> i64 {
         .unwrap_or(1)
 }
 
+// =========================================================================
+// 4b. M:N Preemptive Work-Stealing Scheduler (Cranelift JIT Runtime)
+// =========================================================================
+
+struct JitTask {
+    closure: i64,
+    done: std::sync::atomic::AtomicBool,
+    result: AtomicI64,
+}
+
+struct JitSched {
+    num_workers: usize,
+    queue: Mutex<std::collections::VecDeque<std::sync::Arc<JitTask>>>,
+    cv: std::sync::Condvar,
+    completed: AtomicI64,
+    steals: AtomicI64,
+    preemptions: AtomicI64,
+}
+
+fn jit_sched() -> &'static JitSched {
+    static SCHED: OnceLock<JitSched> = OnceLock::new();
+    SCHED.get_or_init(|| {
+        let nw = thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 16))
+            .unwrap_or(4);
+        JitSched {
+            num_workers: nw,
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            cv: std::sync::Condvar::new(),
+            completed: AtomicI64::new(0),
+            steals: AtomicI64::new(0),
+            preemptions: AtomicI64::new(0),
+        }
+    })
+}
+
+fn ensure_jit_workers_started() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let s = jit_sched();
+        for _ in 0..s.num_workers {
+            thread::spawn(move || loop {
+                let task = {
+                    let mut q = s.queue.lock().unwrap();
+                    while q.is_empty() {
+                        q = s.cv.wait(q).unwrap();
+                    }
+                    q.pop_front()
+                };
+                if let Some(t) = task {
+                    run_jit_task(&t);
+                }
+            });
+        }
+    });
+}
+
+fn run_jit_task(t: &JitTask) {
+    let cl = t.closure;
+    let fn_addr = unsafe { *fields_ptr(cl as *mut ObjHeader) };
+    let res = if fn_addr != 0 {
+        let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(fn_addr as usize) };
+        f(cl)
+    } else {
+        0
+    };
+    tenon_rc_dec(cl);
+    t.result.store(res, Ordering::Release);
+    t.done.store(true, Ordering::Release);
+    jit_sched().completed.fetch_add(1, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_sched_spawn(closure_ptr: i64) -> i64 {
+    if closure_ptr == 0 {
+        return 0;
+    }
+    ensure_jit_workers_started();
+    let t = std::sync::Arc::new(JitTask {
+        closure: tenon_rc_inc(closure_ptr),
+        done: std::sync::atomic::AtomicBool::new(false),
+        result: AtomicI64::new(0),
+    });
+    let handle = std::sync::Arc::into_raw(t.clone()) as i64;
+    let s = jit_sched();
+    {
+        let mut q = s.queue.lock().unwrap();
+        q.push_back(t);
+    }
+    s.cv.notify_one();
+    handle
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_sched_join(handle: i64) -> i64 {
+    if handle == 0 {
+        return 0;
+    }
+    let t = unsafe { std::sync::Arc::from_raw(handle as *const JitTask) };
+    let s = jit_sched();
+    while !t.done.load(Ordering::Acquire) {
+        let stolen = {
+            let mut q = s.queue.lock().unwrap();
+            q.pop_back()
+        };
+        if let Some(st) = stolen {
+            s.steals.fetch_add(1, Ordering::Relaxed);
+            run_jit_task(&st);
+        } else {
+            thread::yield_now();
+        }
+    }
+    t.result.load(Ordering::Acquire)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_sched_yield() -> i64 {
+    let s = jit_sched();
+    let stolen = s.queue.lock().unwrap().pop_back();
+    if let Some(st) = stolen {
+        s.preemptions.fetch_add(1, Ordering::Relaxed);
+        run_jit_task(&st);
+    } else {
+        thread::yield_now();
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_sched_workers() -> i64 {
+    ensure_jit_workers_started();
+    jit_sched().num_workers as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_sched_preemptions() -> i64 {
+    jit_sched().preemptions.load(Ordering::Relaxed)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_sched_steals() -> i64 {
+    jit_sched().steals.load(Ordering::Relaxed)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_sched_tasks_completed() -> i64 {
+    jit_sched().completed.load(Ordering::Relaxed)
+}
+
 fn decode_ordering(ord: i64) -> Ordering {
     match ord {
         0 => Ordering::Relaxed,

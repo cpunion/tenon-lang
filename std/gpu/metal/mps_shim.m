@@ -178,6 +178,10 @@ int64_t tn_mps_batch_begin(void) {
     return g_mps_batch_cmd != nil ? 1 : 0;
 }
 
+void* tn_mps_active_cmd_buffer(void) {
+    return (__bridge void*)g_mps_batch_cmd;
+}
+
 int64_t tn_mps_batch_commit(void) {
     if (g_mps_batch_cmd == nil) return 0;
     @autoreleasepool {

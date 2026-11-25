@@ -1,0 +1,195 @@
+// std/gpu/metal/mps_ultra.tn — Tenon Ultra-Fused Quantized (Q4_0 / Q8_0 / FP16) + Apple MPS Engine
+//
+// Exposes GGUF/MLX-compatible Q4_0 (4-bit) & Q8_0 (8-bit) quantization, 16-lane half-SIMD GEMV,
+// Fused Gate+Up+SwiGLU/GeGLU, Single-Pass FlashDecoding GQA Attention, Gemma-2 Softcap, and
+// 100% GPU-resident Mixtral/DeepSeek Sparse MoE Top-2 Routing — all inside ONE `@linear MpsBatch`!
+
+import "std/core/types.tn"
+import "std/gpu/metal/gpu.tn"
+import "std/gpu/metal/mps.tn"
+
+pub const QUANT_FP16 Int = 0
+pub const QUANT_Q8_0 Int = 1
+pub const QUANT_Q4_0 Int = 2
+
+@c_src("mps_ultra_shim.m")
+extern "C" {
+    fn tn_ultra_init() Int
+    fn tn_ultra_quantize_q4_0_buf(f16_ptr Ptr[UInt8], n_elems Int) Int
+    fn tn_ultra_quantize_q8_0_buf(f16_ptr Ptr[UInt8], n_elems Int) Int
+    fn tn_ultra_embed(tok_h Int, emb_h Int, out_h Int, seq_len Int, d_model Int, vocab Int) Int
+    fn tn_ultra_rmsnorm(x_h Int, w_h Int, w_off Int, out_h Int, seq_len Int, d_model Int, gemma_mode Int) Int
+    fn tn_ultra_rope_kv(
+        qkv_h Int, q_out_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int,
+        seq_len Int, n_h Int, n_kv Int, d_head Int, start_pos Int, max_seq Int,
+    ) Int
+    fn tn_ultra_flash_decode(
+        q_heads_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_h Int,
+        n_heads Int, n_kv Int, d_head Int, kv_len Int, max_seq Int, softcap Float,
+    ) Int
+    fn tn_ultra_gemv(
+        x_h Int, x_off Int,
+        w_h Int, w_off Int,
+        y_h Int, y_off Int,
+        bias_h Int, bias_off Int,
+        out_dim Int, in_dim Int,
+        quant_mode Int, add_res Int, has_bias Int,
+    ) Int
+    fn tn_ultra_ffn_gate_up(
+        x_h Int,
+        wg_h Int, wg_off Int,
+        wu_h Int, wu_off Int,
+        out_h Int,
+        d_ff Int, in_dim Int,
+        quant_mode Int, is_geglu Int,
+    ) Int
+    fn tn_ultra_dequant_to_f16(src_h Int, src_off Int, dst_h Int, n_elems Int, quant_mode Int) Int
+    fn tn_ultra_softcap(buf_h Int, n_elems Int, cap Float) Int
+    fn tn_ultra_add_bias_rows(buf_h Int, bias_h Int, bias_off Int, rows Int, cols Int) Int
+    fn tn_ultra_causal_mask(scores_h Int, seq_len Int, max_seq Int, n_heads Int, start_pos Int, softcap Float) Int
+    fn tn_ultra_from_heads(src_h Int, dst_h Int, seq_len Int, n_heads Int, d_head Int) Int
+    fn tn_ultra_gated_act(gate_h Int, up_h Int, out_h Int, total Int, is_geglu Int) Int
+    fn tn_ultra_res_add(x_h Int, delta_h Int, total Int) Int
+    fn tn_ultra_moe_router(x_h Int, w_h Int, w_off Int, idx_h Int, wt_h Int, d_model Int, n_experts Int) Int
+    fn tn_ultra_moe_expert_ffn(
+        x_h Int, wg_h Int, wg_layer_off Int, wu_h Int, wu_layer_off Int,
+        out_h Int, idx_h Int, slot Int, expert_stride_elems Int,
+        d_ff Int, in_dim Int, quant_mode Int, is_geglu Int,
+    ) Int
+    fn tn_ultra_moe_expert_down(
+        x_h Int, wd_h Int, wd_layer_off Int, y_h Int,
+        idx_h Int, wt_h Int, slot Int, expert_stride_elems Int,
+        out_dim Int, in_dim Int, quant_mode Int,
+    ) Int
+}
+
+pub fn ultra_init() Bool {
+    unsafe { tn_ultra_init() != 0 }
+}
+
+/// Uploads a flat `List[Float16]` into a `@linear GpuBuffer` quantized as FP16 (0), Q8_0 (1), or Q4_0 (2)!
+pub fn ultra_upload_weights(xs List[Float16], quant_mode Int) GpuBuffer {
+    let n = len(xs)
+    if quant_mode == QUANT_Q4_0 {
+        let h = unsafe { tn_ultra_quantize_q4_0_buf(list_data_ptr(xs), n) }
+        return GpuBuffer { handle = h, byte_len = (n / 32) * 18 }
+    }
+    if quant_mode == QUANT_Q8_0 {
+        let h = unsafe { tn_ultra_quantize_q8_0_buf(list_data_ptr(xs), n) }
+        return GpuBuffer { handle = h, byte_len = (n / 32) * 34 }
+    }
+    GpuBuffer.from_f16_list(xs)
+}
+
+pub pure fn ultra_weight_stride_bytes(n_elems Int, quant_mode Int) Int {
+    if quant_mode == QUANT_Q4_0 { return (n_elems / 32) * 18 }
+    if quant_mode == QUANT_Q8_0 { return (n_elems / 32) * 34 }
+    n_elems * 2
+}
+
+pub fn ultra_embed(tok_h Int, emb_h Int, out_h Int, seq_len Int, d_model Int, vocab Int) Bool {
+    unsafe { tn_ultra_embed(tok_h, emb_h, out_h, seq_len, d_model, vocab) != 0 }
+}
+
+pub fn ultra_rmsnorm(x_h Int, w_h Int, w_off Int, out_h Int, seq_len Int, d_model Int, gemma_mode Bool) Bool {
+    unsafe { tn_ultra_rmsnorm(x_h, w_h, w_off, out_h, seq_len, d_model, if gemma_mode { 1 } else { 0 }) != 0 }
+}
+
+pub fn ultra_rope_kv(
+    qkv_h Int, q_out_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int,
+    seq_len Int, n_h Int, n_kv Int, d_head Int, start_pos Int, max_seq Int,
+) Bool {
+    unsafe { tn_ultra_rope_kv(qkv_h, q_out_h, kc_h, kc_off, vc_h, vc_off, seq_len, n_h, n_kv, d_head, start_pos, max_seq) != 0 }
+}
+
+pub fn ultra_flash_decode(
+    q_heads_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_h Int,
+    n_heads Int, n_kv Int, d_head Int, kv_len Int, max_seq Int, softcap Float,
+) Bool {
+    unsafe { tn_ultra_flash_decode(q_heads_h, kc_h, kc_off, vc_h, vc_off, ctx_h, n_heads, n_kv, d_head, kv_len, max_seq, softcap) != 0 }
+}
+
+pub fn ultra_gemv(
+    x_h Int, x_off Int,
+    w_h Int, w_off Int,
+    y_h Int, y_off Int,
+    bias_h Int, bias_off Int,
+    out_dim Int, in_dim Int,
+    quant_mode Int, add_res Bool, has_bias Bool,
+) Bool {
+    unsafe {
+        tn_ultra_gemv(
+            x_h, x_off, w_h, w_off, y_h, y_off, bias_h, bias_off,
+            out_dim, in_dim, quant_mode,
+            if add_res { 1 } else { 0 },
+            if has_bias { 1 } else { 0 },
+        ) != 0
+    }
+}
+
+pub fn ultra_ffn_gate_up(
+    x_h Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int, out_h Int,
+    d_ff Int, in_dim Int, quant_mode Int, is_geglu Bool,
+) Bool {
+    unsafe { tn_ultra_ffn_gate_up(x_h, wg_h, wg_off, wu_h, wu_off, out_h, d_ff, in_dim, quant_mode, if is_geglu { 1 } else { 0 }) != 0 }
+}
+
+pub fn ultra_dequant_to_f16(src_h Int, src_off Int, dst_h Int, n_elems Int, quant_mode Int) Bool {
+    unsafe { tn_ultra_dequant_to_f16(src_h, src_off, dst_h, n_elems, quant_mode) != 0 }
+}
+
+pub fn ultra_softcap(buf_h Int, n_elems Int, cap Float) Bool {
+    unsafe { tn_ultra_softcap(buf_h, n_elems, cap) != 0 }
+}
+
+pub fn ultra_add_bias_rows(buf_h Int, bias_h Int, bias_off Int, rows Int, cols Int) Bool {
+    unsafe { tn_ultra_add_bias_rows(buf_h, bias_h, bias_off, rows, cols) != 0 }
+}
+
+pub fn ultra_causal_mask(scores_h Int, seq_len Int, max_seq Int, n_heads Int, start_pos Int, softcap Float) Bool {
+    unsafe { tn_ultra_causal_mask(scores_h, seq_len, max_seq, n_heads, start_pos, softcap) != 0 }
+}
+
+pub fn ultra_from_heads(src_h Int, dst_h Int, seq_len Int, n_heads Int, d_head Int) Bool {
+    unsafe { tn_ultra_from_heads(src_h, dst_h, seq_len, n_heads, d_head) != 0 }
+}
+
+pub fn ultra_gated_act(gate_h Int, up_h Int, out_h Int, total Int, is_geglu Bool) Bool {
+    unsafe { tn_ultra_gated_act(gate_h, up_h, out_h, total, if is_geglu { 1 } else { 0 }) != 0 }
+}
+
+pub fn ultra_res_add(x_h Int, delta_h Int, total Int) Bool {
+    unsafe { tn_ultra_res_add(x_h, delta_h, total) != 0 }
+}
+
+pub fn ultra_moe_router(x_h Int, w_h Int, w_off Int, idx_h Int, wt_h Int, d_model Int, n_experts Int) Bool {
+    unsafe { tn_ultra_moe_router(x_h, w_h, w_off, idx_h, wt_h, d_model, n_experts) != 0 }
+}
+
+pub fn ultra_moe_expert_ffn(
+    x_h Int, wg_h Int, wg_layer_off Int, wu_h Int, wu_layer_off Int,
+    out_h Int, idx_h Int, slot Int, expert_stride_elems Int,
+    d_ff Int, in_dim Int, quant_mode Int, is_geglu Bool,
+) Bool {
+    unsafe {
+        tn_ultra_moe_expert_ffn(
+            x_h, wg_h, wg_layer_off, wu_h, wu_layer_off,
+            out_h, idx_h, slot, expert_stride_elems,
+            d_ff, in_dim, quant_mode, if is_geglu { 1 } else { 0 },
+        ) != 0
+    }
+}
+
+pub fn ultra_moe_expert_down(
+    x_h Int, wd_h Int, wd_layer_off Int, y_h Int,
+    idx_h Int, wt_h Int, slot Int, expert_stride_elems Int,
+    out_dim Int, in_dim Int, quant_mode Int,
+) Bool {
+    unsafe {
+        tn_ultra_moe_expert_down(
+            x_h, wd_h, wd_layer_off, y_h,
+            idx_h, wt_h, slot, expert_stride_elems,
+            out_dim, in_dim, quant_mode,
+        ) != 0
+    }
+}

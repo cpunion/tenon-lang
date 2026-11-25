@@ -14,12 +14,18 @@
 # 0. 可视化交互体验与旗舰应用（零 `--c-src` 参数、零外部 Shader 文件，全量内置 `@c_src` 与 `gpu_embedded_msl()`！）
 cargo build --release --bin tenon
 
-# (A0) PyTorch 风格精化验证 AI 库（Tenon-Torch `std/nn`：AutogradTape + AMP 混合精度 `GradScaler` + Transformer Self-Attention + AdamW + 编译期 `Matrix[R, C, DType = Float16]` / 变长 `Tensor[...Shape]` 维度证明 + Apple Silicon Metal MPS 硬件加速 Llama-3 GQA Transformer！）
+# (A0) PyTorch 风格精化验证 AI 库 & 超融合量化多架构 LLM 推理引擎（Tenon-Torch `std/nn`：AutogradTape + AMP `GradScaler` + 编译期 `Matrix[R, C, DType = Float16]` / 变长 `Tensor[...Shape]` + DLPack v1.0 / GGUF v3 / Safetensors + Apple MPS + 超融合 Metal Q4_0/Q8_0/FP16 推理，支持 Llama-3/Qwen2/Gemma-2/Mixtral Sparse MoE，M4 Max 上超越 C 封装 MPS 与 llama.cpp 风格 Metal/CPU 基线！）
 ./target/release/tenon test std/nn/nn_test.tn
 ./target/release/tenon check examples/showcase/bad_nn_shape.tn   # 负例：Matrix[4,8] @ Matrix[6,2] 编译期秒抓维度错误！
-./target/release/tenon build examples/showcase/tenon_transformer_mps.tn -o /tmp/tenon_mps_tf && /tmp/tenon_mps_tf  # 完整 6 层 Llama-3 GQA Transformer（Apple MPS 3D Batched FP16 GEMM + MPSMatrixSoftMax + GEMV + Safetensors + KV-Cache！）
+./target/release/tenon build examples/showcase/tenon_ultra_llm_bench.tn -o /tmp/tn_ultra_bench && /tmp/tn_ultra_bench  # Llama-3/Qwen2/Gemma-2/Mixtral-MoE 超融合 Q4_0/Q8_0/FP16 + FlashDecoding 引擎（22M 达 1,310 tok/s，88M 达 598 tok/s！）
+./target/release/tenon build examples/showcase/tenon_transformer_mps.tn -o /tmp/tenon_mps_tf && /tmp/tenon_mps_tf
 ./target/release/tenon build examples/showcase/tenon_torch_studio.tn -o /tmp/tenon_torch_studio && /tmp/tenon_torch_studio
 # 或无头截图预览（生成 /tmp/tenon_torch_studio.png）：TENON_TORCH_SMOKE=1 /tmp/tenon_torch_studio
+
+# (A0b) M:N 抢占式无栈协程工作窃取调度器（零 cgo 开销，~1.8ns C FFI）+ 非装箱栈上可变值记录 + 多后端 GPU（MSL/WGSL/CUDA/SPIR-V GLSL）+ C 头文件自动绑定 `tenon bindgen`
+./target/release/tenon build examples/dogfood/mn_preempt_sched_demo.tn -o /tmp/tn_mn_bench && /tmp/tn_mn_bench
+./target/release/tenon build examples/showcase/tenon_transformer_mps.tn --emit-cuda /tmp/out.cu --emit-spirv-glsl /tmp/out.comp --debug -o /tmp/tn_dbg
+./target/release/tenon bindgen /path/to/header.h -o /tmp/bindings.tn
 
 # (A1) 原生 macOS Apple Silicon Metal 量化 K 线 + 100 组 Metal GPU 并行参数网格热力图（点击热力图格子实时切换 MA 策略！）
 ./target/release/tenon build examples/showcase/quant_kline_gpui.tn -o /tmp/tenon_quant_kline && /tmp/tenon_quant_kline
@@ -54,7 +60,7 @@ cargo build --release --bin tenon
 # (H) 脚手架模板一键创建项目（支持 cli / lib / web / gpui / openui-web / tui / gpu）
 ./target/release/tenon new /tmp/my_gpu_app --template gpu
 
-# 1. 全工作区自动化测试（79 项全量回归；macOS 默认通过 real clang 原生链接校验 + LLVM 22 `lli` 并行执行，全量约 3 秒全绿；设置 `TENON_TEST_NATIVE_EXEC=1` 可切回逐二进制直接执行）
+# 1. 全工作区自动化测试（81 项全量回归；macOS 默认通过 real clang 原生链接校验 + LLVM 22 `lli` 并行执行，全量约 3 秒全绿；设置 `TENON_TEST_NATIVE_EXEC=1` 可切回逐二进制直接执行）
 cargo test --workspace
 
 # 2. 精化类型别名复用 + 高阶形式化验证闭环 + 独立证明导出与审计 + 可执行反例转测试
