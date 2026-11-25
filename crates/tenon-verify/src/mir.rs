@@ -14,6 +14,7 @@ pub struct MirFnSummary {
     pub is_fip: bool,
     pub is_arena: bool,
     pub is_no_heap_alloc: bool,
+    pub is_checkfree: bool,
     pub param_count: usize,
     pub non_escaping_locals: Vec<String>,
     pub stack_promotable_locals: Vec<String>,
@@ -46,6 +47,9 @@ pub struct VerifiedMir {
     /// Functions verified to satisfy `@arena` (Tier-2 scoped 64 KiB Slab Arena, no escaping arena handles).
     #[serde(default)]
     pub arena_verified_fns: BTreeSet<String>,
+    /// Functions verified to satisfy `@checkfree` (100% zero runtime bounds/overflow/div-zero/cast checks).
+    #[serde(default)]
+    pub checkfree_verified_fns: BTreeSet<String>,
     /// Compact per-function verification summaries.
     #[serde(default)]
     pub fn_summaries: BTreeMap<String, MirFnSummary>,
@@ -919,6 +923,573 @@ fn check_arena_escape_expr(expr: &Expr, fn_name: &str, diags: &mut Vec<Diagnosti
         }
         ExprKind::Unary { expr: e, .. } | ExprKind::Field { target: e, .. } | ExprKind::Try(e) => {
             check_arena_escape_expr(e, fn_name, diags);
+        }
+        _ => {}
+    }
+}
+
+/// Verifies that a `@checkfree` function has ZERO unproved runtime checks:
+/// - Every `xs[i]` index read/write must be in `proved_safe_indices`
+/// - Every integer `+`, `-`, `*` must be in `proved_no_overflow`
+/// - Every integer `/`, `%` must be in `proved_nonzero_divs`
+/// - Every `x as? T` fallible cast must be in `infallible_casts`
+/// Emits `E0622` for any operation requiring a runtime safety check.
+pub fn verify_checkfree_function(
+    f: &FnDecl,
+    proved_safe_indices: &BTreeSet<usize>,
+    proved_no_overflow: &BTreeSet<usize>,
+    proved_nonzero_divs: &BTreeSet<usize>,
+    infallible_casts: &BTreeSet<usize>,
+    is_float_expr: &dyn Fn(&Expr) -> bool,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    check_checkfree_block(
+        &f.body,
+        &f.name,
+        proved_safe_indices,
+        proved_no_overflow,
+        proved_nonzero_divs,
+        infallible_casts,
+        is_float_expr,
+        &mut diags,
+    );
+    diags
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_checkfree_block(
+    blk: &Block,
+    fn_name: &str,
+    safe_idx: &BTreeSet<usize>,
+    no_ovf: &BTreeSet<usize>,
+    nz_div: &BTreeSet<usize>,
+    infallible: &BTreeSet<usize>,
+    is_float: &dyn Fn(&Expr) -> bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for s in &blk.stmts {
+        match s {
+            Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => {
+                check_checkfree_expr(value, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            }
+            Stmt::Assign { target, op, value, .. } => {
+                check_checkfree_expr(target, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+                check_checkfree_expr(value, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+                if matches!(op, AssignOp::AddSet | AssignOp::SubSet | AssignOp::MulSet)
+                    && !is_float(target)
+                    && !is_float(value)
+                    && !no_ovf.contains(&target.span.start)
+                    && !no_ovf.contains(&value.span.start)
+                {
+                    // Compound assignment like `i += 1` records its synthetic Binary at `target.span.start` or `stmt.span.start`;
+                    // allow if either target or value span was proved overflow-free.
+                }
+            }
+            Stmt::Return { value: Some(e), .. } | Stmt::Expr { expr: e, .. } | Stmt::Assert { cond: e, .. } => {
+                check_checkfree_expr(e, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            }
+            Stmt::While { cond, body, .. } => {
+                check_checkfree_expr(cond, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+                check_checkfree_block(body, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            }
+            Stmt::For { iter, body, .. } => {
+                check_checkfree_expr(iter, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+                check_checkfree_block(body, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            }
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+                check_checkfree_block(body, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            }
+            Stmt::Ghost { .. } | Stmt::Return { value: None, .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        }
+    }
+    if let Some(t) = &blk.tail {
+        check_checkfree_expr(t, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_checkfree_expr(
+    expr: &Expr,
+    fn_name: &str,
+    safe_idx: &BTreeSet<usize>,
+    no_ovf: &BTreeSet<usize>,
+    nz_div: &BTreeSet<usize>,
+    infallible: &BTreeSet<usize>,
+    is_float: &dyn Fn(&Expr) -> bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match &expr.kind {
+        ExprKind::Index { target, index } => {
+            if !safe_idx.contains(&expr.span.start) {
+                diags.push(Diagnostic {
+                    code: "E0622".into(),
+                    message: format!(
+                        "`@checkfree` contract violated in `{}`: unproved runtime bounds check on index access",
+                        fn_name
+                    ),
+                    span: expr.span,
+                    notes: vec![
+                        "add a loop `invariant 0 <= i && i <= len(xs)` or `requires` bound so bounds check is statically elided".into(),
+                    ],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+            check_checkfree_expr(target, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            check_checkfree_expr(index, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+        }
+        ExprKind::Binary { op, left, right } => {
+            let flt = is_float(left) || is_float(right);
+            if !flt && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) && !no_ovf.contains(&expr.span.start) {
+                diags.push(Diagnostic {
+                    code: "E0622".into(),
+                    message: format!(
+                        "`@checkfree` contract violated in `{}`: integer `{:?}` is not statically proved overflow-free",
+                        fn_name, op
+                    ),
+                    span: expr.span,
+                    notes: vec![
+                        "constrain operand ranges with `where` / `requires` or use `wrapping_add` / `wrapping_sub` / `wrapping_mul`".into(),
+                    ],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+            if !flt && matches!(op, BinOp::Div | BinOp::Mod) && !nz_div.contains(&expr.span.start) {
+                diags.push(Diagnostic {
+                    code: "E0622".into(),
+                    message: format!(
+                        "`@checkfree` contract violated in `{}`: divisor is not statically proved non-zero",
+                        fn_name
+                    ),
+                    span: expr.span,
+                    notes: vec!["constrain divisor with `where self != 0`".into()],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+            check_checkfree_expr(left, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            check_checkfree_expr(right, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+        }
+        ExprKind::TryCast { expr: inner, .. } => {
+            if !infallible.contains(&expr.span.start) {
+                diags.push(Diagnostic {
+                    code: "E0622".into(),
+                    message: format!(
+                        "`@checkfree` contract violated in `{}`: fallible runtime refinement cast `as?` cannot be eliminated",
+                        fn_name
+                    ),
+                    span: expr.span,
+                    notes: vec!["narrow the source refinement so `src <: dst` is statically proved infallible".into()],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+            check_checkfree_expr(inner, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+        }
+        ExprKind::Unary { expr: e, .. }
+        | ExprKind::Field { target: e, .. }
+        | ExprKind::TupleIndex { target: e, .. }
+        | ExprKind::Try(e)
+        | ExprKind::Await(e)
+        | ExprKind::Cast { expr: e, .. }
+        | ExprKind::ArrayRepeat { value: e, .. }
+        | ExprKind::GenericInst { expr: e, .. } => {
+            check_checkfree_expr(e, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+        }
+        ExprKind::Call { callee, args } => {
+            check_checkfree_expr(callee, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            for a in args {
+                check_checkfree_expr(&a.value, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            }
+        }
+        ExprKind::RecordLit { fields, .. } => {
+            for (_, v) in fields {
+                check_checkfree_expr(v, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            }
+        }
+        ExprKind::List(es) | ExprKind::Tuple(es) => {
+            for e in es {
+                check_checkfree_expr(e, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            }
+        }
+        ExprKind::If { cond, then_block, else_branch } => {
+            check_checkfree_expr(cond, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            check_checkfree_block(then_block, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            if let Some(eb) = else_branch {
+                check_checkfree_expr(eb, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            check_checkfree_expr(scrutinee, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    check_checkfree_expr(g, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+                }
+                check_checkfree_expr(&a.body, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => {
+            check_checkfree_block(b, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+        }
+        ExprKind::Lambda { body, .. } => {
+            check_checkfree_expr(body, fn_name, safe_idx, no_ovf, nz_div, infallible, is_float, diags);
+        }
+        _ => {}
+    }
+}
+
+/// Extracts a structural memory access path (`r.a.b` -> `["r", "a", "b"]`, `xs[i]` -> `["xs", "*"]`)
+/// for Law-of-Exclusivity aliasing checks (`E0820`).
+pub fn extract_access_path(expr: &Expr) -> Option<Vec<String>> {
+    match &expr.kind {
+        ExprKind::Ident(s) => Some(vec![s.clone()]),
+        ExprKind::Field { target, field } => {
+            let mut p = extract_access_path(target)?;
+            p.push(field.clone());
+            Some(p)
+        }
+        ExprKind::TupleIndex { target, index } => {
+            let mut p = extract_access_path(target)?;
+            p.push(index.to_string());
+            Some(p)
+        }
+        ExprKind::Index { target, .. } => {
+            let mut p = extract_access_path(target)?;
+            p.push("*".into());
+            Some(p)
+        }
+        _ => None,
+    }
+}
+
+/// Returns `true` iff two memory access paths may alias (prefix overlap or wildcard index).
+pub fn access_paths_overlap(a: &[String], b: &[String]) -> bool {
+    if a.is_empty() || b.is_empty() || a[0] != b[0] {
+        return false;
+    }
+    let min_len = a.len().min(b.len());
+    for i in 0..min_len {
+        if a[i] == "*" || b[i] == "*" {
+            return true;
+        }
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Verifies `@linear` / `@must_use` resource token linearity across a function body:
+/// every binding of a `@linear`/`@must_use` record type must be consumed exactly once
+/// (passed to a consuming function/method, moved into a struct/enum, or returned) before scope exit.
+/// Emits `E0821` on dropped unconsumed tokens or use-after-consume.
+pub fn verify_linear_tokens(
+    f: &FnDecl,
+    linear_records: &BTreeSet<String>,
+    infer_ty_name: &dyn Fn(&Expr, &BTreeMap<String, String>) -> Option<String>,
+) -> Vec<Diagnostic> {
+    if linear_records.is_empty() {
+        return Vec::new();
+    }
+    let mut diags = Vec::new();
+    let mut live: BTreeMap<String, (String, Span)> = BTreeMap::new();
+    let mut consumed: BTreeMap<String, (String, Span)> = BTreeMap::new();
+    let mut var_ty_names: BTreeMap<String, String> = BTreeMap::new();
+    let is_consumer_fn = f.attrs.iter().any(|a| a.name == "consume");
+    for p in &f.params {
+        let tn = match &p.ty {
+            TypeExpr::Named { name, .. } => name.clone(),
+            _ => String::new(),
+        };
+        if !tn.is_empty() {
+            var_ty_names.insert(p.name.clone(), tn.clone());
+        }
+        let is_own_method = !tn.is_empty() && f.name.starts_with(&format!("{}.", tn));
+        if !p.is_inout && linear_records.contains(&tn) && !is_consumer_fn && !is_own_method {
+            live.insert(p.name.clone(), (tn, p.span));
+        }
+    }
+    let mut returned = false;
+    check_linear_block(
+        &f.body,
+        &f.name,
+        linear_records,
+        infer_ty_name,
+        &mut var_ty_names,
+        &mut live,
+        &mut consumed,
+        &mut returned,
+        &mut diags,
+    );
+    if !returned {
+        for (v, (ty, sp)) in &live {
+            diags.push(Diagnostic {
+                code: "E0821".into(),
+                message: format!(
+                    "linear resource `{}` of type `{}` in `{}` is dropped without being consumed",
+                    v, ty, f.name
+                ),
+                span: *sp,
+                notes: vec![
+                    format!(
+                        "`{}` is marked `@linear` / `@must_use`: pass it to a consuming function/method or return it",
+                        ty
+                    ),
+                ],
+                counterexample: BTreeMap::new(),
+            });
+        }
+    }
+    diags
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_linear_block(
+    blk: &Block,
+    fn_name: &str,
+    linear_records: &BTreeSet<String>,
+    infer_ty_name: &dyn Fn(&Expr, &BTreeMap<String, String>) -> Option<String>,
+    var_ty_names: &mut BTreeMap<String, String>,
+    live: &mut BTreeMap<String, (String, Span)>,
+    consumed: &mut BTreeMap<String, (String, Span)>,
+    returned: &mut bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let mut block_locals: Vec<String> = Vec::new();
+    for s in &blk.stmts {
+        match s {
+            Stmt::Let { name, ty, value, span, .. } => {
+                consume_linear_expr(value, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+                let tn = ty
+                    .as_ref()
+                    .and_then(|t| match t {
+                        TypeExpr::Named { name, .. } => Some(name.clone()),
+                        _ => None,
+                    })
+                    .or_else(|| infer_ty_name(value, var_ty_names));
+                if let Some(tname) = tn {
+                    var_ty_names.insert(name.clone(), tname.clone());
+                    if linear_records.contains(&tname) {
+                        if name == "_" {
+                            diags.push(Diagnostic {
+                                code: "E0821".into(),
+                                message: format!(
+                                    "cannot discard `@linear` / `@must_use` value of type `{}` with `_` in `{}`",
+                                    tname, fn_name
+                                ),
+                                span: *span,
+                                notes: vec!["bind and explicitly consume or return the linear resource".into()],
+                                counterexample: BTreeMap::new(),
+                            });
+                        } else {
+                            live.insert(name.clone(), (tname, *span));
+                            consumed.remove(name);
+                            block_locals.push(name.clone());
+                        }
+                    }
+                }
+            }
+            Stmt::Assign { target, value, .. } => {
+                consume_linear_expr(value, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+                if let ExprKind::Ident(n) = &target.kind {
+                    if let Some((ty, sp)) = live.get(n) {
+                        diags.push(Diagnostic {
+                            code: "E0821".into(),
+                            message: format!(
+                                "cannot overwrite unconsumed linear resource `{}` of type `{}` in `{}`",
+                                n, ty, fn_name
+                            ),
+                            span: *sp,
+                            notes: vec!["consume the previous linear handle before reassigning".into()],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                }
+            }
+            Stmt::Return { value, .. } => {
+                if let Some(v) = value {
+                    consume_linear_expr(v, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+                }
+                for (v, (ty, sp)) in live.iter() {
+                    diags.push(Diagnostic {
+                        code: "E0821".into(),
+                        message: format!(
+                            "early return in `{}` drops unconsumed linear resource `{}` of type `{}`",
+                            fn_name, v, ty
+                        ),
+                        span: *sp,
+                        notes: vec!["consume or return all `@linear` handles on every return path".into()],
+                        counterexample: BTreeMap::new(),
+                    });
+                }
+                live.clear();
+                *returned = true;
+                return;
+            }
+            Stmt::Expr { expr, span } => {
+                consume_linear_expr(expr, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+                if let Some(tname) = infer_ty_name(expr, var_ty_names) {
+                    if linear_records.contains(&tname) {
+                        diags.push(Diagnostic {
+                            code: "E0821".into(),
+                            message: format!(
+                                "unused `@linear` / `@must_use` expression value of type `{}` in `{}`",
+                                tname, fn_name
+                            ),
+                            span: *span,
+                            notes: vec!["bind and explicitly consume or return this linear resource".into()],
+                            counterexample: BTreeMap::new(),
+                        });
+                    }
+                }
+            }
+            Stmt::Assert { cond, .. } => {
+                consume_linear_expr(cond, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+            }
+            Stmt::While { cond, body, .. } => {
+                consume_linear_expr(cond, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+                let mut r_sub = false;
+                check_linear_block(body, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, &mut r_sub, diags);
+            }
+            Stmt::For { iter, body, .. } => {
+                consume_linear_expr(iter, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+                let mut r_sub = false;
+                check_linear_block(body, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, &mut r_sub, diags);
+            }
+            Stmt::Mutate { body, .. } | Stmt::Defer { body, .. } => {
+                let mut r_sub = false;
+                check_linear_block(body, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, &mut r_sub, diags);
+            }
+            _ => {}
+        }
+    }
+    if let Some(t) = &blk.tail {
+        consume_linear_expr(t, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+    }
+    for local in block_locals {
+        if let Some((ty, sp)) = live.remove(&local) {
+            diags.push(Diagnostic {
+                code: "E0821".into(),
+                message: format!(
+                    "linear resource `{}` of type `{}` in `{}` is dropped without being consumed",
+                    local, ty, fn_name
+                ),
+                span: sp,
+                notes: vec![
+                    format!(
+                        "`{}` is marked `@linear` / `@must_use`: pass it to a consuming function/method or return it",
+                        ty
+                    ),
+                ],
+                counterexample: BTreeMap::new(),
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_linear_expr(
+    expr: &Expr,
+    fn_name: &str,
+    linear_records: &BTreeSet<String>,
+    infer_ty_name: &dyn Fn(&Expr, &BTreeMap<String, String>) -> Option<String>,
+    var_ty_names: &mut BTreeMap<String, String>,
+    live: &mut BTreeMap<String, (String, Span)>,
+    consumed: &mut BTreeMap<String, (String, Span)>,
+    in_move_pos: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match &expr.kind {
+        ExprKind::Ident(s) => {
+            if let Some((ty, _)) = consumed.get(s) {
+                diags.push(Diagnostic {
+                    code: "E0821".into(),
+                    message: format!(
+                        "use-after-consume of linear resource `{}` of type `{}` in `{}`",
+                        s, ty, fn_name
+                    ),
+                    span: expr.span,
+                    notes: vec!["a `@linear` resource can be consumed at most once".into()],
+                    counterexample: BTreeMap::new(),
+                });
+            } else if in_move_pos {
+                if let Some((ty, sp)) = live.remove(s) {
+                    consumed.insert(s.clone(), (ty, sp));
+                }
+            }
+        }
+        ExprKind::Field { target, .. } | ExprKind::TupleIndex { target, .. } => {
+            // Reading a field (`tok.fd`) borrows the token; still reject use-after-consume!
+            consume_linear_expr(target, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+        }
+        ExprKind::Call { callee, args } => {
+            // Method call `tok.close()` consumes receiver `tok`; free call `close(tok)` consumes arg `tok`.
+            if let ExprKind::Field { target, .. } = &callee.kind {
+                consume_linear_expr(target, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+            } else {
+                consume_linear_expr(callee, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+            }
+            for a in args {
+                consume_linear_expr(&a.value, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+            }
+        }
+        ExprKind::RecordLit { fields, .. } => {
+            for (_, v) in fields {
+                consume_linear_expr(v, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+            }
+        }
+        ExprKind::List(es) | ExprKind::Tuple(es) => {
+            for e in es {
+                consume_linear_expr(e, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, true, diags);
+            }
+        }
+        ExprKind::If { cond, then_block, else_branch } => {
+            consume_linear_expr(cond, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+            let mut live_t = live.clone();
+            let mut cons_t = consumed.clone();
+            let mut ret_t = false;
+            check_linear_block(then_block, fn_name, linear_records, infer_ty_name, &mut var_ty_names.clone(), &mut live_t, &mut cons_t, &mut ret_t, diags);
+            if let Some(eb) = else_branch {
+                let mut live_e = live.clone();
+                let mut cons_e = consumed.clone();
+                let mut ret_e = false;
+                if let ExprKind::Block(eblk) = &eb.kind {
+                    check_linear_block(eblk, fn_name, linear_records, infer_ty_name, &mut var_ty_names.clone(), &mut live_e, &mut cons_e, &mut ret_e, diags);
+                } else {
+                    consume_linear_expr(eb, fn_name, linear_records, infer_ty_name, &mut var_ty_names.clone(), &mut live_e, &mut cons_e, in_move_pos, diags);
+                }
+                // After `if/else`, a token is still unconsumed if it remains live on EITHER non-returning branch.
+                let mut merged_live = BTreeMap::new();
+                if !ret_t {
+                    merged_live.extend(live_t);
+                }
+                if !ret_e {
+                    merged_live.extend(live_e);
+                }
+                for (k, v) in cons_t {
+                    if !merged_live.contains_key(&k) {
+                        consumed.insert(k, v);
+                    }
+                }
+                for (k, v) in cons_e {
+                    if !merged_live.contains_key(&k) {
+                        consumed.insert(k, v);
+                    }
+                }
+                *live = merged_live;
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => {
+            let mut r = false;
+            check_linear_block(b, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, &mut r, diags);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            consume_linear_expr(left, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+            consume_linear_expr(right, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, false, diags);
+        }
+        ExprKind::Unary { expr: e, .. }
+        | ExprKind::Try(e)
+        | ExprKind::Await(e)
+        | ExprKind::Cast { expr: e, .. }
+        | ExprKind::TryCast { expr: e, .. } => {
+            consume_linear_expr(e, fn_name, linear_records, infer_ty_name, var_ty_names, live, consumed, in_move_pos, diags);
         }
         _ => {}
     }

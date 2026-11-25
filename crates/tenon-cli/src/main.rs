@@ -152,7 +152,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
     }
     if let Some(rpath) = emit_repro_test {
-        let repro = tenon_verify::emit_repro_test_from_diagnostics(file, &report.diagnostics);
+        let repro = tenon_verify::emit_repro_test_from_diagnostics(file, Some(&prog), &report.diagnostics);
         if let Err(e) = fs::write(&rpath, repro) {
             eprintln!("warning: failed to write repro test `{}`: {}", rpath.display(), e);
         } else {

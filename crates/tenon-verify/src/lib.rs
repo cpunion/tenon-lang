@@ -1772,8 +1772,14 @@ pub pure fn illegal_pure(v Int) Int {
         let bad_prog = parse("pub pure fn bad_inc(x Int) Int ensures result > 10 { x + 1 }").unwrap();
         let bad_rep = check_program(&bad_prog);
         assert!(!bad_rep.ok);
-        let repro_src = emit_repro_test_from_diagnostics("bad.tn", &bad_rep.diagnostics);
-        assert!(repro_src.contains("test fn repro_counterexample_1()"));
+        let repro_src = emit_repro_test_from_diagnostics("bad.tn", Some(&bad_prog), &bad_rep.diagnostics);
+        assert!(
+            repro_src.contains("test fn repro_bad_inc_1()")
+                && repro_src.contains("bad_inc(ce_x)")
+                && !repro_src.contains("TODO"),
+            "expected concrete runnable repro test without TODO, got:\n{}",
+            repro_src
+        );
 
         // 5. L2 Temporal Liveness (`eventually` / `leads_to`) & JSONL Trace Replay
         let live_results = check_builtin_liveness();
@@ -1798,5 +1804,196 @@ pub pure fn illegal_pure(v Int) Int {
         let tr = replay_trace_jsonl_file(&trace_path).unwrap();
         let _ = std::fs::remove_file(&trace_path);
         assert!(tr.ok && tr.events_checked == 2);
+    }
+
+    #[test]
+    fn verifies_r2_checkfree_linear_tokens_exclusivity_no_await_in_locks_and_repro() {
+        // 1. `@checkfree` positive control: all indices proved safe & all ops proved overflow-free + nonzero div
+        let cf_ok = parse(
+            r#"
+@checkfree
+pub pure fn safe_kernel(a Int where 0 <= self && self <= 100, b Int where 1 <= self && self <= 100) Int {
+    let xs = list_filled(4, 1)
+    var s = a + b
+    var i = 0
+    while i < 4 invariant 0 <= i && i <= 4 && 0 <= s && s <= 200 + 10 * i {
+        let v = xs[i]
+        if 0 <= v && v <= 10 {
+            s = s + v
+        }
+        i = i + 1
+    }
+    s / b
+}
+"#,
+        )
+        .unwrap();
+        let cf_ok_rep = check_program(&cf_ok);
+        assert!(cf_ok_rep.ok, "@checkfree positive failed: {:?}", cf_ok_rep.diagnostics);
+        assert!(cf_ok_rep.mir.checkfree_verified_fns.contains("safe_kernel"));
+
+        // 2. `@checkfree` negative control: unproved bounds & unproved overflow -> E0622
+        let cf_bad = parse(
+            r#"
+@checkfree
+pub pure fn unsafe_kernel(xs List[Int], i Int, x Int, y Int) Int {
+    let v = xs[i]
+    v + x + y
+}
+"#,
+        )
+        .unwrap();
+        let cf_bad_rep = check_program(&cf_bad);
+        assert!(!cf_bad_rep.ok);
+        assert!(
+            cf_bad_rep.diagnostics.iter().any(|d| d.code == "E0622"),
+            "expected E0622 for unproved @checkfree ops, got {:?}",
+            cf_bad_rep.diagnostics
+        );
+
+        // 3. `@linear` / `@must_use` resource tokens: positive (consumed) vs negative (dropped / double-consumed -> E0821)
+        let lin_ok = parse(
+            r#"
+@linear
+pub record TxToken {
+    id Int
+}
+
+@consume
+pub fn commit(t TxToken) Int {
+    t.id
+}
+
+pub fn good_tx() Int {
+    let tx = TxToken { id = 7 }
+    let id_peek = tx.id
+    commit(tx) + id_peek
+}
+"#,
+        )
+        .unwrap();
+        let lin_ok_rep = check_program(&lin_ok);
+        assert!(lin_ok_rep.ok, "linear positive failed: {:?}", lin_ok_rep.diagnostics);
+
+        let lin_drop = parse(
+            r#"
+@linear
+pub record TxToken {
+    id Int
+}
+
+pub fn leak_tx() Int {
+    let tx = TxToken { id = 7 }
+    tx.id
+}
+"#,
+        )
+        .unwrap();
+        let lin_drop_rep = check_program(&lin_drop);
+        assert!(
+            lin_drop_rep.diagnostics.iter().any(|d| d.code == "E0821" && d.message.contains("dropped without being consumed")),
+            "expected E0821 dropped linear token, got {:?}",
+            lin_drop_rep.diagnostics
+        );
+
+        let lin_double = parse(
+            r#"
+@linear
+pub record TxToken {
+    id Int
+}
+
+@consume
+pub fn commit(t TxToken) Int { t.id }
+
+pub fn double_tx() Int {
+    let tx = TxToken { id = 7 }
+    let a = commit(tx)
+    let b = commit(tx)
+    a + b
+}
+"#,
+        )
+        .unwrap();
+        let lin_double_rep = check_program(&lin_double);
+        assert!(
+            lin_double_rep.diagnostics.iter().any(|d| d.code == "E0821" && d.message.contains("use-after-consume")),
+            "expected E0821 double-consume, got {:?}",
+            lin_double_rep.diagnostics
+        );
+
+        // 4. Law of Exclusivity (`E0820`): disjoint fields ok, overlapping `inout` projections & `inout`+read rejected
+        let excl_prog = parse(
+            r#"
+pub record Pair {
+    a Int
+    b Int
+}
+
+pub fn bump_both(inout x Int, inout y Int) {
+    x += 1
+    y += 1
+}
+
+pub fn bump_pair_and_field(inout p Pair, inout x Int) {
+    p.a += 1
+    x += 1
+}
+
+pub fn bump_pair_and_read(inout p Pair, q Pair) Int {
+    p.a += 1
+    q.a
+}
+
+pub fn ok_disjoint() {
+    var p = Pair { a = 1, b = 2 }
+    bump_both(p.a, p.b)
+}
+
+pub fn bad_overlap() Int {
+    var p = Pair { a = 1, b = 2 }
+    bump_pair_and_field(p, p.a)
+    bump_pair_and_read(p, p)
+}
+"#,
+        )
+        .unwrap();
+        let excl_rep = check_program(&excl_prog);
+        let e0820_count = excl_rep.diagnostics.iter().filter(|d| d.code == "E0820").count();
+        assert!(
+            e0820_count >= 2,
+            "expected >=2 E0820 exclusivity errors (projection overlap + read alias), got {:?}",
+            excl_rep.diagnostics
+        );
+
+        // 5. No-`await` inside `mutate` / `mutex_lock` critical sections (`E0603`)
+        let crit_prog = parse(
+            r#"
+pub record Counter {
+    n Int where self >= 0
+}
+
+pub async fn bad_await_in_mutate_and_lock() Int {
+    var c = Counter { n = 1 }
+    mutate c {
+        let v = await yield_val(1)
+        c.n = c.n + v
+    }
+    let m = mutex_new(10)
+    mutex_lock(m)
+    let w = await yield_val(2)
+    mutex_unlock(m)
+    c.n + w
+}
+"#,
+        )
+        .unwrap();
+        let crit_rep = check_program(&crit_prog);
+        let e0603_count = crit_rep.diagnostics.iter().filter(|d| d.code == "E0603").count();
+        assert!(
+            e0603_count >= 2,
+            "expected >=2 E0603 errors (mutate + mutex_lock), got {:?}",
+            crit_rep.diagnostics
+        );
     }
 }

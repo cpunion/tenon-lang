@@ -89,3 +89,48 @@ impl[T] Channel[T] {
         chan_close(self)
     }
 }
+
+// Structured Concurrency: TaskScope guarantees every spawned worker thread is joined
+// deterministically before scope exit, with lock-free cooperative cancellation.
+pub record TaskScope {
+    handles List[Int]
+    cancelled AtomicInt
+}
+
+pub fn task_scope_new() TaskScope {
+    let hs List[Int] = []
+    TaskScope { handles = hs, cancelled = atomic_new(0) }
+}
+
+impl TaskScope {
+    pub fn spawn(inout self, f fn() Int) {
+        let h = thread_spawn(f)
+        self.handles = push(self.handles, h)
+    }
+
+    pub fn cancel(self) {
+        atomic_store(self.cancelled, 1, ORDER_RELEASE)
+    }
+
+    pub fn is_cancelled(self) Bool {
+        atomic_load(self.cancelled, ORDER_ACQUIRE) != 0
+    }
+
+    pub fn len(self) Int {
+        len(self.handles)
+    }
+
+    pub fn join_all(inout self) List[Int] {
+        var results List[Int] = []
+        var i = 0
+        let n = len(self.handles)
+        while i < n {
+            let rv = thread_join(self.handles[i])
+            results = push(results, rv)
+            i += 1
+        }
+        let empty List[Int] = []
+        self.handles = empty
+        results
+    }
+}

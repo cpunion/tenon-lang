@@ -1,0 +1,31 @@
+import "std/sync/sync.tn"
+
+test fn task_scope_structured_concurrency_and_cancel() {
+    let acc = atomic_new(0)
+    var scope = task_scope_new()
+    assert !scope.is_cancelled()
+    assert scope.len() == 0
+
+    scope.spawn(|| {
+        atomic_fetch_add(acc, 10, ORDER_SEQ_CST)
+        11
+    })
+    scope.spawn(|| {
+        atomic_fetch_add(acc, 20, ORDER_SEQ_CST)
+        22
+    })
+    scope.spawn(|| {
+        atomic_fetch_add(acc, 12, ORDER_SEQ_CST)
+        33
+    })
+    assert scope.len() == 3
+
+    let results = scope.join_all()
+    assert scope.len() == 0
+    assert len(results) == 3
+    assert results[0] + results[1] + results[2] == 66
+    assert acc.load(ORDER_SEQ_CST) == 42
+
+    scope.cancel()
+    assert scope.is_cancelled()
+}

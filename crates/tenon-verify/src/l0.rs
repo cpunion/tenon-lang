@@ -537,6 +537,33 @@ impl L0Env {
                 _ => {}
             }
         }
+
+        // General interval refinement: `var <op> expr` refines `var` using `eval_abs_int(expr).interval`
+        if let Some(var) = expr_var_name(left, self_var) {
+            let ri = self.eval_abs_int(right, self_var).interval;
+            let mut cur = self.get_int(&var);
+            match op {
+                BinOp::Le => cur = cur.refine_interval(Interval { min: i64::MIN as i128, max: ri.max }),
+                BinOp::Lt => cur = cur.refine_interval(Interval { min: i64::MIN as i128, max: ri.max.saturating_sub(1) }),
+                BinOp::Ge => cur = cur.refine_interval(Interval { min: ri.min, max: i64::MAX as i128 }),
+                BinOp::Gt => cur = cur.refine_interval(Interval { min: ri.min.saturating_add(1), max: i64::MAX as i128 }),
+                BinOp::Eq => cur = cur.refine_interval(ri),
+                _ => {}
+            }
+            self.set_int(var, cur);
+        } else if let Some(var) = expr_var_name(right, self_var) {
+            let li = self.eval_abs_int(left, self_var).interval;
+            let mut cur = self.get_int(&var);
+            match op {
+                BinOp::Ge => cur = cur.refine_interval(Interval { min: i64::MIN as i128, max: li.max }),
+                BinOp::Gt => cur = cur.refine_interval(Interval { min: i64::MIN as i128, max: li.max.saturating_sub(1) }),
+                BinOp::Le => cur = cur.refine_interval(Interval { min: li.min, max: i64::MAX as i128 }),
+                BinOp::Lt => cur = cur.refine_interval(Interval { min: li.min.saturating_add(1), max: i64::MAX as i128 }),
+                BinOp::Eq => cur = cur.refine_interval(li),
+                _ => {}
+            }
+            self.set_int(var, cur);
+        }
     }
 
     /// Evaluate abstract integer semantics of an expression.
