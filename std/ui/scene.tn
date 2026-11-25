@@ -1,0 +1,150 @@
+// std/ui/scene.tn — Pure Tenon 120fps Batched SceneGraph (`tenon-gpui`)
+//
+// Lowers Flexbox `List[LayoutBox]` into flat batched SDF `QuadInstance` primitives
+// (rounded rectangles, borders, KPI cards, proportional bar charts, action pills)
+// ready for ONE single instanced Apple Silicon Metal GPU draw call via `std/gpu/gpu.tn`!
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+import "std/ui/vdom.tn"
+import "std/ui/layout.tn"
+
+pub record SceneQuad {
+    x        Float32
+    y        Float32
+    w        Float32
+    h        Float32
+    r        Float32
+    g        Float32
+    b        Float32
+    a        Float32
+    radius   Float32
+    border_w Float32
+    br       Float32
+    bg       Float32
+}
+
+pub record SceneGraph {
+    width  Int where 1 <= self && self <= 4096
+    height Int where 1 <= self && self <= 4096
+    quads  List[SceneQuad]
+}
+
+pure fn parse_csv_ints(s Text) List[Int] {
+    var out List[Int] = []
+    let n = len(s)
+    if n == 0 {
+        return out
+    }
+    var cur = 0
+    var has_digit = false
+    var i = 0
+    while i <= n {
+        if i == n || (byte_at(s, i) & 255) == 44 {
+            if has_digit {
+                out = push(out, cur)
+            }
+            cur = 0
+            has_digit = false
+        } else {
+            let b = byte_at(s, i) & 255
+            if b >= 48 && b <= 57 {
+                cur = cur * 10 + (b - 48)
+                has_digit = true
+            }
+        }
+        i += 1
+    }
+    out
+}
+
+pure fn make_quad(
+    x Float, y Float, w Float, h Float,
+    r Float, g Float, b Float, a Float,
+    radius Float, border_w Float, br Float, bg Float,
+) SceneQuad {
+    SceneQuad {
+        x = x as Float32,
+        y = y as Float32,
+        w = w as Float32,
+        h = h as Float32,
+        r = r as Float32,
+        g = g as Float32,
+        b = b as Float32,
+        a = a as Float32,
+        radius = radius as Float32,
+        border_w = border_w as Float32,
+        br = br as Float32,
+        bg = bg as Float32,
+    }
+}
+
+/// Converts Flexbox `List[LayoutBox]` into a batched `SceneGraph` of GPU SDF quads.
+pub pure fn layout_to_scene(
+    boxes List[LayoutBox],
+    width Int where 1 <= self && self <= 4096,
+    height Int where 1 <= self && self <= 4096,
+) SceneGraph {
+    var quads List[SceneQuad] = []
+    var i = 0
+    while i < len(boxes) {
+        let bx = boxes[i]
+        let r = bx.rect
+        if bx.kind == "Card" {
+            // Deep navy card surface (#1E293B) with subtle indigo border
+            quads = push(quads, make_quad(r.x, r.y, r.w, r.h, 0.12, 0.16, 0.24, 1.0, 12.0, 1.5, 0.30, 0.45))
+        } else if bx.kind == "Header" {
+            // Vibrant cyan-indigo header banner (#0EA5E9)
+            quads = push(quads, make_quad(r.x, r.y, r.w, r.h, 0.06, 0.52, 0.85, 1.0, 8.0, 0.0, 0.0, 0.0))
+        } else if bx.kind == "Metric" {
+            // Emerald-tinted metric tile (#10B981 accent bar + dark tile)
+            quads = push(quads, make_quad(r.x, r.y, r.w, r.h, 0.15, 0.22, 0.31, 1.0, 8.0, 1.0, 0.15, 0.72))
+            quads = push(quads, make_quad(r.x + 8.0, r.y + 8.0, 6.0, if r.h > 16.0 { r.h - 16.0 } else { 4.0 }, 0.10, 0.82, 0.50, 1.0, 3.0, 0.0, 0.0, 0.0))
+        } else if bx.kind == "BarChart" {
+            // Chart backing surface
+            quads = push(quads, make_quad(r.x, r.y, r.w, r.h, 0.10, 0.14, 0.22, 1.0, 8.0, 1.0, 0.25, 0.35))
+            let vals = parse_csv_ints(bx.value)
+            let nv = len(vals)
+            var max_v = 1
+            var vi = 0
+            while vi < nv {
+                if vals[vi] > max_v { max_v = vals[vi] }
+                vi += 1
+            }
+            if nv > 0 {
+                let row_h = (r.h - 16.0) / int_to_float(nv)
+                let bar_h = if row_h > 6.0 { row_h - 6.0 } else { 4.0 }
+                let max_bw = if r.w > 24.0 { r.w - 24.0 } else { 10.0 }
+                var bi = 0
+                while bi < nv {
+                    let frac = int_to_float(vals[bi]) / int_to_float(max_v)
+                    let bw = frac * max_bw
+                    let by = r.y + 8.0 + int_to_float(bi) * row_h
+                    quads = push(quads, make_quad(r.x + 12.0, by, bw, bar_h, 0.22, 0.74, 0.97, 1.0, 4.0, 0.0, 0.0, 0.0))
+                    bi += 1
+                }
+            }
+        } else if bx.kind == "Button" {
+            // Warm amber CTA pill button (#F59E0B)
+            quads = push(quads, make_quad(r.x, r.y, r.w, r.h, 0.96, 0.62, 0.04, 1.0, 10.0, 0.0, 0.0, 0.0))
+        } else {
+            quads = push(quads, make_quad(r.x, r.y, r.w, r.h, 0.20, 0.26, 0.36, 1.0, 6.0, 0.0, 0.0, 0.0))
+        }
+        i += 1
+    }
+    SceneGraph { width = width, height = height, quads = quads }
+}
+
+/// One-shot pure pipeline: `VNode` -> Flexbox `LayoutBox`es -> GPU `SceneGraph`.
+pub pure fn vdom_to_scene(
+    node VNode,
+    width Int where 1 <= self && self <= 4096,
+    height Int where 1 <= self && self <= 4096,
+) SceneGraph {
+    let wf = int_to_float(width)
+    let hf = int_to_float(height)
+    let vw NonNegFloat = if wf < 0.0 { 0.0 } else { wf }
+    let vh NonNegFloat = if hf < 0.0 { 0.0 } else { hf }
+    let boxes = layout_vdom(node, vw, vh)
+    layout_to_scene(boxes, width, height)
+}

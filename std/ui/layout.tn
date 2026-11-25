@@ -1,0 +1,201 @@
+// std/ui/layout.tn — Pure Tenon Flexbox Layout Engine with Static `FiniteFloat` / `NonNegFloat` Proofs (`tenon-gpui`)
+//
+// Zero Rust dependencies, zero `NaN` layout bugs: every coordinate `(x, y, w, h)` is
+// statically verified finite & non-negative (`NonNegFloat`), laying out ANY unified
+// `VNode` (from React-like VDOM or OpenUI Lang) into pixel-exact `LayoutBox` rectangles.
+
+import "std/core/types.tn"
+import "std/text/text.tn"
+import "std/ui/vdom.tn"
+
+pub record LayoutRect {
+    x NonNegFloat
+    y NonNegFloat
+    w NonNegFloat
+    h NonNegFloat
+}
+
+pub record LayoutBox {
+    kind  Text
+    key   Text
+    rect  LayoutRect
+    label Text
+    value Text
+    delta Text
+    extra Text
+}
+
+pure fn clamp_nonneg_f(v FiniteFloat) NonNegFloat {
+    if v < 0.0 { 0.0 } else { v }
+}
+
+pure fn safe_div_pos(num NonNegFloat, denom Int) NonNegFloat {
+    let d = if denom <= 0 { 1.0 } else { int_to_float(denom) }
+    let r = num / d
+    if r < 0.0 { 0.0 } else { r }
+}
+
+pure fn intrinsic_height(node VNode) NonNegFloat {
+    match node {
+        VText(_) => 24.0
+        VEl(el) => {
+            let k = vnode_prop_or(el, "data-ui", el.tag)
+            if k == "Header" { 56.0 }
+            else if k == "Row" { 82.0 }
+            else if k == "Metric" { 74.0 }
+            else if k == "BarChart" { 104.0 }
+            else if k == "Button" { 38.0 }
+            else if k == "Text" || k == "Badge" { 28.0 }
+            else { 64.0 }
+        }
+    }
+}
+
+pure fn layout_vnode_rec(
+    node VNode,
+    x NonNegFloat,
+    y NonNegFloat,
+    w NonNegFloat,
+    h NonNegFloat,
+    depth Int,
+    inout out List[LayoutBox],
+) {
+    if depth <= 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    match node {
+        VText(t) => {
+            out = push(out, LayoutBox {
+                kind = "Text",
+                key = "",
+                rect = LayoutRect { x = x, y = y, w = w, h = h },
+                label = t,
+                value = "",
+                delta = "",
+                extra = "",
+            })
+        }
+        VEl(el) => {
+            let k = vnode_prop_or(el, "data-ui", el.tag)
+            if k == "Card" {
+                out = push(out, LayoutBox {
+                    kind = "Card",
+                    key = el.key,
+                    rect = LayoutRect { x = x, y = y, w = w, h = h },
+                    label = el.key,
+                    value = "",
+                    delta = "",
+                    extra = "",
+                })
+                let pad NonNegFloat = 16.0
+                let gap NonNegFloat = 12.0
+                let inner_x = x + pad
+                var cur_y = y + pad
+                let inner_w = clamp_nonneg_f(w - pad * 2.0)
+                let max_y = y + h - pad
+                var i = 0
+                while i < len(el.children) {
+                    let ch = el.children[i]
+                    let ih = intrinsic_height(ch)
+                    let rem = clamp_nonneg_f(max_y - cur_y)
+                    let child_h = if ih < rem { ih } else { rem }
+                    if child_h > 0.0 {
+                        layout_vnode_rec(ch, inner_x, cur_y, inner_w, child_h, depth - 1, out)
+                        cur_y = cur_y + child_h + gap
+                    }
+                    i += 1
+                }
+            } else if k == "Row" {
+                let n = len(el.children)
+                if n <= 0 {
+                    return
+                }
+                let gap NonNegFloat = 12.0
+                let total_gap = if n > 1 { int_to_float(n - 1) * gap } else { 0.0 }
+                let avail_w = clamp_nonneg_f(w - total_gap)
+                let col_w = safe_div_pos(avail_w, n)
+                var i = 0
+                while i < n {
+                    let cx = x + int_to_float(i) * (col_w + gap)
+                    layout_vnode_rec(el.children[i], cx, y, col_w, h, depth - 1, out)
+                    i += 1
+                }
+            } else if k == "Header" {
+                out = push(out, LayoutBox {
+                    kind = "Header",
+                    key = el.key,
+                    rect = LayoutRect { x = x, y = y, w = w, h = h },
+                    label = vnode_prop_or(el, "title", ""),
+                    value = vnode_prop_or(el, "subtitle", ""),
+                    delta = "",
+                    extra = "",
+                })
+            } else if k == "Metric" {
+                out = push(out, LayoutBox {
+                    kind = "Metric",
+                    key = el.key,
+                    rect = LayoutRect { x = x, y = y, w = w, h = h },
+                    label = vnode_prop_or(el, "label", ""),
+                    value = vnode_prop_or(el, "value", ""),
+                    delta = vnode_prop_or(el, "delta", ""),
+                    extra = "",
+                })
+            } else if k == "BarChart" {
+                out = push(out, LayoutBox {
+                    kind = "BarChart",
+                    key = el.key,
+                    rect = LayoutRect { x = x, y = y, w = w, h = h },
+                    label = vnode_prop_or(el, "labels", ""),
+                    value = vnode_prop_or(el, "values", ""),
+                    delta = "",
+                    extra = "",
+                })
+            } else if k == "Button" {
+                var lbl = "Button"
+                if len(el.children) >= 1 {
+                    match el.children[0] {
+                        VText(t) => { lbl = t }
+                        VEl(_) => {}
+                    }
+                }
+                let bw = if w > 140.0 { 140.0 } else { w }
+                out = push(out, LayoutBox {
+                    kind = "Button",
+                    key = el.key,
+                    rect = LayoutRect { x = x, y = y, w = bw, h = h },
+                    label = lbl,
+                    value = vnode_prop_or(el, "data-action", ""),
+                    delta = "",
+                    extra = "",
+                })
+            } else {
+                // Default vertical column container
+                let gap NonNegFloat = 8.0
+                var cur_y = y
+                let max_y = y + h
+                var i = 0
+                while i < len(el.children) {
+                    let ch = el.children[i]
+                    let ih = intrinsic_height(ch)
+                    let rem = clamp_nonneg_f(max_y - cur_y)
+                    let child_h = if ih < rem { ih } else { rem }
+                    if child_h > 0.0 {
+                        layout_vnode_rec(ch, x, cur_y, w, child_h, depth - 1, out)
+                        cur_y = cur_y + child_h + gap
+                    }
+                    i += 1
+                }
+            }
+        }
+    }
+}
+
+/// Computes Flexbox layout boxes for a unified `VNode` tree inside viewport `(viewport_w, viewport_h)`.
+pub pure fn layout_vdom(node VNode, viewport_w NonNegFloat, viewport_h NonNegFloat) List[LayoutBox] {
+    var boxes List[LayoutBox] = []
+    let margin NonNegFloat = 12.0
+    let w = clamp_nonneg_f(viewport_w - margin * 2.0)
+    let h = clamp_nonneg_f(viewport_h - margin * 2.0)
+    layout_vnode_rec(node, margin, margin, w, h, 32, boxes)
+    boxes
+}

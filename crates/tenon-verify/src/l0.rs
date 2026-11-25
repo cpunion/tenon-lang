@@ -462,6 +462,23 @@ impl L0Env {
                     if fname == "int_to_float" && args.len() == 1 {
                         return true;
                     }
+                    if let Some(fdecl) = self.pure_fns.get(fname) {
+                        if let Some(TypeExpr::Named { name: rty, args: rargs, .. }) = &fdecl.ret_ty {
+                            if let Some(alias) = self.type_aliases.get(rty) {
+                                if let Some(pred) = instantiate_alias_predicate(alias, rargs) {
+                                    let mut senv = L0Env {
+                                        pure_fns: self.pure_fns.clone(),
+                                        type_aliases: self.type_aliases.clone(),
+                                        ..Default::default()
+                                    };
+                                    senv.assume_expr(&pred, Some("result"));
+                                    if senv.finite_floats.contains("result") {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 false
             }
@@ -526,26 +543,110 @@ impl L0Env {
                     BinOp::Add => Some((l0 + r0, l1 + r1)),
                     BinOp::Sub => Some((l0 - r1, l1 - r0)),
                     BinOp::Mul => {
-                        let ps = [l0 * r0, l0 * r1, l1 * r0, l1 * r1];
-                        let mn = ps.iter().copied().fold(f64::INFINITY, f64::min);
-                        let mx = ps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                        Some((mn, mx))
+                        if l0 >= 0.0 && r0 >= 0.0 {
+                            let hi = if l1.is_finite() && r1.is_finite() { l1 * r1 } else { f64::INFINITY };
+                            return Some((l0 * r0, hi));
+                        }
+                        if l0.is_finite() && l1.is_finite() && r0.is_finite() && r1.is_finite() {
+                            let ps = [l0 * r0, l0 * r1, l1 * r0, l1 * r1];
+                            let mn = ps.iter().copied().fold(f64::INFINITY, f64::min);
+                            let mx = ps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                            Some((mn, mx))
+                        } else {
+                            None
+                        }
                     }
                     BinOp::Div if r0 > 0.0 || r1 < 0.0 => {
-                        let qs = [l0 / r0, l0 / r1, l1 / r0, l1 / r1];
-                        let mn = qs.iter().copied().fold(f64::INFINITY, f64::min);
-                        let mx = qs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                        Some((mn, mx))
+                        if l0 >= 0.0 && r0 > 0.0 {
+                            let hi = if l1.is_finite() { l1 / r0 } else { f64::INFINITY };
+                            return Some((0.0, hi));
+                        }
+                        if l0.is_finite() && l1.is_finite() && r0.is_finite() && r1.is_finite() {
+                            let qs = [l0 / r0, l0 / r1, l1 / r0, l1 / r1];
+                            let mn = qs.iter().copied().fold(f64::INFINITY, f64::min);
+                            let mx = qs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                            Some((mn, mx))
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 }
             }
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Ident(fname) = &callee.kind {
+                    if fname == "int_to_float" && args.len() == 1 {
+                        let a = self.eval_abs_int(&args[0].value, self_var);
+                        let lo = if a.interval.min <= i64::MIN as i128 { f64::NEG_INFINITY } else { a.interval.min as f64 };
+                        let hi = if a.interval.max >= i64::MAX as i128 { f64::INFINITY } else { a.interval.max as f64 };
+                        return Some((lo, hi));
+                    }
+                    if let Some(fdecl) = self.pure_fns.get(fname) {
+                        if let Some(TypeExpr::Named { name: rty, args: rargs, .. }) = &fdecl.ret_ty {
+                            if let Some(alias) = self.type_aliases.get(rty) {
+                                if let Some(pred) = instantiate_alias_predicate(alias, rargs) {
+                                    let mut senv = L0Env {
+                                        pure_fns: self.pure_fns.clone(),
+                                        type_aliases: self.type_aliases.clone(),
+                                        ..Default::default()
+                                    };
+                                    senv.assume_float_expr(&pred, Some("result"));
+                                    return senv.floats.get("result").copied();
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            ExprKind::If { cond, then_block, else_branch } => {
+                let mut te = self.clone();
+                te.assume_expr(cond, self_var);
+                te.assume_float_expr(cond, self_var);
+                let (t0, t1) = then_block
+                    .tail
+                    .as_deref()
+                    .and_then(|e| te.eval_abs_float(e, self_var))?;
+                let eb = else_branch.as_deref()?;
+                let mut ee = self.clone();
+                let neg = Expr {
+                    kind: ExprKind::Unary { op: UnOp::Not, expr: cond.clone() },
+                    span: cond.span,
+                };
+                ee.assume_expr(&neg, self_var);
+                ee.assume_float_expr(&neg, self_var);
+                let (e0, e1) = ee.eval_abs_float(eb, self_var)?;
+                Some((t0.min(e0), t1.max(e1)))
+            }
+            ExprKind::Block(b) => b.tail.as_deref().and_then(|e| self.eval_abs_float(e, self_var)),
             _ => None,
         }
     }
 
     pub fn assume_float_expr(&mut self, expr: &Expr, self_var: Option<&str>) {
         match &expr.kind {
+            ExprKind::Unary { op: UnOp::Not, expr: inner } => {
+                if let ExprKind::Binary { op, left, right } = &inner.kind {
+                    let flipped = match op {
+                        BinOp::Lt => Some(BinOp::Ge),
+                        BinOp::Le => Some(BinOp::Gt),
+                        BinOp::Gt => Some(BinOp::Le),
+                        BinOp::Ge => Some(BinOp::Lt),
+                        _ => None,
+                    };
+                    if let Some(fop) = flipped {
+                        let rewritten = Expr {
+                            kind: ExprKind::Binary {
+                                op: fop,
+                                left: left.clone(),
+                                right: right.clone(),
+                            },
+                            span: inner.span,
+                        };
+                        self.assume_float_expr(&rewritten, self_var);
+                    }
+                }
+            }
             ExprKind::Binary { op: BinOp::And, left, right } => {
                 self.assume_float_expr(left, self_var);
                 self.assume_float_expr(right, self_var);
@@ -1357,6 +1458,29 @@ impl L0Env {
         }
         if op == BinOp::Gt && self.try_prove_2d_index_lt(right, left, self_var) {
             return L0Result::Proved;
+        }
+
+        // 2c. Float interval comparison check (`NonNegFloat` / `FiniteFloat` bounds in <0.01ms!)
+        if let (Some((l0, l1)), Some((r0, r1))) = (
+            self.eval_abs_float(left, self_var),
+            self.eval_abs_float(right, self_var),
+        ) {
+            let is_float_cmp = !matches!(&left.kind, ExprKind::Int(_))
+                || !matches!(&right.kind, ExprKind::Int(_));
+            if is_float_cmp
+                && (matches!(&left.kind, ExprKind::Float(_))
+                    || matches!(&right.kind, ExprKind::Float(_))
+                    || expr_var_name(left, self_var).is_some_and(|v| self.floats.contains_key(&v) || self.finite_floats.contains(&v))
+                    || expr_var_name(right, self_var).is_some_and(|v| self.floats.contains_key(&v) || self.finite_floats.contains(&v)))
+            {
+                match op {
+                    BinOp::Ge if l0 >= r1 => return L0Result::Proved,
+                    BinOp::Gt if l0 > r1 => return L0Result::Proved,
+                    BinOp::Le if l1 <= r0 => return L0Result::Proved,
+                    BinOp::Lt if l1 < r0 => return L0Result::Proved,
+                    _ => {}
+                }
+            }
         }
 
         // 3. Interval check

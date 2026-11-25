@@ -1,0 +1,34 @@
+// std/ui/gpui_test.tn — Colocated Tests for Pure Tenon Flexbox Layout (`FiniteFloat`) & 120fps SceneGraph
+import "std/ui/vdom.tn"
+import "std/ui/openui.tn"
+import "std/ui/layout.tn"
+import "std/ui/scene.tn"
+
+test fn test_flexbox_layout_and_batched_scene_graph() {
+    let openui = "root = Card([hdr, kpis, chart, btn])\nhdr = Header(\"Tenon GPUI\", \"Pure Tenon Flexbox + Metal\")\nkpis = Row([m1, m2])\nm1 = Metric(\"FPS\", \"120\", \"+0%\")\nm2 = Metric(\"Leaks\", \"0\", \"Perceus\")\nchart = BarChart([\"CPU\", \"GPU\", \"VDOM\"], [40, 120, 90])\nbtn = Button(\"Render\", @render)\n"
+    let doc = openui_parse_stream(openui, true)
+    let tree = openui_to_vdom(doc, ui_store_new())
+
+    let boxes = layout_vdom(tree, 640.0, 400.0)
+    // Expected boxes: Card, Header, Metric 1, Metric 2, BarChart, Button = 6 boxes!
+    assert len(boxes) == 6
+    assert boxes[0].kind == "Card"
+    assert boxes[1].kind == "Header"
+    assert boxes[2].kind == "Metric"
+    assert boxes[3].kind == "Metric"
+    assert boxes[4].kind == "BarChart"
+    assert boxes[5].kind == "Button"
+
+    // Verify Row horizontal split: Metric 2 starts strictly to the right of Metric 1 (zero overlap!)
+    assert boxes[3].rect.x > boxes[2].rect.x + boxes[2].rect.w
+    assert is_finite(boxes[2].rect.w) && boxes[2].rect.w > 200.0
+
+    // Verify vertical stack: Header -> Metrics -> BarChart -> Button strictly non-overlapping!
+    assert boxes[2].rect.y > boxes[1].rect.y + boxes[1].rect.h
+    assert boxes[4].rect.y > boxes[2].rect.y + boxes[2].rect.h
+    assert boxes[5].rect.y > boxes[4].rect.y + boxes[4].rect.h
+
+    // Lower to batched GPU SceneGraph: Card(1) + Header(1) + 2*Metric(4) + BarChart(1 + 3 bars) + Button(1) = 11 quads!
+    let scene = vdom_to_scene(tree, 640, 400)
+    assert len(scene.quads) == 11
+}
