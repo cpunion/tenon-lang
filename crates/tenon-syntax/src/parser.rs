@@ -2474,17 +2474,17 @@ impl Parser {
             }
             TokenKind::While => {
                 let start = self.bump().span;
-                let cond = self.parse_expr()?;
+                let cond = self.parse_expr_no_struct_lit()?;
                 let mut invariants = Vec::new();
                 let mut decreases = None;
                 loop {
                     self.skip_newlines();
                     if self.peek().kind == TokenKind::Invariant {
                         self.bump();
-                        invariants.push(self.parse_expr()?);
+                        invariants.push(self.parse_expr_no_struct_lit()?);
                     } else if self.peek().kind == TokenKind::Decreases {
                         self.bump();
-                        decreases = Some(self.parse_expr()?);
+                        decreases = Some(self.parse_expr_no_struct_lit()?);
                     } else {
                         break;
                     }

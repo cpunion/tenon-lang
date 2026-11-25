@@ -106,6 +106,13 @@ impl LspServer {
                                 "codeActionProvider": true,
                                 "referencesProvider": true,
                                 "renameProvider": true,
+                                "signatureHelpProvider": {
+                                    "triggerCharacters": ["(", ","]
+                                },
+                                "workspaceSymbolProvider": true,
+                                "codeLensProvider": {
+                                    "resolveProvider": false
+                                },
                                 "semanticTokensProvider": {
                                     "legend": {
                                         "tokenTypes": [
@@ -311,6 +318,39 @@ impl LspServer {
                 }
                 "textDocument/semanticTokens/full" => {
                     let result = self.handle_semantic_tokens(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/signatureHelp" => {
+                    let result = self.handle_signature_help(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "workspace/symbol" => {
+                    let result = self.handle_workspace_symbol(&params);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.unwrap_or(Value::Null),
+                        "result": result
+                    });
+                    if write_lsp_message(writer, &resp).is_err() {
+                        return false;
+                    }
+                }
+                "textDocument/codeLens" => {
+                    let result = self.handle_code_lens(&params);
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": id.unwrap_or(Value::Null),
@@ -1371,6 +1411,221 @@ impl LspServer {
             }
         }
         json!({ "changes": Value::Object(changes) })
+    }
+
+    fn handle_signature_help(&self, params: &Value) -> Value {
+        let Some(uri) = params.get("textDocument").and_then(|t| t.get("uri")).and_then(|u| u.as_str()) else {
+            return Value::Null;
+        };
+        let Some(doc) = self.docs.get(uri) else {
+            return Value::Null;
+        };
+        let line = params.get("position").and_then(|p| p.get("line")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let ch = params.get("position").and_then(|p| p.get("character")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let line_str = doc.text.lines().nth(line).unwrap_or("");
+        let prefix: String = line_str.chars().take(ch).collect();
+
+        // Walk backward from cursor to find the enclosing unclosed '(' and count commas at depth 0
+        let bytes = prefix.as_bytes();
+        let mut depth = 0i32;
+        let mut active_param = 0usize;
+        let mut open_paren = None;
+        for idx in (0..bytes.len()).rev() {
+            match bytes[idx] {
+                b')' => depth += 1,
+                b'(' => {
+                    if depth == 0 {
+                        open_paren = Some(idx);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                b',' if depth == 0 => active_param += 1,
+                _ => {}
+            }
+        }
+        let Some(lp) = open_paren else {
+            return Value::Null;
+        };
+        let before = prefix[..lp].trim_end();
+        let callee: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if callee.is_empty() {
+            return Value::Null;
+        }
+        let Some(an) = self.analysis.get(uri) else {
+            return Value::Null;
+        };
+        let Some(prog) = an.full_program.as_ref().or(an.raw_program.as_ref()) else {
+            return Value::Null;
+        };
+
+        let mut sigs = Vec::new();
+        for item in &prog.items {
+            if let Item::Fn(f) = item {
+                if f.name == callee {
+                    let param_labels: Vec<String> = f
+                        .params
+                        .iter()
+                        .map(|p| {
+                            let io = if p.is_inout { "inout " } else { "" };
+                            format!("{}{} {}", io, p.name, p.ty.display_name())
+                        })
+                        .collect();
+                    let ret = f
+                        .ret_ty
+                        .as_ref()
+                        .map(|r| format!(" {}", r.display_name()))
+                        .unwrap_or_default();
+                    let label = format!("fn {}({}){}", f.name, param_labels.join(", "), ret);
+                    let mut doc_lines = Vec::new();
+                    for req in &f.requires {
+                        doc_lines.push(format!("`requires` contract verified statically (line {})", req.span.line));
+                    }
+                    for ens in &f.ensures {
+                        doc_lines.push(format!("`ensures` postcondition verified (line {})", ens.span.line));
+                    }
+                    let param_objs: Vec<Value> = param_labels
+                        .iter()
+                        .map(|pl| json!({ "label": pl }))
+                        .collect();
+                    sigs.push(json!({
+                        "label": label,
+                        "documentation": { "kind": "markdown", "value": doc_lines.join("\n\n") },
+                        "parameters": param_objs
+                    }));
+                }
+            }
+        }
+        if sigs.is_empty() {
+            return Value::Null;
+        }
+        json!({
+            "signatures": sigs,
+            "activeSignature": 0,
+            "activeParameter": active_param
+        })
+    }
+
+    fn handle_workspace_symbol(&self, params: &Value) -> Value {
+        let query = params
+            .get("query")
+            .and_then(|q| q.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let mut results = Vec::new();
+        for (uri, an) in &self.analysis {
+            let Some(prog) = an.raw_program.as_ref().or(an.full_program.as_ref()) else {
+                continue;
+            };
+            for item in &prog.items {
+                let (name, kind, span) = match item {
+                    Item::Fn(f) => (f.name.as_str(), 12u32, f.span),
+                    Item::Record(r) => (r.name.as_str(), 23u32, r.span),
+                    Item::Enum(e) => (e.name.as_str(), 10u32, e.span),
+                    Item::Interface(i) => (i.name.as_str(), 11u32, i.span),
+                    Item::TypeAlias(t) => (t.name.as_str(), 5u32, t.span),
+                    Item::Const(c) => (c.name.as_str(), 14u32, c.span),
+                    _ => continue,
+                };
+                if query.is_empty() || name.to_ascii_lowercase().contains(&query) {
+                    let ln = span.line.saturating_sub(1);
+                    let col = span.col.saturating_sub(1);
+                    results.push(json!({
+                        "name": name,
+                        "kind": kind,
+                        "location": {
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": ln, "character": col },
+                                "end": { "line": ln, "character": col + name.len() }
+                            }
+                        }
+                    }));
+                }
+            }
+        }
+        Value::Array(results)
+    }
+
+    fn handle_code_lens(&self, params: &Value) -> Value {
+        let Some(uri) = params.get("textDocument").and_then(|t| t.get("uri")).and_then(|u| u.as_str()) else {
+            return Value::Array(Vec::new());
+        };
+        let Some(an) = self.analysis.get(uri) else {
+            return Value::Array(Vec::new());
+        };
+        let Some(prog) = an.raw_program.as_ref() else {
+            return Value::Array(Vec::new());
+        };
+        let file_path = self
+            .docs
+            .get(uri)
+            .and_then(|d| d.path.as_ref())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| uri.to_string());
+        let mut lenses = Vec::new();
+        for item in &prog.items {
+            if let Item::Fn(f) = item {
+                let ln = f.span.line.saturating_sub(1);
+                let range = json!({
+                    "start": { "line": ln, "character": 0 },
+                    "end": { "line": ln, "character": 0 }
+                });
+                if f.is_test {
+                    lenses.push(json!({
+                        "range": range,
+                        "command": {
+                            "title": "▶ Run Test",
+                            "command": "tenon.runTest",
+                            "arguments": [file_path, f.name]
+                        }
+                    }));
+                }
+                if let Some(rep) = &an.report {
+                    let fn_start = f.span.start;
+                    let fn_end = f.body.span.end.max(f.span.end);
+                    let proof_count = rep
+                        .proofs
+                        .iter()
+                        .filter(|p| {
+                            p.span.file_id == an.active_file_id
+                                && p.span.start >= fn_start
+                                && p.span.start <= fn_end
+                        })
+                        .count();
+                    let mut badges = Vec::new();
+                    if proof_count > 0 {
+                        badges.push(format!("✓ {} proof{}", proof_count, if proof_count == 1 { "" } else { "s" }));
+                    }
+                    if rep.mir.checkfree_verified_fns.contains(&f.name) {
+                        badges.push("⚡ @checkfree".into());
+                    }
+                    if rep.mir.fip_verified_fns.contains(&f.name) {
+                        badges.push("♻ @fip".into());
+                    }
+                    if rep.mir.arena_verified_fns.contains(&f.name) {
+                        badges.push("⛁ @arena".into());
+                    }
+                    if !badges.is_empty() {
+                        lenses.push(json!({
+                            "range": range,
+                            "command": {
+                                "title": badges.join(" · "),
+                                "command": ""
+                            }
+                        }));
+                    }
+                }
+            }
+        }
+        Value::Array(lenses)
     }
 
     fn handle_semantic_tokens(&self, params: &Value) -> Value {
@@ -2729,5 +2984,70 @@ pub fn demo(r Range[3, 5], inout b Boxed) Int {
         assert!(ren.as_array().unwrap().len() >= 3, "expected >= 3 rename edits");
         let sem = msgs.iter().find(|m| m.get("id") == Some(&json!(6))).unwrap()["result"]["data"].as_array().unwrap();
         assert!(sem.len() >= 25 && sem.len() % 5 == 0, "expected valid semantic token tuples");
+    }
+
+    #[test]
+    fn lsp_signature_help_workspace_symbol_and_code_lens() {
+        let src = r#"@checkfree
+pub pure fn safe_add(a Int where 0 <= self && self <= 100, b Int where 0 <= self && self <= 100) Int {
+    a + b
+}
+
+test fn test_safe_add() {
+    let v = safe_add(10, 20)
+    assert v == 30
+}
+"#;
+        let uri = "file:///tmp/tenon_lsp_r4.tn";
+        let mut input = Vec::new();
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": uri, "languageId": "tenon", "version": 1, "text": src } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "textDocument/signatureHelp",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 6, "character": 25 } }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "workspace/symbol",
+            "params": { "query": "safe_add" }
+        })));
+        input.extend_from_slice(&frame(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "textDocument/codeLens",
+            "params": { "textDocument": { "uri": uri } }
+        })));
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": null })));
+        input.extend_from_slice(&frame(&json!({ "jsonrpc": "2.0", "method": "exit", "params": null })));
+
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        let mut server = LspServer::new();
+        assert!(server.run_loop(&mut reader, &mut output));
+
+        let msgs = read_all_messages(&output);
+        let init = msgs.iter().find(|m| m.get("id") == Some(&json!(1))).unwrap();
+        assert!(init["result"]["capabilities"]["signatureHelpProvider"].is_object());
+        assert_eq!(init["result"]["capabilities"]["workspaceSymbolProvider"], json!(true));
+        assert!(init["result"]["capabilities"]["codeLensProvider"].is_object());
+
+        let sig = &msgs.iter().find(|m| m.get("id") == Some(&json!(2))).unwrap()["result"];
+        assert_eq!(sig["activeParameter"], json!(1));
+        assert!(sig["signatures"][0]["label"].as_str().unwrap().contains("fn safe_add("));
+
+        let wsyms = msgs.iter().find(|m| m.get("id") == Some(&json!(3))).unwrap()["result"].as_array().unwrap();
+        assert!(wsyms.iter().any(|s| s["name"] == "safe_add") && wsyms.iter().any(|s| s["name"] == "test_safe_add"));
+
+        let lenses = msgs.iter().find(|m| m.get("id") == Some(&json!(4))).unwrap()["result"].as_array().unwrap();
+        assert!(
+            lenses.iter().any(|l| l["command"]["title"].as_str().unwrap_or("").contains("▶ Run Test")),
+            "expected Run Test CodeLens, got {:?}",
+            lenses
+        );
+        assert!(
+            lenses.iter().any(|l| l["command"]["title"].as_str().unwrap_or("").contains("@checkfree")),
+            "expected @checkfree CodeLens badge, got {:?}",
+            lenses
+        );
     }
 }

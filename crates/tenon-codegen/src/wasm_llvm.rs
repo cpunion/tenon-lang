@@ -204,8 +204,8 @@ int64_t tenon_rc_ensure_unique(int64_t ptr) {
         tenon_rc_dec(ptr);
         return (int64_t)(uintptr_t)fresh;
     }
-    if (obj->tag == 17 || obj->tag == 18) {
-        int64_t eb = (obj->tag == 17) ? 16 : 32;
+    if (obj->tag == 17 || obj->tag == 18 || obj->tag == 19) {
+        int64_t eb = (obj->tag == 19) ? 4 : ((obj->tag == 17) ? 16 : 32);
         int64_t total_bytes = obj->len * eb;
         int64_t words = (total_bytes + 7) / 8;
         if (words < 2) words = 2;
@@ -605,6 +605,16 @@ pub fn compile_program_to_wasm32_llvm(
                 ));
             }
         }
+    }
+
+    let is_wasi = opts
+        .target_triple
+        .as_deref()
+        .is_some_and(|t| t.contains("wasi"));
+    if is_wasi {
+        exports_c.push_str(
+            "__attribute__((export_name(\"_start\")))\nvoid _start(void) { (void)tenon_fn_main(); }\n",
+        );
     }
 
     let seq = WASM_TMP_SEQ.fetch_add(1, Ordering::Relaxed);

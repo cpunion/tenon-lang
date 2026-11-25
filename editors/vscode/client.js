@@ -122,6 +122,20 @@ async function activate(context) {
     });
   });
   context.subscriptions.push(debugCmd);
+
+  const runTestCmd = vscode.commands.registerCommand('tenon.runTest', async (filePathArg) => {
+    const editor = vscode.window.activeTextEditor;
+    const filePath = filePathArg || (editor && editor.document.uri.fsPath);
+    if (!filePath) {
+      vscode.window.showWarningMessage('Open a .tn test file to run Tenon tests.');
+      return;
+    }
+    const cmd = resolveTenonExecutable(vscode);
+    const term = vscode.window.createTerminal('Tenon Test');
+    term.show(true);
+    term.sendText(`${cmd} test "${filePath}"`);
+  });
+  context.subscriptions.push(runTestCmd);
 }
 
 async function deactivate() {

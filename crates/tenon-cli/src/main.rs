@@ -1424,6 +1424,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     let mut opts = tenon_codegen::llvm_aot::BuildOptions::default();
     let mut emit_mir: Option<PathBuf> = None;
     let mut emit_ts: Option<PathBuf> = None;
+    let mut emit_mjs: Option<PathBuf> = None;
     let mut emit_swift: Option<PathBuf> = None;
     let mut emit_kotlin: Option<PathBuf> = None;
     let mut emit_go: Option<PathBuf> = None;
@@ -1449,6 +1450,10 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             }
             "--emit-ts" if i + 1 < args.len() => {
                 emit_ts = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-mjs" if i + 1 < args.len() => {
+                emit_mjs = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--emit-swift" if i + 1 < args.len() => {
@@ -1550,6 +1555,15 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         let _ = fs::write(p, tenon_codegen::bindings::emit_typescript_bindings(&prog));
         println!("Emitted TypeScript bindings -> `{}`", p.display());
     }
+    if let Some(p) = &emit_mjs {
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let _ = fs::write(p, tenon_codegen::bindings::emit_wasm_mjs_loader(&prog));
+        println!("Emitted Wasm32 ESM Auto-Bridge -> `{}`", p.display());
+    }
     if let Some(p) = &emit_swift {
         let _ = fs::write(p, tenon_codegen::bindings::emit_swift_bindings(&prog));
         println!("Emitted Swift C-ABI bindings -> `{}`", p.display());
@@ -1585,7 +1599,11 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         let _ = fs::write(p, tenon_mir::format_mir(&ssa_mir));
         println!("Emitted Tenon SSA/CFG MIR -> `{}`", p.display());
     }
-    if opts.target_triple.as_deref() == Some("wasm32") {
+    if opts
+        .target_triple
+        .as_deref()
+        .is_some_and(|t| t == "wasm32" || t == "wasm32-wasip2" || t == "wasi")
+    {
         if tenon_codegen::wasm_llvm::has_llvm_wasm32_toolchain() {
             return match tenon_codegen::wasm_llvm::compile_program_to_wasm32_llvm(
                 &prog,

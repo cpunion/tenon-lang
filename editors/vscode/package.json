@@ -34,6 +34,10 @@
       {
         "command": "tenon.debugFile",
         "title": "Tenon: Build & Debug Active File (DWARF -g)"
+      },
+      {
+        "command": "tenon.runTest",
+        "title": "Tenon: Run Test"
       }
     ],
     "keybindings": [

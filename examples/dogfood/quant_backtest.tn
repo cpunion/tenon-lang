@@ -2,17 +2,21 @@
 // Compiles to a C-ABI static library (`libquant.a` + `quant.h` + `quant_cgo.go`) called directly
 // from Go/Wails applications with ZERO runtime overhead and statically proved safety:
 //  - Const `Range[LO, HI]` parameter refinements (positive prices, bounded leverage/BPS)
-//  - `@no_heap_alloc` register-only fee/risk math proved overflow-free (`nsw`)
+//  - `@checkfree` + `@no_heap_alloc` register-only fee/risk math proved 100% check-free & overflow-free (`nsw`)
+//  - Exact `Decimal64` fixed-point notional math (10^8 scale, zero binary float rounding drift)
 //  - Flat unboxed `Float64x4` SIMD 4-bar momentum/dot-product signal kernel
+
+import "std/math/decimal.tn"
 
 pub type Range[LO Int, HI Int] = Int where self >= LO && self <= HI
 pub type PriceCents = Range[1, 1000000000]
 pub type QtyUnits   = Range[1, 1000000]
 pub type FeeBps     = Range[0, 500]
 
-/// Verified order notional & fee check (`@no_heap_alloc`, overflow-free `nsw`).
+/// Verified order notional & fee check (`@checkfree` + `@no_heap_alloc`, zero runtime checks!).
 /// Returns `1` if order notional + fee fits within `max_notional`, else `0`.
 @export("quant_verify_order_risk")
+@checkfree
 @no_heap_alloc
 pub pure fn quant_verify_order_risk(
     price PriceCents,
@@ -25,8 +29,9 @@ pub pure fn quant_verify_order_risk(
     if notional + fee <= max_notional { 1 } else { 0 }
 }
 
-/// Verified EMA step in basis points (`alpha_bps` in `[1, 10000]`, `@no_heap_alloc`).
+/// Verified EMA step in basis points (`alpha_bps` in `[1, 10000]`, `@checkfree` + `@no_heap_alloc`).
 @export("quant_ema_bps")
+@checkfree
 @no_heap_alloc
 pub pure fn quant_ema_bps(
     prev_ema Range[0, 1000000000],
@@ -34,6 +39,14 @@ pub pure fn quant_ema_bps(
     alpha_bps Range[1, 10000]
 ) Int {
     (alpha_bps * price + (10000 - alpha_bps) * prev_ema) / 10000
+}
+
+/// Exact `Decimal64` (10^8 fixed-point) notional computation exposed over C-ABI to Go/Wails!
+@export("quant_decimal_notional_scaled")
+pub pure fn quant_decimal_notional_scaled(price_scaled Int, qty_scaled Int) Int {
+    let p = dec_from_scaled(price_scaled)
+    let q = dec_from_scaled(qty_scaled)
+    dec_mul(p, q).raw
 }
 
 /// 4-wide SIMD `Float64x4` weighted factor signal score (returns score scaled by 100).

@@ -1,0 +1,410 @@
+// examples/bootstrap/tenon_parser.tn — Stage-1 Self-Hosting Pure Tenon Recursive-Descent Parser!
+// Lexes and parses a substantial subset of Tenon (`pub pure fn`, `record`, `let`/`var`, `if/else`,
+// `return`, binary arithmetic/comparison precedence, function calls) into typed AST nodes and
+// pretty-prints canonical formatted Tenon source back out.
+// Zero external dependencies; Perceus RC leak-free (`live_objects == 0`).
+
+import "std/text/text.tn"
+import "std/text/builder.tn"
+
+// Token kinds
+const TK_EOF    Int = 0
+const TK_IDENT  Int = 1
+const TK_INT    Int = 2
+const TK_LPAREN Int = 3
+const TK_RPAREN Int = 4
+const TK_LBRACE Int = 5
+const TK_RBRACE Int = 6
+const TK_COMMA  Int = 7
+const TK_OP     Int = 8
+const TK_EQ     Int = 9
+
+pub record Tok {
+    kind Int
+    text Text
+}
+
+pure fn is_alpha_or_under(b Int) Bool {
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+pure fn is_digit_b(b Int) Bool {
+    b >= 48 && b <= 57
+}
+
+pub pure fn lex_tenon(src Text) List[Tok] {
+    let n = len(src)
+    var out List[Tok] = []
+    var i = 0
+    while i < n {
+        let c = byte_at(src, i)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            i += 1
+        } else if c == 47 && i + 1 < n && byte_at(src, i + 1) == 47 {
+            while i < n && byte_at(src, i) != 10 {
+                i += 1
+            }
+        } else if is_alpha_or_under(c) {
+            let s = i
+            while i < n && (is_alpha_or_under(byte_at(src, i)) || is_digit_b(byte_at(src, i))) {
+                i += 1
+            }
+            out = push(out, Tok { kind = TK_IDENT, text = str_slice(src, s, i) })
+        } else if is_digit_b(c) {
+            let s = i
+            while i < n && is_digit_b(byte_at(src, i)) {
+                i += 1
+            }
+            out = push(out, Tok { kind = TK_INT, text = str_slice(src, s, i) })
+        } else if c == 40 {
+            out = push(out, Tok { kind = TK_LPAREN, text = "(" })
+            i += 1
+        } else if c == 41 {
+            out = push(out, Tok { kind = TK_RPAREN, text = ")" })
+            i += 1
+        } else if c == 123 {
+            out = push(out, Tok { kind = TK_LBRACE, text = "{" })
+            i += 1
+        } else if c == 125 {
+            out = push(out, Tok { kind = TK_RBRACE, text = "}" })
+            i += 1
+        } else if c == 44 {
+            out = push(out, Tok { kind = TK_COMMA, text = "," })
+            i += 1
+        } else if c == 61 && i + 1 < n && byte_at(src, i + 1) == 61 {
+            out = push(out, Tok { kind = TK_OP, text = "==" })
+            i += 2
+        } else if c == 61 {
+            out = push(out, Tok { kind = TK_EQ, text = "=" })
+            i += 1
+        } else if (c == 60 || c == 62 || c == 33) && i + 1 < n && byte_at(src, i + 1) == 61 {
+            out = push(out, Tok { kind = TK_OP, text = str_slice(src, i, i + 2) })
+            i += 2
+        } else {
+            out = push(out, Tok { kind = TK_OP, text = str_slice(src, i, i + 1) })
+            i += 1
+        }
+    }
+    out = push(out, Tok { kind = TK_EOF, text = "" })
+    out
+}
+
+// AST Nodes
+pub record AstParam {
+    name Text
+    ty   Text
+}
+
+pub record AstField {
+    name Text
+    ty   Text
+}
+
+pub enum AstExpr {
+    EInt(Text)
+    EIdent(Text)
+    EBin(Text, AstExpr, AstExpr)
+    ECall(Text, List[AstExpr])
+    EIf(AstExpr, AstExpr, AstExpr)
+}
+
+pub enum AstStmt {
+    SLet(Bool, Text, AstExpr)
+    SReturn(AstExpr)
+    SExpr(AstExpr)
+}
+
+pub record AstFn {
+    is_pub  Bool
+    is_pure Bool
+    name    Text
+    params  List[AstParam]
+    ret_ty  Text
+    stmts   List[AstStmt]
+}
+
+pub record AstRecord {
+    is_pub Bool
+    name   Text
+    fields List[AstField]
+}
+
+pub record AstProgram {
+    records List[AstRecord]
+    fns     List[AstFn]
+}
+
+record Parser {
+    toks List[Tok]
+    pos  Int
+    err  Text
+}
+
+pure fn peek(p Parser) Tok {
+    if p.pos < len(p.toks) { p.toks[p.pos] } else { Tok { kind = TK_EOF, text = "" } }
+}
+
+pure fn bump(inout p Parser) Tok {
+    let t = peek(p)
+    if p.pos + 1 < len(p.toks) {
+        p.pos += 1
+    }
+    t
+}
+
+pure fn eat_text(inout p Parser, want Text) Bool {
+    if peek(p).text == want {
+        let _ = bump(p)
+        true
+    } else {
+        false
+    }
+}
+
+pure fn parse_primary(inout p Parser) AstExpr {
+    let t = peek(p)
+    if t.kind == TK_INT {
+        let _ = bump(p)
+        return EInt(t.text)
+    }
+    if t.kind == TK_IDENT && t.text == "if" {
+        let _ = bump(p)
+        let cond = parse_expr(p)
+        let _ = eat_text(p, "{")
+        let then_e = parse_expr(p)
+        let _ = eat_text(p, "}")
+        let _ = eat_text(p, "else")
+        let _ = eat_text(p, "{")
+        let else_e = parse_expr(p)
+        let _ = eat_text(p, "}")
+        return EIf(cond, then_e, else_e)
+    }
+    if t.kind == TK_IDENT {
+        let _ = bump(p)
+        if peek(p).kind == TK_LPAREN {
+            let _ = bump(p)
+            var args List[AstExpr] = []
+            while peek(p).kind != TK_RPAREN && peek(p).kind != TK_EOF {
+                args = push(args, parse_expr(p))
+                if !eat_text(p, ",") { break }
+            }
+            let _ = eat_text(p, ")")
+            return ECall(t.text, args)
+        }
+        return EIdent(t.text)
+    }
+    if t.kind == TK_LPAREN {
+        let _ = bump(p)
+        let inner = parse_expr(p)
+        let _ = eat_text(p, ")")
+        return inner
+    }
+    p.err = "unexpected token in primary expr: " ++ t.text
+    let _ = bump(p)
+    EInt("0")
+}
+
+pure fn parse_mul(inout p Parser) AstExpr {
+    var lhs = parse_primary(p)
+    while peek(p).text == "*" || peek(p).text == "/" || peek(p).text == "%" {
+        let op = bump(p).text
+        let rhs = parse_primary(p)
+        lhs = EBin(op, lhs, rhs)
+    }
+    lhs
+}
+
+pure fn parse_add(inout p Parser) AstExpr {
+    var lhs = parse_mul(p)
+    while peek(p).text == "+" || peek(p).text == "-" {
+        let op = bump(p).text
+        let rhs = parse_mul(p)
+        lhs = EBin(op, lhs, rhs)
+    }
+    lhs
+}
+
+pure fn parse_expr(inout p Parser) AstExpr {
+    var lhs = parse_add(p)
+    while peek(p).text == "==" || peek(p).text == "!=" ||
+        peek(p).text == "<" || peek(p).text == "<=" ||
+        peek(p).text == ">" || peek(p).text == ">="
+    {
+        let op = bump(p).text
+        let rhs = parse_add(p)
+        lhs = EBin(op, lhs, rhs)
+    }
+    lhs
+}
+
+pure fn parse_fn_decl(inout p Parser, is_pub Bool, is_pure Bool) AstFn {
+    let _ = eat_text(p, "fn")
+    let name = bump(p).text
+    let _ = eat_text(p, "(")
+    var params List[AstParam] = []
+    while peek(p).kind != TK_RPAREN && peek(p).kind != TK_EOF {
+        let pname = bump(p).text
+        let pty = bump(p).text
+        params = push(params, AstParam { name = pname, ty = pty })
+        if !eat_text(p, ",") { break }
+    }
+    let _ = eat_text(p, ")")
+    var ret_ty = ""
+    if peek(p).kind == TK_IDENT {
+        ret_ty = bump(p).text
+    }
+    let _ = eat_text(p, "{")
+    var stmts List[AstStmt] = []
+    while peek(p).kind != TK_RBRACE && peek(p).kind != TK_EOF {
+        if peek(p).text == "let" || peek(p).text == "var" {
+            let is_mut = peek(p).text == "var"
+            let _ = bump(p)
+            let vname = bump(p).text
+            let _ = eat_text(p, "=")
+            let val = parse_expr(p)
+            stmts = push(stmts, SLet(is_mut, vname, val))
+        } else if peek(p).text == "return" {
+            let _ = bump(p)
+            let val = parse_expr(p)
+            stmts = push(stmts, SReturn(val))
+        } else {
+            let e = parse_expr(p)
+            stmts = push(stmts, SExpr(e))
+        }
+    }
+    let _ = eat_text(p, "}")
+    AstFn { is_pub = is_pub, is_pure = is_pure, name = name, params = params, ret_ty = ret_ty, stmts = stmts }
+}
+
+pure fn parse_record_decl(inout p Parser, is_pub Bool) AstRecord {
+    let _ = eat_text(p, "record")
+    let name = bump(p).text
+    let _ = eat_text(p, "{")
+    var fields List[AstField] = []
+    while peek(p).kind != TK_RBRACE && peek(p).kind != TK_EOF {
+        let fname = bump(p).text
+        let fty = bump(p).text
+        fields = push(fields, AstField { name = fname, ty = fty })
+    }
+    let _ = eat_text(p, "}")
+    AstRecord { is_pub = is_pub, name = name, fields = fields }
+}
+
+pub pure fn parse_tenon_program(src Text) Result[AstProgram, Text] {
+    var p = Parser { toks = lex_tenon(src), pos = 0, err = "" }
+    var recs List[AstRecord] = []
+    var fns List[AstFn] = []
+    while peek(p).kind != TK_EOF {
+        let is_pub = eat_text(p, "pub")
+        let is_pure = eat_text(p, "pure")
+        if peek(p).text == "record" {
+            recs = push(recs, parse_record_decl(p, is_pub))
+        } else if peek(p).text == "fn" {
+            fns = push(fns, parse_fn_decl(p, is_pub, is_pure))
+        } else {
+            return Err("unexpected top-level token: " ++ peek(p).text)
+        }
+        if len(p.err) > 0 {
+            return Err(p.err)
+        }
+    }
+    Ok(AstProgram { records = recs, fns = fns })
+}
+
+pure fn fmt_expr(e AstExpr) Text {
+    match e {
+        EInt(s) => s
+        EIdent(s) => s
+        EBin(op, l, r) => "(" ++ fmt_expr(l) ++ " " ++ op ++ " " ++ fmt_expr(r) ++ ")"
+        ECall(nm, args) => {
+            var tb = TextBuilder.new()
+            tb.push_str(nm)
+            tb.push_str("(")
+            var i = 0
+            while i < len(args) {
+                if i > 0 { tb.push_str(", ") }
+                tb.push_str(fmt_expr(args[i]))
+                i += 1
+            }
+            tb.push_str(")")
+            tb.finish()
+        }
+        EIf(c, t, el) => "if " ++ fmt_expr(c) ++ " { " ++ fmt_expr(t) ++ " } else { " ++ fmt_expr(el) ++ " }"
+    }
+}
+
+pub pure fn pretty_print_ast(prog AstProgram) Text {
+    var tb = TextBuilder.new()
+    var ri = 0
+    while ri < len(prog.records) {
+        let r = prog.records[ri]
+        if r.is_pub { tb.push_str("pub ") }
+        tb.push_str("record " ++ r.name ++ " {\n")
+        var fi = 0
+        while fi < len(r.fields) {
+            tb.push_str("    " ++ r.fields[fi].name ++ " " ++ r.fields[fi].ty ++ "\n")
+            fi += 1
+        }
+        tb.push_str("}\n\n")
+        ri += 1
+    }
+    var i = 0
+    while i < len(prog.fns) {
+        let f = prog.fns[i]
+        if f.is_pub { tb.push_str("pub ") }
+        if f.is_pure { tb.push_str("pure ") }
+        tb.push_str("fn " ++ f.name ++ "(")
+        var pi = 0
+        while pi < len(f.params) {
+            if pi > 0 { tb.push_str(", ") }
+            tb.push_str(f.params[pi].name ++ " " ++ f.params[pi].ty)
+            pi += 1
+        }
+        tb.push_str(")")
+        if len(f.ret_ty) > 0 {
+            tb.push_str(" " ++ f.ret_ty)
+        }
+        tb.push_str(" {\n")
+        var si = 0
+        while si < len(f.stmts) {
+            match f.stmts[si] {
+                SLet(is_m, nm, v) => {
+                    let kw = if is_m { "var " } else { "let " }
+                    tb.push_str("    " ++ kw ++ nm ++ " = " ++ fmt_expr(v) ++ "\n")
+                }
+                SReturn(v) => {
+                    tb.push_str("    return " ++ fmt_expr(v) ++ "\n")
+                }
+                SExpr(e) => {
+                    tb.push_str("    " ++ fmt_expr(e) ++ "\n")
+                }
+            }
+            si += 1
+        }
+        tb.push_str("}\n")
+        i += 1
+    }
+    tb.finish()
+}
+
+pub fn main() Int {
+    let sample = "pub record Point { x Int y Int }\npub pure fn score(a Int, b Int) Int {\n    let base = a + b * 2\n    return if base > 10 { add(base, 1) } else { base }\n}\n"
+    match parse_tenon_program(sample) {
+        Ok(ast) => {
+            assert len(ast.records) == 1
+            assert len(ast.fns) == 1
+            assert ast.records[0].name == "Point"
+            assert ast.fns[0].name == "score"
+            assert len(ast.fns[0].params) == 2
+            assert len(ast.fns[0].stmts) == 2
+            let printed = pretty_print_ast(ast)
+            assert printed.contains("(a + (b * 2))")
+            assert printed.contains("add(base, 1)")
+            len(ast.records) + len(ast.fns) + len(ast.fns[0].stmts)
+        }
+        Err(_) => {
+            assert false
+            -1
+        }
+    }
+}
