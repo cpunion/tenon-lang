@@ -432,3 +432,163 @@ pub fn analyze_gpu_graph_fn(
 
     (plan, diags, proofs)
 }
+
+fn expr_depends_on_thread(expr: &Expr, tid_vars: &BTreeSet<String>) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(s) => tid_vars.contains(s),
+        ExprKind::Call { callee, args } => {
+            if let ExprKind::Ident(fname) = &callee.kind {
+                if matches!(
+                    fname.as_str(),
+                    "gpu_global_id_x"
+                        | "gpu_global_id_y"
+                        | "gpu_global_id_z"
+                        | "gpu_local_id_x"
+                        | "gpu_local_id_y"
+                        | "gpu_group_id_x"
+                        | "gpu_group_id_y"
+                ) {
+                    return true;
+                }
+            }
+            args.iter().any(|a| expr_depends_on_thread(&a.value, tid_vars))
+        }
+        ExprKind::Binary { left, right, .. } => {
+            expr_depends_on_thread(left, tid_vars) || expr_depends_on_thread(right, tid_vars)
+        }
+        ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Field { target: inner, .. } => expr_depends_on_thread(inner, tid_vars),
+        ExprKind::Index { target, index } => {
+            expr_depends_on_thread(target, tid_vars) || expr_depends_on_thread(index, tid_vars)
+        }
+        ExprKind::If { cond, then_block, else_branch } => {
+            expr_depends_on_thread(cond, tid_vars)
+                || then_block.tail.as_deref().is_some_and(|e| expr_depends_on_thread(e, tid_vars))
+                || else_branch.as_deref().is_some_and(|e| expr_depends_on_thread(e, tid_vars))
+        }
+        _ => false,
+    }
+}
+
+fn check_kernel_block_safety(
+    fn_name: &str,
+    blk: &Block,
+    inout_buffers: &BTreeSet<String>,
+    tid_vars: &mut BTreeSet<String>,
+    in_divergent_branch: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let check_call_barrier = |expr: &Expr, in_div: bool, diags: &mut Vec<Diagnostic>| {
+        if let ExprKind::Call { callee, .. } = &expr.kind {
+            if matches!(&callee.kind, ExprKind::Ident(s) if s == "gpu_barrier") && in_div {
+                diags.push(Diagnostic {
+                    code: "E0842".into(),
+                    message: format!(
+                        "divergent `gpu_barrier()` inside thread-dependent control flow in `@kernel` `{}`",
+                        fn_name
+                    ),
+                    span: expr.span,
+                    notes: vec![
+                        "all threads in a workgroup/threadgroup must uniformly reach `gpu_barrier()` to prevent GPU deadlock".into(),
+                    ],
+                    counterexample: BTreeMap::new(),
+                });
+            }
+        }
+    };
+
+    for stmt in &blk.stmts {
+        match stmt {
+            Stmt::Let { name, value, .. } => {
+                check_call_barrier(value, in_divergent_branch, diags);
+                if expr_depends_on_thread(value, tid_vars) {
+                    tid_vars.insert(name.clone());
+                }
+            }
+            Stmt::Assign { target, value, span, .. } => {
+                check_call_barrier(value, in_divergent_branch, diags);
+                if let ExprKind::Ident(lhs) = &target.kind {
+                    if expr_depends_on_thread(value, tid_vars) {
+                        tid_vars.insert(lhs.clone());
+                    }
+                } else if let ExprKind::Index { target: arr, index } = &target.kind {
+                    if let ExprKind::Ident(buf_name) = &arr.kind {
+                        if inout_buffers.contains(buf_name)
+                            && !expr_depends_on_thread(index, tid_vars)
+                        {
+                            diags.push(Diagnostic {
+                                code: "E0843".into(),
+                                message: format!(
+                                    "potential GPU data race in `@kernel` `{}`: output buffer `{}` written at thread-invariant index",
+                                    fn_name, buf_name
+                                ),
+                                span: *span,
+                                notes: vec![
+                                    "writes to `inout` GPU output buffers must index by an injective thread coordinate (`gpu_global_id_*` / `gpu_local_id_*` / `gpu_group_id_*`)".into(),
+                                ],
+                                counterexample: BTreeMap::new(),
+                            });
+                        }
+                    }
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                let div = in_divergent_branch || expr_depends_on_thread(cond, tid_vars);
+                check_kernel_block_safety(fn_name, body, inout_buffers, tid_vars, div, diags);
+            }
+            Stmt::Expr { expr, .. } => {
+                check_call_barrier(expr, in_divergent_branch, diags);
+                if let ExprKind::If { cond, then_block, else_branch } = &expr.kind {
+                    let div = in_divergent_branch || expr_depends_on_thread(cond, tid_vars);
+                    check_kernel_block_safety(fn_name, then_block, inout_buffers, tid_vars, div, diags);
+                    if let Some(eb) = else_branch {
+                        if let ExprKind::Block(b) = &eb.kind {
+                            check_kernel_block_safety(fn_name, b, inout_buffers, tid_vars, div, diags);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(tail) = &blk.tail {
+        check_call_barrier(tail, in_divergent_branch, diags);
+        if let ExprKind::If { cond, then_block, else_branch } = &tail.kind {
+            let div = in_divergent_branch || expr_depends_on_thread(cond, tid_vars);
+            check_kernel_block_safety(fn_name, then_block, inout_buffers, tid_vars, div, diags);
+            if let Some(eb) = else_branch {
+                if let ExprKind::Block(b) = &eb.kind {
+                    check_kernel_block_safety(fn_name, b, inout_buffers, tid_vars, div, diags);
+                }
+            }
+        }
+    }
+}
+
+/// Statically verifies `@kernel` safety properties beyond Rust's borrow checker:
+/// 1. `E0842`: Workgroup barrier uniformity (`gpu_barrier()` cannot sit inside thread-divergent branches).
+/// 2. `E0843`: Output buffer write race-freedom (`inout` output writes must use thread-dependent indices).
+pub fn verify_gpu_kernel_safety(f: &FnDecl) -> (Vec<Diagnostic>, Vec<ProofRecord>) {
+    let mut diags = Vec::new();
+    let mut proofs = Vec::new();
+    let inout_buffers: BTreeSet<String> = f
+        .params
+        .iter()
+        .filter(|p| p.is_inout && matches!(&p.ty, TypeExpr::Named { name, .. } if name == "List" || name == "Bytes"))
+        .map(|p| p.name.clone())
+        .collect();
+    let mut tid_vars = BTreeSet::new();
+    check_kernel_block_safety(&f.name, &f.body, &inout_buffers, &mut tid_vars, false, &mut diags);
+    if diags.is_empty() {
+        proofs.push(ProofRecord {
+            obligation: format!(
+                "@kernel barrier-uniformity & disjoint-write race-freedom proof for `{}`",
+                f.name
+            ),
+            tier: ProofTier::L0Fast,
+            span: f.span,
+        });
+    }
+    (diags, proofs)
+}

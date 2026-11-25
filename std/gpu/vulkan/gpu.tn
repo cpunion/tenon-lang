@@ -1,0 +1,43 @@
+// std/gpu/vulkan/gpu.tn — Zero-Rust Portable Vulkan Compute HAL (`@linear` VRAM Handles)
+//
+// Shares the exact same `@linear` resource discipline as `std/gpu/metal/gpu.tn` for Linux/Windows/MoltenVK.
+
+import "std/core/types.tn"
+
+extern "C" {
+    fn tn_vk_init() Int
+    fn tn_vk_device_name_cstr() Ptr[UInt8]
+    fn tn_vk_buf_create(data_ptr Ptr[UInt8], byte_len Int) Int
+    fn tn_vk_buf_read(handle Int, dst_ptr Ptr[UInt8], byte_len Int) Int
+    fn tn_vk_buf_free(handle Int) Int
+}
+
+@linear
+pub record VkBuffer {
+    handle   Int
+    byte_len Int
+}
+
+pub fn vk_init() Bool {
+    unsafe { tn_vk_init() != 0 }
+}
+
+pub fn vk_device_name() Text {
+    unsafe { cstr_to_text(tn_vk_device_name_cstr()) }
+}
+
+impl VkBuffer {
+    pub fn from_f32_list(xs List[Float32]) VkBuffer {
+        let nb = len(xs) * 4
+        let h = unsafe { tn_vk_buf_create(list_data_ptr(xs), nb) }
+        VkBuffer { handle = h, byte_len = nb }
+    }
+
+    pub fn read_into_f32(inout self, inout out List[Float32]) Int {
+        unsafe { tn_vk_buf_read(self.handle, list_data_ptr(out), len(out) * 4) }
+    }
+
+    pub fn destroy(self) {
+        let _ = unsafe { tn_vk_buf_free(self.handle) }
+    }
+}

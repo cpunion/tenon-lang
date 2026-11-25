@@ -1519,6 +1519,7 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
     let mut emit_mir: Option<PathBuf> = None;
     let mut emit_msl: Option<PathBuf> = None;
     let mut emit_wgsl: Option<PathBuf> = None;
+    let mut emit_webgpu: Option<PathBuf> = None;
     let mut emit_ts: Option<PathBuf> = None;
     let mut emit_mjs: Option<PathBuf> = None;
     let mut emit_swift: Option<PathBuf> = None;
@@ -1546,6 +1547,10 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
             }
             "--emit-wgsl" if i + 1 < args.len() => {
                 emit_wgsl = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--emit-webgpu" if i + 1 < args.len() => {
+                emit_webgpu = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--emit-header" if i + 1 < args.len() => {
@@ -1724,6 +1729,16 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
         let wgsl = tenon_codegen::gpu_shader::emit_wgsl(&prog, &report.mir);
         let _ = fs::write(p, &wgsl);
         println!("Emitted WebGPU WGSL ({} bytes) -> `{}`", wgsl.len(), p.display());
+    }
+    if let Some(p) = &emit_webgpu {
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let mjs = tenon_codegen::gpu_shader::emit_webgpu_host_mjs(&prog, &report.mir);
+        let _ = fs::write(p, &mjs);
+        println!("Emitted Browser WebGPU ESM Host ({} bytes) -> `{}`", mjs.len(), p.display());
     }
     if opts
         .target_triple

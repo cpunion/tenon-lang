@@ -371,6 +371,12 @@ int64_t tenon_list_data_ptr(int64_t xs) {
 int64_t tenon_gpu_gid_x(void) { return 0; }
 int64_t tenon_gpu_gid_y(void) { return 0; }
 int64_t tenon_gpu_gid_z(void) { return 0; }
+int64_t tenon_gpu_lid_x(void) { return 0; }
+int64_t tenon_gpu_lid_y(void) { return 0; }
+int64_t tenon_gpu_wgid_x(void) { return 0; }
+int64_t tenon_gpu_wgid_y(void) { return 0; }
+int64_t tenon_gpu_barrier(void) { return 0; }
+int64_t tenon_gpu_shared_f32(int64_t n) { int64_t z = 0; return tenon_flat_list_filled(n, 4, &z); }
 
 int64_t tenon_text_cstr_ptr(int64_t s) {
     if (s == 0) return (int64_t)(uintptr_t)"";

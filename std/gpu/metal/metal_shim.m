@@ -152,6 +152,35 @@ int64_t tn_metal_dispatch_compute4(
     }
 }
 
+int64_t tn_metal_dispatch_threadgroups4(
+    int64_t pipe_handle,
+    int64_t b0, int64_t b1, int64_t b2, int64_t b3,
+    int64_t tgx, int64_t tgy, int64_t tgz,
+    int64_t tx, int64_t ty, int64_t tz
+) {
+    if (pipe_handle <= 0 || pipe_handle >= MAX_HANDLES || g_pipelines[pipe_handle] == nil) return 0;
+    if (tgx <= 0 || tgy <= 0 || tgz <= 0 || tx <= 0 || ty <= 0 || tz <= 0) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pso = g_pipelines[pipe_handle];
+        id<MTLCommandBuffer> cmd = [g_mtl_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        int64_t bs[4] = { b0, b1, b2, b3 };
+        for (int i = 0; i < 4; i++) {
+            if (bs[i] > 0 && bs[i] < MAX_HANDLES && g_buffers[bs[i]] != nil) {
+                [enc setBuffer:g_buffers[bs[i]] offset:0 atIndex:(NSUInteger)i];
+            }
+        }
+        MTLSize groups = MTLSizeMake((NSUInteger)tgx, (NSUInteger)tgy, (NSUInteger)tgz);
+        MTLSize threads = MTLSizeMake((NSUInteger)tx, (NSUInteger)ty, (NSUInteger)tz);
+        [enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        return ([cmd status] == MTLCommandBufferStatusCompleted) ? 1 : 0;
+    }
+}
+
 static const char* kTenonGpuiQuadShaderMSL =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"

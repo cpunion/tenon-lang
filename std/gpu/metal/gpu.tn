@@ -26,6 +26,19 @@ extern "C" {
         gy Int,
         gz Int,
     ) Int
+    fn tn_metal_dispatch_threadgroups4(
+        pipe Int,
+        b0 Int,
+        b1 Int,
+        b2 Int,
+        b3 Int,
+        tgx Int,
+        tgy Int,
+        tgz Int,
+        tx Int,
+        ty Int,
+        tz Int,
+    ) Int
     fn tn_metal_render_quads_offscreen(
         quads_ptr Ptr[UInt8],
         quad_count Int,
@@ -136,6 +149,24 @@ impl GpuComputePipeline {
     ) Bool {
         unsafe {
             tn_metal_dispatch_compute4(self.handle, b0.handle, b1.handle, b2.handle, b3.handle, gx, gy, gz) != 0
+        }
+    }
+
+    /// Dispatches explicit threadgroup/workgroup dimensions (for `gpu_shared_f32` tiled kernels).
+    pub fn dispatch_tiled4(
+        inout self,
+        inout b0 GpuBuffer,
+        inout b1 GpuBuffer,
+        inout b2 GpuBuffer,
+        inout b3 GpuBuffer,
+        tgx Int, tgy Int, tgz Int,
+        tx Int, ty Int, tz Int,
+    ) Bool {
+        unsafe {
+            tn_metal_dispatch_threadgroups4(
+                self.handle, b0.handle, b1.handle, b2.handle, b3.handle,
+                tgx, tgy, tgz, tx, ty, tz,
+            ) != 0
         }
     }
 

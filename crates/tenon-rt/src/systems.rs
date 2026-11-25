@@ -527,6 +527,26 @@ pub extern "C" fn tenon_gpu_gid_y() -> i64 { 0 }
 pub extern "C" fn tenon_gpu_gid_z() -> i64 { 0 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_lid_x() -> i64 { 0 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_lid_y() -> i64 { 0 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_wgid_x() -> i64 { 0 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_wgid_y() -> i64 { 0 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_barrier() -> i64 { 0 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tenon_gpu_shared_f32(n: i64) -> i64 {
+    crate::perceus::tenon_list_filled(n, 0, 0)
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn tenon_text_cstr_ptr(s: i64) -> i64 {
     if s == 0 {
         return c"".as_ptr() as i64;

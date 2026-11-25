@@ -2281,6 +2281,8 @@ impl CheckerCtx {
                             generic_ty("List", vec![named_ty("Any")])
                         } else if b.ret_type == "List[Int]" {
                             generic_ty("List", vec![named_ty("Int")])
+                        } else if b.ret_type == "List[Float32]" {
+                            generic_ty("List", vec![named_ty("Float32")])
                         } else if b.ret_type == "Option[Any]" {
                             generic_ty("Option", vec![named_ty("Any")])
                         } else if b.ret_type == "Result[Any, Any]" {
@@ -2929,6 +2931,11 @@ impl CheckerCtx {
                     &is_param_borrowing,
                 );
                 self.diagnostics.extend(lin_diags);
+            }
+            if crate::gpu_graph::has_kernel_attr(&f.attrs) {
+                let (k_diags, k_proofs) = crate::gpu_graph::verify_gpu_kernel_safety(f);
+                self.diagnostics.extend(k_diags);
+                self.proofs.extend(k_proofs);
             }
             if crate::gpu_graph::has_gpu_graph_attr(&f.attrs) {
                 let (plan, g_diags, g_proofs) =

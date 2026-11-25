@@ -171,6 +171,7 @@ fn ir_uses_systems_core(ir: &str) -> bool {
         || ir.contains("call i64 @tenon_popcnt")
         || ir.contains("call i64 @tenon_bswap")
         || ir.contains("call i64 @tenon_rot")
+        || ir.contains("call i64 @tenon_gpu_")
         || ir_uses_net_runtime(ir)
 }
 
