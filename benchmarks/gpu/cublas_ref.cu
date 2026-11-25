@@ -86,7 +86,9 @@ static void cublas_mm_f16(cublasHandle_t h, const half* x, const half* w, half* 
 int main() {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    double peak_gbs = 2.0 * (double)prop.memoryClockRate * 1e3 * ((double)prop.memoryBusWidth / 8.0) / 1e9;
+    int mem_clk_khz = 0;
+    cudaDeviceGetAttribute(&mem_clk_khz, cudaDevAttrMemoryClockRate, 0);
+    double peak_gbs = 2.0 * (double)mem_clk_khz * 1e3 * ((double)prop.memoryBusWidth / 8.0) / 1e9;
     cudaStream_t stream;
     cudaStreamCreate(&stream);
     cublasHandle_t cublas;
