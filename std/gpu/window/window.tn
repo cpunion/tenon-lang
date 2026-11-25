@@ -1,4 +1,4 @@
-// std/gpu/window/window.tn — Pure Tenon Native macOS Metal Desktop Window API (`tenon-gpui`)
+// std/gpu/window/window.tn — Pure Tenon Native macOS Metal Desktop Window + GPU Glyph Atlas API (`tenon-gpui`)
 //
 // Zero Rust dependencies: links directly against macOS Cocoa + Metal + QuartzCore + CoreGraphics + CoreText + ImageIO.
 
@@ -13,6 +13,11 @@ import "std/core/types.tn"
 extern "C" {
     fn tn_win_open(title_cstr Ptr[UInt8], width Int, height Int, headless Int) Int
     fn tn_win_device_name() Ptr[UInt8]
+    fn tn_win_width() Int
+    fn tn_win_height() Int
+    fn tn_win_set_scissor(x Int, y Int, w Int, h Int) Int
+    fn tn_win_clear_scissor() Int
+    fn tn_win_clipboard_get() Ptr[UInt8]
     fn tn_win_begin_text() Int
     fn tn_win_draw_text(
         text_cstr Ptr[UInt8],
@@ -32,9 +37,9 @@ extern "C" {
 }
 
 pub record WinEvent {
-    kind Int // 0=none, 1=key, 2=mouse_down, 3=quit
-    a    Int // keycode or mouse_x
-    b    Int // char code or mouse_y
+    kind Int // 0=none, 1=key, 2=mouse_down, 3=quit, 4=resize(w,h), 5=scroll(dx,dy), 6=hover(x,y)
+    a    Int
+    b    Int
 }
 
 pub fn win_open(title Text, width Int, height Int, headless Bool) Bool {
@@ -44,6 +49,21 @@ pub fn win_open(title Text, width Int, height Int, headless Bool) Bool {
 
 pub fn win_gpu_name() Text {
     unsafe { cstr_to_text(tn_win_device_name()) }
+}
+
+pub fn win_width() Int { unsafe { tn_win_width() } }
+pub fn win_height() Int { unsafe { tn_win_height() } }
+
+pub fn win_set_scissor(x Int, y Int, w Int, h Int) {
+    let _ = unsafe { tn_win_set_scissor(x, y, w, h) }
+}
+
+pub fn win_clear_scissor() {
+    let _ = unsafe { tn_win_clear_scissor() }
+}
+
+pub fn win_clipboard_get() Text {
+    unsafe { cstr_to_text(tn_win_clipboard_get()) }
 }
 
 pub fn win_begin_text() {

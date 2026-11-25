@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Tenon OpenUI + Wasm32 VDOM Studio</title>
+  <title>Tenon OpenUI + Wasm32 Surgical VDOM &amp; AI Generative UI Studio</title>
   <style>
     :root {
       --bg: #0b1120;
@@ -30,25 +30,44 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 14px 22px;
+      padding: 12px 22px;
       border-bottom: 1px solid var(--border);
       background: #0f172a;
+      flex-wrap: wrap;
+      gap: 10px;
     }
-    .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 16px; }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px; }
     .pill {
       display: inline-flex; align-items: center; gap: 6px;
       font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
       background: rgba(16, 185, 129, 0.14); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35);
     }
     .pill.blue { background: rgba(56, 189, 248, 0.14); color: #38bdf8; border-color: rgba(56, 189, 248, 0.35); }
+    .pill.amber { background: rgba(245, 158, 11, 0.14); color: #fbbf24; border-color: rgba(245, 158, 11, 0.35); }
+
+    /* AI Generative UI Prompt Bar */
+    .ai-bar {
+      display: flex; flex-direction: column; gap: 8px;
+      padding: 12px 22px; background: #0d1526; border-bottom: 1px solid var(--border);
+    }
+    .ai-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .ai-row input[type="text"], .ai-row input[type="password"] {
+      background: #090e1a; color: #f8fafc; border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 12px; font-size: 13px;
+    }
+    #ai-prompt { flex: 1; min-width: 260px; }
+    .api-cfg { display: none; gap: 8px; flex-wrap: wrap; }
+    .api-cfg.open { display: flex; }
+    .api-cfg input { flex: 1; min-width: 180px; font-family: monospace; font-size: 12px; }
+
     main {
       display: grid;
-      grid-template-columns: 1fr 1.1fr;
+      grid-template-columns: 1fr 1.15fr;
       gap: 16px;
       padding: 16px 22px;
       flex: 1;
     }
-    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    @media (max-width: 920px) { main { grid-template-columns: 1fr; } }
     .pane {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -58,7 +77,7 @@
       flex-direction: column;
       gap: 12px;
     }
-    .pane h3 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .pane h3 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     button.ctrl {
       background: #1e293b; color: var(--text); border: 1px solid var(--border);
@@ -66,8 +85,9 @@
     }
     button.ctrl:hover { border-color: var(--accent); color: #fff; }
     button.ctrl.primary { background: #0284c7; border-color: #38bdf8; color: #fff; }
+    button.ctrl.ai { background: #059669; border-color: #34d399; color: #fff; }
     textarea {
-      width: 100%; height: 220px; resize: vertical;
+      width: 100%; height: 210px; resize: vertical;
       background: #090e1a; color: #7dd3fc; border: 1px solid var(--border); border-radius: 8px;
       padding: 12px; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; line-height: 1.5;
     }
@@ -82,7 +102,7 @@
     /* Rendered OpenUI VDOM Styles */
     #preview-stage {
       background: #090e1a; border: 1px solid var(--border); border-radius: 10px;
-      padding: 16px; min-height: 280px;
+      padding: 16px; min-height: 290px;
     }
     #preview-stage [data-ui="Card"] {
       background: #1e293b; border: 1px solid #3b82f680; border-radius: 12px;
@@ -99,7 +119,9 @@
       flex: 1; min-width: 140px; background: #0f172a; border: 1px solid #334155;
       border-left: 4px solid var(--green); border-radius: 8px; padding: 12px;
       display: flex; flex-direction: column; gap: 4px;
+      transition: box-shadow 0.25s;
     }
+    #preview-stage .vdom-patched { box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.75); }
     #preview-stage [data-role="label"] { font-size: 12px; color: var(--muted); }
     #preview-stage [data-role="value"] { font-size: 22px; color: #fff; }
     #preview-stage [data-role="delta"] { font-size: 12px; color: #34d399; font-style: normal; font-weight: 600; }
@@ -112,10 +134,10 @@
     }
     #preview-stage [data-ui="Button"]:hover { filter: brightness(1.1); }
     .chart-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 12px; }
-    .chart-lbl { width: 48px; color: var(--muted); font-family: monospace; }
+    .chart-lbl { width: 56px; color: var(--muted); font-family: monospace; }
     .chart-bar-wrap { flex: 1; background: #1e293b; border-radius: 4px; height: 18px; overflow: hidden; }
     .chart-bar { height: 100%; background: linear-gradient(90deg, #0ea5e9, #38bdf8); border-radius: 4px; transition: width 0.2s; }
-    .chart-num { width: 42px; text-align: right; font-family: monospace; color: #7dd3fc; }
+    .chart-num { width: 46px; text-align: right; font-family: monospace; color: #7dd3fc; }
     pre.codebox {
       margin: 0; background: #090e1a; border: 1px solid var(--border); border-radius: 8px;
       padding: 10px 12px; font-size: 12px; color: #a5f3fc; overflow-x: auto; max-height: 150px;
@@ -126,39 +148,54 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <span>Tenon OpenUI + Wasm32 VDOM Studio</span>
+      <span>Tenon OpenUI + Surgical Wasm32 VDOM Studio</span>
       <span class="pill blue" id="wasm-size">65 KB Wasm32</span>
     </div>
-    <div style="display:flex; gap:10px; align-items:center;">
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <span class="pill amber" id="patch-mode">DOM Mode: Mount</span>
       <span class="pill" id="leak-meter">Perceus Live Objects: 0</span>
       <span class="pill blue" id="render-time">Render: 0.00ms</span>
     </div>
   </header>
+
+  <section class="ai-bar">
+    <div class="ai-row">
+      <input id="ai-prompt" type="text" placeholder="Ask AI to generate an OpenUI interface (e.g. 'BTC quant backtest dashboard', 'Kubernetes cluster', 'Metal GPU profiler')..." />
+      <button class="ctrl ai" id="btn-ai-gen">Generate UI (LLM Stream)</button>
+      <button class="ctrl" id="btn-api-cfg">LLM API Settings</button>
+    </div>
+    <div class="api-cfg" id="api-cfg-panel">
+      <input id="llm-url" type="text" placeholder="OpenAI/Ollama Base URL (leave blank for built-in offline stream)" value="" />
+      <input id="llm-model" type="text" placeholder="Model (e.g. gpt-4o-mini / qwen2.5)" value="qwen2.5" />
+      <input id="llm-key" type="password" placeholder="Bearer API Key (optional for local Ollama)" value="" />
+    </div>
+  </section>
 
   <main>
     <section class="pane">
       <h3>1. OpenUI Lang Source (Streaming DSL)</h3>
       <div class="toolbar">
         <button class="ctrl primary" id="btn-stream">Stream Like LLM</button>
-        <button class="ctrl" id="btn-preset-saas">SaaS Preset</button>
-        <button class="ctrl" id="btn-preset-gpu">Metal GPU Preset</button>
-        <button class="ctrl" id="btn-prompt">Toggle System Prompt</button>
+        <button class="ctrl" id="btn-preset-saas">SaaS</button>
+        <button class="ctrl" id="btn-preset-gpu">Metal GPU</button>
+        <button class="ctrl" id="btn-preset-quant">Quant Backtest</button>
+        <button class="ctrl" id="btn-prompt">System Prompt</button>
       </div>
       <textarea id="openui-input" spellcheck="false"></textarea>
       <div class="state-row">
-        <label for="users-slider">Reactive <code>$users</code>:</label>
+        <label for="users-slider">Reactive <code>$users</code> (Surgical Patch):</label>
         <input id="users-slider" type="range" min="1000" max="50000" step="100" value="12480" />
         <span class="state-val" id="users-val">12,480</span>
       </div>
-      <h3>2. Minimal VDOM JSON Diff (Computed Inside Wasm32)</h3>
+      <h3>2. Minimal VDOM JSON Diff (Computed in Wasm32 &amp; Applied Surgically to DOM)</h3>
       <pre class="codebox" id="patch-output">[]</pre>
       <pre class="codebox" id="prompt-output" style="display:none;"></pre>
     </section>
 
     <section class="pane">
-      <h3>3. Live Rendered DOM (From Tenon Wasm32 Kernel)</h3>
+      <h3>3. Live Rendered DOM (Surgical Patching — Focus &amp; Animations Preserved)</h3>
       <div id="preview-stage">Loading Tenon Wasm32 kernel...</div>
-      <div class="logbox" id="action-log">Click any @action button in the rendered OpenUI card above.</div>
+      <div class="logbox" id="action-log">Drag $users to watch surgical DOM patching (0 innerHTML rebuilds), or click any @action button.</div>
     </section>
   </main>
 
@@ -166,7 +203,7 @@
     import { loadTenonWasm } from "./openui.mjs";
 
     const PRESET_SAAS = `root = Card([hdr, kpis, chart, btn])
-hdr = Header("Tenon OpenUI Dashboard", "Live Wasm32 VDOM + Zero-Leak Perceus")
+hdr = Header("Tenon OpenUI Dashboard", "Surgical Wasm32 VDOM Patching + Zero-Leak Perceus")
 kpis = Row([m1, m2, m3])
 m1 = Metric("Active Users", $users, "+19%")
 m2 = Metric("P99 Latency", "0.42ms", "-31%")
@@ -175,12 +212,30 @@ chart = BarChart(["Web", "TUI", "Metal"], [120, 165, 240])
 btn = Button("Deploy Release", @deploy)`;
 
     const PRESET_GPU = `root = Card([hdr, kpis, chart, btn])
-hdr = Header("Apple Silicon Metal Cluster", "Declarative @gpu_graph + Fused Kernels")
+hdr = Header("Apple Silicon Metal Cluster", "Declarative @gpu_graph + AST-Fused Kernels + E0842/E0843")
 kpis = Row([m1, m2])
-m1 = Metric("Active Streams", $users, "120Hz")
+m1 = Metric("Active Threads", $users, "120Hz")
 m2 = Metric("Fused Passes", "2 -> 1", "-50% VRAM")
-chart = BarChart(["MatMul", "Bias", "ReLU", "SDF"], [210, 95, 80, 185])
+chart = BarChart(["TiledMM", "Fused", "SDF", "Atlas"], [240, 195, 185, 220])
 btn = Button("Dispatch Compute", @dispatch_gpu)`;
+
+    const PRESET_QUANT = `root = Card([hdr, kpis, chart, btn])
+hdr = Header("BTC-USD Verified Quant Backtest", "NonNegFloat + Decimal64 Zero-NaN Ledger")
+kpis = Row([m1, m2, m3])
+m1 = Metric("Equity USD", $users, "+34.2%")
+m2 = Metric("Sharpe Ratio", "2.41", "Proved")
+m3 = Metric("Max Drawdown", "-4.8%", "Bounded")
+chart = BarChart(["MA5", "MA20", "Breakout", "Hedge"], [142, 188, 215, 164])
+btn = Button("Re-Run Strategy", @run_backtest)`;
+
+    const PRESET_K8S = `root = Card([hdr, kpis, chart, btn])
+hdr = Header("Kubernetes Reconciler Control Plane", "Tenon L2 Model-Checked State Machine")
+kpis = Row([m1, m2, m3])
+m1 = Metric("Healthy Pods", $users, "100% Ready")
+m2 = Metric("Reconcile P99", "1.1ms", "Zero Drift")
+m3 = Metric("Split-Brain", "0", "Fenced")
+chart = BarChart(["API", "Sched", "Etcd", "Edge"], [180, 150, 210, 195])
+btn = Button("Trigger Rollout", @rollout)`;
 
     const resp = await fetch("./openui.wasm");
     const bytes = new Uint8Array(await resp.arrayBuffer());
@@ -195,12 +250,15 @@ btn = Button("Dispatch Compute", @dispatch_gpu)`;
     const promptEl = document.getElementById("prompt-output");
     const leakEl = document.getElementById("leak-meter");
     const timeEl = document.getElementById("render-time");
+    const modeEl = document.getElementById("patch-mode");
     const logEl = document.getElementById("action-log");
 
+    let prevSrc = "";
     let prevUsers = "12,480";
     let streamTimer = null;
+    let surgicalCount = 0;
 
-    function enhanceCharts(root) {
+    function enhanceChartsAndEvents(root) {
       root.querySelectorAll('[data-ui="BarChart"]').forEach((el) => {
         const labels = (el.getAttribute("labels") || "").split(",").filter(Boolean);
         const vals = (el.getAttribute("values") || "").split(",").map((v) => parseFloat(v) || 0);
@@ -214,28 +272,163 @@ btn = Button("Dispatch Compute", @dispatch_gpu)`;
       root.querySelectorAll("[data-action]").forEach((btn) => {
         btn.addEventListener("click", () => {
           const act = btn.getAttribute("data-action");
-          logEl.textContent = `[Event Dispatched] ${act} @ ${new Date().toLocaleTimeString()} (Wasm liveObjects=${api.liveObjects()})`;
+          logEl.textContent = `[Event Dispatched -> Agent/Backend] ${act} ($users=${valEl.textContent}, Wasm liveObjects=${api.liveObjects()}) @ ${new Date().toLocaleTimeString()}`;
         });
       });
     }
 
+    function resolveVdomPath(rootEl, pathStr) {
+      if (!rootEl) return null;
+      const parts = pathStr.split("/").filter(Boolean).map((p) => parseInt(p, 10));
+      let cur = rootEl;
+      for (const idx of parts) {
+        if (!cur || !cur.childNodes || idx >= cur.childNodes.length) return null;
+        cur = cur.childNodes[idx];
+      }
+      return cur;
+    }
+
+    // True Surgical DOM Patcher consuming Tenon Wasm32 VDomPatch[] JSON directly!
+    function applySurgicalPatches(stageRoot, patches) {
+      const treeRoot = stageRoot.firstElementChild;
+      if (!treeRoot || patches.length === 0) return false;
+      for (const p of patches) {
+        const node = resolveVdomPath(treeRoot, p.path || "");
+        if (!node) return false;
+        if (p.op === "set_prop" && node.nodeType === Node.ELEMENT_NODE) {
+          node.setAttribute(p.key, p.value);
+          node.classList.add("vdom-patched");
+          setTimeout(() => node.classList.remove("vdom-patched"), 220);
+        } else if (p.op === "set_text") {
+          node.textContent = p.value;
+        } else if (p.op === "remove_prop" && node.nodeType === Node.ELEMENT_NODE) {
+          node.removeAttribute(p.key);
+        } else {
+          return false; // structural op -> full mount fallback
+        }
+      }
+      return true;
+    }
+
     function render(src, usersFmt) {
       const t0 = performance.now();
-      const html = api.render_openui_html(src, usersFmt);
-      const patches = api.diff_openui_patches(src, prevUsers, usersFmt);
+      let patchedSurgically = false;
+      let parsedPatches = [];
+
+      if (src === prevSrc && prevUsers !== usersFmt && stageEl.firstElementChild) {
+        const patchesJson = api.diff_openui_patches(src, prevUsers, usersFmt);
+        parsedPatches = JSON.parse(patchesJson);
+        patchedSurgically = applySurgicalPatches(stageEl, parsedPatches);
+      }
+      if (!patchedSurgically) {
+        const html = api.render_openui_html(src, usersFmt);
+        stageEl.innerHTML = html;
+        enhanceChartsAndEvents(stageEl);
+        if (prevUsers !== usersFmt) {
+          parsedPatches = JSON.parse(api.diff_openui_patches(src, prevUsers, usersFmt));
+        }
+      } else {
+        surgicalCount += parsedPatches.length;
+      }
+
       const dt = (performance.now() - t0).toFixed(2);
+      prevSrc = src;
       prevUsers = usersFmt;
 
-      stageEl.innerHTML = html;
-      enhanceCharts(stageEl);
-      const parsedPatches = JSON.parse(patches);
+      modeEl.textContent = patchedSurgically
+        ? `DOM Mode: Surgical Patch (${parsedPatches.length} ops, 0 innerHTML)`
+        : `DOM Mode: Full Mount (${surgicalCount} surgical ops total)`;
       patchEl.textContent = parsedPatches.length > 0
         ? JSON.stringify(parsedPatches, null, 2)
-        : `[]  /* Rendered ${html.length} B HTML from ${src.length} B OpenUI — drag $users slider to inspect minimal VDOM JSON patches */`;
-      timeEl.textContent = `Render + Diff: ${dt}ms`;
+        : `[]  /* Drag $users slider to watch Wasm32 surgical DOM patching (0 innerHTML rebuilds) */`;
+      timeEl.textContent = `Wasm32: ${dt}ms`;
       const live = api.liveObjects();
       leakEl.textContent = `Perceus Live Objects: ${live}`;
       leakEl.style.color = live === 0 ? "#34d399" : "#f87171";
+    }
+
+    function startOfflineStream(targetSrc) {
+      if (streamTimer) clearInterval(streamTimer);
+      let cursor = 0;
+      streamTimer = setInterval(() => {
+        cursor += 7;
+        const partial = targetSrc.slice(0, cursor);
+        inputEl.value = partial;
+        render(partial, valEl.textContent);
+        if (cursor >= targetSrc.length) {
+          clearInterval(streamTimer);
+          streamTimer = null;
+        }
+      }, 24);
+    }
+
+    async function generateFromLlm(userPrompt) {
+      const baseUrl = document.getElementById("llm-url").value.trim().replace(/\/$/, "");
+      const model = document.getElementById("llm-model").value.trim() || "qwen2.5";
+      const apiKey = document.getElementById("llm-key").value.trim();
+
+      if (!baseUrl) {
+        // Smart offline Generative UI synthesis matched to prompt keywords
+        const p = userPrompt.toLowerCase();
+        const chosen = p.includes("quant") || p.includes("btc") || p.includes("trade") || p.includes("backtest")
+          ? PRESET_QUANT
+          : p.includes("k8s") || p.includes("kube") || p.includes("cluster") || p.includes("pod")
+          ? PRESET_K8S
+          : p.includes("gpu") || p.includes("metal") || p.includes("tensor")
+          ? PRESET_GPU
+          : PRESET_SAAS;
+        logEl.textContent = `[Offline Generative UI Stream] Prompt: "${userPrompt || "Default Dashboard"}" (configure LLM API Settings to stream from OpenAI/Ollama)`;
+        startOfflineStream(chosen);
+        return;
+      }
+
+      logEl.textContent = `[Live LLM SSE Stream -> ${baseUrl}/chat/completions (${model})] Generating OpenUI Lang...`;
+      const headers = { "Content-Type": "application/json" };
+      if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+      try {
+        const res = await fetch(`${baseUrl}/chat/completions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model,
+            stream: true,
+            messages: [
+              { role: "system", content: api.get_openui_prompt() },
+              { role: "user", content: userPrompt || "Build a clean monitoring dashboard using Card, Header, Row, Metric, BarChart, and Button." },
+            ],
+          }),
+        });
+        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let accum = "";
+        let buf = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() || "";
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (payload === "[DONE]") continue;
+            try {
+              const obj = JSON.parse(payload);
+              const delta = obj.choices?.[0]?.delta?.content || "";
+              if (delta) {
+                accum += delta;
+                inputEl.value = accum;
+                render(accum, valEl.textContent);
+              }
+            } catch {}
+          }
+        }
+        logEl.textContent = `[Live LLM Stream Complete] Rendered ${accum.length} B OpenUI (Wasm liveObjects=${api.liveObjects()})`;
+      } catch (err) {
+        logEl.textContent = `[LLM API Error: ${err.message}] Falling back to offline OpenUI stream...`;
+        startOfflineStream(PRESET_QUANT);
+      }
     }
 
     inputEl.value = PRESET_SAAS;
@@ -247,16 +440,9 @@ btn = Button("Dispatch Compute", @dispatch_gpu)`;
       valEl.textContent = fmt;
       render(inputEl.value, fmt);
     });
-    document.getElementById("btn-preset-saas").onclick = () => {
-      if (streamTimer) clearInterval(streamTimer);
-      inputEl.value = PRESET_SAAS;
-      render(inputEl.value, valEl.textContent);
-    };
-    document.getElementById("btn-preset-gpu").onclick = () => {
-      if (streamTimer) clearInterval(streamTimer);
-      inputEl.value = PRESET_GPU;
-      render(inputEl.value, valEl.textContent);
-    };
+    document.getElementById("btn-preset-saas").onclick = () => { if (streamTimer) clearInterval(streamTimer); inputEl.value = PRESET_SAAS; render(PRESET_SAAS, valEl.textContent); };
+    document.getElementById("btn-preset-gpu").onclick = () => { if (streamTimer) clearInterval(streamTimer); inputEl.value = PRESET_GPU; render(PRESET_GPU, valEl.textContent); };
+    document.getElementById("btn-preset-quant").onclick = () => { if (streamTimer) clearInterval(streamTimer); inputEl.value = PRESET_QUANT; render(PRESET_QUANT, valEl.textContent); };
     document.getElementById("btn-prompt").onclick = () => {
       if (promptEl.style.display === "none") {
         promptEl.textContent = api.get_openui_prompt();
@@ -265,21 +451,12 @@ btn = Button("Dispatch Compute", @dispatch_gpu)`;
         promptEl.style.display = "none";
       }
     };
-    document.getElementById("btn-stream").onclick = () => {
-      if (streamTimer) clearInterval(streamTimer);
-      const target = inputEl.value || PRESET_SAAS;
-      let cursor = 0;
-      streamTimer = setInterval(() => {
-        cursor += 6;
-        const partial = target.slice(0, cursor);
-        inputEl.value = partial;
-        render(partial, valEl.textContent);
-        if (cursor >= target.length) {
-          clearInterval(streamTimer);
-          streamTimer = null;
-        }
-      }, 28);
-    };
+    document.getElementById("btn-stream").onclick = () => startOfflineStream(inputEl.value || PRESET_SAAS);
+    document.getElementById("btn-api-cfg").onclick = () => document.getElementById("api-cfg-panel").classList.toggle("open");
+    document.getElementById("btn-ai-gen").onclick = () => generateFromLlm(document.getElementById("ai-prompt").value);
+    document.getElementById("ai-prompt").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") generateFromLlm(e.target.value);
+    });
   </script>
 </body>
 </html>

@@ -1,21 +1,17 @@
-// examples/showcase/metal_gui_app.tn — Real Interactive Native macOS Metal Desktop GUI Window (`tenon-gpui`)!
+// examples/showcase/metal_gui_app.tn — Native macOS Metal Desktop GUI with Dynamic GPU Glyph Atlas & AI Generative OpenUI (`tenon-gpui`)!
 //
 // Zero Rust runtime — 100% Tenon + native macOS Cocoa / Apple Silicon Metal GPU:
-//   OpenUI Lang -> Unified VDOM -> FiniteFloat Flexbox Layout -> Batched SDF Rounded Quads + Retina Typography!
+//   - Pass 1: ALL SDF rounded panels rendered in 1 instanced Metal draw call
+//   - Pass 2: ALL UTF-8 (English + 中文) typography rendered from a dynamic 1024x1024 R8 GPU Glyph Atlas in 1 instanced draw call!
+//   - Live resizable window (`ev.kind == 4`), mouse wheel scroll (`ev.kind == 5`), hover feedback (`ev.kind == 6`),
+//     interactive AI Prompt input box (click box or press `/`, type `quant` / `k8s` / `gpu` / `saas`, Cmd+V paste, Enter to stream OpenUI!)
 //
-// Build & launch the real desktop window:
+// Build & launch:
 //   ./target/release/tenon build --c-src std/gpu/window/metal_window.m -o /tmp/tenon_metal_gui examples/showcase/metal_gui_app.tn
 //   /tmp/tenon_metal_gui
 //
-// Interactive Controls:
-//   - Click [+ Boost] / key `+`    : Increase GPU load & watch bar chart + KPI update at 120Hz
-//   - Click [- Cool]  / key `-`    : Decrease GPU load
-//   - Click [Stream]  / key Space  : Replay live progressive OpenUI Lang LLM streaming inside the GPU window!
-//   - Click [Theme]   / key `t`    : Switch Midnight Indigo <-> Emerald Matrix palette
-//   - Key `q` / `Esc` / close btn  : Exit cleanly with 0 leaks
-//
-// Headless PNG preview mode (used by CI & quick inspection):
-//   TENON_GUI_SMOKE=1 /tmp/tenon_metal_gui   -> saves Retina PNG to `/tmp/tenon_gpui_preview.png`
+// Headless Retina PNG preview:
+//   TENON_GUI_SMOKE=1 /tmp/tenon_metal_gui -> /tmp/tenon_gpui_preview.png
 
 import "std/core/types.tn"
 import "std/text/text.tn"
@@ -50,20 +46,42 @@ pure fn hit_rect(px Int, py Int, rx Int, ry Int, rw Int, rh Int) Bool {
     px >= rx && px <= rx + rw && py >= ry && py <= ry + rh
 }
 
-pure fn openui_template() Text {
-    "root = Card([hdr, kpis, chart])\nhdr = Header(\"Tenon GPUI Studio\", \"Native Apple Silicon Metal Window | OpenUI -> VDOM -> Flexbox -> 120Hz SDF\")\nkpis = Row([m1, m2, m3])\nm1 = Metric(\"Throughput\", $tps, \"+24%\")\nm2 = Metric(\"VDOM Diff\", $patches, \"Keyed\")\nm3 = Metric(\"Perceus Leaks\", \"0 objs\", \"Verified\")\nchart = BarChart([\"Web Wasm\", \"ANSI TUI\", \"Metal GPU\"], [$b1, $b2, $b3])\n"
+pure fn openui_preset_for_mode(mode Int) Text {
+    if mode == 1 {
+        "root = Card([hdr, kpis, chart])\nhdr = Header(\"BTC-USD Quant Backtest | 量化回测\", \"Tenon Verified NonNegFloat Ledger | GPU Glyph Atlas\")\nkpis = Row([m1, m2, m3])\nm1 = Metric(\"Equity USD\", $tps, \"+34.2%\")\nm2 = Metric(\"Sharpe Ratio\", \"2.41\", \"Proved\")\nm3 = Metric(\"Max Drawdown\", \"-4.8%\", \"Zero NaN\")\nchart = BarChart([\"MA5\", \"MA20\", \"Breakout\"], [$b1, $b2, $b3])\n"
+    } else if mode == 2 {
+        "root = Card([hdr, kpis, chart])\nhdr = Header(\"Kubernetes Reconciler | 状态调和\", \"L2 Model-Checked Control Plane | Zero Split-Brain\")\nkpis = Row([m1, m2, m3])\nm1 = Metric(\"Ready Pods\", $tps, \"100% OK\")\nm2 = Metric(\"Reconcile P99\", \"1.1ms\", \"No Drift\")\nm3 = Metric(\"Fenced Locks\", \"0 Deadlock\", \"Verified\")\nchart = BarChart([\"API\", \"Sched\", \"Etcd\"], [$b1, $b2, $b3])\n"
+    } else {
+        "root = Card([hdr, kpis, chart])\nhdr = Header(\"Tenon GPUI Studio | 零 Rust 原生 GPU\", \"Dynamic R8 Glyph Atlas | OpenUI -> VDOM -> Flexbox -> 120Hz Metal\")\nkpis = Row([m1, m2, m3])\nm1 = Metric(\"Throughput\", $tps, \"+24%\")\nm2 = Metric(\"VDOM Diff\", $patches, \"Keyed\")\nm3 = Metric(\"Perceus Leaks\", \"0 objs\", \"Verified\")\nchart = BarChart([\"Web Wasm\", \"ANSI TUI\", \"Metal GPU\"], [$b1, $b2, $b3])\n"
+    }
+}
+
+pure fn detect_mode_from_prompt(p Text) Int {
+    if p.contains("quant") || p.contains("btc") || p.contains("BTC") || p.contains("backtest") {
+        1
+    } else if p.contains("k8s") || p.contains("kube") || p.contains("pod") {
+        2
+    } else {
+        0
+    }
 }
 
 fn render_gui_frame(
+    win_w Int,
+    win_h Int,
     tps Int,
     theme Int,
+    mode Int,
     stream_cursor Int,
+    prompt_buf Text,
+    prompt_focused Bool,
+    hover_btn Int,
     last_action Text,
     patch_count Int,
     gpu_name Text,
     save_png_path Text,
 ) {
-    let full_src = openui_template()
+    let full_src = openui_preset_for_mode(mode)
     let cur_src = if stream_cursor < len(full_src) {
         str_slice(full_src, 0, stream_cursor)
     } else {
@@ -78,16 +96,19 @@ fn render_gui_frame(
     store = ui_store_set(store, "b3", int_to_text(tps))
 
     let vdom = openui_to_vdom(doc, store)
-    let boxes = layout_vdom(vdom, 840.0, 344.0)
-    let scene = layout_to_scene(boxes, 840, 344)
+    let safe_w = if win_w < 320 { 320 } else if win_w > 4096 { 4096 } else { win_w }
+    let raw_ch = if win_h > 180 { win_h - 156 } else { 240 }
+    let content_h_i = if raw_ch < 160 { 160 } else if raw_ch > 4096 { 4096 } else { raw_ch }
+    let layout_w NonNegFloat = int_to_float(safe_w)
+    let layout_h NonNegFloat = int_to_float(content_h_i)
+    let boxes = layout_vdom(vdom, layout_w, layout_h)
+    let scene = layout_to_scene(boxes, safe_w, content_h_i)
 
-    // Pack SceneGraph quads + 4 interactive toolbar buttons + status footer into ONE batched Metal draw call!
     var qf List[Float32] = []
     var qcount = 0
     var qi = 0
     while qi < len(scene.quads) {
         let q = scene.quads[qi]
-        // Theme tint for Header & Card accents
         let rr = if theme == 1 && qi == 1 { 0.04 } else { q.r as Float }
         let gg = if theme == 1 && qi == 1 { 0.62 } else { q.g as Float }
         let bb = if theme == 1 && qi == 1 { 0.48 } else { q.b as Float }
@@ -96,7 +117,7 @@ fn render_gui_frame(
         qi += 1
     }
 
-    // Subtle skeleton cards for streaming `Pending` slots (prevents any blank flash or layout jump!)
+    // Subtle skeleton cards for streaming `Pending` slots
     var pi = 0
     while pi < len(boxes) {
         let bx = boxes[pi]
@@ -107,16 +128,31 @@ fn render_gui_frame(
         pi += 1
     }
 
-    // Interactive Action Buttons Row (y = 358, h = 40)
-    push_quad_f32(qf, 28.0, 358.0, 146.0, 40.0, 0.06, 0.56, 0.88, 1.0, 9.0, 1.0, 0.40, 0.82) // [+ Boost]
-    push_quad_f32(qf, 188.0, 358.0, 146.0, 40.0, 0.22, 0.30, 0.44, 1.0, 9.0, 1.0, 0.45, 0.55) // [- Cool]
-    push_quad_f32(qf, 348.0, 358.0, 175.0, 40.0, 0.94, 0.58, 0.06, 1.0, 9.0, 0.0, 0.0, 0.0)  // [Stream OpenUI]
-    push_quad_f32(qf, 537.0, 358.0, 156.0, 40.0, 0.09, 0.68, 0.48, 1.0, 9.0, 0.0, 0.0, 0.0)  // [Toggle Theme]
-    // Footer status pill
-    push_quad_f32(qf, 28.0, 410.0, 784.0, 30.0, 0.10, 0.14, 0.22, 1.0, 7.0, 1.0, 0.24, 0.34)
-    qcount += 5
+    let prompt_y = content_h_i + 8
+    let btn_y = content_h_i + 56
+    let foot_y = content_h_i + 108
+    let inner_w = if win_w > 80 { win_w - 56 } else { 300 }
 
-    // Crisp Retina CoreText typography pass aligned to the exact Flexbox `LayoutBox` rects!
+    // Interactive AI Generative UI Prompt Input Box
+    let p_br = if prompt_focused { 0.22 } else { 0.26 }
+    let p_bg = if prompt_focused { 0.78 } else { 0.36 }
+    push_quad_f32(qf, 28.0, int_to_float(prompt_y), int_to_float(inner_w - 134), 38.0, 0.07, 0.10, 0.17, 1.0, 8.0, if prompt_focused { 1.5 } else { 1.0 }, p_br, p_bg)
+    push_quad_f32(qf, int_to_float(28 + inner_w - 124), int_to_float(prompt_y), 124.0, 38.0, 0.05, 0.62, 0.44, 1.0, 8.0, 0.0, 0.0, 0.0)
+
+    // Interactive Action Buttons Row
+    let b1_b = if hover_btn == 1 { 0.98 } else { 0.88 }
+    let b2_b = if hover_btn == 2 { 0.56 } else { 0.44 }
+    let b3_g = if hover_btn == 3 { 0.68 } else { 0.58 }
+    let b4_g = if hover_btn == 4 { 0.78 } else { 0.68 }
+    push_quad_f32(qf, 28.0, int_to_float(btn_y), 146.0, 40.0, 0.06, 0.56, b1_b, 1.0, 9.0, 1.0, 0.40, 0.82)
+    push_quad_f32(qf, 188.0, int_to_float(btn_y), 146.0, 40.0, 0.22, 0.30, b2_b, 1.0, 9.0, 1.0, 0.45, 0.55)
+    push_quad_f32(qf, 348.0, int_to_float(btn_y), 175.0, 40.0, 0.94, b3_g, 0.06, 1.0, 9.0, 0.0, 0.0, 0.0)
+    push_quad_f32(qf, 537.0, int_to_float(btn_y), 156.0, 40.0, 0.09, b4_g, 0.48, 1.0, 9.0, 0.0, 0.0, 0.0)
+    // Footer telemetry pill
+    push_quad_f32(qf, 28.0, int_to_float(foot_y), int_to_float(inner_w), 30.0, 0.10, 0.14, 0.22, 1.0, 7.0, 1.0, 0.24, 0.34)
+    qcount += 7
+
+    // Pass 2: Dynamic R8 GPU Glyph Atlas Instanced Typography!
     win_begin_text()
     var bi = 0
     while bi < len(boxes) {
@@ -124,28 +160,43 @@ fn render_gui_frame(
         let rx = float_to_int(bx.rect.x)
         let ry = float_to_int(bx.rect.y)
         if bx.kind == "Header" {
-            win_draw_text(bx.label, rx + 16, ry + 8, 20, true, 255, 255, 255)
-            win_draw_text(bx.value, rx + 16, ry + 34, 12, false, 224, 242, 254)
+            win_draw_text(bx.label, rx + 16, ry + 7, 19, true, 255, 255, 255)
+            win_draw_text(bx.value, rx + 16, ry + 33, 12, false, 224, 242, 254)
         } else if bx.kind == "Metric" {
-            win_draw_text(bx.label, rx + 24, ry + 10, 12, false, 148, 163, 184)
-            win_draw_text(bx.value, rx + 24, ry + 28, 22, true, 248, 250, 252)
+            win_draw_text(bx.label, rx + 24, ry + 9, 12, false, 148, 163, 184)
+            win_draw_text(bx.value, rx + 24, ry + 27, 22, true, 248, 250, 252)
             win_draw_text(bx.delta, rx + 24, ry + 54, 12, true, 52, 211, 153)
         } else if bx.kind == "Pending" {
             win_draw_text("Streaming <" ++ bx.label ++ "> ...", rx + 16, ry + 18, 13, false, 100, 116, 139)
         } else if bx.kind == "BarChart" {
-            win_draw_text("Web Wasm (" ++ int_to_text(tps / 2) ++ ")", rx + 20, ry + 11, 12, true, 15, 23, 42)
-            win_draw_text("ANSI TUI (" ++ int_to_text((tps * 3) / 4) ++ ")", rx + 20, ry + 41, 12, true, 15, 23, 42)
-            win_draw_text("Metal GPU (" ++ int_to_text(tps) ++ ")", rx + 20, ry + 71, 12, true, 15, 23, 42)
+            let l1 = if mode == 1 { "MA5 (" } else if mode == 2 { "API (" } else { "Web Wasm (" }
+            let l2 = if mode == 1 { "MA20 (" } else if mode == 2 { "Sched (" } else { "ANSI TUI (" }
+            let l3 = if mode == 1 { "Breakout (" } else if mode == 2 { "Etcd (" } else { "Metal GPU (" }
+            win_draw_text(l1 ++ int_to_text(tps / 2) ++ ")", rx + 20, ry + 10, 12, true, 15, 23, 42)
+            win_draw_text(l2 ++ int_to_text((tps * 3) / 4) ++ ")", rx + 20, ry + 40, 12, true, 15, 23, 42)
+            win_draw_text(l3 ++ int_to_text(tps) ++ ")", rx + 20, ry + 70, 12, true, 15, 23, 42)
         }
         bi += 1
     }
 
+    // Prompt input box & Generate button labels
+    let prompt_display = if len(prompt_buf) > 0 {
+        if prompt_focused { "AI Prompt: " ++ prompt_buf ++ "|" } else { "AI Prompt: " ++ prompt_buf }
+    } else if prompt_focused {
+        "Type 'quant', 'k8s', or 'gpu' and press Enter...|"
+    } else {
+        "Click here or press '/' to generate OpenUI (try 'quant' / 'k8s' / 'gpu')..."
+    }
+    let p_col = if len(prompt_buf) > 0 || prompt_focused { 226 } else { 120 }
+    win_draw_text(prompt_display, 42, prompt_y + 11, 13, false, p_col, p_col + 10, 240)
+    win_draw_text("Generate UI", 28 + inner_w - 102, prompt_y + 11, 13, true, 255, 255, 255)
+
     // Button labels & footer telemetry
-    win_draw_text("+ Boost Load", 54, 369, 14, true, 255, 255, 255)
-    win_draw_text("- Cool Down", 218, 369, 14, true, 226, 232, 240)
-    win_draw_text("Stream OpenUI", 384, 369, 14, true, 15, 23, 42)
-    win_draw_text("Switch Theme", 566, 369, 14, true, 255, 255, 255)
-    win_draw_text("GPU: " ++ gpu_name ++ "  |  Quads: " ++ int_to_text(qcount) ++ " (1 draw call)  |  Last: " ++ last_action, 42, 418, 12, false, 148, 163, 184)
+    win_draw_text("+ Boost Load", 54, btn_y + 11, 14, true, 255, 255, 255)
+    win_draw_text("- Cool Down", 218, btn_y + 11, 14, true, 226, 232, 240)
+    win_draw_text("Stream OpenUI", 384, btn_y + 11, 14, true, 15, 23, 42)
+    win_draw_text("Switch Theme", 566, btn_y + 11, 14, true, 255, 255, 255)
+    win_draw_text("GPU: " ++ gpu_name ++ "  |  " ++ int_to_text(win_w) ++ "x" ++ int_to_text(win_h) ++ " Atlas  |  " ++ last_action, 42, foot_y + 7, 12, false, 148, 163, 184)
 
     let bg_r = if theme == 1 { 10 } else { 11 }
     let bg_g = if theme == 1 { 24 } else { 17 }
@@ -159,29 +210,35 @@ fn render_gui_frame(
 
 pub fn main() Int {
     let smoke = sys_env("TENON_GUI_SMOKE") == "1"
-    if !win_open("Tenon GPUI — Native Apple Silicon Metal Window", 840, 456, smoke) {
+    var cur_w = 880
+    var cur_h = 500
+    if !win_open("Tenon GPUI — GPU Glyph Atlas + AI OpenUI (Resizable Metal Window)", cur_w, cur_h, smoke) {
         println("ERROR: Failed to initialize Metal GUI window")
         return 1
     }
     let gpu = win_gpu_name()
     if smoke {
         let out_png = "/tmp/tenon_gpui_preview.png"
-        render_gui_frame(240, 0, 9999, "Smoke Snapshot", 2, gpu, out_png)
-        println("Tenon Native Metal GUI Smoke OK -> " ++ out_png ++ " (GPU: " ++ gpu ++ ")")
+        render_gui_frame(cur_w, cur_h, 240, 0, 0, 9999, "quant dashboard", false, 0, "Glyph Atlas Smoke OK", 2, gpu, out_png)
+        println("Tenon Native Metal GUI (GPU Glyph Atlas) Smoke OK -> " ++ out_png ++ " (GPU: " ++ gpu ++ ")")
         return 0
     }
 
-    println("Opened native macOS Metal GUI window on " ++ gpu ++ " (press Esc/Q or close window to exit).")
+    println("Opened resizable Metal GPUI window on " ++ gpu ++ " (resize window, click AI prompt or buttons, Esc/Q to quit).")
     var tps = 220
     var theme = 0
+    var mode = 0
     var stream_cursor = 9999
-    var last_action = "Ready (Click buttons or press +, -, Space, T, Q)"
+    var prompt_buf = ""
+    var prompt_focused = false
+    var hover_btn = 0
+    var last_action = "Ready (Glyph Atlas + Resizable + Scroll + AI Prompt)"
     var patch_count = 2
     var dirty = true
-    let full_len = len(openui_template())
     var running = true
 
     while running {
+        let full_len = len(openui_preset_for_mode(mode))
         let streaming = stream_cursor < full_len
         if dirty {
             let status_txt = if streaming {
@@ -189,59 +246,110 @@ pub fn main() Int {
             } else {
                 last_action
             }
-            render_gui_frame(tps, theme, stream_cursor, status_txt, patch_count, gpu, "")
+            render_gui_frame(cur_w, cur_h, tps, theme, mode, stream_cursor, prompt_buf, prompt_focused, hover_btn, status_txt, patch_count, gpu, "")
             dirty = false
         }
         let wait_ms = if streaming { 45 } else { 32 }
         let ev = win_poll_event(wait_ms)
+        let content_h_i = if cur_h > 180 { cur_h - 156 } else { 240 }
+        let prompt_y = content_h_i + 8
+        let btn_y = content_h_i + 56
+        let inner_w = if cur_w > 80 { cur_w - 56 } else { 300 }
+
         if ev.kind == 3 {
             running = false
-        } else if ev.kind == 1 {
-            // Key press (`ev.a` = macOS keyCode, `ev.b` = ASCII char)
-            if ev.a == 53 || ev.b == 113 || ev.b == 81 { // Esc / q / Q
-                running = false
-            } else if ev.b == 43 || ev.b == 61 { // + / =
-                tps += 20
-                last_action = "Key + (Boosted)"
+        } else if ev.kind == 4 {
+            // Live Window Resize!
+            cur_w = ev.a
+            cur_h = ev.b
+            last_action = "Resized -> " ++ int_to_text(cur_w) ++ "x" ++ int_to_text(cur_h)
+            dirty = true
+        } else if ev.kind == 5 {
+            // Mouse Wheel Scroll adjusts throughput live!
+            if ev.b > 0 {
+                tps += 10
+                last_action = "Scroll Up (Boost)"
                 dirty = true
-            } else if ev.b == 45 { // -
-                if tps > 40 { tps -= 20 }
-                last_action = "Key - (Cooled)"
-                dirty = true
-            } else if ev.b == 32 { // Space -> replay smooth OpenUI streaming!
-                stream_cursor = 33
-                last_action = "Stream Complete (OpenUI -> Metal GPU)"
-                dirty = true
-            } else if ev.b == 116 || ev.b == 84 { // t / T
-                theme = if theme == 0 { 1 } else { 0 }
-                last_action = "Switched Theme"
+            } else if ev.b < 0 && tps > 40 {
+                tps -= 10
+                last_action = "Scroll Down (Cool)"
                 dirty = true
             }
+        } else if ev.kind == 6 {
+            let nh = if hit_rect(ev.a, ev.b, 28, btn_y, 146, 40) { 1 }
+                else if hit_rect(ev.a, ev.b, 188, btn_y, 146, 40) { 2 }
+                else if hit_rect(ev.a, ev.b, 348, btn_y, 175, 40) { 3 }
+                else if hit_rect(ev.a, ev.b, 537, btn_y, 156, 40) { 4 }
+                else { 0 }
+            if nh != hover_btn {
+                hover_btn = nh
+                dirty = true
+            }
+        } else if ev.kind == 1 {
+            let is_cmd = (ev.a & 65536) != 0
+            let kc = ev.a & 65535
+            if kc == 53 { // Esc
+                if prompt_focused {
+                    prompt_focused = false
+                    dirty = true
+                } else {
+                    running = false
+                }
+            } else if prompt_focused {
+                if kc == 36 { // Enter -> trigger OpenUI generation stream!
+                    mode = detect_mode_from_prompt(prompt_buf)
+                    stream_cursor = 33
+                    prompt_focused = false
+                    last_action = "AI Generated OpenUI for `" ++ prompt_buf ++ "`"
+                    dirty = true
+                } else if kc == 51 { // Backspace
+                    if len(prompt_buf) > 0 {
+                        prompt_buf = str_slice(prompt_buf, 0, len(prompt_buf) - 1)
+                        dirty = true
+                    }
+                } else if is_cmd && (ev.b == 118 || ev.b == 86) { // Cmd+V Paste!
+                    let clip = win_clipboard_get()
+                    if len(clip) > 0 {
+                        prompt_buf = prompt_buf ++ clip
+                        dirty = true
+                    }
+                } else if ev.b >= 32 && ev.b < 127 && len(prompt_buf) < 64 {
+                    prompt_buf = prompt_buf ++ byte_to_text(ev.b)
+                    dirty = true
+                }
+            } else {
+                if ev.b == 113 || ev.b == 81 { running = false }
+                else if ev.b == 47 { prompt_focused = true; dirty = true } // '/' focus prompt
+                else if ev.b == 43 || ev.b == 61 { tps += 20; last_action = "Key + (Boosted)"; dirty = true }
+                else if ev.b == 45 && tps > 40 { tps -= 20; last_action = "Key - (Cooled)"; dirty = true }
+                else if ev.b == 32 { stream_cursor = 33; last_action = "Stream Complete"; dirty = true }
+                else if ev.b == 116 || ev.b == 84 { theme = if theme == 0 { 1 } else { 0 }; last_action = "Switched Theme"; dirty = true }
+            }
         } else if ev.kind == 2 {
-            // Mouse click at `(ev.a, ev.b)`
-            if hit_rect(ev.a, ev.b, 28, 358, 146, 40) {
-                tps += 20
-                last_action = "Clicked [+ Boost Load]"
+            if hit_rect(ev.a, ev.b, 28, prompt_y, inner_w - 134, 38) {
+                prompt_focused = true
                 dirty = true
-            } else if hit_rect(ev.a, ev.b, 188, 358, 146, 40) {
-                if tps > 40 { tps -= 20 }
-                last_action = "Clicked [- Cool Down]"
-                dirty = true
-            } else if hit_rect(ev.a, ev.b, 348, 358, 175, 40) {
+            } else if hit_rect(ev.a, ev.b, 28 + inner_w - 124, prompt_y, 124, 38) {
+                mode = detect_mode_from_prompt(prompt_buf)
                 stream_cursor = 33
-                last_action = "Stream Complete (OpenUI -> Metal GPU)"
+                prompt_focused = false
+                last_action = "AI Generated OpenUI"
                 dirty = true
-            } else if hit_rect(ev.a, ev.b, 537, 358, 156, 40) {
-                theme = if theme == 0 { 1 } else { 0 }
-                last_action = "Clicked [Switch Theme]"
-                dirty = true
+            } else if hit_rect(ev.a, ev.b, 28, btn_y, 146, 40) {
+                prompt_focused = false; tps += 20; last_action = "Clicked [+ Boost Load]"; dirty = true
+            } else if hit_rect(ev.a, ev.b, 188, btn_y, 146, 40) {
+                prompt_focused = false; if tps > 40 { tps -= 20 }; last_action = "Clicked [- Cool Down]"; dirty = true
+            } else if hit_rect(ev.a, ev.b, 348, btn_y, 175, 40) {
+                prompt_focused = false; stream_cursor = 33; last_action = "Stream Complete"; dirty = true
+            } else if hit_rect(ev.a, ev.b, 537, btn_y, 156, 40) {
+                prompt_focused = false; theme = if theme == 0 { 1 } else { 0 }; last_action = "Clicked [Switch Theme]"; dirty = true
+            } else {
+                prompt_focused = false; dirty = true
             }
         }
         if streaming {
             stream_cursor += 14
-            if stream_cursor >= full_len {
-                stream_cursor = full_len
-            }
+            if stream_cursor >= full_len { stream_cursor = full_len }
             dirty = true
         }
     }
