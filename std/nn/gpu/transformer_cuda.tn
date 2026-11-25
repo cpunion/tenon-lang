@@ -215,18 +215,18 @@ impl CudaTransformer {
         let ff_stride = cuda_weight_stride_bytes(c.d_ff * d, qm)
         let kv_layer_bytes = kv_dim * ms * 2
 
-        let _ = cuda_embed(self.tok_pos_b.handle, self.tok_emb_b.handle, 0, self.x_b.handle, 1, d, c.vocab_size)
+        let _ = cuda_embed_ss(self.tok_pos_b.handle, self.tok_emb_b.handle, 0, self.x_b.handle, d, c.vocab_size)
 
         var l = 0
         while l < c.n_layers {
             let norm_off = l * d * 2
             let kv_off = l * kv_layer_bytes
-            let _ = cuda_norm_gemv(
+            let _ = cuda_epinorm_gemv(
                 self.x_b.handle, self.norm1_b.handle, norm_off,
                 self.wqkv_b.handle, l * qkv_stride,
                 self.qkv_b.handle,
                 self.bqkv_b.handle, l * qkv_dim * 2,
-                qkv_dim, d, qm, c.gemma_norm, c.has_qkv_bias,
+                qkv_dim, d, qm, c.gemma_norm, c.has_qkv_bias, 0,
             )
             let _ = cuda_rope_flash_decode(
                 self.qkv_b.handle,
@@ -236,26 +236,26 @@ impl CudaTransformer {
                 self.tok_pos_b.handle,
                 c.n_heads, c.n_kv_heads, c.d_head, ms, c.attn_softcap,
             )
-            let _ = cuda_gemv(
+            let _ = cuda_gemv_ss(
                 self.ctx_b.handle,
                 self.wo_b.handle, l * wo_stride,
                 self.x_b.handle,
                 self.bqkv_b.handle, 0,
-                d, d, qm, true, false,
+                d, d, qm, true, false, 1,
             )
-            let _ = cuda_norm_ffn(
+            let _ = cuda_epinorm_ffn(
                 self.x_b.handle, self.norm2_b.handle, norm_off,
                 self.wgate_b.handle, l * ff_stride,
                 self.wup_b.handle, l * ff_stride,
                 self.ffn_act_b.handle,
-                c.d_ff, d, qm, c.is_geglu, c.gemma_norm,
+                c.d_ff, d, qm, c.is_geglu, c.gemma_norm, 1,
             )
-            let _ = cuda_gemv(
+            let _ = cuda_gemv_ss(
                 self.ffn_act_b.handle,
                 self.wdown_b.handle, l * ff_stride,
                 self.x_b.handle,
                 self.bqkv_b.handle, 0,
-                d, c.d_ff, qm, true, false,
+                d, c.d_ff, qm, true, false, 0,
             )
             l += 1
         }

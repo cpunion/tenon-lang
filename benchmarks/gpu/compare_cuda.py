@@ -169,16 +169,24 @@ print("JSON_TF:" + json.dumps(res))
     return {"framework": "TensorFlow", "error": "not installed"}
 
 def parse_tenon(out):
-    r = {"framework": "Tenon CUDA (__dp4a+cuBLAS+Graph)"}
+    r = {"framework": "Tenon CUDA (EpiNorm+cuBLASLt+Graph)"}
     for l in out.splitlines():
         m = re.search(r"ROOFLINE_TC_FP16 4096x4096x4096 ms=[0-9.]+ TFLOPS=([0-9.]+)", l)
         if m: r["tc_4096_tflops"] = float(m.group(1))
+        m = re.search(r"ROOFLINE_TC_FP16_330T 4096x4096x4096 ms=[0-9.]+ TFLOPS=([0-9.]+)", l)
+        if m: r["tc_4096_330t"] = float(m.group(1))
+        m = re.search(r"ROOFLINE_TC_FP8_660T 4096x4096x4096 ms=[0-9.]+ TFLOPS=([0-9.]+)", l)
+        if m: r["tc_4096_fp8"] = float(m.group(1))
         m = re.search(r"ROOFLINE_GEMV 8192x8192_FP16 .*eff_GBs=([0-9.]+)", l)
         if m: r["gemv_fp16_gbs"] = float(m.group(1))
         m = re.search(r"ROOFLINE_GEMV 8192x8192_Q4_0_dp4a .*eff_GBs=([0-9.]+)", l)
         if m: r["gemv_q4_gbs"] = float(m.group(1))
-        m = re.search(r"BENCH_CUDA_PREFILL Llama3.2_1B_Prefill_S512_FP16 .*tok_s=([0-9.]+)", l)
+        m = re.search(r"BENCH_CUDA_PREFILL Llama3.2_1B_Prefill_S512_FP16 seq=.*tok_s=([0-9.]+)", l)
         if m: r["prefill_1b_toks"] = float(m.group(1))
+        m = re.search(r"BENCH_CUDA_PREFILL Llama3.2_1B_Prefill_S512_FP16_330T .*tok_s=([0-9.]+)", l)
+        if m: r["prefill_1b_330t"] = float(m.group(1))
+        m = re.search(r"BENCH_CUDA_PREFILL Llama3.2_1B_Prefill_S512_FP8_660T .*tok_s=([0-9.]+)", l)
+        if m: r["prefill_1b_fp8"] = float(m.group(1))
         m = re.search(r"BENCH_CUDA Llama3.2_1B_FP16 .*graph_tok_s=([0-9.]+) graph_GBs=([0-9.]+)", l)
         if m: r["decode_1b_fp16_toks"], r["decode_1b_fp16_gbs"] = float(m.group(1)), float(m.group(2))
         m = re.search(r"BENCH_CUDA Llama3.2_1B_Q4_0 .*graph_tok_s=([0-9.]+) graph_GBs=([0-9.]+)", l)
@@ -247,6 +255,10 @@ def main():
             f"{fmt(r.get('decode_1b_fp16_gbs'), '', PEAK_GBS):<16} | "
             f"{fmt(r.get('decode_1b_q4_toks'), ' t/s'):<14}"
         )
+    if r_tenon.get("tc_4096_330t") or r_tenon.get("tc_4096_fp8"):
+        print("\n--- Tenon Ada Lovelace sm_89 2x/4x Tensor Core Roofline (330.3T FP16-accum & 660.6T FP8 e4m3fn) ---")
+        print(f"  4096^3 FP16-accum (330.3T ceiling): {fmt(r_tenon.get('tc_4096_330t'), 'T', 330.3)} | 1B S=512 Prefill: {fmt(r_tenon.get('prefill_1b_330t'), ' tok/s')}")
+        print(f"  4096^3 FP8 e4m3fn (660.6T ceiling): {fmt(r_tenon.get('tc_4096_fp8'), 'T', 660.6)} | 1B S=512 Prefill: {fmt(r_tenon.get('prefill_1b_fp8'), ' tok/s')}")
 
 if __name__ == "__main__":
     main()

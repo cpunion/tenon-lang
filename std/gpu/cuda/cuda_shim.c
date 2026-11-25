@@ -28,6 +28,22 @@ typedef int nvrtcResult;
 typedef void* nvrtcProgram;
 typedef int cublasStatus_t;
 typedef void* cublasHandle_t;
+typedef void* cublasLtHandle_t;
+typedef void* cublasLtMatmulDesc_t;
+typedef void* cublasLtMatrixLayout_t;
+typedef void* cublasLtMatmulPreference_t;
+
+typedef struct {
+    uint64_t data[8];
+} cublasLtMatmulAlgo_t;
+
+typedef struct {
+    cublasLtMatmulAlgo_t algo;
+    size_t workspaceSize;
+    cublasStatus_t state;
+    float wavesCount;
+    int reserved[4];
+} cublasLtMatmulHeuristicResult_t;
 
 #define CUDA_SUCCESS 0
 #define NVRTC_SUCCESS 0
@@ -37,8 +53,14 @@ typedef void* cublasHandle_t;
 #define CUDA_R_32F 0
 #define CUDA_R_16F 2
 #define CUDA_R_16BF 14
+#define CUDA_R_8F_E4M3 28
+#define CUBLAS_COMPUTE_16F 64
 #define CUBLAS_COMPUTE_32F 68
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP 99
+#define CUBLASLT_MATMUL_DESC_TRANSA 3
+#define CUBLASLT_MATMUL_DESC_TRANSB 4
+#define CUBLASLT_MATMUL_DESC_FAST_ACCUM 23
+#define CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES 1
 #define CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT 16
 #define CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE 36
 #define CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH 37
@@ -97,15 +119,45 @@ typedef cublasStatus_t (*pfn_cublasGemmEx)(
     const void*, void*, int, int,
     int, int);
 
+typedef cublasStatus_t (*pfn_cublasLtCreate)(cublasLtHandle_t*);
+typedef cublasStatus_t (*pfn_cublasLtMatmulDescCreate)(cublasLtMatmulDesc_t*, int, int);
+typedef cublasStatus_t (*pfn_cublasLtMatmulDescDestroy)(cublasLtMatmulDesc_t);
+typedef cublasStatus_t (*pfn_cublasLtMatmulDescSetAttribute)(cublasLtMatmulDesc_t, int, const void*, size_t);
+typedef cublasStatus_t (*pfn_cublasLtMatrixLayoutCreate)(cublasLtMatrixLayout_t*, int, uint64_t, uint64_t, int64_t);
+typedef cublasStatus_t (*pfn_cublasLtMatrixLayoutDestroy)(cublasLtMatrixLayout_t);
+typedef cublasStatus_t (*pfn_cublasLtMatmulPreferenceCreate)(cublasLtMatmulPreference_t*);
+typedef cublasStatus_t (*pfn_cublasLtMatmulPreferenceDestroy)(cublasLtMatmulPreference_t);
+typedef cublasStatus_t (*pfn_cublasLtMatmulPreferenceSetAttribute)(cublasLtMatmulPreference_t, int, const void*, size_t);
+typedef cublasStatus_t (*pfn_cublasLtMatmulAlgoGetHeuristic)(
+    cublasLtHandle_t, cublasLtMatmulDesc_t,
+    cublasLtMatrixLayout_t, cublasLtMatrixLayout_t,
+    cublasLtMatrixLayout_t, cublasLtMatrixLayout_t,
+    cublasLtMatmulPreference_t, int,
+    cublasLtMatmulHeuristicResult_t*, int*);
+typedef cublasStatus_t (*pfn_cublasLtMatmul)(
+    cublasLtHandle_t, cublasLtMatmulDesc_t,
+    const void*,
+    const void*, cublasLtMatrixLayout_t,
+    const void*, cublasLtMatrixLayout_t,
+    const void*,
+    const void*, cublasLtMatrixLayout_t,
+    void*, cublasLtMatrixLayout_t,
+    const cublasLtMatmulAlgo_t*,
+    void*, size_t, CUstream);
+
 typedef struct {
     int initialized;
     void* libcuda;
     void* libnvrtc;
     void* libcublas;
+    void* libcublaslt;
     CUdevice dev;
     CUcontext ctx;
     CUstream stream;
     cublasHandle_t cublas;
+    cublasLtHandle_t cublaslt;
+    CUdeviceptr lt_workspace;
+    size_t lt_workspace_bytes;
     char dev_name[128];
     int cc_major;
     int cc_minor;
@@ -155,6 +207,18 @@ typedef struct {
     pfn_cublasCreate_v2 cublasCreate;
     pfn_cublasSetStream_v2 cublasSetStream;
     pfn_cublasGemmEx cublasGemmEx;
+
+    pfn_cublasLtCreate cublasLtCreate;
+    pfn_cublasLtMatmulDescCreate cublasLtMatmulDescCreate;
+    pfn_cublasLtMatmulDescDestroy cublasLtMatmulDescDestroy;
+    pfn_cublasLtMatmulDescSetAttribute cublasLtMatmulDescSetAttribute;
+    pfn_cublasLtMatrixLayoutCreate cublasLtMatrixLayoutCreate;
+    pfn_cublasLtMatrixLayoutDestroy cublasLtMatrixLayoutDestroy;
+    pfn_cublasLtMatmulPreferenceCreate cublasLtMatmulPreferenceCreate;
+    pfn_cublasLtMatmulPreferenceDestroy cublasLtMatmulPreferenceDestroy;
+    pfn_cublasLtMatmulPreferenceSetAttribute cublasLtMatmulPreferenceSetAttribute;
+    pfn_cublasLtMatmulAlgoGetHeuristic cublasLtMatmulAlgoGetHeuristic;
+    pfn_cublasLtMatmul cublasLtMatmul;
 } TnCudaState;
 
 /* Shared across cuda_shim.c and cuda_ultra_shim.c */
@@ -309,6 +373,40 @@ int64_t tn_cuda_init(void) {
         if (g_tn_cuda.cublasCreate && g_tn_cuda.cublasCreate(&g_tn_cuda.cublas) == CUBLAS_STATUS_SUCCESS) {
             if (g_tn_cuda.cublasSetStream && g_tn_cuda.stream) {
                 g_tn_cuda.cublasSetStream(g_tn_cuda.cublas, g_tn_cuda.stream);
+            }
+        }
+    }
+
+    /* Load cuBLASLt dynamically for Ada sm_89 / Hopper sm_90 FP8 (e4m3fn) 660+ TFLOPS Tensor Cores! */
+    const char* cublaslt_libs[] = {
+        "libcublasLt.so",
+        "libcublasLt.so.13",
+        "libcublasLt.so.12",
+        "/usr/local/cuda/lib64/libcublasLt.so",
+        "/usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so",
+        "/usr/local/lib/python3.12/dist-packages/nvidia/cublas/lib/libcublasLt.so.12",
+        "/usr/local/lib/python3.12/dist-packages/nvidia/cublas/lib/libcublasLt.so.13",
+        NULL
+    };
+    for (int i = 0; cublaslt_libs[i]; i++) {
+        g_tn_cuda.libcublaslt = dlopen(cublaslt_libs[i], RTLD_LAZY | RTLD_GLOBAL);
+        if (g_tn_cuda.libcublaslt) break;
+    }
+    if (g_tn_cuda.libcublaslt) {
+        g_tn_cuda.cublasLtCreate = (pfn_cublasLtCreate)dlsym(g_tn_cuda.libcublaslt, "cublasLtCreate");
+        g_tn_cuda.cublasLtMatmulDescCreate = (pfn_cublasLtMatmulDescCreate)dlsym(g_tn_cuda.libcublaslt, "cublasLtMatmulDescCreate");
+        g_tn_cuda.cublasLtMatmulDescDestroy = (pfn_cublasLtMatmulDescDestroy)dlsym(g_tn_cuda.libcublaslt, "cublasLtMatmulDescDestroy");
+        g_tn_cuda.cublasLtMatmulDescSetAttribute = (pfn_cublasLtMatmulDescSetAttribute)dlsym(g_tn_cuda.libcublaslt, "cublasLtMatmulDescSetAttribute");
+        g_tn_cuda.cublasLtMatrixLayoutCreate = (pfn_cublasLtMatrixLayoutCreate)dlsym(g_tn_cuda.libcublaslt, "cublasLtMatrixLayoutCreate");
+        g_tn_cuda.cublasLtMatrixLayoutDestroy = (pfn_cublasLtMatrixLayoutDestroy)dlsym(g_tn_cuda.libcublaslt, "cublasLtMatrixLayoutDestroy");
+        g_tn_cuda.cublasLtMatmulPreferenceCreate = (pfn_cublasLtMatmulPreferenceCreate)dlsym(g_tn_cuda.libcublaslt, "cublasLtMatmulPreferenceCreate");
+        g_tn_cuda.cublasLtMatmulPreferenceDestroy = (pfn_cublasLtMatmulPreferenceDestroy)dlsym(g_tn_cuda.libcublaslt, "cublasLtMatmulPreferenceDestroy");
+        g_tn_cuda.cublasLtMatmulPreferenceSetAttribute = (pfn_cublasLtMatmulPreferenceSetAttribute)dlsym(g_tn_cuda.libcublaslt, "cublasLtMatmulPreferenceSetAttribute");
+        g_tn_cuda.cublasLtMatmulAlgoGetHeuristic = (pfn_cublasLtMatmulAlgoGetHeuristic)dlsym(g_tn_cuda.libcublaslt, "cublasLtMatmulAlgoGetHeuristic");
+        g_tn_cuda.cublasLtMatmul = (pfn_cublasLtMatmul)dlsym(g_tn_cuda.libcublaslt, "cublasLtMatmul");
+        if (g_tn_cuda.cublasLtCreate && g_tn_cuda.cublasLtMatmul && g_tn_cuda.cublasLtMatmulAlgoGetHeuristic) {
+            if (g_tn_cuda.cublasLtCreate(&g_tn_cuda.cublaslt) != CUBLAS_STATUS_SUCCESS) {
+                g_tn_cuda.cublaslt = NULL;
             }
         }
     }
@@ -665,6 +763,132 @@ int tn_cuda_cublas_gemm_f16(
     return st == CUBLAS_STATUS_SUCCESS ? 1 : 0;
 }
 
+/* Tensor Core FP16 GEMM (FP16 accum -> 330.3 TFLOPS on RTX 4090 Ada Lovelace!) */
+int tn_cuda_cublas_gemm_f16_fast(
+    CUdeviceptr x_ptr, CUdeviceptr w_ptr, CUdeviceptr y_ptr,
+    int m, int n, int k, int add_res
+) {
+    if (!g_tn_cuda.cublas || !g_tn_cuda.cublasGemmEx) return 0;
+    uint16_t alpha_h = 0x3C00u; /* 1.0 in IEEE-754 half */
+    uint16_t beta_h  = add_res ? 0x3C00u : 0x0000u;
+    cublasStatus_t st = g_tn_cuda.cublasGemmEx(
+        g_tn_cuda.cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha_h,
+        (const void*)(uintptr_t)w_ptr, CUDA_R_16F, k,
+        (const void*)(uintptr_t)x_ptr, CUDA_R_16F, k,
+        &beta_h,
+        (void*)(uintptr_t)y_ptr, CUDA_R_16F, n,
+        CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+    return st == CUBLAS_STATUS_SUCCESS ? 1 : 0;
+}
+
+typedef struct {
+    int valid;
+    int m, n, k;
+    cublasLtMatmulDesc_t desc;
+    cublasLtMatrixLayout_t la, lb, lc, ld;
+    cublasLtMatmulHeuristicResult_t heur;
+} TnLtFp8Plan;
+
+#define TN_LT_FP8_CACHE_MAX 16
+static TnLtFp8Plan g_lt_fp8_cache[TN_LT_FP8_CACHE_MAX];
+
+static TnLtFp8Plan* tn_lt_fp8_get_plan(int m, int n, int k) {
+    for (int i = 0; i < TN_LT_FP8_CACHE_MAX; i++) {
+        if (g_lt_fp8_cache[i].valid && g_lt_fp8_cache[i].m == m && g_lt_fp8_cache[i].n == n && g_lt_fp8_cache[i].k == k) {
+            return &g_lt_fp8_cache[i];
+        }
+    }
+    int slot = -1;
+    for (int i = 0; i < TN_LT_FP8_CACHE_MAX; i++) {
+        if (!g_lt_fp8_cache[i].valid) { slot = i; break; }
+    }
+    if (slot < 0) slot = 0;
+    TnLtFp8Plan* pl = &g_lt_fp8_cache[slot];
+    if (pl->valid) {
+        if (pl->desc) g_tn_cuda.cublasLtMatmulDescDestroy(pl->desc);
+        if (pl->la) g_tn_cuda.cublasLtMatrixLayoutDestroy(pl->la);
+        if (pl->lb) g_tn_cuda.cublasLtMatrixLayoutDestroy(pl->lb);
+        if (pl->lc) g_tn_cuda.cublasLtMatrixLayoutDestroy(pl->lc);
+        if (pl->ld) g_tn_cuda.cublasLtMatrixLayoutDestroy(pl->ld);
+        memset(pl, 0, sizeof(*pl));
+    }
+    if (g_tn_cuda.lt_workspace == 0 && g_tn_cuda.cuMemAlloc) {
+        size_t ws = 32ULL * 1024ULL * 1024ULL;
+        if (g_tn_cuda.cuMemAlloc(&g_tn_cuda.lt_workspace, ws) == CUDA_SUCCESS) {
+            g_tn_cuda.lt_workspace_bytes = ws;
+        }
+    }
+    if (g_tn_cuda.cublasLtMatmulDescCreate(&pl->desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) return NULL;
+    int32_t op_t = CUBLAS_OP_T, op_n = CUBLAS_OP_N;
+    g_tn_cuda.cublasLtMatmulDescSetAttribute(pl->desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t));
+    g_tn_cuda.cublasLtMatmulDescSetAttribute(pl->desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n));
+    int8_t fast_accum = 1;
+    (void)g_tn_cuda.cublasLtMatmulDescSetAttribute(pl->desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast_accum, sizeof(fast_accum));
+
+    /* Column-major TN view of row-major Y[M,N] = X[M,K] @ W[N,K]^T:
+       A = W[K, N] (col-major, ld=K, op=T -> N x K), B = X[K, M] (col-major, ld=K, op=N -> K x M), C/D = Y[N, M] (col-major, ld=N) */
+    if (g_tn_cuda.cublasLtMatrixLayoutCreate(&pl->la, CUDA_R_8F_E4M3, (uint64_t)k, (uint64_t)n, (int64_t)k) != CUBLAS_STATUS_SUCCESS) return NULL;
+    if (g_tn_cuda.cublasLtMatrixLayoutCreate(&pl->lb, CUDA_R_8F_E4M3, (uint64_t)k, (uint64_t)m, (int64_t)k) != CUBLAS_STATUS_SUCCESS) return NULL;
+    if (g_tn_cuda.cublasLtMatrixLayoutCreate(&pl->lc, CUDA_R_16F,     (uint64_t)n, (uint64_t)m, (int64_t)n) != CUBLAS_STATUS_SUCCESS) return NULL;
+    if (g_tn_cuda.cublasLtMatrixLayoutCreate(&pl->ld, CUDA_R_16F,     (uint64_t)n, (uint64_t)m, (int64_t)n) != CUBLAS_STATUS_SUCCESS) return NULL;
+
+    cublasLtMatmulPreference_t pref = NULL;
+    if (g_tn_cuda.cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS) return NULL;
+    uint64_t max_ws = (uint64_t)g_tn_cuda.lt_workspace_bytes;
+    g_tn_cuda.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws, sizeof(max_ws));
+    int returned = 0;
+    cublasStatus_t hs = g_tn_cuda.cublasLtMatmulAlgoGetHeuristic(
+        g_tn_cuda.cublaslt, pl->desc, pl->la, pl->lb, pl->lc, pl->ld, pref, 1, &pl->heur, &returned
+    );
+    g_tn_cuda.cublasLtMatmulPreferenceDestroy(pref);
+    if (hs != CUBLAS_STATUS_SUCCESS || returned <= 0) {
+        g_tn_cuda.cublasLtMatmulDescDestroy(pl->desc);
+        g_tn_cuda.cublasLtMatrixLayoutDestroy(pl->la);
+        g_tn_cuda.cublasLtMatrixLayoutDestroy(pl->lb);
+        g_tn_cuda.cublasLtMatrixLayoutDestroy(pl->lc);
+        g_tn_cuda.cublasLtMatrixLayoutDestroy(pl->ld);
+        memset(pl, 0, sizeof(*pl));
+        return NULL;
+    }
+    pl->m = m; pl->n = n; pl->k = k; pl->valid = 1;
+    return pl;
+}
+
+/* Tensor Core FP8 (e4m3fn x e4m3fn -> FP16) GEMM via dynamically loaded cuBLASLt (660.6 TFLOPS on RTX 4090 sm_89!) */
+int tn_cuda_cublaslt_gemm_fp8(
+    CUdeviceptr x_ptr, CUdeviceptr w_ptr, CUdeviceptr y_ptr,
+    int m, int n, int k, int add_res
+) {
+    if (!g_tn_cuda.cublaslt || !g_tn_cuda.cublasLtMatmul) return 0;
+    if ((g_tn_cuda.cc_major * 10 + g_tn_cuda.cc_minor) < 89) return 0;
+    TnLtFp8Plan* pl = tn_lt_fp8_get_plan(m, n, k);
+    if (!pl) return 0;
+    float alpha = 1.0f;
+    float beta  = add_res ? 1.0f : 0.0f;
+    cublasStatus_t st = g_tn_cuda.cublasLtMatmul(
+        g_tn_cuda.cublaslt, pl->desc,
+        &alpha,
+        (const void*)(uintptr_t)w_ptr, pl->la,
+        (const void*)(uintptr_t)x_ptr, pl->lb,
+        &beta,
+        (const void*)(uintptr_t)y_ptr, pl->lc,
+        (void*)(uintptr_t)y_ptr, pl->ld,
+        &pl->heur.algo,
+        (void*)(uintptr_t)g_tn_cuda.lt_workspace,
+        g_tn_cuda.lt_workspace_bytes,
+        g_tn_cuda.stream
+    );
+    return st == CUBLAS_STATUS_SUCCESS ? 1 : 0;
+}
+
 int64_t tn_cuda_has_cublas(void) {
     return (g_tn_cuda.cublas && g_tn_cuda.cublasGemmEx) ? 1 : 0;
+}
+
+int64_t tn_cuda_has_fp8(void) {
+    return (g_tn_cuda.cublaslt && g_tn_cuda.cublasLtMatmul && (g_tn_cuda.cc_major * 10 + g_tn_cuda.cc_minor) >= 89) ? 1 : 0;
 }

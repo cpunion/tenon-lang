@@ -41,7 +41,16 @@ extern int tn_cuda_cublas_gemm_f16(
     CUdeviceptr x_ptr, CUdeviceptr w_ptr, CUdeviceptr y_ptr,
     int m, int n, int k, int add_res
 );
+extern int tn_cuda_cublas_gemm_f16_fast(
+    CUdeviceptr x_ptr, CUdeviceptr w_ptr, CUdeviceptr y_ptr,
+    int m, int n, int k, int add_res
+);
+extern int tn_cuda_cublaslt_gemm_fp8(
+    CUdeviceptr x_ptr, CUdeviceptr w_ptr, CUdeviceptr y_ptr,
+    int m, int n, int k, int add_res
+);
 extern int64_t tn_cuda_has_cublas(void);
+extern int64_t tn_cuda_has_fp8(void);
 
 /* Host FP16 <-> FP32 conversion for GGUF-exact Q4_0_SB8 / Q8_0_SB8 quantization */
 static inline float tn_cu_f16_to_f32(uint16_t h) {
@@ -433,6 +442,114 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    out[idx] = emb[(size_t)tok * d_model + d];\n"
 "}\n"
 "\n"
+"/* 1B. Single-Token Embedding + Epilogue-Norm Sum-of-Squares Init (writes ss[0]=sum(x^2), ss[1]=0.0f; CUDA-Graph safe!) */\n"
+"extern \"C\" __global__ void cuda_embed_f16_ss(\n"
+"    const uint32_t* __restrict__ tok_ids,\n"
+"    const half* __restrict__ emb,\n"
+"    half* __restrict__ out,\n"
+"    float* __restrict__ ss_buf,\n"
+"    uint32_t d_model, uint32_t vocab\n"
+") {\n"
+"    __shared__ float sw[8];\n"
+"    uint32_t tid = threadIdx.x;\n"
+"    uint32_t tok = tok_ids[0];\n"
+"    if (tok >= vocab) tok = 0;\n"
+"    const half* src = emb + (size_t)tok * d_model;\n"
+"    float ss = 0.0f;\n"
+"    for (uint32_t d = tid; d < d_model; d += blockDim.x) {\n"
+"        half h = __ldg(&src[d]);\n"
+"        out[d] = h;\n"
+"        float f = __half2float(h);\n"
+"        ss = fmaf(f, f, ss);\n"
+"    }\n"
+"    ss = warp_sum(ss);\n"
+"    if ((tid & 31u) == 0u) sw[tid >> 5] = ss;\n"
+"    __syncthreads();\n"
+"    if (tid < 32u) {\n"
+"        float tot = (tid < (blockDim.x >> 5)) ? sw[tid] : 0.0f;\n"
+"        tot = warp_sum(tot);\n"
+"        if (tid == 0u) { ss_buf[0] = tot; ss_buf[1] = 0.0f; }\n"
+"    }\n"
+"}\n"
+"\n"
+"__device__ __forceinline__ uint16_t pack_f32x2_to_fp8_e4m3(float a, float b) {\n"
+"#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890\n"
+"    uint16_t res;\n"
+"    asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\" : \"=h\"(res) : \"f\"(a), \"f\"(b));\n"
+"    return res;\n"
+"#else\n"
+"    (void)a; (void)b; return 0u;\n"
+"#endif\n"
+"}\n"
+"\n"
+"/* 2B. Fused 128-bit RMSNorm -> FP8 e4m3fn Quantizer for Ada sm_89 660 TFLOPS Prefill! */\n"
+"extern \"C\" __global__ void cuda_rmsnorm_fp8_e4m3(\n"
+"    const half* __restrict__ x,\n"
+"    const half* __restrict__ w,\n"
+"    uint8_t* __restrict__ out,\n"
+"    uint32_t d_model, uint32_t gemma_mode\n"
+") {\n"
+"    uint32_t row = blockIdx.x;\n"
+"    uint32_t k8 = d_model >> 3;\n"
+"    const float4* x8 = (const float4*)(x + (size_t)row * d_model);\n"
+"    const float4* w8 = (const float4*)w;\n"
+"    uint64_t* o8 = (uint64_t*)(out + (size_t)row * d_model);\n"
+"    __shared__ float sw[8];\n"
+"    uint32_t tid = threadIdx.x;\n"
+"    float ss = 0.0f;\n"
+"    for (uint32_t i = tid; i < k8; i += blockDim.x) {\n"
+"        float4 v = __ldg(&x8[i]);\n"
+"        const half2* vh = (const half2*)&v;\n"
+"        #pragma unroll\n"
+"        for (int g = 0; g < 4; g++) {\n"
+"            float2 f = __half22float2(vh[g]);\n"
+"            ss = fmaf(f.x, f.x, fmaf(f.y, f.y, ss));\n"
+"        }\n"
+"    }\n"
+"    ss = warp_sum(ss);\n"
+"    if ((tid & 31u) == 0u) sw[tid >> 5] = ss;\n"
+"    __syncthreads();\n"
+"    if (tid < 32u) {\n"
+"        float tot = (tid < (blockDim.x >> 5)) ? sw[tid] : 0.0f;\n"
+"        tot = warp_sum(tot);\n"
+"        if (tid == 0u) sw[0] = rsqrtf(tot / (float)d_model + 1e-5f);\n"
+"    }\n"
+"    __syncthreads();\n"
+"    float inv = sw[0];\n"
+"    float g_add = (gemma_mode != 0u) ? 1.0f : 0.0f;\n"
+"    for (uint32_t i = tid; i < k8; i += blockDim.x) {\n"
+"        float4 xv = __ldg(&x8[i]);\n"
+"        float4 wv = __ldg(&w8[i]);\n"
+"        const half2* xh = (const half2*)&xv;\n"
+"        const half2* wh = (const half2*)&wv;\n"
+"        uint16_t p[4];\n"
+"        #pragma unroll\n"
+"        for (int g = 0; g < 4; g++) {\n"
+"            float2 xf = __half22float2(xh[g]);\n"
+"            float2 wf = __half22float2(wh[g]);\n"
+"            p[g] = pack_f32x2_to_fp8_e4m3(xf.x * inv * (wf.x + g_add), xf.y * inv * (wf.y + g_add));\n"
+"        }\n"
+"        o8[i] = (uint64_t)p[0] | ((uint64_t)p[1] << 16) | ((uint64_t)p[2] << 32) | ((uint64_t)p[3] << 48);\n"
+"    }\n"
+"}\n"
+"\n"
+"/* 2C. Fused SiLU(gate) * up -> FP8 e4m3fn Quantizer for Ada sm_89 660 TFLOPS Prefill! */\n"
+"extern \"C\" __global__ void cuda_silu_mul_fp8_e4m3(\n"
+"    const half* __restrict__ gate,\n"
+"    const half* __restrict__ up,\n"
+"    uint8_t* __restrict__ out,\n"
+"    uint32_t n_elems\n"
+") {\n"
+"    uint32_t i2 = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    uint32_t n2 = n_elems >> 1;\n"
+"    if (i2 >= n2) return;\n"
+"    float2 gf = __half22float2(((const half2*)gate)[i2]);\n"
+"    float2 uf = __half22float2(((const half2*)up)[i2]);\n"
+"    float a0 = (gf.x / (1.0f + __expf(-gf.x))) * uf.x;\n"
+"    float a1 = (gf.y / (1.0f + __expf(-gf.y))) * uf.y;\n"
+"    ((uint16_t*)out)[i2] = pack_f32x2_to_fp8_e4m3(a0, a1);\n"
+"}\n"
+"\n"
 "/* 2. 128-bit `float4` Vectorized Standalone RMSNorm (1.5 us -> leaves 4KB x_norm 100% hot in L2!) */\n"
 "extern \"C\" __global__ void cuda_rmsnorm_f16(\n"
 "    const half* __restrict__ x,\n"
@@ -485,39 +602,54 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    }\n"
 "}\n"
 "\n"
-"/* 3A. Zero-SMEM 128-bit `float4` FP16 GEMV — 4w1r (high SM occupancy for od<=4096) & 4w2r (2x x-reuse for od>4096) */\n"
+"/* 3A. Zero-SMEM 128-bit `float4` FP16 GEMV — 4w1r (od<=4096) & 4w2r (od>4096), with optional Epilogue L2 Atomic SS! */\n"
 "extern \"C\" __global__ void cuda_gemv_f16_1r(\n"
 "    const half* __restrict__ x,\n"
 "    const half* __restrict__ w,\n"
 "    half* __restrict__ y,\n"
 "    const half* __restrict__ bias,\n"
-"    uint32_t out_dim, uint32_t in_dim, uint32_t add_res, uint32_t has_bias\n"
+"    float* __restrict__ ss_buf,\n"
+"    uint32_t out_dim, uint32_t in_dim, uint32_t add_res, uint32_t has_bias, int32_t ss_write_slot\n"
 ") {\n"
 "    uint32_t wid = threadIdx.x >> 5;\n"
 "    uint32_t lane = threadIdx.x & 31u;\n"
 "    uint32_t row = blockIdx.x * 4 + wid;\n"
-"    if (row >= out_dim) return;\n"
-"    uint32_t k8 = in_dim >> 3;\n"
-"    const float4* x8 = (const float4*)x;\n"
-"    const float4* w0 = (const float4*)(w + (size_t)row * in_dim);\n"
-"    float s0 = 0.0f;\n"
-"    for (uint32_t i = lane; i < k8; i += 32u) {\n"
-"        float4 xv = __ldg(&x8[i]);\n"
-"        float4 a0 = __ldg(&w0[i]);\n"
-"        const half2* xh = (const half2*)&xv;\n"
-"        const half2* h0 = (const half2*)&a0;\n"
-"        #pragma unroll\n"
-"        for (int g = 0; g < 4; g++) {\n"
-"            float2 xf = __half22float2(xh[g]);\n"
-"            float2 f0 = __half22float2(h0[g]);\n"
-"            s0 = fmaf(xf.x, f0.x, fmaf(xf.y, f0.y, s0));\n"
+"    float y2 = 0.0f;\n"
+"    if (row < out_dim) {\n"
+"        uint32_t k8 = in_dim >> 3;\n"
+"        const float4* x8 = (const float4*)x;\n"
+"        const float4* w0 = (const float4*)(w + (size_t)row * in_dim);\n"
+"        float s0 = 0.0f;\n"
+"        for (uint32_t i = lane; i < k8; i += 32u) {\n"
+"            float4 xv = __ldg(&x8[i]);\n"
+"            float4 a0 = __ldg(&w0[i]);\n"
+"            const half2* xh = (const half2*)&xv;\n"
+"            const half2* h0 = (const half2*)&a0;\n"
+"            #pragma unroll\n"
+"            for (int g = 0; g < 4; g++) {\n"
+"                float2 xf = __half22float2(xh[g]);\n"
+"                float2 f0 = __half22float2(h0[g]);\n"
+"                s0 = fmaf(xf.x, f0.x, fmaf(xf.y, f0.y, s0));\n"
+"            }\n"
+"        }\n"
+"        s0 = warp_sum(s0);\n"
+"        if (lane == 0) {\n"
+"            if (has_bias) s0 += __half2float(bias[row]);\n"
+"            if (add_res)  s0 += __half2float(y[row]);\n"
+"            half yh = __float2half(s0);\n"
+"            y[row] = yh;\n"
+"            float yf = __half2float(yh);\n"
+"            y2 = yf * yf;\n"
 "        }\n"
 "    }\n"
-"    s0 = warp_sum(s0);\n"
-"    if (lane == 0) {\n"
-"        if (has_bias) s0 += __half2float(bias[row]);\n"
-"        if (add_res)  s0 += __half2float(y[row]);\n"
-"        y[row] = __float2half(s0);\n"
+"    if (ss_write_slot >= 0) {\n"
+"        __shared__ float s_y2[4];\n"
+"        if (lane == 0) s_y2[wid] = y2;\n"
+"        __syncthreads();\n"
+"        if (threadIdx.x == 0) {\n"
+"            atomicAdd(&ss_buf[ss_write_slot], s_y2[0] + s_y2[1] + s_y2[2] + s_y2[3]);\n"
+"            if (blockIdx.x == 0) ss_buf[ss_write_slot ^ 1] = 0.0f;\n"
+"        }\n"
 "    }\n"
 "}\n"
 "\n"
@@ -526,43 +658,61 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    const half* __restrict__ w,\n"
 "    half* __restrict__ y,\n"
 "    const half* __restrict__ bias,\n"
-"    uint32_t out_dim, uint32_t in_dim, uint32_t add_res, uint32_t has_bias\n"
+"    float* __restrict__ ss_buf,\n"
+"    uint32_t out_dim, uint32_t in_dim, uint32_t add_res, uint32_t has_bias, int32_t ss_write_slot\n"
 ") {\n"
 "    uint32_t wid = threadIdx.x >> 5;\n"
 "    uint32_t lane = threadIdx.x & 31u;\n"
 "    uint32_t row0 = (blockIdx.x * 4 + wid) * 2;\n"
-"    if (row0 >= out_dim) return;\n"
-"    uint32_t row1 = (row0 + 1 < out_dim) ? (row0 + 1) : row0;\n"
-"    uint32_t k8 = in_dim >> 3;\n"
-"    const float4* x8 = (const float4*)x;\n"
-"    const float4* w0 = (const float4*)(w + (size_t)row0 * in_dim);\n"
-"    const float4* w1 = (const float4*)(w + (size_t)row1 * in_dim);\n"
-"    float s0 = 0.0f, s1 = 0.0f;\n"
-"    for (uint32_t i = lane; i < k8; i += 32u) {\n"
-"        float4 xv = __ldg(&x8[i]);\n"
-"        float4 a0 = __ldg(&w0[i]);\n"
-"        float4 a1 = __ldg(&w1[i]);\n"
-"        const half2* xh = (const half2*)&xv;\n"
-"        const half2* h0 = (const half2*)&a0;\n"
-"        const half2* h1 = (const half2*)&a1;\n"
-"        #pragma unroll\n"
-"        for (int g = 0; g < 4; g++) {\n"
-"            float2 xf = __half22float2(xh[g]);\n"
-"            float2 f0 = __half22float2(h0[g]);\n"
-"            float2 f1 = __half22float2(h1[g]);\n"
-"            s0 = fmaf(xf.x, f0.x, fmaf(xf.y, f0.y, s0));\n"
-"            s1 = fmaf(xf.x, f1.x, fmaf(xf.y, f1.y, s1));\n"
+"    float y2 = 0.0f;\n"
+"    if (row0 < out_dim) {\n"
+"        uint32_t row1 = (row0 + 1 < out_dim) ? (row0 + 1) : row0;\n"
+"        uint32_t k8 = in_dim >> 3;\n"
+"        const float4* x8 = (const float4*)x;\n"
+"        const float4* w0 = (const float4*)(w + (size_t)row0 * in_dim);\n"
+"        const float4* w1 = (const float4*)(w + (size_t)row1 * in_dim);\n"
+"        float s0 = 0.0f, s1 = 0.0f;\n"
+"        for (uint32_t i = lane; i < k8; i += 32u) {\n"
+"            float4 xv = __ldg(&x8[i]);\n"
+"            float4 a0 = __ldg(&w0[i]);\n"
+"            float4 a1 = __ldg(&w1[i]);\n"
+"            const half2* xh = (const half2*)&xv;\n"
+"            const half2* h0 = (const half2*)&a0;\n"
+"            const half2* h1 = (const half2*)&a1;\n"
+"            #pragma unroll\n"
+"            for (int g = 0; g < 4; g++) {\n"
+"                float2 xf = __half22float2(xh[g]);\n"
+"                float2 f0 = __half22float2(h0[g]);\n"
+"                float2 f1 = __half22float2(h1[g]);\n"
+"                s0 = fmaf(xf.x, f0.x, fmaf(xf.y, f0.y, s0));\n"
+"                s1 = fmaf(xf.x, f1.x, fmaf(xf.y, f1.y, s1));\n"
+"            }\n"
+"        }\n"
+"        s0 = warp_sum(s0); s1 = warp_sum(s1);\n"
+"        if (lane == 0) {\n"
+"            if (has_bias) s0 += __half2float(bias[row0]);\n"
+"            if (add_res)  s0 += __half2float(y[row0]);\n"
+"            half yh0 = __float2half(s0);\n"
+"            y[row0] = yh0;\n"
+"            float yf0 = __half2float(yh0);\n"
+"            y2 = yf0 * yf0;\n"
+"            if (row0 + 1 < out_dim) {\n"
+"                if (has_bias) s1 += __half2float(bias[row0 + 1]);\n"
+"                if (add_res)  s1 += __half2float(y[row0 + 1]);\n"
+"                half yh1 = __float2half(s1);\n"
+"                y[row0 + 1] = yh1;\n"
+"                float yf1 = __half2float(yh1);\n"
+"                y2 += yf1 * yf1;\n"
+"            }\n"
 "        }\n"
 "    }\n"
-"    s0 = warp_sum(s0); s1 = warp_sum(s1);\n"
-"    if (lane == 0) {\n"
-"        if (has_bias) s0 += __half2float(bias[row0]);\n"
-"        if (add_res)  s0 += __half2float(y[row0]);\n"
-"        y[row0] = __float2half(s0);\n"
-"        if (row0 + 1 < out_dim) {\n"
-"            if (has_bias) s1 += __half2float(bias[row0 + 1]);\n"
-"            if (add_res)  s1 += __half2float(y[row0 + 1]);\n"
-"            y[row0 + 1] = __float2half(s1);\n"
+"    if (ss_write_slot >= 0) {\n"
+"        __shared__ float s_y2[4];\n"
+"        if (lane == 0) s_y2[wid] = y2;\n"
+"        __syncthreads();\n"
+"        if (threadIdx.x == 0) {\n"
+"            atomicAdd(&ss_buf[ss_write_slot], s_y2[0] + s_y2[1] + s_y2[2] + s_y2[3]);\n"
+"            if (blockIdx.x == 0) ss_buf[ss_write_slot ^ 1] = 0.0f;\n"
 "        }\n"
 "    }\n"
 "}\n"
@@ -613,30 +763,45 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    }\n"
 "}\n"
 "\n"
-"/* 4A. Zero-SMEM Direct-FP16x + 128-bit `uint4` SB8 4w1r Q8_0 GEMV (ZERO Q8_1 barrier! ~860 GB/s!) */\n"
+"/* 4A. Zero-SMEM Direct-FP16x + 128-bit `uint4` SB8 4w1r Q8_0 GEMV with optional Epilogue L2 Atomic SS! */\n"
 "extern \"C\" __global__ void cuda_gemv_q8_0(\n"
 "    const half* __restrict__ x,\n"
 "    const uint8_t* __restrict__ w,\n"
 "    half* __restrict__ y,\n"
 "    const half* __restrict__ bias,\n"
-"    uint32_t out_dim, uint32_t in_dim, uint32_t add_res, uint32_t has_bias\n"
+"    float* __restrict__ ss_buf,\n"
+"    uint32_t out_dim, uint32_t in_dim, uint32_t add_res, uint32_t has_bias, int32_t ss_write_slot\n"
 ") {\n"
 "    uint32_t wid = threadIdx.x >> 5;\n"
 "    uint32_t lane = threadIdx.x & 31u;\n"
 "    uint32_t row = blockIdx.x * 4 + wid;\n"
-"    if (row >= out_dim) return;\n"
-"    uint32_t nb = in_dim >> 5;\n"
-"    const float4* x8 = (const float4*)x;\n"
-"    size_t b0 = (size_t)row * nb;\n"
-"    float s0 = 0.0f;\n"
-"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
-"        s0 += q8_sb8_dot_fp16x(w, b0 + b, x8, b);\n"
+"    float y2 = 0.0f;\n"
+"    if (row < out_dim) {\n"
+"        uint32_t nb = in_dim >> 5;\n"
+"        const float4* x8 = (const float4*)x;\n"
+"        size_t b0 = (size_t)row * nb;\n"
+"        float s0 = 0.0f;\n"
+"        for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"            s0 += q8_sb8_dot_fp16x(w, b0 + b, x8, b);\n"
+"        }\n"
+"        s0 = warp_sum(s0);\n"
+"        if (lane == 0) {\n"
+"            if (has_bias) s0 += __half2float(bias[row]);\n"
+"            if (add_res)  s0 += __half2float(y[row]);\n"
+"            half yh = __float2half(s0);\n"
+"            y[row] = yh;\n"
+"            float yf = __half2float(yh);\n"
+"            y2 = yf * yf;\n"
+"        }\n"
 "    }\n"
-"    s0 = warp_sum(s0);\n"
-"    if (lane == 0) {\n"
-"        if (has_bias) s0 += __half2float(bias[row]);\n"
-"        if (add_res)  s0 += __half2float(y[row]);\n"
-"        y[row] = __float2half(s0);\n"
+"    if (ss_write_slot >= 0) {\n"
+"        __shared__ float s_y2[4];\n"
+"        if (lane == 0) s_y2[wid] = y2;\n"
+"        __syncthreads();\n"
+"        if (threadIdx.x == 0) {\n"
+"            atomicAdd(&ss_buf[ss_write_slot], s_y2[0] + s_y2[1] + s_y2[2] + s_y2[3]);\n"
+"            if (blockIdx.x == 0) ss_buf[ss_write_slot ^ 1] = 0.0f;\n"
+"        }\n"
 "    }\n"
 "}\n"
 "\n"
@@ -706,31 +871,411 @@ static const char* TENON_CUDA_ULTRA_SRC =
 "    }\n"
 "}\n"
 "\n"
-"/* 5A. Zero-SMEM Direct-FP16x + 128-bit `uint4` SB8 4w1r Q4_0 GEMV (ZERO Q8_1 barrier! 845-931 GB/s!) */\n"
+"/* 5A. Zero-SMEM Direct-FP16x + 128-bit `uint4` SB8 4w1r Q4_0 GEMV with optional Epilogue L2 Atomic SS! */\n"
 "extern \"C\" __global__ void cuda_gemv_q4_0(\n"
 "    const half* __restrict__ x,\n"
 "    const uint8_t* __restrict__ w,\n"
 "    half* __restrict__ y,\n"
 "    const half* __restrict__ bias,\n"
-"    uint32_t out_dim, uint32_t in_dim, uint32_t add_res, uint32_t has_bias\n"
+"    float* __restrict__ ss_buf,\n"
+"    uint32_t out_dim, uint32_t in_dim, uint32_t add_res, uint32_t has_bias, int32_t ss_write_slot\n"
+") {\n"
+"    uint32_t wid = threadIdx.x >> 5;\n"
+"    uint32_t lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4 + wid;\n"
+"    float y2 = 0.0f;\n"
+"    if (row < out_dim) {\n"
+"        uint32_t nb = in_dim >> 5;\n"
+"        const float4* x8 = (const float4*)x;\n"
+"        size_t b0 = (size_t)row * nb;\n"
+"        float s0 = 0.0f;\n"
+"        for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"            s0 += q4_sb8_dot_fp16x(w, b0 + b, x8, b);\n"
+"        }\n"
+"        s0 = warp_sum(s0);\n"
+"        if (lane == 0) {\n"
+"            if (has_bias) s0 += __half2float(bias[row]);\n"
+"            if (add_res)  s0 += __half2float(y[row]);\n"
+"            half yh = __float2half(s0);\n"
+"            y[row] = yh;\n"
+"            float yf = __half2float(yh);\n"
+"            y2 = yf * yf;\n"
+"        }\n"
+"    }\n"
+"    if (ss_write_slot >= 0) {\n"
+"        __shared__ float s_y2[4];\n"
+"        if (lane == 0) s_y2[wid] = y2;\n"
+"        __syncthreads();\n"
+"        if (threadIdx.x == 0) {\n"
+"            atomicAdd(&ss_buf[ss_write_slot], s_y2[0] + s_y2[1] + s_y2[2] + s_y2[3]);\n"
+"            if (blockIdx.x == 0) ss_buf[ss_write_slot ^ 1] = 0.0f;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* 5C. Zero-Barrier Epilogue-Norm GEMV & FFN Kernels (read pre-computed L2 ss_buf[slot], ZERO standalone RMSNorm!) */\n"
+"extern \"C\" __global__ void cuda_gemv_f16_epinorm(\n"
+"    const half* __restrict__ x,\n"
+"    const half* __restrict__ nw,\n"
+"    const half* __restrict__ w,\n"
+"    half* __restrict__ y,\n"
+"    const half* __restrict__ bias,\n"
+"    const float* __restrict__ ss_buf,\n"
+"    uint32_t out_dim, uint32_t in_dim, uint32_t gemma_mode, uint32_t has_bias, uint32_t ss_read_slot\n"
 ") {\n"
 "    uint32_t wid = threadIdx.x >> 5;\n"
 "    uint32_t lane = threadIdx.x & 31u;\n"
 "    uint32_t row = blockIdx.x * 4 + wid;\n"
 "    if (row >= out_dim) return;\n"
+"    float inv_rms = rsqrtf(__ldg(&ss_buf[ss_read_slot]) / (float)in_dim + 1e-5f);\n"
+"    float g_add = (gemma_mode != 0u) ? 1.0f : 0.0f;\n"
+"    uint32_t k8 = in_dim >> 3;\n"
+"    const float4* x8 = (const float4*)x;\n"
+"    const float4* nw8 = (const float4*)nw;\n"
+"    const float4* w0 = (const float4*)(w + (size_t)row * in_dim);\n"
+"    float s0 = 0.0f;\n"
+"    for (uint32_t i = lane; i < k8; i += 32u) {\n"
+"        float4 xv = __ldg(&x8[i]);\n"
+"        float4 nv = __ldg(&nw8[i]);\n"
+"        float4 a0 = __ldg(&w0[i]);\n"
+"        const half2* xh = (const half2*)&xv;\n"
+"        const half2* nh = (const half2*)&nv;\n"
+"        const half2* h0 = (const half2*)&a0;\n"
+"        #pragma unroll\n"
+"        for (int g = 0; g < 4; g++) {\n"
+"            float2 xf = __half22float2(xh[g]);\n"
+"            float2 nf = __half22float2(nh[g]);\n"
+"            float2 f0 = __half22float2(h0[g]);\n"
+"            s0 = fmaf(xf.x * (nf.x + g_add), f0.x, fmaf(xf.y * (nf.y + g_add), f0.y, s0));\n"
+"        }\n"
+"    }\n"
+"    s0 = warp_sum(s0) * inv_rms;\n"
+"    if (lane == 0) {\n"
+"        if (has_bias) s0 += __half2float(bias[row]);\n"
+"        y[row] = __float2half(s0);\n"
+"    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cuda_ffn_f16_epinorm(\n"
+"    const half* __restrict__ x,\n"
+"    const half* __restrict__ nw,\n"
+"    const half* __restrict__ wg,\n"
+"    const half* __restrict__ wu,\n"
+"    half* __restrict__ out,\n"
+"    const float* __restrict__ ss_buf,\n"
+"    uint32_t d_ff, uint32_t in_dim, uint32_t is_geglu, uint32_t gemma_mode, uint32_t ss_read_slot\n"
+") {\n"
+"    uint32_t wid = threadIdx.x >> 5;\n"
+"    uint32_t lane = threadIdx.x & 31u;\n"
+"    uint32_t row0 = (blockIdx.x * 4 + wid) * 2;\n"
+"    if (row0 >= d_ff) return;\n"
+"    uint32_t row1 = (row0 + 1 < d_ff) ? (row0 + 1) : row0;\n"
+"    float inv_rms = rsqrtf(__ldg(&ss_buf[ss_read_slot]) / (float)in_dim + 1e-5f);\n"
+"    float g_add = (gemma_mode != 0u) ? 1.0f : 0.0f;\n"
+"    uint32_t k8 = in_dim >> 3;\n"
+"    const float4* x8 = (const float4*)x;\n"
+"    const float4* nw8 = (const float4*)nw;\n"
+"    const float4* g0 = (const float4*)(wg + (size_t)row0 * in_dim);\n"
+"    const float4* g1 = (const float4*)(wg + (size_t)row1 * in_dim);\n"
+"    const float4* u0 = (const float4*)(wu + (size_t)row0 * in_dim);\n"
+"    const float4* u1 = (const float4*)(wu + (size_t)row1 * in_dim);\n"
+"    float sg0 = 0.0f, su0 = 0.0f, sg1 = 0.0f, su1 = 0.0f;\n"
+"    for (uint32_t i = lane; i < k8; i += 32u) {\n"
+"        float4 xv = __ldg(&x8[i]);\n"
+"        float4 nv = __ldg(&nw8[i]);\n"
+"        float4 vg0 = __ldg(&g0[i]), vu0 = __ldg(&u0[i]);\n"
+"        float4 vg1 = __ldg(&g1[i]), vu1 = __ldg(&u1[i]);\n"
+"        const half2* xh = (const half2*)&xv;\n"
+"        const half2* nh = (const half2*)&nv;\n"
+"        const half2* hg0 = (const half2*)&vg0; const half2* hu0 = (const half2*)&vu0;\n"
+"        const half2* hg1 = (const half2*)&vg1; const half2* hu1 = (const half2*)&vu1;\n"
+"        #pragma unroll\n"
+"        for (int g = 0; g < 4; g++) {\n"
+"            float2 xf = __half22float2(xh[g]);\n"
+"            float2 nf = __half22float2(nh[g]);\n"
+"            float wx = xf.x * (nf.x + g_add);\n"
+"            float wy = xf.y * (nf.y + g_add);\n"
+"            float2 fg0 = __half22float2(hg0[g]), fu0 = __half22float2(hu0[g]);\n"
+"            float2 fg1 = __half22float2(hg1[g]), fu1 = __half22float2(hu1[g]);\n"
+"            sg0 = fmaf(wx, fg0.x, fmaf(wy, fg0.y, sg0));\n"
+"            su0 = fmaf(wx, fu0.x, fmaf(wy, fu0.y, su0));\n"
+"            sg1 = fmaf(wx, fg1.x, fmaf(wy, fg1.y, sg1));\n"
+"            su1 = fmaf(wx, fu1.x, fmaf(wy, fu1.y, su1));\n"
+"        }\n"
+"    }\n"
+"    sg0 = warp_sum(sg0) * inv_rms; su0 = warp_sum(su0) * inv_rms;\n"
+"    sg1 = warp_sum(sg1) * inv_rms; su1 = warp_sum(su1) * inv_rms;\n"
+"    if (lane == 0) {\n"
+"        out[row0] = __float2half(apply_gated_act(sg0, su0, is_geglu));\n"
+"        if (row0 + 1 < d_ff) out[row0 + 1] = __float2half(apply_gated_act(sg1, su1, is_geglu));\n"
+"    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cuda_gemv_q8_0_epinorm(\n"
+"    const half* __restrict__ x,\n"
+"    const half* __restrict__ nw,\n"
+"    const uint8_t* __restrict__ w,\n"
+"    half* __restrict__ y,\n"
+"    const half* __restrict__ bias,\n"
+"    const float* __restrict__ ss_buf,\n"
+"    uint32_t out_dim, uint32_t in_dim, uint32_t gemma_mode, uint32_t has_bias, uint32_t ss_read_slot\n"
+") {\n"
+"    uint32_t wid = threadIdx.x >> 5;\n"
+"    uint32_t lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4 + wid;\n"
+"    if (row >= out_dim) return;\n"
+"    float inv_rms = rsqrtf(__ldg(&ss_buf[ss_read_slot]) / (float)in_dim + 1e-5f);\n"
+"    float g_add = (gemma_mode != 0u) ? 1.0f : 0.0f;\n"
 "    uint32_t nb = in_dim >> 5;\n"
 "    const float4* x8 = (const float4*)x;\n"
+"    const float4* nw8 = (const float4*)nw;\n"
 "    size_t b0 = (size_t)row * nb;\n"
 "    float s0 = 0.0f;\n"
 "    for (uint32_t b = lane; b < nb; b += 32u) {\n"
-"        s0 += q4_sb8_dot_fp16x(w, b0 + b, x8, b);\n"
+"        size_t blk_idx = b0 + b;\n"
+"        size_t sb = blk_idx >> 3;\n"
+"        uint32_t sub = (uint32_t)(blk_idx & 7u);\n"
+"        const uint8_t* sb_ptr = w + sb * 272u;\n"
+"        const uint4* qp = ((const uint4*)sb_ptr) + (sub << 1);\n"
+"        uint4 q0 = __ldg(&qp[0]); uint4 q1 = __ldg(&qp[1]);\n"
+"        float dw = __half2float(__ushort_as_half(__ldg(((const uint16_t*)(sb_ptr + 256u)) + sub)));\n"
+"        uint32_t qw[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };\n"
+"        float bsum = 0.0f;\n"
+"        #pragma unroll\n"
+"        for (int s = 0; s < 4; s++) {\n"
+"            float4 xv = __ldg(&x8[(b << 2) + s]);\n"
+"            float4 nv = __ldg(&nw8[(b << 2) + s]);\n"
+"            const half2* xh = (const half2*)&xv;\n"
+"            const half2* nh = (const half2*)&nv;\n"
+"            #pragma unroll\n"
+"            for (int t = 0; t < 2; t++) {\n"
+"                uint32_t v = qw[s * 2 + t];\n"
+"                float2 xa = __half22float2(xh[t * 2 + 0]); float2 na = __half22float2(nh[t * 2 + 0]);\n"
+"                float2 xb = __half22float2(xh[t * 2 + 1]); float2 nb_v = __half22float2(nh[t * 2 + 1]);\n"
+"                bsum = fmaf((float)((int8_t)(v & 0xFFu)),         xa.x * (na.x + g_add), bsum);\n"
+"                bsum = fmaf((float)((int8_t)((v >> 8) & 0xFFu)),  xa.y * (na.y + g_add), bsum);\n"
+"                bsum = fmaf((float)((int8_t)((v >> 16) & 0xFFu)), xb.x * (nb_v.x + g_add), bsum);\n"
+"                bsum = fmaf((float)((int8_t)((v >> 24) & 0xFFu)), xb.y * (nb_v.y + g_add), bsum);\n"
+"            }\n"
+"        }\n"
+"        s0 = fmaf(dw, bsum, s0);\n"
 "    }\n"
-"    s0 = warp_sum(s0);\n"
+"    s0 = warp_sum(s0) * inv_rms;\n"
 "    if (lane == 0) {\n"
 "        if (has_bias) s0 += __half2float(bias[row]);\n"
-"        if (add_res)  s0 += __half2float(y[row]);\n"
 "        y[row] = __float2half(s0);\n"
 "    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cuda_ffn_q8_0_epinorm(\n"
+"    const half* __restrict__ x,\n"
+"    const half* __restrict__ nw,\n"
+"    const uint8_t* __restrict__ wg,\n"
+"    const uint8_t* __restrict__ wu,\n"
+"    half* __restrict__ out,\n"
+"    const float* __restrict__ ss_buf,\n"
+"    uint32_t d_ff, uint32_t in_dim, uint32_t is_geglu, uint32_t gemma_mode, uint32_t ss_read_slot\n"
+") {\n"
+"    uint32_t wid = threadIdx.x >> 5;\n"
+"    uint32_t lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4 + wid;\n"
+"    if (row >= d_ff) return;\n"
+"    float inv_rms = rsqrtf(__ldg(&ss_buf[ss_read_slot]) / (float)in_dim + 1e-5f);\n"
+"    float g_add = (gemma_mode != 0u) ? 1.0f : 0.0f;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    const float4* x8 = (const float4*)x;\n"
+"    const float4* nw8 = (const float4*)nw;\n"
+"    size_t b0 = (size_t)row * nb;\n"
+"    float sg = 0.0f, su = 0.0f;\n"
+"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"        size_t blk_idx = b0 + b;\n"
+"        size_t sb = blk_idx >> 3;\n"
+"        uint32_t sub = (uint32_t)(blk_idx & 7u);\n"
+"        const uint8_t* sbg = wg + sb * 272u;\n"
+"        const uint8_t* sbu = wu + sb * 272u;\n"
+"        const uint4* qpg = ((const uint4*)sbg) + (sub << 1);\n"
+"        const uint4* qpu = ((const uint4*)sbu) + (sub << 1);\n"
+"        uint4 qg0 = __ldg(&qpg[0]), qg1 = __ldg(&qpg[1]);\n"
+"        uint4 qu0 = __ldg(&qpu[0]), qu1 = __ldg(&qpu[1]);\n"
+"        float dwg = __half2float(__ushort_as_half(__ldg(((const uint16_t*)(sbg + 256u)) + sub)));\n"
+"        float dwu = __half2float(__ushort_as_half(__ldg(((const uint16_t*)(sbu + 256u)) + sub)));\n"
+"        uint32_t qgw[8] = { qg0.x, qg0.y, qg0.z, qg0.w, qg1.x, qg1.y, qg1.z, qg1.w };\n"
+"        uint32_t quw[8] = { qu0.x, qu0.y, qu0.z, qu0.w, qu1.x, qu1.y, qu1.z, qu1.w };\n"
+"        float bg = 0.0f, bu = 0.0f;\n"
+"        #pragma unroll\n"
+"        for (int s = 0; s < 4; s++) {\n"
+"            float4 xv = __ldg(&x8[(b << 2) + s]);\n"
+"            float4 nv = __ldg(&nw8[(b << 2) + s]);\n"
+"            const half2* xh = (const half2*)&xv;\n"
+"            const half2* nh = (const half2*)&nv;\n"
+"            #pragma unroll\n"
+"            for (int t = 0; t < 2; t++) {\n"
+"                float2 xa = __half22float2(xh[t * 2 + 0]); float2 na = __half22float2(nh[t * 2 + 0]);\n"
+"                float2 xb = __half22float2(xh[t * 2 + 1]); float2 nb_v = __half22float2(nh[t * 2 + 1]);\n"
+"                float w0 = xa.x * (na.x + g_add), w1 = xa.y * (na.y + g_add);\n"
+"                float w2 = xb.x * (nb_v.x + g_add), w3 = xb.y * (nb_v.y + g_add);\n"
+"                uint32_t vg = qgw[s * 2 + t];\n"
+"                bg = fmaf((float)((int8_t)(vg & 0xFFu)), w0, bg);\n"
+"                bg = fmaf((float)((int8_t)((vg >> 8) & 0xFFu)), w1, bg);\n"
+"                bg = fmaf((float)((int8_t)((vg >> 16) & 0xFFu)), w2, bg);\n"
+"                bg = fmaf((float)((int8_t)((vg >> 24) & 0xFFu)), w3, bg);\n"
+"                uint32_t vu = quw[s * 2 + t];\n"
+"                bu = fmaf((float)((int8_t)(vu & 0xFFu)), w0, bu);\n"
+"                bu = fmaf((float)((int8_t)((vu >> 8) & 0xFFu)), w1, bu);\n"
+"                bu = fmaf((float)((int8_t)((vu >> 16) & 0xFFu)), w2, bu);\n"
+"                bu = fmaf((float)((int8_t)((vu >> 24) & 0xFFu)), w3, bu);\n"
+"            }\n"
+"        }\n"
+"        sg = fmaf(dwg, bg, sg); su = fmaf(dwu, bu, su);\n"
+"    }\n"
+"    sg = warp_sum(sg) * inv_rms; su = warp_sum(su) * inv_rms;\n"
+"    if (lane == 0) out[row] = __float2half(apply_gated_act(sg, su, is_geglu));\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cuda_gemv_q4_0_epinorm(\n"
+"    const half* __restrict__ x,\n"
+"    const half* __restrict__ nw,\n"
+"    const uint8_t* __restrict__ w,\n"
+"    half* __restrict__ y,\n"
+"    const half* __restrict__ bias,\n"
+"    const float* __restrict__ ss_buf,\n"
+"    uint32_t out_dim, uint32_t in_dim, uint32_t gemma_mode, uint32_t has_bias, uint32_t ss_read_slot\n"
+") {\n"
+"    uint32_t wid = threadIdx.x >> 5;\n"
+"    uint32_t lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4 + wid;\n"
+"    if (row >= out_dim) return;\n"
+"    float inv_rms = rsqrtf(__ldg(&ss_buf[ss_read_slot]) / (float)in_dim + 1e-5f);\n"
+"    float g_add = (gemma_mode != 0u) ? 1.0f : 0.0f;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    const float4* x8 = (const float4*)x;\n"
+"    const float4* nw8 = (const float4*)nw;\n"
+"    size_t b0 = (size_t)row * nb;\n"
+"    float s0 = 0.0f;\n"
+"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"        size_t blk_idx = b0 + b;\n"
+"        size_t sb = blk_idx >> 3;\n"
+"        uint32_t sub = (uint32_t)(blk_idx & 7u);\n"
+"        const uint8_t* sb_ptr = w + sb * 144u;\n"
+"        uint4 q = __ldg(((const uint4*)sb_ptr) + sub);\n"
+"        float dw = __half2float(__ushort_as_half(__ldg(((const uint16_t*)(sb_ptr + 128u)) + sub)));\n"
+"        float4 xa0 = __ldg(&x8[(b << 2) + 0]); float4 na0 = __ldg(&nw8[(b << 2) + 0]);\n"
+"        float4 xa1 = __ldg(&x8[(b << 2) + 1]); float4 na1 = __ldg(&nw8[(b << 2) + 1]);\n"
+"        float4 xb0 = __ldg(&x8[(b << 2) + 2]); float4 nb0 = __ldg(&nw8[(b << 2) + 2]);\n"
+"        float4 xb1 = __ldg(&x8[(b << 2) + 3]); float4 nb1 = __ldg(&nw8[(b << 2) + 3]);\n"
+"        const half2* h_lo0 = (const half2*)&xa0; const half2* n_lo0 = (const half2*)&na0;\n"
+"        const half2* h_lo1 = (const half2*)&xa1; const half2* n_lo1 = (const half2*)&na1;\n"
+"        const half2* h_hi0 = (const half2*)&xb0; const half2* n_hi0 = (const half2*)&nb0;\n"
+"        const half2* h_hi1 = (const half2*)&xb1; const half2* n_hi1 = (const half2*)&nb1;\n"
+"        uint32_t qw[4] = { q.x, q.y, q.z, q.w };\n"
+"        float bsum = 0.0f;\n"
+"        #pragma unroll\n"
+"        for (int g = 0; g < 4; g++) {\n"
+"            uint32_t v = qw[g];\n"
+"            float2 xl0 = __half22float2(g < 2 ? h_lo0[g * 2]     : h_lo1[(g - 2) * 2]);\n"
+"            float2 nl0 = __half22float2(g < 2 ? n_lo0[g * 2]     : n_lo1[(g - 2) * 2]);\n"
+"            float2 xl1 = __half22float2(g < 2 ? h_lo0[g * 2 + 1] : h_lo1[(g - 2) * 2 + 1]);\n"
+"            float2 nl1 = __half22float2(g < 2 ? n_lo0[g * 2 + 1] : n_lo1[(g - 2) * 2 + 1]);\n"
+"            float2 xh0 = __half22float2(g < 2 ? h_hi0[g * 2]     : h_hi1[(g - 2) * 2]);\n"
+"            float2 nh0 = __half22float2(g < 2 ? n_hi0[g * 2]     : n_hi1[(g - 2) * 2]);\n"
+"            float2 xh1 = __half22float2(g < 2 ? h_hi0[g * 2 + 1] : h_hi1[(g - 2) * 2 + 1]);\n"
+"            float2 nh1 = __half22float2(g < 2 ? n_hi0[g * 2 + 1] : n_hi1[(g - 2) * 2 + 1]);\n"
+"            bsum = fmaf((float)((int)(v & 0xFu) - 8),          xl0.x * (nl0.x + g_add), bsum);\n"
+"            bsum = fmaf((float)((int)((v >> 8) & 0xFu) - 8),   xl0.y * (nl0.y + g_add), bsum);\n"
+"            bsum = fmaf((float)((int)((v >> 16) & 0xFu) - 8),  xl1.x * (nl1.x + g_add), bsum);\n"
+"            bsum = fmaf((float)((int)((v >> 24) & 0xFu) - 8),  xl1.y * (nl1.y + g_add), bsum);\n"
+"            bsum = fmaf((float)((int)((v >> 4) & 0xFu) - 8),   xh0.x * (nh0.x + g_add), bsum);\n"
+"            bsum = fmaf((float)((int)((v >> 12) & 0xFu) - 8),  xh0.y * (nh0.y + g_add), bsum);\n"
+"            bsum = fmaf((float)((int)((v >> 20) & 0xFu) - 8),  xh1.x * (nh1.x + g_add), bsum);\n"
+"            bsum = fmaf((float)((int)((v >> 28) & 0xFu) - 8),  xh1.y * (nh1.y + g_add), bsum);\n"
+"        }\n"
+"        s0 = fmaf(dw, bsum, s0);\n"
+"    }\n"
+"    s0 = warp_sum(s0) * inv_rms;\n"
+"    if (lane == 0) {\n"
+"        if (has_bias) s0 += __half2float(bias[row]);\n"
+"        y[row] = __float2half(s0);\n"
+"    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cuda_ffn_q4_0_epinorm(\n"
+"    const half* __restrict__ x,\n"
+"    const half* __restrict__ nw,\n"
+"    const uint8_t* __restrict__ wg,\n"
+"    const uint8_t* __restrict__ wu,\n"
+"    half* __restrict__ out,\n"
+"    const float* __restrict__ ss_buf,\n"
+"    uint32_t d_ff, uint32_t in_dim, uint32_t is_geglu, uint32_t gemma_mode, uint32_t ss_read_slot\n"
+") {\n"
+"    uint32_t wid = threadIdx.x >> 5;\n"
+"    uint32_t lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4 + wid;\n"
+"    if (row >= d_ff) return;\n"
+"    float inv_rms = rsqrtf(__ldg(&ss_buf[ss_read_slot]) / (float)in_dim + 1e-5f);\n"
+"    float g_add = (gemma_mode != 0u) ? 1.0f : 0.0f;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    const float4* x8 = (const float4*)x;\n"
+"    const float4* nw8 = (const float4*)nw;\n"
+"    size_t b0 = (size_t)row * nb;\n"
+"    float sg = 0.0f, su = 0.0f;\n"
+"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"        size_t blk_idx = b0 + b;\n"
+"        size_t sb = blk_idx >> 3;\n"
+"        uint32_t sub = (uint32_t)(blk_idx & 7u);\n"
+"        const uint8_t* sbg = wg + sb * 144u;\n"
+"        const uint8_t* sbu = wu + sb * 144u;\n"
+"        uint4 qg = __ldg(((const uint4*)sbg) + sub);\n"
+"        uint4 qu = __ldg(((const uint4*)sbu) + sub);\n"
+"        float dwg = __half2float(__ushort_as_half(__ldg(((const uint16_t*)(sbg + 128u)) + sub)));\n"
+"        float dwu = __half2float(__ushort_as_half(__ldg(((const uint16_t*)(sbu + 128u)) + sub)));\n"
+"        float4 xa0 = __ldg(&x8[(b << 2) + 0]); float4 na0 = __ldg(&nw8[(b << 2) + 0]);\n"
+"        float4 xa1 = __ldg(&x8[(b << 2) + 1]); float4 na1 = __ldg(&nw8[(b << 2) + 1]);\n"
+"        float4 xb0 = __ldg(&x8[(b << 2) + 2]); float4 nb0 = __ldg(&nw8[(b << 2) + 2]);\n"
+"        float4 xb1 = __ldg(&x8[(b << 2) + 3]); float4 nb1 = __ldg(&nw8[(b << 2) + 3]);\n"
+"        const half2* h_lo0 = (const half2*)&xa0; const half2* n_lo0 = (const half2*)&na0;\n"
+"        const half2* h_lo1 = (const half2*)&xa1; const half2* n_lo1 = (const half2*)&na1;\n"
+"        const half2* h_hi0 = (const half2*)&xb0; const half2* n_hi0 = (const half2*)&nb0;\n"
+"        const half2* h_hi1 = (const half2*)&xb1; const half2* n_hi1 = (const half2*)&nb1;\n"
+"        uint32_t qgw[4] = { qg.x, qg.y, qg.z, qg.w };\n"
+"        uint32_t quw[4] = { qu.x, qu.y, qu.z, qu.w };\n"
+"        float bg = 0.0f, bu = 0.0f;\n"
+"        #pragma unroll\n"
+"        for (int g = 0; g < 4; g++) {\n"
+"            float2 xl0 = __half22float2(g < 2 ? h_lo0[g * 2]     : h_lo1[(g - 2) * 2]);\n"
+"            float2 nl0 = __half22float2(g < 2 ? n_lo0[g * 2]     : n_lo1[(g - 2) * 2]);\n"
+"            float2 xl1 = __half22float2(g < 2 ? h_lo0[g * 2 + 1] : h_lo1[(g - 2) * 2 + 1]);\n"
+"            float2 nl1 = __half22float2(g < 2 ? n_lo0[g * 2 + 1] : n_lo1[(g - 2) * 2 + 1]);\n"
+"            float2 xh0 = __half22float2(g < 2 ? h_hi0[g * 2]     : h_hi1[(g - 2) * 2]);\n"
+"            float2 nh0 = __half22float2(g < 2 ? n_hi0[g * 2]     : n_hi1[(g - 2) * 2]);\n"
+"            float2 xh1 = __half22float2(g < 2 ? h_hi0[g * 2 + 1] : h_hi1[(g - 2) * 2 + 1]);\n"
+"            float2 nh1 = __half22float2(g < 2 ? n_hi0[g * 2 + 1] : n_hi1[(g - 2) * 2 + 1]);\n"
+"            float w0 = xl0.x * (nl0.x + g_add), w1 = xl0.y * (nl0.y + g_add);\n"
+"            float w2 = xl1.x * (nl1.x + g_add), w3 = xl1.y * (nl1.y + g_add);\n"
+"            float w4 = xh0.x * (nh0.x + g_add), w5 = xh0.y * (nh0.y + g_add);\n"
+"            float w6 = xh1.x * (nh1.x + g_add), w7 = xh1.y * (nh1.y + g_add);\n"
+"            uint32_t vg = qgw[g];\n"
+"            bg = fmaf((float)((int)(vg & 0xFu) - 8),         w0, bg);\n"
+"            bg = fmaf((float)((int)((vg >> 8) & 0xFu) - 8),  w1, bg);\n"
+"            bg = fmaf((float)((int)((vg >> 16) & 0xFu) - 8), w2, bg);\n"
+"            bg = fmaf((float)((int)((vg >> 24) & 0xFu) - 8), w3, bg);\n"
+"            bg = fmaf((float)((int)((vg >> 4) & 0xFu) - 8),  w4, bg);\n"
+"            bg = fmaf((float)((int)((vg >> 12) & 0xFu) - 8), w5, bg);\n"
+"            bg = fmaf((float)((int)((vg >> 20) & 0xFu) - 8), w6, bg);\n"
+"            bg = fmaf((float)((int)((vg >> 28) & 0xFu) - 8), w7, bg);\n"
+"            uint32_t vu = quw[g];\n"
+"            bu = fmaf((float)((int)(vu & 0xFu) - 8),         w0, bu);\n"
+"            bu = fmaf((float)((int)((vu >> 8) & 0xFu) - 8),  w1, bu);\n"
+"            bu = fmaf((float)((int)((vu >> 16) & 0xFu) - 8), w2, bu);\n"
+"            bu = fmaf((float)((int)((vu >> 24) & 0xFu) - 8), w3, bu);\n"
+"            bu = fmaf((float)((int)((vu >> 4) & 0xFu) - 8),  w4, bu);\n"
+"            bu = fmaf((float)((int)((vu >> 12) & 0xFu) - 8), w5, bu);\n"
+"            bu = fmaf((float)((int)((vu >> 20) & 0xFu) - 8), w6, bu);\n"
+"            bu = fmaf((float)((int)((vu >> 28) & 0xFu) - 8), w7, bu);\n"
+"        }\n"
+"        sg = fmaf(dwg, bg, sg); su = fmaf(dwu, bu, su);\n"
+"    }\n"
+"    sg = warp_sum(sg) * inv_rms; su = warp_sum(su) * inv_rms;\n"
+"    if (lane == 0) out[row] = __float2half(apply_gated_act(sg, su, is_geglu));\n"
 "}\n"
 "\n"
 "/* 5A2. Zero-SMEM Direct-FP16x + 128-bit `uint4` SB8 4w1r Fused Gate+Up+SwiGLU/GeGLU Q4_0 */\n"
@@ -1169,9 +1714,12 @@ static const char* TENON_CUDA_ULTRA_SRC =
 static int g_cu_ultra_ready = 0;
 static CUmodule g_cu_ultra_mod = NULL;
 static CUdeviceptr g_l2_scratch_dptr = 0;
-static CUfunction k_embed, k_rmsnorm, k_x_to_q8_1, k_gemv_f16, k_gemv_f16_1r, k_ffn_f16;
+static CUdeviceptr g_ss_dptr = 0;
+static CUfunction k_embed, k_embed_ss, k_rmsnorm, k_rmsnorm_fp8, k_silu_mul_fp8, k_x_to_q8_1;
+static CUfunction k_gemv_f16, k_gemv_f16_1r, k_ffn_f16;
 static CUfunction k_gemv_q8, k_gemv_q4, k_ffn_q8, k_ffn_q4, k_gemv_q8_smem, k_gemv_q4_smem;
 static CUfunction k_norm_ffn_q8_smem, k_norm_ffn_q4_smem;
+static CUfunction k_gemv_f16_epinorm, k_ffn_f16_epinorm, k_gemv_q8_epinorm, k_ffn_q8_epinorm, k_gemv_q4_epinorm, k_ffn_q4_epinorm;
 static CUfunction k_rope_flash, k_argmax, k_silu_mul, k_mm_f16, k_mm_q4;
 
 int64_t tn_cuda_ultra_init(void) {
@@ -1181,7 +1729,10 @@ int64_t tn_cuda_ultra_init(void) {
     if (!g_cu_ultra_mod) return 0;
     int ok = 1;
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_embed_f16", &k_embed);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_embed_f16_ss", &k_embed_ss);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_rmsnorm_f16", &k_rmsnorm);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_rmsnorm_fp8_e4m3", &k_rmsnorm_fp8);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_silu_mul_fp8_e4m3", &k_silu_mul_fp8);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_x_to_q8_1", &k_x_to_q8_1);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_f16", &k_gemv_f16);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_f16_1r", &k_gemv_f16_1r);
@@ -1190,6 +1741,12 @@ int64_t tn_cuda_ultra_init(void) {
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_q4_0", &k_gemv_q4);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_ffn_q8_0", &k_ffn_q8);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_ffn_q4_0", &k_ffn_q4);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_f16_epinorm", &k_gemv_f16_epinorm);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_ffn_f16_epinorm", &k_ffn_f16_epinorm);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_q8_0_epinorm", &k_gemv_q8_epinorm);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_ffn_q8_0_epinorm", &k_ffn_q8_epinorm);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_q4_0_epinorm", &k_gemv_q4_epinorm);
+    ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_ffn_q4_0_epinorm", &k_ffn_q4_epinorm);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_q8_0_smem", &k_gemv_q8_smem);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_gemv_q4_0_smem", &k_gemv_q4_smem);
     ok &= tn_cuda_mod_get_fn(g_cu_ultra_mod, "cuda_norm_ffn_q8_0_smem", &k_norm_ffn_q8_smem);
@@ -1203,6 +1760,9 @@ int64_t tn_cuda_ultra_init(void) {
     int64_t sh = tn_cuda_buf_uninit(65536);
     if (sh <= 0) return 0;
     g_l2_scratch_dptr = tn_cuda_buf_dptr(sh);
+    int64_t ssh = tn_cuda_buf_uninit(64);
+    if (ssh <= 0) return 0;
+    g_ss_dptr = tn_cuda_buf_dptr(ssh);
     g_cu_ultra_ready = 1;
     return 1;
 }
@@ -1229,6 +1789,16 @@ int64_t tn_cuda_ultra_embed(int64_t tok_h, int64_t emb_h, int64_t emb_off, int64
     return tn_cuda_launch_raw(k_embed, (total + 255u) / 256u, 1, 1, 256, 1, 1, 0, ps);
 }
 
+int64_t tn_cuda_ultra_embed_ss(int64_t tok_h, int64_t emb_h, int64_t emb_off, int64_t out_h, int64_t d_model, int64_t vocab) {
+    CUdeviceptr pt = tn_cuda_buf_dptr(tok_h);
+    CUdeviceptr pe = tn_cuda_buf_dptr(emb_h) + (uint64_t)emb_off;
+    CUdeviceptr po = tn_cuda_buf_dptr(out_h);
+    CUdeviceptr pss = g_ss_dptr;
+    uint32_t dm = (uint32_t)d_model, vb = (uint32_t)vocab;
+    void* ps[6] = { &pt, &pe, &po, &pss, &dm, &vb };
+    return tn_cuda_launch_raw(k_embed_ss, 1, 1, 1, 256, 1, 1, 0, ps);
+}
+
 int64_t tn_cuda_ultra_rmsnorm(int64_t x_h, int64_t w_h, int64_t w_off, int64_t out_h, int64_t seq_len, int64_t d_model, int64_t gemma_mode) {
     CUdeviceptr px = tn_cuda_buf_dptr(x_h);
     CUdeviceptr pw = tn_cuda_buf_dptr(w_h) + (uint64_t)w_off;
@@ -1238,18 +1808,28 @@ int64_t tn_cuda_ultra_rmsnorm(int64_t x_h, int64_t w_h, int64_t w_off, int64_t o
     return tn_cuda_launch_raw(k_rmsnorm, (unsigned int)seq_len, 1, 1, 256, 1, 1, 0, ps);
 }
 
-int64_t tn_cuda_ultra_gemv(
+int64_t tn_cuda_ultra_rmsnorm_fp8(int64_t x_h, int64_t w_h, int64_t w_off, int64_t out_h, int64_t seq_len, int64_t d_model, int64_t gemma_mode) {
+    CUdeviceptr px = tn_cuda_buf_dptr(x_h);
+    CUdeviceptr pw = tn_cuda_buf_dptr(w_h) + (uint64_t)w_off;
+    CUdeviceptr po = tn_cuda_buf_dptr(out_h);
+    uint32_t dm = (uint32_t)d_model, gm = (uint32_t)gemma_mode;
+    void* ps[5] = { &px, &pw, &po, &dm, &gm };
+    return tn_cuda_launch_raw(k_rmsnorm_fp8, (unsigned int)seq_len, 1, 1, 256, 1, 1, 0, ps);
+}
+
+int64_t tn_cuda_ultra_gemv_ss(
     int64_t x_h, int64_t w_h, int64_t w_off, int64_t y_h, int64_t b_h, int64_t b_off,
-    int64_t out_dim, int64_t in_dim, int64_t quant_mode, int64_t add_res, int64_t has_bias
+    int64_t out_dim, int64_t in_dim, int64_t quant_mode, int64_t add_res, int64_t has_bias, int64_t ss_write_slot
 ) {
     CUdeviceptr px = tn_cuda_buf_dptr(x_h);
     CUdeviceptr pw = tn_cuda_buf_dptr(w_h) + (uint64_t)w_off;
     CUdeviceptr py = tn_cuda_buf_dptr(y_h);
     CUdeviceptr pb = has_bias ? (tn_cuda_buf_dptr(b_h) + (uint64_t)b_off) : py;
+    CUdeviceptr pss = g_ss_dptr;
     uint32_t od = (uint32_t)out_dim, id = (uint32_t)in_dim, ar = (uint32_t)add_res, hb = (uint32_t)has_bias;
-    void* ps[8] = { &px, &pw, &py, &pb, &od, &id, &ar, &hb };
+    int32_t sws = (int32_t)ss_write_slot;
+    void* ps[10] = { &px, &pw, &py, &pb, &pss, &od, &id, &ar, &hb, &sws };
     if (quant_mode == 2 || quant_mode == 1) {
-        /* Direct Zero-SMEM L2-Hot FP16x + SB8 uint4 4w1r (ZERO x_to_q8_1 drain barrier!) */
         CUfunction fn = quant_mode == 2 ? k_gemv_q4 : k_gemv_q8;
         return tn_cuda_launch_raw(fn, (od + 3u) / 4u, 1, 1, 128, 1, 1, 0, ps);
     }
@@ -1257,6 +1837,49 @@ int64_t tn_cuda_ultra_gemv(
         return tn_cuda_launch_raw(k_gemv_f16_1r, (od + 3u) / 4u, 1, 1, 128, 1, 1, 0, ps);
     }
     return tn_cuda_launch_raw(k_gemv_f16, (od + 7u) / 8u, 1, 1, 128, 1, 1, 0, ps);
+}
+
+int64_t tn_cuda_ultra_gemv(
+    int64_t x_h, int64_t w_h, int64_t w_off, int64_t y_h, int64_t b_h, int64_t b_off,
+    int64_t out_dim, int64_t in_dim, int64_t quant_mode, int64_t add_res, int64_t has_bias
+) {
+    return tn_cuda_ultra_gemv_ss(x_h, w_h, w_off, y_h, b_h, b_off, out_dim, in_dim, quant_mode, add_res, has_bias, -1);
+}
+
+int64_t tn_cuda_ultra_epinorm_gemv(
+    int64_t x_h, int64_t nw_h, int64_t nw_off, int64_t w_h, int64_t w_off, int64_t y_h,
+    int64_t b_h, int64_t b_off, int64_t out_dim, int64_t in_dim, int64_t quant_mode,
+    int64_t gemma_mode, int64_t has_bias, int64_t ss_read_slot
+) {
+    CUdeviceptr px = tn_cuda_buf_dptr(x_h);
+    CUdeviceptr pnw = tn_cuda_buf_dptr(nw_h) + (uint64_t)nw_off;
+    CUdeviceptr pw = tn_cuda_buf_dptr(w_h) + (uint64_t)w_off;
+    CUdeviceptr py = tn_cuda_buf_dptr(y_h);
+    CUdeviceptr pb = has_bias ? (tn_cuda_buf_dptr(b_h) + (uint64_t)b_off) : py;
+    CUdeviceptr pss = g_ss_dptr;
+    uint32_t od = (uint32_t)out_dim, id = (uint32_t)in_dim, gm = (uint32_t)gemma_mode, hb = (uint32_t)has_bias, srs = (uint32_t)ss_read_slot;
+    void* ps[11] = { &px, &pnw, &pw, &py, &pb, &pss, &od, &id, &gm, &hb, &srs };
+    CUfunction fn = quant_mode == 2 ? k_gemv_q4_epinorm : (quant_mode == 1 ? k_gemv_q8_epinorm : k_gemv_f16_epinorm);
+    return tn_cuda_launch_raw(fn, (od + 3u) / 4u, 1, 1, 128, 1, 1, 0, ps);
+}
+
+int64_t tn_cuda_ultra_epinorm_ffn(
+    int64_t x_h, int64_t nw_h, int64_t nw_off, int64_t wg_h, int64_t wg_off, int64_t wu_h, int64_t wu_off,
+    int64_t out_h, int64_t d_ff, int64_t in_dim, int64_t quant_mode, int64_t is_geglu, int64_t gemma_mode, int64_t ss_read_slot
+) {
+    CUdeviceptr px = tn_cuda_buf_dptr(x_h);
+    CUdeviceptr pnw = tn_cuda_buf_dptr(nw_h) + (uint64_t)nw_off;
+    CUdeviceptr pwg = tn_cuda_buf_dptr(wg_h) + (uint64_t)wg_off;
+    CUdeviceptr pwu = tn_cuda_buf_dptr(wu_h) + (uint64_t)wu_off;
+    CUdeviceptr po = tn_cuda_buf_dptr(out_h);
+    CUdeviceptr pss = g_ss_dptr;
+    uint32_t df = (uint32_t)d_ff, id = (uint32_t)in_dim, ig = (uint32_t)is_geglu, gm = (uint32_t)gemma_mode, srs = (uint32_t)ss_read_slot;
+    void* ps[11] = { &px, &pnw, &pwg, &pwu, &po, &pss, &df, &id, &ig, &gm, &srs };
+    if (quant_mode == 2 || quant_mode == 1) {
+        CUfunction fn = quant_mode == 2 ? k_ffn_q4_epinorm : k_ffn_q8_epinorm;
+        return tn_cuda_launch_raw(fn, (df + 3u) / 4u, 1, 1, 128, 1, 1, 0, ps);
+    }
+    return tn_cuda_launch_raw(k_ffn_f16_epinorm, (df + 7u) / 8u, 1, 1, 128, 1, 1, 0, ps);
 }
 
 int64_t tn_cuda_ultra_norm_gemv(
@@ -1269,11 +1892,13 @@ int64_t tn_cuda_ultra_norm_gemv(
     CUdeviceptr pw = tn_cuda_buf_dptr(w_h) + (uint64_t)w_off;
     CUdeviceptr py = tn_cuda_buf_dptr(y_h);
     CUdeviceptr pb = has_bias ? (tn_cuda_buf_dptr(b_h) + (uint64_t)b_off) : py;
+    CUdeviceptr pss = g_ss_dptr;
     uint32_t od = (uint32_t)out_dim, id = (uint32_t)in_dim, gm = (uint32_t)gemma_mode, hb = (uint32_t)has_bias, ar = 0;
+    int32_t sws = -1;
     /* Unified 1-CTA vectorized float4 RMSNorm -> 4KB L2-hot scratch + Zero-SMEM 4w1r GEMV! */
     if (!tn_launch_rmsnorm_to_l2(px, pnw, id, gm)) return 0;
     CUdeviceptr pxn = g_l2_scratch_dptr;
-    void* ps[8] = { &pxn, &pw, &py, &pb, &od, &id, &ar, &hb };
+    void* ps[10] = { &pxn, &pw, &py, &pb, &pss, &od, &id, &ar, &hb, &sws };
     if (quant_mode == 2 || quant_mode == 1) {
         CUfunction fn = quant_mode == 2 ? k_gemv_q4 : k_gemv_q8;
         return tn_cuda_launch_raw(fn, (od + 3u) / 4u, 1, 1, 128, 1, 1, 0, ps);
@@ -1338,6 +1963,16 @@ int64_t tn_cuda_ultra_silu_mul(int64_t g_h, int64_t u_h, int64_t o_h, int64_t n_
     return tn_cuda_launch_raw(k_silu_mul, (n + 255u) / 256u, 1, 1, 256, 1, 1, 0, ps);
 }
 
+int64_t tn_cuda_ultra_silu_mul_fp8(int64_t g_h, int64_t u_h, int64_t o_h, int64_t n_elems) {
+    CUdeviceptr pg = tn_cuda_buf_dptr(g_h);
+    CUdeviceptr pu = tn_cuda_buf_dptr(u_h);
+    CUdeviceptr po = tn_cuda_buf_dptr(o_h);
+    uint32_t n = (uint32_t)n_elems;
+    uint32_t n2 = n >> 1;
+    void* ps[4] = { &pg, &pu, &po, &n };
+    return tn_cuda_launch_raw(k_silu_mul_fp8, (n2 + 255u) / 256u, 1, 1, 256, 1, 1, 0, ps);
+}
+
 int64_t tn_cuda_ultra_mm(
     int64_t x_h, int64_t w_h, int64_t w_off, int64_t y_h,
     int64_t m, int64_t n, int64_t k, int64_t quant_mode, int64_t add_res
@@ -1355,4 +1990,29 @@ int64_t tn_cuda_ultra_mm(
     void* ps[7] = { &px, &pw, &py, &um, &un, &uk, &ar };
     CUfunction fn = quant_mode == 2 ? k_mm_q4 : k_mm_f16;
     return tn_cuda_launch_raw(fn, (un + 15u) / 16u, (um + 15u) / 16u, 1, 16, 16, 1, 0, ps);
+}
+
+int64_t tn_cuda_ultra_mm_fast(
+    int64_t x_h, int64_t w_h, int64_t w_off, int64_t y_h,
+    int64_t m, int64_t n, int64_t k, int64_t add_res
+) {
+    CUdeviceptr px = tn_cuda_buf_dptr(x_h);
+    CUdeviceptr pw = tn_cuda_buf_dptr(w_h) + (uint64_t)w_off;
+    CUdeviceptr py = tn_cuda_buf_dptr(y_h);
+    if (tn_cuda_has_cublas()) {
+        if (tn_cuda_cublas_gemm_f16_fast(px, pw, py, (int)m, (int)n, (int)k, (int)add_res)) {
+            return 1;
+        }
+    }
+    return tn_cuda_ultra_mm(x_h, w_h, w_off, y_h, m, n, k, 0, add_res);
+}
+
+int64_t tn_cuda_ultra_mm_fp8(
+    int64_t x_h, int64_t w_h, int64_t w_off, int64_t y_h,
+    int64_t m, int64_t n, int64_t k, int64_t add_res
+) {
+    CUdeviceptr px = tn_cuda_buf_dptr(x_h);
+    CUdeviceptr pw = tn_cuda_buf_dptr(w_h) + (uint64_t)w_off;
+    CUdeviceptr py = tn_cuda_buf_dptr(y_h);
+    return tn_cuda_cublaslt_gemm_fp8(px, pw, py, (int)m, (int)n, (int)k, (int)add_res) ? 1 : 0;
 }

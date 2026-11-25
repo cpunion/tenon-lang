@@ -20,23 +20,42 @@ pub enum TensorDType {
     Float32,
     Float16,
     BFloat16,
+    FP8,
     Int8,
+    Int4,
+    Q8_0,
+    Q4_0,
 }
 
 impl TensorDType {
-    pub fn bytes(self) -> usize {
+    /// Exact average storage bytes per element (supports sub-byte `Int4` = 0.5B and block-quantized `Q4_0` = 18/32 B!).
+    pub fn bytes_f64(self) -> f64 {
         match self {
-            TensorDType::Float32 => 4,
-            TensorDType::Float16 | TensorDType::BFloat16 => 2,
-            TensorDType::Int8 => 1,
+            TensorDType::Float32 => 4.0,
+            TensorDType::Float16 | TensorDType::BFloat16 => 2.0,
+            TensorDType::FP8 | TensorDType::Int8 => 1.0,
+            TensorDType::Int4 => 0.5,
+            TensorDType::Q8_0 => 34.0 / 32.0,
+            TensorDType::Q4_0 => 18.0 / 32.0,
         }
+    }
+    pub fn bytes(self) -> usize {
+        self.bytes_f64().ceil() as usize
+    }
+    pub fn is_quantized_weight(self) -> bool {
+        matches!(self, TensorDType::Int8 | TensorDType::Int4 | TensorDType::Q8_0 | TensorDType::Q4_0 | TensorDType::FP8)
+    }
+    pub fn is_4bit(self) -> bool {
+        matches!(self, TensorDType::Int4 | TensorDType::Q4_0)
     }
     pub fn mlir_ty(self) -> &'static str {
         match self {
             TensorDType::Float32 => "f32",
             TensorDType::Float16 => "f16",
             TensorDType::BFloat16 => "bf16",
-            TensorDType::Int8 => "i8",
+            TensorDType::FP8 => "f8E4M3FN",
+            TensorDType::Int8 | TensorDType::Q8_0 => "i8",
+            TensorDType::Int4 | TensorDType::Q4_0 => "i4",
         }
     }
     pub fn cuda_ty(self) -> &'static str {
@@ -44,7 +63,9 @@ impl TensorDType {
             TensorDType::Float32 => "float",
             TensorDType::Float16 => "half",
             TensorDType::BFloat16 => "__nv_bfloat16",
+            TensorDType::FP8 => "uint8_t",
             TensorDType::Int8 => "int8_t",
+            TensorDType::Int4 | TensorDType::Q8_0 | TensorDType::Q4_0 => "uint8_t",
         }
     }
     pub fn msl_ty(self) -> &'static str {
@@ -52,7 +73,19 @@ impl TensorDType {
             TensorDType::Float32 => "float",
             TensorDType::Float16 => "half",
             TensorDType::BFloat16 => "bfloat",
+            TensorDType::FP8 => "uchar",
             TensorDType::Int8 => "char",
+            TensorDType::Int4 | TensorDType::Q8_0 | TensorDType::Q4_0 => "uchar",
+        }
+    }
+    pub fn target_layout_desc(self) -> &'static str {
+        match self {
+            TensorDType::Q4_0 | TensorDType::Int4 => "CUDA/Metal: Q4_0_SB8 (128-bit uint4, 144B/8blk) | TPU: Native Hardware `i4` (PJRT S4, W4A8 INT8 MXU)",
+            TensorDType::Q8_0 | TensorDType::Int8 => "CUDA/Metal: Q8_0_SB8 (128-bit uint4, 272B/8blk) | TPU: Native `i8` (394 TOPS INT8 MXU)",
+            TensorDType::FP8 => "CUDA sm_89: cublasLt FP8 e4m3fn (660 TFLOPS) | TPU: f8E4M3FN",
+            TensorDType::Float16 => "Dense 128-bit float4/half4 + TensorCore / simdgroup_half8x8",
+            TensorDType::BFloat16 => "Dense BF16 + TPU MXU (197 TFLOPS)",
+            TensorDType::Float32 => "Dense FP32",
         }
     }
 }
@@ -65,15 +98,20 @@ pub struct MatrixShape {
 }
 
 impl MatrixShape {
+    pub fn bytes_f64(self) -> f64 {
+        (self.rows as f64) * (self.cols as f64) * self.dtype.bytes_f64()
+    }
     pub fn bytes(self) -> usize {
-        self.rows * self.cols * self.dtype.bytes()
+        self.bytes_f64().ceil() as usize
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum DataflowOp {
     RmsNorm { x: String, w: String },
-    MatMul { a: String, b: String },
+    MatMul { a: String, b: String, weight_dtype: TensorDType },
+    Rope { x: String },
+    GqaAttention { q: String, k: String, v: String, q_dim: usize, kv_dim: usize },
     SwiGlu { gate: String, up: String },
     Add { a: String, b: String },
     Mul { a: String, b: String },
@@ -91,6 +129,36 @@ pub struct DataflowNode {
 
 #[derive(Debug, Clone)]
 pub enum FusedStage {
+    /// On-chip Horizontal 3-Way QKV Super-Fusion: `RMSNorm(x, nw) -> (Q = h @ w_q || K = h @ w_k || V = h @ w_v)`
+    /// Fuses 4 ops into ONE horizontally concatenated `W_qkv [D, q_dim + 2*kv_dim]` stage (1x input read)!
+    FusedRmsNormQkv {
+        x: String,
+        nw: String,
+        w_q: String,
+        w_k: String,
+        w_v: String,
+        out_q: String,
+        out_k: String,
+        out_v: String,
+        seq: usize,
+        in_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        dtype: TensorDType,
+        weight_dtype: TensorDType,
+    },
+    /// Fused RoPE + Grouped-Query FlashDecoding Attention (`Q[S, q_dim], K[S, kv_dim], V[S, kv_dim] -> [S, q_dim]`)
+    FusedGqaAttention {
+        q: String,
+        k: String,
+        v: String,
+        out_var: String,
+        seq: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        fused_rope: bool,
+        dtype: TensorDType,
+    },
     /// On-chip SRAM/SMEM Fused `RMSNorm(x, nw) -> DualMatMul(w_gate, w_up) -> SwiGLU`
     /// Eliminates BOTH the normalized activation buffer AND the separate gate/up buffers!
     FusedRmsNormGateUpSwiGlu {
@@ -103,6 +171,7 @@ pub enum FusedStage {
         in_dim: usize,
         d_ff: usize,
         dtype: TensorDType,
+        weight_dtype: TensorDType,
     },
     /// On-chip SRAM/SMEM Fused `RMSNorm(x, nw) -> MatMul(w)`
     FusedRmsNormMatMul {
@@ -114,6 +183,7 @@ pub enum FusedStage {
         in_dim: usize,
         out_dim: usize,
         dtype: TensorDType,
+        weight_dtype: TensorDType,
     },
     /// Horizontally Fused Parallel Sibling MatMuls (`a @ w1 || a @ w2`) -> 1x input read!
     FusedDualMatMul {
@@ -126,6 +196,7 @@ pub enum FusedStage {
         in_dim: usize,
         out_dim: usize,
         dtype: TensorDType,
+        weight_dtype: TensorDType,
     },
     /// MatMul with optional in-register Residual Epilogue (`add(res, a @ b)`)
     MatMulEpilogue {
@@ -137,6 +208,7 @@ pub enum FusedStage {
         k: usize,
         n: usize,
         dtype: TensorDType,
+        weight_dtype: TensorDType,
     },
     /// Unfused single op fallback
     Single(DataflowNode),
@@ -185,7 +257,11 @@ fn parse_dtype_type(ty: &TypeExpr) -> Option<TensorDType> {
             "Float32" | "F32" => Some(TensorDType::Float32),
             "Float16" | "F16" => Some(TensorDType::Float16),
             "BFloat16" | "BF16" => Some(TensorDType::BFloat16),
+            "FP8" | "Float8" | "F8E4M3" | "Float8E4M3" => Some(TensorDType::FP8),
             "Int8" | "I8" => Some(TensorDType::Int8),
+            "Int4" | "I4" => Some(TensorDType::Int4),
+            "Q8_0" => Some(TensorDType::Q8_0),
+            "Q4_0" => Some(TensorDType::Q4_0),
             _ => None,
         }
     } else {
@@ -263,7 +339,7 @@ pub fn compile_tensor_graphs(program: &Program) -> Vec<CompiledTensorGraph> {
                     shapes.insert(out_var.clone(), sx);
                     Some(DataflowNode { id, out_var, op: DataflowOp::RmsNorm { x, w }, out_shape: sx })
                 }
-                "tg_matmul" | "matmul" if args.len() >= 2 => {
+                "tg_matmul" | "matmul" | "tg_qmatmul" | "qmatmul" if args.len() >= 2 => {
                     let a = arg_ident(args, 0)?;
                     let b = arg_ident(args, 1)?;
                     let sa = *shapes.get(&a)?;
@@ -271,7 +347,31 @@ pub fn compile_tensor_graphs(program: &Program) -> Vec<CompiledTensorGraph> {
                     if sa.cols != sb.rows { return None; }
                     let sout = MatrixShape { rows: sa.rows, cols: sb.cols, dtype: sa.dtype };
                     shapes.insert(out_var.clone(), sout);
-                    Some(DataflowNode { id, out_var, op: DataflowOp::MatMul { a, b }, out_shape: sout })
+                    Some(DataflowNode { id, out_var, op: DataflowOp::MatMul { a, b, weight_dtype: sb.dtype }, out_shape: sout })
+                }
+                "tg_rope" | "rope" if !args.is_empty() => {
+                    let x = arg_ident(args, 0)?;
+                    let sx = *shapes.get(&x)?;
+                    shapes.insert(out_var.clone(), sx);
+                    Some(DataflowNode { id, out_var, op: DataflowOp::Rope { x }, out_shape: sx })
+                }
+                "tg_gqa_attention" | "gqa_attention" if args.len() >= 3 => {
+                    let q = arg_ident(args, 0)?;
+                    let k = arg_ident(args, 1)?;
+                    let v = arg_ident(args, 2)?;
+                    let sq = *shapes.get(&q)?;
+                    let sk = *shapes.get(&k)?;
+                    let sv = *shapes.get(&v)?;
+                    if sq.rows != sk.rows || sk.rows != sv.rows || sk.cols != sv.cols || sk.cols == 0 || sq.cols % sk.cols != 0 {
+                        return None;
+                    }
+                    shapes.insert(out_var.clone(), sq);
+                    Some(DataflowNode {
+                        id,
+                        out_var,
+                        op: DataflowOp::GqaAttention { q, k, v, q_dim: sq.cols, kv_dim: sk.cols },
+                        out_shape: sq,
+                    })
                 }
                 "tg_swiglu" | "swiglu" if args.len() >= 2 => {
                     let gate = arg_ident(args, 0)?;
@@ -356,21 +456,28 @@ pub fn compile_tensor_graphs(program: &Program) -> Vec<CompiledTensorGraph> {
     graphs
 }
 
-/// Compiler Pass 2: Automatic Horizontal + Vertical On-Chip SRAM + Epilogue Fusion!
+/// Compiler Pass 2: Automatic Horizontal (QKV 3-way & Gate||Up 2-way) + Vertical On-Chip SRAM + RoPE/GQA + Epilogue Fusion!
 fn fuse_tensor_dataflow(nodes: &[DataflowNode], shapes: &BTreeMap<String, MatrixShape>) -> Vec<FusedStage> {
     let mut use_count: BTreeMap<String, usize> = BTreeMap::new();
     for n in nodes {
         match &n.op {
             DataflowOp::RmsNorm { x, w } => { *use_count.entry(x.clone()).or_default() += 1; *use_count.entry(w.clone()).or_default() += 1; }
-            DataflowOp::MatMul { a, b } | DataflowOp::Add { a, b } | DataflowOp::Mul { a, b } => {
+            DataflowOp::MatMul { a, b, .. } | DataflowOp::Add { a, b } | DataflowOp::Mul { a, b } => {
                 *use_count.entry(a.clone()).or_default() += 1;
                 *use_count.entry(b.clone()).or_default() += 1;
+            }
+            DataflowOp::GqaAttention { q, k, v, .. } => {
+                *use_count.entry(q.clone()).or_default() += 1;
+                *use_count.entry(k.clone()).or_default() += 1;
+                *use_count.entry(v.clone()).or_default() += 1;
             }
             DataflowOp::SwiGlu { gate, up } => {
                 *use_count.entry(gate.clone()).or_default() += 1;
                 *use_count.entry(up.clone()).or_default() += 1;
             }
-            DataflowOp::Silu { x } | DataflowOp::Relu { x } => { *use_count.entry(x.clone()).or_default() += 1; }
+            DataflowOp::Rope { x } | DataflowOp::Silu { x } | DataflowOp::Relu { x } => {
+                *use_count.entry(x.clone()).or_default() += 1;
+            }
         }
     }
 
@@ -381,8 +488,8 @@ fn fuse_tensor_dataflow(nodes: &[DataflowNode], shapes: &BTreeMap<String, Matrix
         if consumed[i] {
             continue;
         }
-        // Pattern 1: Vertical + Horizontal Super-Fusion!
-        // `h = rmsnorm(x, nw)` -> `g = matmul(h, w_gate)` || `u = matmul(h, w_up)` -> `a = swiglu(g, u)`
+        // Pattern 0: Horizontal 3-Way QKV Super-Fusion!
+        // `h = rmsnorm(x, nw)` -> `q = matmul(h, wq) || k = matmul(h, wk) || v = matmul(h, wv)`
         if let DataflowOp::RmsNorm { x, w: nw } = &nodes[i].op {
             let h_var = &nodes[i].out_var;
             let mut mm_indices = Vec::new();
@@ -395,6 +502,42 @@ fn fuse_tensor_dataflow(nodes: &[DataflowNode], shapes: &BTreeMap<String, Matrix
                     }
                 }
             }
+            if mm_indices.len() == 3 && use_count.get(h_var).copied().unwrap_or(0) == 3 {
+                let (qi, ki, vi) = (mm_indices[0], mm_indices[1], mm_indices[2]);
+                let (
+                    DataflowOp::MatMul { b: wq, weight_dtype: wd_q, .. },
+                    DataflowOp::MatMul { b: wk, weight_dtype: wd_k, .. },
+                    DataflowOp::MatMul { b: wv, weight_dtype: wd_v, .. },
+                ) = (&nodes[qi].op, &nodes[ki].op, &nodes[vi].op) else {
+                    unreachable!()
+                };
+                if wd_q == wd_k && wd_k == wd_v && nodes[ki].out_shape.cols == nodes[vi].out_shape.cols {
+                    let sx = shapes[x];
+                    consumed[i] = true;
+                    consumed[qi] = true;
+                    consumed[ki] = true;
+                    consumed[vi] = true;
+                    stages.push(FusedStage::FusedRmsNormQkv {
+                        x: x.clone(),
+                        nw: nw.clone(),
+                        w_q: wq.clone(),
+                        w_k: wk.clone(),
+                        w_v: wv.clone(),
+                        out_q: nodes[qi].out_var.clone(),
+                        out_k: nodes[ki].out_var.clone(),
+                        out_v: nodes[vi].out_var.clone(),
+                        seq: sx.rows,
+                        in_dim: sx.cols,
+                        q_dim: nodes[qi].out_shape.cols,
+                        kv_dim: nodes[ki].out_shape.cols,
+                        dtype: sx.dtype,
+                        weight_dtype: *wd_q,
+                    });
+                    continue;
+                }
+            }
+            // Pattern 1: Vertical + Horizontal Super-Fusion!
+            // `h = rmsnorm(x, nw)` -> `g = matmul(h, w_gate)` || `u = matmul(h, w_up)` -> `a = swiglu(g, u)`
             if mm_indices.len() == 2 && use_count.get(h_var).copied().unwrap_or(0) == 2 {
                 let g_idx = mm_indices[0];
                 let u_idx = mm_indices[1];
@@ -412,9 +555,10 @@ fn fuse_tensor_dataflow(nodes: &[DataflowNode], shapes: &BTreeMap<String, Matrix
                     }
                 }
                 if let Some(sk) = swi_idx {
-                    let (DataflowOp::MatMul { b: wg, .. }, DataflowOp::MatMul { b: wu, .. }) =
-                        (&nodes[g_idx].op, &nodes[u_idx].op)
-                    else {
+                    let (
+                        DataflowOp::MatMul { b: wg, weight_dtype: wdt, .. },
+                        DataflowOp::MatMul { b: wu, .. },
+                    ) = (&nodes[g_idx].op, &nodes[u_idx].op) else {
                         unreachable!()
                     };
                     let sx = shapes[x];
@@ -433,6 +577,7 @@ fn fuse_tensor_dataflow(nodes: &[DataflowNode], shapes: &BTreeMap<String, Matrix
                         in_dim: sx.cols,
                         d_ff: sg.cols,
                         dtype: sx.dtype,
+                        weight_dtype: *wdt,
                     });
                     continue;
                 }
@@ -440,7 +585,7 @@ fn fuse_tensor_dataflow(nodes: &[DataflowNode], shapes: &BTreeMap<String, Matrix
             // Pattern 2: Vertical On-Chip SRAM Fusion `rmsnorm(x, nw) -> matmul(h, w)`
             if mm_indices.len() == 1 && use_count.get(h_var).copied().unwrap_or(0) == 1 {
                 let m_idx = mm_indices[0];
-                if let DataflowOp::MatMul { b: wmat, .. } = &nodes[m_idx].op {
+                if let DataflowOp::MatMul { b: wmat, weight_dtype: wdt, .. } = &nodes[m_idx].op {
                     let sx = shapes[x];
                     let sm = nodes[m_idx].out_shape;
                     consumed[i] = true;
@@ -454,21 +599,82 @@ fn fuse_tensor_dataflow(nodes: &[DataflowNode], shapes: &BTreeMap<String, Matrix
                         in_dim: sx.cols,
                         out_dim: sm.cols,
                         dtype: sx.dtype,
+                        weight_dtype: *wdt,
                     });
                     continue;
                 }
             }
         }
 
+        // Pattern 2B: Fused RoPE(Q), RoPE(K) + GQA FlashDecoding Attention!
+        if let DataflowOp::Rope { x: q_in } = &nodes[i].op {
+            let rq_var = &nodes[i].out_var;
+            if use_count.get(rq_var).copied().unwrap_or(0) == 1 {
+                let mut paired_k: Option<(usize, String, String)> = None;
+                let mut attn_idx: Option<(usize, String, usize, usize)> = None;
+                for j in (i + 1)..nodes.len() {
+                    if !consumed[j] {
+                        if let DataflowOp::Rope { x: k_in } = &nodes[j].op {
+                            if paired_k.is_none() && use_count.get(&nodes[j].out_var).copied().unwrap_or(0) == 1 {
+                                paired_k = Some((j, k_in.clone(), nodes[j].out_var.clone()));
+                            }
+                        } else if let DataflowOp::GqaAttention { q, k, v, q_dim, kv_dim } = &nodes[j].op {
+                            if q == rq_var {
+                                if let Some((_, _, ref rk_var)) = paired_k {
+                                    if k == rk_var {
+                                        attn_idx = Some((j, v.clone(), *q_dim, *kv_dim));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let (Some((kj, k_in, _)), Some((aj, v_in, q_dim, kv_dim))) = (paired_k, attn_idx) {
+                    let sq = nodes[i].out_shape;
+                    consumed[i] = true;
+                    consumed[kj] = true;
+                    consumed[aj] = true;
+                    stages.push(FusedStage::FusedGqaAttention {
+                        q: q_in.clone(),
+                        k: k_in,
+                        v: v_in,
+                        out_var: nodes[aj].out_var.clone(),
+                        seq: sq.rows,
+                        q_dim,
+                        kv_dim,
+                        fused_rope: true,
+                        dtype: sq.dtype,
+                    });
+                    continue;
+                }
+            }
+        }
+        if let DataflowOp::GqaAttention { q, k, v, q_dim, kv_dim } = &nodes[i].op {
+            let sq = nodes[i].out_shape;
+            consumed[i] = true;
+            stages.push(FusedStage::FusedGqaAttention {
+                q: q.clone(),
+                k: k.clone(),
+                v: v.clone(),
+                out_var: nodes[i].out_var.clone(),
+                seq: sq.rows,
+                q_dim: *q_dim,
+                kv_dim: *kv_dim,
+                fused_rope: false,
+                dtype: sq.dtype,
+            });
+            continue;
+        }
+
         // Pattern 3: Horizontal Sibling MatMul Fusion (`a @ w1 || a @ w2`) + Epilogue Residual (`add(x, matmul)`)
-        if let DataflowOp::MatMul { a, b } = &nodes[i].op {
+        if let DataflowOp::MatMul { a, b, weight_dtype } = &nodes[i].op {
             let mm_out = &nodes[i].out_var;
-            // Check horizontal sibling
             let mut sibling = None;
             for j in (i + 1)..nodes.len() {
                 if !consumed[j] {
-                    if let DataflowOp::MatMul { a: a2, b: b2 } = &nodes[j].op {
-                        if a2 == a && nodes[j].out_shape == nodes[i].out_shape {
+                    if let DataflowOp::MatMul { a: a2, b: b2, weight_dtype: wd2 } = &nodes[j].op {
+                        if a2 == a && wd2 == weight_dtype && nodes[j].out_shape == nodes[i].out_shape {
                             sibling = Some((j, b2.clone()));
                             break;
                         }
@@ -489,6 +695,7 @@ fn fuse_tensor_dataflow(nodes: &[DataflowNode], shapes: &BTreeMap<String, Matrix
                     in_dim: sa.cols,
                     out_dim: nodes[i].out_shape.cols,
                     dtype: sa.dtype,
+                    weight_dtype: *weight_dtype,
                 });
                 continue;
             }
@@ -522,6 +729,7 @@ fn fuse_tensor_dataflow(nodes: &[DataflowNode], shapes: &BTreeMap<String, Matrix
                     k: sa.cols,
                     n: nodes[i].out_shape.cols,
                     dtype: sa.dtype,
+                    weight_dtype: *weight_dtype,
                 });
             } else {
                 stages.push(FusedStage::MatMulEpilogue {
@@ -533,6 +741,7 @@ fn fuse_tensor_dataflow(nodes: &[DataflowNode], shapes: &BTreeMap<String, Matrix
                     k: sa.cols,
                     n: nodes[i].out_shape.cols,
                     dtype: sa.dtype,
+                    weight_dtype: *weight_dtype,
                 });
             }
             continue;
@@ -554,6 +763,8 @@ fn compute_roofline(
     let mut flops = 0.0_f64;
     let mut naive_bytes = 0.0_f64;
     let mut max_seq = 1usize;
+    let mut uses_quant_int = false;
+    let mut uses_fp8 = false;
 
     for n in raw_nodes {
         match &n.op {
@@ -561,29 +772,46 @@ fn compute_roofline(
                 let sx = shapes[x];
                 max_seq = max_seq.max(sx.rows);
                 flops += 4.0 * (sx.rows * sx.cols) as f64;
-                naive_bytes += (sx.bytes() + shapes[w].bytes() + n.out_shape.bytes()) as f64;
+                naive_bytes += sx.bytes_f64() + shapes[w].bytes_f64() + n.out_shape.bytes_f64();
             }
-            DataflowOp::MatMul { a, b } => {
+            DataflowOp::MatMul { a, b, weight_dtype } => {
                 let sa = shapes[a];
                 let sb = shapes[b];
                 max_seq = max_seq.max(sa.rows);
+                if matches!(weight_dtype, TensorDType::Int4 | TensorDType::Int8 | TensorDType::Q4_0 | TensorDType::Q8_0) {
+                    uses_quant_int = true;
+                }
+                if *weight_dtype == TensorDType::FP8 {
+                    uses_fp8 = true;
+                }
                 flops += 2.0 * (sa.rows * sa.cols * sb.cols) as f64;
-                naive_bytes += (sa.bytes() + sb.bytes() + n.out_shape.bytes()) as f64;
+                naive_bytes += sa.bytes_f64() + sb.bytes_f64() + n.out_shape.bytes_f64();
+            }
+            DataflowOp::Rope { x } => {
+                let sx = shapes[x];
+                flops += 4.0 * (sx.rows * sx.cols) as f64;
+                naive_bytes += 2.0 * sx.bytes_f64();
+            }
+            DataflowOp::GqaAttention { q, k, v, q_dim, .. } => {
+                let sq = shapes[q];
+                max_seq = max_seq.max(sq.rows);
+                flops += 4.0 * (sq.rows * sq.rows * q_dim) as f64;
+                naive_bytes += sq.bytes_f64() + shapes[k].bytes_f64() + shapes[v].bytes_f64() + n.out_shape.bytes_f64();
             }
             DataflowOp::SwiGlu { gate, up } => {
                 let sg = shapes[gate];
                 flops += 5.0 * (sg.rows * sg.cols) as f64;
-                naive_bytes += (sg.bytes() + shapes[up].bytes() + n.out_shape.bytes()) as f64;
+                naive_bytes += sg.bytes_f64() + shapes[up].bytes_f64() + n.out_shape.bytes_f64();
             }
             DataflowOp::Add { a, b } | DataflowOp::Mul { a, b } => {
                 let sa = shapes[a];
                 flops += (sa.rows * sa.cols) as f64;
-                naive_bytes += (sa.bytes() + shapes[b].bytes() + n.out_shape.bytes()) as f64;
+                naive_bytes += sa.bytes_f64() + shapes[b].bytes_f64() + n.out_shape.bytes_f64();
             }
             DataflowOp::Silu { x } | DataflowOp::Relu { x } => {
                 let sx = shapes[x];
                 flops += 4.0 * (sx.rows * sx.cols) as f64;
-                naive_bytes += (sx.bytes() + n.out_shape.bytes()) as f64;
+                naive_bytes += sx.bytes_f64() + n.out_shape.bytes_f64();
             }
         }
     }
@@ -591,26 +819,43 @@ fn compute_roofline(
     let mut fused_bytes = 0.0_f64;
     for st in stages {
         match st {
-            FusedStage::FusedRmsNormGateUpSwiGlu { seq, in_dim, d_ff, dtype, .. } => {
-                let b = dtype.bytes();
-                // Reads x once + nw once + w_gate + w_up, writes ONLY final activated [seq, d_ff]
-                fused_bytes += ((seq * in_dim + in_dim + 2 * in_dim * d_ff + seq * d_ff) * b) as f64;
+            FusedStage::FusedRmsNormQkv { seq, in_dim, q_dim, kv_dim, dtype, weight_dtype, .. } => {
+                let ab = dtype.bytes_f64();
+                let wb = weight_dtype.bytes_f64();
+                let qkv_cols = q_dim + 2 * kv_dim;
+                fused_bytes += ((seq * in_dim + in_dim + seq * qkv_cols) as f64) * ab
+                    + ((in_dim * qkv_cols) as f64) * wb;
             }
-            FusedStage::FusedRmsNormMatMul { seq, in_dim, out_dim, dtype, .. } => {
-                let b = dtype.bytes();
-                fused_bytes += ((seq * in_dim + in_dim + in_dim * out_dim + seq * out_dim) * b) as f64;
+            FusedStage::FusedGqaAttention { seq, q_dim, kv_dim, dtype, .. } => {
+                let ab = dtype.bytes_f64();
+                fused_bytes += ((seq * (q_dim * 2 + kv_dim * 2)) as f64) * ab;
             }
-            FusedStage::FusedDualMatMul { seq, in_dim, out_dim, dtype, .. } => {
-                let b = dtype.bytes();
-                fused_bytes += ((seq * in_dim + 2 * in_dim * out_dim + 2 * seq * out_dim) * b) as f64;
+            FusedStage::FusedRmsNormGateUpSwiGlu { seq, in_dim, d_ff, dtype, weight_dtype, .. } => {
+                let ab = dtype.bytes_f64();
+                let wb = weight_dtype.bytes_f64();
+                fused_bytes += ((seq * in_dim + in_dim + seq * d_ff) as f64) * ab
+                    + ((2 * in_dim * d_ff) as f64) * wb;
             }
-            FusedStage::MatMulEpilogue { seq, k, n, residual, dtype, .. } => {
-                let b = dtype.bytes();
+            FusedStage::FusedRmsNormMatMul { seq, in_dim, out_dim, dtype, weight_dtype, .. } => {
+                let ab = dtype.bytes_f64();
+                let wb = weight_dtype.bytes_f64();
+                fused_bytes += ((seq * in_dim + in_dim + seq * out_dim) as f64) * ab
+                    + ((in_dim * out_dim) as f64) * wb;
+            }
+            FusedStage::FusedDualMatMul { seq, in_dim, out_dim, dtype, weight_dtype, .. } => {
+                let ab = dtype.bytes_f64();
+                let wb = weight_dtype.bytes_f64();
+                fused_bytes += ((seq * in_dim + 2 * seq * out_dim) as f64) * ab
+                    + ((2 * in_dim * out_dim) as f64) * wb;
+            }
+            FusedStage::MatMulEpilogue { seq, k, n, residual, dtype, weight_dtype, .. } => {
+                let ab = dtype.bytes_f64();
+                let wb = weight_dtype.bytes_f64();
                 let res_b = if residual.is_some() { seq * n } else { 0 };
-                fused_bytes += ((seq * k + k * n + res_b + seq * n) * b) as f64;
+                fused_bytes += ((seq * k + res_b + seq * n) as f64) * ab + ((k * n) as f64) * wb;
             }
             FusedStage::Single(node) => {
-                fused_bytes += (node.out_shape.bytes() * 2) as f64;
+                fused_bytes += node.out_shape.bytes_f64() * 2.0;
             }
         }
     }
@@ -621,13 +866,20 @@ fn compute_roofline(
         0.0
     };
     let ai = if fused_bytes > 0.0 { flops / fused_bytes } else { 0.0 };
-    let schedule_class = if max_seq < 16 {
-        "MEMORY-BOUND (Auto: Warp/SIMD-Group Cooperative GEMV + On-Chip SRAM Fusion + Graph Capture)"
+    let schedule_class = if max_seq == 1 {
+        "MEMORY-BOUND B=1 DECODE (Auto: SB8 uint4 4w1r + Epilogue-RMSNorm + Register/Split-K FlashDecode + Graph Capture)"
+    } else if max_seq < 16 {
+        "BATCH/SPECULATIVE VERIFY B=2..15 (Auto: simdgroup_half8x8 / TensorCore MMA + Single-Pass Weight Stream)"
+    } else if uses_fp8 {
+        "COMPUTE-BOUND FP8 (Auto: Ada sm_89 660T cublasLt e4m3fn / TPU MXU + Horizontal Weight Fusion)"
+    } else if uses_quant_int {
+        "COMPUTE-BOUND W4A8/W8A8 (Auto: TPU 394T INT8 MXU / CUDA SB8 MMA + Horizontal Weight Fusion)"
     } else {
-        "COMPUTE-BOUND (Auto: Tensor Core / MXU Systolic Array MMA + Horizontal/Vertical Fusion)"
+        "COMPUTE-BOUND BF16/FP16 (Auto: Tensor Core / MXU Systolic Array MMA + Horizontal/Vertical Fusion)"
     };
 
-    // Physical Silicon Theoretical Minimum Time: T_min = max(Bytes / Peak_BW, FLOPs / Peak_FLOPS)
+    let tpu_peak_t = if uses_quant_int { 394.0 } else { 197.0 };
+    let rtx_peak_t = if uses_fp8 { 660.0 } else { 330.0 };
     let t_ms = |bw_gbs: f64, peak_tflops: f64| -> f64 {
         let t_mem = (fused_bytes / (bw_gbs * 1e9)) * 1e3;
         let t_cmp = (flops / (peak_tflops * 1e12)) * 1e3;
@@ -641,9 +893,9 @@ fn compute_roofline(
         bytes_saved_pct: saved,
         arithmetic_intensity: ai,
         schedule_class,
-        m4_max_t_min_ms: t_ms(546.0, 54.0),
-        rtx4090_t_min_ms: t_ms(1008.0, 165.0),
-        tpu_v5e_t_min_ms: t_ms(819.0, 197.0),
+        m4_max_t_min_ms: t_ms(468.4, 54.0),
+        rtx4090_t_min_ms: t_ms(1008.1, rtx_peak_t),
+        tpu_v5e_t_min_ms: t_ms(819.0, tpu_peak_t),
     }
 }
 
@@ -739,13 +991,144 @@ pub fn emit_tensor_graph_stablehlo(g: &CompiledTensorGraph) -> String {
         }
     };
 
+    let emit_w_dot_f32 = |out: &mut String, a_var: &str, w_var: &str, seq: usize, k: usize, n: usize, act_dt: TensorDType, w_dt: TensorDType, fresh: &mut dyn FnMut(&str) -> String| -> String {
+        let aet = act_dt.mlir_ty();
+        let wet = w_dt.mlir_ty();
+        let res = fresh("dot");
+        if w_dt.is_4bit() {
+            // Auto W4A8 INT8 MXU lowering on TPU v5e-1 (394 TOPS vs 197T BF16, zero VPU float unpack!):
+            //   1. Dynamic per-row INT8 quant on activation `a` -> `a_i8` + `a_scale`
+            //   2. Pure integer sign-extension `i4 -> i8` on weights `w`
+            //   3. Hardware 394 TOPS INT8 MXU `dot_general(a_i8, w_i8) -> i32` -> `f32 * a_scale`!
+            let af = if act_dt == TensorDType::Float32 { a_var.to_string() } else {
+                let t = fresh("af");
+                out.push_str(&format!("    {} = stablehlo.convert {} : (tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n", t, a_var, seq, k, aet, seq, k));
+                t
+            };
+            let c_neg = fresh("cneg");
+            let c_127 = fresh("c127");
+            let c_eps = fresh("ceps");
+            let aabs = fresh("aabs");
+            let amax = fresh("amax");
+            let amax_s = fresh("amaxs");
+            let inv_s = fresh("invs");
+            let inv_sb = fresh("invsb");
+            let a_sc = fresh("asc");
+            let a_i8 = fresh("ai8");
+            let w_i8 = fresh("wi8");
+            let acc_i32 = fresh("acci32");
+            let acc_f32 = fresh("accf32");
+            let sc_f = fresh("scf");
+            let sc_b = fresh("scb");
+            out.push_str(&format!("    {} = stablehlo.constant dense<0.0> : tensor<f32>\n", c_neg));
+            out.push_str(&format!("    {} = stablehlo.constant dense<127.0> : tensor<{}xf32>\n", c_127, seq));
+            out.push_str(&format!("    {} = stablehlo.constant dense<1.0e-6> : tensor<{}xf32>\n", c_eps, seq));
+            out.push_str(&format!("    {} = stablehlo.abs {} : tensor<{}x{}xf32>\n", aabs, af, seq, k));
+            out.push_str(&format!("    {} = stablehlo.reduce({} init: {}) applies stablehlo.maximum across dimensions = [1] : (tensor<{}x{}xf32>, tensor<f32>) -> tensor<{}xf32>\n", amax, aabs, c_neg, seq, k, seq));
+            out.push_str(&format!("    {} = stablehlo.add {}, {} : tensor<{}xf32>\n", amax_s, amax, c_eps, seq));
+            out.push_str(&format!("    {} = stablehlo.divide {}, {} : tensor<{}xf32>\n", inv_s, c_127, amax_s, seq));
+            out.push_str(&format!("    {} = stablehlo.broadcast_in_dim {}, dims = [0] : (tensor<{}xf32>) -> tensor<{}x{}xf32>\n", inv_sb, inv_s, seq, seq, k));
+            out.push_str(&format!("    {} = stablehlo.multiply {}, {} : tensor<{}x{}xf32>\n", a_sc, af, inv_sb, seq, k));
+            out.push_str(&format!("    {} = stablehlo.convert {} : (tensor<{}x{}xf32>) -> tensor<{}x{}xi8>\n", a_i8, a_sc, seq, k, seq, k));
+            out.push_str(&format!("    {} = stablehlo.convert {} : (tensor<{}x{}x{}>) -> tensor<{}x{}xi8>\n", w_i8, w_var, k, n, wet, k, n));
+            out.push_str(&format!("    {} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0] : (tensor<{}x{}xi8>, tensor<{}x{}xi8>) -> tensor<{}x{}xi32>\n", acc_i32, a_i8, w_i8, seq, k, k, n, seq, n));
+            out.push_str(&format!("    {} = stablehlo.convert {} : (tensor<{}x{}xi32>) -> tensor<{}x{}xf32>\n", acc_f32, acc_i32, seq, n, seq, n));
+            out.push_str(&format!("    {} = stablehlo.divide {}, {} : tensor<{}xf32>\n", sc_f, amax_s, c_127, seq));
+            out.push_str(&format!("    {} = stablehlo.broadcast_in_dim {}, dims = [0] : (tensor<{}xf32>) -> tensor<{}x{}xf32>\n", sc_b, sc_f, seq, seq, n));
+            out.push_str(&format!("    {} = stablehlo.multiply {}, {} : tensor<{}x{}xf32>\n", res, acc_f32, sc_b, seq, n));
+        } else if w_dt != act_dt {
+            let w_cast = fresh("wcast");
+            out.push_str(&format!("    {} = stablehlo.convert {} : (tensor<{}x{}x{}>) -> tensor<{}x{}x{}>\n", w_cast, w_var, k, n, wet, k, n, aet));
+            out.push_str(&format!("    {} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n", res, a_var, w_cast, seq, k, aet, k, n, aet, seq, n));
+        } else {
+            out.push_str(&format!("    {} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n", res, a_var, w_var, seq, k, aet, k, n, aet, seq, n));
+        }
+        res
+    };
+
     for st in &g.stages {
         match st {
-            FusedStage::FusedRmsNormGateUpSwiGlu { x, nw, w_gate, w_up, out_var, seq, in_dim, d_ff, dtype } => {
+            FusedStage::FusedRmsNormQkv { x, nw, w_q, w_k, w_v, out_q, out_k, out_v, seq, in_dim, q_dim, kv_dim, dtype, weight_dtype } => {
                 let et = dtype.mlir_ty();
+                let wet = weight_dtype.mlir_ty();
+                let qkv_cols = q_dim + 2 * kv_dim;
+                let h = emit_rmsnorm_mlir(&mut out, x, nw, *seq, *in_dim, *dtype, &mut fresh);
+                let w_qkv = fresh("wqkv");
+                // True 3-Way Horizontal MXU Weight Fusion: concat(w_q, w_k, w_v) -> ONE wide dot_general -> VMEM slice!
+                out.push_str(&format!(
+                    "    {} = stablehlo.concatenate %{}, %{}, %{}, dim = 1 : (tensor<{}x{}x{}>, tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}x{}>\n",
+                    w_qkv, w_q, w_k, w_v, in_dim, q_dim, wet, in_dim, kv_dim, wet, in_dim, kv_dim, wet, in_dim, qkv_cols, wet
+                ));
+                let qkvf = emit_w_dot_f32(&mut out, &h, &w_qkv, *seq, *in_dim, qkv_cols, *dtype, *weight_dtype, &mut fresh);
+                let qf = fresh("qf");
+                let kf = fresh("kf");
+                let vf = fresh("vf");
+                out.push_str(&format!("    {} = stablehlo.slice {} [0:{}, 0:{}] : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", qf, qkvf, seq, q_dim, seq, qkv_cols, seq, q_dim));
+                out.push_str(&format!("    {} = stablehlo.slice {} [0:{}, {}:{}] : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", kf, qkvf, seq, q_dim, q_dim + kv_dim, seq, qkv_cols, seq, kv_dim));
+                out.push_str(&format!("    {} = stablehlo.slice {} [0:{}, {}:{}] : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", vf, qkvf, seq, q_dim + kv_dim, qkv_cols, seq, qkv_cols, seq, kv_dim));
+                for (src_f, dst_v, cols) in [(qf, out_q, *q_dim), (kf, out_k, *kv_dim), (vf, out_v, *kv_dim)] {
+                    if *dtype == TensorDType::Float32 {
+                        out.push_str(&format!("    %{} = stablehlo.reshape {} : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", dst_v, src_f, seq, cols, seq, cols));
+                    } else {
+                        out.push_str(&format!("    %{} = stablehlo.convert {} : (tensor<{}x{}xf32>) -> tensor<{}x{}x{}>\n", dst_v, src_f, seq, cols, seq, cols, et));
+                    }
+                }
+            }
+            FusedStage::FusedGqaAttention { q, k, v, out_var, seq, q_dim, kv_dim, dtype, .. } => {
+                let et = dtype.mlir_ty();
+                let group = q_dim / kv_dim;
+                let (kb, vb) = if group > 1 {
+                    // Zero-copy GQA K/V broadcast repeat from [S, kv_dim] -> [S, q_dim] inside VMEM!
+                    let kr = fresh("kr");
+                    let vr = fresh("vr");
+                    let kparts: Vec<String> = (0..group).map(|_| format!("%{}", k)).collect();
+                    let vparts: Vec<String> = (0..group).map(|_| format!("%{}", v)).collect();
+                    let ktypes: Vec<String> = (0..group).map(|_| format!("tensor<{}x{}x{}>", seq, kv_dim, et)).collect();
+                    out.push_str(&format!("    {} = stablehlo.concatenate {}, dim = 1 : ({}) -> tensor<{}x{}x{}>\n", kr, kparts.join(", "), ktypes.join(", "), seq, q_dim, et));
+                    out.push_str(&format!("    {} = stablehlo.concatenate {}, dim = 1 : ({}) -> tensor<{}x{}x{}>\n", vr, vparts.join(", "), ktypes.join(", "), seq, q_dim, et));
+                    (kr, vr)
+                } else {
+                    (format!("%{}", k), format!("%{}", v))
+                };
+                let sc0 = fresh("sc0");
+                let c_sc = fresh("csc");
+                let sc = fresh("sc");
+                let c_ni = fresh("cni");
+                let smx = fresh("smx");
+                let smxb = fresh("smxb");
+                let sd = fresh("sd");
+                let se = fresh("se");
+                let ss = fresh("ss");
+                let ssb = fresh("ssb");
+                let pr = fresh("pr");
+                let prt = fresh("prt");
+                let ctxf = fresh("ctxf");
+                let inv_sq = 1.0 / (*q_dim as f64).sqrt();
+                out.push_str(&format!("    {} = stablehlo.dot_general %{}, {}, contracting_dims = [1] x [1] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n", sc0, q, kb, seq, q_dim, et, seq, q_dim, et, seq, seq));
+                out.push_str(&format!("    {} = stablehlo.constant dense<{:.10}> : tensor<{}x{}xf32>\n", c_sc, inv_sq, seq, seq));
+                out.push_str(&format!("    {} = stablehlo.multiply {}, {} : tensor<{}x{}xf32>\n", sc, sc0, c_sc, seq, seq));
+                out.push_str(&format!("    {} = stablehlo.constant dense<-1.0e30> : tensor<f32>\n", c_ni));
+                out.push_str(&format!("    {} = stablehlo.reduce({} init: {}) applies stablehlo.maximum across dimensions = [1] : (tensor<{}x{}xf32>, tensor<f32>) -> tensor<{}xf32>\n", smx, sc, c_ni, seq, seq, seq));
+                out.push_str(&format!("    {} = stablehlo.broadcast_in_dim {}, dims = [0] : (tensor<{}xf32>) -> tensor<{}x{}xf32>\n", smxb, smx, seq, seq, seq));
+                out.push_str(&format!("    {} = stablehlo.subtract {}, {} : tensor<{}x{}xf32>\n", sd, sc, smxb, seq, seq));
+                out.push_str(&format!("    {} = stablehlo.exponential {} : tensor<{}x{}xf32>\n", se, sd, seq, seq));
+                out.push_str(&format!("    {} = stablehlo.reduce({} init: %c0_f32) applies stablehlo.add across dimensions = [1] : (tensor<{}x{}xf32>, tensor<f32>) -> tensor<{}xf32>\n", ss, se, seq, seq, seq));
+                out.push_str(&format!("    {} = stablehlo.broadcast_in_dim {}, dims = [0] : (tensor<{}xf32>) -> tensor<{}x{}xf32>\n", ssb, ss, seq, seq, seq));
+                out.push_str(&format!("    {} = stablehlo.divide {}, {} : tensor<{}x{}xf32>\n", pr, se, ssb, seq, seq));
+                if *dtype == TensorDType::Float32 {
+                    out.push_str(&format!("    {} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0] : (tensor<{}x{}xf32>, tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", ctxf, pr, vb, seq, seq, seq, q_dim, seq, q_dim));
+                    out.push_str(&format!("    %{} = stablehlo.reshape {} : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", out_var, ctxf, seq, q_dim, seq, q_dim));
+                } else {
+                    out.push_str(&format!("    {} = stablehlo.convert {} : (tensor<{}x{}xf32>) -> tensor<{}x{}x{}>\n", prt, pr, seq, seq, seq, seq, et));
+                    out.push_str(&format!("    {} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n", ctxf, prt, vb, seq, seq, et, seq, q_dim, et, seq, q_dim));
+                    out.push_str(&format!("    %{} = stablehlo.convert {} : (tensor<{}x{}xf32>) -> tensor<{}x{}x{}>\n", out_var, ctxf, seq, q_dim, seq, q_dim, et));
+                }
+            }
+            FusedStage::FusedRmsNormGateUpSwiGlu { x, nw, w_gate, w_up, out_var, seq, in_dim, d_ff, dtype, weight_dtype } => {
+                let et = dtype.mlir_ty();
+                let wet = weight_dtype.mlir_ty();
                 let h = emit_rmsnorm_mlir(&mut out, x, nw, *seq, *in_dim, *dtype, &mut fresh);
                 let w_gu = fresh("wgu");
-                let gu = fresh("gu");
                 let gf = fresh("gate");
                 let uf = fresh("up");
                 let ng = fresh("ng");
@@ -758,12 +1141,9 @@ pub fn emit_tensor_graph_stablehlo(g: &CompiledTensorGraph) -> String {
                 // True Horizontal MXU Weight Fusion: concat(w_gate, w_up) -> ONE wide systolic dot_general -> VMEM slice!
                 out.push_str(&format!(
                     "    {} = stablehlo.concatenate %{}, %{}, dim = 1 : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}x{}>\n",
-                    w_gu, w_gate, w_up, in_dim, d_ff, et, in_dim, d_ff, et, in_dim, dff2, et
+                    w_gu, w_gate, w_up, in_dim, d_ff, wet, in_dim, d_ff, wet, in_dim, dff2, wet
                 ));
-                out.push_str(&format!(
-                    "    {} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n",
-                    gu, h, w_gu, seq, in_dim, et, in_dim, dff2, et, seq, dff2
-                ));
+                let gu = emit_w_dot_f32(&mut out, &h, &w_gu, *seq, *in_dim, dff2, *dtype, *weight_dtype, &mut fresh);
                 out.push_str(&format!(
                     "    {} = stablehlo.slice {} [0:{}, 0:{}] : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n",
                     gf, gu, seq, d_ff, seq, dff2, seq, d_ff
@@ -784,32 +1164,30 @@ pub fn emit_tensor_graph_stablehlo(g: &CompiledTensorGraph) -> String {
                     out.push_str(&format!("    %{} = stablehlo.convert {} : (tensor<{}x{}xf32>) -> tensor<{}x{}x{}>\n", out_var, act, seq, d_ff, seq, d_ff, et));
                 }
             }
-            FusedStage::FusedRmsNormMatMul { x, nw, w, out_var, seq, in_dim, out_dim, dtype } => {
+            FusedStage::FusedRmsNormMatMul { x, nw, w, out_var, seq, in_dim, out_dim, dtype, weight_dtype } => {
                 let et = dtype.mlir_ty();
                 let h = emit_rmsnorm_mlir(&mut out, x, nw, *seq, *in_dim, *dtype, &mut fresh);
-                let mf = fresh("mm");
-                out.push_str(&format!("    {} = stablehlo.dot_general {}, %{}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n", mf, h, w, seq, in_dim, et, in_dim, out_dim, et, seq, out_dim));
+                let w_ref = format!("%{}", w);
+                let mf = emit_w_dot_f32(&mut out, &h, &w_ref, *seq, *in_dim, *out_dim, *dtype, *weight_dtype, &mut fresh);
                 if *dtype == TensorDType::Float32 {
                     out.push_str(&format!("    %{} = stablehlo.reshape {} : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", out_var, mf, seq, out_dim, seq, out_dim));
                 } else {
                     out.push_str(&format!("    %{} = stablehlo.convert {} : (tensor<{}x{}xf32>) -> tensor<{}x{}x{}>\n", out_var, mf, seq, out_dim, seq, out_dim, et));
                 }
             }
-            FusedStage::FusedDualMatMul { a, w1, w2, out1, out2, seq, in_dim, out_dim, dtype } => {
+            FusedStage::FusedDualMatMul { a, w1, w2, out1, out2, seq, in_dim, out_dim, dtype, weight_dtype } => {
                 let et = dtype.mlir_ty();
+                let wet = weight_dtype.mlir_ty();
                 let w12 = fresh("w12");
-                let mm12 = fresh("mm12");
                 let s1 = fresh("s1");
                 let s2 = fresh("s2");
                 let od2 = out_dim * 2;
                 out.push_str(&format!(
                     "    {} = stablehlo.concatenate %{}, %{}, dim = 1 : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}x{}>\n",
-                    w12, w1, w2, in_dim, out_dim, et, in_dim, out_dim, et, in_dim, od2, et
+                    w12, w1, w2, in_dim, out_dim, wet, in_dim, out_dim, wet, in_dim, od2, wet
                 ));
-                out.push_str(&format!(
-                    "    {} = stablehlo.dot_general %{}, {}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n",
-                    mm12, a, w12, seq, in_dim, et, in_dim, od2, et, seq, od2
-                ));
+                let a_ref = format!("%{}", a);
+                let mm12 = emit_w_dot_f32(&mut out, &a_ref, &w12, *seq, *in_dim, od2, *dtype, *weight_dtype, &mut fresh);
                 out.push_str(&format!("    {} = stablehlo.slice {} [0:{}, 0:{}] : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", s1, mm12, seq, out_dim, seq, od2, seq, out_dim));
                 out.push_str(&format!("    {} = stablehlo.slice {} [0:{}, {}:{}] : (tensor<{}x{}xf32>) -> tensor<{}x{}xf32>\n", s2, mm12, seq, out_dim, od2, seq, od2, seq, out_dim));
                 for (sv, ov) in [(s1, out1), (s2, out2)] {
@@ -820,10 +1198,11 @@ pub fn emit_tensor_graph_stablehlo(g: &CompiledTensorGraph) -> String {
                     }
                 }
             }
-            FusedStage::MatMulEpilogue { a, b, residual, out_var, seq, k, n, dtype } => {
+            FusedStage::MatMulEpilogue { a, b, residual, out_var, seq, k, n, dtype, weight_dtype } => {
                 let et = dtype.mlir_ty();
-                let mf = fresh("mm");
-                out.push_str(&format!("    {} = stablehlo.dot_general %{}, %{}, contracting_dims = [1] x [0] : (tensor<{}x{}x{}>, tensor<{}x{}x{}>) -> tensor<{}x{}xf32>\n", mf, a, b, seq, k, et, k, n, et, seq, n));
+                let a_ref = format!("%{}", a);
+                let b_ref = format!("%{}", b);
+                let mf = emit_w_dot_f32(&mut out, &a_ref, &b_ref, *seq, *k, *n, *dtype, *weight_dtype, &mut fresh);
                 let final_f32 = if let Some(rv) = residual {
                     let rf = if *dtype == TensorDType::Float32 {
                         format!("%{}", rv)
@@ -880,9 +1259,68 @@ pub fn emit_tensor_graph_cuda(g: &CompiledTensorGraph) -> String {
     );
     for (idx, st) in g.stages.iter().enumerate() {
         match st {
-            FusedStage::FusedRmsNormGateUpSwiGlu { seq, in_dim, d_ff, dtype, .. } => {
+            FusedStage::FusedRmsNormQkv { seq, in_dim, q_dim, kv_dim, dtype, weight_dtype, .. } => {
                 let ct = dtype.cuda_ty();
+                let wt = weight_dtype.cuda_ty();
+                let qkv_cols = q_dim + 2 * kv_dim;
+                out.push_str(&format!(
+                    "// Stage {idx}: Auto-Fused Horizontal 3-Way QKV + RMSNorm [{seq}x{in_dim} -> Q:{q_dim}, K:{kv_dim}, V:{kv_dim}]\n\
+                     // Target Layout: {layout}\n\
+                     extern \"C\" __global__ void {fn_name}_stage{idx}_fused_norm_qkv(\n\
+                         const {ct}* __restrict__ x, const {ct}* __restrict__ nw,\n\
+                         const {wt}* __restrict__ w_qkv, {ct}* __restrict__ qkv_out, float inv_rms\n\
+                     ) {{\n\
+                         uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n\
+                         uint32_t row = blockIdx.x * 4u + wid;\n\
+                         if (row >= {qkv_cols}u) return;\n\
+                         float acc = 0.0f;\n\
+                         for (uint32_t k = lane; k < {in_dim}u; k += 32u) {{\n\
+                             float xv = (float)__ldg(&x[k]) * inv_rms * (float)__ldg(&nw[k]);\n\
+                             acc = fmaf(xv, (float)__ldg(&w_qkv[(size_t)row * {in_dim}u + k]), acc);\n\
+                         }}\n\
+                         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);\n\
+                         if (lane == 0) qkv_out[row] = ({ct})acc;\n\
+                     }}\n\n",
+                    layout = weight_dtype.target_layout_desc(),
+                    fn_name = g.fn_name,
+                ));
+            }
+            FusedStage::FusedGqaAttention { seq, q_dim, kv_dim, fused_rope, dtype, .. } => {
+                let ct = dtype.cuda_ty();
+                let group = q_dim / kv_dim;
+                out.push_str(&format!(
+                    "// Stage {idx}: Auto-Fused {rope}GQA Register FlashDecoding [{seq}x{q_dim}, kv={kv_dim}, group={group}]\n\
+                     extern \"C\" __global__ void {fn_name}_stage{idx}_gqa_flash_decode(\n\
+                         const {ct}* __restrict__ q, const {ct}* __restrict__ k_cache,\n\
+                         const {ct}* __restrict__ v_cache, {ct}* __restrict__ ctx, uint32_t pos\n\
+                     ) {{\n\
+                         uint32_t h = blockIdx.x, lane = threadIdx.x & 31u;\n\
+                         uint32_t kv_h = h / {group}u;\n\
+                         float m_run = -1e30f, l_run = 0.0f, acc = 0.0f;\n\
+                         float qv = (float)__ldg(&q[h * 64u + lane]);\n\
+                         for (uint32_t t = 0; t <= pos; t++) {{\n\
+                             float dot = qv * (float)__ldg(&k_cache[(size_t)kv_h * 4096u + t * 64u + lane]);\n\
+                             for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xFFFFFFFFu, dot, off);\n\
+                             float sc = __shfl_sync(0xFFFFFFFFu, dot, 0) * 0.125f;\n\
+                             float mn = fmaxf(m_run, sc), al = __expf(m_run - mn), wt = __expf(sc - mn);\n\
+                             l_run = l_run * al + wt; m_run = mn;\n\
+                             acc = fmaf(acc, al, wt * (float)__ldg(&v_cache[(size_t)kv_h * 4096u + t * 64u + lane]));\n\
+                         }}\n\
+                         ctx[h * 64u + lane] = ({ct})(acc / fmaxf(l_run, 1e-12f));\n\
+                     }}\n\n",
+                    rope = if *fused_rope { "RoPE + " } else { "" },
+                    fn_name = g.fn_name,
+                ));
+            }
+            FusedStage::FusedRmsNormGateUpSwiGlu { seq, in_dim, d_ff, dtype, weight_dtype, .. } => {
+                let ct = dtype.cuda_ty();
+                let wt = weight_dtype.cuda_ty();
                 let to_f = |e: &str| match dtype {
+                    TensorDType::Float16 => format!("__half2float({})", e),
+                    TensorDType::BFloat16 => format!("__bfloat162float({})", e),
+                    _ => format!("(float)({})", e),
+                };
+                let w_to_f = |e: &str| match weight_dtype {
                     TensorDType::Float16 => format!("__half2float({})", e),
                     TensorDType::BFloat16 => format!("__bfloat162float({})", e),
                     _ => format!("(float)({})", e),
@@ -893,12 +1331,12 @@ pub fn emit_tensor_graph_cuda(g: &CompiledTensorGraph) -> String {
                     _ => format!("({})({})", ct, e),
                 };
                 if *seq < 16 {
-                    // Roofline-selected MEMORY-BOUND Schedule: 4-warp (128 thr) cooperative GEMV + on-chip SMEM RMSNorm!
                     out.push_str(&format!(
                         "// Stage {idx}: Auto-Fused Warp-Cooperative SMEM RMSNorm + Horizontal Gate||Up + SwiGLU [{seq}x{in_dim} -> {seq}x{d_ff}]\n\
+                         // Target Layout: {layout}\n\
                          extern \"C\" __global__ void {fn_name}_stage{idx}_fused_norm_swiglu(\n\
                              const {ct}* __restrict__ x, const {ct}* __restrict__ nw,\n\
-                             const {ct}* __restrict__ w_gate, const {ct}* __restrict__ w_up,\n\
+                             const {wt}* __restrict__ w_gate, const {wt}* __restrict__ w_up,\n\
                              {ct}* __restrict__ out\n\
                          ) {{\n\
                              extern __shared__ float sx[];\n\
@@ -937,19 +1375,21 @@ pub fn emit_tensor_graph_cuda(g: &CompiledTensorGraph) -> String {
                                  if (lane == 0) out[row * F + col] = {sout};\n\
                              }}\n\
                          }}\n\n",
+                        layout = weight_dtype.target_layout_desc(),
                         fn_name = g.fn_name,
                         lx = to_f("__ldg(&x[row * D + k])"),
                         lnw = to_f("__ldg(&nw[k])"),
-                        lwg = to_f("__ldg(&w_gate[k * F + col])"),
-                        lwu = to_f("__ldg(&w_up[k * F + col])"),
+                        lwg = w_to_f("__ldg(&w_gate[k * F + col])"),
+                        lwu = w_to_f("__ldg(&w_up[k * F + col])"),
                         sout = from_f("(g / (1.0f + expf(-g))) * u"),
                     ));
                 } else {
                     out.push_str(&format!(
                         "// Stage {idx}: Auto-Fused On-Chip SMEM RMSNorm + Horizontal Gate||Up + SwiGLU [{seq}x{in_dim} -> {seq}x{d_ff}]\n\
+                         // Target Layout: {layout}\n\
                          extern \"C\" __global__ void {fn_name}_stage{idx}_fused_norm_swiglu(\n\
                              const {ct}* __restrict__ x, const {ct}* __restrict__ nw,\n\
-                             const {ct}* __restrict__ w_gate, const {ct}* __restrict__ w_up,\n\
+                             const {wt}* __restrict__ w_gate, const {wt}* __restrict__ w_up,\n\
                              {ct}* __restrict__ out\n\
                          ) {{\n\
                              extern __shared__ float sx[];\n\
@@ -974,18 +1414,25 @@ pub fn emit_tensor_graph_cuda(g: &CompiledTensorGraph) -> String {
                                  out[row * F + col] = {sout};\n\
                              }}\n\
                          }}\n\n",
+                        layout = weight_dtype.target_layout_desc(),
                         fn_name = g.fn_name,
                         lx = to_f("x[row * D + k]"),
                         lnw = to_f("nw[k]"),
-                        lwg = to_f("w_gate[k * F + col]"),
-                        lwu = to_f("w_up[k * F + col]"),
+                        lwg = w_to_f("w_gate[k * F + col]"),
+                        lwu = w_to_f("w_up[k * F + col]"),
                         sout = from_f("(g / (1.0f + expf(-g))) * u"),
                     ));
                 }
             }
-            FusedStage::MatMulEpilogue { seq, k, n, residual, dtype, .. } => {
+            FusedStage::MatMulEpilogue { seq, k, n, residual, dtype, weight_dtype, .. } => {
                 let ct = dtype.cuda_ty();
+                let wt = weight_dtype.cuda_ty();
                 let to_f = |e: &str| match dtype {
+                    TensorDType::Float16 => format!("__half2float({})", e),
+                    TensorDType::BFloat16 => format!("__bfloat162float({})", e),
+                    _ => format!("(float)({})", e),
+                };
+                let w_to_f = |e: &str| match weight_dtype {
                     TensorDType::Float16 => format!("__half2float({})", e),
                     TensorDType::BFloat16 => format!("__bfloat162float({})", e),
                     _ => format!("(float)({})", e),
@@ -998,9 +1445,9 @@ pub fn emit_tensor_graph_cuda(g: &CompiledTensorGraph) -> String {
                 let res_param = if residual.is_some() { format!(", const {ct}* __restrict__ res") } else { String::new() };
                 let res_add = if residual.is_some() { format!("acc += {}; ", to_f("res[row * N + col]")) } else { String::new() };
                 out.push_str(&format!(
-                    "// Stage {idx}: Auto-Fused MatMul{ep} [{seq}x{k} @ {k}x{n}]\n\
+                    "// Stage {idx}: Auto-Fused MatMul{ep} [{seq}x{k} @ {k}x{n}] ({layout})\n\
                      extern \"C\" __global__ void {fn_name}_stage{idx}_matmul_epilogue(\n\
-                         const {ct}* __restrict__ a, const {ct}* __restrict__ b{res_param}, {ct}* __restrict__ out\n\
+                         const {ct}* __restrict__ a, const {wt}* __restrict__ b{res_param}, {ct}* __restrict__ out\n\
                      ) {{\n\
                          uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;\n\
                          uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;\n\
@@ -1012,9 +1459,10 @@ pub fn emit_tensor_graph_cuda(g: &CompiledTensorGraph) -> String {
                          }}\n\
                      }}\n\n",
                     ep = if residual.is_some() { " + Residual Epilogue" } else { "" },
+                    layout = weight_dtype.target_layout_desc(),
                     fn_name = g.fn_name,
                     la = to_f("a[row * K + kk]"),
-                    lb = to_f("b[kk * N + col]"),
+                    lb = w_to_f("b[kk * N + col]"),
                     sout = from_f("acc"),
                 ));
             }
@@ -1044,13 +1492,62 @@ pub fn emit_tensor_graph_msl(g: &CompiledTensorGraph) -> String {
     );
     for (idx, st) in g.stages.iter().enumerate() {
         match st {
-            FusedStage::FusedRmsNormGateUpSwiGlu { seq, in_dim, d_ff, dtype, .. } => {
+            FusedStage::FusedRmsNormQkv { seq, in_dim, q_dim, kv_dim, dtype, weight_dtype, .. } => {
                 let mt = dtype.msl_ty();
+                let wt = weight_dtype.msl_ty();
+                let qkv_cols = q_dim + 2 * kv_dim;
+                out.push_str(&format!(
+                    "// Stage {idx}: Auto-Fused Horizontal 3-Way QKV + RMSNorm [{seq}x{in_dim} -> {qkv_cols}] ({layout})\n\
+                     kernel void {fn_name}_stage{idx}_fused_norm_qkv(\n\
+                         device const {mt}* x [[buffer(0)]], device const {mt}* nw [[buffer(1)]],\n\
+                         device const {wt}* w_qkv [[buffer(2)]], device {mt}* qkv_out [[buffer(3)]],\n\
+                         uint tgid [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+                     ) {{\n\
+                         uint row = tgid * 4u + sg;\n\
+                         if (row >= {qkv_cols}u) return;\n\
+                         float acc = 0.0f;\n\
+                         for (uint k = lane; k < {in_dim}u; k += 32u) acc = fma((float)x[k] * (float)nw[k], (float)w_qkv[row * {in_dim}u + k], acc);\n\
+                         acc = simd_sum(acc);\n\
+                         if (lane == 0) qkv_out[row] = ({mt})acc;\n\
+                     }}\n\n",
+                    layout = weight_dtype.target_layout_desc(),
+                    fn_name = g.fn_name,
+                ));
+            }
+            FusedStage::FusedGqaAttention { seq, q_dim, kv_dim, fused_rope, dtype, .. } => {
+                let mt = dtype.msl_ty();
+                let group = q_dim / kv_dim;
+                out.push_str(&format!(
+                    "// Stage {idx}: Auto-Fused {rope}4-SG Split-K GQA FlashDecoding [{seq}x{q_dim}, kv={kv_dim}, group={group}]\n\
+                     kernel void {fn_name}_stage{idx}_gqa_flash_decode(\n\
+                         device const {mt}* q [[buffer(0)]], device const {mt}* k_cache [[buffer(1)]],\n\
+                         device const {mt}* v_cache [[buffer(2)]], device {mt}* ctx [[buffer(3)]],\n\
+                         constant uint& pos [[buffer(4)]],\n\
+                         uint h [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]\n\
+                     ) {{\n\
+                         uint kv_h = h / {group}u;\n\
+                         float qv = (float)q[h * 64u + lane], m_run = -1e30f, l_run = 0.0f, acc = 0.0f;\n\
+                         for (uint t = 0; t <= pos; t++) {{\n\
+                             float sc = simd_sum(qv * (float)k_cache[kv_h * 4096u + t * 64u + lane]) * 0.125f;\n\
+                             float mn = max(m_run, sc), al = exp(m_run - mn), wt = exp(sc - mn);\n\
+                             l_run = l_run * al + wt; m_run = mn;\n\
+                             acc = fma(acc, al, wt * (float)v_cache[kv_h * 4096u + t * 64u + lane]);\n\
+                         }}\n\
+                         ctx[h * 64u + lane] = ({mt})(acc / max(l_run, 1e-12f));\n\
+                     }}\n\n",
+                    rope = if *fused_rope { "RoPE + " } else { "" },
+                    fn_name = g.fn_name,
+                ));
+            }
+            FusedStage::FusedRmsNormGateUpSwiGlu { seq, in_dim, d_ff, dtype, weight_dtype, .. } => {
+                let mt = dtype.msl_ty();
+                let wt = weight_dtype.msl_ty();
                 out.push_str(&format!(
                     "// Stage {idx}: Auto-Fused Threadgroup SRAM RMSNorm + Horizontal Gate||Up + SwiGLU [{seq}x{in_dim} -> {seq}x{d_ff}]\n\
+                     // Target Layout: {layout}\n\
                      kernel void {fn_name}_stage{idx}_fused_norm_swiglu(\n\
                          device const {mt}* x [[buffer(0)]], device const {mt}* nw [[buffer(1)]],\n\
-                         device const {mt}* w_gate [[buffer(2)]], device const {mt}* w_up [[buffer(3)]],\n\
+                         device const {wt}* w_gate [[buffer(2)]], device const {wt}* w_up [[buffer(3)]],\n\
                          device {mt}* out [[buffer(4)]], threadgroup float* sx [[threadgroup(0)]],\n\
                          uint2 gid [[thread_position_in_grid]], uint lid [[thread_index_in_threadgroup]], uint tgsz [[threads_per_threadgroup]]\n\
                      ) {{\n\
@@ -1071,18 +1568,20 @@ pub fn emit_tensor_graph_msl(g: &CompiledTensorGraph) -> String {
                              out[row * F + col] = ({mt})((g / (1.0f + exp(-g))) * u);\n\
                          }}\n\
                      }}\n\n",
+                    layout = weight_dtype.target_layout_desc(),
                     fn_name = g.fn_name
                 ));
             }
-            FusedStage::MatMulEpilogue { seq, k, n, residual, dtype, .. } => {
+            FusedStage::MatMulEpilogue { seq, k, n, residual, dtype, weight_dtype, .. } => {
                 let mt = dtype.msl_ty();
+                let wt = weight_dtype.msl_ty();
                 let res_param = if residual.is_some() { format!(", device const {mt}* res [[buffer(3)]]") } else { String::new() };
                 let out_idx = if residual.is_some() { 4 } else { 3 };
                 let res_add = if residual.is_some() { "acc += (float)res[row * N + col]; " } else { "" };
                 out.push_str(&format!(
-                    "// Stage {idx}: Auto-Fused SIMD-Group Cooperative MatMul{ep} [{seq}x{k} @ {k}x{n}]\n\
+                    "// Stage {idx}: Auto-Fused SIMD-Group Cooperative MatMul{ep} [{seq}x{k} @ {k}x{n}] ({layout})\n\
                      kernel void {fn_name}_stage{idx}_matmul_epilogue(\n\
-                         device const {mt}* a [[buffer(0)]], device const {mt}* b [[buffer(1)]]{res_param},\n\
+                         device const {mt}* a [[buffer(0)]], device const {wt}* b [[buffer(1)]]{res_param},\n\
                          device {mt}* out [[buffer({out_idx})]],\n\
                          uint2 tgid [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
                      ) {{\n\
@@ -1096,6 +1595,7 @@ pub fn emit_tensor_graph_msl(g: &CompiledTensorGraph) -> String {
                          }}\n\
                      }}\n\n",
                     ep = if residual.is_some() { " + Residual Epilogue" } else { "" },
+                    layout = weight_dtype.target_layout_desc(),
                     fn_name = g.fn_name,
                 ));
             }
@@ -1154,5 +1654,68 @@ pub fn llama3_ffn(
         let msl = emit_tensor_graph_msl(g);
         assert!(msl.contains("llama3_ffn_stage0_fused_norm_swiglu"));
         assert!(msl.contains("threadgroup float* sx [[threadgroup(0)]]"));
+    }
+
+    #[test]
+    fn fuses_full_declarative_llama3_gqa_block_int4_to_w4a8_sb8_and_metal() {
+        let src = r#"
+@gpu_graph("tensor_dataflow")
+pub fn llama3_block_w4(
+    x      Matrix[1, 2048, DType = BFloat16],
+    n1     Matrix[1, 2048, DType = BFloat16],
+    w_q    Matrix[2048, 2048, DType = Int4],
+    w_k    Matrix[2048, 512,  DType = Int4],
+    w_v    Matrix[2048, 512,  DType = Int4],
+    w_o    Matrix[2048, 2048, DType = Int4],
+    n2     Matrix[1, 2048, DType = BFloat16],
+    w_gate Matrix[2048, 8192, DType = Int4],
+    w_up   Matrix[2048, 8192, DType = Int4],
+    w_down Matrix[8192, 2048, DType = Int4],
+) Matrix[1, 2048, DType = BFloat16] {
+    let h1   = tg_rmsnorm(x, n1)
+    let q    = tg_qmatmul(h1, w_q)
+    let k    = tg_qmatmul(h1, w_k)
+    let v    = tg_qmatmul(h1, w_v)
+    let rq   = tg_rope(q)
+    let rk   = tg_rope(k)
+    let ctx  = tg_gqa_attention(rq, rk, v)
+    let o    = tg_qmatmul(ctx, w_o)
+    let res1 = tg_add(x, o)
+    let h2   = tg_rmsnorm(res1, n2)
+    let g    = tg_qmatmul(h2, w_gate)
+    let u    = tg_qmatmul(h2, w_up)
+    let a    = tg_swiglu(g, u)
+    let d    = tg_qmatmul(a, w_down)
+    tg_add(res1, d)
+}
+"#;
+        let prog = tenon_syntax::parse(src).expect("parse");
+        let graphs = compile_tensor_graphs(&prog);
+        assert_eq!(graphs.len(), 1);
+        let g = &graphs[0];
+        // 15 naive Transformer block ops automatically collapse into ONLY 5 hardware super-stages!
+        assert_eq!(g.raw_nodes.len(), 15);
+        assert_eq!(g.stages.len(), 5, "expected 15 ops -> 5 super-stages: {:?}", g.stages);
+        assert!(matches!(g.stages[0], FusedStage::FusedRmsNormQkv { q_dim: 2048, kv_dim: 512, weight_dtype: TensorDType::Int4, .. }));
+        assert!(matches!(g.stages[1], FusedStage::FusedGqaAttention { q_dim: 2048, kv_dim: 512, fused_rope: true, .. }));
+        assert!(matches!(g.stages[2], FusedStage::MatMulEpilogue { k: 2048, n: 2048, residual: Some(_), weight_dtype: TensorDType::Int4, .. }));
+        assert!(matches!(g.stages[3], FusedStage::FusedRmsNormGateUpSwiGlu { in_dim: 2048, d_ff: 8192, weight_dtype: TensorDType::Int4, .. }));
+        assert!(matches!(g.stages[4], FusedStage::MatMulEpilogue { k: 8192, n: 2048, residual: Some(_), weight_dtype: TensorDType::Int4, .. }));
+
+        // TPU StableHLO automatically lowers Int4 -> W4A8 INT8 MXU (i4 -> i8 -> i32, 394 TOPS!) + GQA concat!
+        let shlo = emit_tensor_graph_stablehlo(g);
+        assert!(shlo.contains("xi4) -> tensor<2048x3072xi8>") || shlo.contains("xi4>) -> tensor<2048x3072xi8>"));
+        assert!(shlo.contains("-> tensor<1x3072xi32>"));
+        assert!(shlo.contains("stablehlo.concatenate %w_q, %w_k, %w_v, dim = 1"));
+
+        // CUDA & Metal automatically emit QKV + RoPE/GQA FlashDecode + SB8 layout guidance!
+        let cuda = emit_tensor_graph_cuda(g);
+        assert!(cuda.contains("llama3_block_w4_stage0_fused_norm_qkv"));
+        assert!(cuda.contains("llama3_block_w4_stage1_gqa_flash_decode"));
+        assert!(cuda.contains("Q4_0_SB8"));
+
+        let msl = emit_tensor_graph_msl(g);
+        assert!(msl.contains("llama3_block_w4_stage0_fused_norm_qkv"));
+        assert!(msl.contains("llama3_block_w4_stage1_gqa_flash_decode"));
     }
 }

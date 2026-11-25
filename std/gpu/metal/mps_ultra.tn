@@ -11,11 +11,13 @@ import "std/gpu/metal/mps.tn"
 pub const QUANT_FP16 Int = 0
 pub const QUANT_Q8_0 Int = 1
 pub const QUANT_Q4_0 Int = 2
+pub const QUANT_Q4_0_SB8 Int = 3
 
 @c_src("mps_ultra_shim.m")
 extern "C" {
     fn tn_ultra_init() Int
     fn tn_ultra_quantize_q4_0_buf(f16_ptr Ptr[UInt8], n_elems Int) Int
+    fn tn_ultra_quantize_q4_0_sb8_buf(f16_ptr Ptr[UInt8], n_elems Int) Int
     fn tn_ultra_quantize_q8_0_buf(f16_ptr Ptr[UInt8], n_elems Int) Int
     fn tn_ultra_embed(tok_h Int, emb_h Int, out_h Int, seq_len Int, d_model Int, vocab Int) Int
     fn tn_ultra_embed_off(tok_h Int, emb_h Int, emb_off Int, out_h Int, seq_len Int, d_model Int, vocab Int) Int
@@ -34,11 +36,24 @@ extern "C" {
     ) Int
     fn tn_ultra_argmax_f16(logits_h Int, out_tok_h Int, n_elems Int) Int
     fn tn_ultra_argmax_step_f16(logits_h Int, cur_tok_h Int, hist_tok_h Int, step_idx Int, n_elems Int) Int
+    fn tn_ultra_argmax_batch_f16(logits_h Int, out_toks_h Int, n_elems Int, batch_len Int) Int
     fn tn_ultra_read_u32_0(buf_h Int) Int
     fn tn_ultra_read_u32_at(buf_h Int, idx Int) Int
     fn tn_ultra_mm_quant_f16(
         x_h Int, w_h Int, w_off Int, y_h Int,
         m Int, n Int, k Int, quant_mode Int, add_res Int,
+    ) Int
+    fn tn_ultra_batch_gemm(
+        x_h Int, w_h Int, w_off Int, y_h Int, bias_h Int, bias_off Int,
+        m Int, n Int, k Int, quant_mode Int, add_res Int, has_bias Int,
+    ) Int
+    fn tn_ultra_batch_ffn_gate_up(
+        x_h Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int, out_h Int,
+        m Int, d_ff Int, k Int, quant_mode Int, is_geglu Int,
+    ) Int
+    fn tn_ultra_flash_batch_causal_gqa(
+        q_heads_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_flat_h Int,
+        n_heads Int, n_kv Int, d_head Int, start_pos Int, batch_len Int, max_seq Int, softcap Float,
     ) Int
     fn tn_ultra_gemv(
         x_h Int, x_off Int,
@@ -100,9 +115,13 @@ pub fn ultra_init() Bool {
     unsafe { tn_ultra_init() != 0 }
 }
 
-/// Uploads a flat `List[Float16]` into a `@linear GpuBuffer` quantized as FP16 (0), Q8_0 (1), or Q4_0 (2)!
+/// Uploads a flat `List[Float16]` into a `@linear GpuBuffer` quantized as FP16 (0), Q8_0 (1), Q4_0 (2), or Q4_0_SB8 (3)!
 pub fn ultra_upload_weights(xs List[Float16], quant_mode Int) GpuBuffer {
     let n = len(xs)
+    if quant_mode == QUANT_Q4_0_SB8 {
+        let h = unsafe { tn_ultra_quantize_q4_0_sb8_buf(list_data_ptr(xs), n) }
+        return GpuBuffer { handle = h, byte_len = (n / 32) * 18 }
+    }
     if quant_mode == QUANT_Q4_0 {
         let h = unsafe { tn_ultra_quantize_q4_0_buf(list_data_ptr(xs), n) }
         return GpuBuffer { handle = h, byte_len = (n / 32) * 18 }
@@ -115,7 +134,7 @@ pub fn ultra_upload_weights(xs List[Float16], quant_mode Int) GpuBuffer {
 }
 
 pub pure fn ultra_weight_stride_bytes(n_elems Int, quant_mode Int) Int {
-    if quant_mode == QUANT_Q4_0 { return (n_elems / 32) * 18 }
+    if quant_mode == QUANT_Q4_0 || quant_mode == QUANT_Q4_0_SB8 { return (n_elems / 32) * 18 }
     if quant_mode == QUANT_Q8_0 { return (n_elems / 32) * 34 }
     n_elems * 2
 }
@@ -195,6 +214,47 @@ pub fn ultra_gpu_argmax_f16(logits_h Int, out_tok_h Int, n_elems Int) Bool {
 
 pub fn ultra_gpu_argmax_step_f16(logits_h Int, cur_tok_h Int, hist_tok_h Int, step_idx Int, n_elems Int) Bool {
     unsafe { tn_ultra_argmax_step_f16(logits_h, cur_tok_h, hist_tok_h, step_idx, n_elems) != 0 }
+}
+
+pub fn ultra_gpu_argmax_batch_f16(logits_h Int, out_toks_h Int, n_elems Int, batch_len Int) Bool {
+    unsafe { tn_ultra_argmax_batch_f16(logits_h, out_toks_h, n_elems, batch_len) != 0 }
+}
+
+pub fn ultra_batch_gemm(
+    x_h Int, w_h Int, w_off Int, y_h Int, bias_h Int, bias_off Int,
+    m Int, n Int, k Int, quant_mode Int, add_res Bool, has_bias Bool,
+) Bool {
+    unsafe {
+        tn_ultra_batch_gemm(
+            x_h, w_h, w_off, y_h, bias_h, bias_off, m, n, k, quant_mode,
+            if add_res { 1 } else { 0 },
+            if has_bias { 1 } else { 0 },
+        ) != 0
+    }
+}
+
+pub fn ultra_batch_ffn_gate_up(
+    x_h Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int, out_h Int,
+    m Int, d_ff Int, k Int, quant_mode Int, is_geglu Bool,
+) Bool {
+    unsafe {
+        tn_ultra_batch_ffn_gate_up(
+            x_h, wg_h, wg_off, wu_h, wu_off, out_h, m, d_ff, k, quant_mode,
+            if is_geglu { 1 } else { 0 },
+        ) != 0
+    }
+}
+
+pub fn ultra_flash_batch_causal_gqa(
+    q_heads_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_flat_h Int,
+    n_heads Int, n_kv Int, d_head Int, start_pos Int, batch_len Int, max_seq Int, softcap Float,
+) Bool {
+    unsafe {
+        tn_ultra_flash_batch_causal_gqa(
+            q_heads_h, kc_h, kc_off, vc_h, vc_off, ctx_flat_h,
+            n_heads, n_kv, d_head, start_pos, batch_len, max_seq, softcap,
+        ) != 0
+    }
 }
 
 pub fn ultra_read_u32_0(buf_h Int) Int {

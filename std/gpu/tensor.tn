@@ -18,6 +18,16 @@
 
 import "std/core/types.tn"
 
+/// Quantized & low-precision dependent element DType markers for declarative `@gpu_graph` tensors.
+/// The compiler automatically lowers these to hardware-optimal packed layouts per target:
+///   - NVIDIA CUDA (`sm_89+`): 128-bit aligned superblocks (`Q4_0_SB8` / `Q8_0_SB8`) or `e4m3fn` FP8 Tensor Cores
+///   - Apple Silicon Metal: 128-bit aligned `Q4_0_SB8` / `Q8_0_SB8` + `simdgroup_half8x8` batch MMA
+///   - Google Cloud TPU: native hardware sub-byte `tensor<...xi4>` (`PJRT_Buffer_Type_S4`) + 394 TOPS INT8 MXU (`W4A8`)
+pub type Int4 = Int8
+pub type FP8  = UInt8
+pub type Q4_0 = UInt8
+pub type Q8_0 = UInt8
+
 @gpu_struct("std430")
 pub record MatMulParams {
     m UInt32
@@ -365,6 +375,36 @@ pub pure fn tg_matmul[DType](a Tensor2D[DType], b Tensor2D[DType]) Tensor2D[DTyp
 {
     let out List[DType] = list_filled(a.rows * b.cols, a.data[0])
     Tensor2D { rows = a.rows, cols = b.cols, data = out }
+}
+
+/// Mixed-precision quantized matrix multiply (`Act[M, K, Float16/BFloat16] @ Weight[K, N, Int4/Q4_0/Q8_0/FP8] -> Act[M, N]`).
+/// Z3 statically proves inner contraction dimension equality (`a.cols == b.rows`); the `@gpu_graph` compiler
+/// automatically selects hardware-optimal packed superblocks (`SB8 uint4`), native TPU `i4`/`W4A8`, or FP8 TC!
+pub pure fn tg_qmatmul[ActDType, WeightDType](a Tensor2D[ActDType], b Tensor2D[WeightDType]) Tensor2D[ActDType]
+    requires a.cols == b.rows && len(a.data) == a.rows * a.cols && len(b.data) == b.rows * b.cols
+    ensures result.rows == a.rows && result.cols == b.cols && len(result.data) == a.rows * b.cols
+{
+    let out List[ActDType] = list_filled(a.rows * b.cols, a.data[0])
+    Tensor2D { rows = a.rows, cols = b.cols, data = out }
+}
+
+/// Declarative Rotary Position Embedding (RoPE) shape-preserving transform inside `@gpu_graph`.
+pub pure fn tg_rope[DType](x Tensor2D[DType]) Tensor2D[DType]
+    requires len(x.data) == x.rows * x.cols
+    ensures result.rows == x.rows && result.cols == x.cols && len(result.data) == x.rows * x.cols
+{
+    Tensor2D { rows = x.rows, cols = x.cols, data = x.data }
+}
+
+/// Declarative Grouped-Query Attention (GQA) inside `@gpu_graph`:
+/// Z3 statically proves `q.rows == k.rows == v.rows`, `k.cols == v.cols`, and exact GQA head divisibility `q.cols % k.cols == 0`!
+/// Lowered automatically to Register FlashDecoding (CUDA), 4-SG Split-K FlashDecoding (Metal), or VMEM GQA (TPU StableHLO)!
+pub pure fn tg_gqa_attention[DType](q Tensor2D[DType], k Tensor2D[DType], v Tensor2D[DType]) Tensor2D[DType]
+    requires q.rows == k.rows && k.rows == v.rows && k.cols == v.cols && q.cols % k.cols == 0
+    requires len(q.data) == q.rows * q.cols
+    ensures result.rows == q.rows && result.cols == q.cols && len(result.data) == q.rows * q.cols
+{
+    Tensor2D { rows = q.rows, cols = q.cols, data = q.data }
 }
 
 pub pure fn tg_swiglu[DType](gate Tensor2D[DType], up Tensor2D[DType]) Tensor2D[DType]

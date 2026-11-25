@@ -23,10 +23,24 @@ extern "C" {
     fn tn_cuda_graph_launch(gh Int) Int
     fn tn_cuda_graph_free(gh Int) Int
     fn tn_cuda_ultra_embed(tok_h Int, emb_h Int, emb_off Int, out_h Int, seq_len Int, d_model Int, vocab Int) Int
+    fn tn_cuda_ultra_embed_ss(tok_h Int, emb_h Int, emb_off Int, out_h Int, d_model Int, vocab Int) Int
     fn tn_cuda_ultra_rmsnorm(x_h Int, w_h Int, w_off Int, out_h Int, seq_len Int, d_model Int, gemma_mode Int) Int
+    fn tn_cuda_ultra_rmsnorm_fp8(x_h Int, w_h Int, w_off Int, out_h Int, seq_len Int, d_model Int, gemma_mode Int) Int
     fn tn_cuda_ultra_gemv(
         x_h Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
         out_dim Int, in_dim Int, quant_mode Int, add_res Int, has_bias Int,
+    ) Int
+    fn tn_cuda_ultra_gemv_ss(
+        x_h Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
+        out_dim Int, in_dim Int, quant_mode Int, add_res Int, has_bias Int, ss_write_slot Int,
+    ) Int
+    fn tn_cuda_ultra_epinorm_gemv(
+        x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
+        out_dim Int, in_dim Int, quant_mode Int, gemma_mode Int, has_bias Int, ss_read_slot Int,
+    ) Int
+    fn tn_cuda_ultra_epinorm_ffn(
+        x_h Int, nw_h Int, nw_off Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int,
+        out_h Int, d_ff Int, in_dim Int, quant_mode Int, is_geglu Int, gemma_mode Int, ss_read_slot Int,
     ) Int
     fn tn_cuda_ultra_norm_gemv(
         x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
@@ -42,14 +56,24 @@ extern "C" {
     ) Int
     fn tn_cuda_ultra_argmax(logits_h Int, tok_pos_h Int, n_elems Int, inc_pos Int) Int
     fn tn_cuda_ultra_silu_mul(g_h Int, u_h Int, o_h Int, n_elems Int) Int
+    fn tn_cuda_ultra_silu_mul_fp8(g_h Int, u_h Int, o_h Int, n_elems Int) Int
     fn tn_cuda_ultra_mm(
         x_h Int, w_h Int, w_off Int, y_h Int,
         m Int, n Int, k Int, quant_mode Int, add_res Int,
+    ) Int
+    fn tn_cuda_ultra_mm_fast(
+        x_h Int, w_h Int, w_off Int, y_h Int,
+        m Int, n Int, k Int, add_res Int,
+    ) Int
+    fn tn_cuda_ultra_mm_fp8(
+        x_h Int, w_h Int, w_off Int, y_h Int,
+        m Int, n Int, k Int, add_res Int,
     ) Int
 }
 
 extern "C" {
     fn tn_cuda_has_cublas() Int
+    fn tn_cuda_has_fp8() Int
 }
 
 @linear
@@ -115,9 +139,18 @@ pub fn cuda_embed(tok_h Int, emb_h Int, emb_off Int, out_h Int, seq_len Int, d_m
     unsafe { tn_cuda_ultra_embed(tok_h, emb_h, emb_off, out_h, seq_len, d_model, vocab) != 0 }
 }
 
+pub fn cuda_embed_ss(tok_h Int, emb_h Int, emb_off Int, out_h Int, d_model Int, vocab Int) Bool {
+    unsafe { tn_cuda_ultra_embed_ss(tok_h, emb_h, emb_off, out_h, d_model, vocab) != 0 }
+}
+
 pub fn cuda_rmsnorm(x_h Int, w_h Int, w_off Int, out_h Int, seq_len Int, d_model Int, gemma_mode Bool) Bool {
     let gm = if gemma_mode { 1 } else { 0 }
     unsafe { tn_cuda_ultra_rmsnorm(x_h, w_h, w_off, out_h, seq_len, d_model, gm) != 0 }
+}
+
+pub fn cuda_rmsnorm_fp8(x_h Int, w_h Int, w_off Int, out_h Int, seq_len Int, d_model Int, gemma_mode Bool) Bool {
+    let gm = if gemma_mode { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_rmsnorm_fp8(x_h, w_h, w_off, out_h, seq_len, d_model, gm) != 0 }
 }
 
 pub fn cuda_gemv(
@@ -127,6 +160,33 @@ pub fn cuda_gemv(
     let ar = if add_res { 1 } else { 0 }
     let hb = if has_bias { 1 } else { 0 }
     unsafe { tn_cuda_ultra_gemv(x_h, w_h, w_off, y_h, b_h, b_off, out_dim, in_dim, quant_mode, ar, hb) != 0 }
+}
+
+pub fn cuda_gemv_ss(
+    x_h Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
+    out_dim Int, in_dim Int, quant_mode Int, add_res Bool, has_bias Bool, ss_write_slot Int,
+) Bool {
+    let ar = if add_res { 1 } else { 0 }
+    let hb = if has_bias { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_gemv_ss(x_h, w_h, w_off, y_h, b_h, b_off, out_dim, in_dim, quant_mode, ar, hb, ss_write_slot) != 0 }
+}
+
+pub fn cuda_epinorm_gemv(
+    x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
+    out_dim Int, in_dim Int, quant_mode Int, gemma_mode Bool, has_bias Bool, ss_read_slot Int,
+) Bool {
+    let gm = if gemma_mode { 1 } else { 0 }
+    let hb = if has_bias { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_epinorm_gemv(x_h, nw_h, nw_off, w_h, w_off, y_h, b_h, b_off, out_dim, in_dim, quant_mode, gm, hb, ss_read_slot) != 0 }
+}
+
+pub fn cuda_epinorm_ffn(
+    x_h Int, nw_h Int, nw_off Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int,
+    out_h Int, d_ff Int, in_dim Int, quant_mode Int, is_geglu Bool, gemma_mode Bool, ss_read_slot Int,
+) Bool {
+    let ig = if is_geglu { 1 } else { 0 }
+    let gm = if gemma_mode { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_epinorm_ffn(x_h, nw_h, nw_off, wg_h, wg_off, wu_h, wu_off, out_h, d_ff, in_dim, quant_mode, ig, gm, ss_read_slot) != 0 }
 }
 
 pub fn cuda_norm_gemv(
@@ -163,11 +223,29 @@ pub fn cuda_has_cublas() Bool {
     unsafe { tn_cuda_has_cublas() != 0 }
 }
 
+pub fn cuda_has_fp8() Bool {
+    unsafe { tn_cuda_has_fp8() != 0 }
+}
+
 pub fn cuda_silu_mul(g_h Int, u_h Int, o_h Int, n_elems Int) Bool {
     unsafe { tn_cuda_ultra_silu_mul(g_h, u_h, o_h, n_elems) != 0 }
+}
+
+pub fn cuda_silu_mul_fp8(g_h Int, u_h Int, o_h Int, n_elems Int) Bool {
+    unsafe { tn_cuda_ultra_silu_mul_fp8(g_h, u_h, o_h, n_elems) != 0 }
 }
 
 pub fn cuda_mm(x_h Int, w_h Int, w_off Int, y_h Int, m Int, n Int, k Int, quant_mode Int, add_res Bool) Bool {
     let ar = if add_res { 1 } else { 0 }
     unsafe { tn_cuda_ultra_mm(x_h, w_h, w_off, y_h, m, n, k, quant_mode, ar) != 0 }
+}
+
+pub fn cuda_mm_fast(x_h Int, w_h Int, w_off Int, y_h Int, m Int, n Int, k Int, add_res Bool) Bool {
+    let ar = if add_res { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_mm_fast(x_h, w_h, w_off, y_h, m, n, k, ar) != 0 }
+}
+
+pub fn cuda_mm_fp8(x_h Int, w_h Int, w_off Int, y_h Int, m Int, n Int, k Int, add_res Bool) Bool {
+    let ar = if add_res { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_mm_fp8(x_h, w_h, w_off, y_h, m, n, k, ar) != 0 }
 }

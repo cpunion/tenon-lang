@@ -311,46 +311,108 @@ fn bench_cuda_tensorcore_gemm(m Int, n Int, k Int, iters Int) Int {
         ++ " TFLOPS=" ++ float_to_text(tflops)
         ++ " pct_4090_165T=" ++ float_to_text((tflops / 165.2) * 100.0) ++ "%"
     )
+
+    // 2. Ada Lovelace 330.3 TFLOPS FP16-accum (`CUBLAS_COMPUTE_16F`)!
+    wi = 0
+    while wi < 25 {
+        let _ = cuda_mm_fast(x_b.handle, w_b.handle, 0, y_b.handle, m, n, k, false)
+        wi += 1
+    }
+    let _ = cuda_sync()
+    let tf0 = time_now_ns()
+    i = 0
+    while i < iters {
+        let _ = cuda_mm_fast(x_b.handle, w_b.handle, 0, y_b.handle, m, n, k, false)
+        i += 1
+    }
+    let _ = cuda_sync()
+    let dtf_ns = time_now_ns() - tf0
+    let msf = int_to_float(dtf_ns) / (int_to_float(iters) * 1000000.0)
+    let tflops_f = (flops / (msf / 1000.0)) / 1000000000000.0
+    println(
+        "ROOFLINE_TC_FP16_330T " ++ int_to_text(m) ++ "x" ++ int_to_text(n) ++ "x" ++ int_to_text(k)
+        ++ " ms=" ++ float_to_text(msf)
+        ++ " TFLOPS=" ++ float_to_text(tflops_f)
+        ++ " pct_4090_330T=" ++ float_to_text((tflops_f / 330.3) * 100.0) ++ "%"
+    )
+
+    // 3. Ada Lovelace 660.6 TFLOPS FP8 (`e4m3fn` via dynamic `dlopen("libcublasLt.so")`)!
+    if cuda_has_fp8() {
+        let x8_b = CudaBuffer.uninit(m * k)
+        let w8_b = CudaBuffer.uninit(n * k)
+        let ok8 = cuda_mm_fp8(x8_b.handle, w8_b.handle, 0, y_b.handle, m, n, k, false)
+        if ok8 {
+            wi = 0
+            while wi < 25 {
+                let _ = cuda_mm_fp8(x8_b.handle, w8_b.handle, 0, y_b.handle, m, n, k, false)
+                wi += 1
+            }
+            let _ = cuda_sync()
+            let t80 = time_now_ns()
+            i = 0
+            while i < iters {
+                let _ = cuda_mm_fp8(x8_b.handle, w8_b.handle, 0, y_b.handle, m, n, k, false)
+                i += 1
+            }
+            let _ = cuda_sync()
+            let dt8_ns = time_now_ns() - t80
+            let ms8 = int_to_float(dt8_ns) / (int_to_float(iters) * 1000000.0)
+            let tflops_8 = (flops / (ms8 / 1000.0)) / 1000000000000.0
+            println(
+                "ROOFLINE_TC_FP8_660T " ++ int_to_text(m) ++ "x" ++ int_to_text(n) ++ "x" ++ int_to_text(k)
+                ++ " ms=" ++ float_to_text(ms8)
+                ++ " TFLOPS=" ++ float_to_text(tflops_8)
+                ++ " pct_4090_660T=" ++ float_to_text((tflops_8 / 660.6) * 100.0) ++ "%"
+            )
+        }
+        let _ = x8_b.free()
+        let _ = w8_b.free()
+    }
     let _ = x_b.free()
     let _ = w_b.free()
     let _ = y_b.free()
     0
 }
 
-fn bench_cuda_prefill_f16(name Text, seq Int, d Int, dff Int, n_layers Int, iters Int) Int {
+fn bench_cuda_prefill_mode(name Text, seq Int, d Int, dff Int, n_layers Int, iters Int, mode Int) Int {
+    // mode: 0 = FP16 (165.2T FP32 accum), 1 = FP16-accum (330.3T), 2 = FP8 e4m3fn (660.6T)
+    if mode == 2 && !cuda_has_fp8() { return 0 }
     let x_b = CudaBuffer.uninit(seq * d * 2)
     let xn_b = CudaBuffer.uninit(seq * d * 2)
     let nw_b = CudaBuffer.from_f16_list(cuda_synth_ones_f16(d, 1.0))
     let qkv_dim = d + (d / 4) * 2
-    let wqkv_b = CudaBuffer.uninit(qkv_dim * d * 2)
+    let w_elem_bytes = if mode == 2 { 1 } else { 2 }
+    let wqkv_b = CudaBuffer.uninit(qkv_dim * d * w_elem_bytes)
     let qkv_b = CudaBuffer.uninit(seq * qkv_dim * 2)
-    let wo_b = CudaBuffer.uninit(d * d * 2)
-    let wg_b = CudaBuffer.uninit(dff * d * 2)
-    let wu_b = CudaBuffer.uninit(dff * d * 2)
-    let wd_b = CudaBuffer.uninit(d * dff * 2)
+    let wo_b = CudaBuffer.uninit(d * d * w_elem_bytes)
+    let wg_b = CudaBuffer.uninit(dff * d * w_elem_bytes)
+    let wu_b = CudaBuffer.uninit(dff * d * w_elem_bytes)
+    let wd_b = CudaBuffer.uninit(d * dff * w_elem_bytes)
     let g_b = CudaBuffer.uninit(seq * dff * 2)
     let u_b = CudaBuffer.uninit(seq * dff * 2)
     let act_b = CudaBuffer.uninit(seq * dff * 2)
 
-    // Warmup 1 layer pass
     var wi = 0
     while wi < 5 {
-        let _ = cuda_rmsnorm(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
-        let _ = cuda_mm(xn_b.handle, wqkv_b.handle, 0, qkv_b.handle, seq, qkv_dim, d, CUDA_QUANT_FP16, false)
-        let _ = cuda_mm(xn_b.handle, wo_b.handle, 0, x_b.handle, seq, d, d, CUDA_QUANT_FP16, true)
-        let _ = cuda_rmsnorm(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
-        let _ = cuda_mm(xn_b.handle, wg_b.handle, 0, g_b.handle, seq, dff, d, CUDA_QUANT_FP16, false)
-        let _ = cuda_mm(xn_b.handle, wu_b.handle, 0, u_b.handle, seq, dff, d, CUDA_QUANT_FP16, false)
-        let _ = cuda_silu_mul(g_b.handle, u_b.handle, act_b.handle, seq * dff)
-        let _ = cuda_mm(act_b.handle, wd_b.handle, 0, x_b.handle, seq, d, dff, CUDA_QUANT_FP16, true)
-        wi += 1
-    }
-    let _ = cuda_sync()
-    let t0 = time_now_ns()
-    var it = 0
-    while it < iters {
-        var l = 0
-        while l < n_layers {
+        if mode == 2 {
+            let _ = cuda_rmsnorm_fp8(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
+            let _ = cuda_mm_fp8(xn_b.handle, wqkv_b.handle, 0, qkv_b.handle, seq, qkv_dim, d, false)
+            let _ = cuda_mm_fp8(xn_b.handle, wo_b.handle, 0, x_b.handle, seq, d, d, true)
+            let _ = cuda_rmsnorm_fp8(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
+            let _ = cuda_mm_fp8(xn_b.handle, wg_b.handle, 0, g_b.handle, seq, dff, d, false)
+            let _ = cuda_mm_fp8(xn_b.handle, wu_b.handle, 0, u_b.handle, seq, dff, d, false)
+            let _ = cuda_silu_mul_fp8(g_b.handle, u_b.handle, act_b.handle, seq * dff)
+            let _ = cuda_mm_fp8(act_b.handle, wd_b.handle, 0, x_b.handle, seq, d, dff, true)
+        } else if mode == 1 {
+            let _ = cuda_rmsnorm(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
+            let _ = cuda_mm_fast(xn_b.handle, wqkv_b.handle, 0, qkv_b.handle, seq, qkv_dim, d, false)
+            let _ = cuda_mm_fast(xn_b.handle, wo_b.handle, 0, x_b.handle, seq, d, d, true)
+            let _ = cuda_rmsnorm(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
+            let _ = cuda_mm_fast(xn_b.handle, wg_b.handle, 0, g_b.handle, seq, dff, d, false)
+            let _ = cuda_mm_fast(xn_b.handle, wu_b.handle, 0, u_b.handle, seq, dff, d, false)
+            let _ = cuda_silu_mul(g_b.handle, u_b.handle, act_b.handle, seq * dff)
+            let _ = cuda_mm_fast(act_b.handle, wd_b.handle, 0, x_b.handle, seq, d, dff, true)
+        } else {
             let _ = cuda_rmsnorm(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
             let _ = cuda_mm(xn_b.handle, wqkv_b.handle, 0, qkv_b.handle, seq, qkv_dim, d, CUDA_QUANT_FP16, false)
             let _ = cuda_mm(xn_b.handle, wo_b.handle, 0, x_b.handle, seq, d, d, CUDA_QUANT_FP16, true)
@@ -359,6 +421,43 @@ fn bench_cuda_prefill_f16(name Text, seq Int, d Int, dff Int, n_layers Int, iter
             let _ = cuda_mm(xn_b.handle, wu_b.handle, 0, u_b.handle, seq, dff, d, CUDA_QUANT_FP16, false)
             let _ = cuda_silu_mul(g_b.handle, u_b.handle, act_b.handle, seq * dff)
             let _ = cuda_mm(act_b.handle, wd_b.handle, 0, x_b.handle, seq, d, dff, CUDA_QUANT_FP16, true)
+        }
+        wi += 1
+    }
+    let _ = cuda_sync()
+    let t0 = time_now_ns()
+    var it = 0
+    while it < iters {
+        var l = 0
+        while l < n_layers {
+            if mode == 2 {
+                let _ = cuda_rmsnorm_fp8(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
+                let _ = cuda_mm_fp8(xn_b.handle, wqkv_b.handle, 0, qkv_b.handle, seq, qkv_dim, d, false)
+                let _ = cuda_mm_fp8(xn_b.handle, wo_b.handle, 0, x_b.handle, seq, d, d, true)
+                let _ = cuda_rmsnorm_fp8(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
+                let _ = cuda_mm_fp8(xn_b.handle, wg_b.handle, 0, g_b.handle, seq, dff, d, false)
+                let _ = cuda_mm_fp8(xn_b.handle, wu_b.handle, 0, u_b.handle, seq, dff, d, false)
+                let _ = cuda_silu_mul_fp8(g_b.handle, u_b.handle, act_b.handle, seq * dff)
+                let _ = cuda_mm_fp8(act_b.handle, wd_b.handle, 0, x_b.handle, seq, d, dff, true)
+            } else if mode == 1 {
+                let _ = cuda_rmsnorm(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
+                let _ = cuda_mm_fast(xn_b.handle, wqkv_b.handle, 0, qkv_b.handle, seq, qkv_dim, d, false)
+                let _ = cuda_mm_fast(xn_b.handle, wo_b.handle, 0, x_b.handle, seq, d, d, true)
+                let _ = cuda_rmsnorm(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
+                let _ = cuda_mm_fast(xn_b.handle, wg_b.handle, 0, g_b.handle, seq, dff, d, false)
+                let _ = cuda_mm_fast(xn_b.handle, wu_b.handle, 0, u_b.handle, seq, dff, d, false)
+                let _ = cuda_silu_mul(g_b.handle, u_b.handle, act_b.handle, seq * dff)
+                let _ = cuda_mm_fast(act_b.handle, wd_b.handle, 0, x_b.handle, seq, d, dff, true)
+            } else {
+                let _ = cuda_rmsnorm(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
+                let _ = cuda_mm(xn_b.handle, wqkv_b.handle, 0, qkv_b.handle, seq, qkv_dim, d, CUDA_QUANT_FP16, false)
+                let _ = cuda_mm(xn_b.handle, wo_b.handle, 0, x_b.handle, seq, d, d, CUDA_QUANT_FP16, true)
+                let _ = cuda_rmsnorm(x_b.handle, nw_b.handle, 0, xn_b.handle, seq, d, false)
+                let _ = cuda_mm(xn_b.handle, wg_b.handle, 0, g_b.handle, seq, dff, d, CUDA_QUANT_FP16, false)
+                let _ = cuda_mm(xn_b.handle, wu_b.handle, 0, u_b.handle, seq, dff, d, CUDA_QUANT_FP16, false)
+                let _ = cuda_silu_mul(g_b.handle, u_b.handle, act_b.handle, seq * dff)
+                let _ = cuda_mm(act_b.handle, wd_b.handle, 0, x_b.handle, seq, d, dff, CUDA_QUANT_FP16, true)
+            }
             l += 1
         }
         it += 1
@@ -369,6 +468,7 @@ fn bench_cuda_prefill_f16(name Text, seq Int, d Int, dff Int, n_layers Int, iter
     let tok_s = (int_to_float(seq) * 1000.0) / ms
     let layer_flops = 2.0 * int_to_float(seq) * int_to_float(qkv_dim * d + d * d + 3 * d * dff)
     let tflops = ((layer_flops * int_to_float(n_layers)) / (ms / 1000.0)) / 1000000000000.0
+    let peak_t = if mode == 2 { 660.6 } else if mode == 1 { 330.3 } else { 165.2 }
     println(
         "BENCH_CUDA_PREFILL " ++ name
         ++ " seq=" ++ int_to_text(seq)
@@ -376,7 +476,7 @@ fn bench_cuda_prefill_f16(name Text, seq Int, d Int, dff Int, n_layers Int, iter
         ++ " ms=" ++ float_to_text(ms)
         ++ " tok_s=" ++ float_to_text(tok_s)
         ++ " TFLOPS=" ++ float_to_text(tflops)
-        ++ " pct_4090_165T=" ++ float_to_text((tflops / 165.2) * 100.0) ++ "%"
+        ++ " pct_peak=" ++ float_to_text((tflops / peak_t) * 100.0) ++ "%"
     )
     let _ = x_b.free()
     let _ = xn_b.free()
@@ -406,6 +506,7 @@ fn main() Int {
         ++ " VRAM_MB=" ++ int_to_text(cuda_vram_mb())
         ++ " peak_GBs=" ++ float_to_text(cuda_peak_gbs())
         ++ " has_cublas=" ++ if cuda_has_cublas() { "true" } else { "false" }
+        ++ " has_fp8=" ++ if cuda_has_fp8() { "true" } else { "false" }
     )
 
     // 1. Single-source `@kernel` compiled via `gpu_embedded_cuda()` -> NVRTC -> real NVIDIA GPU!
@@ -490,8 +591,10 @@ fn main() Int {
     let _ = bench_raw_gemv("8192x8192_Q8_0_dp4a", 8192, 8192, CUDA_QUANT_Q8_0, 100)
     let _ = bench_raw_gemv("8192x8192_Q4_0_dp4a", 8192, 8192, CUDA_QUANT_Q4_0, 100)
 
-    // 4. End-to-End Multi-Scale LLM Decode (Streaming vs Native CUDA Graphs) + FP16 Tensor Core Prefill!
-    let _ = bench_cuda_prefill_f16("Llama3.2_1B_Prefill_S512_FP16", 512, 2048, 8192, 16, 15)
+    // 4. End-to-End Multi-Scale LLM Decode (Epilogue-Norm + Native CUDA Graphs) + 165T / 330T / 660T Prefill!
+    let _ = bench_cuda_prefill_mode("Llama3.2_1B_Prefill_S512_FP16", 512, 2048, 8192, 16, 15, 0)
+    let _ = bench_cuda_prefill_mode("Llama3.2_1B_Prefill_S512_FP16_330T", 512, 2048, 8192, 16, 15, 1)
+    let _ = bench_cuda_prefill_mode("Llama3.2_1B_Prefill_S512_FP8_660T", 512, 2048, 8192, 16, 15, 2)
     let _ = bench_cuda_llm("Llama3_6L_21M_Q4_0", cuda_llama3_cfg(4096, 512, 6, 8, 2, 1408, 256, CUDA_QUANT_Q4_0), 64)
     let _ = bench_cuda_llm("Llama3_12L_85M_Q4_0", cuda_llama3_cfg(8192, 768, 12, 12, 4, 2048, 256, CUDA_QUANT_Q4_0), 64)
     let _ = bench_cuda_llm("Llama3.2_1B_Q4_0", cuda_llama3_cfg(128256, 2048, 16, 32, 8, 8192, 256, CUDA_QUANT_Q4_0), 32)
