@@ -93,10 +93,15 @@ pub fn main() Int {
         println("ERROR: Metal GPU unavailable")
         return 1
     }
-    let msl_path = "/tmp/tenon_tiled_mlp.metal"
-    let msl_src = sys_read_file(msl_path)
+    let env_msl = sys_env("TENON_MSL_PATH")
+    var msl_path = if len(env_msl) > 0 { env_msl } else { "/tmp/tiled.metal" }
+    var msl_src = sys_read_file(msl_path)
     if !sys_file_ok() || len(msl_src) < 64 {
-        println("Run with `--emit-msl /tmp/tenon_tiled_mlp.metal` first!")
+        msl_path = "/tmp/tenon_tiled_mlp.metal"
+        msl_src = sys_read_file(msl_path)
+    }
+    if !sys_file_ok() || len(msl_src) < 64 {
+        println("Run with `--emit-msl /tmp/tiled.metal` (or set TENON_MSL_PATH) first!")
         return 1
     }
 
@@ -164,6 +169,7 @@ pub fn main() Int {
     }
     println("=== Tenon H1 Tiled Shared-Memory Metal + AST-Fused @gpu_graph Demo ===")
     println("Metal GPU Device : " ++ gpu_device_name())
+    println("Loaded MSL Shader: " ++ msl_path ++ " (" ++ int_to_text(len(msl_src)) ++ " bytes)")
     println("Verified Proofs  : E0842 barrier-uniform + E0843 race-free + AST-fused scale_bias__fused__relu_act")
     println("CPU == Metal GPU : " ++ int_to_text(matches) ++ "/16 bit-exact! [0]=" ++ int_to_text(float_to_int(gpu_out[0] as Float)) ++ ", [1]=" ++ int_to_text(float_to_int(gpu_out[1] as Float)) ++ ", [15]=" ++ int_to_text(float_to_int(gpu_out[15] as Float)))
     0
