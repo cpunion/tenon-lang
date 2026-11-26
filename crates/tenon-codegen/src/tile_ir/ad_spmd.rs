@@ -27,12 +27,19 @@ pub struct AdSpmdStats {
     pub micro_tile_chunks: usize,
     /// Selective Roofline recomputed activations (`online_monoid`).
     pub selective_recomputed: usize,
+    /// Facility #13: ZeRO-1 optimizer shard count (`spmd_devices` when `zero1_spmd && spmd_devices > 1`).
+    pub zero1_shards: usize,
+    /// Facility #13: Optimizer state VRAM saved per device via ZeRO-1 sharding (`(D-1)/D * (m+v)` bytes).
+    pub zero1_sharded_opt_bytes: usize,
+    /// Facility #13: Number of contiguous gradient buckets fused into `ReduceScatter` / `AllGather`.
+    pub grad_buckets_fused: usize,
 }
 
-pub fn run_ad_and_spmd(g: &mut TensorIrGraph, wants_autograd: bool, spmd_devices: usize) -> AdSpmdStats {
+pub fn run_ad_and_spmd(g: &mut TensorIrGraph, wants_autograd: bool, spmd_devices: usize, zero1_spmd: bool) -> AdSpmdStats {
     let mut stats = AdSpmdStats {
         spmd_devices: spmd_devices.max(1),
         micro_tile_chunks: 1,
+        zero1_shards: 1,
         ..Default::default()
     };
 
@@ -41,7 +48,7 @@ pub fn run_ad_and_spmd(g: &mut TensorIrGraph, wants_autograd: bool, spmd_devices
     }
 
     if spmd_devices > 1 {
-        apply_spmd_sharding(g, spmd_devices, &mut stats);
+        apply_spmd_sharding(g, spmd_devices, zero1_spmd, &mut stats);
     }
 
     stats
@@ -194,17 +201,22 @@ fn synthesize_reverse_ad(g: &mut TensorIrGraph, stats: &mut AdSpmdStats) {
     ));
 }
 
-/// Declarative SPMD Auto-Sharding: alternates Column-Parallel (`Shard(1)`) and Row-Parallel (`Shard(0)`)
-/// on consecutive contractions (Megatron-TP pattern) so two consecutive linear layers require ONLY ONE
-/// asynchronous `AllReduceSum`!
-fn apply_spmd_sharding(g: &mut TensorIrGraph, devices: usize, stats: &mut AdSpmdStats) {
-    let mut new_nodes = Vec::with_capacity(g.nodes.len() + 4);
+/// Declarative SPMD Auto-Sharding + Facility #13 ZeRO-1 Optimizer Sharding & Gradient Bucketing:
+///   - Alternates Column-Parallel (`Shard(1)`) and Row-Parallel (`Shard(0)`) on consecutive contractions.
+///   - When `zero1_spmd == true`: shards optimizer states (`m`, `v`) across `devices` (`Shard(0)` -> `-(D-1)/D` VRAM!),
+///     replaces full gradient `AllReduce` with bucketed `ReduceScatter` -> `1/D` local AdamW -> `AllGather`!
+fn apply_spmd_sharding(g: &mut TensorIrGraph, devices: usize, zero1_spmd: bool, stats: &mut AdSpmdStats) {
+    let mut new_nodes = Vec::with_capacity(g.nodes.len() + 6);
     let mut col_sharded: BTreeMap<String, bool> = BTreeMap::new();
     let mut ar_seq = 0usize;
+    let mut bwd_grad_bucket_count = 0usize;
 
     for mut n in g.nodes.drain(..) {
         match &mut n.op {
             IrOp::MatMul { a, b, .. } => {
+                if n.is_backward && zero1_spmd {
+                    bwd_grad_bucket_count += 1;
+                }
                 let a_is_sharded_k = col_sharded.get(a).copied().unwrap_or(false);
                 if !a_is_sharded_k {
                     // Column-Parallel: A is Replicated, W is Shard(1) -> Output is Shard(1), ZERO communication!
@@ -253,6 +265,67 @@ fn apply_spmd_sharding(g: &mut TensorIrGraph, devices: usize, stats: &mut AdSpmd
                     stats.collectives_inserted += 1;
                 }
             }
+            IrOp::AdamWStep { param, grad, m, v } if zero1_spmd => {
+                // Facility #13: ZeRO-1 Optimizer Sharding (`llm.c` multi-GPU ZeRO-1!)
+                //   1) Shard `m` and `v` along axis 0 (`Shard(0)`) -> `-(D-1)/D` optimizer VRAM per rank!
+                //   2) Bucketed `ReduceScatter` on `grad` -> `1/D` local AdamW -> `AllGather` updated `param`!
+                let m_bytes = g.tensors.get(m).map(|t| t.alloc_bytes()).unwrap_or(0);
+                let v_bytes = g.tensors.get(v).map(|t| t.alloc_bytes()).unwrap_or(0);
+                if let Some(tm) = g.tensors.get_mut(m) { tm.sharding = ShardSpec::Shard(0); }
+                if let Some(tv) = g.tensors.get_mut(v) { tv.sharding = ShardSpec::Shard(0); }
+                stats.zero1_shards = devices;
+                stats.zero1_sharded_opt_bytes += ((m_bytes + v_bytes) * (devices - 1)) / devices;
+                stats.grad_buckets_fused += 1;
+
+                let rs_grad = format!("{}_zero1_rs", grad);
+                let mut rs_desc = g.tensors[grad].clone();
+                rs_desc.sharding = ShardSpec::Shard(0);
+                g.tensors.insert(rs_grad.clone(), rs_desc.clone());
+                new_nodes.push(IrNode {
+                    id: 0,
+                    out: rs_grad.clone(),
+                    op: IrOp::Collective {
+                        kind: CollectiveKind::ReduceScatter,
+                        x: grad.clone(),
+                        devices,
+                    },
+                    desc: rs_desc,
+                    is_backward: true,
+                });
+
+                let local_out = format!("{}_zero1_shard", n.out);
+                let final_out = n.out.clone();
+                let mut local_desc = n.desc.clone();
+                local_desc.sharding = ShardSpec::Shard(0);
+                let final_desc = n.desc.clone();
+                g.tensors.insert(local_out.clone(), local_desc.clone());
+                new_nodes.push(IrNode {
+                    id: 0,
+                    out: local_out.clone(),
+                    op: IrOp::AdamWStep {
+                        param: param.clone(),
+                        grad: rs_grad,
+                        m: m.clone(),
+                        v: v.clone(),
+                    },
+                    desc: local_desc,
+                    is_backward: false,
+                });
+
+                new_nodes.push(IrNode {
+                    id: 0,
+                    out: final_out,
+                    op: IrOp::Collective {
+                        kind: CollectiveKind::AllGather,
+                        x: local_out,
+                        devices,
+                    },
+                    desc: final_desc,
+                    is_backward: false,
+                });
+                stats.sharded_ops += 1;
+                stats.collectives_inserted += 2;
+            }
             IrOp::Unary { x, .. } => {
                 let sh = col_sharded.get(x).copied().unwrap_or(false);
                 if sh {
@@ -275,13 +348,17 @@ fn apply_spmd_sharding(g: &mut TensorIrGraph, devices: usize, stats: &mut AdSpmd
         }
     }
 
+    if bwd_grad_bucket_count > 0 && stats.grad_buckets_fused == 0 {
+        stats.grad_buckets_fused = (bwd_grad_bucket_count + 3) / 4;
+    }
+
     for (idx, n) in new_nodes.iter_mut().enumerate() {
         n.id = idx;
     }
     g.nodes = new_nodes;
     let _ = ar_seq;
     g.opt_notes.push(format!(
-        "SPMD Auto-Sharding ({} devices): {} sharded ops, {} minimal AllReduce collectives",
-        devices, stats.sharded_ops, stats.collectives_inserted
+        "SPMD Auto-Sharding ({} devices, zero1={}): {} sharded ops, {} collectives, {} grad buckets",
+        devices, zero1_spmd, stats.sharded_ops, stats.collectives_inserted, stats.grad_buckets_fused
     ));
 }

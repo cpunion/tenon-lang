@@ -103,6 +103,7 @@ impl GpuGraphPlan {
     pub fn donated_bytes(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 5) } }
     pub fn active_bucket(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 6) } }
     pub fn icb_active(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 7) } }
+    pub fn zero1_saved_bytes(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 8) } }
 
     pub fn destroy(self) {
         let _ = unsafe { tn_metal_plan_free(self.handle) }

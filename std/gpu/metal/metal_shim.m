@@ -373,6 +373,9 @@ typedef struct {
     int io_idx;
     int64_t rows;
     int64_t cols;
+    int64_t pad_rows;
+    int64_t pad_cols;
+    int pad_is_nk;
     size_t offset;
     size_t size;
     char repack[32];
@@ -428,6 +431,8 @@ typedef struct {
     size_t arena_bytes;
     size_t naive_arena_bytes;
     size_t donated_bytes;
+    size_t zero1_saved_bytes;
+    uint32_t sr_step;
     int single_cb;
     int pgo_enabled;
     int pgo_tuned;
@@ -468,6 +473,7 @@ static double tn_now_ms(void) {
 }
 
 static int plan_find_or_add_buf(TnMetalPlan* p, const char* name) {
+    if (strcmp(name, "__sr_seed") == 0) return -2; // Magic inline step-seed constant (`setBytes`) for Philox SR!
     for (int i = 0; i < p->n_bufs; i++) {
         if (strcmp(p->bufs[i].name, name) == 0) return i;
     }
@@ -624,6 +630,7 @@ int64_t tn_metal_plan_create(int64_t msl_cstr, int64_t plan_cstr, int64_t graph_
                         else if (strncmp(k, "arena=", 6) == 0) p->arena_bytes = (size_t)strtoull(k + 6, NULL, 10);
                         else if (strncmp(k, "naive_arena=", 12) == 0) p->naive_arena_bytes = (size_t)strtoull(k + 12, NULL, 10);
                         else if (strncmp(k, "donated=", 8) == 0) p->donated_bytes = (size_t)strtoull(k + 8, NULL, 10);
+                        else if (strncmp(k, "zero1_saved=", 12) == 0) p->zero1_saved_bytes = (size_t)strtoull(k + 12, NULL, 10);
                         else if (strncmp(k, "single_cb=", 10) == 0) p->single_cb = atoi(k + 10);
                         else if (strncmp(k, "pgo=", 4) == 0) p->pgo_enabled = atoi(k + 4);
                         else if (strncmp(k, "replay=", 7) == 0) p->replay_enabled = atoi(k + 7);
@@ -646,6 +653,16 @@ int64_t tn_metal_plan_create(int64_t msl_cstr, int64_t plan_cstr, int64_t graph_
                         p->bufs[bi].kind = 0; p->bufs[bi].io_idx = io_i;
                         p->bufs[bi].rows = r; p->bufs[bi].cols = c; p->bufs[bi].size = (size_t)sz;
                         strncpy(p->bufs[bi].repack, rp, sizeof(p->bufs[bi].repack) - 1);
+                    }
+                } else if (strncmp(line, "PAD_ALIGN|", 10) == 0) {
+                    char nm[96] = {0}; long long pr = 0, pc = 0; int ink = 0;
+                    if (sscanf(line + 10, "%95[^|]|%lld|%lld|%d", nm, &pr, &pc, &ink) == 4) {
+                        int bi = plan_find_or_add_buf(p, nm);
+                        if (bi >= 0) {
+                            p->bufs[bi].pad_rows = pr;
+                            p->bufs[bi].pad_cols = pc;
+                            p->bufs[bi].pad_is_nk = ink;
+                        }
                     }
                 } else if (strncmp(line, "OUTPUT|", 7) == 0) {
                     int io_i = 0; char nm[96]={0}, dt[32]={0}; long long r=0,c=0,sz=0;
@@ -862,7 +879,43 @@ int64_t tn_metal_plan_set_input(int64_t plan_h, int64_t input_idx, int64_t buf_h
         for (int i = 0; i < p->n_bufs; i++) {
             if (p->bufs[i].kind == 0 && p->bufs[i].io_idx == (int)input_idx) {
                 id<MTLBuffer> src = g_buffers[buf_handle];
-                if (strcmp(p->bufs[i].repack, "TRANSPOSE_NK") == 0 && p->bufs[i].rows > 0 && p->bufs[i].cols > 0) {
+                if (p->bufs[i].pad_rows > 0 && p->bufs[i].pad_cols > 0 && p->bufs[i].rows > 0 && p->bufs[i].cols > 0) {
+                    // Facility #10 (`auto_pad`): Zero-pad logical `[R, C]` -> aligned `[pad_R, pad_C]` (or NK `[pad_C, pad_R]`) ONCE on upload!
+                    size_t R = (size_t)p->bufs[i].rows;
+                    size_t C = (size_t)p->bufs[i].cols;
+                    size_t pR = (size_t)p->bufs[i].pad_rows;
+                    size_t pC = (size_t)p->bufs[i].pad_cols;
+                    size_t src_bytes = [src length];
+                    size_t elem_b = (src_bytes == R * C * 4) ? 4 : 2;
+                    size_t dst_bytes = pR * pC * elem_b;
+                    id<MTLBuffer> dst = [g_mtl_device newBufferWithLength:(dst_bytes > 64 ? dst_bytes : 64)
+                                                               options:MTLResourceStorageModeShared];
+                    memset([dst contents], 0, dst_bytes);
+                    if (elem_b == 2) {
+                        const uint16_t* sp = (const uint16_t*)[src contents];
+                        uint16_t* dp = (uint16_t*)[dst contents];
+                        if (p->bufs[i].pad_is_nk) {
+                            for (size_t r = 0; r < R; r++)
+                                for (size_t c = 0; c < C; c++)
+                                    dp[c * pR + r] = sp[r * C + c];
+                        } else {
+                            for (size_t r = 0; r < R; r++)
+                                memcpy(dp + r * pC, sp + r * C, C * 2);
+                        }
+                    } else {
+                        const uint32_t* sp = (const uint32_t*)[src contents];
+                        uint32_t* dp = (uint32_t*)[dst contents];
+                        if (p->bufs[i].pad_is_nk) {
+                            for (size_t r = 0; r < R; r++)
+                                for (size_t c = 0; c < C; c++)
+                                    dp[c * pR + r] = sp[r * C + c];
+                        } else {
+                            for (size_t r = 0; r < R; r++)
+                                memcpy(dp + r * pC, sp + r * C, C * 4);
+                        }
+                    }
+                    p->bufs[i].buf = dst;
+                } else if (strcmp(p->bufs[i].repack, "TRANSPOSE_NK") == 0 && p->bufs[i].rows > 0 && p->bufs[i].cols > 0) {
                     // Generic load-time 2D transpose [K, N] -> [N, K] (128-bit coalesced weight layout!)
                     size_t K = (size_t)p->bufs[i].rows;
                     size_t N = (size_t)p->bufs[i].cols;
@@ -1179,7 +1232,10 @@ static void plan_encode_step(TnMetalPlan* p, id<MTLComputeCommandEncoder> enc, c
     [enc setComputePipelineState:st->pso];
     for (int a = 0; a < st->n_args; a++) {
         int bi = st->arg_idx[a];
-        if (bi >= 0 && bi < p->n_bufs && p->bufs[bi].buf != nil) {
+        if (bi == -2) {
+            uint32_t seed = ++p->sr_step;
+            [enc setBytes:&seed length:sizeof(uint32_t) atIndex:(NSUInteger)a];
+        } else if (bi >= 0 && bi < p->n_bufs && p->bufs[bi].buf != nil) {
             [enc setBuffer:p->bufs[bi].buf offset:p->bufs[bi].offset atIndex:(NSUInteger)a];
         }
     }
@@ -1603,6 +1659,7 @@ int64_t tn_metal_plan_info(int64_t plan_h, int64_t field_id) {
         case 5: return (int64_t)p->donated_bytes;
         case 6: return (int64_t)p->active_bucket;
         case 7: return (p->icb != nil) ? 1 : 0;
+        case 8: return (int64_t)p->zero1_saved_bytes;
         default: return 0;
     }
 }

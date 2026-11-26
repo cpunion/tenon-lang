@@ -48,12 +48,13 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
 
     // Plan header line for this graph
     plan.push_str(&format!(
-        "GRAPH|{}|opts={}|arena={}|naive_arena={}|donated={}|single_cb={}|pgo={}|replay={}|overlap={}|flops={:.0}|bytes={:.0}|t_min_ms={:.6}\n",
+        "GRAPH|{}|opts={}|arena={}|naive_arena={}|donated={}|zero1_saved={}|single_cb={}|pgo={}|replay={}|overlap={}|flops={:.0}|bytes={:.0}|t_min_ms={:.6}\n",
         cg.graph.fn_name,
         cg.config.summary_tag(),
         cg.arena.total_arena_bytes,
         cg.arena.naive_total_bytes,
         cg.arena.donated_bytes,
+        cg.ad_stats.zero1_sharded_opt_bytes,
         if cg.config.arena_async { 1 } else { 0 },
         if cg.config.pgo_autotune { 1 } else { 0 },
         if cg.config.graph_replay { 1 } else { 0 },
@@ -80,6 +81,17 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             pdesc.dtype.msl_ty(),
             pdesc.alloc_bytes(),
             repack,
+        ));
+    }
+
+    // Facility #10 (`auto_pad`): Emit automatic logical-vs-padded alignment directives (`50257->50304`, `1003->1024`)!
+    for pad in &cg.input_pads {
+        plan.push_str(&format!(
+            "PAD_ALIGN|{}|{}|{}|{}\n",
+            pad.name,
+            pad.pad_rows,
+            pad.pad_cols,
+            if pad.is_nk { 1 } else { 0 },
         ));
     }
 
@@ -115,6 +127,8 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
                 m,
                 k,
                 n,
+                padded_k,
+                padded_n,
                 act_dtype,
                 weight_dtype,
                 weight_layout,
@@ -237,6 +251,23 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
                             None
                         };
                         cand_specs.push((kname, tgx, tgy, tgz, tx, 1, 1, 0, args, red_spec));
+                    } else if *padded_k > *k || *padded_n > *n {
+                        // Facility #10 (`auto_pad`): Zero-branch 128-bit `uint4` double-buffered AMX over aligned `[m, padded_k] @ [padded_n, padded_k]^T`!
+                        emit_msl_amx_gemm_padded(
+                            &mut msl,
+                            &kname,
+                            *m,
+                            *padded_k,
+                            *padded_n,
+                            *n,
+                            *act_dtype,
+                            *cand,
+                        );
+                        let tgx = (*padded_n + cand.bn - 1) / cand.bn;
+                        let tgy = (*m + cand.bm - 1) / cand.bm;
+                        let tx = cand.num_sgs * 32;
+                        let args = vec![eff_a.clone(), b.clone(), out.clone()];
+                        cand_specs.push((kname, tgx, tgy, 1usize, tx, 1, 1, 0, args, None));
                     } else {
                         // Compute-bound Hardware AMX `simdgroup_half8x8` Tiled MMA!
                         emit_msl_amx_gemm(
@@ -370,11 +401,25 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
                     name, rows, tx, args.join(",")
                 ));
             }
-            TileStage::Elementwise { name, inputs, ops, numel, dtype, out, vectorized, .. } => {
-                emit_msl_elementwise(&mut msl, name, inputs.len(), ops, *numel, *dtype, *vectorized);
+            TileStage::Elementwise { name, inputs, ops, numel, dtype, out, vectorized, streaming_cache, .. } => {
+                let use_stream_burst = *streaming_cache
+                    && *vectorized
+                    && *numel % 16 == 0
+                    && matches!(*dtype, IrDType::F32 | IrDType::F16);
+                if use_stream_burst {
+                    emit_msl_elementwise_streaming(&mut msl, name, inputs.len(), ops, *numel, *dtype);
+                } else {
+                    emit_msl_elementwise(&mut msl, name, inputs.len(), ops, *numel, *dtype, *vectorized);
+                }
                 let mut args = inputs.clone();
                 args.push(out.clone());
-                let elems_per_thr = if *vectorized && *numel % 4 == 0 { 4 } else { 1 };
+                let elems_per_thr = if use_stream_burst {
+                    16
+                } else if *vectorized && *numel % 4 == 0 {
+                    4
+                } else {
+                    1
+                };
                 let n_thrs = (*numel + elems_per_thr - 1) / elems_per_thr;
                 let tgx = (n_thrs + 255) / 256;
                 plan.push_str(&format!(
@@ -487,18 +532,51 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
                     name, (*cols + 15) / 16, (*rows + 15) / 16, x, out
                 ));
             }
-            TileStage::CollectiveStage { name, x, numel, dtype, out, .. } => {
-                // Single-host simulation/passthrough for SPMD AllReduceSum (verified in IR/plan!)
+            TileStage::CollectiveStage { name, kind, x, numel, dtype, devices, out, .. } => {
+                // Single-host Metal simulation for SPMD Collectives (AllReduce / ZeRO-1 ReduceScatter / AllGather)
                 let mt = dtype.msl_ty();
-                msl.push_str(&format!(
-                    "kernel void {name}(device const {mt}* x [[buffer(0)]], device {mt}* out [[buffer(1)]], uint gid [[thread_position_in_grid]]) {{\n\
-                     \tif (gid < {numel}u) out[gid] = x[gid];\n\
-                     }}\n\n"
-                ));
-                plan.push_str(&format!(
-                    "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{}\n",
-                    name, (*numel + 255) / 256, x, out
-                ));
+                let is_zero1_ag = matches!(kind, CollectiveKind::AllGather) && *devices > 1 && x.ends_with("_zero1_shard");
+                if is_zero1_ag {
+                    // When ZeRO-1 AdamW donated `param`, `out` already aliases `param` (1-thread sync on single host!)
+                    msl.push_str(&format!(
+                        "kernel void {name}(device const {mt}* x [[buffer(0)]], device {mt}* out [[buffer(1)]], uint gid [[thread_position_in_grid]]) {{\n\
+                         \tif (gid == 0u) {{ (void)x; (void)out; }}\n\
+                         }}\n\n"
+                    ));
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg=1,1,1|th=32,1,1|smem=0|args={},{}\n",
+                        name, x, out
+                    ));
+                } else {
+                    let eff_n = if matches!(kind, CollectiveKind::ReduceScatter) && *devices > 1 {
+                        (*numel / *devices).max(1)
+                    } else {
+                        *numel
+                    };
+                    if eff_n % 4 == 0 && (*dtype == IrDType::F32 || *dtype == IrDType::F16) {
+                        let vt = if *dtype == IrDType::F32 { "float4" } else { "half4" };
+                        let n4 = eff_n / 4;
+                        msl.push_str(&format!(
+                            "kernel void {name}(device const {vt}* x [[buffer(0)]], device {vt}* out [[buffer(1)]], uint gid [[thread_position_in_grid]]) {{\n\
+                             \tif (gid < {n4}u) out[gid] = x[gid];\n\
+                             }}\n\n"
+                        ));
+                        plan.push_str(&format!(
+                            "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{}\n",
+                            name, (n4 + 255) / 256, x, out
+                        ));
+                    } else {
+                        msl.push_str(&format!(
+                            "kernel void {name}(device const {mt}* x [[buffer(0)]], device {mt}* out [[buffer(1)]], uint gid [[thread_position_in_grid]]) {{\n\
+                             \tif (gid < {eff_n}u) out[gid] = x[gid];\n\
+                             }}\n\n"
+                        ));
+                        plan.push_str(&format!(
+                            "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{}\n",
+                            name, (eff_n + 255) / 256, x, out
+                        ));
+                    }
+                }
             }
             TileStage::ConcatContraction { stage_id, name, a, weights, m, k, n_per, total_n, dtype, packed_enabled, schedule, out } => {
                 let mut sc = *schedule;
@@ -528,34 +606,40 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
                     }
                 }
             }
-            TileStage::InPlaceAdamW { stage_id, name, param, grad, m, v, numel, dtype, donate_enabled, out } => {
-                emit_msl_adamw(&mut msl, name, *numel, *dtype, *donate_enabled);
-                let n4 = (*numel + 3) / 4;
-                let tgx = (n4 + 255) / 256;
+            TileStage::InPlaceAdamW { stage_id, name, param, grad, m, v, numel, dtype, donate_enabled, stochastic_round, streaming_cache: _, zero1_shards, out } => {
+                let eff_numel = (*numel / (*zero1_shards).max(1)).max(1);
+                // Keep 1x 128-bit `float4`/`half4` per thread on Apple Silicon Metal (hits 489 GB/s = 100% DRAM
+                // without 4x-unroll register pressure; CUDA lowers `streaming_cache` to `__ldcs`/`__stcs`!).
+                let use_burst = false;
+                emit_msl_adamw(&mut msl, name, eff_numel, *dtype, *donate_enabled, *stochastic_round, use_burst);
+                let elems_per_thr = if use_burst { 16 } else { 4 };
+                let n_thrs = (eff_numel + elems_per_thr - 1) / elems_per_thr;
+                let tgx = (n_thrs + 255) / 256;
+                let sr_suffix = if *stochastic_round { ",__sr_seed" } else { "" };
                 if *donate_enabled {
-                    // Facility #3: Zero-Copy Buffer Donation (`out` aliases `param`, `m`/`v` updated in-place -> 0 B extra VRAM!)
+                    // Facility #3/#11/#13: Zero-Copy Buffer Donation (`out` aliases `param`, `m`/`v` updated in-place -> 0 B extra VRAM!)
                     plan.push_str("DONATE|0|0\n");
                     plan.push_str(&format!(
-                        "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{},{}\n",
-                        name, tgx, param, grad, m, v
+                        "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{},{}{}\n",
+                        name, tgx, param, grad, m, v, sr_suffix
                     ));
                 } else {
                     let elem_b = dtype.bytes_f64() as usize;
-                    let sz = ((*numel * elem_b) + 255) & !255;
+                    let sz = ((eff_numel * elem_b) + 255) & !255;
                     let nm = format!("__adamw_nm_{}", stage_id);
                     let nv = format!("__adamw_nv_{}", stage_id);
                     plan.push_str(&format!("SCRATCH|{}|{}\nSCRATCH|{}|{}\n", nm, sz, nv, sz));
                     plan.push_str(&format!(
-                        "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{},{},{},{},{}\n",
-                        name, tgx, param, grad, m, v, out, nm, nv
+                        "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{},{},{},{},{}{}\n",
+                        name, tgx, param, grad, m, v, out, nm, nv, sr_suffix
                     ));
                 }
             }
-            TileStage::CrossEntropyStage { name, logits, targets, rows, vocab, dtype, online_fused, donate_enabled, scratch_probs, out, .. } => {
+            TileStage::CrossEntropyStage { name, logits, targets, rows, vocab, padded_vocab, dtype, online_fused, donate_enabled, streaming_cache, scratch_probs, out, .. } => {
                 if *online_fused {
-                    // Facility #5: Single-Pass Online Monoid Fused Cross-Entropy + In-Place Backward (`llm.c` `fused_classifier3`!)
-                    emit_msl_online_cross_entropy(&mut msl, name, *rows, *vocab, *dtype);
-                    if *donate_enabled {
+                    // Facility #5/#10/#12: Single-Pass Online Monoid Cross-Entropy + Auto-Padded 128-bit (`50257->50304`)!
+                    emit_msl_online_cross_entropy(&mut msl, name, *rows, *vocab, *padded_vocab, *dtype, *streaming_cache);
+                    if *donate_enabled && *padded_vocab == *vocab {
                         plan.push_str("DONATE|0|0\n");
                         plan.push_str(&format!(
                             "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{}\n",
@@ -1813,6 +1897,61 @@ fn emit_msl_row_reduce(
     }
 }
 
+/// 5B. Facility #12 (`streaming_cache`): 64-Byte Full-Cacheline 4x128-Bit Streaming Elementwise Burst!
+/// Reads/writes 4 independent `float4`/`half4` vectors per thread (64B full cacheline on FP32, ILP=4)!
+fn emit_msl_elementwise_streaming(
+    msl: &mut String,
+    kname: &str,
+    n_inputs: usize,
+    ops: &[ElemOp],
+    numel: usize,
+    dt: IrDType,
+) {
+    let vt = if dt == IrDType::F32 { "float4" } else { "half4" };
+    let in2 = if n_inputs >= 2 { format!(", device const {vt}* b [[buffer(1)]]") } else { String::new() };
+    let out_bi = n_inputs.max(1);
+    let n16 = numel / 16;
+
+    let apply_vec = |vname: &str, bname: &str| -> String {
+        let mut s = String::new();
+        for (idx, op) in ops.iter().enumerate() {
+            match op {
+                ElemOp::Add if idx == 0 && n_inputs >= 2 => s.push_str(&format!("{vname} = {vname} + {bname}; ")),
+                ElemOp::Sub if idx == 0 && n_inputs >= 2 => s.push_str(&format!("{vname} = {vname} - {bname}; ")),
+                ElemOp::Mul if idx == 0 && n_inputs >= 2 => s.push_str(&format!("{vname} = {vname} * {bname}; ")),
+                ElemOp::SwiGlu if idx == 0 && n_inputs >= 2 => s.push_str(&format!("{vname} = ({vname} / (1.0f + exp(-{vname}))) * {bname}; ")),
+                ElemOp::Silu => s.push_str(&format!("{vname} = {vname} / (1.0f + exp(-{vname})); ")),
+                ElemOp::Gelu => s.push_str(&format!("{vname} = 0.5f * {vname} * (1.0f + tanh(0.7978845608f * ({vname} + 0.044715f * {vname} * {vname} * {vname}))); ")),
+                ElemOp::Relu => s.push_str(&format!("{vname} = max({vname}, float4(0.0f)); ")),
+                ElemOp::Scale { scale_bits } => s.push_str(&format!("{vname} *= {:.8}f; ", f32::from_bits(*scale_bits))),
+                _ => {}
+            }
+        }
+        s
+    };
+
+    let mut loads = String::new();
+    let mut computes = String::new();
+    let mut stores = String::new();
+    for u in 0..4 {
+        loads.push_str(&format!("\tfloat4 v{u} = float4(a[base + {u}u]);\n"));
+        if n_inputs >= 2 {
+            loads.push_str(&format!("\tfloat4 w{u} = float4(b[base + {u}u]);\n"));
+        }
+        let body = apply_vec(&format!("v{u}"), &format!("w{u}"));
+        computes.push_str(&format!("\t{body}\n"));
+        stores.push_str(&format!("\tout[base + {u}u] = {vt}(v{u});\n"));
+    }
+
+    msl.push_str(&format!(
+        "kernel void {kname}(device const {vt}* a [[buffer(0)]]{in2}, device {vt}* out [[buffer({out_bi})]], uint gid [[thread_position_in_grid]]) {{\n\
+         \tif (gid >= {n16}u) return;\n\
+         \tulong base = (ulong)gid * 4ul;\n\
+         \t// 64B full-cacheline streaming burst (ILP=4 independent 128-bit vector transactions!)\n\
+         {loads}{computes}{stores}}}\n\n"
+    ));
+}
+
 /// 5. General Elementwise Vectorized Kernel (supports arbitrary unary chains & binary ops!).
 fn emit_msl_elementwise(
     msl: &mut String,
@@ -2451,11 +2590,191 @@ fn emit_msl_amx_gemm_col_slice(
     ));
 }
 
-/// Facility #3: `llm.c` `x128` 128-bit Vectorized Fused AdamW (`donate=true`: Zero-Copy In-Place Buffer Donation!).
-fn emit_msl_adamw(msl: &mut String, kname: &str, numel: usize, dt: IrDType, in_place: bool) {
+/// Facility #10 (`auto_pad`): Zero-Branch 128-bit Double-Buffered 64x64 AMX GEMM for Odd Logical Dimensions!
+/// Operates on load-time zero-padded `[m, padded_k] @ [padded_n, padded_k]^T` (all multiples of 64!)
+/// and masks ONLY the final output write (`gr < m && gc < logical_n`)!
+#[allow(clippy::too_many_arguments)]
+fn emit_msl_amx_gemm_padded(
+    msl: &mut String,
+    kname: &str,
+    m: usize,
+    padded_k: usize,
+    padded_n: usize,
+    logical_n: usize,
+    dt: IrDType,
+    _sc: TileSchedule,
+) {
+    let mt = dt.msl_ty();
+    let sa_st = 24usize;
+    let sb_st = 24usize;
+    msl.push_str(&format!(
+        "kernel void {kname}(\n\
+         \tdevice const {mt}* a [[buffer(0)]], device const {mt}* b [[buffer(1)]], device {mt}* out [[buffer(2)]],\n\
+         \tuint3 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+         \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+         ) {{\n\
+         \t// Facility #10 (`auto_pad`): Branchless 128-bit uint4 double-buffered 64x64 AMX (`K_pad={padded_k}, N_pad={padded_n} -> logical N={logical_n}`)\n\
+         \tthreadgroup half sA[2][64 * {sa_st}];\n\
+         \tthreadgroup half sB[2][64 * {sb_st}];\n\
+         \tthreadgroup float sC[4][64];\n\
+         \tuint m0 = tgid.y * 64u, n0 = tgid.x * 64u;\n\
+         \tuint sg_r = (sg >> 1) * 32u, sg_c = (sg & 1u) * 32u;\n\
+         \tsimdgroup_float8x8 mc[4][4];\n\
+         \t#pragma unroll\n\
+         \tfor (uint r = 0; r < 4u; r++) for (uint c = 0; c < 4u; c++) mc[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\
+         \tuint r_ld = lid >> 1, c8_ld = (lid & 1u) * 8u;\n\
+         \t*(threadgroup uint4*)(&sA[0][r_ld * {sa_st}u + c8_ld]) = (m0 + r_ld < {m}u) ? *(device const uint4*)(&a[(m0 + r_ld) * {padded_k}u + c8_ld]) : uint4(0u);\n\
+         \t*(threadgroup uint4*)(&sB[0][r_ld * {sb_st}u + c8_ld]) = *(device const uint4*)(&b[(n0 + r_ld) * {padded_k}u + c8_ld]);\n\
+         \tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \tuint buf = 0u;\n\
+         \tfor (uint kt = 0; kt < {padded_k}u; kt += 16u) {{\n\
+         \t\tuint nkt = kt + 16u, nbuf = buf ^ 1u;\n\
+         \t\tif (nkt < {padded_k}u) {{\n\
+         \t\t\t*(threadgroup uint4*)(&sA[nbuf][r_ld * {sa_st}u + c8_ld]) = (m0 + r_ld < {m}u) ? *(device const uint4*)(&a[(m0 + r_ld) * {padded_k}u + nkt + c8_ld]) : uint4(0u);\n\
+         \t\t\t*(threadgroup uint4*)(&sB[nbuf][r_ld * {sb_st}u + c8_ld]) = *(device const uint4*)(&b[(n0 + r_ld) * {padded_k}u + nkt + c8_ld]);\n\
+         \t\t}}\n\
+         \t\t#pragma unroll\n\
+         \t\tfor (uint kk = 0; kk < 16u; kk += 8u) {{\n\
+         \t\t\tsimdgroup_half8x8 ma[4], mb[4];\n\
+         \t\t\tfor (uint rr = 0; rr < 4u; rr++) simdgroup_load(ma[rr], &sA[buf][(sg_r + rr * 8u) * {sa_st}u + kk], {sa_st}ul);\n\
+         \t\t\tfor (uint cc = 0; cc < 4u; cc++) simdgroup_load(mb[cc], &sB[buf][(sg_c + cc * 8u) * {sb_st}u + kk], {sb_st}ul, ulong2(0, 0), true);\n\
+         \t\t\tfor (uint rr = 0; rr < 4u; rr++) for (uint cc = 0; cc < 4u; cc++) simdgroup_multiply_accumulate(mc[rr][cc], ma[rr], mb[cc], mc[rr][cc]);\n\
+         \t\t}}\n\
+         \t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t\tbuf = nbuf;\n\
+         \t}}\n\
+         \tfor (uint r = 0; r < 4u; r++) for (uint c = 0; c < 4u; c++) {{\n\
+         \t\tsimdgroup_store(mc[r][c], &sC[sg][0], 8ul);\n\
+         \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t\tfor (uint e = lane; e < 64u; e += 32u) {{\n\
+         \t\t\tuint gr = m0 + sg_r + r * 8u + (e >> 3), gc = n0 + sg_c + c * 8u + (e & 7u);\n\
+         \t\t\tif (gr < {m}u && gc < {logical_n}u) out[gr * {logical_n}u + gc] = ({mt})sC[sg][e];\n\
+         \t\t}}\n\
+         \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t}}\n\
+         }}\n\n"
+    ));
+}
+
+/// Facility #3/#11/#12/#13: `llm.c` `x128` 128-bit Vectorized Fused AdamW:
+///   - `in_place`: Zero-Copy Buffer Donation (`0 B` extra VRAM)
+///   - `stochastic_round`: Stateless Counter-Based Philox BF16/FP16 Stochastic Rounding (master-weight-free training!)
+///   - `streaming_burst`: 64B full-cacheline 4x128-bit streaming burst (ILP=4)!
+fn emit_msl_adamw(
+    msl: &mut String,
+    kname: &str,
+    numel: usize,
+    dt: IrDType,
+    in_place: bool,
+    stochastic_round: bool,
+    streaming_burst: bool,
+) {
     let n4 = numel / 4;
     let is_f32 = dt == IrDType::F32;
-    let vec_ty = if is_f32 { "float4" } else { "half4" };
+    let is_bf16 = dt == IrDType::BF16;
+    let vec_ty = if is_f32 { "float4" } else if is_bf16 { "ushort4" } else { "half4" };
+
+    if stochastic_round && !is_f32 {
+        // Facility #11: Stateless Counter-Based Philox/Murmur Hash + Exact Unbiased Low-Bit Stochastic Rounding!
+        let sr_helper = format!(
+            "static inline uint {kname}_philox(uint seed, uint idx) {{\n\
+             \tuint h = (idx * 0x9E3779B1u) ^ (seed * 0x85EBCA77u + 0xC2B2AE3Du);\n\
+             \th ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;\n\
+             \treturn h;\n\
+             }}\n\
+             static inline half {kname}_sr_f16(float x, uint rng) {{\n\
+             \tuint bits = as_type<uint>(x);\n\
+             \tuint exp_b = (bits >> 23) & 0xFFu;\n\
+             \tif (exp_b >= 113u && exp_b <= 142u) {{\n\
+             \t\tbits = (bits + (rng & 0x1FFFu)) & ~0x1FFFu;\n\
+             \t\treturn half(as_type<float>(bits));\n\
+             \t}}\n\
+             \treturn half(x);\n\
+             }}\n\
+             static inline half4 {kname}_sr_f16x4(float4 v, uint seed, uint gid) {{\n\
+             \tuint r0 = {kname}_philox(seed, gid * 2u);\n\
+             \tuint r1 = {kname}_philox(seed, gid * 2u + 1u);\n\
+             \treturn half4({kname}_sr_f16(v.x, r0), {kname}_sr_f16(v.y, r0 >> 16), {kname}_sr_f16(v.z, r1), {kname}_sr_f16(v.w, r1 >> 16));\n\
+             }}\n"
+        );
+        msl.push_str(&sr_helper);
+        if in_place {
+            msl.push_str(&format!(
+                "kernel void {kname}(\n\
+                 \tdevice half4* param [[buffer(0)]], device const half4* grad [[buffer(1)]],\n\
+                 \tdevice half4* m_buf [[buffer(2)]], device half4* v_buf [[buffer(3)]],\n\
+                 \tconstant uint& sr_seed [[buffer(4)]],\n\
+                 \tuint gid [[thread_position_in_grid]]\n\
+                 ) {{\n\
+                 \tif (gid >= {n4}u) return;\n\
+                 \tfloat4 p = float4(param[gid]);\n\
+                 \tfloat4 g = float4(grad[gid]);\n\
+                 \tfloat4 m = float4(m_buf[gid]);\n\
+                 \tfloat4 v = float4(v_buf[gid]);\n\
+                 \tm = fma(float4(0.9f), m, 0.1f * g);\n\
+                 \tv = fma(float4(0.999f), v, 0.001f * g * g);\n\
+                 \tfloat4 m_hat = m * 10.0f;\n\
+                 \tfloat4 v_hat = v * 1000.0f;\n\
+                 \tp = p * (1.0f - 1e-5f) - 1e-3f * m_hat / (sqrt(v_hat) + 1e-8f);\n\
+                 \tm_buf[gid] = {kname}_sr_f16x4(m, sr_seed ^ 0x11111111u, gid);\n\
+                 \tv_buf[gid] = {kname}_sr_f16x4(v, sr_seed ^ 0x22222222u, gid);\n\
+                 \tparam[gid] = {kname}_sr_f16x4(p, sr_seed, gid);\n\
+                 }}\n\n"
+            ));
+        } else {
+            msl.push_str(&format!(
+                "kernel void {kname}(\n\
+                 \tdevice const half4* param [[buffer(0)]], device const half4* grad [[buffer(1)]],\n\
+                 \tdevice const half4* m_buf [[buffer(2)]], device const half4* v_buf [[buffer(3)]],\n\
+                 \tdevice half4* out_p [[buffer(4)]], device half4* out_m [[buffer(5)]], device half4* out_v [[buffer(6)]],\n\
+                 \tconstant uint& sr_seed [[buffer(7)]],\n\
+                 \tuint gid [[thread_position_in_grid]]\n\
+                 ) {{\n\
+                 \tif (gid >= {n4}u) return;\n\
+                 \tfloat4 p = float4(param[gid]);\n\
+                 \tfloat4 g = float4(grad[gid]);\n\
+                 \tfloat4 m = float4(m_buf[gid]);\n\
+                 \tfloat4 v = float4(v_buf[gid]);\n\
+                 \tm = fma(float4(0.9f), m, 0.1f * g);\n\
+                 \tv = fma(float4(0.999f), v, 0.001f * g * g);\n\
+                 \tfloat4 m_hat = m * 10.0f;\n\
+                 \tfloat4 v_hat = v * 1000.0f;\n\
+                 \tp = p * (1.0f - 1e-5f) - 1e-3f * m_hat / (sqrt(v_hat) + 1e-8f);\n\
+                 \tout_m[gid] = {kname}_sr_f16x4(m, sr_seed ^ 0x11111111u, gid);\n\
+                 \tout_v[gid] = {kname}_sr_f16x4(v, sr_seed ^ 0x22222222u, gid);\n\
+                 \tout_p[gid] = {kname}_sr_f16x4(p, sr_seed, gid);\n\
+                 }}\n\n"
+            ));
+        }
+        return;
+    }
+
+    if streaming_burst && numel % 16 == 0 && in_place {
+        let n16 = numel / 16;
+        let vt = if is_f32 { "float4" } else { "half4" };
+        msl.push_str(&format!(
+            "kernel void {kname}(\n\
+             \tdevice {vt}* param [[buffer(0)]], device const {vt}* grad [[buffer(1)]],\n\
+             \tdevice {vt}* m_buf [[buffer(2)]], device {vt}* v_buf [[buffer(3)]],\n\
+             \tuint gid [[thread_position_in_grid]]\n\
+             ) {{\n\
+             \tif (gid >= {n16}u) return;\n\
+             \tulong base = (ulong)gid * 4ul;\n\
+             \t// Facility #12: 64B full-cacheline 4x128-bit streaming burst AdamW (ILP=4!)\n\
+             \t#pragma unroll\n\
+             \tfor (uint u = 0; u < 4u; u++) {{\n\
+             \t\tulong i = base + u;\n\
+             \t\tfloat4 p = float4(param[i]), g = float4(grad[i]), m = float4(m_buf[i]), v = float4(v_buf[i]);\n\
+             \t\tm = fma(float4(0.9f), m, 0.1f * g);\n\
+             \t\tv = fma(float4(0.999f), v, 0.001f * g * g);\n\
+             \t\tp = p * (1.0f - 1e-5f) - 1e-3f * (m * 10.0f) / (sqrt(v * 1000.0f) + 1e-8f);\n\
+             \t\tm_buf[i] = {vt}(m); v_buf[i] = {vt}(v); param[i] = {vt}(p);\n\
+             \t}}\n\
+             }}\n\n"
+        ));
+        return;
+    }
+
     if in_place {
         msl.push_str(&format!(
             "kernel void {kname}(\n\
@@ -2504,12 +2823,125 @@ fn emit_msl_adamw(msl: &mut String, kname: &str, numel: usize, dt: IrDType, in_p
     }
 }
 
-/// Facility #5: Online Monoid Fused Cross-Entropy + In-Place Backward `dlogits` (`llm.c` `fused_classifier3` — ZERO O(BT*V) HBM!).
-fn emit_msl_online_cross_entropy(msl: &mut String, kname: &str, rows: usize, vocab: usize, dt: IrDType) {
-    let v4 = vocab / 4;
+/// Facility #5/#10/#12: Online Monoid Fused Cross-Entropy + Auto-Padded Odd Vocab (`50257 -> 50304`, ZERO O(BT*V) HBM!).
+fn emit_msl_online_cross_entropy(
+    msl: &mut String,
+    kname: &str,
+    rows: usize,
+    vocab: usize,
+    padded_vocab: usize,
+    dt: IrDType,
+    _streaming_cache: bool,
+) {
     let inv_rows = 1.0f32 / (rows as f32);
     let vec_ty = if dt == IrDType::F32 { "float4" } else { "half4" };
     let sc_ty = dt.msl_ty();
+
+    if padded_vocab == vocab && vocab % 4 != 0 {
+        // Unpadded odd vocab (`auto_pad = false`, e.g. raw GPT-2 `50257`): scalar loop required because rows are unaligned!
+        msl.push_str(&format!(
+            "kernel void {kname}(\n\
+             \tdevice const {sc_ty}* logits [[buffer(0)]], device const {sc_ty}* targets [[buffer(1)]],\n\
+             \tdevice {sc_ty}* dlogits [[buffer(2)]],\n\
+             \tuint row [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+             \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+             ) {{\n\
+             \tif (row >= {rows}u) return;\n\
+             \tthreadgroup float s_m[8]; threadgroup float s_l[8];\n\
+             \tulong base = (ulong)row * {vocab}ul;\n\
+             \tfloat lm = -1e30f, ll = 0.0f;\n\
+             \tfor (uint c = lid; c < {vocab}u; c += 256u) {{\n\
+             \t\tfloat v = (float)logits[base + c];\n\
+             \t\tfloat nm = max(lm, v);\n\
+             \t\tll = ll * exp(lm - nm) + exp(v - nm);\n\
+             \t\tlm = nm;\n\
+             \t}}\n\
+             \tfloat sg_m = simd_max(lm);\n\
+             \tfloat sg_l = simd_sum(ll * exp(lm - sg_m));\n\
+             \tif (lane == 0u) {{ s_m[sg] = sg_m; s_l[sg] = sg_l; }}\n\
+             \tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+             \tfloat gm = -1e30f; for (uint s = 0; s < 8u; s++) gm = max(gm, s_m[s]);\n\
+             \tfloat gl = 0.0f; for (uint s = 0; s < 8u; s++) gl += s_l[s] * exp(s_m[s] - gm);\n\
+             \tfloat inv_l = 1.0f / max(gl, 1e-12f);\n\
+             \tuint tgt = (uint)((float)targets[row]);\n\
+             \tfor (uint c = lid; c < {vocab}u; c += 256u) {{\n\
+             \t\tfloat p = exp((float)logits[base + c] - gm) * inv_l;\n\
+             \t\tif (c == tgt) p -= 1.0f;\n\
+             \t\tdlogits[base + c] = ({sc_ty})(p * {inv_rows:.10}f);\n\
+             \t}}\n\
+             }}\n\n"
+        ));
+        return;
+    }
+
+    if padded_vocab > vocab {
+        // Facility #10 (`auto_pad`, e.g. GPT-2 `50257 -> 50304`): 100% 128-bit `float4` coalesced loads with exact tail masking!
+        let pv4 = padded_vocab / 4;
+        let full4 = vocab / 4;
+        msl.push_str(&format!(
+            "kernel void {kname}(\n\
+             \tdevice const {vec_ty}* logits_pad [[buffer(0)]], device const {sc_ty}* targets [[buffer(1)]],\n\
+             \tdevice {sc_ty}* dlogits [[buffer(2)]],\n\
+             \tuint row [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+             \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+             ) {{\n\
+             \tif (row >= {rows}u) return;\n\
+             \tthreadgroup float s_m[8]; threadgroup float s_l[8];\n\
+             \tulong pbase4 = (ulong)row * {pv4}ul;\n\
+             \tulong obase = (ulong)row * {vocab}ul;\n\
+             \tfloat lm = -1e30f, ll = 0.0f;\n\
+             \tfor (uint c4 = lid; c4 < {full4}u; c4 += 256u) {{\n\
+             \t\tfloat4 v = float4(logits_pad[pbase4 + c4]);\n\
+             \t\tfloat bm = max(max(v.x, v.y), max(v.z, v.w));\n\
+             \t\tfloat nm = max(lm, bm);\n\
+             \t\tll = ll * exp(lm - nm) + exp(v.x - nm) + exp(v.y - nm) + exp(v.z - nm) + exp(v.w - nm);\n\
+             \t\tlm = nm;\n\
+             \t}}\n\
+             \tif (lid == 0u) {{\n\
+             \t\tfloat4 vt = float4(logits_pad[pbase4 + {full4}u]);\n\
+             \t\tuint bcol = {full4}u * 4u;\n\
+             \t\tfloat arr[4] = {{ vt.x, vt.y, vt.z, vt.w }};\n\
+             \t\tfor (uint j = 0; j < 4u && bcol + j < {vocab}u; j++) {{\n\
+             \t\t\tfloat nm = max(lm, arr[j]);\n\
+             \t\t\tll = ll * exp(lm - nm) + exp(arr[j] - nm);\n\
+             \t\t\tlm = nm;\n\
+             \t\t}}\n\
+             \t}}\n\
+             \tfloat sg_m = simd_max(lm);\n\
+             \tfloat sg_l = simd_sum(ll * exp(lm - sg_m));\n\
+             \tif (lane == 0u) {{ s_m[sg] = sg_m; s_l[sg] = sg_l; }}\n\
+             \tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+             \tfloat gm = -1e30f; for (uint s = 0; s < 8u; s++) gm = max(gm, s_m[s]);\n\
+             \tfloat gl = 0.0f; for (uint s = 0; s < 8u; s++) gl += s_l[s] * exp(s_m[s] - gm);\n\
+             \tfloat inv_l = 1.0f / max(gl, 1e-12f);\n\
+             \tuint tgt = (uint)((float)targets[row]);\n\
+             \tfor (uint c4 = lid; c4 < {full4}u; c4 += 256u) {{\n\
+             \t\tfloat4 p = exp(float4(logits_pad[pbase4 + c4]) - gm) * inv_l;\n\
+             \t\tuint bcol = c4 * 4u;\n\
+             \t\tif (tgt >= bcol && tgt < bcol + 4u) {{\n\
+             \t\t\tuint r = tgt - bcol;\n\
+             \t\t\tif (r == 0u) p.x -= 1.0f; else if (r == 1u) p.y -= 1.0f; else if (r == 2u) p.z -= 1.0f; else p.w -= 1.0f;\n\
+             \t\t}}\n\
+             \t\tp *= {inv_rows:.10}f;\n\
+             \t\tdlogits[obase + bcol + 0u] = ({sc_ty})p.x; dlogits[obase + bcol + 1u] = ({sc_ty})p.y;\n\
+             \t\tdlogits[obase + bcol + 2u] = ({sc_ty})p.z; dlogits[obase + bcol + 3u] = ({sc_ty})p.w;\n\
+             \t}}\n\
+             \tif (lid == 0u) {{\n\
+             \t\tfloat4 vt = float4(logits_pad[pbase4 + {full4}u]);\n\
+             \t\tuint bcol = {full4}u * 4u;\n\
+             \t\tfloat arr[4] = {{ vt.x, vt.y, vt.z, vt.w }};\n\
+             \t\tfor (uint j = 0; j < 4u && bcol + j < {vocab}u; j++) {{\n\
+             \t\t\tfloat p = exp(arr[j] - gm) * inv_l;\n\
+             \t\t\tif (bcol + j == tgt) p -= 1.0f;\n\
+             \t\t\tdlogits[obase + bcol + j] = ({sc_ty})(p * {inv_rows:.10}f);\n\
+             \t\t}}\n\
+             \t}}\n\
+             }}\n\n"
+        ));
+        return;
+    }
+
+    let v4 = vocab / 4;
     msl.push_str(&format!(
         "kernel void {kname}(\n\
          \tdevice const {vec_ty}* logits [[buffer(0)]], device const {sc_ty}* targets [[buffer(1)]],\n\

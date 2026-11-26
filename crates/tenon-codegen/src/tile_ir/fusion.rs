@@ -97,6 +97,9 @@ pub enum TileStage {
         m: usize,
         k: usize,
         n: usize,
+        /// Facility #10 (`auto_pad`): physical padded K/N (`>= k, n`, aligned to 64 for 128-bit & MMA fast paths!).
+        padded_k: usize,
+        padded_n: usize,
         act_dtype: IrDType,
         weight_dtype: IrDType,
         weight_layout: LayoutTag,
@@ -137,6 +140,8 @@ pub enum TileStage {
         dtype: IrDType,
         out: String,
         vectorized: bool,
+        /// Facility #12 (`streaming_cache`): 64B full-cacheline 4x128-bit streaming burst / CUDA `__ldcs`/`__stcs`.
+        streaming_cache: bool,
     },
     /// General Attention: either single-pass **Tiled Online-Softmax FlashAttention** (`online_tiled=true`,
     /// ZERO O(S^2) HBM!) or naive 3-stage $O(S^2)$ materialization (`online_tiled=false` for ablation!).
@@ -229,7 +234,7 @@ pub enum TileStage {
         schedule: TileSchedule,
         out: String,
     },
-    /// Facility #3: Zero-Copy Buffer-Donated Fused 128-bit AdamW Update (`llm.c` `adamw_kernel3`!).
+    /// Facility #3/#11/#12/#13: Zero-Copy Buffer-Donated Fused 128-bit AdamW Update (`llm.c` `adamw_kernel3`!).
     InPlaceAdamW {
         stage_id: usize,
         name: String,
@@ -240,9 +245,15 @@ pub enum TileStage {
         numel: usize,
         dtype: IrDType,
         donate_enabled: bool,
+        /// Facility #11: Stateless Counter-Based Philox BF16/FP16 stochastic rounding (no FP32 master weights!).
+        stochastic_round: bool,
+        /// Facility #12: Streaming cache hints (`__ldcs`/`__stcs` / 64B burst).
+        streaming_cache: bool,
+        /// Facility #13: ZeRO-1 optimizer shard factor (`1` = full, `D > 1` = `1/D` local shard update!).
+        zero1_shards: usize,
         out: String,
     },
-    /// Facility #5: Online Monoid Fused Cross-Entropy Loss + In-Place Backward `dlogits` (`llm.c` `fused_classifier3`!).
+    /// Facility #5/#10/#12: Online Monoid Fused Cross-Entropy Loss + In-Place Backward `dlogits` (`llm.c` `fused_classifier3`!).
     CrossEntropyStage {
         stage_id: usize,
         name: String,
@@ -250,9 +261,12 @@ pub enum TileStage {
         targets: String,
         rows: usize,
         vocab: usize,
+        /// Facility #10: physical aligned vocab (`50257 -> 50304`, multiple of 64 when `auto_pad` ON!).
+        padded_vocab: usize,
         dtype: IrDType,
         online_fused: bool,
         donate_enabled: bool,
+        streaming_cache: bool,
         scratch_probs: Option<String>,
         out: String,
     },
@@ -332,11 +346,17 @@ pub struct StaticArenaPlan {
     pub allocations: BTreeMap<String, (usize, usize)>,
 }
 
-/// Lowers `TensorIrGraph` into fused `TileStage`s + Layout Repacks + Static Arena Plan.
+/// Lowers `TensorIrGraph` into fused `TileStage`s + Layout Repacks + Auto-Pads + Cache Policies + Static Arena Plan.
 pub fn lower_to_tile_stages(
     g: &mut TensorIrGraph,
     cfg: GpuOptConfig,
-) -> (Vec<TileStage>, StaticArenaPlan, Vec<(String, LayoutTag)>) {
+) -> (
+    Vec<TileStage>,
+    StaticArenaPlan,
+    Vec<(String, LayoutTag)>,
+    Vec<PadAlignSpec>,
+    BTreeMap<String, CachePolicy>,
+) {
     let input_set: BTreeSet<String> = g.params.iter().map(|(k, _)| k.clone()).collect();
     let output_set: BTreeSet<String> = g.outputs.iter().cloned().collect();
 
@@ -400,7 +420,24 @@ pub fn lower_to_tile_stages(
     let mut weight_layouts: BTreeMap<String, LayoutTag> = BTreeMap::new();
     let mut bsr32_weights: Vec<String> = Vec::new();
     let mut int8_weights: Vec<String> = Vec::new();
+    let mut input_pads: Vec<PadAlignSpec> = Vec::new();
     let mut donated_bytes_total: usize = 0;
+
+    // Facility #12: Automatic Liveness-Driven Cache Policy (`Streaming` vs `Persistent`)!
+    let mut cache_policies: BTreeMap<String, CachePolicy> = BTreeMap::new();
+    if cfg.streaming_cache {
+        for (tname, tdesc) in &g.tensors {
+            let uses = use_count.get(tname).copied().unwrap_or(0);
+            let policy = if tdesc.alloc_bytes() >= 4 * 1024 * 1024 && uses <= 1 {
+                CachePolicy::Streaming
+            } else if uses >= 2 {
+                CachePolicy::Persistent
+            } else {
+                CachePolicy::Default
+            };
+            cache_policies.insert(tname.clone(), policy);
+        }
+    }
     let mut resolve_weight_layout = |w_name: &str, m: usize, k: usize, n: usize, w_dtype: IrDType, trans_b: bool| -> (IrDType, LayoutTag) {
         // If this parameter was already assigned a physical layout by an earlier stage (e.g. Forward
         // repacked `w1` to `ColMajorNK` and Backward reads `w1^T`), ALWAYS return its TRUE physical layout
@@ -547,6 +584,8 @@ pub fn lower_to_tile_stages(
                         m,
                         k,
                         n: n0,
+                        padded_k: k,
+                        padded_n: n0,
                         act_dtype: sx.dtype,
                         weight_dtype: eff_wdt,
                         weight_layout: wlayout,
@@ -613,12 +652,40 @@ pub fn lower_to_tile_stages(
                     (Vec::new(), out_var)
                 };
 
-                let (eff_wdt, wlayout) = resolve_weight_layout(b, m, k, n, *weight_dtype, *trans_b);
+                // Facility #10 (`auto_pad`): Automatic logical-vs-padded alignment for odd/unaligned MatMul dims!
+                // Zero-pads `a[m, k] -> [m, pad_k]` and `b[k, n] -> [pad_n, pad_k]` (NK) ONCE on upload so the
+                // entire AMX inner loop executes branchless 128-bit `uint4` double-buffered 64x64 tiles!
+                let can_auto_pad = cfg.auto_pad
+                    && cfg.tile_mma
+                    && !*trans_a
+                    && !*trans_b
+                    && dual_b.is_none()
+                    && epilogue.is_empty()
+                    && sa.dtype == IrDType::F16
+                    && sb.dtype == IrDType::F16
+                    && m >= 16
+                    && (k % 8 != 0 || n % 8 != 0)
+                    && input_set.contains(a)
+                    && input_set.contains(b);
+                let (padded_k, padded_n, eff_wdt, wlayout) = if can_auto_pad {
+                    let pk = (k + 63) & !63;
+                    let pn = (n + 63) & !63;
+                    if !input_pads.iter().any(|p| p.name == *a) {
+                        input_pads.push(PadAlignSpec { name: a.clone(), pad_rows: m, pad_cols: pk, is_nk: false });
+                    }
+                    if !input_pads.iter().any(|p| p.name == *b) {
+                        input_pads.push(PadAlignSpec { name: b.clone(), pad_rows: pk, pad_cols: pn, is_nk: true });
+                    }
+                    (pk, pn, *weight_dtype, LayoutTag::ColMajorNK)
+                } else {
+                    let (ew, wl) = resolve_weight_layout(b, m, k, n, *weight_dtype, *trans_b);
+                    (k, n, ew, wl)
+                };
                 if let Some(ref wb) = dual_b {
                     let _ = resolve_weight_layout(wb, m, k, n, *weight_dtype, *trans_b);
                 }
 
-                let (schedule, pgo_candidates) = solve_tile_schedule(m, k, n, sa.dtype, eff_wdt, wlayout, dual_b.is_some(), cfg);
+                let (schedule, pgo_candidates) = solve_tile_schedule(m, padded_k, padded_n, sa.dtype, eff_wdt, wlayout, dual_b.is_some(), cfg);
                 let max_sk = pgo_candidates.iter().map(|c| c.split_k).max().unwrap_or(schedule.split_k).max(schedule.split_k);
                 let split_k_scratch = if max_sk > 1 {
                     let sc_name = format!("__sk_scratch_{}", stage_id);
@@ -638,6 +705,8 @@ pub fn lower_to_tile_stages(
                     m,
                     k,
                     n,
+                    padded_k,
+                    padded_n,
                     act_dtype: sa.dtype,
                     weight_dtype: eff_wdt,
                     weight_layout: wlayout,
@@ -677,6 +746,8 @@ pub fn lower_to_tile_stages(
                         m,
                         k,
                         n,
+                        padded_k: k,
+                        padded_n: n,
                         act_dtype: sx.dtype,
                         weight_dtype: eff_wdt,
                         weight_layout: wlayout,
@@ -755,6 +826,9 @@ pub fn lower_to_tile_stages(
                 let sp = &g.tensors[param];
                 let numel = sp.numel();
                 let donate_enabled = cfg.buffer_donation;
+                let stochastic_round = cfg.stochastic_round && matches!(sp.dtype, IrDType::F16 | IrDType::BF16);
+                let streaming_cache = cfg.streaming_cache;
+                let zero1_shards = if cfg.zero1_spmd && cfg.spmd_devices > 1 { cfg.spmd_devices } else { 1 };
                 if donate_enabled {
                     // Donates param + m + v in-place (ZERO extra output allocation!)
                     donated_bytes_total += sp.alloc_bytes() * 3;
@@ -769,6 +843,9 @@ pub fn lower_to_tile_stages(
                     numel,
                     dtype: sp.dtype,
                     donate_enabled,
+                    stochastic_round,
+                    streaming_cache,
+                    zero1_shards,
                     out: node.out.clone(),
                 });
             }
@@ -779,7 +856,18 @@ pub fn lower_to_tile_stages(
                 let vocab = sl.cols();
                 let online_fused = cfg.online_monoid;
                 let donate_enabled = cfg.buffer_donation;
-                if donate_enabled {
+                let streaming_cache = cfg.streaming_cache;
+                // Facility #10 (`auto_pad`): align odd vocabulary (e.g. GPT-2 `50257 -> 50304`) to 64 for 128-bit `float4`!
+                let padded_vocab = if cfg.auto_pad && vocab % 4 != 0 && input_set.contains(logits) {
+                    let pv = (vocab + 63) & !63;
+                    if !input_pads.iter().any(|p| p.name == *logits) {
+                        input_pads.push(PadAlignSpec { name: logits.clone(), pad_rows: rows, pad_cols: pv, is_nk: false });
+                    }
+                    pv
+                } else {
+                    vocab
+                };
+                if donate_enabled && padded_vocab == vocab {
                     donated_bytes_total += sl.alloc_bytes();
                 }
                 let scratch_probs = if !online_fused {
@@ -796,9 +884,11 @@ pub fn lower_to_tile_stages(
                     targets: targets.clone(),
                     rows,
                     vocab,
+                    padded_vocab,
                     dtype: sl.dtype,
                     online_fused,
                     donate_enabled,
+                    streaming_cache,
                     scratch_probs,
                     out: node.out.clone(),
                 });
@@ -986,6 +1076,7 @@ pub fn lower_to_tile_stages(
                         dtype: node.desc.dtype,
                         out: node.out.clone(),
                         vectorized: cfg.tile_mma,
+                        streaming_cache: false,
                     });
                 }
             }
@@ -1083,6 +1174,7 @@ pub fn lower_to_tile_stages(
                     dtype: node.desc.dtype,
                     out: cur_out,
                     vectorized: cfg.tile_mma,
+                    streaming_cache: cfg.streaming_cache && node.desc.numel() >= 16384,
                 });
             }
             IrOp::Binary { op, a, b } => {
@@ -1096,6 +1188,7 @@ pub fn lower_to_tile_stages(
                     dtype: node.desc.dtype,
                     out: node.out.clone(),
                     vectorized: cfg.tile_mma,
+                    streaming_cache: cfg.streaming_cache && node.desc.numel() >= 16384,
                 });
             }
             IrOp::Rope { x } => {
@@ -1109,6 +1202,7 @@ pub fn lower_to_tile_stages(
                     dtype: node.desc.dtype,
                     out: node.out.clone(),
                     vectorized: cfg.tile_mma,
+                    streaming_cache: false,
                 });
             }
             IrOp::Transpose { x } => {
@@ -1168,7 +1262,7 @@ pub fn lower_to_tile_stages(
     let mut arena = build_static_arena(&stages, g, &input_set, &output_set, &extra_scratch_sizes, cfg.arena_async);
     arena.donated_bytes = donated_bytes_total;
 
-    (stages, arena, input_repacks)
+    (stages, arena, input_repacks, input_pads, cache_policies)
 }
 
 /// Absorbs an arbitrary chain of single-use elementwise ops (`+ bias/residual`, `silu`, `gelu`, `relu`, `scale`)

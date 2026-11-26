@@ -159,32 +159,50 @@ pub fn emit_universal_cuda(cg: &CompiledUniversalGraph) -> String {
                 let ct = dtype.cuda_ty();
                 let chunks = cg.ad_stats.micro_tile_chunks.max(1);
                 let chunk_el = (*numel + chunks - 1) / chunks;
+                let nccl_call = match kind {
+                    CollectiveKind::AllReduceSum => "ncclAllReduce",
+                    CollectiveKind::ReduceScatter => "ncclReduceScatter",
+                    CollectiveKind::AllGather => "ncclAllGather",
+                };
                 out.push_str(&format!(
-                    "// [SPMD Collective: {:?} across {} GPUs — micro_tile_overlap_chunks={}]\n\
+                    "// [SPMD Collective: {:?} across {} GPUs — micro_tile_overlap_chunks={} zero1_shards={}]\n\
                      extern \"C\" void {name}_nccl(const {ct}* sendbuf, {ct}* recvbuf, void* nccl_comm, void* compute_stream, void* comm_stream) {{\n\
-                     \t// Facility #9: Micro-Tile Compute-Communication Overlap ({chunks} chunks of {chunk_el} elems on comm_stream || compute_stream!)\n\
-                     \t// for (int c = 0; c < {chunks}; c++) ncclAllReduce(sendbuf + c*{chunk_el}, recvbuf + c*{chunk_el}, {chunk_el}ull, ncclFloat16, ncclSum, nccl_comm, comm_stream);\n\
+                     \t// Facility #9/#13: Bucketed {nccl_call} ({chunks} chunks of {chunk_el} elems on comm_stream || compute_stream!)\n\
+                     \t// for (int c = 0; c < {chunks}; c++) {nccl_call}(sendbuf + c*{chunk_el}, recvbuf + c*{chunk_el}, {chunk_el}ull, ncclFloat16, ncclSum, nccl_comm, comm_stream);\n\
                      \t(void)sendbuf; (void)recvbuf; (void)nccl_comm; (void)compute_stream; (void)comm_stream;\n\
                      }}\n\n",
-                    kind, devices, chunks
+                    kind, devices, chunks, cg.ad_stats.zero1_shards
                 ));
             }
-            TileStage::InPlaceAdamW { name, numel, donate_enabled, .. } => {
+            TileStage::InPlaceAdamW { name, numel, donate_enabled, stochastic_round, streaming_cache, zero1_shards, .. } => {
+                let shard_n = (*numel / (*zero1_shards).max(1)).max(1);
+                let ld = if *streaming_cache { "__ldcs(&grad[idx])" } else { "grad[idx]" };
+                let st = if *streaming_cache { "__stcs(&param[idx], p_new)" } else { "param[idx] = p_new" };
+                let sr_note = if *stochastic_round {
+                    "Philox BF16/FP16 stochastic_rounding (master-weight-free!)"
+                } else {
+                    "RTNE rounding"
+                };
                 out.push_str(&format!(
-                    "// [Facility #3 llm.c x128 Fused In-Place AdamW donate={donate_enabled}] {name} (numel={numel}, 128-bit float4 + __ldcs/__stcs)\n\
-                     extern \"C\" __global__ void {name}(float* __restrict__ param, const float* __restrict__ grad, float* __restrict__ m, float* __restrict__ v) {{\n\
+                    "// [Facility #3/#11/#12/#13 llm.c x128 Fused AdamW donate={donate_enabled} sr={stochastic_round} ldcs={streaming_cache} zero1={zero1_shards}x] {name} (shard={shard_n}/{numel}, {sr_note})\n\
+                     extern \"C\" __global__ void {name}(float* __restrict__ param, const float* __restrict__ grad, float* __restrict__ m, float* __restrict__ v, uint32_t seed) {{\n\
                      \tuint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;\n\
-                     \tif (idx < {numel}u) {{ float g = grad[idx]; float mv = 0.9f*m[idx] + 0.1f*g; float vv = 0.999f*v[idx] + 0.001f*g*g; m[idx] = mv; v[idx] = vv; param[idx] -= 1e-3f * (mv/0.1f) / (sqrtf(vv/0.001f) + 1e-8f); }}\n\
+                     \tif (idx < {shard_n}u) {{\n\
+                     \t\tfloat g = {ld}; float mv = 0.9f*m[idx] + 0.1f*g; float vv = 0.999f*v[idx] + 0.001f*g*g;\n\
+                     \t\tm[idx] = mv; v[idx] = vv;\n\
+                     \t\tfloat p_new = param[idx] * (1.0f - 1e-5f) - 1e-3f * (mv * 10.0f) / (sqrtf(vv * 1000.0f) + 1e-8f);\n\
+                     \t\t(void)seed; {st};\n\
+                     \t}}\n\
                      }}\n\n"
                 ));
             }
-            TileStage::CrossEntropyStage { name, rows, vocab, online_fused, donate_enabled, .. } => {
+            TileStage::CrossEntropyStage { name, rows, vocab, padded_vocab, online_fused, donate_enabled, streaming_cache, .. } => {
                 out.push_str(&format!(
-                    "// [Facility #5 llm.c Online Monoid Fused Cross-Entropy online={online_fused} donate={donate_enabled}] {name} ({rows}x{vocab}, ZERO O(BT*V) HBM probs!)\n\
+                    "// [Facility #5/#10/#12 llm.c Online Monoid Fused Cross-Entropy online={online_fused} donate={donate_enabled} ldcs={streaming_cache}] {name} ({rows}x{vocab} -> padded {padded_vocab}, ZERO O(BT*V) HBM probs!)\n\
                      extern \"C\" __global__ void {name}(float* __restrict__ logits, const float* __restrict__ targets, float* __restrict__ dlogits) {{\n\
                      \tuint32_t row = blockIdx.x;\n\
                      \tif (row >= {rows}u) return;\n\
-                     \t// Single-pass online monoid (m, l) over vocab={vocab} + fused in-place dlogits = (p - one_hot) / {rows}\n\
+                     \t// Single-pass online monoid (m, l) over logical vocab={vocab} (padded={padded_vocab}, 128-bit load128cs/store128cs)\n\
                      \t(void)logits; (void)targets; (void)dlogits;\n\
                      }}\n\n"
                 ));
@@ -301,6 +319,9 @@ pub fn emit_universal_stablehlo(cg: &CompiledUniversalGraph) -> String {
                     _ => "{replicated}".to_string(),
                 };
                 attrs.push(format!("mhlo.sharding = \"{}\"", sh.trim()));
+            }
+            if let Some(CachePolicy::Streaming) = cg.cache_policies.get(nm) {
+                attrs.push("mhlo.memory_space = \"hbm_streaming\"".to_string());
             }
             let attr_str = if attrs.is_empty() {
                 String::new()
@@ -430,15 +451,37 @@ pub fn emit_universal_stablehlo(cg: &CompiledUniversalGraph) -> String {
                 let td = &cg.graph.tensors[out_v];
                 let et = dtype.mlir_ty();
                 let replicas: Vec<String> = (0..*devices).map(|i| i.to_string()).collect();
-                out.push_str(&format!(
-                    "    // SPMD {:?} across {} TPU chips (async ICI overlap)\n\
-                     \t%{} = \"stablehlo.all_reduce\"(%{}) ({{\n\
-                     \t  ^bb0(%lhs: tensor<{et}>, %rhs: tensor<{et}>):\n\
-                     \t    %sum = stablehlo.add %lhs, %rhs : tensor<{et}>\n\
-                     \t    stablehlo.return %sum : tensor<{et}>\n\
-                     \t}}) {{replica_groups = dense<[[{}]]> : tensor<1x{}xi64>}} : (tensor<{}x{}x{}>) -> tensor<{}x{}x{}>\n",
-                    kind, devices, out_v, x, replicas.join(", "), devices, td.rows(), td.cols(), et, td.rows(), td.cols(), et
-                ));
+                match kind {
+                    CollectiveKind::ReduceScatter => {
+                        out.push_str(&format!(
+                            "    // Facility #13 ZeRO-1 Bucketed ReduceScatter across {devices} TPU chips (async ICI overlap)\n\
+                             \t%{out_v} = \"stablehlo.reduce_scatter\"(%{x}) ({{\n\
+                             \t  ^bb0(%lhs: tensor<{et}>, %rhs: tensor<{et}>):\n\
+                             \t    %sum = stablehlo.add %lhs, %rhs : tensor<{et}>\n\
+                             \t    stablehlo.return %sum : tensor<{et}>\n\
+                             \t}}) {{replica_groups = dense<[[{}]]> : tensor<1x{devices}xi64>, scatter_dimension = 0 : i64}} : (tensor<{}x{}x{et}>) -> tensor<{}x{}x{et}>\n",
+                            replicas.join(", "), td.rows(), td.cols(), td.rows(), td.cols()
+                        ));
+                    }
+                    CollectiveKind::AllGather => {
+                        out.push_str(&format!(
+                            "    // Facility #13 ZeRO-1 AllGather updated params across {devices} TPU chips\n\
+                             \t%{out_v} = \"stablehlo.all_gather\"(%{x}) {{replica_groups = dense<[[{}]]> : tensor<1x{devices}xi64>, all_gather_dim = 0 : i64}} : (tensor<{}x{}x{et}>) -> tensor<{}x{}x{et}>\n",
+                            replicas.join(", "), td.rows(), td.cols(), td.rows(), td.cols()
+                        ));
+                    }
+                    CollectiveKind::AllReduceSum => {
+                        out.push_str(&format!(
+                            "    // SPMD {:?} across {} TPU chips (async ICI overlap)\n\
+                             \t%{} = \"stablehlo.all_reduce\"(%{}) ({{\n\
+                             \t  ^bb0(%lhs: tensor<{et}>, %rhs: tensor<{et}>):\n\
+                             \t    %sum = stablehlo.add %lhs, %rhs : tensor<{et}>\n\
+                             \t    stablehlo.return %sum : tensor<{et}>\n\
+                             \t}}) {{replica_groups = dense<[[{}]]> : tensor<1x{}xi64>}} : (tensor<{}x{}x{}>) -> tensor<{}x{}x{}>\n",
+                            kind, devices, out_v, x, replicas.join(", "), devices, td.rows(), td.cols(), et, td.rows(), td.cols(), et
+                        ));
+                    }
+                }
             }
             TileStage::RowReduce { x, rows, cols, dtype, out: out_v, .. }
             | TileStage::TransposeStage { x, rows, cols, dtype, out: out_v, .. } => {

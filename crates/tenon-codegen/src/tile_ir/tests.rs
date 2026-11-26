@@ -291,3 +291,91 @@ pub fn ssm_scan(
         assert!(tpu.contains("func.func"));
     }
 }
+
+#[test]
+fn stage5_llmc_4_facilities_default_on_and_multi_backend() {
+    // Verify `default()` enables ALL 24 general compiler passes out of the box!
+    let def = GpuOptConfig::default();
+    assert_eq!(def, GpuOptConfig::all());
+    assert!(def.auto_pad && def.stochastic_round && def.streaming_cache && def.zero1_spmd);
+
+    let s4 = GpuOptConfig::parse_spec("stage4");
+    assert!(!s4.auto_pad && !s4.stochastic_round && !s4.streaming_cache && !s4.zero1_spmd);
+
+    let src = r#"
+@gpu_graph("tensor_dataflow")
+pub fn odd_gemm(
+    a Matrix[512, 1003, Float16],
+    b Matrix[1003, 2003, Float16],
+) Matrix[512, 2003, Float16] {
+    tg_matmul(a, b)
+}
+
+@gpu_graph("tensor_dataflow")
+pub fn gpt2_vocab_xent(
+    logits  Matrix[128, 50257, Float32],
+    targets Matrix[128, 1, Float32],
+) Matrix[128, 50257, Float32] {
+    tg_cross_entropy(logits, targets)
+}
+
+@gpu_graph("tensor_dataflow")
+pub fn sr_adamw_f16(
+    p Matrix[1024, 4096, Float16],
+    g Matrix[1024, 4096, Float16],
+    m Matrix[1024, 4096, Float16],
+    v Matrix[1024, 4096, Float16],
+) Matrix[1024, 4096, Float16] {
+    tg_adamw_step(p, g, m, v)
+}
+
+@gpu_graph("tensor_dataflow")
+pub fn stream_add_64mb(
+    a Matrix[4096, 4096, Float32],
+    b Matrix[4096, 4096, Float32],
+) Matrix[4096, 4096, Float32] {
+    tg_add(a, b)
+}
+"#;
+    let prog = tenon_syntax::parse(src).expect("parse stage5");
+    let off = compile_universal_graphs(&prog, GpuOptConfig::stage4());
+    let on = compile_universal_graphs(&prog, GpuOptConfig::default());
+    let z1 = compile_universal_graphs(&prog, GpuOptConfig::parse_spec("all,spmd=4"));
+
+    // #10A Odd-Dim MatMul Auto-Pad (`1003->1024`, `2003->2048`)
+    let (msl_mm, plan_mm) = emit_metal::emit_metal_graph_and_plan(&on[0]);
+    assert!(plan_mm.contains("PAD_ALIGN|a|512|1024|0"));
+    assert!(plan_mm.contains("PAD_ALIGN|b|1024|2048|1"));
+    assert!(msl_mm.contains("K_pad=1024, N_pad=2048 -> logical N=2003"));
+    assert!(off[0].input_pads.is_empty());
+
+    // #10B GPT-2 Odd-Vocab Cross-Entropy Auto-Pad (`50257 -> 50304`)
+    let (_, plan_ce_on) = emit_metal::emit_metal_graph_and_plan(&on[1]);
+    let (msl_ce_off, _) = emit_metal::emit_metal_graph_and_plan(&off[1]);
+    assert!(plan_ce_on.contains("PAD_ALIGN|logits|128|50304|0"));
+    assert!(msl_ce_off.contains("50257u"));
+
+    // #11 Philox Stochastic Rounding on FP16 AdamW
+    let (msl_sr_on, plan_sr_on) = emit_metal::emit_metal_graph_and_plan(&on[2]);
+    let (msl_sr_off, _) = emit_metal::emit_metal_graph_and_plan(&off[2]);
+    assert!(msl_sr_on.contains("_philox") && msl_sr_on.contains("_sr_f16"));
+    assert!(plan_sr_on.contains("__sr_seed"));
+    assert!(!msl_sr_off.contains("_philox"));
+
+    // #12 Liveness-Driven Streaming Cache Hints (`CachePolicy::Streaming` -> 64B Metal burst / CUDA `__ldcs` / TPU `hbm_streaming`)
+    assert_eq!(on[3].cache_policies.get("a"), Some(&CachePolicy::Streaming));
+    let (msl_st_on, _) = emit_metal::emit_metal_graph_and_plan(&on[3]);
+    assert!(msl_st_on.contains("64B full-cacheline streaming burst"));
+    let cuda_sr = emit_cuda_tpu::emit_universal_cuda(&on[2]);
+    assert!(cuda_sr.contains("__ldcs") && cuda_sr.contains("__stcs") && cuda_sr.contains("stochastic_rounding"));
+    let tpu_st = emit_cuda_tpu::emit_universal_stablehlo(&on[3]);
+    assert!(tpu_st.contains("hbm_streaming"));
+
+    // #13 ZeRO-1 Optimizer Sharding + Gradient Bucketing (`spmd=4`: ReduceScatter + 1/4 AdamW + AllGather!)
+    assert_eq!(z1[2].ad_stats.zero1_shards, 4);
+    assert!(z1[2].ad_stats.zero1_sharded_opt_bytes > 0);
+    let cuda_z1 = emit_cuda_tpu::emit_universal_cuda(&z1[2]);
+    assert!(cuda_z1.contains("ncclReduceScatter") && cuda_z1.contains("ncclAllGather"));
+    let tpu_z1 = emit_cuda_tpu::emit_universal_stablehlo(&z1[2]);
+    assert!(tpu_z1.contains("stablehlo.reduce_scatter") && tpu_z1.contains("stablehlo.all_gather"));
+}

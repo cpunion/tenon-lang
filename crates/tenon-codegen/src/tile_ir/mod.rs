@@ -72,6 +72,16 @@ pub struct GpuOptConfig {
     /// #9: Micro-Tile Compute-Communication SPMD Overlap + Dual-Queue Async Weight Prefetch (`MTLEvent` / NCCL stream).
     pub async_overlap: bool,
 
+    // --- Stage 5: `llm.c`-Inspired Universal Compiler Facilities (ALL Default-ON!) ---
+    /// #10: Automatic logical-vs-padded dimension alignment (`50257->50304`, `1003->1024`) restoring 128-bit & MMA fast paths!
+    pub auto_pad: bool,
+    /// #11: Stateless Counter-Based Philox Stochastic Rounding on BF16/FP16 optimizer updates (master-weight-free training!).
+    pub stochastic_round: bool,
+    /// #12: Liveness-driven Streaming Cache Hints (`CachePolicy::Streaming` -> CUDA `__ldcs`/`__stcs`, Metal 64B burst, TPU MSA).
+    pub streaming_cache: bool,
+    /// #13: Automatic ZeRO-1 Optimizer State Sharding (`ReduceScatter` + `1/D` local AdamW + `AllGather`) + Gradient Bucketing.
+    pub zero1_spmd: bool,
+
     /// Optional SPMD device count (`1` = single device, `>1` = auto-sharded multi-device SPMD).
     pub spmd_devices: usize,
     /// Optional explicit tile override `(BM, BN, BK)` for deterministic ablation/tuning.
@@ -107,6 +117,10 @@ impl GpuOptConfig {
             dyn_bucket: false,
             non_tf_ops: false,
             async_overlap: false,
+            auto_pad: false,
+            stochastic_round: false,
+            streaming_cache: false,
+            zero1_spmd: false,
             spmd_devices: 1,
             force_tile: None,
         }
@@ -139,7 +153,7 @@ impl GpuOptConfig {
         c
     }
 
-    pub fn all() -> Self {
+    pub fn stage4() -> Self {
         let mut c = Self::stage3();
         c.tile_swizzle = true;
         c.horiz_pack = true;
@@ -153,8 +167,17 @@ impl GpuOptConfig {
         c
     }
 
+    pub fn all() -> Self {
+        let mut c = Self::stage4();
+        c.auto_pad = true;
+        c.stochastic_round = true;
+        c.streaming_cache = true;
+        c.zero1_spmd = true;
+        c
+    }
+
     /// Parses comma-separated preset & toggle specs, e.g.:
-    ///   `"none"`, `"stage1"`, `"stage2"`, `"all"`,
+    ///   `"none"`, `"stage1"`, `"stage2"`, `"stage3"`, `"stage4"`, `"all"`,
     ///   `"none,+tile_mma,+layout_prop"`, `"all,-warp_spec,-pgo_autotune"`,
     ///   `"all,spmd=4"`, `"tile_mma,layout_prop,fusion"`.
     pub fn parse_spec(spec: &str) -> Self {
@@ -178,7 +201,8 @@ impl GpuOptConfig {
             "stage1" | "s1" => Self::stage1(),
             "stage2" | "s2" => Self::stage2(),
             "stage3" | "s3" => Self::stage3(),
-            "stage4" | "s4" | "all" | "O3" => Self::all(),
+            "stage4" | "s4" => Self::stage4(),
+            "stage5" | "s5" | "all" | "O3" => Self::all(),
             t if t.starts_with('-') => Self::all(),
             _ => Self::none(),
         };
@@ -189,7 +213,8 @@ impl GpuOptConfig {
                 "stage1" | "s1" => cfg = Self::stage1(),
                 "stage2" | "s2" => cfg = Self::stage2(),
                 "stage3" | "s3" => cfg = Self::stage3(),
-                "stage4" | "s4" | "all" | "O3" => cfg = Self::all(),
+                "stage4" | "s4" => cfg = Self::stage4(),
+                "stage5" | "s5" | "all" | "O3" => cfg = Self::all(),
                 _ => {
                     if let Some(rest) = tok.strip_prefix("spmd=") {
                         if let Ok(n) = rest.parse::<usize>() {
@@ -228,6 +253,10 @@ impl GpuOptConfig {
                         "dyn_bucket" | "bucket" | "dynamic" => cfg.dyn_bucket = enable,
                         "non_tf_ops" | "conv_scan" | "implicit_conv" => cfg.non_tf_ops = enable,
                         "async_overlap" | "overlap" | "prefetch" => cfg.async_overlap = enable,
+                        "auto_pad" | "pad" | "align_pad" => cfg.auto_pad = enable,
+                        "stochastic_round" | "sr" | "philox" => cfg.stochastic_round = enable,
+                        "streaming_cache" | "ldcs" | "stcs" => cfg.streaming_cache = enable,
+                        "zero1_spmd" | "zero1" => cfg.zero1_spmd = enable,
                         _ => {}
                     }
                 }
@@ -265,6 +294,10 @@ impl GpuOptConfig {
         if self.dyn_bucket { on.push("dyn_bkt"); }
         if self.non_tf_ops { on.push("conv_scan"); }
         if self.async_overlap { on.push("overlap"); }
+        if self.auto_pad { on.push("autopad"); }
+        if self.stochastic_round { on.push("sr"); }
+        if self.streaming_cache { on.push("ldcs"); }
+        if self.zero1_spmd { on.push("zero1"); }
         if self.spmd_devices > 1 {
             on.push("spmd_multi");
         }
@@ -742,6 +775,26 @@ impl TensorIrGraph {
     }
 }
 
+/// Automatic Liveness-Driven Cache Policy (`llm.c` Facility #12: `__ldcs`/`__stcs` streaming cache hints!).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CachePolicy {
+    Default,
+    /// Multi-consumer hot activation/weight kept L2/SLC-resident.
+    Persistent,
+    /// Large single-use tensor (`>= 4 MB`, `use_count <= 1`) marked evict-first (`__ldcs`/`__stcs` / 64B streaming burst).
+    Streaming,
+}
+
+/// Automatic Logical-vs-Padded Alignment directive (`llm.c` Facility #10: e.g. `50257 -> 50304`, `1003 -> 1024`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PadAlignSpec {
+    pub name: String,
+    pub pad_rows: usize,
+    pub pad_cols: usize,
+    /// `true` -> zero-pad AND transpose `[K, N] -> [pad_N, pad_K]` for coalesced 128-bit weight loads!
+    pub is_nk: bool,
+}
+
 /// Complete compiled multi-stage pipeline artifact (IR + Fused Tile Stages + Static Arena + Roofline).
 #[derive(Debug, Clone)]
 pub struct CompiledUniversalGraph {
@@ -750,6 +803,8 @@ pub struct CompiledUniversalGraph {
     pub stages: Vec<fusion::TileStage>,
     pub arena: fusion::StaticArenaPlan,
     pub input_repacks: Vec<(String, LayoutTag)>,
+    pub input_pads: Vec<PadAlignSpec>,
+    pub cache_policies: BTreeMap<String, CachePolicy>,
     pub roofline: UniversalRoofline,
     pub egraph_stats: egraph::EGraphStats,
     pub ad_stats: ad_spmd::AdSpmdStats,
@@ -1170,9 +1225,9 @@ pub fn run_optimization_pipeline(mut g: TensorIrGraph, mut cfg: GpuOptConfig) ->
         egraph::EGraphStats::default()
     };
 
-    // --- Stage 1 Pillar 6: Compile-Time Reverse-Mode AD (VJP) + Declarative SPMD ---
+    // --- Stage 1 Pillar 6 + Stage 5 Facility #13: Reverse-Mode AD (VJP) + Declarative SPMD + ZeRO-1 ---
     let mut ad_stats = if cfg.ad_and_spmd {
-        ad_spmd::run_ad_and_spmd(&mut g, wants_autograd, cfg.spmd_devices)
+        ad_spmd::run_ad_and_spmd(&mut g, wants_autograd, cfg.spmd_devices, cfg.zero1_spmd)
     } else {
         ad_spmd::AdSpmdStats::default()
     };
@@ -1183,8 +1238,8 @@ pub fn run_optimization_pipeline(mut g: TensorIrGraph, mut cfg: GpuOptConfig) ->
         ad_stats.selective_recomputed = ad_stats.checkpointed_activations;
     }
 
-    // --- Stage 1 Pillars 1-5 + Stage 2 (Warp-Spec/PGO) + Stage 3 (Ragged/Sparse/MXFP4) ---
-    let (stages, arena, input_repacks) = fusion::lower_to_tile_stages(&mut g, cfg);
+    // --- Stage 1-5: Fusion, Layout, Auto-Pad, Streaming Cache Policy, Static Arena & Schedule ---
+    let (stages, arena, input_repacks, input_pads, cache_policies) = fusion::lower_to_tile_stages(&mut g, cfg);
 
     let opt_flops = estimate_graph_flops(&g);
     let fused_bytes = fusion::estimate_fused_bytes(&stages);
@@ -1227,6 +1282,8 @@ pub fn run_optimization_pipeline(mut g: TensorIrGraph, mut cfg: GpuOptConfig) ->
         stages,
         arena,
         input_repacks,
+        input_pads,
+        cache_policies,
         roofline,
         egraph_stats,
         ad_stats,
