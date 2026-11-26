@@ -381,3 +381,88 @@ pub fn stream_add_64mb(
     let tpu_z1 = emit_cuda_tpu::emit_universal_stablehlo(&z1[2]);
     assert!(tpu_z1.contains("stablehlo.reduce_scatter") && tpu_z1.contains("stablehlo.all_gather"));
 }
+
+#[test]
+fn stage6_hetero_streaming_vram_budget_numa4r_dual_dma_and_hybrid_dispatch() {
+    let def = GpuOptConfig::default();
+    assert_eq!(def, GpuOptConfig::stage6());
+    assert!(def.vram_budget_plan && def.numa_repack_layout && def.dual_stream_dma && def.hetero_dispatch);
+
+    let s5 = GpuOptConfig::parse_spec("stage5");
+    assert!(s5.auto_pad && s5.zero1_spmd);
+    assert!(!s5.vram_budget_plan && !s5.numa_repack_layout && !s5.dual_stream_dma && !s5.hetero_dispatch);
+
+    let src = r#"
+@gpu_graph("stream:vram=24G,ram=64G,layers=80,experts=0,ctx=16384,kv=auto,kv_dim=1024,ddr=70,pcie=24")
+pub fn llama70b_layer_24g(
+    x       Matrix[1, 8192, Float16],
+    wq      Matrix[8192, 8192, Q4_0],
+    wk      Matrix[8192, 1024, Q4_0],
+    wv      Matrix[8192, 1024, Q4_0],
+    wo      Matrix[8192, 8192, Q4_0],
+    w_gate  Matrix[8192, 28672, Q4_K],
+    w_up    Matrix[8192, 28672, Q4_K],
+    w_down  Matrix[28672, 8192, Q4_K],
+) Matrix[1, 8192, Float16] {
+    let g = tg_matmul(x, w_gate)
+    let u = tg_matmul(x, w_up)
+    let h = tg_swiglu(g, u)
+    tg_matmul(h, w_down)
+}
+
+@gpu_graph("stream:vram=24G,ram=32G,layers=46,experts=128,topk=8,ctx=8192,kv=auto,kv_dim=1024")
+pub fn glm106b_moe_nvme(
+    x        Matrix[1, 4096, Float16],
+    wq       Matrix[4096, 4096, Q4_0],
+    exp_gate Matrix[4096, 1408, Q4_0],
+    exp_up   Matrix[4096, 1408, Q4_0],
+    exp_down Matrix[1408, 4096, Q4_0],
+) Matrix[1, 4096, Float16] {
+    let g = tg_matmul(x, exp_gate)
+    let u = tg_matmul(x, exp_up)
+    let h = tg_swiglu(g, u)
+    tg_matmul(h, exp_down)
+}
+"#;
+    let prog = tenon_syntax::parse(src).expect("parse stage6");
+    let off = compile_universal_graphs(&prog, GpuOptConfig::stage5());
+    let on = compile_universal_graphs(&prog, GpuOptConfig::default());
+    assert_eq!(on.len(), 2);
+
+    // 1. 70B Dense @ 24GB VRAM, 64GB RAM, 16K ctx -> HybridCpuInt16 + Q8_0 KV + NUMA Q4K_4R + 30..45 pinned GPU FFNs!
+    let hp_dense = &on[0].hetero_plan;
+    assert!(hp_dense.active);
+    assert!(hp_dense.kv_quant_q8, "16K ctx on 24G VRAM must auto-enable Q8_0 KV-Cache");
+    assert!(hp_dense.kv_bytes_saved > 2_000_000_000, "Q8_0 KV should save >2GB on 70B @ 16K ctx");
+    assert!(hp_dense.pinned_gpu_ffn_layers >= 30 && hp_dense.pinned_gpu_ffn_layers <= 48,
+        "expected ~35-42 pinned GPU FFNs on 24G 4090, got {}", hp_dense.pinned_gpu_ffn_layers);
+    assert_eq!(hp_dense.dispatch_mode, hetero_stream::HeteroDispatchMode::HybridCpuInt16);
+    assert!(!hp_dense.use_nocache_nvme);
+    assert_eq!(hp_dense.dma_ring_slots, 4);
+    assert!(hp_dense.prefill_chunk_tokens >= 32);
+    assert!(on[0].input_repacks.iter().any(|(_, l)| *l == LayoutTag::NumaRepackQ4K_4R));
+    assert!(hp_dense.projected_prefill_tok_s > hp_dense.projected_decode_tok_s * 10.0);
+
+    // Ablation: Stage 5 (without Stage 6) has naive ring=1, no Q8 KV upgrade, no NUMA 4R repack!
+    assert_eq!(off[0].hetero_plan.dma_ring_slots, 1);
+    assert_eq!(off[0].hetero_plan.prefill_chunk_tokens, 1);
+    assert!(off[0].hetero_plan.numa_repack_weights.is_empty());
+
+    // 2. 106B MoE @ 24GB VRAM, 32GB Host RAM (< 58GB model) -> DirectNvmeStream + Per-Layer LRU + 16-slot DMA + Promoter!
+    let hp_moe = &on[1].hetero_plan;
+    assert!(hp_moe.use_nocache_nvme, "32G host RAM < 58G MoE must trigger F_NOCACHE direct NVMe");
+    assert_eq!(hp_moe.dispatch_mode, hetero_stream::HeteroDispatchMode::DirectNvmeStream);
+    assert!(hp_moe.lru_slots_per_layer >= 30 && hp_moe.lru_slots_per_layer <= 90,
+        "expected ~40-60 LRU expert slots on 24G VRAM, got {}", hp_moe.lru_slots_per_layer);
+    assert_eq!(hp_moe.dma_ring_slots, 16);
+    assert!(hp_moe.async_promoter && hp_moe.purgeable_reclaim);
+
+    // 3. Multi-backend Metal Plan + CUDA + TPU StableHLO emission check!
+    let (msl_d, plan_d) = emit_metal::emit_metal_graph_and_plan(&on[0]);
+    assert!(plan_d.contains("HETERO_PLAN|mode=HYBRID_CPU_INT16|") && plan_d.contains("NUMA_REPACK_Q4K_4R"));
+    assert!(msl_d.contains("Stage 6 Heterogeneous Streaming") && msl_d.contains("MTLPurgeableStateEmpty"));
+    let cuda_d = emit_cuda_tpu::emit_universal_cuda(&on[0]);
+    assert!(cuda_d.contains("cuStreamWaitEvent") && cuda_d.contains("_mm256_madd_epi16") && cuda_d.contains("d_step_args"));
+    let tpu_d = emit_cuda_tpu::emit_universal_stablehlo(&on[0]);
+    assert!(tpu_d.contains("mhlo.memory_kind=\"pinned_host\""));
+}

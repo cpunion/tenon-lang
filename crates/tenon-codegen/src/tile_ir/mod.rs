@@ -15,6 +15,7 @@ pub mod egraph;
 pub mod emit_cuda_tpu;
 pub mod emit_metal;
 pub mod fusion;
+pub mod hetero_stream;
 #[cfg(test)]
 mod tests;
 
@@ -82,6 +83,16 @@ pub struct GpuOptConfig {
     /// #13: Automatic ZeRO-1 Optimizer State Sharding (`ReduceScatter` + `1/D` local AdamW + `AllGather`) + Gradient Bucketing.
     pub zero1_spmd: bool,
 
+    // --- Stage 6: Universal Heterogeneous Out-of-Core Streaming Facilities (ALL Default-ON!) ---
+    /// #14: Automatic Hard-VRAM-Cap Budget Planner (Core Attn + Q8_0 KV-Cache + Prefix FFN / Per-Layer LRU + NVMe F_NOCACHE + Batched Prefill).
+    pub vram_budget_plan: bool,
+    /// #15: NUMA-Local Parallel First-Touch 4-Row Contiguous Weight Repacking (`Q4_0_4R` 144B/72B, `Q4_K_4R`).
+    pub numa_repack_layout: bool,
+    /// #16: Hardware Dual-Stream `Compute || DMA` Pipeline (`cuStreamWaitEvent` / `MTLEvent` + `MTLPurgeableStateEmpty` + Async Promoter).
+    pub dual_stream_dma: bool,
+    /// #17: Roofline-Driven GPU+CPU Hybrid Dispatch (AVX2/NEON INT16 `Main=tid0` container-cgroup-aware worker pool when `BW_DDR > 1.2 * BW_PCIe`).
+    pub hetero_dispatch: bool,
+
     /// Optional SPMD device count (`1` = single device, `>1` = auto-sharded multi-device SPMD).
     pub spmd_devices: usize,
     /// Optional explicit tile override `(BM, BN, BK)` for deterministic ablation/tuning.
@@ -121,6 +132,10 @@ impl GpuOptConfig {
             stochastic_round: false,
             streaming_cache: false,
             zero1_spmd: false,
+            vram_budget_plan: false,
+            numa_repack_layout: false,
+            dual_stream_dma: false,
+            hetero_dispatch: false,
             spmd_devices: 1,
             force_tile: None,
         }
@@ -167,13 +182,26 @@ impl GpuOptConfig {
         c
     }
 
-    pub fn all() -> Self {
+    pub fn stage5() -> Self {
         let mut c = Self::stage4();
         c.auto_pad = true;
         c.stochastic_round = true;
         c.streaming_cache = true;
         c.zero1_spmd = true;
         c
+    }
+
+    pub fn stage6() -> Self {
+        let mut c = Self::stage5();
+        c.vram_budget_plan = true;
+        c.numa_repack_layout = true;
+        c.dual_stream_dma = true;
+        c.hetero_dispatch = true;
+        c
+    }
+
+    pub fn all() -> Self {
+        Self::stage6()
     }
 
     /// Parses comma-separated preset & toggle specs, e.g.:
@@ -202,7 +230,8 @@ impl GpuOptConfig {
             "stage2" | "s2" => Self::stage2(),
             "stage3" | "s3" => Self::stage3(),
             "stage4" | "s4" => Self::stage4(),
-            "stage5" | "s5" | "all" | "O3" => Self::all(),
+            "stage5" | "s5" => Self::stage5(),
+            "stage6" | "s6" | "all" | "O3" => Self::all(),
             t if t.starts_with('-') => Self::all(),
             _ => Self::none(),
         };
@@ -214,7 +243,8 @@ impl GpuOptConfig {
                 "stage2" | "s2" => cfg = Self::stage2(),
                 "stage3" | "s3" => cfg = Self::stage3(),
                 "stage4" | "s4" => cfg = Self::stage4(),
-                "stage5" | "s5" | "all" | "O3" => cfg = Self::all(),
+                "stage5" | "s5" => cfg = Self::stage5(),
+                "stage6" | "s6" | "all" | "O3" => cfg = Self::all(),
                 _ => {
                     if let Some(rest) = tok.strip_prefix("spmd=") {
                         if let Ok(n) = rest.parse::<usize>() {
@@ -257,6 +287,10 @@ impl GpuOptConfig {
                         "stochastic_round" | "sr" | "philox" => cfg.stochastic_round = enable,
                         "streaming_cache" | "ldcs" | "stcs" => cfg.streaming_cache = enable,
                         "zero1_spmd" | "zero1" => cfg.zero1_spmd = enable,
+                        "vram_budget_plan" | "vram_plan" | "budget" => cfg.vram_budget_plan = enable,
+                        "numa_repack_layout" | "numa_repack" | "repack_4r" => cfg.numa_repack_layout = enable,
+                        "dual_stream_dma" | "dma_ring" | "dual_stream" => cfg.dual_stream_dma = enable,
+                        "hetero_dispatch" | "hetero" | "hybrid_cpu" => cfg.hetero_dispatch = enable,
                         _ => {}
                     }
                 }
@@ -298,6 +332,10 @@ impl GpuOptConfig {
         if self.stochastic_round { on.push("sr"); }
         if self.streaming_cache { on.push("ldcs"); }
         if self.zero1_spmd { on.push("zero1"); }
+        if self.vram_budget_plan { on.push("vram_plan"); }
+        if self.numa_repack_layout { on.push("numa4r"); }
+        if self.dual_stream_dma { on.push("dma_ring"); }
+        if self.hetero_dispatch { on.push("hetero"); }
         if self.spmd_devices > 1 {
             on.push("spmd_multi");
         }
@@ -390,6 +428,7 @@ impl TargetSpec {
 }
 
 /// Element numeric type (extended with Stage 3 OCP Microscaling `MXFP4`).
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IrDType {
     F32,
@@ -400,6 +439,10 @@ pub enum IrDType {
     I4,
     Q8_0,
     Q4_0,
+    /// GGML K-Quant super-blocks (256 weights: Q4_K=144B, Q5_K=176B, Q6_K=210B).
+    Q4_K,
+    Q5_K,
+    Q6_K,
     /// OCP Microscaling FP4: 32 E2M1 4-bit elements + 1 E8M0 shared exponent = 17 bytes / 32 elems (0.53125 B/elem).
     MXFP4,
 }
@@ -413,12 +456,15 @@ impl IrDType {
             Self::I4 => 0.5,
             Self::Q8_0 => 34.0 / 32.0,
             Self::Q4_0 => 18.0 / 32.0,
+            Self::Q4_K => 144.0 / 256.0,
+            Self::Q5_K => 176.0 / 256.0,
+            Self::Q6_K => 210.0 / 256.0,
             Self::MXFP4 => 17.0 / 32.0,
         }
     }
 
     pub fn is_sub_byte(self) -> bool {
-        matches!(self, Self::I4 | Self::Q4_0 | Self::MXFP4)
+        matches!(self, Self::I4 | Self::Q4_0 | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4)
     }
 
     pub fn msl_ty(self) -> &'static str {
@@ -426,7 +472,7 @@ impl IrDType {
             Self::F32 => "float",
             Self::F16 => "half",
             Self::BF16 => "bfloat",
-            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::MXFP4 => "uchar",
+            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4 => "uchar",
             Self::I8 => "char",
         }
     }
@@ -437,7 +483,7 @@ impl IrDType {
             Self::F16 => "__half",
             Self::BF16 => "__nv_bfloat16",
             Self::I8 => "int8_t",
-            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::MXFP4 => "uint8_t",
+            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4 => "uint8_t",
         }
     }
 
@@ -447,8 +493,8 @@ impl IrDType {
             Self::F16 => "f16",
             Self::BF16 => "bf16",
             Self::FP8 => "f8E4M3FN",
-            Self::I8 | Self::Q8_0 => "i8",
-            Self::I4 | Self::Q4_0 | Self::MXFP4 => "i4",
+            Self::I8 | Self::Q8_0 | Self::Q5_K | Self::Q6_K => "i8",
+            Self::I4 | Self::Q4_0 | Self::Q4_K | Self::MXFP4 => "i4",
         }
     }
 }
@@ -473,6 +519,7 @@ impl DimExpr {
 }
 
 /// Physical storage layout solved by the Layout Propagation Pass.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LayoutTag {
     /// Standard contiguous row-major `[rows, cols]`.
@@ -489,6 +536,10 @@ pub enum LayoutTag {
     Bsr32NK,
     /// Per-row INT8 dynamic-quantized weights (`[N, K]` int8 + `[N]` FP32 row scales -> -50% DRAM!).
     Int8RowScaleNK,
+    /// Stage 6 Facility #15: NUMA-local parallel first-touch 4-row interleaved Q4_0 (`72B/blk` or `144B/blk` fused gate+up).
+    NumaRepackQ4_4R,
+    /// Stage 6 Facility #15: NUMA-local parallel first-touch 4-row interleaved K-Quant (`Q4_K`/`Q5_K`/`Q6_K`).
+    NumaRepackQ4K_4R,
 }
 
 impl LayoutTag {
@@ -505,6 +556,8 @@ impl LayoutTag {
             Self::MXFP4Super16NK => "PACK_MXFP4_NK_SB16",
             Self::Bsr32NK => "PACK_BSR32_NK",
             Self::Int8RowScaleNK => "PACK_INT8_ROW_NK",
+            Self::NumaRepackQ4_4R => "NUMA_REPACK_Q4_4R",
+            Self::NumaRepackQ4K_4R => "NUMA_REPACK_Q4K_4R",
         }
     }
 }
@@ -808,6 +861,7 @@ pub struct CompiledUniversalGraph {
     pub roofline: UniversalRoofline,
     pub egraph_stats: egraph::EGraphStats,
     pub ad_stats: ad_spmd::AdSpmdStats,
+    pub hetero_plan: hetero_stream::HeteroStreamPlan,
 }
 
 #[derive(Debug, Clone)]
@@ -842,7 +896,7 @@ fn parse_dim_expr(ty: &TypeExpr) -> Option<DimExpr> {
                     name.as_str(),
                     "Float32" | "F32" | "Float16" | "F16" | "BFloat16" | "BF16"
                         | "FP8" | "Float8" | "Int8" | "I8" | "Int4" | "I4"
-                        | "Q8_0" | "Q4_0" | "MXFP4" | "FP4"
+                        | "Q8_0" | "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "MXFP4" | "FP4"
                 )
             {
                 return Some(DimExpr::Sym { name: name.clone(), max_bound: 1024 });
@@ -863,6 +917,9 @@ fn parse_ir_dtype(ty: &TypeExpr) -> Option<IrDType> {
             "Int4" | "I4" => Some(IrDType::I4),
             "Q8_0" => Some(IrDType::Q8_0),
             "Q4_0" => Some(IrDType::Q4_0),
+            "Q4_K" | "Q4_K_M" => Some(IrDType::Q4_K),
+            "Q5_K" | "Q5_K_M" => Some(IrDType::Q5_K),
+            "Q6_K" => Some(IrDType::Q6_K),
             "MXFP4" | "FP4" | "BlockFloat4" => Some(IrDType::MXFP4),
             _ => None,
         }
@@ -1239,7 +1296,10 @@ pub fn run_optimization_pipeline(mut g: TensorIrGraph, mut cfg: GpuOptConfig) ->
     }
 
     // --- Stage 1-5: Fusion, Layout, Auto-Pad, Streaming Cache Policy, Static Arena & Schedule ---
-    let (stages, arena, input_repacks, input_pads, cache_policies) = fusion::lower_to_tile_stages(&mut g, cfg);
+    let (stages, arena, mut input_repacks, input_pads, cache_policies) = fusion::lower_to_tile_stages(&mut g, cfg);
+
+    // --- Stage 6: Universal Heterogeneous Out-of-Core Streaming Planner (VRAM Budget, NUMA 4R, Dual-Stream DMA, Hybrid CPU+GPU) ---
+    let hetero_plan = hetero_stream::plan_hetero_stream(&g, cfg, &mut input_repacks);
 
     let opt_flops = estimate_graph_flops(&g);
     let fused_bytes = fusion::estimate_fused_bytes(&stages);
@@ -1261,7 +1321,7 @@ pub fn run_optimization_pipeline(mut g: TensorIrGraph, mut cfg: GpuOptConfig) ->
         let t_cmp = (opt_flops / (peak_t * 1e12)) * 1e3;
         t_mem.max(t_cmp)
     };
-    let uses_low_bit = g.tensors.values().any(|t| matches!(t.dtype, IrDType::FP8 | IrDType::I8 | IrDType::I4 | IrDType::Q4_0 | IrDType::MXFP4));
+    let uses_low_bit = g.tensors.values().any(|t| matches!(t.dtype, IrDType::FP8 | IrDType::I8 | IrDType::I4 | IrDType::Q4_0 | IrDType::Q4_K | IrDType::Q5_K | IrDType::Q6_K | IrDType::MXFP4));
 
     let roofline = UniversalRoofline {
         raw_flops,
@@ -1287,6 +1347,7 @@ pub fn run_optimization_pipeline(mut g: TensorIrGraph, mut cfg: GpuOptConfig) ->
         roofline,
         egraph_stats,
         ad_stats,
+        hetero_plan,
     }
 }
 

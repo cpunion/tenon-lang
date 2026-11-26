@@ -452,7 +452,15 @@ pub fn lower_to_tile_stages(
         let is_pure_weight = input_set.contains(w_name) && !non_weight_uses.contains(w_name);
         // Stage 3: MXFP4 auto-quantization on memory-bound weights (`M <= 8` & `K % 32 == 0`) or explicit MXFP4 dtype
         // Uses 16-block interleaved SuperBlock16 (272B, 16B aligned, single DRAM stream) whenever `K % 512 == 0`!
-        if cfg.mxfp4_quant && is_pure_weight && (w_dtype == IrDType::MXFP4 || (m <= 8 && k >= 256 && k % 32 == 0 && n >= 64)) {
+        if cfg.mxfp4_quant
+            && is_pure_weight
+            && (w_dtype == IrDType::MXFP4
+                || (matches!(w_dtype, IrDType::F32 | IrDType::F16 | IrDType::BF16)
+                    && m <= 8
+                    && k >= 256
+                    && k % 32 == 0
+                    && n >= 64))
+        {
             let lay = if k % 512 == 0 {
                 LayoutTag::MXFP4Super16NK
             } else {

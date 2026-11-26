@@ -1,3 +1,4 @@
+mod llm;
 mod lsp;
 
 use std::env;
@@ -50,6 +51,7 @@ async fn main() -> ExitCode {
         "new" => cmd_new(&args[2..]),
         "doc" => cmd_doc(&args[2..]),
         "bench" => cmd_bench(&args[2..]),
+        "llm" => llm::cmd_llm(&args[2..]).await,
         "fmt" => cmd_fmt(&args[2..]),
         "bindgen" => cmd_bindgen(&args[2..]),
         "lsp" => lsp::run_lsp_stdio(),
@@ -99,6 +101,8 @@ USAGE:
   tenon doc <file_or_dir> [-o <dir>] [--format md|html|both]
                                                   Generate Markdown & HTML API reference from verified AST
   tenon bench <file.tn> [--iters <N>]             Compile with LLVM -O3 and run timed benchmark iterations
+  tenon llm <model.gguf> [--chat "..."|--serve 127.0.0.1:8080] [--max-vram-gb N] [--ctx 4096]
+                                                  Run streaming GGUF LLM CLI or OpenAI `/v1/chat/completions` SSE server
   tenon serve|authority|worker|cluster-demo|agent Distributed runtime, Fenced Authority/Worker & CLI Agent
   tenon fmt <file.tn> [--check]                   Format Tenon source file with canonical indentation
   tenon lsp                                       Run Language Server Protocol (JSON-RPC 2.0 over stdio)"#

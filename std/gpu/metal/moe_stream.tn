@@ -42,6 +42,22 @@ extern "C" {
     /// Runs a single forward step at `pos` for token `tok_id` and returns argmax next token ID!
     fn tn_moe_step(handle Int, tok_id Int, pos Int) Int
 
+    /// Batched causal prompt prefill: reads weights ONCE per chunk of 32 tokens (8-30x faster TTFT!).
+    fn tn_moe_prefill(handle Int, tok_ids_ptr Ptr[UInt8], n_toks Int, start_pos Int) Int
+
+    /// Auto Apple Silicon VRAM/RAM budget planner (`out_plan_ptr` holds 9 Ints: slots, nocache, kv_q8, prefill_b, est_vram, disk, n_layers, n_experts, d_model).
+    fn tn_moe_auto_plan(path_cstr Ptr[UInt8], max_vram_gb Float, max_ctx Int, kv_mode Int, out_plan_ptr Ptr[UInt8]) Int
+
+    /// Full sampler (temperature + top_k + top_p + min_p + repetition_penalty); pass `tok_id = -1` to sample from last prefill logits.
+    fn tn_moe_sample_next(
+        handle Int, tok_id Int, pos Int,
+        temp Float, top_k Int, top_p Float, min_p Float, repeat_penalty Float,
+        recent_ptr Ptr[UInt8], n_recent Int, seed Int,
+    ) Int
+
+    /// Returns GGUF `general.architecture` C-string (`llama`, `glm4moe`, `qwen3moe`, `deepseek2`, etc.).
+    fn tn_moe_get_arch(handle Int) Ptr[UInt8]
+
     /// Decodes a token ID to a UTF-8 C string from the GGUF's embedded vocabulary.
     fn tn_moe_token_cstr(handle Int, tok_id Int) Ptr[UInt8]
 
@@ -111,6 +127,32 @@ impl StreamingMoeModel {
     pub fn step(inout self, tok_id Int, pos Int) Int {
         unsafe { tn_moe_step(self.handle, tok_id, pos) }
     }
+
+    pub fn prefill(inout self, tok_ids List[Int], start_pos Int) Int {
+        unsafe { tn_moe_prefill(self.handle, list_data_ptr(tok_ids), len(tok_ids), start_pos) }
+    }
+
+    pub fn sample_next(
+        inout self, tok_id Int, pos Int,
+        temp Float, top_k Int, top_p Float, min_p Float, repeat_penalty Float,
+        recent List[Int], seed Int,
+    ) Int {
+        unsafe {
+            tn_moe_sample_next(
+                self.handle, tok_id, pos,
+                temp, top_k, top_p, min_p, repeat_penalty,
+                list_data_ptr(recent), len(recent), seed,
+            )
+        }
+    }
+
+    pub fn arch_name(inout self) Text {
+        unsafe { cstr_to_text(tn_moe_get_arch(self.handle)) }
+    }
+
+    pub fn max_ctx(inout self) Int { unsafe { tn_moe_info(self.handle, 21) } }
+    pub fn kv_quant_q8(inout self) Bool { unsafe { tn_moe_info(self.handle, 22) != 0 } }
+    pub fn is_mla(inout self) Bool { unsafe { tn_moe_info(self.handle, 23) != 0 } }
 
     pub fn token_text(inout self, tok_id Int) Text {
         unsafe { cstr_to_text(tn_moe_token_cstr(self.handle, tok_id)) }

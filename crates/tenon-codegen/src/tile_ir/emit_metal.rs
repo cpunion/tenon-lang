@@ -114,6 +114,40 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
         plan.push_str(&format!("ARENA|{}|{}|{}\n", tname, off, sz));
     }
 
+    // Stage 6 Heterogeneous Out-of-Core Streaming Plan Directive (Facilities #14-#17)
+    if cg.hetero_plan.active {
+        let hp = &cg.hetero_plan;
+        plan.push_str(&format!(
+            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
+            hp.dispatch_mode.tag(),
+            hp.vram_cap_bytes,
+            hp.core_vram_bytes,
+            hp.pinned_gpu_ffn_layers,
+            hp.lru_slots_per_layer,
+            hp.cpu_offload_layers,
+            if hp.kv_quant_q8 { 1 } else { 0 },
+            hp.kv_bytes_saved,
+            if hp.use_nocache_nvme { 1 } else { 0 },
+            hp.prefill_chunk_tokens,
+            hp.dma_ring_slots,
+            if hp.purgeable_reclaim { 1 } else { 0 },
+            if hp.async_promoter { 1 } else { 0 },
+            hp.projected_decode_tok_s,
+            hp.projected_prefill_tok_s,
+        ));
+        msl.push_str(&format!(
+            "// [Stage 6 Heterogeneous Streaming] mode={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={}\n",
+            hp.dispatch_mode.tag(),
+            hp.pinned_gpu_ffn_layers,
+            hp.lru_slots_per_layer,
+            hp.kv_quant_q8,
+            hp.kv_bytes_saved as f64 / 1e6,
+            hp.dma_ring_slots,
+            hp.purgeable_reclaim,
+            hp.prefill_chunk_tokens,
+        ));
+    }
+
     // Emit each TileStage -> MSL kernel(s) + Plan dispatch directive(s)
     for st in &cg.stages {
         match st {

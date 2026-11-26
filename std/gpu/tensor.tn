@@ -27,6 +27,9 @@ pub type Int4  = Int8
 pub type FP8   = UInt8
 pub type Q4_0  = UInt8
 pub type Q8_0  = UInt8
+pub type Q4_K  = UInt8
+pub type Q5_K  = UInt8
+pub type Q6_K  = UInt8
 /// OCP Microscaling FP4 (32 E2M1 4-bit elements + 1 shared E8M0 exponent = 17 B / 32 weights = 0.531 B/wt).
 pub type MXFP4 = UInt8
 
