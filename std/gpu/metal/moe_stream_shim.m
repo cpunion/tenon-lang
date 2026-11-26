@@ -276,69 +276,87 @@ static NSString* const kMoeMslSource = @R"(
 #include <metal_stdlib>
 using namespace metal;
 
-// Load 32 floats into 8 float4 registers ONCE per lane -> reuse across 4 rows (4x fewer activation loads!)
-static inline void load_x32_reg(const device float* x, thread float4 xv[8]) {
+// Load 32 floats into float4 registers (100% exact FP32, shared across 4 weight rows!)
+static inline float load_x32_q4(const device float* x, thread float4 xv_lo[4], thread float4 xv_hi[4]) {
+    const device float4* x4 = (const device float4*)x;
+    float4 xs = float4(0.0f);
+    #pragma unroll
+    for (uint g = 0; g < 4u; g++) {
+        float4 lo = x4[g];
+        float4 hi = x4[g + 4u];
+        xs += lo + hi;
+        xv_lo[g] = lo;
+        xv_hi[g] = hi;
+    }
+    return (xs.x + xs.y) + (xs.z + xs.w);
+}
+
+static inline void load_x32_f4(const device float* x, thread float4 xv[8]) {
     const device float4* x4 = (const device float4*)x;
     #pragma unroll
     for (uint i = 0; i < 8u; i++) xv[i] = x4[i];
 }
 
-// Fast vectorized GGML Q4_0 block dot against register-cached `xv[8]` (18 bytes / 32 elems)
-static inline float dot_q4_0_reg(const device uchar* blk, thread const float4 xv[8]) {
+// Ultra-fast 64-bit `packed_ushort4` zero-shift GGML Q4_0 dot (2 loads vs 16, exact FP32, 2-byte safe for GGUF mmap!)
+static inline float dot_q4_0_fast(const device uchar* blk, thread const float4 xv_lo[4], thread const float4 xv_hi[4], float x_sum) {
     float d = float(*(const device half*)blk);
-    const device uchar* qs = blk + 2u;
-    float4 s0 = float4(0.0f), s1 = float4(0.0f);
-    #pragma unroll
-    for (uint g = 0; g < 4u; g++) {
-        uint off = g * 4u;
-        uchar b0 = qs[off], b1 = qs[off + 1u], b2 = qs[off + 2u], b3 = qs[off + 3u];
-        float4 lo = float4(float(int(b0 & 0xFu) - 8), float(int(b1 & 0xFu) - 8),
-                           float(int(b2 & 0xFu) - 8), float(int(b3 & 0xFu) - 8));
-        float4 hi = float4(float(int(b0 >> 4) - 8),   float(int(b1 >> 4) - 8),
-                           float(int(b2 >> 4) - 8),   float(int(b3 >> 4) - 8));
-        s0 = fma(lo, xv[g],      s0);
-        s1 = fma(hi, xv[g + 4u], s1);
-    }
-    float4 t = s0 + s1;
-    return d * ((t.x + t.y) + (t.z + t.w));
+    const device packed_ushort4* q64 = (const device packed_ushort4*)(blk + 2u);
+    ushort4 p0 = q64[0];
+    ushort4 p1 = q64[1];
+    uchar4 c0 = as_type<uchar4>(p0.xy);
+    uchar4 c1 = as_type<uchar4>(p0.zw);
+    uchar4 c2 = as_type<uchar4>(p1.xy);
+    uchar4 c3 = as_type<uchar4>(p1.zw);
+    float4 s0 = xv_lo[0] * float4(c0 & uchar4(0x0Fu));
+    float4 s1 = xv_hi[0] * float4(c0 & uchar4(0xF0u));
+    s0 = fma(xv_lo[1], float4(c1 & uchar4(0x0Fu)), s0);
+    s1 = fma(xv_hi[1], float4(c1 & uchar4(0xF0u)), s1);
+    s0 = fma(xv_lo[2], float4(c2 & uchar4(0x0Fu)), s0);
+    s1 = fma(xv_hi[2], float4(c2 & uchar4(0xF0u)), s1);
+    s0 = fma(xv_lo[3], float4(c3 & uchar4(0x0Fu)), s0);
+    s1 = fma(xv_hi[3], float4(c3 & uchar4(0xF0u)), s1);
+    float4 t = fma(s1, 0.0625f, s0);
+    return d * (((t.x + t.y) + (t.z + t.w)) - 8.0f * x_sum);
 }
 
-// Fast vectorized GGML Q4_1 block dot (20 bytes / 32 elems: half d + half m + uchar qs[16], val = d*q + m)
-static inline float dot_q4_1_reg(const device uchar* blk, thread const float4 xv[8], float sum_x) {
+// Ultra-fast 64-bit `packed_ushort4` zero-shift GGML Q4_1 dot (20 bytes / 32 elems: half d + half m + uchar qs[16])
+static inline float dot_q4_1_fast(const device uchar* blk, thread const float4 xv_lo[4], thread const float4 xv_hi[4], float x_sum) {
     float d = float(*(const device half*)(blk));
     float m = float(*(const device half*)(blk + 2u));
-    const device uchar* qs = blk + 4u;
-    float4 s0 = float4(0.0f), s1 = float4(0.0f);
-    #pragma unroll
-    for (uint g = 0; g < 4u; g++) {
-        uint off = g * 4u;
-        uchar b0 = qs[off], b1 = qs[off + 1u], b2 = qs[off + 2u], b3 = qs[off + 3u];
-        float4 lo = float4(float(b0 & 0xFu), float(b1 & 0xFu), float(b2 & 0xFu), float(b3 & 0xFu));
-        float4 hi = float4(float(b0 >> 4),   float(b1 >> 4),   float(b2 >> 4),   float(b3 >> 4));
-        s0 = fma(lo, xv[g],      s0);
-        s1 = fma(hi, xv[g + 4u], s1);
-    }
-    float4 t = s0 + s1;
-    return fma(d, (t.x + t.y) + (t.z + t.w), m * sum_x);
+    const device packed_ushort4* q64 = (const device packed_ushort4*)(blk + 4u);
+    ushort4 p0 = q64[0];
+    ushort4 p1 = q64[1];
+    uchar4 c0 = as_type<uchar4>(p0.xy);
+    uchar4 c1 = as_type<uchar4>(p0.zw);
+    uchar4 c2 = as_type<uchar4>(p1.xy);
+    uchar4 c3 = as_type<uchar4>(p1.zw);
+    float4 s0 = xv_lo[0] * float4(c0 & uchar4(0x0Fu));
+    float4 s1 = xv_hi[0] * float4(c0 & uchar4(0xF0u));
+    s0 = fma(xv_lo[1], float4(c1 & uchar4(0x0Fu)), s0);
+    s1 = fma(xv_hi[1], float4(c1 & uchar4(0xF0u)), s1);
+    s0 = fma(xv_lo[2], float4(c2 & uchar4(0x0Fu)), s0);
+    s1 = fma(xv_hi[2], float4(c2 & uchar4(0xF0u)), s1);
+    s0 = fma(xv_lo[3], float4(c3 & uchar4(0x0Fu)), s0);
+    s1 = fma(xv_hi[3], float4(c3 & uchar4(0xF0u)), s1);
+    float4 t = fma(s1, 0.0625f, s0);
+    return fma(d, (t.x + t.y) + (t.z + t.w), m * x_sum);
 }
 
-static inline float sum_x32_reg(thread const float4 xv[8]) {
-    float4 s = (xv[0] + xv[1]) + (xv[2] + xv[3]) + (xv[4] + xv[5]) + (xv[6] + xv[7]);
-    return (s.x + s.y) + (s.z + s.w);
-}
-
-// Exact GGML Q8_0 block (34 bytes / 32 elems: half d + 32 int8)
-static inline float dot_q8_0_reg(const device uchar* blk, thread const float4 xv[8]) {
+// Vectorized 64-bit `packed_ushort4 -> char4` GGML Q8_0 dot (34 bytes / 32 elems: half d + 32 int8)
+static inline float dot_q8_0_fast(const device uchar* blk, thread const float4 xv[8]) {
     float d = float(*(const device half*)blk);
-    const device char* qs = (const device char*)(blk + 2u);
-    float acc = 0.0f;
-    #pragma unroll
-    for (uint g = 0; g < 8u; g++) {
-        uint j = g * 4u;
-        float4 qv = float4(float(qs[j]), float(qs[j+1]), float(qs[j+2]), float(qs[j+3]));
-        acc += dot(qv, xv[g]);
-    }
-    return d * acc;
+    const device packed_ushort4* q64 = (const device packed_ushort4*)(blk + 2u);
+    ushort4 p0 = q64[0], p1 = q64[1], p2 = q64[2], p3 = q64[3];
+    float4 s0 = xv[0] * float4(as_type<char4>(p0.xy));
+    float4 s1 = xv[1] * float4(as_type<char4>(p0.zw));
+    s0 = fma(xv[2], float4(as_type<char4>(p1.xy)), s0);
+    s1 = fma(xv[3], float4(as_type<char4>(p1.zw)), s1);
+    s0 = fma(xv[4], float4(as_type<char4>(p2.xy)), s0);
+    s1 = fma(xv[5], float4(as_type<char4>(p2.zw)), s1);
+    s0 = fma(xv[6], float4(as_type<char4>(p3.xy)), s0);
+    s1 = fma(xv[7], float4(as_type<char4>(p3.zw)), s1);
+    float4 t = s0 + s1;
+    return d * ((t.x + t.y) + (t.z + t.w));
 }
 
 // Exact GGML Q4_K block (144 bytes / 256 elems)
@@ -560,7 +578,7 @@ kernel void moe_swiglu_mul(
 
 struct MoeGemvArgs { uint out_dim; uint in_dim; uint add_res; };
 
-// 4-row-per-SG register-reused Q4_0 GEMV (16 rows/TG)
+// 4-row-per-SG 64-bit vectorized Q4_0 GEMV (NSG=2 -> 8 rows/TG, 64 thr/TG for peak M4 Max occupancy!)
 kernel void moe_gemv_q4(
     const device uchar* w [[buffer(0)]],
     const device float* x [[buffer(1)]],
@@ -570,7 +588,7 @@ kernel void moe_gemv_q4(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    uint row0 = (tgid * 4u + sg) * 4u;
+    uint row0 = (tgid * 2u + sg) * 4u;
     if (row0 >= p.out_dim) return;
     uint nb = p.in_dim >> 5;
     ulong rb = (ulong)nb * 18ul;
@@ -580,13 +598,13 @@ kernel void moe_gemv_q4(
     const device uchar* wp3 = (row0 + 3u < p.out_dim) ? (wp0 + rb * 3ul) : wp0;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     for (uint b = lane; b < nb; b += 32u) {
-        thread float4 xv[8];
-        load_x32_reg(x + (b << 5), xv);
+        thread float4 xv_lo[4], xv_hi[4];
+        float xs = load_x32_q4(x + (b << 5), xv_lo, xv_hi);
         ulong boff = (ulong)b * 18ul;
-        a0 += dot_q4_0_reg(wp0 + boff, xv);
-        a1 += dot_q4_0_reg(wp1 + boff, xv);
-        a2 += dot_q4_0_reg(wp2 + boff, xv);
-        a3 += dot_q4_0_reg(wp3 + boff, xv);
+        a0 += dot_q4_0_fast(wp0 + boff, xv_lo, xv_hi, xs);
+        a1 += dot_q4_0_fast(wp1 + boff, xv_lo, xv_hi, xs);
+        a2 += dot_q4_0_fast(wp2 + boff, xv_lo, xv_hi, xs);
+        a3 += dot_q4_0_fast(wp3 + boff, xv_lo, xv_hi, xs);
     }
     a0 = simd_sum(a0); a1 = simd_sum(a1); a2 = simd_sum(a2); a3 = simd_sum(a3);
     if (lane == 0u) {
@@ -597,7 +615,7 @@ kernel void moe_gemv_q4(
     }
 }
 
-// 4-row-per-SG register-reused Q4_1 GEMV (16 rows/TG)
+// 4-row-per-SG 64-bit vectorized Q4_1 GEMV (NSG=2 -> 8 rows/TG, 64 thr/TG)
 kernel void moe_gemv_q4_1(
     const device uchar* w [[buffer(0)]],
     const device float* x [[buffer(1)]],
@@ -607,7 +625,7 @@ kernel void moe_gemv_q4_1(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    uint row0 = (tgid * 4u + sg) * 4u;
+    uint row0 = (tgid * 2u + sg) * 4u;
     if (row0 >= p.out_dim) return;
     uint nb = p.in_dim >> 5;
     ulong rb = (ulong)nb * 20ul;
@@ -617,14 +635,13 @@ kernel void moe_gemv_q4_1(
     const device uchar* wp3 = (row0 + 3u < p.out_dim) ? (wp0 + rb * 3ul) : wp0;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     for (uint b = lane; b < nb; b += 32u) {
-        thread float4 xv[8];
-        load_x32_reg(x + (b << 5), xv);
-        float sx = sum_x32_reg(xv);
+        thread float4 xv_lo[4], xv_hi[4];
+        float sx = load_x32_q4(x + (b << 5), xv_lo, xv_hi);
         ulong boff = (ulong)b * 20ul;
-        a0 += dot_q4_1_reg(wp0 + boff, xv, sx);
-        a1 += dot_q4_1_reg(wp1 + boff, xv, sx);
-        a2 += dot_q4_1_reg(wp2 + boff, xv, sx);
-        a3 += dot_q4_1_reg(wp3 + boff, xv, sx);
+        a0 += dot_q4_1_fast(wp0 + boff, xv_lo, xv_hi, sx);
+        a1 += dot_q4_1_fast(wp1 + boff, xv_lo, xv_hi, sx);
+        a2 += dot_q4_1_fast(wp2 + boff, xv_lo, xv_hi, sx);
+        a3 += dot_q4_1_fast(wp3 + boff, xv_lo, xv_hi, sx);
     }
     a0 = simd_sum(a0); a1 = simd_sum(a1); a2 = simd_sum(a2); a3 = simd_sum(a3);
     if (lane == 0u) {
@@ -635,7 +652,7 @@ kernel void moe_gemv_q4_1(
     }
 }
 
-// 2-row-per-SG Q8_0 GEMV (8 rows/TG)
+// 2-row-per-SG 64-bit vectorized Q8_0 GEMV (NSG=2 -> 4 rows/TG, 64 thr/TG)
 kernel void moe_gemv_q8(
     const device uchar* w [[buffer(0)]],
     const device float* x [[buffer(1)]],
@@ -645,7 +662,7 @@ kernel void moe_gemv_q8(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    uint row0 = (tgid * 4u + sg) * 2u;
+    uint row0 = (tgid * 2u + sg) * 2u;
     uint row1 = row0 + 1u;
     if (row0 >= p.out_dim) return;
     uint nb = p.in_dim >> 5;
@@ -655,10 +672,10 @@ kernel void moe_gemv_q8(
     float a0 = 0.0f, a1 = 0.0f;
     for (uint b = lane; b < nb; b += 32u) {
         thread float4 xv[8];
-        load_x32_reg(x + (b << 5), xv);
+        load_x32_f4(x + (b << 5), xv);
         ulong boff = (ulong)b * 34ul;
-        a0 += dot_q8_0_reg(wp0 + boff, xv);
-        if (row1 < p.out_dim) a1 += dot_q8_0_reg(wp1 + boff, xv);
+        a0 += dot_q8_0_fast(wp0 + boff, xv);
+        if (row1 < p.out_dim) a1 += dot_q8_0_fast(wp1 + boff, xv);
     }
     a0 = simd_sum(a0); a1 = simd_sum(a1);
     if (lane == 0u) {
@@ -790,7 +807,7 @@ kernel void moe_gemv_f32(
     if (lane == 0u) y[row] = p.add_res ? (y[row] + res) : res;
 }
 
-// Fused Dense SwiGLU Gate || Up Q4_0 (2 rows/SG = 8 rows/TG, shares xn across 4 weight rows!)
+// Fused Dense SwiGLU Gate || Up Q4_0 (NSG=2, 2 rows/SG = 4 rows/TG, shares compact half4 xn across 4 weight rows!)
 kernel void moe_dense_gate_up_q4(
     const device uchar* wg [[buffer(0)]],
     const device uchar* wu [[buffer(1)]],
@@ -801,7 +818,7 @@ kernel void moe_dense_gate_up_q4(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    uint row0 = (tgid * 4u + sg) * 2u;
+    uint row0 = (tgid * 2u + sg) * 2u;
     uint row1 = row0 + 1u;
     if (row0 >= p.out_dim) return;
     uint nb = p.in_dim >> 5;
@@ -812,13 +829,13 @@ kernel void moe_dense_gate_up_q4(
     const device uchar* u1 = (row1 < p.out_dim) ? (u0 + rb) : u0;
     float ag0 = 0.0f, ag1 = 0.0f, au0 = 0.0f, au1 = 0.0f;
     for (uint b = lane; b < nb; b += 32u) {
-        thread float4 xv[8];
-        load_x32_reg(xn + (b << 5), xv);
+        thread float4 xv_lo[4], xv_hi[4];
+        float xs = load_x32_q4(xn + (b << 5), xv_lo, xv_hi);
         ulong boff = (ulong)b * 18ul;
-        ag0 += dot_q4_0_reg(g0 + boff, xv);
-        au0 += dot_q4_0_reg(u0 + boff, xv);
-        ag1 += dot_q4_0_reg(g1 + boff, xv);
-        au1 += dot_q4_0_reg(u1 + boff, xv);
+        ag0 += dot_q4_0_fast(g0 + boff, xv_lo, xv_hi, xs);
+        au0 += dot_q4_0_fast(u0 + boff, xv_lo, xv_hi, xs);
+        ag1 += dot_q4_0_fast(g1 + boff, xv_lo, xv_hi, xs);
+        au1 += dot_q4_0_fast(u1 + boff, xv_lo, xv_hi, xs);
     }
     ag0 = simd_sum(ag0); au0 = simd_sum(au0);
     ag1 = simd_sum(ag1); au1 = simd_sum(au1);
@@ -1030,7 +1047,7 @@ kernel void moe_topk_gate_up_q4(
     uint lane [[thread_index_in_simdgroup]]
 ) {
     uint slot = tgid.y;
-    uint row0 = (tgid.x * 4u + sg) * 2u;
+    uint row0 = (tgid.x * 2u + sg) * 2u;
     uint row1 = row0 + 1u;
     if (slot >= p.n_active || row0 >= p.d_ff) return;
     uint eid = e_idx[slot];
@@ -1042,13 +1059,13 @@ kernel void moe_topk_gate_up_q4(
     const device uchar* wu1 = (row1 < p.d_ff) ? (wu0 + rb) : wu0;
     float ag0 = 0.0f, ag1 = 0.0f, au0 = 0.0f, au1 = 0.0f;
     for (uint b = lane; b < nb; b += 32u) {
-        thread float4 xv[8];
-        load_x32_reg(xn + (b << 5), xv);
+        thread float4 xv_lo[4], xv_hi[4];
+        float xs = load_x32_q4(xn + (b << 5), xv_lo, xv_hi);
         ulong boff = (ulong)b * 18ul;
-        ag0 += dot_q4_0_reg(wg0 + boff, xv);
-        au0 += dot_q4_0_reg(wu0 + boff, xv);
-        ag1 += dot_q4_0_reg(wg1 + boff, xv);
-        au1 += dot_q4_0_reg(wu1 + boff, xv);
+        ag0 += dot_q4_0_fast(wg0 + boff, xv_lo, xv_hi, xs);
+        au0 += dot_q4_0_fast(wu0 + boff, xv_lo, xv_hi, xs);
+        ag1 += dot_q4_0_fast(wg1 + boff, xv_lo, xv_hi, xs);
+        au1 += dot_q4_0_fast(wu1 + boff, xv_lo, xv_hi, xs);
     }
     ag0 = simd_sum(ag0); au0 = simd_sum(au0);
     ag1 = simd_sum(ag1); au1 = simd_sum(au1);
@@ -1069,7 +1086,7 @@ kernel void moe_topk_down_accum_q4(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    uint row0 = (tgid * 4u + sg) * 4u;
+    uint row0 = (tgid * 2u + sg) * 4u;
     if (row0 >= p.d_model) return;
     uint nb = p.d_ff >> 5;
     ulong rb = (ulong)nb * 18ul;
@@ -1083,13 +1100,13 @@ kernel void moe_topk_down_accum_q4(
         const device float* hp = h_in + (ulong)s * p.d_ff;
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         for (uint b = lane; b < nb; b += 32u) {
-            thread float4 hv[8];
-            load_x32_reg(hp + (b << 5), hv);
+            thread float4 hv_lo[4], hv_hi[4];
+            float hs = load_x32_q4(hp + (b << 5), hv_lo, hv_hi);
             ulong boff = (ulong)b * 18ul;
-            a0 += dot_q4_0_reg(wd0 + boff, hv);
-            a1 += dot_q4_0_reg(wd1 + boff, hv);
-            a2 += dot_q4_0_reg(wd2 + boff, hv);
-            a3 += dot_q4_0_reg(wd3 + boff, hv);
+            a0 += dot_q4_0_fast(wd0 + boff, hv_lo, hv_hi, hs);
+            a1 += dot_q4_0_fast(wd1 + boff, hv_lo, hv_hi, hs);
+            a2 += dot_q4_0_fast(wd2 + boff, hv_lo, hv_hi, hs);
+            a3 += dot_q4_0_fast(wd3 + boff, hv_lo, hv_hi, hs);
         }
         float w = e_wt[s];
         t0 = fma(w, simd_sum(a0), t0); t1 = fma(w, simd_sum(a1), t1);
@@ -1114,7 +1131,7 @@ kernel void moe_topk_down_accum_q4_1(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    uint row0 = (tgid * 4u + sg) * 4u;
+    uint row0 = (tgid * 2u + sg) * 4u;
     if (row0 >= p.d_model) return;
     uint nb = p.d_ff >> 5;
     ulong rb = (ulong)nb * 20ul;
@@ -1128,14 +1145,13 @@ kernel void moe_topk_down_accum_q4_1(
         const device float* hp = h_in + (ulong)s * p.d_ff;
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         for (uint b = lane; b < nb; b += 32u) {
-            thread float4 hv[8];
-            load_x32_reg(hp + (b << 5), hv);
-            float sh = sum_x32_reg(hv);
+            thread float4 hv_lo[4], hv_hi[4];
+            float sh = load_x32_q4(hp + (b << 5), hv_lo, hv_hi);
             ulong boff = (ulong)b * 20ul;
-            a0 += dot_q4_1_reg(wd0 + boff, hv, sh);
-            a1 += dot_q4_1_reg(wd1 + boff, hv, sh);
-            a2 += dot_q4_1_reg(wd2 + boff, hv, sh);
-            a3 += dot_q4_1_reg(wd3 + boff, hv, sh);
+            a0 += dot_q4_1_fast(wd0 + boff, hv_lo, hv_hi, sh);
+            a1 += dot_q4_1_fast(wd1 + boff, hv_lo, hv_hi, sh);
+            a2 += dot_q4_1_fast(wd2 + boff, hv_lo, hv_hi, sh);
+            a3 += dot_q4_1_fast(wd3 + boff, hv_lo, hv_hi, sh);
         }
         float w = e_wt[s];
         t0 = fma(w, simd_sum(a0), t0); t1 = fma(w, simd_sum(a1), t1);
@@ -1160,7 +1176,7 @@ kernel void moe_slot_gate_up_q4(
     uint lane [[thread_index_in_simdgroup]]
 ) {
     uint s = tgid.y;
-    uint row0 = (tgid.x * 4u + sg) * 2u;
+    uint row0 = (tgid.x * 2u + sg) * 2u;
     uint row1 = row0 + 1u;
     if (s >= p.n_active || row0 >= p.d_ff) return;
     uint cslot = slot_ids[s];
@@ -1173,13 +1189,13 @@ kernel void moe_slot_gate_up_q4(
     const device uchar* wu1 = (row1 < p.d_ff) ? (wu0 + rb) : wu0;
     float ag0 = 0.0f, ag1 = 0.0f, au0 = 0.0f, au1 = 0.0f;
     for (uint b = lane; b < nb; b += 32u) {
-        thread float4 xv[8];
-        load_x32_reg(xn + (b << 5), xv);
+        thread float4 xv_lo[4], xv_hi[4];
+        float xs = load_x32_q4(xn + (b << 5), xv_lo, xv_hi);
         ulong boff = (ulong)b * 18ul;
-        ag0 += dot_q4_0_reg(wg0 + boff, xv);
-        au0 += dot_q4_0_reg(wu0 + boff, xv);
-        ag1 += dot_q4_0_reg(wg1 + boff, xv);
-        au1 += dot_q4_0_reg(wu1 + boff, xv);
+        ag0 += dot_q4_0_fast(wg0 + boff, xv_lo, xv_hi, xs);
+        au0 += dot_q4_0_fast(wu0 + boff, xv_lo, xv_hi, xs);
+        ag1 += dot_q4_0_fast(wg1 + boff, xv_lo, xv_hi, xs);
+        au1 += dot_q4_0_fast(wu1 + boff, xv_lo, xv_hi, xs);
     }
     ag0 = simd_sum(ag0); au0 = simd_sum(au0);
     ag1 = simd_sum(ag1); au1 = simd_sum(au1);
@@ -1200,7 +1216,7 @@ kernel void moe_slot_down_accum_q4(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    uint row0 = (tgid * 4u + sg) * 4u;
+    uint row0 = (tgid * 2u + sg) * 4u;
     if (row0 >= p.d_model) return;
     uint nb = p.d_ff >> 5;
     ulong rb = (ulong)nb * 18ul;
@@ -1215,13 +1231,13 @@ kernel void moe_slot_down_accum_q4(
         const device float* hp = h_in + (ulong)s * p.d_ff;
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         for (uint b = lane; b < nb; b += 32u) {
-            thread float4 hv[8];
-            load_x32_reg(hp + (b << 5), hv);
+            thread float4 hv_lo[4], hv_hi[4];
+            float hs = load_x32_q4(hp + (b << 5), hv_lo, hv_hi);
             ulong boff = (ulong)b * 18ul;
-            a0 += dot_q4_0_reg(wd0 + boff, hv);
-            a1 += dot_q4_0_reg(wd1 + boff, hv);
-            a2 += dot_q4_0_reg(wd2 + boff, hv);
-            a3 += dot_q4_0_reg(wd3 + boff, hv);
+            a0 += dot_q4_0_fast(wd0 + boff, hv_lo, hv_hi, hs);
+            a1 += dot_q4_0_fast(wd1 + boff, hv_lo, hv_hi, hs);
+            a2 += dot_q4_0_fast(wd2 + boff, hv_lo, hv_hi, hs);
+            a3 += dot_q4_0_fast(wd3 + boff, hv_lo, hv_hi, hs);
         }
         float w = e_wt[s];
         t0 = fma(w, simd_sum(a0), t0); t1 = fma(w, simd_sum(a1), t1);
@@ -1246,7 +1262,7 @@ kernel void moe_slot_down_accum_q4_1(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    uint row0 = (tgid * 4u + sg) * 4u;
+    uint row0 = (tgid * 2u + sg) * 4u;
     if (row0 >= p.d_model) return;
     uint nb = p.d_ff >> 5;
     ulong rb = (ulong)nb * 20ul;
@@ -1261,14 +1277,13 @@ kernel void moe_slot_down_accum_q4_1(
         const device float* hp = h_in + (ulong)s * p.d_ff;
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         for (uint b = lane; b < nb; b += 32u) {
-            thread float4 hv[8];
-            load_x32_reg(hp + (b << 5), hv);
-            float sh = sum_x32_reg(hv);
+            thread float4 hv_lo[4], hv_hi[4];
+            float sh = load_x32_q4(hp + (b << 5), hv_lo, hv_hi);
             ulong boff = (ulong)b * 20ul;
-            a0 += dot_q4_1_reg(wd0 + boff, hv, sh);
-            a1 += dot_q4_1_reg(wd1 + boff, hv, sh);
-            a2 += dot_q4_1_reg(wd2 + boff, hv, sh);
-            a3 += dot_q4_1_reg(wd3 + boff, hv, sh);
+            a0 += dot_q4_1_fast(wd0 + boff, hv_lo, hv_hi, sh);
+            a1 += dot_q4_1_fast(wd1 + boff, hv_lo, hv_hi, sh);
+            a2 += dot_q4_1_fast(wd2 + boff, hv_lo, hv_hi, sh);
+            a3 += dot_q4_1_fast(wd3 + boff, hv_lo, hv_hi, sh);
         }
         float w = e_wt[s];
         t0 = fma(w, simd_sum(a0), t0); t1 = fma(w, simd_sum(a1), t1);
@@ -1902,15 +1917,16 @@ static void encode_gemv_raw(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> buf,
     struct { uint32_t out_dim, in_dim, add_res; } args = { out_dim, in_dim, add_res };
     id<MTLComputePipelineState> pso = g_pso_gemv_q4;
     NSUInteger rows_per_tg = 4;
+    NSUInteger tptg = 128;
     switch (gtype) {
-        case TN_GGML_Q4_0: pso = g_pso_gemv_q4;   rows_per_tg = 16; break;
-        case TN_GGML_Q4_1: pso = g_pso_gemv_q4_1; rows_per_tg = 16; break;
-        case TN_GGML_Q8_0: pso = g_pso_gemv_q8;   rows_per_tg = 8;  break;
-        case TN_GGML_Q4_K: pso = g_pso_gemv_q4k;  rows_per_tg = 4;  break;
-        case TN_GGML_Q5_K: pso = g_pso_gemv_q5k;  rows_per_tg = 8;  break;
-        case TN_GGML_Q6_K: pso = g_pso_gemv_q6k;  rows_per_tg = 8;  break;
-        case TN_GGML_F16:  pso = g_pso_gemv_f16;  rows_per_tg = 4;  break;
-        default:           pso = g_pso_gemv_f32;  rows_per_tg = 4;  break;
+        case TN_GGML_Q4_0: pso = g_pso_gemv_q4;   rows_per_tg = 8; tptg = 64; break;
+        case TN_GGML_Q4_1: pso = g_pso_gemv_q4_1; rows_per_tg = 8; tptg = 64; break;
+        case TN_GGML_Q8_0: pso = g_pso_gemv_q8;   rows_per_tg = 4; tptg = 64; break;
+        case TN_GGML_Q4_K: pso = g_pso_gemv_q4k;  rows_per_tg = 4; break;
+        case TN_GGML_Q5_K: pso = g_pso_gemv_q5k;  rows_per_tg = 8; break;
+        case TN_GGML_Q6_K: pso = g_pso_gemv_q6k;  rows_per_tg = 8; break;
+        case TN_GGML_F16:  pso = g_pso_gemv_f16;  rows_per_tg = 4; break;
+        default:           pso = g_pso_gemv_f32;  rows_per_tg = 4; break;
     }
     [enc setComputePipelineState:pso];
     [enc setBuffer:buf offset:(NSUInteger)off atIndex:0];
@@ -1918,7 +1934,7 @@ static void encode_gemv_raw(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> buf,
     [enc setBuffer:y offset:0 atIndex:2];
     [enc setBytes:&args length:sizeof(args) atIndex:3];
     [enc dispatchThreadgroups:MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        threadsPerThreadgroup:MTLSizeMake(tptg, 1, 1)];
 }
 
 static void encode_gemv(id<MTLComputeCommandEncoder> enc, const MoeWeightRef* w, id<MTLBuffer> x, id<MTLBuffer> y,
@@ -1962,7 +1978,7 @@ static void encode_dense_ffn_raw(
         [enc setBuffer:m->buf_xn offset:0 atIndex:2];
         [enc setBuffer:m->buf_sh_g offset:0 atIndex:3];
         [enc setBytes:&args length:sizeof(args) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake((d_ff + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake((d_ff + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     } else {
         encode_gemv_raw(enc, g_buf, g_off, g_type, m->buf_xn, m->buf_sh_g, d_ff, dm, 0);
         encode_gemv_raw(enc, u_buf, u_off, u_type, m->buf_xn, m->buf_sh_u, d_ff, dm, 0);
@@ -2090,7 +2106,10 @@ static void cpu_router_topk_from_logits(
 
 static void schedule_next_layer_prefetch(MoeModel* m, int next_L) {
     if (!m->enable_overlap || next_L >= m->n_layers) return;
-    if (m->cache_slots_per_layer < m->top_k + 4) return; // Don't thrash extreme minimal Top-K caches!
+    // Only speculate when cache is large enough to avoid thrashing (>= top_k+4) AND small enough (< 50% experts)
+    // that misses are frequent; at >=50% cache (e.g. 64-80/128), natural LRU hit rate is already ~90% so
+    // speculative mispredicts only add wasted SSD traffic and cache pollution!
+    if (m->cache_slots_per_layer < m->top_k + 4 || m->cache_slots_per_layer * 2 >= m->n_experts) return;
     MoeLayer* nly = &m->layers[next_L];
     if (nly->is_dense || !nly->router_host) return;
     const float* x_cur = (const float*)[m->buf_x contents];
@@ -2170,6 +2189,28 @@ static void encode_final_lm_head(MoeModel* m, id<MTLComputeCommandEncoder> enc) 
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
+static int encode_tail_until_next_moe(MoeModel* m, id<MTLComputeCommandEncoder> enc, int start_L, uint32_t pos) {
+    int L = start_L;
+    while (L < m->n_layers && m->layers[L].is_dense) {
+        MoeLayer* ly = &m->layers[L];
+        encode_layer_attn_body(m, enc, L, pos, nil);
+        encode_dense_ffn_raw(m, enc,
+            ly->ffn_gate.buf, ly->ffn_gate.offset, ly->ffn_gate.ggml_type,
+            ly->ffn_up.buf,   ly->ffn_up.offset,   ly->ffn_up.ggml_type,
+            ly->ffn_down.buf, ly->ffn_down.offset, ly->ffn_down.ggml_type,
+            (uint32_t)m->d_ff_dense);
+        L++;
+    }
+    if (L < m->n_layers) {
+        MoeLayer* ly = &m->layers[L];
+        encode_layer_attn_body(m, enc, L, pos, nil);
+        encode_gemv(enc, &ly->router, m->buf_xn, m->buf_rlogits, (uint32_t)m->n_experts, (uint32_t)m->d_model, 0);
+    } else {
+        encode_final_lm_head(m, enc);
+    }
+    return L;
+}
+
 int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
     if (handle <= 0 || handle >= MOE_MAX_MODELS || !g_moe[handle].active) return 0;
     @autoreleasepool {
@@ -2227,8 +2268,8 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                     [enc setBuffer:m->buf_eidx offset:0 atIndex:3];
                     [enc setBuffer:m->buf_h offset:0 atIndex:4];
                     [enc setBytes:&margs length:sizeof(margs) atIndex:5];
-                    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_ff_exp + 7) / 8), (NSUInteger)m->top_k, 1)
-                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_ff_exp + 3) / 4), (NSUInteger)m->top_k, 1)
+                        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
 
                     [enc setComputePipelineState:(ly->down_exps.ggml_type == TN_GGML_Q4_1 ? g_pso_moe_down_q4_1 : g_pso_moe_down_q4)];
                     [enc setBuffer:ly->down_exps.buf offset:(NSUInteger)ly->down_exps.offset atIndex:0];
@@ -2237,8 +2278,8 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                     [enc setBuffer:m->buf_ewt offset:0 atIndex:3];
                     [enc setBuffer:m->buf_x offset:0 atIndex:4];
                     [enc setBytes:&margs length:sizeof(margs) atIndex:5];
-                    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_model + 15) / 16), 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_model + 7) / 8), 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                     m->cache_hits += m->top_k;
                 }
             }
@@ -2340,42 +2381,21 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
         }
 
         // =========================================================================
-        // PATH C: SPARSE MoE ON-DEMAND STREAMING MODE (Bounded Per-Layer LRU Pool + Hit||Miss Overlap!)
+        // PATH C: SPARSE MoE ON-DEMAND STREAMING MODE (Bounded Per-Layer LRU Pool + Fused MoE(L)+Attn(L+1) CB!)
         // =========================================================================
+        int L = 0;
         {
-            id<MTLCommandBuffer> ecmd = [g_moe_q commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [ecmd computeCommandEncoder];
-            encode_embed_step(m, enc, (uint32_t)tok_id);
-            [enc endEncoding];
-            [ecmd commit];
+            id<MTLCommandBuffer> icmd = [g_moe_q commandBuffer];
+            id<MTLComputeCommandEncoder> ienc = [icmd computeCommandEncoder];
+            encode_embed_step(m, ienc, (uint32_t)tok_id);
+            L = encode_tail_until_next_moe(m, ienc, 0, (uint32_t)pos);
+            [ienc endEncoding];
+            [icmd commit];
+            [icmd waitUntilCompleted];
         }
 
-        for (int L = 0; L < m->n_layers; L++) {
+        while (L < m->n_layers) {
             MoeLayer* ly = &m->layers[L];
-            if (ly->is_dense) {
-                // Leading Dense block (e.g. GLM-4.5 blk.0) — pinned in core VRAM!
-                id<MTLCommandBuffer> dcmd = [g_moe_q commandBuffer];
-                id<MTLComputeCommandEncoder> denc = [dcmd computeCommandEncoder];
-                encode_layer_attn_body(m, denc, L, (uint32_t)pos, nil);
-                encode_dense_ffn_raw(m, denc,
-                    ly->ffn_gate.buf, ly->ffn_gate.offset, ly->ffn_gate.ggml_type,
-                    ly->ffn_up.buf,   ly->ffn_up.offset,   ly->ffn_up.ggml_type,
-                    ly->ffn_down.buf, ly->ffn_down.offset, ly->ffn_down.ggml_type,
-                    (uint32_t)m->d_ff_dense);
-                [denc endEncoding];
-                [dcmd commit];
-                [dcmd waitUntilCompleted];
-                continue;
-            }
-
-            // Step 1: Attention + FFN-Norm + Router logits on GPU
-            id<MTLCommandBuffer> acmd = [g_moe_q commandBuffer];
-            id<MTLComputeCommandEncoder> aenc = [acmd computeCommandEncoder];
-            encode_layer_attn_body(m, aenc, L, (uint32_t)pos, nil);
-            encode_gemv(aenc, &ly->router, m->buf_xn, m->buf_rlogits, (uint32_t)m->n_experts, (uint32_t)m->d_model, 0);
-            [aenc endEncoding];
-            [acmd commit];
-            [acmd waitUntilCompleted];
 
             // Ensure any speculative prefetch targeting Layer L has finished writing cache slots!
             dispatch_group_wait(m->prefetch_grp, DISPATCH_TIME_FOREVER);
@@ -2420,7 +2440,7 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                 ? g_pso_moe_slot_down_q4_1 : g_pso_moe_slot_down_q4;
 
             if (!m->enable_overlap) {
-                // Naive Synchronous Serial Baseline
+                // Naive Synchronous Serial Baseline (also benefits from 1-CB fused MoE(L)+Attn(L+1)!)
                 double io0 = moe_now_ms();
                 for (int mi = 0; mi < n_misses; mi++) load_expert_into_slot(m, L, miss_eids[mi], miss_slots[mi]);
                 ssd_acc_ms += (moe_now_ms() - io0);
@@ -2450,7 +2470,7 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                 [menc setBuffer:m->buf_eidx offset:0 atIndex:2];
                 [menc setBuffer:m->buf_h offset:0 atIndex:3];
                 [menc setBytes:&margs length:sizeof(margs) atIndex:4];
-                [menc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_ff_exp + 7) / 8), (NSUInteger)tot_a, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [menc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_ff_exp + 3) / 4), (NSUInteger)tot_a, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                 [menc setComputePipelineState:down_pso];
                 [menc setBuffer:ly->cache_buf offset:0 atIndex:0];
                 [menc setBuffer:m->buf_h offset:0 atIndex:1];
@@ -2458,10 +2478,57 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                 [menc setBuffer:m->buf_ewt offset:0 atIndex:3];
                 [menc setBuffer:m->buf_x offset:0 atIndex:4];
                 [menc setBytes:&margs length:sizeof(margs) atIndex:5];
-                [menc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_model + 15) / 16), 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [menc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_model + 7) / 8), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                int next_L = encode_tail_until_next_moe(m, menc, L + 1, (uint32_t)pos);
                 [menc endEncoding];
                 [mcmd commit];
                 [mcmd waitUntilCompleted];
+                L = next_L;
+            } else if (n_misses == 0) {
+                // ZERO-MISS FAST PATH: Fuse SharedExp + All Hits(L) + Attn+Router(L+1) in ONE single CommandBuffer!
+                if (n_hits > 0) {
+                    uint32_t hs[MOE_MAX_TOPK];
+                    for (int hi = 0; hi < n_hits; hi++) hs[hi] = (uint32_t)hit_slots[hi];
+                    memcpy([m->buf_eidx contents], hs, (size_t)n_hits * 4);
+                    memcpy([m->buf_ewt contents], hit_w, (size_t)n_hits * 4);
+                }
+                id<MTLCommandBuffer> hcmd = [g_moe_q commandBuffer];
+                id<MTLComputeCommandEncoder> henc = [hcmd computeCommandEncoder];
+                if (ly->has_shared_exp) {
+                    encode_dense_ffn_raw(m, henc,
+                        ly->sh_gate.buf, ly->sh_gate.offset, ly->sh_gate.ggml_type,
+                        ly->sh_up.buf,   ly->sh_up.offset,   ly->sh_up.ggml_type,
+                        ly->sh_down.buf, ly->sh_down.offset, ly->sh_down.ggml_type,
+                        (uint32_t)m->d_ff_exp);
+                }
+                if (n_hits > 0) {
+                    struct { uint32_t dm, df, na; uint64_t gb, ub, db, sb; } margs = {
+                        (uint32_t)m->d_model, (uint32_t)m->d_ff_exp, (uint32_t)n_hits,
+                        ly->gate_exp_bytes, ly->up_exp_bytes, ly->down_exp_bytes, ly->slot_stride_bytes
+                    };
+                    [henc setComputePipelineState:g_pso_moe_slot_gu_q4];
+                    [henc setBuffer:ly->cache_buf offset:0 atIndex:0];
+                    [henc setBuffer:m->buf_xn offset:0 atIndex:1];
+                    [henc setBuffer:m->buf_eidx offset:0 atIndex:2];
+                    [henc setBuffer:m->buf_h offset:0 atIndex:3];
+                    [henc setBytes:&margs length:sizeof(margs) atIndex:4];
+                    [henc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_ff_exp + 3) / 4), (NSUInteger)n_hits, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                    [henc setComputePipelineState:down_pso];
+                    [henc setBuffer:ly->cache_buf offset:0 atIndex:0];
+                    [henc setBuffer:m->buf_h offset:0 atIndex:1];
+                    [henc setBuffer:m->buf_eidx offset:0 atIndex:2];
+                    [henc setBuffer:m->buf_ewt offset:0 atIndex:3];
+                    [henc setBuffer:m->buf_x offset:0 atIndex:4];
+                    [henc setBytes:&margs length:sizeof(margs) atIndex:5];
+                    [henc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_model + 7) / 8), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                }
+                // Snapshot pre-MoE residual for optional low-cache prefetch before GPU mutates buf_x!
+                int next_L = encode_tail_until_next_moe(m, henc, L + 1, (uint32_t)pos);
+                [henc endEncoding];
+                schedule_next_layer_prefetch(m, next_L);
+                [hcmd commit];
+                [hcmd waitUntilCompleted];
+                L = next_L;
             } else {
                 // TENON SMART ASYNC STREAMER: (SharedExp + HIT Experts) GPU Compute || Parallel NVMe `pread()` for MISSES!
                 id<MTLCommandBuffer> hcmd = nil;
@@ -2492,7 +2559,7 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                         [henc setBuffer:m->buf_eidx offset:0 atIndex:2];
                         [henc setBuffer:m->buf_h offset:0 atIndex:3];
                         [henc setBytes:&margs length:sizeof(margs) atIndex:4];
-                        [henc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_ff_exp + 7) / 8), (NSUInteger)n_hits, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        [henc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_ff_exp + 3) / 4), (NSUInteger)n_hits, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                         [henc setComputePipelineState:down_pso];
                         [henc setBuffer:ly->cache_buf offset:0 atIndex:0];
                         [henc setBuffer:m->buf_h offset:0 atIndex:1];
@@ -2500,13 +2567,13 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                         [henc setBuffer:m->buf_ewt offset:0 atIndex:3];
                         [henc setBuffer:m->buf_x offset:0 atIndex:4];
                         [henc setBytes:&margs length:sizeof(margs) atIndex:5];
-                        [henc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_model + 15) / 16), 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        [henc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_model + 7) / 8), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                     }
                     [henc endEncoding];
                     [hcmd commit];
                 }
 
-                if (n_misses > 0) {
+                {
                     double io0 = moe_now_ms();
                     int* p_eids = miss_eids;
                     int* p_slots = miss_slots;
@@ -2518,48 +2585,40 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
 
                 if (hcmd) [hcmd waitUntilCompleted];
 
-                if (n_misses == 0) {
-                    schedule_next_layer_prefetch(m, L + 1);
-                } else {
-                    uint32_t ms_u[MOE_MAX_TOPK];
-                    for (int mi = 0; mi < n_misses; mi++) ms_u[mi] = (uint32_t)miss_slots[mi];
-                    memcpy([m->buf_eidx contents], ms_u, (size_t)n_misses * 4);
-                    memcpy([m->buf_ewt contents], miss_w, (size_t)n_misses * 4);
-                    id<MTLCommandBuffer> mcmd = [g_moe_q commandBuffer];
-                    id<MTLComputeCommandEncoder> menc = [mcmd computeCommandEncoder];
-                    struct { uint32_t dm, df, na; uint64_t gb, ub, db, sb; } margs = {
-                        (uint32_t)m->d_model, (uint32_t)m->d_ff_exp, (uint32_t)n_misses,
-                        ly->gate_exp_bytes, ly->up_exp_bytes, ly->down_exp_bytes, ly->slot_stride_bytes
-                    };
-                    [menc setComputePipelineState:g_pso_moe_slot_gu_q4];
-                    [menc setBuffer:ly->cache_buf offset:0 atIndex:0];
-                    [menc setBuffer:m->buf_xn offset:0 atIndex:1];
-                    [menc setBuffer:m->buf_eidx offset:0 atIndex:2];
-                    [menc setBuffer:m->buf_h offset:0 atIndex:3];
-                    [menc setBytes:&margs length:sizeof(margs) atIndex:4];
-                    [menc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_ff_exp + 7) / 8), (NSUInteger)n_misses, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                    [menc setComputePipelineState:down_pso];
-                    [menc setBuffer:ly->cache_buf offset:0 atIndex:0];
-                    [menc setBuffer:m->buf_h offset:0 atIndex:1];
-                    [menc setBuffer:m->buf_eidx offset:0 atIndex:2];
-                    [menc setBuffer:m->buf_ewt offset:0 atIndex:3];
-                    [menc setBuffer:m->buf_x offset:0 atIndex:4];
-                    [menc setBytes:&margs length:sizeof(margs) atIndex:5];
-                    [menc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_model + 15) / 16), 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                    [menc endEncoding];
-                    [mcmd commit];
-                    schedule_next_layer_prefetch(m, L + 1);
-                    [mcmd waitUntilCompleted];
-                }
+                uint32_t ms_u[MOE_MAX_TOPK];
+                for (int mi = 0; mi < n_misses; mi++) ms_u[mi] = (uint32_t)miss_slots[mi];
+                memcpy([m->buf_eidx contents], ms_u, (size_t)n_misses * 4);
+                memcpy([m->buf_ewt contents], miss_w, (size_t)n_misses * 4);
+                id<MTLCommandBuffer> mcmd = [g_moe_q commandBuffer];
+                id<MTLComputeCommandEncoder> menc = [mcmd computeCommandEncoder];
+                struct { uint32_t dm, df, na; uint64_t gb, ub, db, sb; } margs = {
+                    (uint32_t)m->d_model, (uint32_t)m->d_ff_exp, (uint32_t)n_misses,
+                    ly->gate_exp_bytes, ly->up_exp_bytes, ly->down_exp_bytes, ly->slot_stride_bytes
+                };
+                [menc setComputePipelineState:g_pso_moe_slot_gu_q4];
+                [menc setBuffer:ly->cache_buf offset:0 atIndex:0];
+                [menc setBuffer:m->buf_xn offset:0 atIndex:1];
+                [menc setBuffer:m->buf_eidx offset:0 atIndex:2];
+                [menc setBuffer:m->buf_h offset:0 atIndex:3];
+                [menc setBytes:&margs length:sizeof(margs) atIndex:4];
+                [menc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_ff_exp + 3) / 4), (NSUInteger)n_misses, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [menc setComputePipelineState:down_pso];
+                [menc setBuffer:ly->cache_buf offset:0 atIndex:0];
+                [menc setBuffer:m->buf_h offset:0 atIndex:1];
+                [menc setBuffer:m->buf_eidx offset:0 atIndex:2];
+                [menc setBuffer:m->buf_ewt offset:0 atIndex:3];
+                [menc setBuffer:m->buf_x offset:0 atIndex:4];
+                [menc setBytes:&margs length:sizeof(margs) atIndex:5];
+                [menc dispatchThreadgroups:MTLSizeMake((NSUInteger)((m->d_model + 7) / 8), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                int next_L = encode_tail_until_next_moe(m, menc, L + 1, (uint32_t)pos);
+                [menc endEncoding];
+                // Read clean post-Hit buf_x BEFORE mcmd mutates it, then overlap prefetch with Misses(L)+Attn(L+1)!
+                schedule_next_layer_prefetch(m, next_L);
+                [mcmd commit];
+                [mcmd waitUntilCompleted];
+                L = next_L;
             }
         }
-
-        id<MTLCommandBuffer> fcmd = [g_moe_q commandBuffer];
-        id<MTLComputeCommandEncoder> fenc = [fcmd computeCommandEncoder];
-        encode_final_lm_head(m, fenc);
-        [fenc endEncoding];
-        [fcmd commit];
-        [fcmd waitUntilCompleted];
 
         double tot = moe_now_ms() - t0;
         m->last_total_ms = tot;
@@ -2674,39 +2733,54 @@ double tn_moe_last_timing_ms(int64_t handle, int64_t which) {
     return m->last_gpu_ms;
 }
 
+static inline void purge_mtl_buf(id<MTLBuffer> buf, int is_nocopy) {
+    if (!is_nocopy && buf != nil) {
+        [buf setPurgeableState:MTLPurgeableStateEmpty];
+    }
+}
+
 int64_t tn_moe_free(int64_t handle) {
     if (handle <= 0 || handle >= MOE_MAX_MODELS || !g_moe[handle].active) return 0;
-    MoeModel* m = &g_moe[handle];
-    if (m->prefetch_grp) dispatch_group_wait(m->prefetch_grp, DISPATCH_TIME_FOREVER);
-    if (m->dense_io_grp) dispatch_group_wait(m->dense_io_grp, DISPATCH_TIME_FOREVER);
-    for (int L = 0; L < m->n_layers; L++) {
-        MoeLayer* ly = &m->layers[L];
-        if (ly->router_host) { free(ly->router_host); ly->router_host = NULL; }
-        if (ly->ffn_norm_host) { free(ly->ffn_norm_host); ly->ffn_norm_host = NULL; }
-        if (ly->exp_bias_host) { free(ly->exp_bias_host); ly->exp_bias_host = NULL; }
-        ly->cache_buf = nil; ly->k_cache = nil; ly->v_cache = nil;
-        ly->attn_norm.buf = nil; ly->wq.buf = nil; ly->wk.buf = nil; ly->wv.buf = nil; ly->wo.buf = nil;
-        ly->bq.buf = nil; ly->bk.buf = nil; ly->bv.buf = nil;
-        ly->q_norm.buf = nil; ly->k_norm.buf = nil; ly->ffn_norm.buf = nil; ly->router.buf = nil;
-        ly->exp_bias.buf = nil; ly->ffn_gate.buf = nil; ly->ffn_up.buf = nil; ly->ffn_down.buf = nil;
-        ly->gate_exps.buf = nil; ly->up_exps.buf = nil; ly->down_exps.buf = nil;
-        ly->sh_gate.buf = nil; ly->sh_up.buf = nil; ly->sh_down.buf = nil;
+    @autoreleasepool {
+        MoeModel* m = &g_moe[handle];
+        if (m->prefetch_grp) dispatch_group_wait(m->prefetch_grp, DISPATCH_TIME_FOREVER);
+        if (m->dense_io_grp) dispatch_group_wait(m->dense_io_grp, DISPATCH_TIME_FOREVER);
+        int nc = m->resident_mode;
+        for (int L = 0; L < m->n_layers; L++) {
+            MoeLayer* ly = &m->layers[L];
+            if (ly->router_host) { free(ly->router_host); ly->router_host = NULL; }
+            if (ly->ffn_norm_host) { free(ly->ffn_norm_host); ly->ffn_norm_host = NULL; }
+            if (ly->exp_bias_host) { free(ly->exp_bias_host); ly->exp_bias_host = NULL; }
+            purge_mtl_buf(ly->cache_buf, 0);
+            purge_mtl_buf(ly->wq.buf, nc); purge_mtl_buf(ly->wk.buf, nc);
+            purge_mtl_buf(ly->wv.buf, nc); purge_mtl_buf(ly->wo.buf, nc);
+            purge_mtl_buf(ly->ffn_gate.buf, nc); purge_mtl_buf(ly->ffn_up.buf, nc); purge_mtl_buf(ly->ffn_down.buf, nc);
+            purge_mtl_buf(ly->sh_gate.buf, nc); purge_mtl_buf(ly->sh_up.buf, nc); purge_mtl_buf(ly->sh_down.buf, nc);
+            ly->cache_buf = nil; ly->k_cache = nil; ly->v_cache = nil;
+            ly->attn_norm.buf = nil; ly->wq.buf = nil; ly->wk.buf = nil; ly->wv.buf = nil; ly->wo.buf = nil;
+            ly->bq.buf = nil; ly->bk.buf = nil; ly->bv.buf = nil;
+            ly->q_norm.buf = nil; ly->k_norm.buf = nil; ly->ffn_norm.buf = nil; ly->router.buf = nil;
+            ly->exp_bias.buf = nil; ly->ffn_gate.buf = nil; ly->ffn_up.buf = nil; ly->ffn_down.buf = nil;
+            ly->gate_exps.buf = nil; ly->up_exps.buf = nil; ly->down_exps.buf = nil;
+            ly->sh_gate.buf = nil; ly->sh_up.buf = nil; ly->sh_down.buf = nil;
+        }
+        if (m->vocab_tokens) {
+            for (int i = 0; i < m->vocab_size; i++) free(m->vocab_tokens[i]);
+            free(m->vocab_tokens);
+            m->vocab_tokens = NULL;
+        }
+        for (int s = 0; s < 4; s++) { purge_mtl_buf(m->dense_ping[s], 0); m->dense_ping[s] = nil; }
+        purge_mtl_buf(m->tok_embd.buf, nc); purge_mtl_buf(m->lm_head.buf, nc);
+        m->tok_embd.buf = nil; m->out_norm.buf = nil; m->lm_head.buf = nil; m->rope_freqs.buf = nil;
+        m->buf_emb_row = nil; m->buf_x = nil; m->buf_xn = nil; m->buf_q = nil; m->buf_k = nil; m->buf_v = nil;
+        m->buf_ctx = nil; m->buf_rlogits = nil; m->buf_eidx = nil; m->buf_ewt = nil;
+        m->buf_h = nil; m->buf_sh_g = nil; m->buf_sh_u = nil; m->buf_logits = nil; m->buf_argmax = nil;
+        for (int s = 0; s < m->n_shards; s++) {
+            m->mmap_mtl_bufs[s] = nil;
+            if (m->mmap_ptrs[s] && m->mmap_ptrs[s] != MAP_FAILED) { munmap(m->mmap_ptrs[s], m->mmap_lens[s]); m->mmap_ptrs[s] = NULL; }
+            if (m->fds[s] >= 0) { close(m->fds[s]); m->fds[s] = -1; }
+        }
+        m->active = 0;
     }
-    if (m->vocab_tokens) {
-        for (int i = 0; i < m->vocab_size; i++) free(m->vocab_tokens[i]);
-        free(m->vocab_tokens);
-        m->vocab_tokens = NULL;
-    }
-    for (int s = 0; s < 4; s++) m->dense_ping[s] = nil;
-    m->tok_embd.buf = nil; m->out_norm.buf = nil; m->lm_head.buf = nil; m->rope_freqs.buf = nil;
-    m->buf_emb_row = nil; m->buf_x = nil; m->buf_xn = nil; m->buf_q = nil; m->buf_k = nil; m->buf_v = nil;
-    m->buf_ctx = nil; m->buf_rlogits = nil; m->buf_eidx = nil; m->buf_ewt = nil;
-    m->buf_h = nil; m->buf_sh_g = nil; m->buf_sh_u = nil; m->buf_logits = nil; m->buf_argmax = nil;
-    for (int s = 0; s < m->n_shards; s++) {
-        m->mmap_mtl_bufs[s] = nil;
-        if (m->mmap_ptrs[s] && m->mmap_ptrs[s] != MAP_FAILED) { munmap(m->mmap_ptrs[s], m->mmap_lens[s]); m->mmap_ptrs[s] = NULL; }
-        if (m->fds[s] >= 0) { close(m->fds[s]); m->fds[s] = -1; }
-    }
-    m->active = 0;
     return 1;
 }
