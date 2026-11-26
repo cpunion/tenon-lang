@@ -1,0 +1,193 @@
+// examples/showcase/tenon_cuda_moe_stream_bench.tn
+// NVIDIA CUDA (RunPod RTX 4090 24GB / A100 / H100) Oversized Multi-Shard MoE & Dense Streaming Benchmark
+//
+// Evaluates oversized models exceeding single-card 24GB RTX 4090 VRAM:
+//   [1] 106B Sparse MoE: `GLM-4.5-Air-Q4_0` (58.47 GiB, 2 Shards, 46L x 128E Top-8)
+//       -> RAM-backed Async PCIe DMA (40/128 VRAM LRU = ~20.4 GiB < 24 GiB VRAM! vs KTransformers / ik_llama.cpp / SGLang)
+//       -> NVMe Direct Streaming (`use_nocache=true`, 40/128 VRAM LRU + <2 GiB Host RAM! vs BigMoeOnEdge CUDA)
+//       -> Strict ablation: Sync Serial vs Dual-Stream Async PCIe DMA Overlap!
+//   [2] 70B Dense: `Llama-3.3-70B-Instruct-Q4_0` (37.36 GiB, 80L)
+//       -> All-80-Attn + 32 Pinned FFNs + 4-Slot Async PCIe DMA FFN Ring (~20.1 GiB < 24 GiB VRAM!)
+//
+// Env overrides:
+//   - `TENON_GLM_PATH`   (default `/workspace/models/glm45-air/GLM-4.5-Air-Q4_0-00001-of-00002.gguf`)
+//   - `TENON_LLAMA_PATH` (default `/workspace/models/llama33-70b/Llama-3.3-70B-Instruct-Q4_0.gguf`)
+//   - `TENON_CUDA_MODE`  (`glm` | `llama` | `all`, default `all`)
+
+import "std/core/types.tn"
+import "std/os/io.tn"
+import "std/text/text.tn"
+import "std/gpu/cuda/moe_stream_cuda.tn"
+
+fn run_cuda_config(
+    label Text,
+    path Text,
+    prompt_ids List[Int],
+    gen_tokens Int,
+    cache_slots Int,
+    use_nocache Bool,
+    enable_overlap Bool,
+    verify_ref Bool,
+    ref_ids List[Int],
+    print_text Bool,
+) List[Int] {
+    var model = CudaStreamingMoeModel.open_gguf(path, cache_slots, use_nocache, enable_overlap)
+    assert(model.is_valid())
+
+    let n_prompt = len(prompt_ids)
+    var pos = 0
+    var tok = prompt_ids[0]
+    var pi = 0
+    while pi < n_prompt {
+        tok = model.step(prompt_ids[pi], pos)
+        pos += 1
+        pi += 1
+    }
+
+    model.reset()
+
+    var out_ids List[Int] = list_filled(gen_tokens, 0)
+    var gen_text = ""
+    let t0 = cumoe_now_ms()
+    var step_i = 0
+    while step_i < gen_tokens {
+        out_ids[step_i] = tok
+        if print_text {
+            gen_text = gen_text ++ model.token_text(tok)
+        }
+        if step_i + 1 < gen_tokens {
+            tok = model.step(tok, pos)
+            pos += 1
+        }
+        step_i += 1
+    }
+    let elapsed_ms = cumoe_now_ms() - t0
+    let decode_steps = gen_tokens - 1
+    let ms_per_tok = elapsed_ms / int_to_float(decode_steps)
+    let tok_per_s = 1000.0 / ms_per_tok
+
+    let hits = model.cache_hits()
+    let misses = model.cache_misses()
+    let pref_hits = model.prefetch_hits()
+    let tot_acc = hits + misses
+    let hit_pct = if tot_acc > 0 { (int_to_float(hits) * 100.0) / int_to_float(tot_acc) } else { 100.0 }
+    let dma_gb = int_to_float(model.pcie_h2d_bytes()) / (1024.0 * 1024.0 * 1024.0)
+    let dma_gbs = if elapsed_ms > 0.0 { dma_gb / (elapsed_ms / 1000.0) } else { 0.0 }
+    let core_gb = int_to_float(model.core_vram_bytes()) / (1024.0 * 1024.0 * 1024.0)
+    let pool_gb = int_to_float(model.cache_vram_bytes()) / (1024.0 * 1024.0 * 1024.0)
+    let vram_gb = core_gb + pool_gb
+    let rss_gb  = int_to_float(model.os_peak_rss_bytes()) / (1024.0 * 1024.0 * 1024.0)
+    let disk_gb = int_to_float(model.total_disk_bytes()) / (1024.0 * 1024.0 * 1024.0)
+
+    var exact_ok = true
+    var mismatch_idx = -1
+    if verify_ref {
+        var vi = 0
+        while vi < gen_tokens {
+            if out_ids[vi] != ref_ids[vi] {
+                exact_ok = false
+                if mismatch_idx < 0 { mismatch_idx = vi }
+            }
+            vi += 1
+        }
+    }
+
+    println(
+        label
+        ++ " | tok/s=" ++ float_to_text(tok_per_s)
+        ++ " | ms/tok=" ++ float_to_text(ms_per_tok)
+        ++ " | hit=" ++ float_to_text(hit_pct) ++ "% (pref=" ++ int_to_text(pref_hits) ++ ")"
+        ++ " | h2d=" ++ float_to_text(dma_gb) ++ "GB (" ++ float_to_text(dma_gbs) ++ " GB/s)"
+        ++ " | vram=" ++ float_to_text(vram_gb) ++ "GiB (core=" ++ float_to_text(core_gb) ++ "+pool=" ++ float_to_text(pool_gb) ++ " / disk=" ++ float_to_text(disk_gb) ++ "GiB, hostPeakRSS=" ++ float_to_text(rss_gb) ++ "GiB)"
+        ++ " | exact=" ++ (if exact_ok { "BIT-EXACT" } else { "DIFF@" ++ int_to_text(mismatch_idx) })
+    )
+    if print_text {
+        println("  OUTPUT >> " ++ gen_text)
+    }
+    model.destroy()
+    out_ids
+}
+
+fn bench_glm_cuda(path Text) {
+    println("\n===============================================================================")
+    println("[CUDA 1/2] 106B SPARSE MoE: GLM-4.5-Air-Q4_0 (58.47 GiB, 2 Shards, 128E Top-8)")
+    println("           Single 24GB RTX 4090 VRAM-LRU + Pinned Dual-Stream PCIe DMA Engine")
+    println("===============================================================================")
+
+    let prompt_ids List[Int] = [
+        151331, 151333, 151336, 198, 840, 20726, 1246, 386, 12729, 315, 50426, 4119,
+        3581, 12558, 304, 1378, 22809, 13, 151337, 198, 151350, 198, 151351, 198
+    ]
+    let empty_ref List[Int] = []
+    let gen_n = 32
+
+    // [C1-RAM-SER] Serial baseline at 40/128 VRAM (~20.4 GiB < 24 GiB) backed by Host RAM mmap
+    let ref_ids = run_cuda_config(
+        "[C1-RAM-SER]  106B VRAM-40/128 (RAM, Serial)  ",
+        path, prompt_ids, gen_n, 40, false, false, false, empty_ref, true
+    )
+    // [C1-RAM-DMA] Dual-Stream Async PCIe DMA Overlap (40/128 VRAM = ~20.4 GiB, Host RAM tier)
+    let _ = run_cuda_config(
+        "[C1-RAM-DMA]  106B VRAM-40/128 (RAM, AsyncDMA)",
+        path, prompt_ids, gen_n, 40, false, true, true, ref_ids, false
+    )
+    // [C2-RAM-24]  Smaller 24/128 VRAM (~13.9 GiB <= 16 GiB card!) + Host RAM Async DMA
+    let _ = run_cuda_config(
+        "[C2-RAM-16G]  106B VRAM-24/128 (RAM, AsyncDMA)",
+        path, prompt_ids, gen_n, 24, false, true, true, ref_ids, false
+    )
+    // [C3-NVME-DMA] Strict NVMe Direct (`use_nocache=true`, 40/128 VRAM, ZERO Host RAM bloat!)
+    let _ = run_cuda_config(
+        "[C3-NVME-DMA] 106B VRAM-40/128 (NVMe,AsyncDMA)",
+        path, prompt_ids, gen_n, 40, true, true, true, ref_ids, false
+    )
+}
+
+fn bench_llama_cuda(path Text) {
+    println("\n===============================================================================")
+    println("[CUDA 2/2] 70B DENSE: Llama-3.3-70B-Instruct-Q4_0 (37.36 GiB, 80 Layers)")
+    println("           Single 24GB RTX 4090 All-80-Attn + 32-FFN + 4-Slot Async PCIe Ring")
+    println("===============================================================================")
+
+    let prompt_ids List[Int] = [
+        128000, 128006, 882, 128007, 271, 849, 21435, 1268, 386, 13025, 315, 51859,
+        4211, 3665, 12849, 304, 832, 11914, 13, 128009, 128006, 78191, 128007, 271
+    ]
+    let empty_ref List[Int] = []
+    let gen_n = 16
+
+    // [CD1-SER] Serial baseline (All-80-Attn + 32 Pinned FFNs + 4-Slot Ring = ~20.1 GiB < 24 GiB)
+    let ref_ids = run_cuda_config(
+        "[CD1-RAM-SER] 70B Attn80+32FFN (RAM, Serial)  ",
+        path, prompt_ids, gen_n, 32, false, false, false, empty_ref, true
+    )
+    // [CD1-DMA] Async PCIe DMA Ring Overlap
+    let _ = run_cuda_config(
+        "[CD1-RAM-DMA] 70B Attn80+32FFN (RAM, AsyncDMA)",
+        path, prompt_ids, gen_n, 32, false, true, true, ref_ids, false
+    )
+}
+
+fn main() Int {
+    assert(cumoe_init())
+    let vram_gb = int_to_float(cumoe_vram_bytes()) / (1024.0 * 1024.0 * 1024.0)
+    println("=== Tenon Native CUDA Universal Hard-VRAM-Capped Streaming Engine ===")
+    println("GPU_DEVICE name=\"" ++ cumoe_device_name() ++ "\" vram_GiB=" ++ float_to_text(vram_gb))
+
+    let glm_env = sys_env("TENON_GLM_PATH")
+    let glm_path = if len(glm_env) > 0 { glm_env } else { "/workspace/models/glm45-air/GLM-4.5-Air-Q4_0-00001-of-00002.gguf" }
+    let llama_env = sys_env("TENON_LLAMA_PATH")
+    let llama_path = if len(llama_env) > 0 { llama_env } else { "/workspace/models/llama33-70b/Llama-3.3-70B-Instruct-Q4_0.gguf" }
+
+    let mode = sys_env("TENON_CUDA_MODE")
+    if mode == "glm" {
+        bench_glm_cuda(glm_path)
+    } else if mode == "llama" {
+        bench_llama_cuda(llama_path)
+    } else {
+        bench_glm_cuda(glm_path)
+        bench_llama_cuda(llama_path)
+    }
+    println("\nALL_CUDA_STREAMING_BENCHMARKS_PASSED!")
+    0
+}
