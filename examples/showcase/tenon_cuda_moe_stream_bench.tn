@@ -169,16 +169,26 @@ fn bench_llama_cuda(path Text) {
         "[CD1-RAM-SER] 70B Attn80+32FFN (RAM, Serial)  ",
         path, prompt_ids, gen_n, 32, false, false, false, empty_ref, true
     )
-    // [CD1-DMA] Async PCIe DMA Ring Overlap
+    // [CD1-DMA-32] Hybrid NUMA-Repacked Q4_0_4R + INT16 (19.40 GiB VRAM, All-80-Attn + 32 Pinned FFNs)
     let _ = run_cuda_config(
-        "[CD1-RAM-DMA] 70B Attn80+32FFN (RAM, AsyncDMA)",
+        "[CD1-RAM-DMA] 70B Attn80+32FFN (RAM, Hybrid)  ",
         path, prompt_ids, gen_n, 32, false, true, true, ref_ids, false
     )
-    // [CD2-RES-48G] Full-VRAM Resident (100% GPU GDDR6X on 48GB cards, 37.36 GiB model!)
+    // [CD1-DMA-37] Fair 24GB-Tier Budget (21.27 GiB VRAM <= llama.cpp -ngl 44 21.5 GiB, All-80-Attn + 37 Pinned FFNs)
+    let _ = run_cuda_config(
+        "[CD1-RAM-37]  70B Attn80+37FFN (RAM, Hybrid)  ",
+        path, prompt_ids, gen_n, 37, false, true, true, ref_ids, false
+    )
+    // [CD1-DMA-41] Max 24GB RTX 4090 Fit (22.72 GiB VRAM < llama.cpp -ngl 48 23.2 GiB, All-80-Attn + 41 Pinned FFNs!)
+    let _ = run_cuda_config(
+        "[CD1-RAM-41]  70B Attn80+41FFN (RAM, Hybrid)  ",
+        path, prompt_ids, gen_n, 41, false, true, true, ref_ids, false
+    )
+    // [CD2-RES-48G] Full-VRAM Resident (100% GPU GDDR6X + CUDA Graph on 48GB cards, 37.36 GiB model!)
     let vram_gb = int_to_float(cumoe_vram_bytes()) / (1024.0 * 1024.0 * 1024.0)
     if vram_gb >= 44.0 {
         let _ = run_cuda_config(
-            "[CD2-RES-48G] 70B Full-VRAM    (100% GPU)     ",
+            "[CD2-RES-48G] 70B Full-VRAM    (CUDA Graph)   ",
             path, prompt_ids, gen_n, 80, false, true, true, ref_ids, false
         )
     }
