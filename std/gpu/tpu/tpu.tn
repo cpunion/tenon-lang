@@ -38,6 +38,7 @@ extern "C" {
     fn tn_tpu_exec_2(exec_h Int, b0 Int, b1 Int) Int
     fn tn_tpu_exec_3(exec_h Int, b0 Int, b1 Int, b2 Int) Int
     fn tn_tpu_exec_many(exec_h Int, in_handles_ptr Ptr[UInt8], n_in Int, out_handles_ptr Ptr[UInt8], max_out Int) Int
+    fn tn_tpu_exec_pipelined(exec_h Int, in_handles_ptr Ptr[UInt8], n_in Int, chain_arg_idx Int, iters Int) Int
     fn tn_tpu_f32_to_bf16(src_f32_ptr Ptr[UInt8], dst_bf16_ptr Ptr[UInt8], n Int) Int
     fn tn_tpu_bf16_to_f32(src_bf16_ptr Ptr[UInt8], dst_f32_ptr Ptr[UInt8], n Int) Int
 }
@@ -231,6 +232,11 @@ impl TpuExecutable {
 
     pub fn run_many(inout self, in_handles List[Int], out_elems Int, out_dtype Int) TpuBuffer {
         let oh = unsafe { tn_tpu_exec_many(self.handle, list_data_ptr(in_handles), len(in_handles), null_ptr(), 0) }
+        TpuBuffer { handle = oh, n_elems = out_elems, dtype = out_dtype }
+    }
+
+    pub fn run_pipelined(inout self, in_handles List[Int], chain_arg_idx Int, iters Int, out_elems Int, out_dtype Int) TpuBuffer {
+        let oh = unsafe { tn_tpu_exec_pipelined(self.handle, list_data_ptr(in_handles), len(in_handles), chain_arg_idx, iters) }
         TpuBuffer { handle = oh, n_elems = out_elems, dtype = out_dtype }
     }
 

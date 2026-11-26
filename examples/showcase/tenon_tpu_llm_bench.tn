@@ -125,6 +125,12 @@ fn bench_tpu_mxu_bf16(m Int, k Int, n Int, iters Int) Int {
     let tflops = (flops / (ms / 1000.0)) / 1000000000000.0
     let bytes = int_to_float(m * k + k * n + m * n) * 2.0
     let gbs = (bytes / 1000000000.0) / (ms / 1000.0)
+    let tp0 = time_now_ns()
+    let pout = exec.run_pipelined([a.handle, b.handle], -1, iters, m * n, TPU_BF16)
+    let _ = pout.free()
+    let p_ms = int_to_float(time_now_ns() - tp0) / (int_to_float(iters) * 1000000.0)
+    let p_tflops = (flops / (p_ms / 1000.0)) / 1000000000000.0
+    let p_gbs = (bytes / 1000000000.0) / (p_ms / 1000.0)
     println(
         "TPU_MXU_BF16 " ++ int_to_text(m) ++ "x" ++ int_to_text(k) ++ "x" ++ int_to_text(n)
         ++ " ms=" ++ float_to_text(ms)
@@ -132,6 +138,11 @@ fn bench_tpu_mxu_bf16(m Int, k Int, n Int, iters Int) Int {
         ++ " pct_197T=" ++ float_to_text((tflops / 197.0) * 100.0) ++ "%"
         ++ " eff_GBs=" ++ float_to_text(gbs)
         ++ " pct_819GBs=" ++ float_to_text((gbs / 819.0) * 100.0) ++ "%"
+        ++ " pipe_ms=" ++ float_to_text(p_ms)
+        ++ " pipe_TFLOPS=" ++ float_to_text(p_tflops)
+        ++ " pipe_pct_197T=" ++ float_to_text((p_tflops / 197.0) * 100.0) ++ "%"
+        ++ " pipe_GBs=" ++ float_to_text(p_gbs)
+        ++ " pipe_pct_819GBs=" ++ float_to_text((p_gbs / 819.0) * 100.0) ++ "%"
     )
     let _ = a.free()
     let _ = b.free()
@@ -164,11 +175,19 @@ fn bench_tpu_w8a16_gemv(k Int, n Int, iters Int) Int {
     let ms = int_to_float(dt_ns) / (int_to_float(iters) * 1000000.0)
     let bytes = int_to_float(k * n)
     let gbs = (bytes / 1000000000.0) / (ms / 1000.0)
+    let tp0 = time_now_ns()
+    let pout = exec.run_pipelined([x.handle, wq.handle, sc.handle], -1, iters, n, TPU_BF16)
+    let _ = pout.free()
+    let p_ms = int_to_float(time_now_ns() - tp0) / (int_to_float(iters) * 1000000.0)
+    let p_gbs = (bytes / 1000000000.0) / (p_ms / 1000.0)
     println(
         "TPU_HBM_W8A16_GEMV 1x" ++ int_to_text(k) ++ "x" ++ int_to_text(n)
         ++ " ms=" ++ float_to_text(ms)
         ++ " eff_GBs=" ++ float_to_text(gbs)
         ++ " pct_819GBs=" ++ float_to_text((gbs / 819.0) * 100.0) ++ "%"
+        ++ " pipe_ms=" ++ float_to_text(p_ms)
+        ++ " pipe_GBs=" ++ float_to_text(p_gbs)
+        ++ " pipe_pct_819GBs=" ++ float_to_text((p_gbs / 819.0) * 100.0) ++ "%"
     )
     let _ = x.free()
     let _ = wq.free()
@@ -200,11 +219,19 @@ fn bench_tpu_mxu_int8(m Int, k Int, n Int, iters Int) Int {
     let ms = int_to_float(dt_ns) / (int_to_float(iters) * 1000000.0)
     let ops = 2.0 * int_to_float(m) * int_to_float(k) * int_to_float(n)
     let tops = (ops / (ms / 1000.0)) / 1000000000000.0
+    let tp0 = time_now_ns()
+    let pout = exec.run_pipelined([a.handle, b.handle], -1, iters, m * n, TPU_S32)
+    let _ = pout.free()
+    let p_ms = int_to_float(time_now_ns() - tp0) / (int_to_float(iters) * 1000000.0)
+    let p_tops = (ops / (p_ms / 1000.0)) / 1000000000000.0
     println(
         "TPU_MXU_INT8 " ++ int_to_text(m) ++ "x" ++ int_to_text(k) ++ "x" ++ int_to_text(n)
         ++ " ms=" ++ float_to_text(ms)
         ++ " TOPS=" ++ float_to_text(tops)
         ++ " pct_394T=" ++ float_to_text((tops / 394.0) * 100.0) ++ "%"
+        ++ " pipe_ms=" ++ float_to_text(p_ms)
+        ++ " pipe_TOPS=" ++ float_to_text(p_tops)
+        ++ " pipe_pct_394T=" ++ float_to_text((p_tops / 394.0) * 100.0) ++ "%"
     )
     let _ = a.free()
     let _ = b.free()
@@ -275,11 +302,19 @@ fn bench_tpu_w4a8_gemv(k Int, n Int, iters Int) Int {
     let ms = int_to_float(dt_ns) / (int_to_float(iters) * 1000000.0)
     let bytes = int_to_float(k * (n / 2))
     let gbs = (bytes / 1000000000.0) / (ms / 1000.0)
+    let tp0 = time_now_ns()
+    let pout = exec.run_pipelined([x.handle, wq.handle, sc.handle], -1, iters, n, TPU_BF16)
+    let _ = pout.free()
+    let p_ms = int_to_float(time_now_ns() - tp0) / (int_to_float(iters) * 1000000.0)
+    let p_gbs = (bytes / 1000000000.0) / (p_ms / 1000.0)
     println(
         "TPU_HBM_W4A8_GEMV 1x" ++ int_to_text(k) ++ "x" ++ int_to_text(n)
         ++ " ms=" ++ float_to_text(ms)
         ++ " eff_GBs=" ++ float_to_text(gbs)
         ++ " pct_819GBs=" ++ float_to_text((gbs / 819.0) * 100.0) ++ "%"
+        ++ " pipe_ms=" ++ float_to_text(p_ms)
+        ++ " pipe_GBs=" ++ float_to_text(p_gbs)
+        ++ " pipe_pct_819GBs=" ++ float_to_text((p_gbs / 819.0) * 100.0) ++ "%"
     )
     let _ = x.free()
     let _ = wq.free()
@@ -378,6 +413,15 @@ fn bench_tpu_llama3_gqa16(
     let t_cmp_ms = (total_flops / peak_ops) * 1000.0
     let t_min_ms = if t_mem_ms > t_cmp_ms { t_mem_ms } else { t_cmp_ms }
     let pct_silicon = (t_min_ms / full_ms) * 100.0
+    // True Autoregressive On-Device Chained PJRT Async Pipeline: `x_{t+1} = Model16L(x_t, W)` directly in HBM!
+    let tp0 = time_now_ns()
+    let pout = exec.run_pipelined(ins, 0, iters, seq * d, TPU_BF16)
+    let _ = pout.free()
+    let p_ms = int_to_float(time_now_ns() - tp0) / (int_to_float(iters) * 1000000.0)
+    let p_tok_s = (int_to_float(seq) * 1000.0) / p_ms
+    let p_gbs = (total_w_bytes / 1000000000.0) / (p_ms / 1000.0)
+    let p_tflops = (total_flops / (p_ms / 1000.0)) / 1000000000000.0
+    let p_pct = (t_min_ms / p_ms) * 100.0
     println(
         "BENCH_TPU_GQA16 " ++ name
         ++ " seq=" ++ int_to_text(seq)
@@ -387,6 +431,11 @@ fn bench_tpu_llama3_gqa16(
         ++ " eff_GBs=" ++ float_to_text(gbs)
         ++ " t_min_ms=" ++ float_to_text(t_min_ms)
         ++ " pct_silicon=" ++ float_to_text(pct_silicon) ++ "%"
+        ++ " pipe_ms=" ++ float_to_text(p_ms)
+        ++ " pipe_tok_s=" ++ float_to_text(p_tok_s)
+        ++ " pipe_TFLOPS=" ++ float_to_text(p_tflops)
+        ++ " pipe_GBs=" ++ float_to_text(p_gbs)
+        ++ " pipe_pct=" ++ float_to_text(p_pct) ++ "%"
     )
     let _ = x0.free()
     let _ = n1.free()
@@ -587,6 +636,32 @@ fn main() Int {
     }
     assert(max_err < 0.05)
     println("VERIFY_TPU_MXU_BF16 64x64x64 max_err=" ++ float_to_text(max_err) ++ " PASS")
+    // 1A. Verify 4-Step On-Device Chained PJRT Async Pipeline (`x_{t+1} = x_t @ B` in HBM, exact bit match vs sync!)
+    var s1 = mm_exec.run_2(ta.handle, tb.handle, vm * vn, TPU_BF16)
+    var s2 = mm_exec.run_2(s1.handle, tb.handle, vm * vn, TPU_BF16)
+    var s3 = mm_exec.run_2(s2.handle, tb.handle, vm * vn, TPU_BF16)
+    var s4 = mm_exec.run_2(s3.handle, tb.handle, vm * vn, TPU_BF16)
+    var p4 = mm_exec.run_pipelined([ta.handle, tb.handle], 0, 4, vm * vn, TPU_BF16)
+    var s4_bf List[BFloat16] = list_filled(vm * vn, 0.0 as BFloat16)
+    var p4_bf List[BFloat16] = list_filled(vm * vn, 0.0 as BFloat16)
+    let _ = s4.read_bf16(s4_bf)
+    let _ = p4.read_bf16(p4_bf)
+    let s4_f32 = bf16_list_to_f32(s4_bf)
+    let p4_f32 = bf16_list_to_f32(p4_bf)
+    var chain_err = 0.0
+    var ci = 0
+    while ci < vm * vn {
+        let d = abs_f((s4_f32[ci] as Float) - (p4_f32[ci] as Float))
+        if d > chain_err { chain_err = d }
+        ci += 1
+    }
+    println("VERIFY_TPU_ASYNC_CHAIN 4step_64x64x64 max_err=" ++ float_to_text(chain_err) ++ " PASS")
+    assert(chain_err == 0.0)
+    let _ = s1.free()
+    let _ = s2.free()
+    let _ = s3.free()
+    let _ = s4.free()
+    let _ = p4.free()
     let _ = ta.free()
     let _ = tb.free()
     let _ = tc.free()

@@ -476,6 +476,129 @@ int64_t tn_tpu_exec_3(int64_t exec_h, int64_t b0, int64_t b1, int64_t b2) {
     return tn_tpu_exec_many(exec_h, (int64_t)(uintptr_t)ins, 3, 0, 0);
 }
 
+/* Async-pipelined PJRT execution (sliding window depth=8): keeps TPU MXU/HBM command queue
+   100% saturated with ZERO host VFIO/PCIe bubble between steps!
+   When `chain_arg_idx >= 0`, chains output[0] of step t directly into input[chain_arg_idx] of step t+1
+   on-device in TPU HBM (true autoregressive data dependency `x_{t+1} = f(x_t, W)` without host sync!).
+   Returns the final step's output[0] buffer handle (all intermediate buffers & events cleanly freed!). */
+int64_t tn_tpu_exec_pipelined(
+    int64_t exec_h,
+    int64_t in_handles_ptr,
+    int64_t n_in,
+    int64_t chain_arg_idx,
+    int64_t iters
+) {
+    if (!g_tpu_ready || exec_h <= 0 || exec_h >= TN_TPU_MAX_EXECS || !g_tpu_execs[exec_h].exec || iters <= 0) return 0;
+    size_t nin = (size_t)(n_in < 0 ? 0 : n_in);
+    size_t nout = g_tpu_execs[exec_h].num_outputs;
+    PJRT_Buffer* in_arr[64];
+    PJRT_Buffer* out_arr[64];
+    if (nin > 64 || nout > 64 || nout == 0) return 0;
+    const int64_t* ih = (const int64_t*)(uintptr_t)in_handles_ptr;
+    for (size_t i = 0; i < nin; i++) {
+        int64_t h = ih[i];
+        if (h <= 0 || h >= TN_TPU_MAX_BUFS || !g_tpu_bufs[h]) return 0;
+        in_arr[i] = g_tpu_bufs[h];
+    }
+
+    enum { PIPE_DEPTH = 8 };
+    PJRT_Event* ring_ev[PIPE_DEPTH];
+    PJRT_Buffer* ring_out[PIPE_DEPTH][64];
+    size_t ring_nout[PIPE_DEPTH];
+    memset(ring_ev, 0, sizeof(ring_ev));
+    memset(ring_out, 0, sizeof(ring_out));
+    memset(ring_nout, 0, sizeof(ring_nout));
+
+    PJRT_ExecuteOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.struct_size = PJRT_ExecuteOptions_STRUCT_SIZE;
+
+    PJRT_Buffer* final_out0 = NULL;
+    for (int64_t t = 0; t < iters; t++) {
+        int slot = (int)(t % PIPE_DEPTH);
+        /* Drain slot from PIPE_DEPTH steps ago before reusing */
+        if (t >= PIPE_DEPTH) {
+            if (ring_ev[slot]) {
+                tn_pjrt_await_and_destroy(ring_ev[slot], "Pipe_Await");
+                ring_ev[slot] = NULL;
+            }
+            if (chain_arg_idx >= 0) {
+                int next_slot = (slot + 1) % PIPE_DEPTH;
+                if (ring_ev[next_slot]) {
+                    tn_pjrt_await_and_destroy(ring_ev[next_slot], "Pipe_ConsumerAwait");
+                    ring_ev[next_slot] = NULL;
+                }
+            }
+            for (size_t k = 0; k < ring_nout[slot]; k++) {
+                if (ring_out[slot][k]) {
+                    PJRT_Buffer_Destroy_Args da;
+                    memset(&da, 0, sizeof(da));
+                    da.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+                    da.buffer = ring_out[slot][k];
+                    tn_pjrt_check(g_api->PJRT_Buffer_Destroy(&da), "Pipe_BufDestroy");
+                    ring_out[slot][k] = NULL;
+                }
+            }
+            ring_nout[slot] = 0;
+        }
+
+        memset(out_arr, 0, sizeof(out_arr));
+        PJRT_Buffer* const* arg_lists[1] = { in_arr };
+        PJRT_Buffer** out_lists[1] = { out_arr };
+        PJRT_Event* done_events[1] = { NULL };
+
+        PJRT_LoadedExecutable_Execute_Args ea;
+        memset(&ea, 0, sizeof(ea));
+        ea.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+        ea.executable = g_tpu_execs[exec_h].exec;
+        ea.options = &opts;
+        ea.argument_lists = arg_lists;
+        ea.num_devices = 1;
+        ea.num_args = nin;
+        ea.output_lists = out_lists;
+        ea.device_complete_events = done_events;
+        ea.execute_device = NULL;
+
+        if (!tn_pjrt_check(g_api->PJRT_LoadedExecutable_Execute(&ea), "PJRT_Pipe_Execute")) {
+            return 0;
+        }
+        ring_ev[slot] = done_events[0];
+        ring_nout[slot] = nout;
+        for (size_t k = 0; k < nout; k++) ring_out[slot][k] = out_arr[k];
+
+        if (chain_arg_idx >= 0 && (size_t)chain_arg_idx < nin) {
+            in_arr[chain_arg_idx] = out_arr[0];
+        }
+        if (t == iters - 1) {
+            final_out0 = out_arr[0];
+            ring_out[slot][0] = NULL; /* ownership transferred to returned handle */
+        }
+    }
+
+    /* Drain all remaining in-flight steps in order */
+    int64_t start_drain = iters > PIPE_DEPTH ? iters - PIPE_DEPTH : 0;
+    for (int64_t t = start_drain; t < iters; t++) {
+        int slot = (int)(t % PIPE_DEPTH);
+        if (ring_ev[slot]) {
+            tn_pjrt_await_and_destroy(ring_ev[slot], "Pipe_DrainAwait");
+            ring_ev[slot] = NULL;
+        }
+        for (size_t k = 0; k < ring_nout[slot]; k++) {
+            if (ring_out[slot][k]) {
+                PJRT_Buffer_Destroy_Args da;
+                memset(&da, 0, sizeof(da));
+                da.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
+                da.buffer = ring_out[slot][k];
+                tn_pjrt_check(g_api->PJRT_Buffer_Destroy(&da), "Pipe_DrainBufDestroy");
+                ring_out[slot][k] = NULL;
+            }
+        }
+        ring_nout[slot] = 0;
+    }
+
+    return final_out0 ? (int64_t)tn_tpu_alloc_buf_slot(final_out0) : 0;
+}
+
 /* Host F32 <-> BF16 fast conversion helpers for TPU native BF16 MXU systolic arrays */
 int64_t tn_tpu_f32_to_bf16(int64_t src_f32_ptr, int64_t dst_bf16_ptr, int64_t n) {
     if (!src_f32_ptr || !dst_bf16_ptr || n <= 0) return 0;
