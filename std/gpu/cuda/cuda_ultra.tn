@@ -69,6 +69,29 @@ extern "C" {
         x_h Int, w_h Int, w_off Int, y_h Int,
         m Int, n Int, k Int, add_res Int,
     ) Int
+    fn tn_cuda_ultra_f16_to_fp8(src_h Int, dst_h Int, n_elems Int) Int
+    fn tn_cuda_ultra_mm_fp8_ptx(
+        x_h Int, w_h Int, w_off Int, y_h Int,
+        m Int, n Int, k Int, add_res Int,
+    ) Int
+    fn tn_cuda_ultra_epinorm_lm_argmax(
+        x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int,
+        tok_pos_h Int, out_dim Int, in_dim Int, quant_mode Int,
+        gemma_mode Int, ss_read_slot Int, inc_pos Int,
+    ) Int
+    fn tn_cuda_ultra_batch_gemm(
+        x_h Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
+        batch Int, out_dim Int, in_dim Int, quant_mode Int, add_res Int, has_bias Int,
+    ) Int
+    fn tn_cuda_ultra_batch_ffn(
+        x_h Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int, y_h Int,
+        batch Int, d_ff Int, in_dim Int, quant_mode Int, is_geglu Int,
+    ) Int
+    fn tn_cuda_ultra_batch_rope_flash_gqa(
+        qkv_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_h Int,
+        batch Int, start_pos Int, n_heads Int, n_kv Int, d_head Int, max_seq Int, softcap Float,
+    ) Int
+    fn tn_cuda_ultra_batch_argmax(logits_h Int, out_toks_h Int, batch Int, vocab Int) Int
 }
 
 extern "C" {
@@ -248,4 +271,51 @@ pub fn cuda_mm_fast(x_h Int, w_h Int, w_off Int, y_h Int, m Int, n Int, k Int, a
 pub fn cuda_mm_fp8(x_h Int, w_h Int, w_off Int, y_h Int, m Int, n Int, k Int, add_res Bool) Bool {
     let ar = if add_res { 1 } else { 0 }
     unsafe { tn_cuda_ultra_mm_fp8(x_h, w_h, w_off, y_h, m, n, k, ar) != 0 }
+}
+
+pub fn cuda_f16_to_fp8(src_h Int, dst_h Int, n_elems Int) Bool {
+    unsafe { tn_cuda_ultra_f16_to_fp8(src_h, dst_h, n_elems) != 0 }
+}
+
+pub fn cuda_mm_fp8_ptx(x_h Int, w_h Int, w_off Int, y_h Int, m Int, n Int, k Int, add_res Bool) Bool {
+    let ar = if add_res { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_mm_fp8_ptx(x_h, w_h, w_off, y_h, m, n, k, ar) != 0 }
+}
+
+pub fn cuda_epinorm_lm_argmax(
+    x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int,
+    tok_pos_h Int, out_dim Int, in_dim Int, quant_mode Int,
+    gemma_mode Bool, ss_read_slot Int, inc_pos Bool,
+) Bool {
+    let gm = if gemma_mode { 1 } else { 0 }
+    let ip = if inc_pos { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_epinorm_lm_argmax(x_h, nw_h, nw_off, w_h, w_off, tok_pos_h, out_dim, in_dim, quant_mode, gm, ss_read_slot, ip) != 0 }
+}
+
+pub fn cuda_batch_gemm(
+    x_h Int, w_h Int, w_off Int, y_h Int, b_h Int, b_off Int,
+    batch Int, out_dim Int, in_dim Int, quant_mode Int, add_res Bool, has_bias Bool,
+) Bool {
+    let ar = if add_res { 1 } else { 0 }
+    let hb = if has_bias { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_batch_gemm(x_h, w_h, w_off, y_h, b_h, b_off, batch, out_dim, in_dim, quant_mode, ar, hb) != 0 }
+}
+
+pub fn cuda_batch_ffn(
+    x_h Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int, y_h Int,
+    batch Int, d_ff Int, in_dim Int, quant_mode Int, is_geglu Bool,
+) Bool {
+    let ig = if is_geglu { 1 } else { 0 }
+    unsafe { tn_cuda_ultra_batch_ffn(x_h, wg_h, wg_off, wu_h, wu_off, y_h, batch, d_ff, in_dim, quant_mode, ig) != 0 }
+}
+
+pub fn cuda_batch_rope_flash_gqa(
+    qkv_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_h Int,
+    batch Int, start_pos Int, n_heads Int, n_kv Int, d_head Int, max_seq Int, softcap Float,
+) Bool {
+    unsafe { tn_cuda_ultra_batch_rope_flash_gqa(qkv_h, kc_h, kc_off, vc_h, vc_off, ctx_h, batch, start_pos, n_heads, n_kv, d_head, max_seq, softcap) != 0 }
+}
+
+pub fn cuda_batch_argmax(logits_h Int, out_toks_h Int, batch Int, vocab Int) Bool {
+    unsafe { tn_cuda_ultra_batch_argmax(logits_h, out_toks_h, batch, vocab) != 0 }
 }

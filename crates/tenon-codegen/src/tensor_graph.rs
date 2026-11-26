@@ -80,9 +80,9 @@ impl TensorDType {
     }
     pub fn target_layout_desc(self) -> &'static str {
         match self {
-            TensorDType::Q4_0 | TensorDType::Int4 => "CUDA/Metal: Q4_0_SB8 (128-bit uint4, 144B/8blk) | TPU: Native Hardware `i4` (PJRT S4, W4A8 INT8 MXU)",
-            TensorDType::Q8_0 | TensorDType::Int8 => "CUDA/Metal: Q8_0_SB8 (128-bit uint4, 272B/8blk) | TPU: Native `i8` (394 TOPS INT8 MXU)",
-            TensorDType::FP8 => "CUDA sm_89: cublasLt FP8 e4m3fn (660 TFLOPS) | TPU: f8E4M3FN",
+            TensorDType::Q4_0 | TensorDType::Int4 => "CUDA/Metal: Q4_0_SB8 (128-bit uint4 + lop3/half2 + W4A16 MMA+SplitK) | TPU: W4A8_PACK (i8-DMA 0.5B/wt + VPU shift unpack + 394T INT8 MXU)",
+            TensorDType::Q8_0 | TensorDType::Int8 => "CUDA/Metal: Q8_0_SB8 (128-bit uint4, 272B/8blk) | TPU: Native `i8` (394 TOPS INT8 MXU + Algebraic Fused RMSNorm+INT8)",
+            TensorDType::FP8 => "CUDA sm_89: Native PTX mma.m16n8k32.f16.e4m3 (660.6 TFLOPS) + cp.async | TPU: f8E4M3FN",
             TensorDType::Float16 => "Dense 128-bit float4/half4 + TensorCore / simdgroup_half8x8",
             TensorDType::BFloat16 => "Dense BF16 + TPU MXU (197 TFLOPS)",
             TensorDType::Float32 => "Dense FP32",
@@ -867,13 +867,15 @@ fn compute_roofline(
     };
     let ai = if fused_bytes > 0.0 { flops / fused_bytes } else { 0.0 };
     let schedule_class = if max_seq == 1 {
-        "MEMORY-BOUND B=1 DECODE (Auto: SB8 uint4 4w1r + Epilogue-RMSNorm + Register/Split-K FlashDecode + Graph Capture)"
-    } else if max_seq < 16 {
-        "BATCH/SPECULATIVE VERIFY B=2..15 (Auto: simdgroup_half8x8 / TensorCore MMA + Single-Pass Weight Stream)"
+        "MEMORY-BOUND B=1 DECODE (Auto: SB8 uint4 lop3/half2 + Epilogue-RMSNorm + 1-Kernel Atomic LM_Argmax + Graph Capture)"
+    } else if max_seq <= 4 {
+        "SPECULATIVE VERIFY B=2..4 (Auto: Register-Direct Unpack-Once Q4 + Fused Batch RoPE+Causal GQA FlashAttn)"
+    } else if max_seq <= 32 {
+        "BATCH/SPECULATIVE VERIFY B=5..32 (Auto: Metal AMX / CUDA mma.m16n8k16 W4A16 + Adaptive Split-K + Fused Batch FlashGQA)"
     } else if uses_fp8 {
-        "COMPUTE-BOUND FP8 (Auto: Ada sm_89 660T cublasLt e4m3fn / TPU MXU + Horizontal Weight Fusion)"
+        "COMPUTE-BOUND FP8 (Auto: Ada sm_89 Native PTX mma.m16n8k32.f16.e4m3 660.6T + 3-Stage cp.async Swizzle)"
     } else if uses_quant_int {
-        "COMPUTE-BOUND W4A8/W8A8 (Auto: TPU 394T INT8 MXU / CUDA SB8 MMA + Horizontal Weight Fusion)"
+        "COMPUTE-BOUND W4A8/W8A8 (Auto: TPU 394T INT8 MXU + Algebraic Fused RMSNorm+INT8 / W4A8_PACK i8-DMA)"
     } else {
         "COMPUTE-BOUND BF16/FP16 (Auto: Tensor Core / MXU Systolic Array MMA + Horizontal/Vertical Fusion)"
     };

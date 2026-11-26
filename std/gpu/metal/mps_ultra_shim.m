@@ -92,8 +92,39 @@ static id<MTLComputePipelineState> g_ultra_batch_ffn_f16 = nil;
 static id<MTLComputePipelineState> g_ultra_batch_ffn_q8 = nil;
 static id<MTLComputePipelineState> g_ultra_batch_ffn_q4 = nil;
 static id<MTLComputePipelineState> g_ultra_batch_ffn_q4_sb8 = nil;
+static id<MTLComputePipelineState> g_ultra_batch_gemm_q4_b4 = nil;
+static id<MTLComputePipelineState> g_ultra_batch_gemm_q4_sb8_b4 = nil;
+static id<MTLComputePipelineState> g_ultra_batch_ffn_q4_b4 = nil;
+static id<MTLComputePipelineState> g_ultra_batch_ffn_q4_sb8_b4 = nil;
+static id<MTLComputePipelineState> g_ultra_batch_gemm_q4_b32 = nil;
+static id<MTLComputePipelineState> g_ultra_batch_gemm_q4_sb8_b32 = nil;
+static id<MTLComputePipelineState> g_ultra_batch_ffn_q4_b32 = nil;
+static id<MTLComputePipelineState> g_ultra_batch_ffn_q4_sb8_b32 = nil;
+static id<MTLComputePipelineState> g_ultra_sk_finish = nil;
+static id<MTLComputePipelineState> g_ultra_batch_rope_flash_gqa = nil;
+static id<MTLComputePipelineState> g_ultra_embed_ss = nil;
+static id<MTLComputePipelineState> g_ultra_gemv_f16_ss = nil;
+static id<MTLComputePipelineState> g_ultra_gemv_q8_ss = nil;
+static id<MTLComputePipelineState> g_ultra_gemv_q4_ss = nil;
+static id<MTLComputePipelineState> g_ultra_gemv_q4_sb8_ss = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_gemv_f16 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_gemv_q8 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_gemv_q4 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_gemv_q4_sb8 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_ffn_f16 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_ffn_q8 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_ffn_q4 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_ffn_q4_sb8 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_lm_argmax_f16 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_lm_argmax_q8 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_lm_argmax_q4 = nil;
+static id<MTLComputePipelineState> g_ultra_epinorm_lm_argmax_q4_sb8 = nil;
+static id<MTLComputePipelineState> g_ultra_argmax_reduce_pairs = nil;
 static id<MTLComputePipelineState> g_ultra_flash_batch_gqa = nil;
 static id<MTLComputePipelineState> g_ultra_argmax_batch = nil;
+static id<MTLBuffer> g_ultra_ss_buf = nil;
+static id<MTLBuffer> g_ultra_sk_buf = nil;
+static id<MTLBuffer> g_ultra_lm_pairs_buf = nil;
 static int g_ultra_inited = 0;
 
 static const char* kUltraMetalKernelsMSL =
@@ -2396,7 +2427,7 @@ static const char* kUltraMetalKernelsMSL =
 "\n"
 "// 13. Single-Simdgroup Zero-TG-Barrier `N=32 x K=32` Hardware AMX `simdgroup_half8x8` Speculative/Batch Decode (`B = 4` & `B = 8`)!\n"
 "//     32 lanes <-> 32 rows (1 Q4 block/lane), `half4 fma` dequant into bank-free sB[32][36], ZERO `threadgroup_barrier`!\n"
-"struct BatchGemmParams { uint M; uint N; uint K; uint add_res; uint has_bias; uint _p0; uint _p1; uint _p2; };\n"
+"struct BatchGemmParams { uint M; uint N; uint K; uint add_res; uint has_bias; uint sk; uint _p1; uint _p2; };\n"
 "struct BatchFfnParams  { uint M; uint d_ff; uint K; uint is_geglu; };\n"
 "struct BatchFlashParams { uint n_heads; uint n_kv; uint d_head; uint start_pos; uint batch_len; uint max_seq; float inv_sqrt_dh; float softcap; };\n"
 "\n"
@@ -2426,16 +2457,21 @@ static const char* kUltraMetalKernelsMSL =
 "    device half* Y [[buffer(2)]],\n"
 "    device const half* bias [[buffer(3)]],\n"
 "    constant BatchGemmParams& p [[buffer(4)]],\n"
-"    uint tg_id [[threadgroup_position_in_grid]],\n"
+"    device atomic_float* Y_sk [[buffer(5)]],\n"
+"    uint2 tgid [[threadgroup_position_in_grid]],\n"
 "    uint sg [[simdgroup_index_in_threadgroup]],\n"
 "    uint lane [[thread_index_in_simdgroup]]\n"
 ") {\n"
-"    // Coalesced 128B-Aligned NSG=4 N=32 x K=128 Split-K2 2x2 Hardware AMX Engine (12 KB TG mem, 8 SGs/core!)\n"
-"    // 4 contiguous Q4 blocks/row -> 100% cache-line coalescing across K, vectorized half4 TG stores, 4x fewer barriers!\n"
-"    uint n0 = tg_id * 32u;\n"
+"    // Coalesced 128B-Aligned NSG=4 N=32 x K=128 Split-K2 2x2 Hardware AMX Engine + Adaptive Grid Split-K!\n"
+"    uint n0 = tgid.x * 32u;\n"
 "    if (n0 >= p.N) return;\n"
 "    uint tid = sg * 32u + lane;\n"
 "    uint nb = p.K >> 5;\n"
+"    uint sk = max(p.sk, 1u);\n"
+"    uint b_per = (((nb + sk - 1u) / sk) + 3u) & ~3u;\n"
+"    uint b_start = tgid.y * b_per;\n"
+"    uint b_end = min(b_start + b_per, nb);\n"
+"    if (b_start >= b_end) return;\n"
 "    uint M = min(p.M, 16u);\n"
 "    uint nr = tid >> 2;\n"
 "    uint bk = tid & 3u;\n"
@@ -2451,7 +2487,7 @@ static const char* kUltraMetalKernelsMSL =
 "    simdgroup_float8x8 c11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
 "    uint sg_n = (sg & 1u) * 16u;\n"
 "    uint sg_k = (sg >> 1) * 64u;\n"
-"    for (uint b = 0; b < nb; b += 4u) {\n"
+"    for (uint b = b_start; b < b_end; b += 4u) {\n"
 "        uint k_off = b << 5;\n"
 "        uint k_in = k_off + c_a;\n"
 "        bool k_ok = (k_in < p.K);\n"
@@ -2460,7 +2496,7 @@ static const char* kUltraMetalKernelsMSL =
 "        *(threadgroup half4*)(&sA[r_a0 + 8u][c_a])      = (k_ok && (r_a0 + 8u) < M) ? *(device const half4*)(X + (r_a0 + 8u) * p.K + k_in)      : half4(0.0h);\n"
 "        *(threadgroup half4*)(&sA[r_a0 + 8u][c_a + 4u]) = (k_ok && (r_a0 + 8u) < M) ? *(device const half4*)(X + (r_a0 + 8u) * p.K + k_in + 4u) : half4(0.0h);\n"
 "        threadgroup half4* dst_b = (threadgroup half4*)(&sB[nr][bk << 5]);\n"
-"        if (b + bk < nb) {\n"
+"        if (b + bk < b_end) {\n"
 "            uint idx = base_w + b + bk;\n"
 "            device const uchar* bp = W + (idx >> 3) * 144u;\n"
 "            uint sub = idx & 7u;\n"
@@ -2510,10 +2546,14 @@ static const char* kUltraMetalKernelsMSL =
 "        uint col = n0 + lc;\n"
 "        if (col < p.N) {\n"
 "            float v = sOut[idx] + sOut[512u + idx];\n"
-"            if (p.has_bias != 0) v += (float)bias[col];\n"
 "            uint di = t * p.N + col;\n"
-"            if (p.add_res != 0) v += (float)Y[di];\n"
-"            Y[di] = (half)v;\n"
+"            if (sk == 1u) {\n"
+"                if (p.has_bias != 0) v += (float)bias[col];\n"
+"                if (p.add_res != 0) v += (float)Y[di];\n"
+"                Y[di] = (half)v;\n"
+"            } else {\n"
+"                atomic_fetch_add_explicit(&Y_sk[di], v, memory_order_relaxed);\n"
+"            }\n"
 "        }\n"
 "    }\n"
 "}\n"
@@ -2524,14 +2564,20 @@ static const char* kUltraMetalKernelsMSL =
 "    device half* Y [[buffer(2)]],\n"
 "    device const half* bias [[buffer(3)]],\n"
 "    constant BatchGemmParams& p [[buffer(4)]],\n"
-"    uint tg_id [[threadgroup_position_in_grid]],\n"
+"    device atomic_float* Y_sk [[buffer(5)]],\n"
+"    uint2 tgid [[threadgroup_position_in_grid]],\n"
 "    uint sg [[simdgroup_index_in_threadgroup]],\n"
 "    uint lane [[thread_index_in_simdgroup]]\n"
 ") {\n"
-"    uint n0 = tg_id * 32u;\n"
+"    uint n0 = tgid.x * 32u;\n"
 "    if (n0 >= p.N) return;\n"
 "    uint tid = sg * 32u + lane;\n"
 "    uint nb = p.K >> 5;\n"
+"    uint sk = max(p.sk, 1u);\n"
+"    uint b_per = (((nb + sk - 1u) / sk) + 3u) & ~3u;\n"
+"    uint b_start = tgid.y * b_per;\n"
+"    uint b_end = min(b_start + b_per, nb);\n"
+"    if (b_start >= b_end) return;\n"
 "    uint M = min(p.M, 16u);\n"
 "    uint nr = tid >> 2;\n"
 "    uint bk = tid & 3u;\n"
@@ -2547,7 +2593,7 @@ static const char* kUltraMetalKernelsMSL =
 "    simdgroup_float8x8 c11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
 "    uint sg_n = (sg & 1u) * 16u;\n"
 "    uint sg_k = (sg >> 1) * 64u;\n"
-"    for (uint b = 0; b < nb; b += 4u) {\n"
+"    for (uint b = b_start; b < b_end; b += 4u) {\n"
 "        uint k_off = b << 5;\n"
 "        uint k_in = k_off + c_a;\n"
 "        bool k_ok = (k_in < p.K);\n"
@@ -2556,7 +2602,7 @@ static const char* kUltraMetalKernelsMSL =
 "        *(threadgroup half4*)(&sA[r_a0 + 8u][c_a])      = (k_ok && (r_a0 + 8u) < M) ? *(device const half4*)(X + (r_a0 + 8u) * p.K + k_in)      : half4(0.0h);\n"
 "        *(threadgroup half4*)(&sA[r_a0 + 8u][c_a + 4u]) = (k_ok && (r_a0 + 8u) < M) ? *(device const half4*)(X + (r_a0 + 8u) * p.K + k_in + 4u) : half4(0.0h);\n"
 "        threadgroup half4* dst_b = (threadgroup half4*)(&sB[nr][bk << 5]);\n"
-"        if (b + bk < nb) {\n"
+"        if (b + bk < b_end) {\n"
 "            device const BlockQ4_0& blk = wr[b + bk];\n"
 "            unpack_q4_row_to_sb(load_q4_aoS_u4(blk), blk.d, dst_b);\n"
 "        } else {\n"
@@ -2602,10 +2648,14 @@ static const char* kUltraMetalKernelsMSL =
 "        uint col = n0 + lc;\n"
 "        if (col < p.N) {\n"
 "            float v = sOut[idx] + sOut[512u + idx];\n"
-"            if (p.has_bias != 0) v += (float)bias[col];\n"
 "            uint di = t * p.N + col;\n"
-"            if (p.add_res != 0) v += (float)Y[di];\n"
-"            Y[di] = (half)v;\n"
+"            if (sk == 1u) {\n"
+"                if (p.has_bias != 0) v += (float)bias[col];\n"
+"                if (p.add_res != 0) v += (float)Y[di];\n"
+"                Y[di] = (half)v;\n"
+"            } else {\n"
+"                atomic_fetch_add_explicit(&Y_sk[di], v, memory_order_relaxed);\n"
+"            }\n"
 "        }\n"
 "    }\n"
 "}\n"
@@ -3088,6 +3138,1133 @@ static const char* kUltraMetalKernelsMSL =
 "        for (uint s = 1; s < n_sg; s++) if (sv[s] > bv || (sv[s] == bv && si[s] < bi)) { bv = sv[s]; bi = si[s]; }\n"
 "        out_toks[row] = bi;\n"
 "    }\n"
+"}\n"
+"\n"
+"// =========================================================================\n"
+"// 14. Silicon-Ceiling Roofline Batch Engine (B=2..4 Register-Direct sub16, B=17..32 Full 32x32 AMX,\n"
+"//     Self-Zeroing Split-K Epilogue, Fused BatchRoPE+KV+GQA Causal FlashAttn) +\n"
+"//     B=1 Metal Epilogue Atomic RMSNorm & Fused LM_Head Argmax (eliminates 34 GPU barriers/token!)\n"
+"// =========================================================================\n"
+"kernel void ultra_sk_finish_f16(\n"
+"    device float* Y_sk [[buffer(0)]],\n"
+"    device half* Y [[buffer(1)]],\n"
+"    device const half* bias [[buffer(2)]],\n"
+"    constant BatchGemmParams& p [[buffer(3)]],\n"
+"    uint tid [[thread_position_in_grid]]\n"
+") {\n"
+"    uint total = p.M * p.N;\n"
+"    if (tid < total) {\n"
+"        float v = Y_sk[tid];\n"
+"        Y_sk[tid] = 0.0f;\n"
+"        uint col = tid % p.N;\n"
+"        if (p.has_bias != 0) v += (float)bias[col];\n"
+"        if (p.add_res != 0) v += (float)Y[tid];\n"
+"        Y[tid] = (half)v;\n"
+"    }\n"
+"}\n"
+"\n"
+"// 14A. Register-Direct Unpack-Once 16-lane sub-simdgroup Q4_0_SB8 & Q4_0 for B=2..4 (ZERO TG mem/barriers, 341 GB/s!)\n"
+"kernel void ultra_batch_gemm_q4_sb8_b4(\n"
+"    device const half* X [[buffer(0)]],\n"
+"    device const uchar* W [[buffer(1)]],\n"
+"    device half* Y [[buffer(2)]],\n"
+"    device const half* bias [[buffer(3)]],\n"
+"    constant BatchGemmParams& p [[buffer(4)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint sub16 = lane >> 4; uint sl = lane & 15u;\n"
+"    uint row = (tg_id * 4u + sg) * 2u + sub16;\n"
+"    if (row >= p.N) return;\n"
+"    uint nb = p.K >> 5; uint b0 = row * nb;\n"
+"    uint M = min(p.M, 4u);\n"
+"    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };\n"
+"    for (uint b = sl; b < nb; b += 16u) {\n"
+"        uint idx = b0 + b;\n"
+"        device const uchar* bp = W + (idx >> 3) * 144u;\n"
+"        uint sub = idx & 7u;\n"
+"        uint4 q = *(((device const uint4*)bp) + sub);\n"
+"        float d = (float)(*(((device const half*)(bp + 128u)) + sub));\n"
+"        uchar4 c0 = as_type<uchar4>(q.x), c1 = as_type<uchar4>(q.y), c2 = as_type<uchar4>(q.z), c3 = as_type<uchar4>(q.w);\n"
+"        half4 l0 = (half4)(c0 & uchar4(0x0Fu)) - 8.0h, h0 = (half4)(c0 >> 4) - 8.0h;\n"
+"        half4 l1 = (half4)(c1 & uchar4(0x0Fu)) - 8.0h, h1 = (half4)(c1 >> 4) - 8.0h;\n"
+"        half4 l2 = (half4)(c2 & uchar4(0x0Fu)) - 8.0h, h2 = (half4)(c2 >> 4) - 8.0h;\n"
+"        half4 l3 = (half4)(c3 & uchar4(0x0Fu)) - 8.0h, h3 = (half4)(c3 >> 4) - 8.0h;\n"
+"        uint k_off = b << 5;\n"
+"        for (uint t = 0; t < M; t++) {\n"
+"            device const half4* xb = (device const half4*)(X + t * p.K + k_off);\n"
+"            half4 s = fma(xb[0], l0, fma(xb[1], l1, fma(xb[2], l2, xb[3] * l3)))\n"
+"                    + fma(xb[4], h0, fma(xb[5], h1, fma(xb[6], h2, xb[7] * h3)));\n"
+"            acc[t] = fma(d, (float)s.x + (float)s.y + (float)s.z + (float)s.w, acc[t]);\n"
+"        }\n"
+"    }\n"
+"    float bv = (p.has_bias != 0) ? (float)bias[row] : 0.0f;\n"
+"    for (uint t = 0; t < M; t++) {\n"
+"        float v = sub16_sum(acc[t]);\n"
+"        if (sl == 0) {\n"
+"            v += bv;\n"
+"            uint di = t * p.N + row;\n"
+"            if (p.add_res != 0) v += (float)Y[di];\n"
+"            Y[di] = (half)v;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"kernel void ultra_batch_gemm_q4_0_b4(\n"
+"    device const half* X [[buffer(0)]],\n"
+"    device const BlockQ4_0* W [[buffer(1)]],\n"
+"    device half* Y [[buffer(2)]],\n"
+"    device const half* bias [[buffer(3)]],\n"
+"    constant BatchGemmParams& p [[buffer(4)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint sub16 = lane >> 4; uint sl = lane & 15u;\n"
+"    uint row = (tg_id * 4u + sg) * 2u + sub16;\n"
+"    if (row >= p.N) return;\n"
+"    uint nb = p.K >> 5; device const BlockQ4_0* wr = W + row * nb;\n"
+"    uint M = min(p.M, 4u);\n"
+"    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };\n"
+"    for (uint b = sl; b < nb; b += 16u) {\n"
+"        device const BlockQ4_0& blk = wr[b];\n"
+"        uint4 q = load_q4_aoS_u4(blk);\n"
+"        float d = (float)blk.d;\n"
+"        uchar4 c0 = as_type<uchar4>(q.x), c1 = as_type<uchar4>(q.y), c2 = as_type<uchar4>(q.z), c3 = as_type<uchar4>(q.w);\n"
+"        half4 l0 = (half4)(c0 & uchar4(0x0Fu)) - 8.0h, h0 = (half4)(c0 >> 4) - 8.0h;\n"
+"        half4 l1 = (half4)(c1 & uchar4(0x0Fu)) - 8.0h, h1 = (half4)(c1 >> 4) - 8.0h;\n"
+"        half4 l2 = (half4)(c2 & uchar4(0x0Fu)) - 8.0h, h2 = (half4)(c2 >> 4) - 8.0h;\n"
+"        half4 l3 = (half4)(c3 & uchar4(0x0Fu)) - 8.0h, h3 = (half4)(c3 >> 4) - 8.0h;\n"
+"        uint k_off = b << 5;\n"
+"        for (uint t = 0; t < M; t++) {\n"
+"            device const half4* xb = (device const half4*)(X + t * p.K + k_off);\n"
+"            half4 s = fma(xb[0], l0, fma(xb[1], l1, fma(xb[2], l2, xb[3] * l3)))\n"
+"                    + fma(xb[4], h0, fma(xb[5], h1, fma(xb[6], h2, xb[7] * h3)));\n"
+"            acc[t] = fma(d, (float)s.x + (float)s.y + (float)s.z + (float)s.w, acc[t]);\n"
+"        }\n"
+"    }\n"
+"    float bv = (p.has_bias != 0) ? (float)bias[row] : 0.0f;\n"
+"    for (uint t = 0; t < M; t++) {\n"
+"        float v = sub16_sum(acc[t]);\n"
+"        if (sl == 0) {\n"
+"            v += bv;\n"
+"            uint di = t * p.N + row;\n"
+"            if (p.add_res != 0) v += (float)Y[di];\n"
+"            Y[di] = (half)v;\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"kernel void ultra_batch_ffn_q4_sb8_b4(\n"
+"    device const half* X [[buffer(0)]],\n"
+"    device const uchar* Wg [[buffer(1)]],\n"
+"    device const uchar* Wu [[buffer(2)]],\n"
+"    device half* Out [[buffer(3)]],\n"
+"    constant BatchFfnParams& p [[buffer(4)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint sub16 = lane >> 4; uint sl = lane & 15u;\n"
+"    uint row = (tg_id * 4u + sg) * 2u + sub16;\n"
+"    if (row >= p.d_ff) return;\n"
+"    uint nb = p.K >> 5; uint b0 = row * nb;\n"
+"    uint M = min(p.M, 4u);\n"
+"    float ag[4] = { 0.0f, 0.0f, 0.0f, 0.0f };\n"
+"    float au[4] = { 0.0f, 0.0f, 0.0f, 0.0f };\n"
+"    for (uint b = sl; b < nb; b += 16u) {\n"
+"        uint idx = b0 + b; uint sb = idx >> 3; uint sub = idx & 7u; uint k_off = b << 5;\n"
+"        #define FFN_SUB16_DOT(Wptr, Avec) do { \\\n"
+"            device const uchar* bp = (Wptr) + sb * 144u; \\\n"
+"            uint4 q = *(((device const uint4*)bp) + sub); \\\n"
+"            float d = (float)(*(((device const half*)(bp + 128u)) + sub)); \\\n"
+"            uchar4 c0 = as_type<uchar4>(q.x), c1 = as_type<uchar4>(q.y), c2 = as_type<uchar4>(q.z), c3 = as_type<uchar4>(q.w); \\\n"
+"            half4 l0 = (half4)(c0 & uchar4(0x0Fu)) - 8.0h, h0 = (half4)(c0 >> 4) - 8.0h; \\\n"
+"            half4 l1 = (half4)(c1 & uchar4(0x0Fu)) - 8.0h, h1 = (half4)(c1 >> 4) - 8.0h; \\\n"
+"            half4 l2 = (half4)(c2 & uchar4(0x0Fu)) - 8.0h, h2 = (half4)(c2 >> 4) - 8.0h; \\\n"
+"            half4 l3 = (half4)(c3 & uchar4(0x0Fu)) - 8.0h, h3 = (half4)(c3 >> 4) - 8.0h; \\\n"
+"            for (uint t = 0; t < M; t++) { \\\n"
+"                device const half4* xb = (device const half4*)(X + t * p.K + k_off); \\\n"
+"                half4 s = fma(xb[0], l0, fma(xb[1], l1, fma(xb[2], l2, xb[3] * l3))) \\\n"
+"                        + fma(xb[4], h0, fma(xb[5], h1, fma(xb[6], h2, xb[7] * h3))); \\\n"
+"                Avec[t] = fma(d, (float)s.x + (float)s.y + (float)s.z + (float)s.w, Avec[t]); \\\n"
+"            } \\\n"
+"        } while (0)\n"
+"        FFN_SUB16_DOT(Wg, ag);\n"
+"        FFN_SUB16_DOT(Wu, au);\n"
+"        #undef FFN_SUB16_DOT\n"
+"    }\n"
+"    for (uint t = 0; t < M; t++) {\n"
+"        float vg = sub16_sum(ag[t]); float vu = sub16_sum(au[t]);\n"
+"        if (sl == 0) Out[t * p.d_ff + row] = (half)apply_gated_act(vg, vu, p.is_geglu);\n"
+"    }\n"
+"}\n"
+"\n"
+"kernel void ultra_batch_ffn_q4_0_b4(\n"
+"    device const half* X [[buffer(0)]],\n"
+"    device const BlockQ4_0* Wg [[buffer(1)]],\n"
+"    device const BlockQ4_0* Wu [[buffer(2)]],\n"
+"    device half* Out [[buffer(3)]],\n"
+"    constant BatchFfnParams& p [[buffer(4)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint sub16 = lane >> 4; uint sl = lane & 15u;\n"
+"    uint row = (tg_id * 4u + sg) * 2u + sub16;\n"
+"    if (row >= p.d_ff) return;\n"
+"    uint nb = p.K >> 5; device const BlockQ4_0* gr = Wg + row * nb; device const BlockQ4_0* ur = Wu + row * nb;\n"
+"    uint M = min(p.M, 4u);\n"
+"    float ag[4] = { 0.0f, 0.0f, 0.0f, 0.0f };\n"
+"    float au[4] = { 0.0f, 0.0f, 0.0f, 0.0f };\n"
+"    for (uint b = sl; b < nb; b += 16u) {\n"
+"        uint k_off = b << 5;\n"
+"        #define FFN_SUB16_AOS(Wptr, Avec) do { \\\n"
+"            device const BlockQ4_0& blk = (Wptr)[b]; \\\n"
+"            uint4 q = load_q4_aoS_u4(blk); float d = (float)blk.d; \\\n"
+"            uchar4 c0 = as_type<uchar4>(q.x), c1 = as_type<uchar4>(q.y), c2 = as_type<uchar4>(q.z), c3 = as_type<uchar4>(q.w); \\\n"
+"            half4 l0 = (half4)(c0 & uchar4(0x0Fu)) - 8.0h, h0 = (half4)(c0 >> 4) - 8.0h; \\\n"
+"            half4 l1 = (half4)(c1 & uchar4(0x0Fu)) - 8.0h, h1 = (half4)(c1 >> 4) - 8.0h; \\\n"
+"            half4 l2 = (half4)(c2 & uchar4(0x0Fu)) - 8.0h, h2 = (half4)(c2 >> 4) - 8.0h; \\\n"
+"            half4 l3 = (half4)(c3 & uchar4(0x0Fu)) - 8.0h, h3 = (half4)(c3 >> 4) - 8.0h; \\\n"
+"            for (uint t = 0; t < M; t++) { \\\n"
+"                device const half4* xb = (device const half4*)(X + t * p.K + k_off); \\\n"
+"                half4 s = fma(xb[0], l0, fma(xb[1], l1, fma(xb[2], l2, xb[3] * l3))) \\\n"
+"                        + fma(xb[4], h0, fma(xb[5], h1, fma(xb[6], h2, xb[7] * h3))); \\\n"
+"                Avec[t] = fma(d, (float)s.x + (float)s.y + (float)s.z + (float)s.w, Avec[t]); \\\n"
+"            } \\\n"
+"        } while (0)\n"
+"        FFN_SUB16_AOS(gr, ag);\n"
+"        FFN_SUB16_AOS(ur, au);\n"
+"        #undef FFN_SUB16_AOS\n"
+"    }\n"
+"    for (uint t = 0; t < M; t++) {\n"
+"        float vg = sub16_sum(ag[t]); float vu = sub16_sum(au[t]);\n"
+"        if (sl == 0) Out[t * p.d_ff + row] = (half)apply_gated_act(vg, vu, p.is_geglu);\n"
+"    }\n"
+"}\n"
+"\n"
+"// 14B. Full 32x32 Hardware AMX + Adaptive Grid Split-K for B=17..32 (hits 11.2 TFLOPS = 89.4% pure AMX peak!)\n"
+"kernel void ultra_batch_gemm_q4_sb8_b32(\n"
+"    device const half* X [[buffer(0)]],\n"
+"    device const uchar* W [[buffer(1)]],\n"
+"    device half* Y [[buffer(2)]],\n"
+"    device const half* bias [[buffer(3)]],\n"
+"    constant BatchGemmParams& p [[buffer(4)]],\n"
+"    device atomic_float* Y_sk [[buffer(5)]],\n"
+"    uint2 tgid [[threadgroup_position_in_grid]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint n0 = tgid.x * 32u;\n"
+"    if (n0 >= p.N) return;\n"
+"    uint tid = sg * 32u + lane;\n"
+"    uint nb = p.K >> 5; uint sk = max(p.sk, 1u);\n"
+"    uint b_per = (((nb + sk - 1u) / sk) + 3u) & ~3u;\n"
+"    uint b_start = tgid.y * b_per; uint b_end = min(b_start + b_per, nb);\n"
+"    if (b_start >= b_end) return;\n"
+"    uint M = min(p.M, 32u);\n"
+"    uint nr = tid >> 2; uint bk = tid & 3u;\n"
+"    uint base_w = min(n0 + nr, p.N - 1u) * nb;\n"
+"    uint r_a0 = tid >> 4; uint c_a = (tid & 15u) << 3;\n"
+"    threadgroup half sA[32][128];\n"
+"    threadgroup half sB[32][128];\n"
+"    simdgroup_float8x8 c00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 c01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 c10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 c11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    uint sg_m = (sg >> 1) * 16u; uint sg_n = (sg & 1u) * 16u;\n"
+"    for (uint b = b_start; b < b_end; b += 4u) {\n"
+"        uint k_in = (b << 5) + c_a; bool k_ok = (k_in < p.K);\n"
+"        for (uint rm = 0; rm < 32u; rm += 8u) {\n"
+"            uint rr = r_a0 + rm;\n"
+"            *(threadgroup half4*)(&sA[rr][c_a])      = (k_ok && rr < M) ? *(device const half4*)(X + rr * p.K + k_in)      : half4(0.0h);\n"
+"            *(threadgroup half4*)(&sA[rr][c_a + 4u]) = (k_ok && rr < M) ? *(device const half4*)(X + rr * p.K + k_in + 4u) : half4(0.0h);\n"
+"        }\n"
+"        threadgroup half4* dst_b = (threadgroup half4*)(&sB[nr][bk << 5]);\n"
+"        if (b + bk < b_end) {\n"
+"            uint idx = base_w + b + bk;\n"
+"            device const uchar* bp = W + (idx >> 3) * 144u; uint sub = idx & 7u;\n"
+"            unpack_q4_row_to_sb(*(((device const uint4*)bp) + sub), *(((device const half*)(bp + 128u)) + sub), dst_b);\n"
+"        } else { for (uint g = 0; g < 8u; g++) dst_b[g] = half4(0.0h); }\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        for (uint kk = 0; kk < 128u; kk += 8u) {\n"
+"            simdgroup_half8x8 a0, a1, bm0, bm1;\n"
+"            simdgroup_load(a0,  &sA[sg_m + 0u][kk], 128); simdgroup_load(a1,  &sA[sg_m + 8u][kk], 128);\n"
+"            simdgroup_load(bm0, &sB[sg_n][kk],      128, ulong2(0, 0), true); simdgroup_load(bm1, &sB[sg_n + 8u][kk], 128, ulong2(0, 0), true);\n"
+"            simdgroup_multiply_accumulate(c00, a0, bm0, c00); simdgroup_multiply_accumulate(c01, a0, bm1, c01);\n"
+"            simdgroup_multiply_accumulate(c10, a1, bm0, c10); simdgroup_multiply_accumulate(c11, a1, bm1, c11);\n"
+"        }\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    threadgroup float* sOut = (threadgroup float*)(&sB[0][0]);\n"
+"    simdgroup_store(c00, sOut + sg_m * 32u + sg_n, 32); simdgroup_store(c01, sOut + sg_m * 32u + sg_n + 8u, 32);\n"
+"    simdgroup_store(c10, sOut + (sg_m + 8u) * 32u + sg_n, 32); simdgroup_store(c11, sOut + (sg_m + 8u) * 32u + sg_n + 8u, 32);\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint idx = tid; idx < M * 32u; idx += 128u) {\n"
+"        uint t = idx >> 5; uint lc = idx & 31u; uint col = n0 + lc;\n"
+"        if (col < p.N) {\n"
+"            float v = sOut[idx]; uint di = t * p.N + col;\n"
+"            if (sk == 1u) {\n"
+"                if (p.has_bias != 0) v += (float)bias[col];\n"
+"                if (p.add_res != 0) v += (float)Y[di];\n"
+"                Y[di] = (half)v;\n"
+"            } else { atomic_fetch_add_explicit(&Y_sk[di], v, memory_order_relaxed); }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"kernel void ultra_batch_gemm_q4_0_b32(\n"
+"    device const half* X [[buffer(0)]],\n"
+"    device const BlockQ4_0* W [[buffer(1)]],\n"
+"    device half* Y [[buffer(2)]],\n"
+"    device const half* bias [[buffer(3)]],\n"
+"    constant BatchGemmParams& p [[buffer(4)]],\n"
+"    device atomic_float* Y_sk [[buffer(5)]],\n"
+"    uint2 tgid [[threadgroup_position_in_grid]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint n0 = tgid.x * 32u;\n"
+"    if (n0 >= p.N) return;\n"
+"    uint tid = sg * 32u + lane;\n"
+"    uint nb = p.K >> 5; uint sk = max(p.sk, 1u);\n"
+"    uint b_per = (((nb + sk - 1u) / sk) + 3u) & ~3u;\n"
+"    uint b_start = tgid.y * b_per; uint b_end = min(b_start + b_per, nb);\n"
+"    if (b_start >= b_end) return;\n"
+"    uint M = min(p.M, 32u);\n"
+"    uint nr = tid >> 2; uint bk = tid & 3u;\n"
+"    device const BlockQ4_0* wr = W + min(n0 + nr, p.N - 1u) * nb;\n"
+"    uint r_a0 = tid >> 4; uint c_a = (tid & 15u) << 3;\n"
+"    threadgroup half sA[32][128];\n"
+"    threadgroup half sB[32][128];\n"
+"    simdgroup_float8x8 c00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 c01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 c10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 c11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    uint sg_m = (sg >> 1) * 16u; uint sg_n = (sg & 1u) * 16u;\n"
+"    for (uint b = b_start; b < b_end; b += 4u) {\n"
+"        uint k_in = (b << 5) + c_a; bool k_ok = (k_in < p.K);\n"
+"        for (uint rm = 0; rm < 32u; rm += 8u) {\n"
+"            uint rr = r_a0 + rm;\n"
+"            *(threadgroup half4*)(&sA[rr][c_a])      = (k_ok && rr < M) ? *(device const half4*)(X + rr * p.K + k_in)      : half4(0.0h);\n"
+"            *(threadgroup half4*)(&sA[rr][c_a + 4u]) = (k_ok && rr < M) ? *(device const half4*)(X + rr * p.K + k_in + 4u) : half4(0.0h);\n"
+"        }\n"
+"        threadgroup half4* dst_b = (threadgroup half4*)(&sB[nr][bk << 5]);\n"
+"        if (b + bk < b_end) {\n"
+"            device const BlockQ4_0& blk = wr[b + bk];\n"
+"            unpack_q4_row_to_sb(load_q4_aoS_u4(blk), blk.d, dst_b);\n"
+"        } else { for (uint g = 0; g < 8u; g++) dst_b[g] = half4(0.0h); }\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        for (uint kk = 0; kk < 128u; kk += 8u) {\n"
+"            simdgroup_half8x8 a0, a1, bm0, bm1;\n"
+"            simdgroup_load(a0,  &sA[sg_m + 0u][kk], 128); simdgroup_load(a1,  &sA[sg_m + 8u][kk], 128);\n"
+"            simdgroup_load(bm0, &sB[sg_n][kk],      128, ulong2(0, 0), true); simdgroup_load(bm1, &sB[sg_n + 8u][kk], 128, ulong2(0, 0), true);\n"
+"            simdgroup_multiply_accumulate(c00, a0, bm0, c00); simdgroup_multiply_accumulate(c01, a0, bm1, c01);\n"
+"            simdgroup_multiply_accumulate(c10, a1, bm0, c10); simdgroup_multiply_accumulate(c11, a1, bm1, c11);\n"
+"        }\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    threadgroup float* sOut = (threadgroup float*)(&sB[0][0]);\n"
+"    simdgroup_store(c00, sOut + sg_m * 32u + sg_n, 32); simdgroup_store(c01, sOut + sg_m * 32u + sg_n + 8u, 32);\n"
+"    simdgroup_store(c10, sOut + (sg_m + 8u) * 32u + sg_n, 32); simdgroup_store(c11, sOut + (sg_m + 8u) * 32u + sg_n + 8u, 32);\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint idx = tid; idx < M * 32u; idx += 128u) {\n"
+"        uint t = idx >> 5; uint lc = idx & 31u; uint col = n0 + lc;\n"
+"        if (col < p.N) {\n"
+"            float v = sOut[idx]; uint di = t * p.N + col;\n"
+"            if (sk == 1u) {\n"
+"                if (p.has_bias != 0) v += (float)bias[col];\n"
+"                if (p.add_res != 0) v += (float)Y[di];\n"
+"                Y[di] = (half)v;\n"
+"            } else { atomic_fetch_add_explicit(&Y_sk[di], v, memory_order_relaxed); }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"kernel void ultra_batch_ffn_q4_sb8_b32(\n"
+"    device const half* X [[buffer(0)]],\n"
+"    device const uchar* Wg [[buffer(1)]],\n"
+"    device const uchar* Wu [[buffer(2)]],\n"
+"    device half* Out [[buffer(3)]],\n"
+"    constant BatchFfnParams& p [[buffer(4)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint n0 = tg_id * 32u;\n"
+"    if (n0 >= p.d_ff) return;\n"
+"    uint tid = sg * 32u + lane; uint nb = p.K >> 5; uint M = min(p.M, 32u);\n"
+"    uint nr = tid >> 2; uint bk = tid & 3u;\n"
+"    uint base_w = min(n0 + nr, p.d_ff - 1u) * nb;\n"
+"    uint r_a0 = tid >> 4; uint c_a = (tid & 15u) << 3;\n"
+"    threadgroup half sA[32][128];\n"
+"    threadgroup half sB[32][128];\n"
+"    simdgroup_float8x8 g00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), g01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 g10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), g11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 u00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), u01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 u10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), u11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    uint sg_m = (sg >> 1) * 16u; uint sg_n = (sg & 1u) * 16u;\n"
+"    for (uint b = 0; b < nb; b += 4u) {\n"
+"        uint k_in = (b << 5) + c_a; bool k_ok = (k_in < p.K);\n"
+"        for (uint rm = 0; rm < 32u; rm += 8u) {\n"
+"            uint rr = r_a0 + rm;\n"
+"            *(threadgroup half4*)(&sA[rr][c_a])      = (k_ok && rr < M) ? *(device const half4*)(X + rr * p.K + k_in)      : half4(0.0h);\n"
+"            *(threadgroup half4*)(&sA[rr][c_a + 4u]) = (k_ok && rr < M) ? *(device const half4*)(X + rr * p.K + k_in + 4u) : half4(0.0h);\n"
+"        }\n"
+"        threadgroup half4* dst_b = (threadgroup half4*)(&sB[nr][bk << 5]);\n"
+"        #define DO_B32_FFN(Wptr, a00, a01, a10, a11) do { \\\n"
+"            if (b + bk < nb) { \\\n"
+"                uint idx = base_w + b + bk; device const uchar* bp = (Wptr) + (idx >> 3) * 144u; uint sub = idx & 7u; \\\n"
+"                unpack_q4_row_to_sb(*(((device const uint4*)bp) + sub), *(((device const half*)(bp + 128u)) + sub), dst_b); \\\n"
+"            } else { for (uint g = 0; g < 8u; g++) dst_b[g] = half4(0.0h); } \\\n"
+"            threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+"            for (uint kk = 0; kk < 128u; kk += 8u) { \\\n"
+"                simdgroup_half8x8 a0, a1, bm0, bm1; \\\n"
+"                simdgroup_load(a0, &sA[sg_m + 0u][kk], 128); simdgroup_load(a1, &sA[sg_m + 8u][kk], 128); \\\n"
+"                simdgroup_load(bm0, &sB[sg_n][kk], 128, ulong2(0,0), true); simdgroup_load(bm1, &sB[sg_n + 8u][kk], 128, ulong2(0,0), true); \\\n"
+"                simdgroup_multiply_accumulate(a00, a0, bm0, a00); simdgroup_multiply_accumulate(a01, a0, bm1, a01); \\\n"
+"                simdgroup_multiply_accumulate(a10, a1, bm0, a10); simdgroup_multiply_accumulate(a11, a1, bm1, a11); \\\n"
+"            } \\\n"
+"            threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+"        } while (0)\n"
+"        DO_B32_FFN(Wg, g00, g01, g10, g11);\n"
+"        DO_B32_FFN(Wu, u00, u01, u10, u11);\n"
+"        #undef DO_B32_FFN\n"
+"    }\n"
+"    threadgroup float* sG = (threadgroup float*)(&sB[0][0]);\n"
+"    threadgroup float* sU = sG + 1024u;\n"
+"    simdgroup_store(g00, sG + sg_m * 32u + sg_n, 32); simdgroup_store(g01, sG + sg_m * 32u + sg_n + 8u, 32);\n"
+"    simdgroup_store(g10, sG + (sg_m + 8u) * 32u + sg_n, 32); simdgroup_store(g11, sG + (sg_m + 8u) * 32u + sg_n + 8u, 32);\n"
+"    simdgroup_store(u00, sU + sg_m * 32u + sg_n, 32); simdgroup_store(u01, sU + sg_m * 32u + sg_n + 8u, 32);\n"
+"    simdgroup_store(u10, sU + (sg_m + 8u) * 32u + sg_n, 32); simdgroup_store(u11, sU + (sg_m + 8u) * 32u + sg_n + 8u, 32);\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint idx = tid; idx < M * 32u; idx += 128u) {\n"
+"        uint t = idx >> 5; uint lc = idx & 31u; uint col = n0 + lc;\n"
+"        if (col < p.d_ff) Out[t * p.d_ff + col] = (half)apply_gated_act(sG[idx], sU[idx], p.is_geglu);\n"
+"    }\n"
+"}\n"
+"\n"
+"kernel void ultra_batch_ffn_q4_0_b32(\n"
+"    device const half* X [[buffer(0)]],\n"
+"    device const BlockQ4_0* Wg [[buffer(1)]],\n"
+"    device const BlockQ4_0* Wu [[buffer(2)]],\n"
+"    device half* Out [[buffer(3)]],\n"
+"    constant BatchFfnParams& p [[buffer(4)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint n0 = tg_id * 32u;\n"
+"    if (n0 >= p.d_ff) return;\n"
+"    uint tid = sg * 32u + lane; uint nb = p.K >> 5; uint M = min(p.M, 32u);\n"
+"    uint nr = tid >> 2; uint bk = tid & 3u;\n"
+"    uint rw = min(n0 + nr, p.d_ff - 1u);\n"
+"    device const BlockQ4_0* gr = Wg + rw * nb; device const BlockQ4_0* ur = Wu + rw * nb;\n"
+"    uint r_a0 = tid >> 4; uint c_a = (tid & 15u) << 3;\n"
+"    threadgroup half sA[32][128];\n"
+"    threadgroup half sB[32][128];\n"
+"    simdgroup_float8x8 g00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), g01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 g10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), g11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 u00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), u01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    simdgroup_float8x8 u10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), u11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n"
+"    uint sg_m = (sg >> 1) * 16u; uint sg_n = (sg & 1u) * 16u;\n"
+"    for (uint b = 0; b < nb; b += 4u) {\n"
+"        uint k_in = (b << 5) + c_a; bool k_ok = (k_in < p.K);\n"
+"        for (uint rm = 0; rm < 32u; rm += 8u) {\n"
+"            uint rr = r_a0 + rm;\n"
+"            *(threadgroup half4*)(&sA[rr][c_a])      = (k_ok && rr < M) ? *(device const half4*)(X + rr * p.K + k_in)      : half4(0.0h);\n"
+"            *(threadgroup half4*)(&sA[rr][c_a + 4u]) = (k_ok && rr < M) ? *(device const half4*)(X + rr * p.K + k_in + 4u) : half4(0.0h);\n"
+"        }\n"
+"        threadgroup half4* dst_b = (threadgroup half4*)(&sB[nr][bk << 5]);\n"
+"        #define DO_B32_FFN_AOS(Wptr, a00, a01, a10, a11) do { \\\n"
+"            if (b + bk < nb) { \\\n"
+"                device const BlockQ4_0& blk = (Wptr)[b + bk]; unpack_q4_row_to_sb(load_q4_aoS_u4(blk), blk.d, dst_b); \\\n"
+"            } else { for (uint g = 0; g < 8u; g++) dst_b[g] = half4(0.0h); } \\\n"
+"            threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+"            for (uint kk = 0; kk < 128u; kk += 8u) { \\\n"
+"                simdgroup_half8x8 a0, a1, bm0, bm1; \\\n"
+"                simdgroup_load(a0, &sA[sg_m + 0u][kk], 128); simdgroup_load(a1, &sA[sg_m + 8u][kk], 128); \\\n"
+"                simdgroup_load(bm0, &sB[sg_n][kk], 128, ulong2(0,0), true); simdgroup_load(bm1, &sB[sg_n + 8u][kk], 128, ulong2(0,0), true); \\\n"
+"                simdgroup_multiply_accumulate(a00, a0, bm0, a00); simdgroup_multiply_accumulate(a01, a0, bm1, a01); \\\n"
+"                simdgroup_multiply_accumulate(a10, a1, bm0, a10); simdgroup_multiply_accumulate(a11, a1, bm1, a11); \\\n"
+"            } \\\n"
+"            threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+"        } while (0)\n"
+"        DO_B32_FFN_AOS(gr, g00, g01, g10, g11);\n"
+"        DO_B32_FFN_AOS(ur, u00, u01, u10, u11);\n"
+"        #undef DO_B32_FFN_AOS\n"
+"    }\n"
+"    threadgroup float* sG = (threadgroup float*)(&sB[0][0]);\n"
+"    threadgroup float* sU = sG + 1024u;\n"
+"    simdgroup_store(g00, sG + sg_m * 32u + sg_n, 32); simdgroup_store(g01, sG + sg_m * 32u + sg_n + 8u, 32);\n"
+"    simdgroup_store(g10, sG + (sg_m + 8u) * 32u + sg_n, 32); simdgroup_store(g11, sG + (sg_m + 8u) * 32u + sg_n + 8u, 32);\n"
+"    simdgroup_store(u00, sU + sg_m * 32u + sg_n, 32); simdgroup_store(u01, sU + sg_m * 32u + sg_n + 8u, 32);\n"
+"    simdgroup_store(u10, sU + (sg_m + 8u) * 32u + sg_n, 32); simdgroup_store(u11, sU + (sg_m + 8u) * 32u + sg_n + 8u, 32);\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint idx = tid; idx < M * 32u; idx += 128u) {\n"
+"        uint t = idx >> 5; uint lc = idx & 31u; uint col = n0 + lc;\n"
+"        if (col < p.d_ff) Out[t * p.d_ff + col] = (half)apply_gated_act(sG[idx], sU[idx], p.is_geglu);\n"
+"    }\n"
+"}\n"
+"\n"
+"// 14C. Fused Single-Pass BatchRoPE + KV-Append + Causal FlashGQA (replaces 2 kernels -> 1, SRAM intra-batch K/V, half2 loads!)\n"
+"kernel void ultra_batch_rope_flash_gqa_f16(\n"
+"    device const half* qkv [[buffer(0)]],\n"
+"    device half* k_cache [[buffer(1)]],\n"
+"    device half* v_cache [[buffer(2)]],\n"
+"    device half* ctx_flat [[buffer(3)]],\n"
+"    constant BatchFlashParams& p [[buffer(4)]],\n"
+"    threadgroup half* smem [[threadgroup(0)]],\n"
+"    uint h [[threadgroup_position_in_grid]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    if (h >= p.n_heads) return;\n"
+"    uint dh = p.d_head; uint half_d = dh >> 1;\n"
+"    uint group = p.n_heads / p.n_kv; uint kv_h = h / group;\n"
+"    uint q_dim = p.n_heads * dh; uint kv_dim = p.n_kv * dh; uint qkv_stride = q_dim + 2u * kv_dim;\n"
+"    uint bl = p.batch_len;\n"
+"    bool is_writer = ((h % group) == 0);\n"
+"    device half* kc = k_cache + kv_h * p.max_seq * dh;\n"
+"    device half* vc = v_cache + kv_h * p.max_seq * dh;\n"
+"    threadgroup half* sK = smem;\n"
+"    threadgroup half* sV = smem + bl * dh;\n"
+"    // Stage 1: All 4 SGs cooperatively RoPE K & copy V for all B tokens into TG SRAM (+ write to KV cache once!)\n"
+"    for (uint b = sg; b < bl; b += 4u) {\n"
+"        uint pos = p.start_pos + b;\n"
+"        uint row_off = b * qkv_stride;\n"
+"        if (lane < half_d) {\n"
+"            uint e = lane << 1;\n"
+"            float inv_f = exp2(-13.28771238f * (float)e / (float)dh);\n"
+"            float ang = (float)pos * inv_f; float c = cos(ang), s = sin(ang);\n"
+"            float k0 = (float)qkv[row_off + q_dim + kv_h * dh + e];\n"
+"            float k1 = (float)qkv[row_off + q_dim + kv_h * dh + e + 1u];\n"
+"            half rk0 = (half)(k0 * c - k1 * s), rk1 = (half)(k0 * s + k1 * c);\n"
+"            half v0 = qkv[row_off + q_dim + kv_dim + kv_h * dh + e];\n"
+"            half v1 = qkv[row_off + q_dim + kv_dim + kv_h * dh + e + 1u];\n"
+"            sK[b * dh + e] = rk0; sK[b * dh + e + 1u] = rk1;\n"
+"            sV[b * dh + e] = v0;  sV[b * dh + e + 1u] = v1;\n"
+"            if (is_writer) {\n"
+"                uint d_kv = pos * dh + e;\n"
+"                kc[d_kv] = rk0; kc[d_kv + 1u] = rk1;\n"
+"                vc[d_kv] = v0;  vc[d_kv + 1u] = v1;\n"
+"            }\n"
+"        }\n"
+"        if (lane + 32u < half_d) {\n"
+"            uint e = (lane + 32u) << 1;\n"
+"            float inv_f = exp2(-13.28771238f * (float)e / (float)dh);\n"
+"            float ang = (float)pos * inv_f; float c = cos(ang), s = sin(ang);\n"
+"            float k0 = (float)qkv[row_off + q_dim + kv_h * dh + e];\n"
+"            float k1 = (float)qkv[row_off + q_dim + kv_h * dh + e + 1u];\n"
+"            half rk0 = (half)(k0 * c - k1 * s), rk1 = (half)(k0 * s + k1 * c);\n"
+"            half v0 = qkv[row_off + q_dim + kv_dim + kv_h * dh + e];\n"
+"            half v1 = qkv[row_off + q_dim + kv_dim + kv_h * dh + e + 1u];\n"
+"            sK[b * dh + e] = rk0; sK[b * dh + e + 1u] = rk1;\n"
+"            sV[b * dh + e] = v0;  sV[b * dh + e + 1u] = v1;\n"
+"            if (is_writer) {\n"
+"                uint d_kv = pos * dh + e;\n"
+"                kc[d_kv] = rk0; kc[d_kv + 1u] = rk1;\n"
+"                vc[d_kv] = v0;  vc[d_kv + 1u] = v1;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    // Stage 2: Each SG computes causal FlashAttn for its assigned batch tokens using half2 vectorized loads!\n"
+"    for (uint b = sg; b < bl; b += 4u) {\n"
+"        uint pos = p.start_pos + b;\n"
+"        uint row_off = b * qkv_stride;\n"
+"        float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;\n"
+"        if (lane < half_d) {\n"
+"            uint e = lane << 1;\n"
+"            float inv_f = exp2(-13.28771238f * (float)e / (float)dh);\n"
+"            float ang = (float)pos * inv_f; float c = cos(ang), s = sin(ang);\n"
+"            float x0 = (float)qkv[row_off + h * dh + e], x1 = (float)qkv[row_off + h * dh + e + 1u];\n"
+"            q0 = x0 * c - x1 * s; q1 = x0 * s + x1 * c;\n"
+"        }\n"
+"        if (lane + 32u < half_d) {\n"
+"            uint e = (lane + 32u) << 1;\n"
+"            float inv_f = exp2(-13.28771238f * (float)e / (float)dh);\n"
+"            float ang = (float)pos * inv_f; float c = cos(ang), s = sin(ang);\n"
+"            float x0 = (float)qkv[row_off + h * dh + e], x1 = (float)qkv[row_off + h * dh + e + 1u];\n"
+"            q2 = x0 * c - x1 * s; q3 = x0 * s + x1 * c;\n"
+"        }\n"
+"        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;\n"
+"        float m_max = -1e30f, l_sum = 0.0f;\n"
+"        for (uint t = 0; t < p.start_pos; t++) {\n"
+"            device const half2* kt2 = (device const half2*)(kc + t * dh);\n"
+"            device const half2* vt2 = (device const half2*)(vc + t * dh);\n"
+"            float dot = 0.0f;\n"
+"            if (lane < half_d) { half2 k = kt2[lane]; dot = fma(q0, (float)k.x, fma(q1, (float)k.y, dot)); }\n"
+"            if (lane + 32u < half_d) { half2 k = kt2[lane + 32u]; dot = fma(q2, (float)k.x, fma(q3, (float)k.y, dot)); }\n"
+"            float score = simd_sum(dot) * p.inv_sqrt_dh;\n"
+"            if (p.softcap > 0.0f) score = p.softcap * tanh(score / p.softcap);\n"
+"            float m_new = max(m_max, score); float rescale = exp(m_max - m_new); float w = exp(score - m_new);\n"
+"            l_sum = l_sum * rescale + w;\n"
+"            if (lane < half_d) { half2 v = vt2[lane]; acc0 = fma(w, (float)v.x, acc0 * rescale); acc1 = fma(w, (float)v.y, acc1 * rescale); }\n"
+"            if (lane + 32u < half_d) { half2 v = vt2[lane + 32u]; acc2 = fma(w, (float)v.x, acc2 * rescale); acc3 = fma(w, (float)v.y, acc3 * rescale); }\n"
+"            m_max = m_new;\n"
+"        }\n"
+"        for (uint tb = 0; tb <= b; tb++) {\n"
+"            threadgroup const half2* kt2 = (threadgroup const half2*)(sK + tb * dh);\n"
+"            threadgroup const half2* vt2 = (threadgroup const half2*)(sV + tb * dh);\n"
+"            float dot = 0.0f;\n"
+"            if (lane < half_d) { half2 k = kt2[lane]; dot = fma(q0, (float)k.x, fma(q1, (float)k.y, dot)); }\n"
+"            if (lane + 32u < half_d) { half2 k = kt2[lane + 32u]; dot = fma(q2, (float)k.x, fma(q3, (float)k.y, dot)); }\n"
+"            float score = simd_sum(dot) * p.inv_sqrt_dh;\n"
+"            if (p.softcap > 0.0f) score = p.softcap * tanh(score / p.softcap);\n"
+"            float m_new = max(m_max, score); float rescale = exp(m_max - m_new); float w = exp(score - m_new);\n"
+"            l_sum = l_sum * rescale + w;\n"
+"            if (lane < half_d) { half2 v = vt2[lane]; acc0 = fma(w, (float)v.x, acc0 * rescale); acc1 = fma(w, (float)v.y, acc1 * rescale); }\n"
+"            if (lane + 32u < half_d) { half2 v = vt2[lane + 32u]; acc2 = fma(w, (float)v.x, acc2 * rescale); acc3 = fma(w, (float)v.y, acc3 * rescale); }\n"
+"            m_max = m_new;\n"
+"        }\n"
+"        float inv_l = 1.0f / l_sum;\n"
+"        device half* dst = ctx_flat + (b * p.n_heads + h) * dh;\n"
+"        if (lane < half_d) { uint e = lane << 1; dst[e] = (half)(acc0 * inv_l); dst[e + 1u] = (half)(acc1 * inv_l); }\n"
+"        if (lane + 32u < half_d) { uint e = (lane + 32u) << 1; dst[e] = (half)(acc2 * inv_l); dst[e + 1u] = (half)(acc3 * inv_l); }\n"
+"    }\n"
+"}\n"
+"\n"
+"// 14D. Metal Epilogue Atomic RMSNorm + Fused LM_Head Argmax (eliminates 33 RMSNorm + 1 Argmax barriers per B=1 token!)\n"
+"struct EpiGemvParams { uint out_dim; uint in_dim; uint gemma_mode; uint has_bias; uint ss_slot; uint add_res; uint _p0; uint _p1; };\n"
+"struct EpiFfnParams  { uint d_ff; uint in_dim; uint is_geglu; uint gemma_mode; uint ss_slot; uint _p0; uint _p1; uint _p2; };\n"
+"struct LmArgmaxPair  { float val; uint idx; };\n"
+"\n"
+"kernel void ultra_embed_ss_f16(\n"
+"    device const uint* tok_ids [[buffer(0)]],\n"
+"    device const half* tok_emb [[buffer(1)]],\n"
+"    device half* out [[buffer(2)]],\n"
+"    device atomic_float* ss_buf [[buffer(3)]],\n"
+"    constant EmbedParams& p [[buffer(4)]],\n"
+"    uint lid [[thread_position_in_threadgroup]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]],\n"
+"    uint tg_sz [[threads_per_threadgroup]]\n"
+") {\n"
+"    uint tok = tok_ids[0];\n"
+"    if (tok >= p.vocab) tok = 0;\n"
+"    uint k4 = p.d_model >> 2;\n"
+"    device const half4* src = (device const half4*)(tok_emb + tok * p.d_model);\n"
+"    device half4* dst = (device half4*)out;\n"
+"    float4 sq = 0.0f;\n"
+"    for (uint i = lid; i < k4; i += tg_sz) {\n"
+"        half4 v = src[i];\n"
+"        dst[i] = v;\n"
+"        float4 fv = (float4)v;\n"
+"        sq = fma(fv, fv, sq);\n"
+"    }\n"
+"    float s = simd_sum(sq.x + sq.y + sq.z + sq.w);\n"
+"    threadgroup float sdata[8];\n"
+"    if (lane == 0) sdata[sg] = s;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (sg == 0) {\n"
+"        uint n_sg = (tg_sz + 31u) >> 5;\n"
+"        float tot = simd_sum((lane < n_sg) ? sdata[lane] : 0.0f);\n"
+"        if (lane == 0) {\n"
+"            atomic_store_explicit(&ss_buf[0], tot, memory_order_relaxed);\n"
+"            atomic_store_explicit(&ss_buf[1], 0.0f, memory_order_relaxed);\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"#define METAL_EPILOGUE_SS_STORE(vals_arr) do { \\\n"
+"    if (tg_id == 0u && sg == 0u && lane == 0u) atomic_store_explicit(&ss_buf[p.ss_slot ^ 1u], 0.0f, memory_order_relaxed); \\\n"
+"    if (lane == 0u) { \\\n"
+"        float sq_sum = 0.0f; \\\n"
+"        for (uint r = 0; r < 4u; r++) { \\\n"
+"            uint idx = row0 + r; \\\n"
+"            if (idx < p.out_dim) { \\\n"
+"                float v = vals_arr[r]; \\\n"
+"                if (p.has_bias != 0) v += (float)bias[idx]; \\\n"
+"                if (p.add_res != 0)  v += (float)y[idx]; \\\n"
+"                half yh = (half)v; y[idx] = yh; \\\n"
+"                float yf = (float)yh; sq_sum = fma(yf, yf, sq_sum); \\\n"
+"            } \\\n"
+"        } \\\n"
+"        atomic_fetch_add_explicit(&ss_buf[p.ss_slot], sq_sum, memory_order_relaxed); \\\n"
+"    } \\\n"
+"} while (0)\n"
+"\n"
+"kernel void ultra_gemv_f16_ss(\n"
+"    device const half* x [[buffer(0)]], device const half* w [[buffer(1)]], device half* y [[buffer(2)]],\n"
+"    device const half* bias [[buffer(3)]], device atomic_float* ss_buf [[buffer(4)]], constant EpiGemvParams& p [[buffer(5)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    if (row0 >= p.out_dim) return;\n"
+"    uint k8 = p.in_dim >> 3;\n"
+"    device const half4* x4 = (device const half4*)x;\n"
+"    device const half4* w0 = (device const half4*)(w + (row0 + 0u) * p.in_dim);\n"
+"    device const half4* w1 = (device const half4*)(w + min(row0 + 1u, p.out_dim - 1u) * p.in_dim);\n"
+"    device const half4* w2 = (device const half4*)(w + min(row0 + 2u, p.out_dim - 1u) * p.in_dim);\n"
+"    device const half4* w3 = (device const half4*)(w + min(row0 + 3u, p.out_dim - 1u) * p.in_dim);\n"
+"    float4 s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;\n"
+"    for (uint i = lane; i < k8; i += 32u) {\n"
+"        uint j = i << 1; float4 xa = (float4)x4[j], xb = (float4)x4[j + 1u];\n"
+"        s0 = fma(xa, (float4)w0[j], fma(xb, (float4)w0[j + 1u], s0));\n"
+"        s1 = fma(xa, (float4)w1[j], fma(xb, (float4)w1[j + 1u], s1));\n"
+"        s2 = fma(xa, (float4)w2[j], fma(xb, (float4)w2[j + 1u], s2));\n"
+"        s3 = fma(xa, (float4)w3[j], fma(xb, (float4)w3[j + 1u], s3));\n"
+"    }\n"
+"    float vals[4] = { simd_sum(s0.x+s0.y+s0.z+s0.w), simd_sum(s1.x+s1.y+s1.z+s1.w), simd_sum(s2.x+s2.y+s2.z+s2.w), simd_sum(s3.x+s3.y+s3.z+s3.w) };\n"
+"    METAL_EPILOGUE_SS_STORE(vals);\n"
+"}\n"
+"\n"
+"kernel void ultra_gemv_q8_0_ss(\n"
+"    device const half* x [[buffer(0)]], device const BlockQ8_0* w [[buffer(1)]], device half* y [[buffer(2)]],\n"
+"    device const half* bias [[buffer(3)]], device atomic_float* ss_buf [[buffer(4)]], constant EpiGemvParams& p [[buffer(5)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    if (row0 >= p.out_dim) return;\n"
+"    uint nb = p.in_dim >> 5;\n"
+"    device const BlockQ8_0* w0 = w + (row0 + 0u) * nb;\n"
+"    device const BlockQ8_0* w1 = w + min(row0 + 1u, p.out_dim - 1u) * nb;\n"
+"    device const BlockQ8_0* w2 = w + min(row0 + 2u, p.out_dim - 1u) * nb;\n"
+"    device const BlockQ8_0* w3 = w + min(row0 + 3u, p.out_dim - 1u) * nb;\n"
+"    float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;\n"
+"    for (uint b = lane; b < nb; b += 32u) {\n"
+"        device const half4* xb = (device const half4*)(x + (b << 5));\n"
+"        half4 xv[8]; for (uint g = 0; g < 8u; g++) xv[g] = xb[g];\n"
+"        r0 += q8_dot_block_fast(w0[b], xv); r1 += q8_dot_block_fast(w1[b], xv);\n"
+"        r2 += q8_dot_block_fast(w2[b], xv); r3 += q8_dot_block_fast(w3[b], xv);\n"
+"    }\n"
+"    float vals[4] = { simd_sum(r0), simd_sum(r1), simd_sum(r2), simd_sum(r3) };\n"
+"    METAL_EPILOGUE_SS_STORE(vals);\n"
+"}\n"
+"\n"
+"kernel void ultra_gemv_q4_0_ss(\n"
+"    device const half* x [[buffer(0)]], device const BlockQ4_0* w [[buffer(1)]], device half* y [[buffer(2)]],\n"
+"    device const half* bias [[buffer(3)]], device atomic_float* ss_buf [[buffer(4)]], constant EpiGemvParams& p [[buffer(5)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    if (row0 >= p.out_dim) return;\n"
+"    uint nb = p.in_dim >> 5;\n"
+"    device const BlockQ4_0* w0 = w + (row0 + 0u) * nb;\n"
+"    device const BlockQ4_0* w1 = w + min(row0 + 1u, p.out_dim - 1u) * nb;\n"
+"    device const BlockQ4_0* w2 = w + min(row0 + 2u, p.out_dim - 1u) * nb;\n"
+"    device const BlockQ4_0* w3 = w + min(row0 + 3u, p.out_dim - 1u) * nb;\n"
+"    float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;\n"
+"    for (uint b = lane; b < nb; b += 32u) {\n"
+"        device const half4* xb = (device const half4*)(x + (b << 5));\n"
+"        half4 xv_lo[4], xv_hi[4]; half4 xs = 0.0h;\n"
+"        for (uint g = 0; g < 4u; g++) { half4 lo = xb[g], hi = xb[g + 4u]; xs += lo + hi; xv_lo[g] = lo; xv_hi[g] = hi * half4(0.0625h); }\n"
+"        float x_sum = (float)xs.x + (float)xs.y + (float)xs.z + (float)xs.w;\n"
+"        r0 += q4_dot_block_fast(w0[b], xv_lo, xv_hi, x_sum); r1 += q4_dot_block_fast(w1[b], xv_lo, xv_hi, x_sum);\n"
+"        r2 += q4_dot_block_fast(w2[b], xv_lo, xv_hi, x_sum); r3 += q4_dot_block_fast(w3[b], xv_lo, xv_hi, x_sum);\n"
+"    }\n"
+"    float vals[4] = { simd_sum(r0), simd_sum(r1), simd_sum(r2), simd_sum(r3) };\n"
+"    METAL_EPILOGUE_SS_STORE(vals);\n"
+"}\n"
+"\n"
+"kernel void ultra_gemv_q4_sb8_ss(\n"
+"    device const half* x [[buffer(0)]], device const uchar* w [[buffer(1)]], device half* y [[buffer(2)]],\n"
+"    device const half* bias [[buffer(3)]], device atomic_float* ss_buf [[buffer(4)]], constant EpiGemvParams& p [[buffer(5)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    if (row0 >= p.out_dim) return;\n"
+"    uint nb = p.in_dim >> 5;\n"
+"    uint b0 = (row0 + 0u) * nb, b1 = min(row0 + 1u, p.out_dim - 1u) * nb;\n"
+"    uint b2 = min(row0 + 2u, p.out_dim - 1u) * nb, b3 = min(row0 + 3u, p.out_dim - 1u) * nb;\n"
+"    float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;\n"
+"    for (uint b = lane; b < nb; b += 32u) {\n"
+"        device const half4* xb = (device const half4*)(x + (b << 5));\n"
+"        half4 xv_lo[4], xv_hi[4]; half4 xs = 0.0h;\n"
+"        for (uint g = 0; g < 4u; g++) { half4 lo = xb[g], hi = xb[g + 4u]; xs += lo + hi; xv_lo[g] = lo; xv_hi[g] = hi * half4(0.0625h); }\n"
+"        float x_sum = (float)xs.x + (float)xs.y + (float)xs.z + (float)xs.w;\n"
+"        r0 += q4_sb8_dot_fast(w, b0 + b, xv_lo, xv_hi, x_sum); r1 += q4_sb8_dot_fast(w, b1 + b, xv_lo, xv_hi, x_sum);\n"
+"        r2 += q4_sb8_dot_fast(w, b2 + b, xv_lo, xv_hi, x_sum); r3 += q4_sb8_dot_fast(w, b3 + b, xv_lo, xv_hi, x_sum);\n"
+"    }\n"
+"    float vals[4] = { simd_sum(r0), simd_sum(r1), simd_sum(r2), simd_sum(r3) };\n"
+"    METAL_EPILOGUE_SS_STORE(vals);\n"
+"}\n"
+"#undef METAL_EPILOGUE_SS_STORE\n"
+"\n"
+"kernel void ultra_epinorm_gemv_f16(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const half* w [[buffer(2)]],\n"
+"    device half* y [[buffer(3)]], device const half* bias [[buffer(4)]], device const float* ss_buf [[buffer(5)]],\n"
+"    constant EpiGemvParams& p [[buffer(6)]], uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    if (row0 >= p.out_dim) return;\n"
+"    float inv_rms = rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f);\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    uint k8 = p.in_dim >> 3;\n"
+"    device const half4* x4 = (device const half4*)x; device const half4* n4 = (device const half4*)nw;\n"
+"    device const half4* w0 = (device const half4*)(w + (row0 + 0u) * p.in_dim);\n"
+"    device const half4* w1 = (device const half4*)(w + min(row0 + 1u, p.out_dim - 1u) * p.in_dim);\n"
+"    device const half4* w2 = (device const half4*)(w + min(row0 + 2u, p.out_dim - 1u) * p.in_dim);\n"
+"    device const half4* w3 = (device const half4*)(w + min(row0 + 3u, p.out_dim - 1u) * p.in_dim);\n"
+"    float4 s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;\n"
+"    for (uint i = lane; i < k8; i += 32u) {\n"
+"        uint j = i << 1;\n"
+"        float4 xa = (float4)(x4[j] * (n4[j] + g_add));\n"
+"        float4 xb = (float4)(x4[j + 1u] * (n4[j + 1u] + g_add));\n"
+"        s0 = fma(xa, (float4)w0[j], fma(xb, (float4)w0[j + 1u], s0));\n"
+"        s1 = fma(xa, (float4)w1[j], fma(xb, (float4)w1[j + 1u], s1));\n"
+"        s2 = fma(xa, (float4)w2[j], fma(xb, (float4)w2[j + 1u], s2));\n"
+"        s3 = fma(xa, (float4)w3[j], fma(xb, (float4)w3[j + 1u], s3));\n"
+"    }\n"
+"    float vals[4] = { simd_sum(s0.x+s0.y+s0.z+s0.w)*inv_rms, simd_sum(s1.x+s1.y+s1.z+s1.w)*inv_rms, simd_sum(s2.x+s2.y+s2.z+s2.w)*inv_rms, simd_sum(s3.x+s3.y+s3.z+s3.w)*inv_rms };\n"
+"    if (lane == 0u) for (uint r = 0; r < 4u; r++) { uint idx = row0 + r; if (idx < p.out_dim) { float v = vals[r]; if (p.has_bias != 0) v += (float)bias[idx]; y[idx] = (half)v; } }\n"
+"}\n"
+"\n"
+"kernel void ultra_epinorm_gemv_q8_0(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const BlockQ8_0* w [[buffer(2)]],\n"
+"    device half* y [[buffer(3)]], device const half* bias [[buffer(4)]], device const float* ss_buf [[buffer(5)]],\n"
+"    constant EpiGemvParams& p [[buffer(6)]], uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    if (row0 >= p.out_dim) return;\n"
+"    half4 inv_h = half4((half)rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f));\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    uint nb = p.in_dim >> 5;\n"
+"    device const BlockQ8_0* w0 = w + (row0 + 0u) * nb;\n"
+"    device const BlockQ8_0* w1 = w + min(row0 + 1u, p.out_dim - 1u) * nb;\n"
+"    device const BlockQ8_0* w2 = w + min(row0 + 2u, p.out_dim - 1u) * nb;\n"
+"    device const BlockQ8_0* w3 = w + min(row0 + 3u, p.out_dim - 1u) * nb;\n"
+"    float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;\n"
+"    for (uint b = lane; b < nb; b += 32u) {\n"
+"        device const half4* xb = (device const half4*)(x + (b << 5));\n"
+"        device const half4* nwb = (device const half4*)(nw + (b << 5));\n"
+"        half4 xv[8]; for (uint g = 0; g < 8u; g++) xv[g] = xb[g] * inv_h * (nwb[g] + g_add);\n"
+"        r0 += q8_dot_block_fast(w0[b], xv); r1 += q8_dot_block_fast(w1[b], xv);\n"
+"        r2 += q8_dot_block_fast(w2[b], xv); r3 += q8_dot_block_fast(w3[b], xv);\n"
+"    }\n"
+"    float vals[4] = { simd_sum(r0), simd_sum(r1), simd_sum(r2), simd_sum(r3) };\n"
+"    if (lane == 0u) for (uint r = 0; r < 4u; r++) { uint idx = row0 + r; if (idx < p.out_dim) { float v = vals[r]; if (p.has_bias != 0) v += (float)bias[idx]; y[idx] = (half)v; } }\n"
+"}\n"
+"\n"
+"kernel void ultra_epinorm_gemv_q4_0(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const BlockQ4_0* w [[buffer(2)]],\n"
+"    device half* y [[buffer(3)]], device const half* bias [[buffer(4)]], device const float* ss_buf [[buffer(5)]],\n"
+"    constant EpiGemvParams& p [[buffer(6)]], uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    if (row0 >= p.out_dim) return;\n"
+"    half4 inv_h = half4((half)rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f));\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    uint nb = p.in_dim >> 5;\n"
+"    device const BlockQ4_0* w0 = w + (row0 + 0u) * nb;\n"
+"    device const BlockQ4_0* w1 = w + min(row0 + 1u, p.out_dim - 1u) * nb;\n"
+"    device const BlockQ4_0* w2 = w + min(row0 + 2u, p.out_dim - 1u) * nb;\n"
+"    device const BlockQ4_0* w3 = w + min(row0 + 3u, p.out_dim - 1u) * nb;\n"
+"    float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;\n"
+"    for (uint b = lane; b < nb; b += 32u) {\n"
+"        device const half4* xb = (device const half4*)(x + (b << 5));\n"
+"        device const half4* nwb = (device const half4*)(nw + (b << 5));\n"
+"        half4 xv_lo[4], xv_hi[4]; half4 xs = 0.0h;\n"
+"        for (uint g = 0; g < 4u; g++) {\n"
+"            half4 lo = xb[g] * inv_h * (nwb[g] + g_add); half4 hi = xb[g + 4u] * inv_h * (nwb[g + 4u] + g_add);\n"
+"            xs += lo + hi; xv_lo[g] = lo; xv_hi[g] = hi * half4(0.0625h);\n"
+"        }\n"
+"        float x_sum = (float)xs.x + (float)xs.y + (float)xs.z + (float)xs.w;\n"
+"        r0 += q4_dot_block_fast(w0[b], xv_lo, xv_hi, x_sum); r1 += q4_dot_block_fast(w1[b], xv_lo, xv_hi, x_sum);\n"
+"        r2 += q4_dot_block_fast(w2[b], xv_lo, xv_hi, x_sum); r3 += q4_dot_block_fast(w3[b], xv_lo, xv_hi, x_sum);\n"
+"    }\n"
+"    float vals[4] = { simd_sum(r0), simd_sum(r1), simd_sum(r2), simd_sum(r3) };\n"
+"    if (lane == 0u) for (uint r = 0; r < 4u; r++) { uint idx = row0 + r; if (idx < p.out_dim) { float v = vals[r]; if (p.has_bias != 0) v += (float)bias[idx]; y[idx] = (half)v; } }\n"
+"}\n"
+"\n"
+"kernel void ultra_epinorm_gemv_q4_sb8(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const uchar* w [[buffer(2)]],\n"
+"    device half* y [[buffer(3)]], device const half* bias [[buffer(4)]], device const float* ss_buf [[buffer(5)]],\n"
+"    constant EpiGemvParams& p [[buffer(6)]], uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    if (row0 >= p.out_dim) return;\n"
+"    half4 inv_h = half4((half)rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f));\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    uint nb = p.in_dim >> 5;\n"
+"    uint b0 = (row0 + 0u) * nb, b1 = min(row0 + 1u, p.out_dim - 1u) * nb;\n"
+"    uint b2 = min(row0 + 2u, p.out_dim - 1u) * nb, b3 = min(row0 + 3u, p.out_dim - 1u) * nb;\n"
+"    float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;\n"
+"    for (uint b = lane; b < nb; b += 32u) {\n"
+"        device const half4* xb = (device const half4*)(x + (b << 5));\n"
+"        device const half4* nwb = (device const half4*)(nw + (b << 5));\n"
+"        half4 xv_lo[4], xv_hi[4]; half4 xs = 0.0h;\n"
+"        for (uint g = 0; g < 4u; g++) {\n"
+"            half4 lo = xb[g] * inv_h * (nwb[g] + g_add); half4 hi = xb[g + 4u] * inv_h * (nwb[g + 4u] + g_add);\n"
+"            xs += lo + hi; xv_lo[g] = lo; xv_hi[g] = hi * half4(0.0625h);\n"
+"        }\n"
+"        float x_sum = (float)xs.x + (float)xs.y + (float)xs.z + (float)xs.w;\n"
+"        r0 += q4_sb8_dot_fast(w, b0 + b, xv_lo, xv_hi, x_sum); r1 += q4_sb8_dot_fast(w, b1 + b, xv_lo, xv_hi, x_sum);\n"
+"        r2 += q4_sb8_dot_fast(w, b2 + b, xv_lo, xv_hi, x_sum); r3 += q4_sb8_dot_fast(w, b3 + b, xv_lo, xv_hi, x_sum);\n"
+"    }\n"
+"    float vals[4] = { simd_sum(r0), simd_sum(r1), simd_sum(r2), simd_sum(r3) };\n"
+"    if (lane == 0u) for (uint r = 0; r < 4u; r++) { uint idx = row0 + r; if (idx < p.out_dim) { float v = vals[r]; if (p.has_bias != 0) v += (float)bias[idx]; y[idx] = (half)v; } }\n"
+"}\n"
+"\n"
+"kernel void ultra_epinorm_ffn_f16(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const half* wg [[buffer(2)]], device const half* wu [[buffer(3)]],\n"
+"    device half* out [[buffer(4)]], device const float* ss_buf [[buffer(5)]], constant EpiFfnParams& p [[buffer(6)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 2u;\n"
+"    if (row0 >= p.d_ff) return;\n"
+"    uint row1 = min(row0 + 1u, p.d_ff - 1u);\n"
+"    float inv_rms = rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f);\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    uint k8 = p.in_dim >> 3;\n"
+"    device const half4* x4 = (device const half4*)x; device const half4* n4 = (device const half4*)nw;\n"
+"    device const half4* g0 = (device const half4*)(wg + row0 * p.in_dim); device const half4* g1 = (device const half4*)(wg + row1 * p.in_dim);\n"
+"    device const half4* u0 = (device const half4*)(wu + row0 * p.in_dim); device const half4* u1 = (device const half4*)(wu + row1 * p.in_dim);\n"
+"    float4 sg0 = 0.0f, sg1 = 0.0f, su0 = 0.0f, su1 = 0.0f;\n"
+"    for (uint i = lane; i < k8; i += 32u) {\n"
+"        uint j = i << 1;\n"
+"        float4 xa = (float4)(x4[j] * (n4[j] + g_add)); float4 xb = (float4)(x4[j + 1u] * (n4[j + 1u] + g_add));\n"
+"        sg0 = fma(xa, (float4)g0[j], fma(xb, (float4)g0[j + 1u], sg0)); sg1 = fma(xa, (float4)g1[j], fma(xb, (float4)g1[j + 1u], sg1));\n"
+"        su0 = fma(xa, (float4)u0[j], fma(xb, (float4)u0[j + 1u], su0)); su1 = fma(xa, (float4)u1[j], fma(xb, (float4)u1[j + 1u], su1));\n"
+"    }\n"
+"    float vg0 = simd_sum(sg0.x+sg0.y+sg0.z+sg0.w)*inv_rms, vu0 = simd_sum(su0.x+su0.y+su0.z+su0.w)*inv_rms;\n"
+"    float vg1 = simd_sum(sg1.x+sg1.y+sg1.z+sg1.w)*inv_rms, vu1 = simd_sum(su1.x+su1.y+su1.z+su1.w)*inv_rms;\n"
+"    if (lane == 0u) { out[row0] = (half)apply_gated_act(vg0, vu0, p.is_geglu); if (row0 + 1u < p.d_ff) out[row1] = (half)apply_gated_act(vg1, vu1, p.is_geglu); }\n"
+"}\n"
+"\n"
+"kernel void ultra_epinorm_ffn_q8_0(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const BlockQ8_0* wg [[buffer(2)]], device const BlockQ8_0* wu [[buffer(3)]],\n"
+"    device half* out [[buffer(4)]], device const float* ss_buf [[buffer(5)]], constant EpiFfnParams& p [[buffer(6)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 2u;\n"
+"    if (row0 >= p.d_ff) return;\n"
+"    uint row1 = min(row0 + 1u, p.d_ff - 1u);\n"
+"    half4 inv_h = half4((half)rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f));\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    uint nb = p.in_dim >> 5;\n"
+"    device const BlockQ8_0* g0 = wg + row0 * nb; device const BlockQ8_0* g1 = wg + row1 * nb;\n"
+"    device const BlockQ8_0* u0 = wu + row0 * nb; device const BlockQ8_0* u1 = wu + row1 * nb;\n"
+"    float vg0 = 0.0f, vu0 = 0.0f, vg1 = 0.0f, vu1 = 0.0f;\n"
+"    for (uint b = lane; b < nb; b += 32u) {\n"
+"        device const half4* xb = (device const half4*)(x + (b << 5)); device const half4* nwb = (device const half4*)(nw + (b << 5));\n"
+"        half4 xv[8]; for (uint g = 0; g < 8u; g++) xv[g] = xb[g] * inv_h * (nwb[g] + g_add);\n"
+"        vg0 += q8_dot_block_fast(g0[b], xv); vg1 += q8_dot_block_fast(g1[b], xv);\n"
+"        vu0 += q8_dot_block_fast(u0[b], xv); vu1 += q8_dot_block_fast(u1[b], xv);\n"
+"    }\n"
+"    vg0 = simd_sum(vg0); vu0 = simd_sum(vu0); vg1 = simd_sum(vg1); vu1 = simd_sum(vu1);\n"
+"    if (lane == 0u) { out[row0] = (half)apply_gated_act(vg0, vu0, p.is_geglu); if (row0 + 1u < p.d_ff) out[row1] = (half)apply_gated_act(vg1, vu1, p.is_geglu); }\n"
+"}\n"
+"\n"
+"kernel void ultra_epinorm_ffn_q4_0(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const BlockQ4_0* wg [[buffer(2)]], device const BlockQ4_0* wu [[buffer(3)]],\n"
+"    device half* out [[buffer(4)]], device const float* ss_buf [[buffer(5)]], constant EpiFfnParams& p [[buffer(6)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 2u;\n"
+"    if (row0 >= p.d_ff) return;\n"
+"    uint row1 = min(row0 + 1u, p.d_ff - 1u);\n"
+"    half4 inv_h = half4((half)rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f));\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    uint nb = p.in_dim >> 5;\n"
+"    device const BlockQ4_0* g0 = wg + row0 * nb; device const BlockQ4_0* g1 = wg + row1 * nb;\n"
+"    device const BlockQ4_0* u0 = wu + row0 * nb; device const BlockQ4_0* u1 = wu + row1 * nb;\n"
+"    float vg0 = 0.0f, vu0 = 0.0f, vg1 = 0.0f, vu1 = 0.0f;\n"
+"    for (uint b = lane; b < nb; b += 32u) {\n"
+"        device const half4* xb = (device const half4*)(x + (b << 5)); device const half4* nwb = (device const half4*)(nw + (b << 5));\n"
+"        half4 xv_lo[4], xv_hi[4]; half4 xs = 0.0h;\n"
+"        for (uint g = 0; g < 4u; g++) {\n"
+"            half4 lo = xb[g] * inv_h * (nwb[g] + g_add); half4 hi = xb[g + 4u] * inv_h * (nwb[g + 4u] + g_add);\n"
+"            xs += lo + hi; xv_lo[g] = lo; xv_hi[g] = hi * half4(0.0625h);\n"
+"        }\n"
+"        float x_sum = (float)xs.x + (float)xs.y + (float)xs.z + (float)xs.w;\n"
+"        vg0 += q4_dot_block_fast(g0[b], xv_lo, xv_hi, x_sum); vg1 += q4_dot_block_fast(g1[b], xv_lo, xv_hi, x_sum);\n"
+"        vu0 += q4_dot_block_fast(u0[b], xv_lo, xv_hi, x_sum); vu1 += q4_dot_block_fast(u1[b], xv_lo, xv_hi, x_sum);\n"
+"    }\n"
+"    vg0 = simd_sum(vg0); vu0 = simd_sum(vu0); vg1 = simd_sum(vg1); vu1 = simd_sum(vu1);\n"
+"    if (lane == 0u) { out[row0] = (half)apply_gated_act(vg0, vu0, p.is_geglu); if (row0 + 1u < p.d_ff) out[row1] = (half)apply_gated_act(vg1, vu1, p.is_geglu); }\n"
+"}\n"
+"\n"
+"kernel void ultra_epinorm_ffn_q4_sb8(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const uchar* wg [[buffer(2)]], device const uchar* wu [[buffer(3)]],\n"
+"    device half* out [[buffer(4)]], device const float* ss_buf [[buffer(5)]], constant EpiFfnParams& p [[buffer(6)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 2u;\n"
+"    if (row0 >= p.d_ff) return;\n"
+"    uint row1 = min(row0 + 1u, p.d_ff - 1u);\n"
+"    half4 inv_h = half4((half)rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f));\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    uint nb = p.in_dim >> 5; uint b0 = row0 * nb, b1 = row1 * nb;\n"
+"    float vg0 = 0.0f, vu0 = 0.0f, vg1 = 0.0f, vu1 = 0.0f;\n"
+"    for (uint b = lane; b < nb; b += 32u) {\n"
+"        device const half4* xb = (device const half4*)(x + (b << 5)); device const half4* nwb = (device const half4*)(nw + (b << 5));\n"
+"        half4 xv_lo[4], xv_hi[4]; half4 xs = 0.0h;\n"
+"        for (uint g = 0; g < 4u; g++) {\n"
+"            half4 lo = xb[g] * inv_h * (nwb[g] + g_add); half4 hi = xb[g + 4u] * inv_h * (nwb[g + 4u] + g_add);\n"
+"            xs += lo + hi; xv_lo[g] = lo; xv_hi[g] = hi * half4(0.0625h);\n"
+"        }\n"
+"        float x_sum = (float)xs.x + (float)xs.y + (float)xs.z + (float)xs.w;\n"
+"        vg0 += q4_sb8_dot_fast(wg, b0 + b, xv_lo, xv_hi, x_sum); vg1 += q4_sb8_dot_fast(wg, b1 + b, xv_lo, xv_hi, x_sum);\n"
+"        vu0 += q4_sb8_dot_fast(wu, b0 + b, xv_lo, xv_hi, x_sum); vu1 += q4_sb8_dot_fast(wu, b1 + b, xv_lo, xv_hi, x_sum);\n"
+"    }\n"
+"    vg0 = simd_sum(vg0); vu0 = simd_sum(vu0); vg1 = simd_sum(vg1); vu1 = simd_sum(vu1);\n"
+"    if (lane == 0u) { out[row0] = (half)apply_gated_act(vg0, vu0, p.is_geglu); if (row0 + 1u < p.d_ff) out[row1] = (half)apply_gated_act(vg1, vu1, p.is_geglu); }\n"
+"}\n"
+"\n"
+"// 14E. Fused Final EpiNorm + LM_Head + Local-TG Top-1 Argmax (eliminates final RMSNorm + 256KB logits write/read!)\n"
+"#define LM_ARGMAX_TG_REDUCE(vals_arr) do { \\\n"
+"    threadgroup float sv[2]; threadgroup uint si[2]; \\\n"
+"    if (lane == 0u) { \\\n"
+"        float bv = -1e30f; uint bi = 0u; \\\n"
+"        for (uint r = 0; r < 4u; r++) { \\\n"
+"            uint idx = row0 + r; \\\n"
+"            if (idx < p.out_dim) { \\\n"
+"                float v = (float)((half)vals_arr[r]); \\\n"
+"                if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; } \\\n"
+"            } \\\n"
+"        } \\\n"
+"        sv[sg] = bv; si[sg] = bi; \\\n"
+"    } \\\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup); \\\n"
+"    if (sg == 0u && lane == 0u) { \\\n"
+"        float bv = sv[0]; uint bi = si[0]; \\\n"
+"        if ((tg_id * 8u + 4u) < p.out_dim && (sv[1] > bv || (sv[1] == bv && si[1] < bi))) { bv = sv[1]; bi = si[1]; } \\\n"
+"        pairs[tg_id].val = bv; pairs[tg_id].idx = bi; \\\n"
+"    } \\\n"
+"} while (0)\n"
+"\n"
+"kernel void ultra_epinorm_lm_argmax_f16(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const half* w [[buffer(2)]],\n"
+"    device LmArgmaxPair* pairs [[buffer(3)]], device const float* ss_buf [[buffer(4)]], constant EpiGemvParams& p [[buffer(5)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    float inv_rms = rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f);\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    float vals[4] = { -1e30f, -1e30f, -1e30f, -1e30f };\n"
+"    if (row0 < p.out_dim) {\n"
+"        uint k8 = p.in_dim >> 3;\n"
+"        device const half4* x4 = (device const half4*)x; device const half4* n4 = (device const half4*)nw;\n"
+"        device const half4* w0 = (device const half4*)(w + (row0 + 0u) * p.in_dim);\n"
+"        device const half4* w1 = (device const half4*)(w + min(row0 + 1u, p.out_dim - 1u) * p.in_dim);\n"
+"        device const half4* w2 = (device const half4*)(w + min(row0 + 2u, p.out_dim - 1u) * p.in_dim);\n"
+"        device const half4* w3 = (device const half4*)(w + min(row0 + 3u, p.out_dim - 1u) * p.in_dim);\n"
+"        float4 s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;\n"
+"        for (uint i = lane; i < k8; i += 32u) {\n"
+"            uint j = i << 1; float4 xa = (float4)(x4[j]*(n4[j]+g_add)), xb = (float4)(x4[j+1u]*(n4[j+1u]+g_add));\n"
+"            s0 = fma(xa, (float4)w0[j], fma(xb, (float4)w0[j+1u], s0)); s1 = fma(xa, (float4)w1[j], fma(xb, (float4)w1[j+1u], s1));\n"
+"            s2 = fma(xa, (float4)w2[j], fma(xb, (float4)w2[j+1u], s2)); s3 = fma(xa, (float4)w3[j], fma(xb, (float4)w3[j+1u], s3));\n"
+"        }\n"
+"        vals[0] = simd_sum(s0.x+s0.y+s0.z+s0.w)*inv_rms; vals[1] = simd_sum(s1.x+s1.y+s1.z+s1.w)*inv_rms;\n"
+"        vals[2] = simd_sum(s2.x+s2.y+s2.z+s2.w)*inv_rms; vals[3] = simd_sum(s3.x+s3.y+s3.z+s3.w)*inv_rms;\n"
+"    }\n"
+"    LM_ARGMAX_TG_REDUCE(vals);\n"
+"}\n"
+"\n"
+"kernel void ultra_epinorm_lm_argmax_q8_0(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const BlockQ8_0* w [[buffer(2)]],\n"
+"    device LmArgmaxPair* pairs [[buffer(3)]], device const float* ss_buf [[buffer(4)]], constant EpiGemvParams& p [[buffer(5)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    half4 inv_h = half4((half)rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f));\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    float vals[4] = { -1e30f, -1e30f, -1e30f, -1e30f };\n"
+"    if (row0 < p.out_dim) {\n"
+"        uint nb = p.in_dim >> 5;\n"
+"        device const BlockQ8_0* w0 = w + (row0 + 0u) * nb; device const BlockQ8_0* w1 = w + min(row0 + 1u, p.out_dim - 1u) * nb;\n"
+"        device const BlockQ8_0* w2 = w + min(row0 + 2u, p.out_dim - 1u) * nb; device const BlockQ8_0* w3 = w + min(row0 + 3u, p.out_dim - 1u) * nb;\n"
+"        float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;\n"
+"        for (uint b = lane; b < nb; b += 32u) {\n"
+"            device const half4* xb = (device const half4*)(x + (b << 5)); device const half4* nwb = (device const half4*)(nw + (b << 5));\n"
+"            half4 xv[8]; for (uint g = 0; g < 8u; g++) xv[g] = xb[g] * inv_h * (nwb[g] + g_add);\n"
+"            r0 += q8_dot_block_fast(w0[b], xv); r1 += q8_dot_block_fast(w1[b], xv);\n"
+"            r2 += q8_dot_block_fast(w2[b], xv); r3 += q8_dot_block_fast(w3[b], xv);\n"
+"        }\n"
+"        vals[0] = simd_sum(r0); vals[1] = simd_sum(r1); vals[2] = simd_sum(r2); vals[3] = simd_sum(r3);\n"
+"    }\n"
+"    LM_ARGMAX_TG_REDUCE(vals);\n"
+"}\n"
+"\n"
+"kernel void ultra_epinorm_lm_argmax_q4_0(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const BlockQ4_0* w [[buffer(2)]],\n"
+"    device LmArgmaxPair* pairs [[buffer(3)]], device const float* ss_buf [[buffer(4)]], constant EpiGemvParams& p [[buffer(5)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    half4 inv_h = half4((half)rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f));\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    float vals[4] = { -1e30f, -1e30f, -1e30f, -1e30f };\n"
+"    if (row0 < p.out_dim) {\n"
+"        uint nb = p.in_dim >> 5;\n"
+"        device const BlockQ4_0* w0 = w + (row0 + 0u) * nb; device const BlockQ4_0* w1 = w + min(row0 + 1u, p.out_dim - 1u) * nb;\n"
+"        device const BlockQ4_0* w2 = w + min(row0 + 2u, p.out_dim - 1u) * nb; device const BlockQ4_0* w3 = w + min(row0 + 3u, p.out_dim - 1u) * nb;\n"
+"        float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;\n"
+"        for (uint b = lane; b < nb; b += 32u) {\n"
+"            device const half4* xb = (device const half4*)(x + (b << 5)); device const half4* nwb = (device const half4*)(nw + (b << 5));\n"
+"            half4 xv_lo[4], xv_hi[4]; half4 xs = 0.0h;\n"
+"            for (uint g = 0; g < 4u; g++) { half4 lo = xb[g]*inv_h*(nwb[g]+g_add), hi = xb[g+4u]*inv_h*(nwb[g+4u]+g_add); xs += lo+hi; xv_lo[g]=lo; xv_hi[g]=hi*half4(0.0625h); }\n"
+"            float x_sum = (float)xs.x + (float)xs.y + (float)xs.z + (float)xs.w;\n"
+"            r0 += q4_dot_block_fast(w0[b], xv_lo, xv_hi, x_sum); r1 += q4_dot_block_fast(w1[b], xv_lo, xv_hi, x_sum);\n"
+"            r2 += q4_dot_block_fast(w2[b], xv_lo, xv_hi, x_sum); r3 += q4_dot_block_fast(w3[b], xv_lo, xv_hi, x_sum);\n"
+"        }\n"
+"        vals[0] = simd_sum(r0); vals[1] = simd_sum(r1); vals[2] = simd_sum(r2); vals[3] = simd_sum(r3);\n"
+"    }\n"
+"    LM_ARGMAX_TG_REDUCE(vals);\n"
+"}\n"
+"\n"
+"kernel void ultra_epinorm_lm_argmax_q4_sb8(\n"
+"    device const half* x [[buffer(0)]], device const half* nw [[buffer(1)]], device const uchar* w [[buffer(2)]],\n"
+"    device LmArgmaxPair* pairs [[buffer(3)]], device const float* ss_buf [[buffer(4)]], constant EpiGemvParams& p [[buffer(5)]],\n"
+"    uint tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n"
+") {\n"
+"    uint row0 = (tg_id * 2u + sg) * 4u;\n"
+"    half4 inv_h = half4((half)rsqrt(ss_buf[p.ss_slot] / (float)p.in_dim + 1e-5f));\n"
+"    half4 g_add = (p.gemma_mode != 0) ? half4(1.0h) : half4(0.0h);\n"
+"    float vals[4] = { -1e30f, -1e30f, -1e30f, -1e30f };\n"
+"    if (row0 < p.out_dim) {\n"
+"        uint nb = p.in_dim >> 5;\n"
+"        uint b0 = (row0 + 0u) * nb, b1 = min(row0 + 1u, p.out_dim - 1u) * nb;\n"
+"        uint b2 = min(row0 + 2u, p.out_dim - 1u) * nb, b3 = min(row0 + 3u, p.out_dim - 1u) * nb;\n"
+"        float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;\n"
+"        for (uint b = lane; b < nb; b += 32u) {\n"
+"            device const half4* xb = (device const half4*)(x + (b << 5)); device const half4* nwb = (device const half4*)(nw + (b << 5));\n"
+"            half4 xv_lo[4], xv_hi[4]; half4 xs = 0.0h;\n"
+"            for (uint g = 0; g < 4u; g++) { half4 lo = xb[g]*inv_h*(nwb[g]+g_add), hi = xb[g+4u]*inv_h*(nwb[g+4u]+g_add); xs += lo+hi; xv_lo[g]=lo; xv_hi[g]=hi*half4(0.0625h); }\n"
+"            float x_sum = (float)xs.x + (float)xs.y + (float)xs.z + (float)xs.w;\n"
+"            r0 += q4_sb8_dot_fast(w, b0 + b, xv_lo, xv_hi, x_sum); r1 += q4_sb8_dot_fast(w, b1 + b, xv_lo, xv_hi, x_sum);\n"
+"            r2 += q4_sb8_dot_fast(w, b2 + b, xv_lo, xv_hi, x_sum); r3 += q4_sb8_dot_fast(w, b3 + b, xv_lo, xv_hi, x_sum);\n"
+"        }\n"
+"        vals[0] = simd_sum(r0); vals[1] = simd_sum(r1); vals[2] = simd_sum(r2); vals[3] = simd_sum(r3);\n"
+"    }\n"
+"    LM_ARGMAX_TG_REDUCE(vals);\n"
+"}\n"
+"#undef LM_ARGMAX_TG_REDUCE\n"
+"\n"
+"struct PairReduceParams { uint n_pairs; uint write_hist; uint step_idx; uint _pad; };\n"
+"kernel void ultra_argmax_reduce_pairs_f16(\n"
+"    device const LmArgmaxPair* pairs [[buffer(0)]],\n"
+"    device uint* cur_tok [[buffer(1)]],\n"
+"    device uint* hist_tok [[buffer(2)]],\n"
+"    constant PairReduceParams& p [[buffer(3)]],\n"
+"    uint lid [[thread_position_in_threadgroup]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]],\n"
+"    uint tg_sz [[threads_per_threadgroup]]\n"
+") {\n"
+"    float bv = -1e30f; uint bi = 0u;\n"
+"    for (uint i = lid; i < p.n_pairs; i += tg_sz) {\n"
+"        LmArgmaxPair pr = pairs[i];\n"
+"        if (pr.val > bv || (pr.val == bv && pr.idx < bi)) { bv = pr.val; bi = pr.idx; }\n"
+"    }\n"
+"    for (ushort off = 16; off > 0; off >>= 1) {\n"
+"        float ov = simd_shuffle_down(bv, off); uint oi = simd_shuffle_down(bi, off);\n"
+"        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }\n"
+"    }\n"
+"    threadgroup float sv[8]; threadgroup uint si[8];\n"
+"    if (lane == 0u) { sv[sg] = bv; si[sg] = bi; }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (sg == 0u && lane == 0u) {\n"
+"        uint n_sg = (tg_sz + 31u) >> 5;\n"
+"        float rbv = sv[0]; uint rbi = si[0];\n"
+"        for (uint s = 1; s < n_sg; s++) if (sv[s] > rbv || (sv[s] == rbv && si[s] < rbi)) { rbv = sv[s]; rbi = si[s]; }\n"
+"        cur_tok[0] = rbi;\n"
+"        if (p.write_hist != 0u) hist_tok[p.step_idx] = rbi;\n"
+"    }\n"
 "}\n";
 
 static id<MTLDevice> u_dev(void) { void* p = tn_metal_raw_device(); return p ? (__bridge id<MTLDevice>)p : nil; }
@@ -3210,9 +4387,42 @@ int64_t tn_ultra_init(void) {
         MK_PSO(g_ultra_batch_ffn_q8, "ultra_batch_ffn_q8_0");
         MK_PSO(g_ultra_batch_ffn_q4, "ultra_batch_ffn_q4_0");
         MK_PSO(g_ultra_batch_ffn_q4_sb8, "ultra_batch_ffn_q4_sb8");
+        MK_PSO(g_ultra_batch_gemm_q4_b4, "ultra_batch_gemm_q4_0_b4");
+        MK_PSO(g_ultra_batch_gemm_q4_sb8_b4, "ultra_batch_gemm_q4_sb8_b4");
+        MK_PSO(g_ultra_batch_ffn_q4_b4, "ultra_batch_ffn_q4_0_b4");
+        MK_PSO(g_ultra_batch_ffn_q4_sb8_b4, "ultra_batch_ffn_q4_sb8_b4");
+        MK_PSO(g_ultra_batch_gemm_q4_b32, "ultra_batch_gemm_q4_0_b32");
+        MK_PSO(g_ultra_batch_gemm_q4_sb8_b32, "ultra_batch_gemm_q4_sb8_b32");
+        MK_PSO(g_ultra_batch_ffn_q4_b32, "ultra_batch_ffn_q4_0_b32");
+        MK_PSO(g_ultra_batch_ffn_q4_sb8_b32, "ultra_batch_ffn_q4_sb8_b32");
+        MK_PSO(g_ultra_sk_finish, "ultra_sk_finish_f16");
+        MK_PSO(g_ultra_batch_rope_flash_gqa, "ultra_batch_rope_flash_gqa_f16");
+        MK_PSO(g_ultra_embed_ss, "ultra_embed_ss_f16");
+        MK_PSO(g_ultra_gemv_f16_ss, "ultra_gemv_f16_ss");
+        MK_PSO(g_ultra_gemv_q8_ss, "ultra_gemv_q8_0_ss");
+        MK_PSO(g_ultra_gemv_q4_ss, "ultra_gemv_q4_0_ss");
+        MK_PSO(g_ultra_gemv_q4_sb8_ss, "ultra_gemv_q4_sb8_ss");
+        MK_PSO(g_ultra_epinorm_gemv_f16, "ultra_epinorm_gemv_f16");
+        MK_PSO(g_ultra_epinorm_gemv_q8, "ultra_epinorm_gemv_q8_0");
+        MK_PSO(g_ultra_epinorm_gemv_q4, "ultra_epinorm_gemv_q4_0");
+        MK_PSO(g_ultra_epinorm_gemv_q4_sb8, "ultra_epinorm_gemv_q4_sb8");
+        MK_PSO(g_ultra_epinorm_ffn_f16, "ultra_epinorm_ffn_f16");
+        MK_PSO(g_ultra_epinorm_ffn_q8, "ultra_epinorm_ffn_q8_0");
+        MK_PSO(g_ultra_epinorm_ffn_q4, "ultra_epinorm_ffn_q4_0");
+        MK_PSO(g_ultra_epinorm_ffn_q4_sb8, "ultra_epinorm_ffn_q4_sb8");
+        MK_PSO(g_ultra_epinorm_lm_argmax_f16, "ultra_epinorm_lm_argmax_f16");
+        MK_PSO(g_ultra_epinorm_lm_argmax_q8, "ultra_epinorm_lm_argmax_q8_0");
+        MK_PSO(g_ultra_epinorm_lm_argmax_q4, "ultra_epinorm_lm_argmax_q4_0");
+        MK_PSO(g_ultra_epinorm_lm_argmax_q4_sb8, "ultra_epinorm_lm_argmax_q4_sb8");
+        MK_PSO(g_ultra_argmax_reduce_pairs, "ultra_argmax_reduce_pairs_f16");
         MK_PSO(g_ultra_flash_batch_gqa, "ultra_flash_batch_causal_gqa_f16");
         MK_PSO(g_ultra_argmax_batch, "ultra_argmax_batch_f16");
         #undef MK_PSO
+        g_ultra_ss_buf = [dev newBufferWithLength:64 options:MTLResourceStorageModeShared];
+        memset([g_ultra_ss_buf contents], 0, 64);
+        g_ultra_sk_buf = [dev newBufferWithLength:(32u * 4096u * sizeof(float)) options:MTLResourceStorageModeShared];
+        memset([g_ultra_sk_buf contents], 0, 32u * 4096u * sizeof(float));
+        g_ultra_lm_pairs_buf = [dev newBufferWithLength:(32768u * 8u) options:MTLResourceStorageModeShared];
         g_ultra_inited = 1;
         return 1;
     }
@@ -3674,56 +4884,287 @@ int64_t tn_ultra_ffn_gate_up(
     }
 }
 
-/// Multi-Token Speculative/Batch Decode GEMM (`B = 1..16`, weights loaded ONCE for all B tokens!)
+/// Multi-Token Speculative/Batch Decode GEMM (`B = 1..32`, Roofline Auto-Dispatch: sub16 B<=4, AMX+Split-K B<=16, Full 32x32 AMX+Split-K B<=32!)
 int64_t tn_ultra_batch_gemm(
     int64_t x_h, int64_t w_h, int64_t w_off, int64_t y_h, int64_t bias_h, int64_t bias_off,
     int64_t M, int64_t N, int64_t K, int64_t quant_mode, int64_t add_res, int64_t has_bias
 ) {
-    if (!tn_ultra_init() || M <= 0 || M > 16) return 0;
+    if (!tn_ultra_init() || M <= 0 || M > 32) return 0;
     @autoreleasepool {
         int local = 0;
         id<MTLCommandBuffer> cmd = u_cmd(&local);
         id<MTLComputeCommandEncoder> enc = u_enc(cmd, local);
-        id<MTLComputePipelineState> pso = (quant_mode == 3) ? g_ultra_batch_gemm_q4_sb8
-            : (quant_mode == 2) ? g_ultra_batch_gemm_q4
-            : (quant_mode == 1) ? g_ultra_batch_gemm_q8 : g_ultra_batch_gemm_f16;
+        id<MTLBuffer> bb = has_bias ? u_buf(bias_h) : u_buf(x_h);
+        NSUInteger boff = (NSUInteger)(has_bias ? bias_off : 0);
+        if (quant_mode == 2 || quant_mode == 3) {
+            if (M <= 4) {
+                id<MTLComputePipelineState> pso = (quant_mode == 3) ? g_ultra_batch_gemm_q4_sb8_b4 : g_ultra_batch_gemm_q4_b4;
+                [enc setComputePipelineState:pso];
+                [enc setBuffer:u_buf(x_h) offset:0 atIndex:0];
+                [enc setBuffer:u_buf(w_h) offset:(NSUInteger)w_off atIndex:1];
+                [enc setBuffer:u_buf(y_h) offset:0 atIndex:2];
+                [enc setBuffer:bb offset:boff atIndex:3];
+                uint32_t p[8] = { (uint32_t)M, (uint32_t)N, (uint32_t)K, (uint32_t)add_res, (uint32_t)has_bias, 1u, 0, 0 };
+                [enc setBytes:p length:sizeof(p) atIndex:4];
+                NSUInteger n_tg = ((NSUInteger)N + 7) / 8;
+                [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            } else {
+                uint32_t sk = 1u;
+                if (N <= 3072 && (M * N) <= (32 * 4096)) {
+                    if (K >= 4096 && (K % 512) == 0) sk = 4u;
+                    else if (K >= 2048 && (K % 256) == 0) sk = 2u;
+                }
+                id<MTLComputePipelineState> pso = (M <= 16)
+                    ? ((quant_mode == 3) ? g_ultra_batch_gemm_q4_sb8 : g_ultra_batch_gemm_q4)
+                    : ((quant_mode == 3) ? g_ultra_batch_gemm_q4_sb8_b32 : g_ultra_batch_gemm_q4_b32);
+                [enc setComputePipelineState:pso];
+                [enc setBuffer:u_buf(x_h) offset:0 atIndex:0];
+                [enc setBuffer:u_buf(w_h) offset:(NSUInteger)w_off atIndex:1];
+                [enc setBuffer:u_buf(y_h) offset:0 atIndex:2];
+                [enc setBuffer:bb offset:boff atIndex:3];
+                uint32_t p[8] = { (uint32_t)M, (uint32_t)N, (uint32_t)K, (uint32_t)add_res, (uint32_t)has_bias, sk, 0, 0 };
+                [enc setBytes:p length:sizeof(p) atIndex:4];
+                [enc setBuffer:g_ultra_sk_buf offset:0 atIndex:5];
+                NSUInteger n_tg = ((NSUInteger)N + 31) / 32;
+                [enc dispatchThreadgroups:MTLSizeMake(n_tg, (NSUInteger)sk, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                if (sk > 1u) {
+                    [enc setComputePipelineState:g_ultra_sk_finish];
+                    [enc setBuffer:g_ultra_sk_buf offset:0 atIndex:0];
+                    [enc setBuffer:u_buf(y_h) offset:0 atIndex:1];
+                    [enc setBuffer:bb offset:boff atIndex:2];
+                    [enc setBytes:p length:sizeof(p) atIndex:3];
+                    NSUInteger tot = (NSUInteger)(M * N);
+                    [enc dispatchThreads:MTLSizeMake(tot, 1, 1) threadsPerThreadgroup:MTLSizeMake(tot < 256 ? tot : 256, 1, 1)];
+                }
+            }
+        } else {
+            id<MTLComputePipelineState> pso = (quant_mode == 1) ? g_ultra_batch_gemm_q8 : g_ultra_batch_gemm_f16;
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:u_buf(x_h) offset:0 atIndex:0];
+            [enc setBuffer:u_buf(w_h) offset:(NSUInteger)w_off atIndex:1];
+            [enc setBuffer:u_buf(y_h) offset:0 atIndex:2];
+            [enc setBuffer:bb offset:boff atIndex:3];
+            uint32_t p[8] = { (uint32_t)M, (uint32_t)N, (uint32_t)K, (uint32_t)add_res, (uint32_t)has_bias, 1u, 0, 0 };
+            [enc setBytes:p length:sizeof(p) atIndex:4];
+            NSUInteger n_tg = ((NSUInteger)N + 3) / 4;
+            [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
+        u_finish(cmd, enc, local);
+        return 1;
+    }
+}
+
+/// Multi-Token Speculative/Batch Decode Fused Gate+Up+SwiGLU/GeGLU (`B = 1..32`, Roofline Auto-Dispatch!)
+int64_t tn_ultra_batch_ffn_gate_up(
+    int64_t x_h, int64_t wg_h, int64_t wg_off, int64_t wu_h, int64_t wu_off, int64_t out_h,
+    int64_t M, int64_t d_ff, int64_t K, int64_t quant_mode, int64_t is_geglu
+) {
+    if (!tn_ultra_init() || M <= 0 || M > 32) return 0;
+    @autoreleasepool {
+        int local = 0;
+        id<MTLCommandBuffer> cmd = u_cmd(&local);
+        id<MTLComputeCommandEncoder> enc = u_enc(cmd, local);
+        uint32_t p[4] = { (uint32_t)M, (uint32_t)d_ff, (uint32_t)K, (uint32_t)is_geglu };
+        if (quant_mode == 2 || quant_mode == 3) {
+            id<MTLComputePipelineState> pso = (M <= 4)
+                ? ((quant_mode == 3) ? g_ultra_batch_ffn_q4_sb8_b4 : g_ultra_batch_ffn_q4_b4)
+                : (M <= 16)
+                ? ((quant_mode == 3) ? g_ultra_batch_ffn_q4_sb8 : g_ultra_batch_ffn_q4)
+                : ((quant_mode == 3) ? g_ultra_batch_ffn_q4_sb8_b32 : g_ultra_batch_ffn_q4_b32);
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:u_buf(x_h) offset:0 atIndex:0];
+            [enc setBuffer:u_buf(wg_h) offset:(NSUInteger)wg_off atIndex:1];
+            [enc setBuffer:u_buf(wu_h) offset:(NSUInteger)wu_off atIndex:2];
+            [enc setBuffer:u_buf(out_h) offset:0 atIndex:3];
+            [enc setBytes:p length:sizeof(p) atIndex:4];
+            NSUInteger n_tg = (M <= 4) ? (((NSUInteger)d_ff + 7) / 8) : (((NSUInteger)d_ff + 31) / 32);
+            [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            id<MTLComputePipelineState> pso = (quant_mode == 1) ? g_ultra_batch_ffn_q8 : g_ultra_batch_ffn_f16;
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:u_buf(x_h) offset:0 atIndex:0];
+            [enc setBuffer:u_buf(wg_h) offset:(NSUInteger)wg_off atIndex:1];
+            [enc setBuffer:u_buf(wu_h) offset:(NSUInteger)wu_off atIndex:2];
+            [enc setBuffer:u_buf(out_h) offset:0 atIndex:3];
+            [enc setBytes:p length:sizeof(p) atIndex:4];
+            NSUInteger n_tg = ((NSUInteger)d_ff + 3) / 4;
+            [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
+        u_finish(cmd, enc, local);
+        return 1;
+    }
+}
+
+/// Fused Single-Pass BatchRoPE + KV-Append + Causal FlashGQA (replaces RoPE_KV + FlashGQA with 1 dispatch!)
+int64_t tn_ultra_batch_rope_flash_gqa(
+    int64_t qkv_h, int64_t kc_h, int64_t kc_off, int64_t vc_h, int64_t vc_off, int64_t ctx_flat_h,
+    int64_t n_heads, int64_t n_kv, int64_t d_head, int64_t start_pos, int64_t batch_len, int64_t max_seq, double softcap
+) {
+    if (!tn_ultra_init()) return 0;
+    @autoreleasepool {
+        int local = 0;
+        id<MTLCommandBuffer> cmd = u_cmd(&local);
+        id<MTLComputeCommandEncoder> enc = u_enc(cmd, local);
+        [enc setComputePipelineState:g_ultra_batch_rope_flash_gqa];
+        [enc setBuffer:u_buf(qkv_h) offset:0 atIndex:0];
+        [enc setBuffer:u_buf(kc_h) offset:(NSUInteger)kc_off atIndex:1];
+        [enc setBuffer:u_buf(vc_h) offset:(NSUInteger)vc_off atIndex:2];
+        [enc setBuffer:u_buf(ctx_flat_h) offset:0 atIndex:3];
+        struct { uint32_t nh, nkv, dh, sp, bl, ms; float inv_s, sc; } p = {
+            (uint32_t)n_heads, (uint32_t)n_kv, (uint32_t)d_head, (uint32_t)start_pos, (uint32_t)batch_len, (uint32_t)max_seq,
+            1.0f / sqrtf((float)d_head), (float)softcap
+        };
+        [enc setBytes:&p length:sizeof(p) atIndex:4];
+        NSUInteger smem_bytes = (NSUInteger)(2 * batch_len * d_head * 2);
+        [enc setThreadgroupMemoryLength:(smem_bytes < 16 ? 16 : smem_bytes) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        u_finish(cmd, enc, local);
+        return 1;
+    }
+}
+
+/// Metal Epilogue Atomic RMSNorm: Embed + ss[0] = sum(x^2), ss[1] = 0
+int64_t tn_ultra_embed_ss_off(int64_t tok_h, int64_t emb_h, int64_t emb_off, int64_t out_h, int64_t d_model, int64_t vocab) {
+    if (!tn_ultra_init()) return 0;
+    @autoreleasepool {
+        int local = 0;
+        id<MTLCommandBuffer> cmd = u_cmd(&local);
+        id<MTLComputeCommandEncoder> enc = u_enc(cmd, local);
+        [enc setComputePipelineState:g_ultra_embed_ss];
+        [enc setBuffer:u_buf(tok_h) offset:0 atIndex:0];
+        [enc setBuffer:u_buf(emb_h) offset:(NSUInteger)emb_off atIndex:1];
+        [enc setBuffer:u_buf(out_h) offset:0 atIndex:2];
+        [enc setBuffer:g_ultra_ss_buf offset:0 atIndex:3];
+        uint32_t p[4] = { 1u, (uint32_t)d_model, (uint32_t)vocab, 0 };
+        [enc setBytes:p length:sizeof(p) atIndex:4];
+        NSUInteger tgsz = (d_model >= 256) ? 256 : 64;
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tgsz, 1, 1)];
+        u_finish(cmd, enc, local);
+        return 1;
+    }
+}
+
+/// Metal Epilogue Atomic RMSNorm: GEMV + atomic-add sum(y^2) to ss[ss_slot] & clear ss[ss_slot ^ 1]
+int64_t tn_ultra_gemv_ss(
+    int64_t x_h, int64_t w_h, int64_t w_off, int64_t y_h, int64_t bias_h, int64_t bias_off,
+    int64_t out_dim, int64_t in_dim, int64_t quant_mode, int64_t add_res, int64_t has_bias, int64_t ss_slot
+) {
+    if (!tn_ultra_init()) return 0;
+    @autoreleasepool {
+        int local = 0;
+        id<MTLCommandBuffer> cmd = u_cmd(&local);
+        id<MTLComputeCommandEncoder> enc = u_enc(cmd, local);
+        id<MTLComputePipelineState> pso = (quant_mode == 3) ? g_ultra_gemv_q4_sb8_ss
+            : (quant_mode == 2) ? g_ultra_gemv_q4_ss
+            : (quant_mode == 1) ? g_ultra_gemv_q8_ss : g_ultra_gemv_f16_ss;
         [enc setComputePipelineState:pso];
         [enc setBuffer:u_buf(x_h) offset:0 atIndex:0];
         [enc setBuffer:u_buf(w_h) offset:(NSUInteger)w_off atIndex:1];
         [enc setBuffer:u_buf(y_h) offset:0 atIndex:2];
         id<MTLBuffer> bb = has_bias ? u_buf(bias_h) : u_buf(x_h);
         [enc setBuffer:bb offset:(NSUInteger)(has_bias ? bias_off : 0) atIndex:3];
-        uint32_t p[8] = { (uint32_t)M, (uint32_t)N, (uint32_t)K, (uint32_t)add_res, (uint32_t)has_bias, 0, 0, 0 };
-        [enc setBytes:p length:sizeof(p) atIndex:4];
-        NSUInteger n_tg = (quant_mode == 2 || quant_mode == 3) ? (((NSUInteger)N + 31) / 32) : (((NSUInteger)N + 3) / 4);
-        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc setBuffer:g_ultra_ss_buf offset:0 atIndex:4];
+        uint32_t p[8] = { (uint32_t)out_dim, (uint32_t)in_dim, 0, (uint32_t)has_bias, (uint32_t)(ss_slot & 1), (uint32_t)add_res, 0, 0 };
+        [enc setBytes:p length:sizeof(p) atIndex:5];
+        NSUInteger n_tg = ((NSUInteger)out_dim + 7) / 8;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         u_finish(cmd, enc, local);
         return 1;
     }
 }
 
-/// Multi-Token Speculative/Batch Decode Fused Gate+Up+SwiGLU/GeGLU (`B = 1..16`, weights loaded ONCE!)
-int64_t tn_ultra_batch_ffn_gate_up(
-    int64_t x_h, int64_t wg_h, int64_t wg_off, int64_t wu_h, int64_t wu_off, int64_t out_h,
-    int64_t M, int64_t d_ff, int64_t K, int64_t quant_mode, int64_t is_geglu
+/// Metal Epilogue Atomic RMSNorm: Fused On-the-Fly RMSNorm + GEMV (ZERO standalone RMSNorm dispatch!)
+int64_t tn_ultra_epinorm_gemv(
+    int64_t x_h, int64_t nw_h, int64_t nw_off, int64_t w_h, int64_t w_off, int64_t y_h,
+    int64_t bias_h, int64_t bias_off, int64_t out_dim, int64_t in_dim,
+    int64_t quant_mode, int64_t gemma_mode, int64_t has_bias, int64_t ss_slot
 ) {
-    if (!tn_ultra_init() || M <= 0 || M > 16) return 0;
+    if (!tn_ultra_init()) return 0;
     @autoreleasepool {
         int local = 0;
         id<MTLCommandBuffer> cmd = u_cmd(&local);
         id<MTLComputeCommandEncoder> enc = u_enc(cmd, local);
-        id<MTLComputePipelineState> pso = (quant_mode == 3) ? g_ultra_batch_ffn_q4_sb8
-            : (quant_mode == 2) ? g_ultra_batch_ffn_q4
-            : (quant_mode == 1) ? g_ultra_batch_ffn_q8 : g_ultra_batch_ffn_f16;
+        id<MTLComputePipelineState> pso = (quant_mode == 3) ? g_ultra_epinorm_gemv_q4_sb8
+            : (quant_mode == 2) ? g_ultra_epinorm_gemv_q4
+            : (quant_mode == 1) ? g_ultra_epinorm_gemv_q8 : g_ultra_epinorm_gemv_f16;
         [enc setComputePipelineState:pso];
         [enc setBuffer:u_buf(x_h) offset:0 atIndex:0];
-        [enc setBuffer:u_buf(wg_h) offset:(NSUInteger)wg_off atIndex:1];
-        [enc setBuffer:u_buf(wu_h) offset:(NSUInteger)wu_off atIndex:2];
-        [enc setBuffer:u_buf(out_h) offset:0 atIndex:3];
-        uint32_t p[4] = { (uint32_t)M, (uint32_t)d_ff, (uint32_t)K, (uint32_t)is_geglu };
-        [enc setBytes:p length:sizeof(p) atIndex:4];
-        NSUInteger n_tg = (quant_mode == 2 || quant_mode == 3) ? (((NSUInteger)d_ff + 31) / 32) : (((NSUInteger)d_ff + 3) / 4);
-        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc setBuffer:u_buf(nw_h) offset:(NSUInteger)nw_off atIndex:1];
+        [enc setBuffer:u_buf(w_h) offset:(NSUInteger)w_off atIndex:2];
+        [enc setBuffer:u_buf(y_h) offset:0 atIndex:3];
+        id<MTLBuffer> bb = has_bias ? u_buf(bias_h) : u_buf(x_h);
+        [enc setBuffer:bb offset:(NSUInteger)(has_bias ? bias_off : 0) atIndex:4];
+        [enc setBuffer:g_ultra_ss_buf offset:0 atIndex:5];
+        uint32_t p[8] = { (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)gemma_mode, (uint32_t)has_bias, (uint32_t)(ss_slot & 1), 0, 0, 0 };
+        [enc setBytes:p length:sizeof(p) atIndex:6];
+        NSUInteger n_tg = ((NSUInteger)out_dim + 7) / 8;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        u_finish(cmd, enc, local);
+        return 1;
+    }
+}
+
+/// Metal Epilogue Atomic RMSNorm: Fused On-the-Fly RMSNorm + Gate+Up+SwiGLU/GeGLU
+int64_t tn_ultra_epinorm_ffn_gate_up(
+    int64_t x_h, int64_t nw_h, int64_t nw_off, int64_t wg_h, int64_t wg_off, int64_t wu_h, int64_t wu_off,
+    int64_t out_h, int64_t d_ff, int64_t in_dim, int64_t quant_mode, int64_t is_geglu, int64_t gemma_mode, int64_t ss_slot
+) {
+    if (!tn_ultra_init()) return 0;
+    @autoreleasepool {
+        int local = 0;
+        id<MTLCommandBuffer> cmd = u_cmd(&local);
+        id<MTLComputeCommandEncoder> enc = u_enc(cmd, local);
+        id<MTLComputePipelineState> pso = (quant_mode == 3) ? g_ultra_epinorm_ffn_q4_sb8
+            : (quant_mode == 2) ? g_ultra_epinorm_ffn_q4
+            : (quant_mode == 1) ? g_ultra_epinorm_ffn_q8 : g_ultra_epinorm_ffn_f16;
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:u_buf(x_h) offset:0 atIndex:0];
+        [enc setBuffer:u_buf(nw_h) offset:(NSUInteger)nw_off atIndex:1];
+        [enc setBuffer:u_buf(wg_h) offset:(NSUInteger)wg_off atIndex:2];
+        [enc setBuffer:u_buf(wu_h) offset:(NSUInteger)wu_off atIndex:3];
+        [enc setBuffer:u_buf(out_h) offset:0 atIndex:4];
+        [enc setBuffer:g_ultra_ss_buf offset:0 atIndex:5];
+        uint32_t p[8] = { (uint32_t)d_ff, (uint32_t)in_dim, (uint32_t)is_geglu, (uint32_t)gemma_mode, (uint32_t)(ss_slot & 1), 0, 0, 0 };
+        [enc setBytes:p length:sizeof(p) atIndex:6];
+        NSUInteger n_tg = ((NSUInteger)d_ff + 3) / 4;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        u_finish(cmd, enc, local);
+        return 1;
+    }
+}
+
+/// Fused Final EpiNorm + LM_Head + Top-1 Argmax (ZERO logits VRAM write/read, supports single & chained step!)
+int64_t tn_ultra_epinorm_lmhead_argmax(
+    int64_t x_h, int64_t nw_h, int64_t nw_off, int64_t w_h, int64_t w_off,
+    int64_t cur_tok_h, int64_t hist_tok_h, int64_t write_hist, int64_t step_idx,
+    int64_t vocab, int64_t in_dim, int64_t quant_mode, int64_t gemma_mode, int64_t ss_slot
+) {
+    if (!tn_ultra_init()) return 0;
+    @autoreleasepool {
+        int local = 0;
+        id<MTLCommandBuffer> cmd = u_cmd(&local);
+        id<MTLComputeCommandEncoder> enc = u_enc(cmd, local);
+        id<MTLComputePipelineState> pso = (quant_mode == 3) ? g_ultra_epinorm_lm_argmax_q4_sb8
+            : (quant_mode == 2) ? g_ultra_epinorm_lm_argmax_q4
+            : (quant_mode == 1) ? g_ultra_epinorm_lm_argmax_q8 : g_ultra_epinorm_lm_argmax_f16;
+        NSUInteger n_tg = ((NSUInteger)vocab + 7) / 8;
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:u_buf(x_h) offset:0 atIndex:0];
+        [enc setBuffer:u_buf(nw_h) offset:(NSUInteger)nw_off atIndex:1];
+        [enc setBuffer:u_buf(w_h) offset:(NSUInteger)w_off atIndex:2];
+        [enc setBuffer:g_ultra_lm_pairs_buf offset:0 atIndex:3];
+        [enc setBuffer:g_ultra_ss_buf offset:0 atIndex:4];
+        uint32_t p[8] = { (uint32_t)vocab, (uint32_t)in_dim, (uint32_t)gemma_mode, 0, (uint32_t)(ss_slot & 1), 0, 0, 0 };
+        [enc setBytes:p length:sizeof(p) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+
+        [enc setComputePipelineState:g_ultra_argmax_reduce_pairs];
+        [enc setBuffer:g_ultra_lm_pairs_buf offset:0 atIndex:0];
+        [enc setBuffer:u_buf(cur_tok_h) offset:0 atIndex:1];
+        [enc setBuffer:(write_hist ? u_buf(hist_tok_h) : u_buf(cur_tok_h)) offset:0 atIndex:2];
+        uint32_t rp[4] = { (uint32_t)n_tg, (uint32_t)write_hist, (uint32_t)step_idx, 0 };
+        [enc setBytes:rp length:sizeof(rp) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         u_finish(cmd, enc, local);
         return 1;
     }

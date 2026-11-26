@@ -55,6 +55,29 @@ extern "C" {
         q_heads_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_flat_h Int,
         n_heads Int, n_kv Int, d_head Int, start_pos Int, batch_len Int, max_seq Int, softcap Float,
     ) Int
+    fn tn_ultra_batch_rope_flash_gqa(
+        qkv_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_flat_h Int,
+        n_heads Int, n_kv Int, d_head Int, start_pos Int, batch_len Int, max_seq Int, softcap Float,
+    ) Int
+    fn tn_ultra_embed_ss_off(tok_h Int, emb_h Int, emb_off Int, out_h Int, d_model Int, vocab Int) Int
+    fn tn_ultra_gemv_ss(
+        x_h Int, w_h Int, w_off Int, y_h Int, bias_h Int, bias_off Int,
+        out_dim Int, in_dim Int, quant_mode Int, add_res Int, has_bias Int, ss_slot Int,
+    ) Int
+    fn tn_ultra_epinorm_gemv(
+        x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int, y_h Int,
+        bias_h Int, bias_off Int, out_dim Int, in_dim Int,
+        quant_mode Int, gemma_mode Int, has_bias Int, ss_slot Int,
+    ) Int
+    fn tn_ultra_epinorm_ffn_gate_up(
+        x_h Int, nw_h Int, nw_off Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int,
+        out_h Int, d_ff Int, in_dim Int, quant_mode Int, is_geglu Int, gemma_mode Int, ss_slot Int,
+    ) Int
+    fn tn_ultra_epinorm_lmhead_argmax(
+        x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int,
+        cur_tok_h Int, hist_tok_h Int, write_hist Int, step_idx Int,
+        vocab Int, in_dim Int, quant_mode Int, gemma_mode Int, ss_slot Int,
+    ) Int
     fn tn_ultra_gemv(
         x_h Int, x_off Int,
         w_h Int, w_off Int,
@@ -253,6 +276,81 @@ pub fn ultra_flash_batch_causal_gqa(
         tn_ultra_flash_batch_causal_gqa(
             q_heads_h, kc_h, kc_off, vc_h, vc_off, ctx_flat_h,
             n_heads, n_kv, d_head, start_pos, batch_len, max_seq, softcap,
+        ) != 0
+    }
+}
+
+pub fn ultra_batch_rope_flash_gqa(
+    qkv_h Int, kc_h Int, kc_off Int, vc_h Int, vc_off Int, ctx_flat_h Int,
+    n_heads Int, n_kv Int, d_head Int, start_pos Int, batch_len Int, max_seq Int, softcap Float,
+) Bool {
+    unsafe {
+        tn_ultra_batch_rope_flash_gqa(
+            qkv_h, kc_h, kc_off, vc_h, vc_off, ctx_flat_h,
+            n_heads, n_kv, d_head, start_pos, batch_len, max_seq, softcap,
+        ) != 0
+    }
+}
+
+pub fn ultra_embed_ss_off(tok_h Int, emb_h Int, emb_off Int, out_h Int, d_model Int, vocab Int) Bool {
+    unsafe { tn_ultra_embed_ss_off(tok_h, emb_h, emb_off, out_h, d_model, vocab) != 0 }
+}
+
+pub fn ultra_gemv_ss(
+    x_h Int, w_h Int, w_off Int, y_h Int, bias_h Int, bias_off Int,
+    out_dim Int, in_dim Int, quant_mode Int, add_res Bool, has_bias Bool, ss_slot Int,
+) Bool {
+    unsafe {
+        tn_ultra_gemv_ss(
+            x_h, w_h, w_off, y_h, bias_h, bias_off, out_dim, in_dim, quant_mode,
+            if add_res { 1 } else { 0 },
+            if has_bias { 1 } else { 0 },
+            ss_slot,
+        ) != 0
+    }
+}
+
+pub fn ultra_epinorm_gemv(
+    x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int, y_h Int,
+    bias_h Int, bias_off Int, out_dim Int, in_dim Int,
+    quant_mode Int, gemma_mode Bool, has_bias Bool, ss_slot Int,
+) Bool {
+    unsafe {
+        tn_ultra_epinorm_gemv(
+            x_h, nw_h, nw_off, w_h, w_off, y_h, bias_h, bias_off, out_dim, in_dim, quant_mode,
+            if gemma_mode { 1 } else { 0 },
+            if has_bias { 1 } else { 0 },
+            ss_slot,
+        ) != 0
+    }
+}
+
+pub fn ultra_epinorm_ffn_gate_up(
+    x_h Int, nw_h Int, nw_off Int, wg_h Int, wg_off Int, wu_h Int, wu_off Int,
+    out_h Int, d_ff Int, in_dim Int, quant_mode Int, is_geglu Bool, gemma_mode Bool, ss_slot Int,
+) Bool {
+    unsafe {
+        tn_ultra_epinorm_ffn_gate_up(
+            x_h, nw_h, nw_off, wg_h, wg_off, wu_h, wu_off, out_h, d_ff, in_dim, quant_mode,
+            if is_geglu { 1 } else { 0 },
+            if gemma_mode { 1 } else { 0 },
+            ss_slot,
+        ) != 0
+    }
+}
+
+pub fn ultra_epinorm_lmhead_argmax(
+    x_h Int, nw_h Int, nw_off Int, w_h Int, w_off Int,
+    cur_tok_h Int, hist_tok_h Int, write_hist Bool, step_idx Int,
+    vocab Int, in_dim Int, quant_mode Int, gemma_mode Bool, ss_slot Int,
+) Bool {
+    unsafe {
+        tn_ultra_epinorm_lmhead_argmax(
+            x_h, nw_h, nw_off, w_h, w_off, cur_tok_h, hist_tok_h,
+            if write_hist { 1 } else { 0 },
+            step_idx, vocab, in_dim, quant_mode,
+            if gemma_mode { 1 } else { 0 },
+            ss_slot,
         ) != 0
     }
 }

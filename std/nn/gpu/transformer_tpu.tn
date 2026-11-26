@@ -121,6 +121,147 @@ pub fn shlo_w4a8_matmul(m Int, k Int, n Int) Text {
     ++ "}\n"
 }
 
+/// Emits a StableHLO MLIR module for TPU **W4A8_PACK** (Native `i8` HBM DMA 0.5 B/wt + VPU Shift Unpack + 394 TOPS INT8 MXU!):
+/// Stores 2 signed 4-bit weights per `i8` byte (`tensor<K/2 x N x i8>` -> bypasses XLA's slow sub-byte `s4` DMA and runs at full `i8` HBM speed!).
+/// `use_concat == false`: split-dot `dot(x_lo, w_lo) + dot(x_hi, w_hi)` (ZERO concat copy in VMEM!).
+/// `use_concat == true`:  concat `concat(w_lo, w_hi, dim=0)` -> single wide MXU `dot_general`.
+pub fn shlo_w4a8_packed_matmul(m Int, k Int, n Int, use_concat Bool) Text {
+    let ms = int_to_text(m)
+    let ks = int_to_text(k)
+    let k2 = k / 2
+    let k2s = int_to_text(k2)
+    let ns = int_to_text(n)
+    let dot_body = if use_concat {
+        "    %w_all = stablehlo.concatenate %w_lo, %w_hi, dim = 0 : (tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>, tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xi8>\n"
+        ++ "    %acc_i32 = stablehlo.dot_general %x_i8, %w_all, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<" ++ ms ++ "x" ++ ks ++ "xi8>, tensor<" ++ ks ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xi32>\n"
+    } else {
+        "    %x_lo = stablehlo.slice %x_i8 [0:" ++ ms ++ ", 0:" ++ k2s ++ "] : (tensor<" ++ ms ++ "x" ++ ks ++ "xi8>) -> tensor<" ++ ms ++ "x" ++ k2s ++ "xi8>\n"
+        ++ "    %x_hi = stablehlo.slice %x_i8 [0:" ++ ms ++ ", " ++ k2s ++ ":" ++ ks ++ "] : (tensor<" ++ ms ++ "x" ++ ks ++ "xi8>) -> tensor<" ++ ms ++ "x" ++ k2s ++ "xi8>\n"
+        ++ "    %a0 = stablehlo.dot_general %x_lo, %w_lo, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<" ++ ms ++ "x" ++ k2s ++ "xi8>, tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xi32>\n"
+        ++ "    %a1 = stablehlo.dot_general %x_hi, %w_hi, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<" ++ ms ++ "x" ++ k2s ++ "xi8>, tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xi32>\n"
+        ++ "    %acc_i32 = stablehlo.add %a0, %a1 : tensor<" ++ ms ++ "x" ++ ns ++ "xi32>\n"
+    }
+    "module @tenon_tpu_w4a8_pack {\n"
+    ++ "  func.func public @main(%x: tensor<" ++ ms ++ "x" ++ ks ++ "xbf16>, %wp: tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>, %sc: tensor<" ++ ns ++ "xbf16>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xbf16> {\n"
+    ++ "    %c0 = stablehlo.constant dense<0.0> : tensor<f32>\n"
+    ++ "    %c_eps = stablehlo.constant dense<1.0e-6> : tensor<" ++ ms ++ "xf32>\n"
+    ++ "    %c_inv127 = stablehlo.constant dense<0.00787401575> : tensor<" ++ ms ++ "xf32>\n"
+    ++ "    %c_127 = stablehlo.constant dense<127.0> : tensor<" ++ ms ++ "xf32>\n"
+    ++ "    %c4 = stablehlo.constant dense<4> : tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>\n"
+    ++ "    %xf = stablehlo.convert %x : (tensor<" ++ ms ++ "x" ++ ks ++ "xbf16>) -> tensor<" ++ ms ++ "x" ++ ks ++ "xf32>\n"
+    ++ "    %xabs = stablehlo.abs %xf : tensor<" ++ ms ++ "x" ++ ks ++ "xf32>\n"
+    ++ "    %xmax = stablehlo.reduce(%xabs init: %c0) applies stablehlo.maximum across dimensions = [1] : (tensor<" ++ ms ++ "x" ++ ks ++ "xf32>, tensor<f32>) -> tensor<" ++ ms ++ "xf32>\n"
+    ++ "    %xmax_s = stablehlo.maximum %xmax, %c_eps : tensor<" ++ ms ++ "xf32>\n"
+    ++ "    %row_sc = stablehlo.multiply %xmax_s, %c_inv127 : tensor<" ++ ms ++ "xf32>\n"
+    ++ "    %inv_sc = stablehlo.divide %c_127, %xmax_s : tensor<" ++ ms ++ "xf32>\n"
+    ++ "    %inv_scb = stablehlo.broadcast_in_dim %inv_sc, dims = [0] : (tensor<" ++ ms ++ "xf32>) -> tensor<" ++ ms ++ "x" ++ ks ++ "xf32>\n"
+    ++ "    %xs = stablehlo.multiply %xf, %inv_scb : tensor<" ++ ms ++ "x" ++ ks ++ "xf32>\n"
+    ++ "    %xr = stablehlo.round_nearest_even %xs : tensor<" ++ ms ++ "x" ++ ks ++ "xf32>\n"
+    ++ "    %x_i8 = stablehlo.convert %xr : (tensor<" ++ ms ++ "x" ++ ks ++ "xf32>) -> tensor<" ++ ms ++ "x" ++ ks ++ "xi8>\n"
+    ++ "    %w_hi = stablehlo.shift_right_arithmetic %wp, %c4 : tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>\n"
+    ++ "    %w_sh = stablehlo.shift_left %wp, %c4 : tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>\n"
+    ++ "    %w_lo = stablehlo.shift_right_arithmetic %w_sh, %c4 : tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>\n"
+    ++ dot_body
+    ++ "    %acc_f32 = stablehlo.convert %acc_i32 : (tensor<" ++ ms ++ "x" ++ ns ++ "xi32>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xf32>\n"
+    ++ "    %rscb = stablehlo.broadcast_in_dim %row_sc, dims = [0] : (tensor<" ++ ms ++ "xf32>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xf32>\n"
+    ++ "    %s1 = stablehlo.multiply %acc_f32, %rscb : tensor<" ++ ms ++ "x" ++ ns ++ "xf32>\n"
+    ++ "    %scf = stablehlo.convert %sc : (tensor<" ++ ns ++ "xbf16>) -> tensor<" ++ ns ++ "xf32>\n"
+    ++ "    %scb = stablehlo.broadcast_in_dim %scf, dims = [1] : (tensor<" ++ ns ++ "xf32>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xf32>\n"
+    ++ "    %scaled = stablehlo.multiply %s1, %scb : tensor<" ++ ms ++ "x" ++ ns ++ "xf32>\n"
+    ++ "    %out = stablehlo.convert %scaled : (tensor<" ++ ms ++ "x" ++ ns ++ "xf32>) -> tensor<" ++ ms ++ "x" ++ ns ++ "xbf16>\n"
+    ++ "    return %out : tensor<" ++ ms ++ "x" ++ ns ++ "xbf16>\n"
+    ++ "  }\n"
+    ++ "}\n"
+}
+
+fn shlo_emit_int8_dot_core(
+    pfx Text,
+    x_i8 Text,
+    w_src Text,
+    rsc_1d Text,
+    s Text,
+    k Int,
+    n Int,
+    mode Int,
+    out_f32 Text,
+) Text {
+    let ks = int_to_text(k)
+    let k2s = int_to_text(k / 2)
+    let ns = int_to_text(n)
+    let dot_str = if mode == 488 {
+        "    %" ++ pfx ++ "_c4 = stablehlo.constant dense<4> : tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>\n"
+        ++ "    %" ++ pfx ++ "_whi = stablehlo.shift_right_arithmetic " ++ w_src ++ ", %" ++ pfx ++ "_c4 : tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>\n"
+        ++ "    %" ++ pfx ++ "_wsh = stablehlo.shift_left " ++ w_src ++ ", %" ++ pfx ++ "_c4 : tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>\n"
+        ++ "    %" ++ pfx ++ "_wlo = stablehlo.shift_right_arithmetic %" ++ pfx ++ "_wsh, %" ++ pfx ++ "_c4 : tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>\n"
+        ++ "    %" ++ pfx ++ "_xlo = stablehlo.slice " ++ x_i8 ++ " [0:" ++ s ++ ", 0:" ++ k2s ++ "] : (tensor<" ++ s ++ "x" ++ ks ++ "xi8>) -> tensor<" ++ s ++ "x" ++ k2s ++ "xi8>\n"
+        ++ "    %" ++ pfx ++ "_xhi = stablehlo.slice " ++ x_i8 ++ " [0:" ++ s ++ ", " ++ k2s ++ ":" ++ ks ++ "] : (tensor<" ++ s ++ "x" ++ ks ++ "xi8>) -> tensor<" ++ s ++ "x" ++ k2s ++ "xi8>\n"
+        ++ "    %" ++ pfx ++ "_a0 = stablehlo.dot_general %" ++ pfx ++ "_xlo, %" ++ pfx ++ "_wlo, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<" ++ s ++ "x" ++ k2s ++ "xi8>, tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ s ++ "x" ++ ns ++ "xi32>\n"
+        ++ "    %" ++ pfx ++ "_a1 = stablehlo.dot_general %" ++ pfx ++ "_xhi, %" ++ pfx ++ "_whi, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<" ++ s ++ "x" ++ k2s ++ "xi8>, tensor<" ++ k2s ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ s ++ "x" ++ ns ++ "xi32>\n"
+        ++ "    %" ++ pfx ++ "_i32 = stablehlo.add %" ++ pfx ++ "_a0, %" ++ pfx ++ "_a1 : tensor<" ++ s ++ "x" ++ ns ++ "xi32>\n"
+    } else if mode == 48 {
+        "    %" ++ pfx ++ "_wi8 = stablehlo.convert " ++ w_src ++ " : (tensor<" ++ ks ++ "x" ++ ns ++ "xi4>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xi8>\n"
+        ++ "    %" ++ pfx ++ "_i32 = stablehlo.dot_general " ++ x_i8 ++ ", %" ++ pfx ++ "_wi8, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<" ++ s ++ "x" ++ ks ++ "xi8>, tensor<" ++ ks ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ s ++ "x" ++ ns ++ "xi32>\n"
+    } else {
+        "    %" ++ pfx ++ "_i32 = stablehlo.dot_general " ++ x_i8 ++ ", " ++ w_src ++ ", contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<" ++ s ++ "x" ++ ks ++ "xi8>, tensor<" ++ ks ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ s ++ "x" ++ ns ++ "xi32>\n"
+    }
+    dot_str
+    ++ "    %" ++ pfx ++ "_af = stablehlo.convert %" ++ pfx ++ "_i32 : (tensor<" ++ s ++ "x" ++ ns ++ "xi32>) -> tensor<" ++ s ++ "x" ++ ns ++ "xf32>\n"
+    ++ "    %" ++ pfx ++ "_rscb = stablehlo.broadcast_in_dim " ++ rsc_1d ++ ", dims = [0] : (tensor<" ++ s ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ns ++ "xf32>\n"
+    ++ "    " ++ out_f32 ++ " = stablehlo.multiply %" ++ pfx ++ "_af, %" ++ pfx ++ "_rscb : tensor<" ++ s ++ "x" ++ ns ++ "xf32>\n"
+}
+
+/// Algebraic Single-Pass Fused `RMSNorm + Dynamic INT8 Quantization + MXU Projection`!
+/// Exact mathematical identity: `r1 = rsqrt(mean(x^2)+eps) > 0` CANCELS out of `round((x*nw*r1) * 127 / max(|x*nw*r1|))`!
+/// Fuses `reduce_add(x^2)` and `reduce_max(|x*nw|)` into ONE VPU pass & folds `r1` into the 1D `[S]` post-MXU scale!
+fn shlo_emit_rmsnorm_int8_proj(
+    pfx Text,
+    x_f32 Text,
+    nw_bf16 Text,
+    w_src Text,
+    s Text,
+    k Int,
+    n Int,
+    mode Int,
+    out_f32 Text,
+) Text {
+    let ks = int_to_text(k)
+    let ns = int_to_text(n)
+    if mode == 16 {
+        "    %" ++ pfx ++ "_xsq = stablehlo.multiply " ++ x_f32 ++ ", " ++ x_f32 ++ " : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_ss = stablehlo.reduce(%" ++ pfx ++ "_xsq init: %c0) applies stablehlo.add across dimensions = [1] : (tensor<" ++ s ++ "x" ++ ks ++ "xf32>, tensor<f32>) -> tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_m = stablehlo.multiply %" ++ pfx ++ "_ss, %c_inv_d : tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_v = stablehlo.add %" ++ pfx ++ "_m, %c_eps : tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_r = stablehlo.rsqrt %" ++ pfx ++ "_v : tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_rb = stablehlo.broadcast_in_dim %" ++ pfx ++ "_r, dims = [0] : (tensor<" ++ s ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_nwf = stablehlo.convert " ++ nw_bf16 ++ " : (tensor<" ++ ks ++ "xbf16>) -> tensor<" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_nwb = stablehlo.broadcast_in_dim %" ++ pfx ++ "_nwf, dims = [1] : (tensor<" ++ ks ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_xn = stablehlo.multiply " ++ x_f32 ++ ", %" ++ pfx ++ "_rb : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_xnw = stablehlo.multiply %" ++ pfx ++ "_xn, %" ++ pfx ++ "_nwb : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_xb = stablehlo.convert %" ++ pfx ++ "_xnw : (tensor<" ++ s ++ "x" ++ ks ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ks ++ "xbf16>\n"
+        ++ "    " ++ out_f32 ++ " = stablehlo.dot_general %" ++ pfx ++ "_xb, " ++ w_src ++ ", contracting_dims = [1] x [0] : (tensor<" ++ s ++ "x" ++ ks ++ "xbf16>, tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>) -> tensor<" ++ s ++ "x" ++ ns ++ "xf32>\n"
+    } else {
+        "    %" ++ pfx ++ "_xsq = stablehlo.multiply " ++ x_f32 ++ ", " ++ x_f32 ++ " : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_ss = stablehlo.reduce(%" ++ pfx ++ "_xsq init: %c0) applies stablehlo.add across dimensions = [1] : (tensor<" ++ s ++ "x" ++ ks ++ "xf32>, tensor<f32>) -> tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_m = stablehlo.multiply %" ++ pfx ++ "_ss, %c_inv_d : tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_v = stablehlo.add %" ++ pfx ++ "_m, %c_eps : tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_r = stablehlo.rsqrt %" ++ pfx ++ "_v : tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_nwf = stablehlo.convert " ++ nw_bf16 ++ " : (tensor<" ++ ks ++ "xbf16>) -> tensor<" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_nwb = stablehlo.broadcast_in_dim %" ++ pfx ++ "_nwf, dims = [1] : (tensor<" ++ ks ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_u = stablehlo.multiply " ++ x_f32 ++ ", %" ++ pfx ++ "_nwb : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_uabs = stablehlo.abs %" ++ pfx ++ "_u : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_mx = stablehlo.reduce(%" ++ pfx ++ "_uabs init: %c0) applies stablehlo.maximum across dimensions = [1] : (tensor<" ++ s ++ "x" ++ ks ++ "xf32>, tensor<f32>) -> tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_mxs = stablehlo.maximum %" ++ pfx ++ "_mx, %c_qeps : tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_rsc0 = stablehlo.multiply %" ++ pfx ++ "_mxs, %" ++ pfx ++ "_r : tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_rsc = stablehlo.multiply %" ++ pfx ++ "_rsc0, %c_inv127 : tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_isc = stablehlo.divide %c_127, %" ++ pfx ++ "_mxs : tensor<" ++ s ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_iscb = stablehlo.broadcast_in_dim %" ++ pfx ++ "_isc, dims = [0] : (tensor<" ++ s ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_xs = stablehlo.multiply %" ++ pfx ++ "_u, %" ++ pfx ++ "_iscb : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_xr = stablehlo.round_nearest_even %" ++ pfx ++ "_xs : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_xi8 = stablehlo.convert %" ++ pfx ++ "_xr : (tensor<" ++ s ++ "x" ++ ks ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ks ++ "xi8>\n"
+        ++ shlo_emit_int8_dot_core(pfx, "%" ++ pfx ++ "_xi8", w_src, "%" ++ pfx ++ "_rsc", s, k, n, mode, out_f32)
+    }
+}
+
 fn shlo_emit_int8_proj(
     pfx Text,
     x_f32 Text,
@@ -129,8 +270,6 @@ fn shlo_emit_int8_proj(
     k Int,
     n Int,
     mode Int,
-    lo_c Text,
-    hi_c Text,
     out_f32 Text,
 ) Text {
     let ks = int_to_text(k)
@@ -139,11 +278,6 @@ fn shlo_emit_int8_proj(
         "    %" ++ pfx ++ "_xb = stablehlo.convert " ++ x_f32 ++ " : (tensor<" ++ s ++ "x" ++ ks ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ks ++ "xbf16>\n"
         ++ "    " ++ out_f32 ++ " = stablehlo.dot_general %" ++ pfx ++ "_xb, " ++ w_src ++ ", contracting_dims = [1] x [0] : (tensor<" ++ s ++ "x" ++ ks ++ "xbf16>, tensor<" ++ ks ++ "x" ++ ns ++ "xbf16>) -> tensor<" ++ s ++ "x" ++ ns ++ "xf32>\n"
     } else {
-        let w_conv = if mode == 48 {
-            "    %" ++ pfx ++ "_wi8 = stablehlo.convert " ++ w_src ++ " : (tensor<" ++ ks ++ "x" ++ ns ++ "xi4>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xi8>\n"
-        } else {
-            "    %" ++ pfx ++ "_wi8 = stablehlo.reshape " ++ w_src ++ " : (tensor<" ++ ks ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ ks ++ "x" ++ ns ++ "xi8>\n"
-        }
         "    %" ++ pfx ++ "_abs = stablehlo.abs " ++ x_f32 ++ " : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
         ++ "    %" ++ pfx ++ "_mx = stablehlo.reduce(%" ++ pfx ++ "_abs init: %c0) applies stablehlo.maximum across dimensions = [1] : (tensor<" ++ s ++ "x" ++ ks ++ "xf32>, tensor<f32>) -> tensor<" ++ s ++ "xf32>\n"
         ++ "    %" ++ pfx ++ "_mxs = stablehlo.maximum %" ++ pfx ++ "_mx, %c_qeps : tensor<" ++ s ++ "xf32>\n"
@@ -152,22 +286,19 @@ fn shlo_emit_int8_proj(
         ++ "    %" ++ pfx ++ "_iscb = stablehlo.broadcast_in_dim %" ++ pfx ++ "_isc, dims = [0] : (tensor<" ++ s ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
         ++ "    %" ++ pfx ++ "_xs = stablehlo.multiply " ++ x_f32 ++ ", %" ++ pfx ++ "_iscb : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
         ++ "    %" ++ pfx ++ "_xr = stablehlo.round_nearest_even %" ++ pfx ++ "_xs : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
-        ++ "    %" ++ pfx ++ "_xc1 = stablehlo.maximum %" ++ pfx ++ "_xr, " ++ lo_c ++ " : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
-        ++ "    %" ++ pfx ++ "_xc2 = stablehlo.minimum %" ++ pfx ++ "_xc1, " ++ hi_c ++ " : tensor<" ++ s ++ "x" ++ ks ++ "xf32>\n"
-        ++ "    %" ++ pfx ++ "_xi8 = stablehlo.convert %" ++ pfx ++ "_xc2 : (tensor<" ++ s ++ "x" ++ ks ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ks ++ "xi8>\n"
-        ++ w_conv
-        ++ "    %" ++ pfx ++ "_i32 = stablehlo.dot_general %" ++ pfx ++ "_xi8, %" ++ pfx ++ "_wi8, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<" ++ s ++ "x" ++ ks ++ "xi8>, tensor<" ++ ks ++ "x" ++ ns ++ "xi8>) -> tensor<" ++ s ++ "x" ++ ns ++ "xi32>\n"
-        ++ "    %" ++ pfx ++ "_af = stablehlo.convert %" ++ pfx ++ "_i32 : (tensor<" ++ s ++ "x" ++ ns ++ "xi32>) -> tensor<" ++ s ++ "x" ++ ns ++ "xf32>\n"
-        ++ "    %" ++ pfx ++ "_rscb = stablehlo.broadcast_in_dim %" ++ pfx ++ "_rsc, dims = [0] : (tensor<" ++ s ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ns ++ "xf32>\n"
-        ++ "    " ++ out_f32 ++ " = stablehlo.multiply %" ++ pfx ++ "_af, %" ++ pfx ++ "_rscb : tensor<" ++ s ++ "x" ++ ns ++ "xf32>\n"
+        ++ "    %" ++ pfx ++ "_xi8 = stablehlo.convert %" ++ pfx ++ "_xr : (tensor<" ++ s ++ "x" ++ ks ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ks ++ "xi8>\n"
+        ++ shlo_emit_int8_dot_core(pfx, "%" ++ pfx ++ "_xi8", w_src, "%" ++ pfx ++ "_rsc", s, k, n, mode, out_f32)
     }
 }
 
 /// Roofline-Optimal Real Llama-3.2-1B GQA (32H / 8KV -> `qkv_dim = 3072`) Statically-Unrolled All-N-Layer TPU Engine!
 ///   - Real GQA Attention via 4D batched `dot_general` (`[S, n_kv, group, d_head] x [S, n_kv, d_head]`, ZERO KV copy!)
-///   - `mode == 48`: **W4A8 INT8 MXU (`394 TOPS`)** — native `i4` HBM -> pure integer `i4 -> i8` -> INT8 MXU (bypasses VPU float dequant!)
-///   - `mode == 88`: **W8A8 INT8 MXU (`394 TOPS`)** — native `i8` HBM -> direct `i8 @ i8 -> i32` (2x Prefill S=512 compute ceiling!)
-///   - `mode == 16`: **BF16 MXU (`197 TFLOPS`)** — exact real-GQA BF16 baseline!
+///   - Algebraic Single-Pass Fused `RMSNorm + Dynamic INT8 Quant` (`r1` cancels out of `xi8`, folded into 1D scale!)
+///   - Persistent `f32` inter-layer residual stream (eliminates 30 redundant `f32 <-> bf16` conversions!)
+///   - `mode == 488`: **W4A8_PACK** (`tensor<K/2 x N x i8>` native `i8` HBM DMA 0.5B/wt + VPU shift unpack + 394T INT8 MXU!)
+///   - `mode == 48`:  **W4A8** (`tensor<K x N x i4>` native `i4` -> `i8` + 394T INT8 MXU!)
+///   - `mode == 88`:  **W8A8** (`tensor<K x N x i8>` -> 394T INT8 MXU!)
+///   - `mode == 16`:  **BF16** (`197 TFLOPS` MXU baseline!)
 pub fn shlo_llama3_gqa_int8mxu_unrolled(
     n_layers Int where self > 0,
     seq Int where self > 0,
@@ -193,7 +324,11 @@ pub fn shlo_llama3_gqa_int8mxu_unrolled(
     let kv_s = int_to_text(kv_dim)
     let fs = int_to_text(dff)
     let f2s = int_to_text(dff * 2)
-    let wt = if mode == 16 { "bf16" } else if mode == 88 { "i8" } else { "i4" }
+    let wd_k_in = if mode == 488 { d / 2 } else { d }
+    let wf_k_in = if mode == 488 { dff / 2 } else { dff }
+    let wdks = int_to_text(wd_k_in)
+    let wfks = int_to_text(wf_k_in)
+    let wt = if mode == 16 { "bf16" } else if mode == 88 || mode == 488 { "i8" } else { "i4" }
     let inv_d = float_to_text(1.0 / int_to_float(d))
     let inv_sqrt_dh = float_to_text(1.0 / (gpu_sqrt(int_to_float(dh) as Float32) as Float))
 
@@ -202,11 +337,11 @@ pub fn shlo_llama3_gqa_int8mxu_unrolled(
         ++ "  func.func public @main(\n"
         ++ "    %x0: tensor<" ++ s ++ "x" ++ ds ++ "xbf16>,\n"
         ++ "    %n1_all: tensor<" ++ ls ++ "x" ++ ds ++ "xbf16>,\n"
-        ++ "    %wqkv_all: tensor<" ++ ls ++ "x" ++ ds ++ "x" ++ qkv_s ++ "x" ++ wt ++ ">,\n"
-        ++ "    %wo_all: tensor<" ++ ls ++ "x" ++ ds ++ "x" ++ ds ++ "x" ++ wt ++ ">,\n"
+        ++ "    %wqkv_all: tensor<" ++ ls ++ "x" ++ wdks ++ "x" ++ qkv_s ++ "x" ++ wt ++ ">,\n"
+        ++ "    %wo_all: tensor<" ++ ls ++ "x" ++ wdks ++ "x" ++ ds ++ "x" ++ wt ++ ">,\n"
         ++ "    %n2_all: tensor<" ++ ls ++ "x" ++ ds ++ "xbf16>,\n"
-        ++ "    %wgu_all: tensor<" ++ ls ++ "x" ++ ds ++ "x" ++ f2s ++ "x" ++ wt ++ ">,\n"
-        ++ "    %wd_all: tensor<" ++ ls ++ "x" ++ fs ++ "x" ++ ds ++ "x" ++ wt ++ ">\n"
+        ++ "    %wgu_all: tensor<" ++ ls ++ "x" ++ wdks ++ "x" ++ f2s ++ "x" ++ wt ++ ">,\n"
+        ++ "    %wd_all: tensor<" ++ ls ++ "x" ++ wfks ++ "x" ++ ds ++ "x" ++ wt ++ ">\n"
         ++ "  ) -> tensor<" ++ s ++ "x" ++ ds ++ "xbf16> {\n"
         ++ "    %c0 = stablehlo.constant dense<0.0> : tensor<f32>\n"
         ++ "    %c_neg_inf = stablehlo.constant dense<-1.0e30> : tensor<f32>\n"
@@ -214,15 +349,12 @@ pub fn shlo_llama3_gqa_int8mxu_unrolled(
         ++ "    %c_inv_d = stablehlo.constant dense<" ++ inv_d ++ "> : tensor<" ++ s ++ "xf32>\n"
         ++ "    %c_eps = stablehlo.constant dense<1.0e-5> : tensor<" ++ s ++ "xf32>\n"
         ++ "    %c_scale = stablehlo.constant dense<" ++ inv_sqrt_dh ++ "> : tensor<" ++ nkvs ++ "x" ++ s ++ "x" ++ grps ++ "x" ++ s ++ "xf32>\n"
+        ++ "    %x0_f32 = stablehlo.convert %x0 : (tensor<" ++ s ++ "x" ++ ds ++ "xbf16>) -> tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
     if mode != 16 {
         out = out
             ++ "    %c_qeps = stablehlo.constant dense<1.0e-6> : tensor<" ++ s ++ "xf32>\n"
             ++ "    %c_inv127 = stablehlo.constant dense<0.00787401575> : tensor<" ++ s ++ "xf32>\n"
             ++ "    %c_127 = stablehlo.constant dense<127.0> : tensor<" ++ s ++ "xf32>\n"
-            ++ "    %c_lo_d = stablehlo.constant dense<-127.0> : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %c_hi_d = stablehlo.constant dense<127.0> : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %c_lo_f = stablehlo.constant dense<-127.0> : tensor<" ++ s ++ "x" ++ fs ++ "xf32>\n"
-            ++ "    %c_hi_f = stablehlo.constant dense<127.0> : tensor<" ++ s ++ "x" ++ fs ++ "xf32>\n"
     }
 
     var l = 0
@@ -230,30 +362,18 @@ pub fn shlo_llama3_gqa_int8mxu_unrolled(
         let li = int_to_text(l)
         let l1 = int_to_text(l + 1)
         let p = "L" ++ li
-        let xin = if l == 0 { "%x0" } else { "%x_L" ++ int_to_text(l - 1) }
-        let xout = "%x_L" ++ li
+        let xin_f32 = if l == 0 { "%x0_f32" } else { "%xf_L" ++ int_to_text(l - 1) }
+        let xout_f32 = "%xf_L" ++ li
 
         out = out
             ++ "    %" ++ p ++ "_n1s = stablehlo.slice %n1_all [" ++ li ++ ":" ++ l1 ++ ", 0:" ++ ds ++ "] : (tensor<" ++ ls ++ "x" ++ ds ++ "xbf16>) -> tensor<1x" ++ ds ++ "xbf16>\n"
             ++ "    %" ++ p ++ "_n1 = stablehlo.reshape %" ++ p ++ "_n1s : (tensor<1x" ++ ds ++ "xbf16>) -> tensor<" ++ ds ++ "xbf16>\n"
-            ++ "    %" ++ p ++ "_qkvs = stablehlo.slice %wqkv_all [" ++ li ++ ":" ++ l1 ++ ", 0:" ++ ds ++ ", 0:" ++ qkv_s ++ "] : (tensor<" ++ ls ++ "x" ++ ds ++ "x" ++ qkv_s ++ "x" ++ wt ++ ">) -> tensor<1x" ++ ds ++ "x" ++ qkv_s ++ "x" ++ wt ++ ">\n"
-            ++ "    %" ++ p ++ "_qkvr = stablehlo.reshape %" ++ p ++ "_qkvs : (tensor<1x" ++ ds ++ "x" ++ qkv_s ++ "x" ++ wt ++ ">) -> tensor<" ++ ds ++ "x" ++ qkv_s ++ "x" ++ wt ++ ">\n"
-            ++ "    %" ++ p ++ "_wos = stablehlo.slice %wo_all [" ++ li ++ ":" ++ l1 ++ ", 0:" ++ ds ++ ", 0:" ++ ds ++ "] : (tensor<" ++ ls ++ "x" ++ ds ++ "x" ++ ds ++ "x" ++ wt ++ ">) -> tensor<1x" ++ ds ++ "x" ++ ds ++ "x" ++ wt ++ ">\n"
-            ++ "    %" ++ p ++ "_wor = stablehlo.reshape %" ++ p ++ "_wos : (tensor<1x" ++ ds ++ "x" ++ ds ++ "x" ++ wt ++ ">) -> tensor<" ++ ds ++ "x" ++ ds ++ "x" ++ wt ++ ">\n"
-            // RMSNorm 1
-            ++ "    %" ++ p ++ "_xf = stablehlo.convert " ++ xin ++ " : (tensor<" ++ s ++ "x" ++ ds ++ "xbf16>) -> tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_xsq = stablehlo.multiply %" ++ p ++ "_xf, %" ++ p ++ "_xf : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_ss1 = stablehlo.reduce(%" ++ p ++ "_xsq init: %c0) applies stablehlo.add across dimensions = [1] : (tensor<" ++ s ++ "x" ++ ds ++ "xf32>, tensor<f32>) -> tensor<" ++ s ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_m1 = stablehlo.multiply %" ++ p ++ "_ss1, %c_inv_d : tensor<" ++ s ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_v1 = stablehlo.add %" ++ p ++ "_m1, %c_eps : tensor<" ++ s ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_r1 = stablehlo.rsqrt %" ++ p ++ "_v1 : tensor<" ++ s ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_r1b = stablehlo.broadcast_in_dim %" ++ p ++ "_r1, dims = [0] : (tensor<" ++ s ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_n1f = stablehlo.convert %" ++ p ++ "_n1 : (tensor<" ++ ds ++ "xbf16>) -> tensor<" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_n1b = stablehlo.broadcast_in_dim %" ++ p ++ "_n1f, dims = [1] : (tensor<" ++ ds ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_xn1f = stablehlo.multiply %" ++ p ++ "_xf, %" ++ p ++ "_r1b : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_xn1w = stablehlo.multiply %" ++ p ++ "_xn1f, %" ++ p ++ "_n1b : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            // Horizontally Fused Real-GQA QKV Projection (`[S, 2048] @ [2048, 3072]`) on 394T INT8 MXU (or 197T BF16)
-            ++ shlo_emit_int8_proj(p ++ "_qkv", "%" ++ p ++ "_xn1w", "%" ++ p ++ "_qkvr", s, d, qkv_dim, mode, "%c_lo_d", "%c_hi_d", "%" ++ p ++ "_qkvf")
+            ++ "    %" ++ p ++ "_qkvs = stablehlo.slice %wqkv_all [" ++ li ++ ":" ++ l1 ++ ", 0:" ++ wdks ++ ", 0:" ++ qkv_s ++ "] : (tensor<" ++ ls ++ "x" ++ wdks ++ "x" ++ qkv_s ++ "x" ++ wt ++ ">) -> tensor<1x" ++ wdks ++ "x" ++ qkv_s ++ "x" ++ wt ++ ">\n"
+            ++ "    %" ++ p ++ "_qkvr = stablehlo.reshape %" ++ p ++ "_qkvs : (tensor<1x" ++ wdks ++ "x" ++ qkv_s ++ "x" ++ wt ++ ">) -> tensor<" ++ wdks ++ "x" ++ qkv_s ++ "x" ++ wt ++ ">\n"
+            ++ "    %" ++ p ++ "_wos = stablehlo.slice %wo_all [" ++ li ++ ":" ++ l1 ++ ", 0:" ++ wdks ++ ", 0:" ++ ds ++ "] : (tensor<" ++ ls ++ "x" ++ wdks ++ "x" ++ ds ++ "x" ++ wt ++ ">) -> tensor<1x" ++ wdks ++ "x" ++ ds ++ "x" ++ wt ++ ">\n"
+            ++ "    %" ++ p ++ "_wor = stablehlo.reshape %" ++ p ++ "_wos : (tensor<1x" ++ wdks ++ "x" ++ ds ++ "x" ++ wt ++ ">) -> tensor<" ++ wdks ++ "x" ++ ds ++ "x" ++ wt ++ ">\n"
+            // Single-Pass Fused RMSNorm1 + Dynamic INT8 Quant + Horizontally Fused QKV Projection!
+            ++ shlo_emit_rmsnorm_int8_proj(p ++ "_qkv", xin_f32, "%" ++ p ++ "_n1", "%" ++ p ++ "_qkvr", s, d, qkv_dim, mode, "%" ++ p ++ "_qkvf")
             ++ "    %" ++ p ++ "_qkvb = stablehlo.convert %" ++ p ++ "_qkvf : (tensor<" ++ s ++ "x" ++ qkv_s ++ "xf32>) -> tensor<" ++ s ++ "x" ++ qkv_s ++ "xbf16>\n"
             ++ "    %" ++ p ++ "_qb = stablehlo.slice %" ++ p ++ "_qkvb [0:" ++ s ++ ", 0:" ++ q_end ++ "] : (tensor<" ++ s ++ "x" ++ qkv_s ++ "xbf16>) -> tensor<" ++ s ++ "x" ++ ds ++ "xbf16>\n"
             ++ "    %" ++ p ++ "_kb = stablehlo.slice %" ++ p ++ "_qkvb [0:" ++ s ++ ", " ++ q_end ++ ":" ++ k_end ++ "] : (tensor<" ++ s ++ "x" ++ qkv_s ++ "xbf16>) -> tensor<" ++ s ++ "x" ++ kv_s ++ "xbf16>\n"
@@ -275,27 +395,17 @@ pub fn shlo_llama3_gqa_int8mxu_unrolled(
             ++ "    %" ++ p ++ "_ctx4 = stablehlo.dot_general %" ++ p ++ "_probb, %" ++ p ++ "_v3, batching_dims = [0] x [1], contracting_dims = [3] x [0] : (tensor<" ++ nkvs ++ "x" ++ s ++ "x" ++ grps ++ "x" ++ s ++ "xbf16>, tensor<" ++ s ++ "x" ++ nkvs ++ "x" ++ dhs ++ "xbf16>) -> tensor<" ++ nkvs ++ "x" ++ s ++ "x" ++ grps ++ "x" ++ dhs ++ "xf32>\n"
             ++ "    %" ++ p ++ "_ctx4t = stablehlo.transpose %" ++ p ++ "_ctx4, dims = [1, 0, 2, 3] : (tensor<" ++ nkvs ++ "x" ++ s ++ "x" ++ grps ++ "x" ++ dhs ++ "xf32>) -> tensor<" ++ s ++ "x" ++ nkvs ++ "x" ++ grps ++ "x" ++ dhs ++ "xf32>\n"
             ++ "    %" ++ p ++ "_ctxf = stablehlo.reshape %" ++ p ++ "_ctx4t : (tensor<" ++ s ++ "x" ++ nkvs ++ "x" ++ grps ++ "x" ++ dhs ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            // Wo + Residual
-            ++ shlo_emit_int8_proj(p ++ "_wo", "%" ++ p ++ "_ctxf", "%" ++ p ++ "_wor", s, d, d, mode, "%c_lo_d", "%c_hi_d", "%" ++ p ++ "_ao")
-            ++ "    %" ++ p ++ "_h1 = stablehlo.add %" ++ p ++ "_xf, %" ++ p ++ "_ao : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            // RMSNorm 2 + Fused Gate||Up + SwiGLU + Wdown + Residual!
+            // Wo + Residual (keeps residual in f32!)
+            ++ shlo_emit_int8_proj(p ++ "_wo", "%" ++ p ++ "_ctxf", "%" ++ p ++ "_wor", s, d, d, mode, "%" ++ p ++ "_ao")
+            ++ "    %" ++ p ++ "_h1 = stablehlo.add " ++ xin_f32 ++ ", %" ++ p ++ "_ao : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
+            // Single-Pass Fused RMSNorm2 + Dynamic INT8 Quant + Horizontally Fused Gate||Up + SwiGLU + Wdown + Residual!
             ++ "    %" ++ p ++ "_n2s = stablehlo.slice %n2_all [" ++ li ++ ":" ++ l1 ++ ", 0:" ++ ds ++ "] : (tensor<" ++ ls ++ "x" ++ ds ++ "xbf16>) -> tensor<1x" ++ ds ++ "xbf16>\n"
             ++ "    %" ++ p ++ "_n2 = stablehlo.reshape %" ++ p ++ "_n2s : (tensor<1x" ++ ds ++ "xbf16>) -> tensor<" ++ ds ++ "xbf16>\n"
-            ++ "    %" ++ p ++ "_gus = stablehlo.slice %wgu_all [" ++ li ++ ":" ++ l1 ++ ", 0:" ++ ds ++ ", 0:" ++ f2s ++ "] : (tensor<" ++ ls ++ "x" ++ ds ++ "x" ++ f2s ++ "x" ++ wt ++ ">) -> tensor<1x" ++ ds ++ "x" ++ f2s ++ "x" ++ wt ++ ">\n"
-            ++ "    %" ++ p ++ "_gur = stablehlo.reshape %" ++ p ++ "_gus : (tensor<1x" ++ ds ++ "x" ++ f2s ++ "x" ++ wt ++ ">) -> tensor<" ++ ds ++ "x" ++ f2s ++ "x" ++ wt ++ ">\n"
-            ++ "    %" ++ p ++ "_wds = stablehlo.slice %wd_all [" ++ li ++ ":" ++ l1 ++ ", 0:" ++ fs ++ ", 0:" ++ ds ++ "] : (tensor<" ++ ls ++ "x" ++ fs ++ "x" ++ ds ++ "x" ++ wt ++ ">) -> tensor<1x" ++ fs ++ "x" ++ ds ++ "x" ++ wt ++ ">\n"
-            ++ "    %" ++ p ++ "_wdr = stablehlo.reshape %" ++ p ++ "_wds : (tensor<1x" ++ fs ++ "x" ++ ds ++ "x" ++ wt ++ ">) -> tensor<" ++ fs ++ "x" ++ ds ++ "x" ++ wt ++ ">\n"
-            ++ "    %" ++ p ++ "_h1sq = stablehlo.multiply %" ++ p ++ "_h1, %" ++ p ++ "_h1 : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_ss2 = stablehlo.reduce(%" ++ p ++ "_h1sq init: %c0) applies stablehlo.add across dimensions = [1] : (tensor<" ++ s ++ "x" ++ ds ++ "xf32>, tensor<f32>) -> tensor<" ++ s ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_m2 = stablehlo.multiply %" ++ p ++ "_ss2, %c_inv_d : tensor<" ++ s ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_v2 = stablehlo.add %" ++ p ++ "_m2, %c_eps : tensor<" ++ s ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_r2 = stablehlo.rsqrt %" ++ p ++ "_v2 : tensor<" ++ s ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_r2b = stablehlo.broadcast_in_dim %" ++ p ++ "_r2, dims = [0] : (tensor<" ++ s ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_n2f = stablehlo.convert %" ++ p ++ "_n2 : (tensor<" ++ ds ++ "xbf16>) -> tensor<" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_n2b = stablehlo.broadcast_in_dim %" ++ p ++ "_n2f, dims = [1] : (tensor<" ++ ds ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_xn2f = stablehlo.multiply %" ++ p ++ "_h1, %" ++ p ++ "_r2b : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    %" ++ p ++ "_xn2w = stablehlo.multiply %" ++ p ++ "_xn2f, %" ++ p ++ "_n2b : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ shlo_emit_int8_proj(p ++ "_gu", "%" ++ p ++ "_xn2w", "%" ++ p ++ "_gur", s, d, dff * 2, mode, "%c_lo_d", "%c_hi_d", "%" ++ p ++ "_guf")
+            ++ "    %" ++ p ++ "_gus = stablehlo.slice %wgu_all [" ++ li ++ ":" ++ l1 ++ ", 0:" ++ wdks ++ ", 0:" ++ f2s ++ "] : (tensor<" ++ ls ++ "x" ++ wdks ++ "x" ++ f2s ++ "x" ++ wt ++ ">) -> tensor<1x" ++ wdks ++ "x" ++ f2s ++ "x" ++ wt ++ ">\n"
+            ++ "    %" ++ p ++ "_gur = stablehlo.reshape %" ++ p ++ "_gus : (tensor<1x" ++ wdks ++ "x" ++ f2s ++ "x" ++ wt ++ ">) -> tensor<" ++ wdks ++ "x" ++ f2s ++ "x" ++ wt ++ ">\n"
+            ++ "    %" ++ p ++ "_wds = stablehlo.slice %wd_all [" ++ li ++ ":" ++ l1 ++ ", 0:" ++ wfks ++ ", 0:" ++ ds ++ "] : (tensor<" ++ ls ++ "x" ++ wfks ++ "x" ++ ds ++ "x" ++ wt ++ ">) -> tensor<1x" ++ wfks ++ "x" ++ ds ++ "x" ++ wt ++ ">\n"
+            ++ "    %" ++ p ++ "_wdr = stablehlo.reshape %" ++ p ++ "_wds : (tensor<1x" ++ wfks ++ "x" ++ ds ++ "x" ++ wt ++ ">) -> tensor<" ++ wfks ++ "x" ++ ds ++ "x" ++ wt ++ ">\n"
+            ++ shlo_emit_rmsnorm_int8_proj(p ++ "_gu", "%" ++ p ++ "_h1", "%" ++ p ++ "_n2", "%" ++ p ++ "_gur", s, d, dff * 2, mode, "%" ++ p ++ "_guf")
             ++ "    %" ++ p ++ "_gate = stablehlo.slice %" ++ p ++ "_guf [0:" ++ s ++ ", 0:" ++ fs ++ "] : (tensor<" ++ s ++ "x" ++ f2s ++ "xf32>) -> tensor<" ++ s ++ "x" ++ fs ++ "xf32>\n"
             ++ "    %" ++ p ++ "_up = stablehlo.slice %" ++ p ++ "_guf [0:" ++ s ++ ", " ++ fs ++ ":" ++ f2s ++ "] : (tensor<" ++ s ++ "x" ++ f2s ++ "xf32>) -> tensor<" ++ s ++ "x" ++ fs ++ "xf32>\n"
             ++ "    %" ++ p ++ "_ng = stablehlo.negate %" ++ p ++ "_gate : tensor<" ++ s ++ "x" ++ fs ++ "xf32>\n"
@@ -303,13 +413,13 @@ pub fn shlo_llama3_gqa_int8mxu_unrolled(
             ++ "    %" ++ p ++ "_den = stablehlo.add %c_one, %" ++ p ++ "_eg : tensor<" ++ s ++ "x" ++ fs ++ "xf32>\n"
             ++ "    %" ++ p ++ "_silu = stablehlo.divide %" ++ p ++ "_gate, %" ++ p ++ "_den : tensor<" ++ s ++ "x" ++ fs ++ "xf32>\n"
             ++ "    %" ++ p ++ "_act = stablehlo.multiply %" ++ p ++ "_silu, %" ++ p ++ "_up : tensor<" ++ s ++ "x" ++ fs ++ "xf32>\n"
-            ++ shlo_emit_int8_proj(p ++ "_wd", "%" ++ p ++ "_act", "%" ++ p ++ "_wdr", s, dff, d, mode, "%c_lo_f", "%c_hi_f", "%" ++ p ++ "_down")
-            ++ "    %" ++ p ++ "_h2 = stablehlo.add %" ++ p ++ "_h1, %" ++ p ++ "_down : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
-            ++ "    " ++ xout ++ " = stablehlo.convert %" ++ p ++ "_h2 : (tensor<" ++ s ++ "x" ++ ds ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ds ++ "xbf16>\n"
+            ++ shlo_emit_int8_proj(p ++ "_wd", "%" ++ p ++ "_act", "%" ++ p ++ "_wdr", s, dff, d, mode, "%" ++ p ++ "_down")
+            ++ "    " ++ xout_f32 ++ " = stablehlo.add %" ++ p ++ "_h1, %" ++ p ++ "_down : tensor<" ++ s ++ "x" ++ ds ++ "xf32>\n"
         l += 1
     }
-    let last_x = "%x_L" ++ int_to_text(n_layers - 1)
-    out ++ "    return " ++ last_x ++ " : tensor<" ++ s ++ "x" ++ ds ++ "xbf16>\n  }\n}\n"
+    let last_xf = "%xf_L" ++ int_to_text(n_layers - 1)
+    out ++ "    %x_final = stablehlo.convert " ++ last_xf ++ " : (tensor<" ++ s ++ "x" ++ ds ++ "xf32>) -> tensor<" ++ s ++ "x" ++ ds ++ "xbf16>\n"
+        ++ "    return %x_final : tensor<" ++ s ++ "x" ++ ds ++ "xbf16>\n  }\n}\n"
 }
 
 fn shlo_emit_unpack_2d(pfx Text, src Text, k Int, n Int, quant_bits Int, out_var Text) Text {

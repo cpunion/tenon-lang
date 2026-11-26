@@ -388,6 +388,12 @@ def parse_tenon_output(stdout):
         m = re.search(r"TPU_HBM_W4A8_GEMV 1x16384x16384 ms=([0-9.]+) eff_GBs=([0-9.]+)", line)
         if m:
             res["hbm_w4a8_ms"], res["hbm_w4a8_gbs"] = float(m.group(1)), float(m.group(2))
+        m = re.search(r"TPU_HBM_W4A8_PACK_SPLIT 1x16384x16384 ms=([0-9.]+) eff_GBs=([0-9.]+)", line)
+        if m:
+            res["hbm_w4a8_pack_ms"], res["hbm_w4a8_pack_gbs"] = float(m.group(1)), float(m.group(2))
+        m = re.search(r"TPU_HBM_W4A8_PACK_CONCAT 1x16384x16384 ms=([0-9.]+) eff_GBs=([0-9.]+)", line)
+        if m:
+            res["hbm_w4a8_packc_ms"], res["hbm_w4a8_packc_gbs"] = float(m.group(1)), float(m.group(2))
         m = re.search(r"DECLARATIVE_GPU_GRAPH_TPU llama3_ffn_b32 ms=([0-9.]+) eff_GBs=([0-9.]+)", line)
         if m:
             res["decl_ffn_ms"], res["decl_ffn_gbs"] = float(m.group(1)), float(m.group(2))
@@ -396,9 +402,12 @@ def parse_tenon_output(stdout):
             ("gqa_prefill_s512_bf16", "Llama3.2_1B_GQA_Prefill_S512_BF16"),
             ("gqa_prefill_s512_w8a8", "Llama3.2_1B_GQA_Prefill_S512_W8A8"),
             ("gqa_decode_b128_w4a8", "Llama3.2_1B_GQA_Decode_B128_W4A8"),
+            ("gqa_decode_b128_w4a8_pack", "Llama3.2_1B_GQA_Decode_B128_W4A8_PACK"),
             ("gqa_decode_b32_w4a8", "Llama3.2_1B_GQA_Decode_B32_W4A8"),
+            ("gqa_decode_b32_w4a8_pack", "Llama3.2_1B_GQA_Decode_B32_W4A8_PACK"),
             ("gqa_decode_b1_bf16", "Llama3.2_1B_GQA_Decode_B1_BF16"),
             ("gqa_decode_b1_w4a8", "Llama3.2_1B_GQA_Decode_B1_W4A8"),
+            ("gqa_decode_b1_w4a8_pack", "Llama3.2_1B_GQA_Decode_B1_W4A8_PACK"),
             ("decode_b128_w4", "Llama3.2_1B_Decode_B128_W4A16"),
             ("decode_b32_bf16", "Llama3.2_1B_Decode_B32_BF16"),
             ("decode_b32_w8", "Llama3.2_1B_Decode_B32_W8A16"),
@@ -407,7 +416,7 @@ def parse_tenon_output(stdout):
             ("decode_b1_w8", "Llama3.2_1B_Decode_B1_W8A16"),
             ("decode_b1_w4", "Llama3.2_1B_Decode_B1_W4A16"),
         ]:
-            m = re.search(rf"BENCH_TPU_(?:FULL16|FUSED16|GQA16) {pat}.*full_ms=([0-9.]+) tok_s=([0-9.]+)", line)
+            m = re.search(rf"BENCH_TPU_(?:FULL16|FUSED16|GQA16) {pat} .*full_ms=([0-9.]+) tok_s=([0-9.]+)", line)
             if m:
                 res[f"{tag}_ms"], res[f"{tag}_toks"] = float(m.group(1)), float(m.group(2))
     return res
@@ -461,6 +470,10 @@ def main():
             f"{fmt(r.get('gqa_decode_b1_w4a8_toks')):<9} | "
             f"{fmt(r.get('decode_b1_w4_toks')):<9}"
         )
+    if r_tenon.get("hbm_w4a8_pack_gbs") or r_tenon.get("gqa_decode_b1_w4a8_pack_toks"):
+        print("\n--- Tenon TPU v5e-1 W4A8_PACK (`i8`-DMA 0.5B/wt + VPU Shift Unpack + Algebraic Fused RMSNorm+INT8) ---")
+        print(f"  1x16384^2 HBM: W4A8_i4={fmt(r_tenon.get('hbm_w4a8_gbs'), ' GB/s', TPU_PEAK_GBS)} | W4A8_PACK_SPLIT={fmt(r_tenon.get('hbm_w4a8_pack_gbs'), ' GB/s', TPU_PEAK_GBS)} | W4A8_PACK_CONCAT={fmt(r_tenon.get('hbm_w4a8_packc_gbs'), ' GB/s', TPU_PEAK_GBS)}")
+        print(f"  1B GQA Decode: B=1={fmt(r_tenon.get('gqa_decode_b1_w4a8_pack_toks'), ' tok/s')} | B=32={fmt(r_tenon.get('gqa_decode_b32_w4a8_pack_toks'), ' tok/s')} | B=128={fmt(r_tenon.get('gqa_decode_b128_w4a8_pack_toks'), ' tok/s')}")
 
 if __name__ == "__main__":
     main()

@@ -177,6 +177,8 @@ def parse_tenon(out):
         if m: r["tc_4096_330t"] = float(m.group(1))
         m = re.search(r"ROOFLINE_TC_FP8_660T 4096x4096x4096 ms=[0-9.]+ TFLOPS=([0-9.]+)", l)
         if m: r["tc_4096_fp8"] = float(m.group(1))
+        m = re.search(r"ROOFLINE_TC_FP8_660T_PTX 4096x4096x4096 ms=[0-9.]+ TFLOPS=([0-9.]+)", l)
+        if m: r["tc_4096_fp8_ptx"] = float(m.group(1))
         m = re.search(r"ROOFLINE_GEMV 8192x8192_FP16 .*eff_GBs=([0-9.]+)", l)
         if m: r["gemv_fp16_gbs"] = float(m.group(1))
         m = re.search(r"ROOFLINE_GEMV 8192x8192_Q4_0_dp4a .*eff_GBs=([0-9.]+)", l)
@@ -185,8 +187,15 @@ def parse_tenon(out):
         if m: r["prefill_1b_toks"] = float(m.group(1))
         m = re.search(r"BENCH_CUDA_PREFILL Llama3.2_1B_Prefill_S512_FP16_330T .*tok_s=([0-9.]+)", l)
         if m: r["prefill_1b_330t"] = float(m.group(1))
-        m = re.search(r"BENCH_CUDA_PREFILL Llama3.2_1B_Prefill_S512_FP8_660T .*tok_s=([0-9.]+)", l)
+        m = re.search(r"BENCH_CUDA_PREFILL Llama3.2_1B_Prefill_S512_FP8_660T seq=.*tok_s=([0-9.]+)", l)
         if m: r["prefill_1b_fp8"] = float(m.group(1))
+        m = re.search(r"BENCH_CUDA_PREFILL Llama3.2_1B_Prefill_S512_FP8_660T_PTX .*tok_s=([0-9.]+)", l)
+        if m: r["prefill_1b_fp8_ptx"] = float(m.group(1))
+        m = re.search(r"BENCH_CUDA_BATCH_1B Llama3.2_1B_Q4_0 B4_ms=[0-9.]+ B4_tok_s=([0-9.]+).*B8_tok_s=([0-9.]+).*B16_tok_s=([0-9.]+).*B32_tok_s=([0-9.]+)", l)
+        if m:
+            r["batch_b4_toks"], r["batch_b8_toks"], r["batch_b16_toks"], r["batch_b32_toks"] = (
+                float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
+            )
         m = re.search(r"BENCH_CUDA Llama3.2_1B_FP16 .*graph_tok_s=([0-9.]+) graph_GBs=([0-9.]+)", l)
         if m: r["decode_1b_fp16_toks"], r["decode_1b_fp16_gbs"] = float(m.group(1)), float(m.group(2))
         m = re.search(r"BENCH_CUDA Llama3.2_1B_Q4_0 .*graph_tok_s=([0-9.]+) graph_GBs=([0-9.]+)", l)
@@ -255,10 +264,14 @@ def main():
             f"{fmt(r.get('decode_1b_fp16_gbs'), '', PEAK_GBS):<16} | "
             f"{fmt(r.get('decode_1b_q4_toks'), ' t/s'):<14}"
         )
-    if r_tenon.get("tc_4096_330t") or r_tenon.get("tc_4096_fp8"):
-        print("\n--- Tenon Ada Lovelace sm_89 2x/4x Tensor Core Roofline (330.3T FP16-accum & 660.6T FP8 e4m3fn) ---")
-        print(f"  4096^3 FP16-accum (330.3T ceiling): {fmt(r_tenon.get('tc_4096_330t'), 'T', 330.3)} | 1B S=512 Prefill: {fmt(r_tenon.get('prefill_1b_330t'), ' tok/s')}")
-        print(f"  4096^3 FP8 e4m3fn (660.6T ceiling): {fmt(r_tenon.get('tc_4096_fp8'), 'T', 660.6)} | 1B S=512 Prefill: {fmt(r_tenon.get('prefill_1b_fp8'), ' tok/s')}")
+    if r_tenon.get("tc_4096_330t") or r_tenon.get("tc_4096_fp8") or r_tenon.get("tc_4096_fp8_ptx"):
+        print("\n--- Tenon Ada Lovelace sm_89 2x/4x Tensor Core Roofline (330.3T FP16-accum & Native PTX 660.6T FP8) ---")
+        print(f"  4096^3 FP16-accum (330.3T ceiling):      {fmt(r_tenon.get('tc_4096_330t'), 'T', 330.3)} | 1B S=512 Prefill: {fmt(r_tenon.get('prefill_1b_330t'), ' tok/s')}")
+        print(f"  4096^3 FP8 cublasLt (330.3T FP32 cap):   {fmt(r_tenon.get('tc_4096_fp8'), 'T', 330.3)} | 1B S=512 Prefill: {fmt(r_tenon.get('prefill_1b_fp8'), ' tok/s')}")
+        print(f"  4096^3 FP8 Native PTX (660.6T FP16 acc): {fmt(r_tenon.get('tc_4096_fp8_ptx'), 'T', 660.6)} | 1B S=512 Prefill: {fmt(r_tenon.get('prefill_1b_fp8_ptx'), ' tok/s')}")
+    if r_tenon.get("batch_b4_toks"):
+        print("\n--- Tenon CUDA Multi-Token Speculative/Batch Decode (1.24B Q4_0, Register-Direct B<=4 + W4A16 MMA+SplitK B=5..32) ---")
+        print(f"  B=4: {fmt(r_tenon.get('batch_b4_toks'), ' tok/s')} | B=8: {fmt(r_tenon.get('batch_b8_toks'), ' tok/s')} | B=16: {fmt(r_tenon.get('batch_b16_toks'), ' tok/s')} | B=32: {fmt(r_tenon.get('batch_b32_toks'), ' tok/s')}")
 
 if __name__ == "__main__":
     main()

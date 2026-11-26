@@ -408,7 +408,7 @@ impl UltraMpsTransformer {
             ffn_gate_b = GpuBuffer.uninit(ms * d_ff * 2),
             ffn_up_b = GpuBuffer.uninit(ms * d_ff * 2),
             ffn_act_b = GpuBuffer.uninit(ms * d_ff * 2),
-            logits_b = GpuBuffer.uninit(16 * vocab * 2),
+            logits_b = GpuBuffer.uninit(32 * vocab * 2),
             deq_b = GpuBuffer.uninit(max_deq * 2),
             moe_idx_b = GpuBuffer.uninit(16),
             moe_wt_b = GpuBuffer.uninit(16),
@@ -594,6 +594,59 @@ impl UltraMpsTransformer {
 
         let _ = mps_write_params4(self.tok_ids_b.handle, 0, tok_id, 0, 0, 0)
         let batch = MpsBatch.begin()
+        let use_epinorm = (c.arch != ARCH_MIXTRAL_MOE) && (c.logit_softcap == 0.0) && (d % 32 == 0) && (c.d_ff % 32 == 0)
+        if use_epinorm {
+            let _ = ultra_embed_ss_off(self.tok_ids_b.handle, h_emb, self.off_tok_emb, self.x_b.handle, d, c.vocab_size)
+            var l = 0
+            while l < c.n_layers {
+                let norm_off = l * d * 2
+                let kv_off = l * kv_layer_bytes
+                let _ = ultra_epinorm_gemv(
+                    self.x_b.handle, h_n1, self.off_norm1 + norm_off,
+                    h_wqkv, self.off_wqkv + l * qkv_stride,
+                    self.qkv_b.handle,
+                    h_bqkv, self.off_bqkv + l * qkv_dim * 2,
+                    qkv_dim, d, qm, c.gemma_norm, c.has_qkv_bias, 0,
+                )
+                let _ = ultra_rope_flash_decode(
+                    self.qkv_b.handle,
+                    self.k_cache_b.handle, kv_off,
+                    self.v_cache_b.handle, kv_off,
+                    self.ctx_flat_b.handle,
+                    c.n_heads, c.n_kv_heads, c.d_head, pos, ms, c.attn_softcap,
+                )
+                let _ = ultra_gemv_ss(
+                    self.ctx_flat_b.handle,
+                    h_wo, self.off_wo + l * wo_stride,
+                    self.x_b.handle,
+                    h_bqkv, self.off_bqkv,
+                    d, d, qm, true, false, 1,
+                )
+                let _ = ultra_epinorm_ffn_gate_up(
+                    self.x_b.handle, h_n2, self.off_norm2 + norm_off,
+                    h_wg, self.off_wgate + l * ff_layer_stride,
+                    h_wu, self.off_wup + l * ff_layer_stride,
+                    self.ffn_act_b.handle,
+                    c.d_ff, d, qm, c.is_geglu, c.gemma_norm, 1,
+                )
+                let _ = ultra_gemv_ss(
+                    self.ffn_act_b.handle,
+                    h_wd, self.off_wdown + l * ff_layer_stride,
+                    self.x_b.handle,
+                    h_bqkv, self.off_bqkv,
+                    d, c.d_ff, qm, true, false, 0,
+                )
+                l += 1
+            }
+            let _ = ultra_epinorm_lmhead_argmax(
+                self.x_b.handle, h_fn, self.off_fnorm,
+                h_lm, self.off_lmhead,
+                self.tok_ids_b.handle, self.tok_ids_b.handle, false, 0,
+                c.vocab_size, d, qm, c.gemma_norm, 0,
+            )
+            let _ = batch.commit_and_wait()
+            return ultra_read_u32_0(self.tok_ids_b.handle)
+        }
         let _ = ultra_embed_off(self.tok_ids_b.handle, h_emb, self.off_tok_emb, self.x_b.handle, 1, d, c.vocab_size)
 
         var l = 0
@@ -715,9 +768,62 @@ impl UltraMpsTransformer {
         let hist_b = GpuBuffer.uninit(if n_steps > 0 { n_steps * 4 } else { 4 })
         let _ = mps_write_params4(self.tok_ids_b.handle, 0, start_tok, 0, 0, 0)
         let batch = MpsBatch.begin()
+        let use_epinorm = (c.arch != ARCH_MIXTRAL_MOE) && (c.logit_softcap == 0.0) && (d % 32 == 0) && (c.d_ff % 32 == 0)
         var s = 0
         while s < n_steps {
             let pos = start_pos + s
+            if use_epinorm {
+                let _ = ultra_embed_ss_off(self.tok_ids_b.handle, h_emb, self.off_tok_emb, self.x_b.handle, d, c.vocab_size)
+                var l = 0
+                while l < c.n_layers {
+                    let norm_off = l * d * 2
+                    let kv_off = l * kv_layer_bytes
+                    let _ = ultra_epinorm_gemv(
+                        self.x_b.handle, h_n1, self.off_norm1 + norm_off,
+                        h_wqkv, self.off_wqkv + l * qkv_stride,
+                        self.qkv_b.handle,
+                        h_bqkv, self.off_bqkv + l * qkv_dim * 2,
+                        qkv_dim, d, qm, c.gemma_norm, c.has_qkv_bias, 0,
+                    )
+                    let _ = ultra_rope_flash_decode(
+                        self.qkv_b.handle,
+                        self.k_cache_b.handle, kv_off,
+                        self.v_cache_b.handle, kv_off,
+                        self.ctx_flat_b.handle,
+                        c.n_heads, c.n_kv_heads, c.d_head, pos, ms, c.attn_softcap,
+                    )
+                    let _ = ultra_gemv_ss(
+                        self.ctx_flat_b.handle,
+                        h_wo, self.off_wo + l * wo_stride,
+                        self.x_b.handle,
+                        h_bqkv, self.off_bqkv,
+                        d, d, qm, true, false, 1,
+                    )
+                    let _ = ultra_epinorm_ffn_gate_up(
+                        self.x_b.handle, h_n2, self.off_norm2 + norm_off,
+                        h_wg, self.off_wgate + l * ff_layer_stride,
+                        h_wu, self.off_wup + l * ff_layer_stride,
+                        self.ffn_act_b.handle,
+                        c.d_ff, d, qm, c.is_geglu, c.gemma_norm, 1,
+                    )
+                    let _ = ultra_gemv_ss(
+                        self.ffn_act_b.handle,
+                        h_wd, self.off_wdown + l * ff_layer_stride,
+                        self.x_b.handle,
+                        h_bqkv, self.off_bqkv,
+                        d, c.d_ff, qm, true, false, 0,
+                    )
+                    l += 1
+                }
+                let _ = ultra_epinorm_lmhead_argmax(
+                    self.x_b.handle, h_fn, self.off_fnorm,
+                    h_lm, self.off_lmhead,
+                    self.tok_ids_b.handle, hist_b.handle, true, s,
+                    c.vocab_size, d, qm, c.gemma_norm, 0,
+                )
+                s += 1
+                continue
+            }
             let _ = ultra_embed_off(self.tok_ids_b.handle, h_emb, self.off_tok_emb, self.x_b.handle, 1, d, c.vocab_size)
             var l = 0
             while l < c.n_layers {
@@ -860,14 +966,8 @@ impl UltraMpsTransformer {
                 self.qkv_b.handle, h_bqkv, self.off_bqkv + l * qkv_dim * 2,
                 b_len, qkv_dim, d, qm, false, c.has_qkv_bias,
             )
-            let _ = ultra_rope_kv(
-                self.qkv_b.handle, self.q_heads_b.handle,
-                self.k_cache_b.handle, kv_off,
-                self.v_cache_b.handle, kv_off,
-                b_len, c.n_heads, c.n_kv_heads, c.d_head, start_pos, ms,
-            )
-            let _ = ultra_flash_batch_causal_gqa(
-                self.q_heads_b.handle,
+            let _ = ultra_batch_rope_flash_gqa(
+                self.qkv_b.handle,
                 self.k_cache_b.handle, kv_off,
                 self.v_cache_b.handle, kv_off,
                 self.ctx_flat_b.handle,
@@ -954,14 +1054,8 @@ impl UltraMpsTransformer {
                     self.qkv_b.handle, h_bqkv, self.off_bqkv + l * qkv_dim * 2,
                     b_len, qkv_dim, d, qm, false, c.has_qkv_bias,
                 )
-                let _ = ultra_rope_kv(
-                    self.qkv_b.handle, self.q_heads_b.handle,
-                    self.k_cache_b.handle, kv_off,
-                    self.v_cache_b.handle, kv_off,
-                    b_len, c.n_heads, c.n_kv_heads, c.d_head, cur_pos, ms,
-                )
-                let _ = ultra_flash_batch_causal_gqa(
-                    self.q_heads_b.handle,
+                let _ = ultra_batch_rope_flash_gqa(
+                    self.qkv_b.handle,
                     self.k_cache_b.handle, kv_off,
                     self.v_cache_b.handle, kv_off,
                     self.ctx_flat_b.handle,

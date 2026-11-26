@@ -201,9 +201,9 @@ impl CudaTransformer {
         qkv_b + wo_b + ff_b + lm_b + norm_b
     }
 
-    /// Enqueues ONE complete ultra-fused Transformer decode step (5 kernels/layer + embed + fnorm + lmhead + argmax).
-    /// Safe to execute either directly on the CUDA stream OR inside a `cuda_graph_begin()..cuda_graph_end()` capture!
-    pub fn enqueue_decode_step(inout self, inc_pos Bool) Int {
+    /// Enqueues ONE complete ultra-fused Transformer decode step (5 kernels/layer + embed + 1-kernel Fused EpiNorm+LM_Head+Argmax!).
+    /// When `want_logits == false`, eliminates final standalone RMSNorm + 256KB logits write + standalone Argmax!
+    pub fn enqueue_decode_step_mode(inout self, inc_pos Bool, want_logits Bool) Int {
         let c = self.cfg
         let d = c.d_model
         let kv_dim = c.n_kv_heads * c.d_head
@@ -259,21 +259,87 @@ impl CudaTransformer {
             )
             l += 1
         }
-        let _ = cuda_rmsnorm(self.x_b.handle, self.fnorm_b.handle, 0, self.x_norm_b.handle, 1, d, c.gemma_norm)
-        let _ = cuda_gemv(
-            self.x_norm_b.handle,
-            self.lmhead_b.handle, 0,
-            self.logits_b.handle,
-            self.bqkv_b.handle, 0,
-            c.vocab_size, d, qm, false, false,
+        if want_logits {
+            let _ = cuda_rmsnorm(self.x_b.handle, self.fnorm_b.handle, 0, self.x_norm_b.handle, 1, d, c.gemma_norm)
+            let _ = cuda_gemv(
+                self.x_norm_b.handle,
+                self.lmhead_b.handle, 0,
+                self.logits_b.handle,
+                self.bqkv_b.handle, 0,
+                c.vocab_size, d, qm, false, false,
+            )
+            let _ = cuda_argmax(self.logits_b.handle, self.tok_pos_b.handle, c.vocab_size, inc_pos)
+        } else {
+            let _ = cuda_epinorm_lm_argmax(
+                self.x_b.handle, self.fnorm_b.handle, 0,
+                self.lmhead_b.handle, 0,
+                self.tok_pos_b.handle, c.vocab_size, d, qm, c.gemma_norm, 0, inc_pos,
+            )
+        }
+        0
+    }
+
+    pub fn enqueue_decode_step(inout self, inc_pos Bool) Int {
+        self.enqueue_decode_step_mode(inc_pos, false)
+    }
+
+    /// Multi-Token Speculative/Batch Decode (`B = 2..32`) with Roofline Auto-Dispatch:
+    ///   - `B <= 4`: Register-Direct Unpack-Once (`cuda_batch_gemm_q4_0_b4`, ZERO SMEM/barriers!)
+    ///   - `5 <= B <= 32`: Hardware Tensor Core W4A16 MMA (`mma.m16n8k16`) + Adaptive Split-K!
+    ///   - Single-Pass Race-Free Fused Batch RoPE + KV-Append + Causal GQA FlashAttention!
+    pub fn enqueue_batch_decode_step(inout self, tok_h Int, batch_logits_h Int, out_toks_h Int, batch Int, start_pos Int) Int {
+        let c = self.cfg
+        let d = c.d_model
+        let kv_dim = c.n_kv_heads * c.d_head
+        let qkv_dim = d + kv_dim * 2
+        let ms = c.max_seq_len
+        let qm = c.quant_mode
+        let qkv_stride = cuda_weight_stride_bytes(qkv_dim * d, qm)
+        let wo_stride = cuda_weight_stride_bytes(d * d, qm)
+        let ff_stride = cuda_weight_stride_bytes(c.d_ff * d, qm)
+        let kv_layer_bytes = kv_dim * ms * 2
+
+        let _ = cuda_embed(tok_h, self.tok_emb_b.handle, 0, self.x_b.handle, batch, d, c.vocab_size)
+        var l = 0
+        while l < c.n_layers {
+            let norm_off = l * d * 2
+            let kv_off = l * kv_layer_bytes
+            let _ = cuda_rmsnorm(self.x_b.handle, self.norm1_b.handle, norm_off, self.x_norm_b.handle, batch, d, c.gemma_norm)
+            let _ = cuda_batch_gemm(
+                self.x_norm_b.handle, self.wqkv_b.handle, l * qkv_stride, self.qkv_b.handle,
+                self.bqkv_b.handle, l * qkv_dim * 2, batch, qkv_dim, d, qm, false, c.has_qkv_bias,
+            )
+            let _ = cuda_batch_rope_flash_gqa(
+                self.qkv_b.handle, self.k_cache_b.handle, kv_off, self.v_cache_b.handle, kv_off,
+                self.ctx_b.handle, batch, start_pos, c.n_heads, c.n_kv_heads, c.d_head, ms, c.attn_softcap,
+            )
+            let _ = cuda_batch_gemm(
+                self.ctx_b.handle, self.wo_b.handle, l * wo_stride, self.x_b.handle,
+                self.bqkv_b.handle, 0, batch, d, d, qm, true, false,
+            )
+            let _ = cuda_rmsnorm(self.x_b.handle, self.norm2_b.handle, norm_off, self.x_norm_b.handle, batch, d, c.gemma_norm)
+            let _ = cuda_batch_ffn(
+                self.x_norm_b.handle, self.wgate_b.handle, l * ff_stride, self.wup_b.handle, l * ff_stride,
+                self.ffn_act_b.handle, batch, c.d_ff, d, qm, c.is_geglu,
+            )
+            let _ = cuda_batch_gemm(
+                self.ffn_act_b.handle, self.wdown_b.handle, l * ff_stride, self.x_b.handle,
+                self.bqkv_b.handle, 0, batch, d, c.d_ff, qm, true, false,
+            )
+            l += 1
+        }
+        let _ = cuda_rmsnorm(self.x_b.handle, self.fnorm_b.handle, 0, self.x_norm_b.handle, batch, d, c.gemma_norm)
+        let _ = cuda_batch_gemm(
+            self.x_norm_b.handle, self.lmhead_b.handle, 0, batch_logits_h,
+            self.bqkv_b.handle, 0, batch, c.vocab_size, d, qm, false, false,
         )
-        let _ = cuda_argmax(self.logits_b.handle, self.tok_pos_b.handle, c.vocab_size, inc_pos)
+        let _ = cuda_batch_argmax(batch_logits_h, out_toks_h, batch, c.vocab_size)
         0
     }
 
     pub fn decode_step_logits(inout self, tok_id Int, pos Int) List[Float16] {
         let _ = cuda_write_tok_pos(self.tok_pos_b.handle, tok_id, pos)
-        let _ = self.enqueue_decode_step(false)
+        let _ = self.enqueue_decode_step_mode(false, true)
         let _ = cuda_sync()
         var logits List[Float16] = list_filled(self.cfg.vocab_size, 0.0 as Float16)
         let _ = self.logits_b.read_f16(logits)
@@ -282,7 +348,7 @@ impl CudaTransformer {
 
     pub fn decode_step_greedy(inout self, tok_id Int, pos Int) Int {
         let _ = cuda_write_tok_pos(self.tok_pos_b.handle, tok_id, pos)
-        let _ = self.enqueue_decode_step(false)
+        let _ = self.enqueue_decode_step_mode(false, false)
         let _ = cuda_sync()
         cuda_read_tok(self.tok_pos_b.handle)
     }

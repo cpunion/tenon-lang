@@ -66,6 +66,7 @@ typedef struct {
 #define CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH 37
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR 75
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR 76
+#define CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES 8
 #define CU_STREAM_CAPTURE_MODE_GLOBAL 0
 
 typedef CUresult (*pfn_cuInit)(unsigned int);
@@ -88,6 +89,7 @@ typedef CUresult (*pfn_cuModuleLoadData)(CUmodule*, const void*);
 typedef CUresult (*pfn_cuModuleLoadDataEx)(CUmodule*, const void*, unsigned int, int*, void**);
 typedef CUresult (*pfn_cuModuleUnload)(CUmodule);
 typedef CUresult (*pfn_cuModuleGetFunction)(CUfunction*, CUmodule, const char*);
+typedef CUresult (*pfn_cuFuncSetAttribute)(CUfunction, int, int);
 typedef CUresult (*pfn_cuLaunchKernel)(
     CUfunction, unsigned int, unsigned int, unsigned int,
     unsigned int, unsigned int, unsigned int,
@@ -185,6 +187,7 @@ typedef struct {
     pfn_cuModuleLoadDataEx cuModuleLoadDataEx;
     pfn_cuModuleUnload cuModuleUnload;
     pfn_cuModuleGetFunction cuModuleGetFunction;
+    pfn_cuFuncSetAttribute cuFuncSetAttribute;
     pfn_cuLaunchKernel cuLaunchKernel;
     pfn_cuStreamCreate cuStreamCreate;
     pfn_cuStreamSynchronize cuStreamSynchronize;
@@ -289,6 +292,7 @@ int64_t tn_cuda_init(void) {
     g_tn_cuda.cuModuleLoadDataEx = (pfn_cuModuleLoadDataEx)tn_cuda_sym(g_tn_cuda.libcuda, "cuModuleLoadDataEx", NULL);
     g_tn_cuda.cuModuleUnload = (pfn_cuModuleUnload)tn_cuda_sym(g_tn_cuda.libcuda, "cuModuleUnload", NULL);
     g_tn_cuda.cuModuleGetFunction = (pfn_cuModuleGetFunction)tn_cuda_sym(g_tn_cuda.libcuda, "cuModuleGetFunction", NULL);
+    g_tn_cuda.cuFuncSetAttribute = (pfn_cuFuncSetAttribute)tn_cuda_sym(g_tn_cuda.libcuda, "cuFuncSetAttribute", NULL);
     g_tn_cuda.cuLaunchKernel = (pfn_cuLaunchKernel)tn_cuda_sym(g_tn_cuda.libcuda, "cuLaunchKernel", NULL);
     g_tn_cuda.cuStreamCreate = (pfn_cuStreamCreate)tn_cuda_sym(g_tn_cuda.libcuda, "cuStreamCreate", NULL);
     g_tn_cuda.cuStreamSynchronize = (pfn_cuStreamSynchronize)tn_cuda_sym(g_tn_cuda.libcuda, "cuStreamSynchronize", NULL);
@@ -661,6 +665,11 @@ CUstream tn_cuda_get_stream(void) {
 int tn_cuda_mod_get_fn(CUmodule mod, const char* name, CUfunction* out) {
     if (!mod || !name || !out || !g_tn_cuda.cuModuleGetFunction) return 0;
     return g_tn_cuda.cuModuleGetFunction(out, mod, name) == CUDA_SUCCESS ? 1 : 0;
+}
+
+int tn_cuda_fn_set_max_dyn_smem(CUfunction fn, int bytes) {
+    if (!fn || !g_tn_cuda.cuFuncSetAttribute) return 0;
+    return g_tn_cuda.cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes) == CUDA_SUCCESS ? 1 : 0;
 }
 
 int tn_cuda_launch_raw(
