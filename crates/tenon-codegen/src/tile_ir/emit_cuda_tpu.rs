@@ -69,11 +69,11 @@ pub fn emit_universal_cuda(cg: &CompiledUniversalGraph) -> String {
                          \t}}\n\
                          }}\n\n"
                     ));
-                } else if *weight_layout == LayoutTag::MXFP4Block32NK {
+                } else if weight_layout.is_mxfp4() {
                     out.push_str(&format!(
-                        "// [Stage 3 OCP MXFP4 128-bit uint4 + E8M0] {name} [{m}x{k} @ {k}x{n}]\n\
+                        "// [Stage 3 OCP MXFP4 128-bit uint4 + E8M0 ({:?})] {name} [{m}x{k} @ {k}x{n}]\n\
                          extern \"C\" __global__ void {name}(const {ct}* __restrict__ a, const uint8_t* __restrict__ w_mxfp4, {ct}* __restrict__ out) {{\n\
-                         \t__shared__ float k_e2m1[16];\n\
+                         \t// Zero-branch IEEE-754 half bit-synthesis (mag 0..7 -> exact half * 2^-14, *16384 folded into E8M0!)\n\
                          \tconst uint32_t n_blk = {k}u / 32u;\n\
                          \tuint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n\
                          \tuint32_t row = blockIdx.y, col = blockIdx.x * 4u + wid;\n\
@@ -83,16 +83,21 @@ pub fn emit_universal_cuda(cg: &CompiledUniversalGraph) -> String {
                          \tfloat acc = 0.0f;\n\
                          \tfor (uint32_t blk = lane; blk < n_blk; blk += 32u) {{\n\
                          \t\tuint4 q = __ldg(&nib[(size_t)col * n_blk + blk]);\n\
-                         \t\tfloat sc = __uint_as_float(((uint32_t)__ldg(&scales[(size_t)col * n_blk + blk])) << 23);\n\
+                         \t\tfloat sc = __uint_as_float(((uint32_t)__ldg(&scales[(size_t)col * n_blk + blk])) << 23) * 16384.0f;\n\
                          \t\tuint32_t wv[4] = {{ q.x, q.y, q.z, q.w }};\n\
                          \t\tfloat d = 0.0f;\n\
-                         \t\tfor (int u = 0; u < 4; u++) for (int s = 0; s < 8; s++)\n\
-                         \t\t\td = fmaf((float)__ldg(&a[row * {k}u + blk * 32u + u * 8u + s]), k_e2m1[(wv[u] >> (s * 4)) & 15u], d);\n\
+                         \t\tfor (int u = 0; u < 4; u++) for (int s = 0; s < 8; s++) {{\n\
+                         \t\t\tuint16_t nib4 = (wv[u] >> (s * 4)) & 15u;\n\
+                         \t\t\tuint16_t hb = ((nib4 & 8u) << 12) | ((nib4 & 7u) << 9);\n\
+                         \t\t\tfloat w = __half2float(__ushort_as_half(hb));\n\
+                         \t\t\td = fmaf((float)__ldg(&a[row * {k}u + blk * 32u + u * 8u + s]), w, d);\n\
+                         \t\t}}\n\
                          \t\tacc = fmaf(d, sc, acc);\n\
                          \t}}\n\
                          \tfor (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);\n\
                          \tif (lane == 0u) out[row * {n}u + col] = ({ct})acc;\n\
-                         }}\n\n"
+                         }}\n\n",
+                        weight_layout
                     ));
                 } else {
                     let mma_inst = if *weight_dtype == IrDType::FP8 {

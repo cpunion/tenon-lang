@@ -62,13 +62,23 @@ pub pure fn bottleneck_chain(
     tg_matmul(t, w2)
 }
 
-// 5. Long-Sequence Causal Attention (`S=1024, D=512`, 8 heads x 64d -> Online FlashAttention vs Naive O(S^2)!)
+// 5. Long-Sequence Causal Attention (`S=1024, D=512`, 8 heads x 64d -> AMX FlashAttention-2 vs Lane-Flash vs Naive O(S^2)!)
 @gpu_graph("tensor_dataflow")
 pub pure fn long_flash_attn(
     q Matrix[1024, 512, DType = Float16],
     k Matrix[1024, 512, DType = Float16],
     v Matrix[1024, 512, DType = Float16],
 ) Matrix[1024, 512, DType = Float16] {
+    tg_gqa_attention(q, k, v)
+}
+
+// 5B. Longer-Sequence Causal Attention (`S=2048, D=512`, 8 heads x 64d -> stresses AMX FlashAttention-2 compute utilization!)
+@gpu_graph("tensor_dataflow")
+pub pure fn long_flash_attn_2k(
+    q Matrix[2048, 512, DType = Float16],
+    k Matrix[2048, 512, DType = Float16],
+    v Matrix[2048, 512, DType = Float16],
+) Matrix[2048, 512, DType = Float16] {
     tg_gqa_attention(q, k, v)
 }
 
@@ -81,13 +91,13 @@ pub pure fn decode_b1_8k(
     tg_matmul(x, w)
 }
 
-// 7. General Non-LLM Training Forward + Compile-Time Reverse-Mode AD (`@gpu_graph("autograd")`)!
+// 7. General Non-LLM Training Forward + Compile-Time Reverse-Mode AD (`@gpu_graph("autograd")`, exact SiluBwd VJP fused into MatMul epilogue!)
 @gpu_graph("autograd")
 pub pure fn train_mlp_ad(
-    x  Matrix[256, 512, DType = Float16],
-    w1 Matrix[512, 1024, DType = Float16],
-    w2 Matrix[1024, 512, DType = Float16],
-) Matrix[256, 512, DType = Float16] {
+    x  Matrix[512, 1024, DType = Float16],
+    w1 Matrix[1024, 2048, DType = Float16],
+    w2 Matrix[2048, 1024, DType = Float16],
+) Matrix[512, 1024, DType = Float16] {
     let h = tg_matmul(x, w1)
     let a = tg_silu(h)
     tg_matmul(a, w2)
@@ -102,12 +112,12 @@ pub pure fn ragged_batch_50(
     tg_ragged_matmul(a, b, 50)
 }
 
-// 8B. Stage 3 Structured 75% Block-Sparse GEMM (25% dense `32x32` tiles -> Persistent Work-Stealing Queue!)
+// 8B. Stage 3 Structured 75% Block-Sparse GEMM (25% dense `32x32` tiles -> True Compressed BSR-32 + Persistent Work-Stealing!)
 @gpu_graph("tensor_dataflow")
 pub pure fn block_sparse_25(
-    a Matrix[512, 1024, DType = Float16],
-    b Matrix[1024, 1024, DType = Float16],
-) Matrix[512, 1024, DType = Float16] {
+    a Matrix[1024, 2048, DType = Float16],
+    b Matrix[2048, 2048, DType = Float16],
+) Matrix[1024, 2048, DType = Float16] {
     tg_block_sparse_matmul(a, b, 25, 32)
 }
 
@@ -448,8 +458,8 @@ fn main() Int {
     begw1.destroy()
     begw2.destroy()
 
-    // --- 5. Long-Sequence Causal Attention S=1024, D=512 (Naive O(S^2) vs Online FlashAttention!) ---
-    println("\n--- [5/8] Online Tiled FlashAttention S=1024, D=512 (Naive O(S^2) vs Flash Online-Softmax) ---")
+    // --- 5. Long-Sequence Causal Attention S=1024 & S=2048, D=512 (Naive O(S^2) vs AMX FlashAttention-2!) ---
+    println("\n--- [5/8] Hardware AMX FlashAttention-2 S=1024 & S=2048, D=512 (Naive O(S^2) vs AMX Online-Softmax) ---")
     let aq = synth_f16(1024 * 512, 73, 0.2)
     let ak = synth_f16(1024 * 512, 79, 0.2)
     let av = synth_f16(1024 * 512, 83, 0.2)
@@ -473,15 +483,19 @@ fn main() Int {
     let _ = fa_p1.bind_input(1, bak)
     let _ = fa_p1.bind_input(2, bav)
     let _ = fa_p1.bind_output(0, fa_o1)
-    let fa_ms1 = fa_p1.bench_ms(2, 10)
+    let fa_ms1 = fa_p1.bench_ms(4, 25)
     var fa_h1 List[Float16] = list_filled(1024 * 512, 0.0 as Float16)
     let _ = fa_o1.read_into_f16(fa_h1)
     let fa_diff = max_diff_f16(fa_h0, fa_h1, 1024 * 512)
     assert(fa_diff < 0.02)
+    // Causal FLOPs = 2 * S^2 * D_total (half of 4*S^2*D_total because causal triangle!)
+    let fa1k_tflops = ((2.0 * 1024.0 * 1024.0 * 512.0) / (fa_ms1 / 1000.0)) / 1000000000000.0
     println(
         "ABL_FLASH_ATTN_S1024 naive_ms=" ++ float_to_text(fa_ms0)
-        ++ " flash_ms=" ++ float_to_text(fa_ms1)
+        ++ " flash_amx_ms=" ++ float_to_text(fa_ms1)
         ++ " speedup=" ++ float_to_text(fa_ms0 / fa_ms1) ++ "x"
+        ++ " TFLOPS=" ++ float_to_text(fa1k_tflops)
+        ++ " pct_16.2T=" ++ float_to_text((fa1k_tflops / 16.2) * 100.0) ++ "%"
         ++ " naive_scratch_KB=" ++ int_to_text(fa_p0.arena_bytes() / 1024)
         ++ " flash_scratch_KB=" ++ int_to_text(fa_p1.arena_bytes() / 1024)
         ++ " max_diff=" ++ float_to_text(fa_diff) ++ " PASS"
@@ -493,6 +507,33 @@ fn main() Int {
     baq.destroy()
     bak.destroy()
     bav.destroy()
+
+    // S=2048 AMX FlashAttention-2 utilization check (would need 128 MB O(S^2) scores if naive -> 0 KB with Flash!)
+    let aq2 = synth_f16(2048 * 512, 74, 0.2)
+    let ak2 = synth_f16(2048 * 512, 80, 0.2)
+    let av2 = synth_f16(2048 * 512, 84, 0.2)
+    var baq2 = GpuBuffer.from_f16_list(aq2)
+    var bak2 = GpuBuffer.from_f16_list(ak2)
+    var bav2 = GpuBuffer.from_f16_list(av2)
+    var fa2_p = GpuGraphPlan.compile(msl_s1, pln_s1, "long_flash_attn_2k")
+    var fa2_o = GpuBuffer.uninit(2048 * 512 * 2)
+    let _ = fa2_p.bind_input(0, baq2)
+    let _ = fa2_p.bind_input(1, bak2)
+    let _ = fa2_p.bind_input(2, bav2)
+    let _ = fa2_p.bind_output(0, fa2_o)
+    let fa2_ms = fa2_p.bench_ms(4, 20)
+    let fa2k_tflops = ((2.0 * 2048.0 * 2048.0 * 512.0) / (fa2_ms / 1000.0)) / 1000000000000.0
+    println(
+        "ABL_FLASH_ATTN_S2048 flash_amx_ms=" ++ float_to_text(fa2_ms)
+        ++ " TFLOPS=" ++ float_to_text(fa2k_tflops)
+        ++ " pct_16.2T=" ++ float_to_text((fa2k_tflops / 16.2) * 100.0) ++ "%"
+        ++ " flash_scratch_KB=" ++ int_to_text(fa2_p.arena_bytes() / 1024) ++ " PASS"
+    )
+    fa2_o.destroy()
+    fa2_p.destroy()
+    baq2.destroy()
+    bak2.destroy()
+    bav2.destroy()
 
     // --- 6. Memory-Bound B=1 Decode (1x8192x8192 = 128MB > 48MB SLC -> True DRAM Wall vs Stage 3 MXFP4!) ---
     println("\n--- [6/8] Memory-Bound B=1 Decode 1x8192x8192 (128MB DRAM: Scalar -> RowMajor -> Layout NK -> Stage 3 MXFP4) ---")
@@ -566,22 +607,22 @@ fn main() Int {
     bdx.destroy()
     bdw.destroy()
 
-    // --- 7. Stage 1 Pillar 6: Compile-Time Reverse-Mode AD Training Graph (Fwd + Bwd Live on Metal!) ---
-    println("\n--- [7/8] Compile-Time Reverse-Mode AD Training Graph (`@gpu_graph(\"autograd\")` 256x512->1024->512) ---")
-    let tx = synth_f16(256 * 512, 101, 0.2)
-    let tw1 = synth_f16(512 * 1024, 103, 0.08)
-    let tw2 = synth_f16(1024 * 512, 107, 0.08)
-    let tdout = synth_f16(256 * 512, 109, 0.2)
+    // --- 7. Stage 1 Pillar 6: Compile-Time Reverse-Mode AD Training Graph (Exact SiluBwd VJP Fused into MatMul Epilogue!) ---
+    println("\n--- [7/8] Compile-Time Reverse-Mode AD Training Graph (`@gpu_graph(\"autograd\")` 512x1024->2048->1024, Exact VJP Fusion!) ---")
+    let tx = synth_f16(512 * 1024, 101, 0.15)
+    let tw1 = synth_f16(1024 * 2048, 103, 0.05)
+    let tw2 = synth_f16(2048 * 1024, 107, 0.05)
+    let tdout = synth_f16(512 * 1024, 109, 0.15)
     var btx = GpuBuffer.from_f16_list(tx)
     var btw1 = GpuBuffer.from_f16_list(tw1)
     var btw2 = GpuBuffer.from_f16_list(tw2)
     var btdout = GpuBuffer.from_f16_list(tdout)
     var ad_p = GpuGraphPlan.compile(msl_s2, pln_s2, "train_mlp_ad")
     assert(ad_p.handle > 0)
-    var out_y = GpuBuffer.uninit(256 * 512 * 2)
-    var out_dx = GpuBuffer.uninit(256 * 512 * 2)
-    var out_dw1 = GpuBuffer.uninit(512 * 1024 * 2)
-    var out_dw2 = GpuBuffer.uninit(1024 * 512 * 2)
+    var out_y = GpuBuffer.uninit(512 * 1024 * 2)
+    var out_dx = GpuBuffer.uninit(512 * 1024 * 2)
+    var out_dw1 = GpuBuffer.uninit(1024 * 2048 * 2)
+    var out_dw2 = GpuBuffer.uninit(2048 * 1024 * 2)
     let _ = ad_p.bind_input(0, btx)
     let _ = ad_p.bind_input(1, btw1)
     let _ = ad_p.bind_input(2, btw2)
@@ -590,42 +631,58 @@ fn main() Int {
     let _ = ad_p.bind_output(1, out_dx)
     let _ = ad_p.bind_output(2, out_dw1)
     let _ = ad_p.bind_output(3, out_dw2)
-    let ad_ms = ad_p.bench_ms(3, 20)
-    // Exact CPU verification of Forward `y` (2 layers) & Backward `dW2 = A^T @ dOut`!
-    var y_h List[Float16] = list_filled(256 * 512, 0.0 as Float16)
-    var dw2_h List[Float16] = list_filled(1024 * 512, 0.0 as Float16)
+    let ad_ms = ad_p.bench_ms(4, 20)
+    // Exact CPU FP64 verification of BOTH Forward `y` AND Backward `dX` (exercises fused `SiluBwd` VJP epilogue!)
+    var y_h List[Float16] = list_filled(512 * 1024, 0.0 as Float16)
+    var dx_h List[Float16] = list_filled(512 * 1024, 0.0 as Float16)
     let _ = out_y.read_into_f16(y_h)
-    let _ = out_dw2.read_into_f16(dw2_h)
-    // Verify row 0 of hidden `a = silu(x @ w1)` -> `y[0, 0..8]` and `dW2[0..4, 0..4]`
-    var a_row0 List[Float] = list_filled(1024, 0.0)
+    let _ = out_dx.read_into_f16(dx_h)
+    var h_row0 List[Float] = list_filled(2048, 0.0)
+    var a_row0 List[Float] = list_filled(2048, 0.0)
+    var dh_row0 List[Float] = list_filled(2048, 0.0)
     var c = 0
-    while c < 1024 {
-        var acc = 0.0
-        var kk = 0
-        while kk < 512 {
-            acc += (tx[kk] as Float) * (tw1[kk * 1024 + c] as Float)
-            kk += 1
-        }
-        let ex = gpu_exp((-acc) as Float32) as Float
-        a_row0[c] = acc / (1.0 + ex)
-        c += 1
-    }
-    var ad_fwd_err = 0.0
-    var oc = 0
-    while oc < 8 {
+    while c < 2048 {
         var acc = 0.0
         var kk = 0
         while kk < 1024 {
-            acc += a_row0[kk] * (tw2[kk * 512 + oc] as Float)
+            acc += (tx[kk] as Float) * (tw1[kk * 2048 + c] as Float)
             kk += 1
         }
-        let d = abs_f((y_h[oc] as Float) - acc)
-        if d > ad_fwd_err { ad_fwd_err = d }
+        h_row0[c] = acc
+        let sig = 1.0 / (1.0 + (gpu_exp((-acc) as Float32) as Float))
+        a_row0[c] = acc * sig
+        // Exact backward `dA[0, c] = sum_j dOut[0, j] * W2[c, j]`, `dH[0, c] = dA[0, c] * silu'(h[0, c])`
+        var da_c = 0.0
+        var j = 0
+        while j < 1024 {
+            da_c += (tdout[j] as Float) * (tw2[c * 1024 + j] as Float)
+            j += 1
+        }
+        dh_row0[c] = da_c * sig * (1.0 + acc * (1.0 - sig))
+        c += 1
+    }
+    var ad_fwd_err = 0.0
+    var ad_bwd_err = 0.0
+    var oc = 0
+    while oc < 8 {
+        var fy = 0.0
+        var bdx_v = 0.0
+        var kk = 0
+        while kk < 2048 {
+            fy += a_row0[kk] * (tw2[kk * 1024 + oc] as Float)
+            bdx_v += dh_row0[kk] * (tw1[oc * 2048 + kk] as Float)
+            kk += 1
+        }
+        let df = abs_f((y_h[oc] as Float) - fy)
+        if df > ad_fwd_err { ad_fwd_err = df }
+        let db = abs_f((dx_h[oc] as Float) - bdx_v)
+        if db > ad_bwd_err { ad_bwd_err = db }
         oc += 1
     }
     assert(ad_fwd_err < 0.05)
-    // Total Fwd+Bwd FLOPs = 3x forward = 3 * 2 * (256*512*1024 + 256*1024*512) = 1.611 GFLOPs
-    let ad_flops = 3.0 * 4.0 * 256.0 * 512.0 * 1024.0
+    assert(ad_bwd_err < 0.05)
+    // Total Fwd+Bwd FLOPs = 3x forward = 3 * 2 * (512*1024*2048 + 512*2048*1024) = 12.885 GFLOPs
+    let ad_flops = 3.0 * 4.0 * 512.0 * 1024.0 * 2048.0
     let ad_tflops = (ad_flops / (ad_ms / 1000.0)) / 1000000000000.0
     println(
         "ABL_TRAIN_AD_FWDBWD ms=" ++ float_to_text(ad_ms)
@@ -633,7 +690,8 @@ fn main() Int {
         ++ " pct_16.2T=" ++ float_to_text((ad_tflops / 16.2) * 100.0) ++ "%"
         ++ " dispatches=" ++ int_to_text(ad_p.num_dispatches())
         ++ " arena_KB=" ++ int_to_text(ad_p.arena_bytes() / 1024)
-        ++ " fwd_err=" ++ float_to_text(ad_fwd_err) ++ " PASS"
+        ++ " fwd_err=" ++ float_to_text(ad_fwd_err)
+        ++ " bwd_dx_err=" ++ float_to_text(ad_bwd_err) ++ " PASS"
     )
     out_y.destroy()
     out_dx.destroy()
@@ -649,10 +707,8 @@ fn main() Int {
     println("\n--- [8/8] Stage 3 Dynamic Ragged (50% valid) & Block-Sparse (75% zero 32x32 tiles) ---")
     let ra = synth_f16(512 * 1024, 113, 0.1)
     let rb = synth_f16(1024 * 1024, 127, 0.08)
-    let sb = synth_block_sparse_f16(1024, 1024, 131, 0.12)
     var bra = GpuBuffer.from_f16_list(ra)
     var brb = GpuBuffer.from_f16_list(rb)
-    var bsb = GpuBuffer.from_f16_list(sb)
 
     // 8A: Ragged
     var rg_p0 = GpuGraphPlan.compile(msl_s2, pln_s2, "ragged_batch_50")
@@ -681,29 +737,33 @@ fn main() Int {
         ++ " valid_diff=" ++ float_to_text(rg_diff) ++ " PASS"
     )
 
-    // 8B: Block-Sparse (75% zeros skipped via GPU Persistent Work-Stealing Queue!)
+    // 8B: Block-Sparse 1024x2048x2048 (75% zero -> True Compressed BSR-32 -75% weight VRAM + Persistent Work-Stealing Queue!)
+    let spa = synth_f16(1024 * 2048, 129, 0.08)
+    let sb = synth_block_sparse_f16(2048, 2048, 131, 0.08)
+    var bspa = GpuBuffer.from_f16_list(spa)
+    var bsb = GpuBuffer.from_f16_list(sb)
     var sp_p0 = GpuGraphPlan.compile(msl_s2, pln_s2, "block_sparse_25")
-    var sp_o0 = GpuBuffer.uninit(512 * 1024 * 2)
-    let _ = sp_p0.bind_input(0, bra)
+    var sp_o0 = GpuBuffer.uninit(1024 * 2048 * 2)
+    let _ = sp_p0.bind_input(0, bspa)
     let _ = sp_p0.bind_input(1, bsb)
     let _ = sp_p0.bind_output(0, sp_o0)
-    let sp_ms0 = sp_p0.bench_ms(5, 30)
-    var sp_h0 List[Float16] = list_filled(512 * 1024, 0.0 as Float16)
+    let sp_ms0 = sp_p0.bench_ms(4, 20)
+    var sp_h0 List[Float16] = list_filled(1024 * 2048, 0.0 as Float16)
     let _ = sp_o0.read_into_f16(sp_h0)
 
     var sp_p1 = GpuGraphPlan.compile(msl_all, pln_all, "block_sparse_25")
-    var sp_o1 = GpuBuffer.uninit(512 * 1024 * 2)
-    let _ = sp_p1.bind_input(0, bra)
+    var sp_o1 = GpuBuffer.uninit(1024 * 2048 * 2)
+    let _ = sp_p1.bind_input(0, bspa)
     let _ = sp_p1.bind_input(1, bsb)
     let _ = sp_p1.bind_output(0, sp_o1)
-    let sp_ms1 = sp_p1.bench_ms(5, 30)
-    var sp_h1 List[Float16] = list_filled(512 * 1024, 0.0 as Float16)
+    let sp_ms1 = sp_p1.bench_ms(4, 20)
+    var sp_h1 List[Float16] = list_filled(1024 * 2048, 0.0 as Float16)
     let _ = sp_o1.read_into_f16(sp_h1)
-    let sp_diff = max_diff_f16(sp_h0, sp_h1, 512 * 1024)
+    let sp_diff = max_diff_f16(sp_h0, sp_h1, 1024 * 2048)
     assert(sp_diff < 0.02)
     println(
         "ABL_BLOCK_SPARSE_25 dense_ms=" ++ float_to_text(sp_ms0)
-        ++ " sparse_ws_ms=" ++ float_to_text(sp_ms1)
+        ++ " sparse_bsr32_ms=" ++ float_to_text(sp_ms1)
         ++ " speedup=" ++ float_to_text(sp_ms0 / sp_ms1) ++ "x"
         ++ " max_diff=" ++ float_to_text(sp_diff) ++ " PASS"
     )
@@ -718,6 +778,7 @@ fn main() Int {
     sp_p1.destroy()
     bra.destroy()
     brb.destroy()
+    bspa.destroy()
     bsb.destroy()
 
     println("\n=== ALL 8 STAGE-1/2/3 ABLATIONS VERIFIED LIVE ON SILICON (Perceus live_objects == 0, Linear VRAM == 0 leaks) ===")

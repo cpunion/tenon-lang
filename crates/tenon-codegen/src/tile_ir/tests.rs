@@ -146,16 +146,19 @@ pub fn sparse_and_ragged(
     let off = compile_universal_graphs(&prog, GpuOptConfig::parse_spec("stage1,-fusion"));
     let on = compile_universal_graphs(&prog, GpuOptConfig::all());
 
-    // MXFP4 auto-repack on B=1 memory-bound decode
+    // MXFP4 interleaved SuperBlock16 auto-repack on B=1 memory-bound decode
     let (msl_mx, plan_mx) = emit_metal::emit_metal_graph_and_plan(&on[0]);
-    assert!(msl_mx.contains("mxfp4_e2m1"));
-    assert!(plan_mx.contains("PACK_MXFP4_NK"));
+    assert!(msl_mx.contains("mxfp4_e2m1_x4"));
+    assert!(plan_mx.contains("PACK_MXFP4_NK_SB16"));
 
-    // FlashAttention online tiled vs naive O(S^2)
+    // FlashAttention hardware AMX FlashAttention-2 vs naive O(S^2)
+    let (msl_fa, _) = emit_metal::emit_metal_graph_and_plan(&on[1]);
+    assert!(msl_fa.contains("simdgroup_multiply_accumulate"), "expected AMX FlashAttention-2!");
     assert!(off[1].arena.total_arena_bytes > on[1].arena.total_arena_bytes * 10, "expected FlashAttention to eliminate O(S^2) HBM!");
 
-    // Ragged + BlockSparse persistent work-stealing
-    let (msl_sp, _) = emit_metal::emit_metal_graph_and_plan(&on[2]);
+    // Ragged + True BSR-32 Compressed BlockSparse persistent work-stealing
+    let (msl_sp, plan_sp) = emit_metal::emit_metal_graph_and_plan(&on[2]);
     assert!(msl_sp.contains("atomic_fetch_add_explicit"));
+    assert!(plan_sp.contains("PACK_BSR32_NK"), "expected true BSR-32 compressed weight repack!");
     assert!(on[2].roofline.fused_bytes < off[2].roofline.fused_bytes);
 }

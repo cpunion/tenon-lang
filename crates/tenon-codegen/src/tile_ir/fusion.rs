@@ -14,6 +14,12 @@ pub enum EpilogueOp {
     Silu,
     Gelu,
     Relu,
+    /// Exact fused Reverse-Mode AD VJP epilogue: `val *= silu'(saved_x)`.
+    SiluBwd { saved_x: String },
+    /// Exact fused Reverse-Mode AD VJP epilogue: `val *= gelu'(saved_x)`.
+    GeluBwd { saved_x: String },
+    /// Exact fused Reverse-Mode AD VJP epilogue: `val = (saved_x > 0) ? val : 0`.
+    ReluBwd { saved_x: String },
     Scale(f32),
 }
 
@@ -32,6 +38,8 @@ pub struct TileSchedule {
     pub bn: usize,
     pub bk: usize,
     pub num_sgs: usize,
+    /// Output columns handled per SIMD-group in GEMV (`1`, `2`, or `4` -> shares activation loads across rows!).
+    pub rows_per_sg: usize,
     pub split_k: usize,
     pub double_buf: bool,
     pub swizzle_pad: usize,
@@ -43,11 +51,12 @@ pub struct TileSchedule {
 impl TileSchedule {
     pub fn tag(&self) -> String {
         format!(
-            "m{}n{}k{}_sg{}_sk{}{}{}",
+            "m{}n{}k{}_sg{}_r{}_sk{}{}{}",
             self.bm,
             self.bn,
             self.bk,
             self.num_sgs,
+            self.rows_per_sg,
             self.split_k,
             if self.double_buf { "_db" } else { "" },
             if self.swizzle_pad > 0 { "_swz" } else { "" }
@@ -142,6 +151,8 @@ pub enum TileStage {
         paged: bool,
         fused_rope: bool,
         online_tiled: bool,
+        /// Hardware Matrix Unit FlashAttention-2 (`simdgroup_half8x8` / Tensor Core `mma.sync`) when `tile_mma && online_tiled`!
+        use_mma: bool,
         out: String,
         /// Scratch buffer name `[seq, seq]` when `online_tiled == false` (naive HBM materialization!).
         naive_scores_scratch: Option<String>,
@@ -221,10 +232,37 @@ pub fn lower_to_tile_stages(
     let input_set: BTreeSet<String> = g.params.iter().map(|(k, _)| k.clone()).collect();
     let output_set: BTreeSet<String> = g.outputs.iter().cloned().collect();
 
-    // Compute consumer counts across the DAG
+    // Compute consumer counts AND identify tensors read as activations/LHS/elementwise inputs.
+    // A parameter used as LHS `a` (e.g. `x` or `__d_out` in Reverse-Mode AD!) MUST stay `RowMajor`
+    // so repacking RHS weights to `ColMajorNK`/`MXFP4` never corrupts an LHS consumer!
     let mut use_count: BTreeMap<String, usize> = BTreeMap::new();
+    let mut non_weight_uses: BTreeSet<String> = BTreeSet::new();
     for n in &g.nodes {
         bump_node_uses(&n.op, &mut use_count);
+        match &n.op {
+            IrOp::MatMul { a, .. }
+            | IrOp::Conv2d { x: a, .. }
+            | IrOp::RaggedMatMul { a, .. }
+            | IrOp::BlockSparseMatMul { a, .. } => {
+                non_weight_uses.insert(a.clone());
+            }
+            IrOp::Binary { a, b, .. } => {
+                non_weight_uses.insert(a.clone());
+                non_weight_uses.insert(b.clone());
+            }
+            IrOp::Unary { x, .. }
+            | IrOp::Reduce { x, .. }
+            | IrOp::Rope { x }
+            | IrOp::Transpose { x }
+            | IrOp::Collective { x, .. } => {
+                non_weight_uses.insert(x.clone());
+            }
+            IrOp::Attention { q, k, v, .. } => {
+                non_weight_uses.insert(q.clone());
+                non_weight_uses.insert(k.clone());
+                non_weight_uses.insert(v.clone());
+            }
+        }
     }
     for o in &g.outputs {
         *use_count.entry(o.clone()).or_default() += 1;
@@ -232,17 +270,31 @@ pub fn lower_to_tile_stages(
 
     // Track which weights should be repacked at load time (`input_repacks`)
     let mut weight_layouts: BTreeMap<String, LayoutTag> = BTreeMap::new();
+    let mut bsr32_weights: Vec<String> = Vec::new();
     let mut resolve_weight_layout = |w_name: &str, m: usize, k: usize, n: usize, w_dtype: IrDType, trans_b: bool| -> (IrDType, LayoutTag) {
+        // If this parameter was already assigned a physical layout by an earlier stage (e.g. Forward
+        // repacked `w1` to `ColMajorNK` and Backward reads `w1^T`), ALWAYS return its TRUE physical layout
+        // so emitters compute `b_is_nk = trans_b ^ (w_layout == ColMajorNK)` with zero double-transpose!
+        if let Some(&existing) = weight_layouts.get(w_name) {
+            let eff_dt = if existing.is_mxfp4() { IrDType::MXFP4 } else { w_dtype };
+            return (eff_dt, existing);
+        }
         if trans_b {
             return (w_dtype, LayoutTag::RowMajor);
         }
-        let is_param = input_set.contains(w_name);
+        let is_pure_weight = input_set.contains(w_name) && !non_weight_uses.contains(w_name);
         // Stage 3: MXFP4 auto-quantization on memory-bound weights (`M <= 8` & `K % 32 == 0`) or explicit MXFP4 dtype
-        if cfg.mxfp4_quant && is_param && (w_dtype == IrDType::MXFP4 || (m <= 8 && k >= 256 && k % 32 == 0 && n >= 64)) {
-            weight_layouts.insert(w_name.to_string(), LayoutTag::MXFP4Block32NK);
-            return (IrDType::MXFP4, LayoutTag::MXFP4Block32NK);
+        // Uses 16-block interleaved SuperBlock16 (272B, 16B aligned, single DRAM stream) whenever `K % 512 == 0`!
+        if cfg.mxfp4_quant && is_pure_weight && (w_dtype == IrDType::MXFP4 || (m <= 8 && k >= 256 && k % 32 == 0 && n >= 64)) {
+            let lay = if k % 512 == 0 {
+                LayoutTag::MXFP4Super16NK
+            } else {
+                LayoutTag::MXFP4Block32NK
+            };
+            weight_layouts.insert(w_name.to_string(), lay);
+            return (IrDType::MXFP4, lay);
         }
-        if cfg.layout_prop && is_param && !w_dtype.is_sub_byte() {
+        if cfg.layout_prop && is_pure_weight && !w_dtype.is_sub_byte() {
             weight_layouts.insert(w_name.to_string(), LayoutTag::ColMajorNK);
             return (w_dtype, LayoutTag::ColMajorNK);
         }
@@ -536,7 +588,14 @@ pub fn lower_to_tile_stages(
                 let sb = &g.tensors[b];
                 let (m, k, n) = (sa.rows(), sa.cols(), sb.cols());
                 consumed[i] = true;
-                let (_, wlayout) = resolve_weight_layout(b, m, k, n, sb.dtype, false);
+                // Stage 3: True compressed 32x32 BSR layout (`PACK_BSR32_NK`) eliminates zero blocks from VRAM & DRAM!
+                let wlayout = if cfg.ragged_sparse && input_set.contains(b) && *block_size == 32 && k % 32 == 0 && n % 32 == 0 && sb.dtype == IrDType::F16 {
+                    bsr32_weights.push(b.clone());
+                    LayoutTag::Bsr32NK
+                } else {
+                    let (_, wl) = resolve_weight_layout(b, m, k, n, sb.dtype, false);
+                    wl
+                };
                 let (schedule, _) = solve_tile_schedule(m, k, n, sa.dtype, sb.dtype, wlayout, false, cfg);
                 stages.push(TileStage::BlockSparseContraction {
                     stage_id,
@@ -598,6 +657,7 @@ pub fn lower_to_tile_stages(
                             paged,
                             fused_rope: true,
                             online_tiled: true,
+                            use_mma: cfg.tile_mma,
                             out: g.nodes[aj].out.clone(),
                             naive_scores_scratch: None,
                         });
@@ -646,6 +706,7 @@ pub fn lower_to_tile_stages(
                     paged: *paged,
                     fused_rope: false,
                     online_tiled,
+                    use_mma: cfg.tile_mma,
                     out: node.out.clone(),
                     naive_scores_scratch,
                 });
@@ -769,16 +830,19 @@ pub fn lower_to_tile_stages(
     }
 
     // Apply solved physical layouts back to graph tensor descriptors
+    for bname in bsr32_weights {
+        weight_layouts.insert(bname, LayoutTag::Bsr32NK);
+    }
     let mut input_repacks = Vec::new();
     for (p_name, p_desc) in &mut g.params {
         if let Some(&lay) = weight_layouts.get(p_name) {
             p_desc.layout = lay;
-            if lay == LayoutTag::MXFP4Block32NK {
+            if lay.is_mxfp4() {
                 p_desc.dtype = IrDType::MXFP4;
             }
             if let Some(t) = g.tensors.get_mut(p_name) {
                 t.layout = lay;
-                if lay == LayoutTag::MXFP4Block32NK {
+                if lay.is_mxfp4() {
                     t.dtype = IrDType::MXFP4;
                 }
             }
@@ -840,6 +904,18 @@ fn absorb_epilogue_chain(
                     matched = Some((j, EpilogueOp::MulTensor { src: other }, g.nodes[j].out.clone()));
                     break;
                 }
+                IrOp::Binary { op: ElemOp::SiluBwd, a, b } if a == &cur_var => {
+                    matched = Some((j, EpilogueOp::SiluBwd { saved_x: b.clone() }, g.nodes[j].out.clone()));
+                    break;
+                }
+                IrOp::Binary { op: ElemOp::GeluBwd, a, b } if a == &cur_var => {
+                    matched = Some((j, EpilogueOp::GeluBwd { saved_x: b.clone() }, g.nodes[j].out.clone()));
+                    break;
+                }
+                IrOp::Binary { op: ElemOp::ReluBwd, a, b } if a == &cur_var => {
+                    matched = Some((j, EpilogueOp::ReluBwd { saved_x: b.clone() }, g.nodes[j].out.clone()));
+                    break;
+                }
                 _ => {}
             }
         }
@@ -862,7 +938,7 @@ pub fn solve_tile_schedule(
     n: usize,
     _act_dtype: IrDType,
     _weight_dtype: IrDType,
-    _layout: LayoutTag,
+    layout: LayoutTag,
     has_dual: bool,
     cfg: GpuOptConfig,
 ) -> (TileSchedule, Vec<TileSchedule>) {
@@ -872,6 +948,7 @@ pub fn solve_tile_schedule(
             bn: 16,
             bk: 1,
             num_sgs: 4,
+            rows_per_sg: 1,
             split_k: 1,
             double_buf: false,
             swizzle_pad: 0,
@@ -886,9 +963,12 @@ pub fn solve_tile_schedule(
     let double_buf = cfg.warp_spec;
 
     // Memory-bound regime (`M <= 8`): 128-bit coalesced SIMD-group GEMV schedule
+    // Supports multi-row shared-activation GEMV (`rows_per_sg = 1, 2, 4`) so activation loads are amortized
+    // and multiple independent DRAM streams stay in flight per SIMD-group!
     if m <= 8 {
+        let def_rps = if layout.is_mxfp4() && !has_dual && n >= 256 && n % 2 == 0 { 2 } else { 1 };
         let n_tiles = (n + 15) / 16;
-        let split_k = if cfg.stream_k && k >= 1024 && n_tiles < 160 {
+        let split_k = if cfg.stream_k && k >= 1024 && n_tiles < 128 {
             if k >= 4096 && n_tiles < 64 { 4 } else { 2 }
         } else {
             1
@@ -898,6 +978,7 @@ pub fn solve_tile_schedule(
             bn: 16,
             bk: 32,
             num_sgs: 4,
+            rows_per_sg: def_rps,
             split_k,
             double_buf,
             swizzle_pad,
@@ -907,10 +988,20 @@ pub fn solve_tile_schedule(
         };
         let mut cands = vec![sched];
         if cfg.pgo_autotune {
-            cands.push(TileSchedule { bn: 8, num_sgs: 4, split_k: 1, ..sched });
-            cands.push(TileSchedule { bn: 16, num_sgs: 8, split_k: 1, ..sched });
+            cands.push(TileSchedule { bn: 8, num_sgs: 4, rows_per_sg: 1, split_k: 1, stream_k: false, ..sched });
+            cands.push(TileSchedule { bn: 16, num_sgs: 8, rows_per_sg: 1, split_k: 1, stream_k: false, ..sched });
+            if !has_dual && n % 2 == 0 {
+                cands.push(TileSchedule { bn: 16, num_sgs: 4, rows_per_sg: 2, split_k: 1, stream_k: false, ..sched });
+                cands.push(TileSchedule { bn: 32, num_sgs: 8, rows_per_sg: 2, split_k: 1, stream_k: false, ..sched });
+            }
+            if !has_dual && n % 4 == 0 && layout.is_mxfp4() {
+                cands.push(TileSchedule { bn: 32, num_sgs: 4, rows_per_sg: 4, split_k: 1, stream_k: false, ..sched });
+                if cfg.stream_k && k >= 1024 {
+                    cands.push(TileSchedule { bn: 32, num_sgs: 4, rows_per_sg: 4, split_k: 2, stream_k: true, ..sched });
+                }
+            }
             if cfg.stream_k && k >= 1024 {
-                cands.push(TileSchedule { bn: 16, num_sgs: 4, split_k: 2, stream_k: true, ..sched });
+                cands.push(TileSchedule { bn: 16, num_sgs: 4, rows_per_sg: def_rps, split_k: 2, stream_k: true, ..sched });
             }
         }
         return (sched, dedup_schedules(cands));
@@ -920,7 +1011,7 @@ pub fn solve_tile_schedule(
     // Register-pressure & SRAM-occupancy model:
     //   - `has_dual`: 2x accumulators (`mc` + `mc2`), so `32x32 (4SG, 8 acc)` prevents register spill!
     //   - `double_buf` (`warp_spec`): `BK=16` keeps 2x ping-pong SMEM at 12 KB (2 TGs/core concurrent!)
-    //   - Single-buf: `64x64x32 (8SG)` or `64x64x16 (4SG)` keeps SMEM <= 10 KB!
+    //   - Single-buf: `64x64x32 (8SG)` or `128x64x16 (8SG, 9.2 KB SMEM, 42.7 FLOPs/byte!)`
     let (bm, bn, bk, num_sgs) = if let Some((fm, fn_, fk)) = cfg.force_tile {
         (fm, fn_, fk, if fm >= 64 && fn_ >= 64 { 8 } else { 4 })
     } else if has_dual {
@@ -946,6 +1037,7 @@ pub fn solve_tile_schedule(
         bn,
         bk,
         num_sgs,
+        rows_per_sg: 1,
         split_k,
         double_buf,
         swizzle_pad,
@@ -963,6 +1055,11 @@ pub fn solve_tile_schedule(
             cands.push(TileSchedule { bm: 64, bn: 64, bk: 16, num_sgs: 4, double_buf: true, split_k: 1, stream_k: false, ..default_sched });
             cands.push(TileSchedule { bm: 64, bn: 64, bk: 32, num_sgs: 4, double_buf: false, split_k: 1, stream_k: false, ..default_sched });
             cands.push(TileSchedule { bm: 64, bn: 64, bk: 32, num_sgs: 8, double_buf: false, split_k: 1, stream_k: false, ..default_sched });
+            if m >= 128 && n >= 128 {
+                // High arithmetic-intensity 8-SG tiles (`42.7 FLOPs/byte`, only `9.2 KB` single-buf / `18.4 KB` double-buf SMEM!)
+                cands.push(TileSchedule { bm: 128, bn: 64, bk: 16, num_sgs: 8, double_buf: false, split_k: 1, stream_k: false, ..default_sched });
+                cands.push(TileSchedule { bm: 64, bn: 128, bk: 16, num_sgs: 8, double_buf: false, split_k: 1, stream_k: false, ..default_sched });
+            }
         } else if m >= 64 && n >= 64 && has_dual {
             cands.push(TileSchedule { bm: 32, bn: 32, bk: 16, num_sgs: 4, double_buf: false, split_k: 1, stream_k: false, ..default_sched });
             cands.push(TileSchedule { bm: 64, bn: 64, bk: 32, num_sgs: 8, double_buf: false, split_k: 1, stream_k: false, ..default_sched });
@@ -1113,7 +1210,10 @@ pub fn collect_stage_io(st: &TileStage, ins: &mut Vec<String>, outs: &mut Vec<St
                 match ep {
                     EpilogueOp::AddTensor { src, .. }
                     | EpilogueOp::SubTensor { src }
-                    | EpilogueOp::MulTensor { src } => ins.push(src.clone()),
+                    | EpilogueOp::MulTensor { src }
+                    | EpilogueOp::SiluBwd { saved_x: src }
+                    | EpilogueOp::GeluBwd { saved_x: src }
+                    | EpilogueOp::ReluBwd { saved_x: src } => ins.push(src.clone()),
                     _ => {}
                 }
             }
@@ -1126,7 +1226,10 @@ pub fn collect_stage_io(st: &TileStage, ins: &mut Vec<String>, outs: &mut Vec<St
                 match ep {
                     EpilogueOp::AddTensor { src, .. }
                     | EpilogueOp::SubTensor { src }
-                    | EpilogueOp::MulTensor { src } => ins.push(src.clone()),
+                    | EpilogueOp::MulTensor { src }
+                    | EpilogueOp::SiluBwd { saved_x: src }
+                    | EpilogueOp::GeluBwd { saved_x: src }
+                    | EpilogueOp::ReluBwd { saved_x: src } => ins.push(src.clone()),
                     _ => {}
                 }
             }
@@ -1168,7 +1271,10 @@ pub fn estimate_fused_bytes(stages: &[TileStage]) -> f64 {
                 let ep_reads: f64 = epilogue.iter().map(|e| match e {
                     EpilogueOp::AddTensor { broadcast_row: false, .. }
                     | EpilogueOp::SubTensor { .. }
-                    | EpilogueOp::MulTensor { .. } => (*m * *n) as f64 * ab,
+                    | EpilogueOp::MulTensor { .. }
+                    | EpilogueOp::SiluBwd { .. }
+                    | EpilogueOp::GeluBwd { .. }
+                    | EpilogueOp::ReluBwd { .. } => (*m * *n) as f64 * ab,
                     EpilogueOp::AddTensor { broadcast_row: true, .. } => (*n) as f64 * ab,
                     _ => 0.0,
                 }).sum();

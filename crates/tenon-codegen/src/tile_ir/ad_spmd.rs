@@ -128,14 +128,16 @@ fn synthesize_reverse_ad(g: &mut TensorIrGraph, stats: &mut AdSpmdStats) {
                 g.push_node(silu_g.clone(), IrOp::Unary { op: ElemOp::Silu, x: gate.clone() }, sg.clone(), true);
                 let dup = fresh("swiglu_dup");
                 g.push_node(dup.clone(), IrOp::Binary { op: ElemOp::Mul, a: dy.clone(), b: silu_g }, su.clone(), true);
+                let dsilu = fresh("swiglu_dsilu");
+                g.push_node(dsilu.clone(), IrOp::Binary { op: ElemOp::Mul, a: dy, b: up.clone() }, sg.clone(), true);
                 let dgate = fresh("swiglu_dgate");
-                g.push_node(dgate.clone(), IrOp::Binary { op: ElemOp::Mul, a: dy, b: up.clone() }, sg.clone(), true);
+                g.push_node(dgate.clone(), IrOp::Binary { op: ElemOp::SiluBwd, a: dsilu, b: gate.clone() }, sg.clone(), true);
                 accum_grad(g, &mut adj, up, dup, su, &mut fresh);
                 accum_grad(g, &mut adj, gate, dgate, sg, &mut fresh);
-                stats.backward_nodes_synthesized += 3;
+                stats.backward_nodes_synthesized += 4;
             }
             IrOp::Unary { op, x } => {
-                // Roofline Checkpointing: cheap elementwise activations never pin HBM
+                // Roofline Checkpointing + Exact VJP (`SiluBwd` / `GeluBwd` / `ReluBwd` — auto-fused into upstream MatMul epilogue!)
                 stats.checkpointed_activations += 1;
                 let sx = g.tensors[x].clone();
                 let dx = fresh("un_dx");
@@ -143,8 +145,16 @@ fn synthesize_reverse_ad(g: &mut TensorIrGraph, stats: &mut AdSpmdStats) {
                     ElemOp::Scale { scale_bits } => {
                         g.push_node(dx.clone(), IrOp::Unary { op: ElemOp::Scale { scale_bits: *scale_bits }, x: dy }, sx.clone(), true);
                     }
+                    ElemOp::Silu => {
+                        g.push_node(dx.clone(), IrOp::Binary { op: ElemOp::SiluBwd, a: dy, b: x.clone() }, sx.clone(), true);
+                    }
+                    ElemOp::Gelu => {
+                        g.push_node(dx.clone(), IrOp::Binary { op: ElemOp::GeluBwd, a: dy, b: x.clone() }, sx.clone(), true);
+                    }
+                    ElemOp::Relu => {
+                        g.push_node(dx.clone(), IrOp::Binary { op: ElemOp::ReluBwd, a: dy, b: x.clone() }, sx.clone(), true);
+                    }
                     _ => {
-                        // Fused local derivative `dy * act'(x)` lowered as elementwise VJP
                         g.push_node(dx.clone(), IrOp::Binary { op: ElemOp::Mul, a: dy, b: x.clone() }, sx.clone(), true);
                     }
                 }

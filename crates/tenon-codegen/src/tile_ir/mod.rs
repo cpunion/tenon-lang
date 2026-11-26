@@ -393,15 +393,25 @@ pub enum LayoutTag {
     Swizzled128,
     /// OCP MXFP4 block-32 packed (`[cols, rows/32]` of 17-byte blocks: 16B E2M1 nibbles + 1B E8M0 scale).
     MXFP4Block32NK,
+    /// OCP MXFP4 Interleaved SuperBlock16 (`16` blocks = 512 weights = 256B `uint4` nibbles + 16B `uint4` scales = 272B, 16B aligned, single DRAM stream!).
+    MXFP4Super16NK,
+    /// True compressed 32x32 Block Sparse Row (BSR) layout: header + row_ptr + k_idx + contiguous non-zero [32_n][32_k] FP16 blocks!
+    Bsr32NK,
 }
 
 impl LayoutTag {
+    pub fn is_mxfp4(self) -> bool {
+        matches!(self, Self::MXFP4Block32NK | Self::MXFP4Super16NK)
+    }
+
     pub fn plan_tag(self) -> &'static str {
         match self {
             Self::RowMajor => "ROW_MAJOR",
             Self::ColMajorNK => "TRANSPOSE_NK",
             Self::Swizzled128 => "SWIZZLE_128",
             Self::MXFP4Block32NK => "PACK_MXFP4_NK",
+            Self::MXFP4Super16NK => "PACK_MXFP4_NK_SB16",
+            Self::Bsr32NK => "PACK_BSR32_NK",
         }
     }
 }
@@ -478,18 +488,22 @@ impl TensorDesc {
 
     pub fn alloc_bytes(&self) -> usize {
         match self.layout {
-            LayoutTag::MXFP4Block32NK => {
+            LayoutTag::MXFP4Block32NK | LayoutTag::MXFP4Super16NK => {
                 let r = self.rows();
                 let c = self.cols();
                 let blocks = (r + 31) / 32;
                 (c * blocks * 17).max(64)
+            }
+            LayoutTag::Bsr32NK => {
+                // Compressed size depends on runtime non-zero blocks; upper bound by dense size + BSR index header
+                ((self.numel() * 2) + 4096).max(64)
             }
             _ => ((self.numel() as f64 * self.dtype.bytes_f64()).ceil() as usize).max(4),
         }
     }
 }
 
-/// Elementwise unary/binary operator for general fusion trees.
+/// Elementwise unary/binary operator for general fusion trees (including exact Reverse-Mode AD VJPs!).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ElemOp {
     Add,
@@ -499,6 +513,12 @@ pub enum ElemOp {
     Gelu,
     Relu,
     SwiGlu,
+    /// Exact VJP `dy * silu'(saved_x)` where `silu'(x) = sig(x) * (1 + x * (1 - sig(x)))`.
+    SiluBwd,
+    /// Exact VJP `dy * gelu'(saved_x)` (tanh approximation derivative).
+    GeluBwd,
+    /// Exact VJP `(saved_x > 0) ? dy : 0`.
+    ReluBwd,
     Scale { scale_bits: u32 },
     Cast(IrDType),
 }

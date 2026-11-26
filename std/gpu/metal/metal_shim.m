@@ -717,6 +717,110 @@ int64_t tn_metal_plan_set_input(int64_t plan_h, int64_t input_idx, int64_t buf_h
                                 dp[n * K + k] = sp[k * N + n];
                     }
                     p->bufs[i].buf = dst;
+                } else if (strcmp(p->bufs[i].repack, "PACK_MXFP4_NK_SB16") == 0 && p->bufs[i].rows > 0 && p->bufs[i].cols > 0) {
+                    // Stage 3 Interleaved SuperBlock16 OCP MXFP4: 16 blocks (512 weights) = 256B uint4 nibbles + 16B uint4 scales = 272B (16B aligned, SINGLE DRAM stream!)
+                    size_t K = (size_t)p->bufs[i].rows;
+                    size_t N = (size_t)p->bufs[i].cols;
+                    size_t n_sb = K / 512;
+                    size_t total_bytes = N * n_sb * 272;
+                    id<MTLBuffer> dst = [g_mtl_device newBufferWithLength:(total_bytes > 64 ? total_bytes : 64)
+                                                               options:MTLResourceStorageModeShared];
+                    const uint16_t* sp = (const uint16_t*)[src contents];
+                    uint8_t* out_base = (uint8_t*)[dst contents];
+                    for (size_t n = 0; n < N; n++) {
+                        for (size_t sb = 0; sb < n_sb; sb++) {
+                            uint8_t* sb_ptr = out_base + (n * n_sb + sb) * 272;
+                            uint8_t* sc_ptr = sb_ptr + 256;
+                            for (size_t bi = 0; bi < 16; bi++) {
+                                size_t blk = sb * 16 + bi;
+                                float vals[32];
+                                float mx = 0.0f;
+                                for (size_t j = 0; j < 32; j++) {
+                                    float v = tn_f16_to_f32(sp[(blk * 32 + j) * N + n]);
+                                    vals[j] = v;
+                                    float av = fabsf(v);
+                                    if (av > mx) mx = av;
+                                }
+                                int exp_i = (mx > 1e-12f) ? (int)ceilf(log2f(mx / 6.0f)) : -126;
+                                if (exp_i < -126) exp_i = -126;
+                                if (exp_i > 127) exp_i = 127;
+                                uint8_t e8m0 = (uint8_t)(exp_i + 127);
+                                uint32_t fbits = ((uint32_t)e8m0) << 23;
+                                float sc = 1.0f;
+                                memcpy(&sc, &fbits, 4);
+                                float inv_sc = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+                                sc_ptr[bi] = e8m0;
+                                uint8_t* bp = sb_ptr + bi * 16;
+                                for (size_t j = 0; j < 16; j++) {
+                                    uint8_t lo = tn_quant_e2m1(vals[j * 2] * inv_sc);
+                                    uint8_t hi = tn_quant_e2m1(vals[j * 2 + 1] * inv_sc);
+                                    bp[j] = (uint8_t)((hi << 4) | (lo & 0x0Fu));
+                                }
+                            }
+                        }
+                    }
+                    p->bufs[i].buf = dst;
+                } else if (strcmp(p->bufs[i].repack, "PACK_BSR32_NK") == 0 && p->bufs[i].rows > 0 && p->bufs[i].cols > 0) {
+                    // Stage 3 True Compressed 32x32 Block Sparse Row (BSR-32) packing for ANY arbitrary sparse matrix!
+                    // Layout (all 16B aligned): [4 u32 hdr] [row_ptr[n_tiles+1]] [k_idx[nnz]] [contiguous non-zero 32_n x 32_k FP16 blocks]
+                    size_t K = (size_t)p->bufs[i].rows;
+                    size_t N = (size_t)p->bufs[i].cols;
+                    size_t n_tiles = N / 32;
+                    size_t k_blocks = K / 32;
+                    const uint16_t* sp = (const uint16_t*)[src contents];
+                    uint32_t* row_ptr = (uint32_t*)calloc(n_tiles + 1, sizeof(uint32_t));
+                    size_t max_blk = n_tiles * k_blocks;
+                    uint32_t* k_idx = (uint32_t*)malloc((max_blk > 0 ? max_blk : 1) * sizeof(uint32_t));
+                    uint32_t total_nnz = 0;
+                    for (size_t tn = 0; tn < n_tiles; tn++) {
+                        row_ptr[tn] = total_nnz;
+                        for (size_t kb = 0; kb < k_blocks; kb++) {
+                            int nz = 0;
+                            for (size_t kr = 0; kr < 32 && !nz; kr++) {
+                                const uint16_t* rowp = sp + (kb * 32 + kr) * N + tn * 32;
+                                for (size_t nc = 0; nc < 32; nc++) {
+                                    if ((rowp[nc] & 0x7FFFu) != 0) { nz = 1; break; }
+                                }
+                            }
+                            if (nz) {
+                                k_idx[total_nnz++] = (uint32_t)(kb * 32);
+                            }
+                        }
+                    }
+                    row_ptr[n_tiles] = total_nnz;
+                    size_t rp_u32 = 4 + n_tiles + 1;
+                    size_t kidx_off_u32 = (rp_u32 + 3) & ~((size_t)3);
+                    size_t data_off_bytes = ((kidx_off_u32 + total_nnz) * 4 + 15) & ~((size_t)15);
+                    size_t total_bytes = data_off_bytes + (size_t)total_nnz * 32 * 32 * 2;
+                    id<MTLBuffer> dst = [g_mtl_device newBufferWithLength:(total_bytes > 64 ? total_bytes : 64)
+                                                               options:MTLResourceStorageModeShared];
+                    uint32_t* hdr = (uint32_t*)[dst contents];
+                    memset(hdr, 0, data_off_bytes);
+                    hdr[0] = (uint32_t)kidx_off_u32;
+                    hdr[1] = (uint32_t)(data_off_bytes / 2);
+                    hdr[2] = (uint32_t)n_tiles;
+                    hdr[3] = total_nnz;
+                    memcpy(hdr + 4, row_ptr, (n_tiles + 1) * sizeof(uint32_t));
+                    if (total_nnz > 0) {
+                        memcpy(hdr + kidx_off_u32, k_idx, total_nnz * sizeof(uint32_t));
+                        uint16_t* data_out = ((uint16_t*)[dst contents]) + (data_off_bytes / 2);
+                        for (size_t tn = 0; tn < n_tiles; tn++) {
+                            for (uint32_t b_i = row_ptr[tn]; b_i < row_ptr[tn + 1]; b_i++) {
+                                size_t kt = (size_t)k_idx[b_i];
+                                uint16_t* blk_dst = data_out + (size_t)b_i * 1024;
+                                // Store block transposed as [32_n][32_k] for zero-scatter 128-bit uint4 loads!
+                                for (size_t kr = 0; kr < 32; kr++) {
+                                    const uint16_t* sr = sp + (kt + kr) * N + tn * 32;
+                                    for (size_t nc = 0; nc < 32; nc++) {
+                                        blk_dst[nc * 32 + kr] = sr[nc];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    free(row_ptr);
+                    free(k_idx);
+                    p->bufs[i].buf = dst;
                 } else if (strcmp(p->bufs[i].repack, "PACK_MXFP4_NK") == 0 && p->bufs[i].rows > 0 && p->bufs[i].cols > 0) {
                     // Generic load-time OCP MXFP4 packing: [K, N] FP16 -> [N, K/2] 128-bit aligned E2M1 nibbles + [N, K/32] E8M0 scales!
                     size_t K = (size_t)p->bufs[i].rows;
@@ -975,7 +1079,7 @@ double tn_metal_plan_bench_ms(int64_t plan_h, int64_t warmup, int64_t iters) {
                 if (p->single_cb) plan_exec_batch_single_cb(p, chunk);
                 else for (int64_t w = 0; w < chunk; w++) plan_exec_once_sync_per_op(p);
                 w_done += chunk;
-            } while ((tn_now_ms() - wt0) < 15.0 && w_done < 96);
+            } while ((tn_now_ms() - wt0) < 30.0 && w_done < 256);
         }
         double t0 = tn_now_ms();
         if (p->single_cb) {
