@@ -57,6 +57,9 @@ extern "C" {
 
     /// Returns GGUF `general.architecture` C-string (`llama`, `glm4moe`, `qwen3moe`, `deepseek2`, etc.).
     fn tn_moe_get_arch(handle Int) Ptr[UInt8]
+    fn tn_moe_kv_slot_set(handle Int, slot_id Int) Int
+    fn tn_moe_copy_logits(handle Int, dst_f32_ptr Ptr[UInt8]) Int
+    fn tn_moe_verify_batch(handle Int, draft_ids_ptr Ptr[UInt8], n_draft Int, start_pos Int, out_argmax_ptr Ptr[UInt8]) Int
 
     /// Decodes a token ID to a UTF-8 C string from the GGUF's embedded vocabulary.
     fn tn_moe_token_cstr(handle Int, tok_id Int) Ptr[UInt8]

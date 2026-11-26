@@ -439,7 +439,10 @@ pub enum IrDType {
     I4,
     Q8_0,
     Q4_0,
-    /// GGML K-Quant super-blocks (256 weights: Q4_K=144B, Q5_K=176B, Q6_K=210B).
+    /// GGML K-Quant & I-Quant super-blocks (256 weights: Q2_K=84B, Q3_K=110B, IQ4_XS=136B, Q4_K=144B, Q5_K=176B, Q6_K=210B).
+    Q2_K,
+    Q3_K,
+    IQ4_XS,
     Q4_K,
     Q5_K,
     Q6_K,
@@ -456,6 +459,9 @@ impl IrDType {
             Self::I4 => 0.5,
             Self::Q8_0 => 34.0 / 32.0,
             Self::Q4_0 => 18.0 / 32.0,
+            Self::Q2_K => 84.0 / 256.0,
+            Self::Q3_K => 110.0 / 256.0,
+            Self::IQ4_XS => 136.0 / 256.0,
             Self::Q4_K => 144.0 / 256.0,
             Self::Q5_K => 176.0 / 256.0,
             Self::Q6_K => 210.0 / 256.0,
@@ -464,7 +470,7 @@ impl IrDType {
     }
 
     pub fn is_sub_byte(self) -> bool {
-        matches!(self, Self::I4 | Self::Q4_0 | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4)
+        matches!(self, Self::I4 | Self::Q4_0 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4)
     }
 
     pub fn msl_ty(self) -> &'static str {
@@ -472,7 +478,7 @@ impl IrDType {
             Self::F32 => "float",
             Self::F16 => "half",
             Self::BF16 => "bfloat",
-            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4 => "uchar",
+            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4 => "uchar",
             Self::I8 => "char",
         }
     }
@@ -483,7 +489,7 @@ impl IrDType {
             Self::F16 => "__half",
             Self::BF16 => "__nv_bfloat16",
             Self::I8 => "int8_t",
-            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4 => "uint8_t",
+            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4 => "uint8_t",
         }
     }
 
@@ -494,7 +500,7 @@ impl IrDType {
             Self::BF16 => "bf16",
             Self::FP8 => "f8E4M3FN",
             Self::I8 | Self::Q8_0 | Self::Q5_K | Self::Q6_K => "i8",
-            Self::I4 | Self::Q4_0 | Self::Q4_K | Self::MXFP4 => "i4",
+            Self::I4 | Self::Q4_0 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::MXFP4 => "i4",
         }
     }
 }
@@ -896,7 +902,7 @@ fn parse_dim_expr(ty: &TypeExpr) -> Option<DimExpr> {
                     name.as_str(),
                     "Float32" | "F32" | "Float16" | "F16" | "BFloat16" | "BF16"
                         | "FP8" | "Float8" | "Int8" | "I8" | "Int4" | "I4"
-                        | "Q8_0" | "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "MXFP4" | "FP4"
+                        | "Q8_0" | "Q4_0" | "Q2_K" | "Q3_K" | "IQ4_XS" | "Q4_K" | "Q5_K" | "Q6_K" | "MXFP4" | "FP4"
                 )
             {
                 return Some(DimExpr::Sym { name: name.clone(), max_bound: 1024 });
@@ -917,6 +923,9 @@ fn parse_ir_dtype(ty: &TypeExpr) -> Option<IrDType> {
             "Int4" | "I4" => Some(IrDType::I4),
             "Q8_0" => Some(IrDType::Q8_0),
             "Q4_0" => Some(IrDType::Q4_0),
+            "Q2_K" => Some(IrDType::Q2_K),
+            "Q3_K" | "Q3_K_M" => Some(IrDType::Q3_K),
+            "IQ4_XS" => Some(IrDType::IQ4_XS),
             "Q4_K" | "Q4_K_M" => Some(IrDType::Q4_K),
             "Q5_K" | "Q5_K_M" => Some(IrDType::Q5_K),
             "Q6_K" => Some(IrDType::Q6_K),
@@ -1321,7 +1330,7 @@ pub fn run_optimization_pipeline(mut g: TensorIrGraph, mut cfg: GpuOptConfig) ->
         let t_cmp = (opt_flops / (peak_t * 1e12)) * 1e3;
         t_mem.max(t_cmp)
     };
-    let uses_low_bit = g.tensors.values().any(|t| matches!(t.dtype, IrDType::FP8 | IrDType::I8 | IrDType::I4 | IrDType::Q4_0 | IrDType::Q4_K | IrDType::Q5_K | IrDType::Q6_K | IrDType::MXFP4));
+    let uses_low_bit = g.tensors.values().any(|t| matches!(t.dtype, IrDType::FP8 | IrDType::I8 | IrDType::I4 | IrDType::Q4_0 | IrDType::Q2_K | IrDType::Q3_K | IrDType::IQ4_XS | IrDType::Q4_K | IrDType::Q5_K | IrDType::Q6_K | IrDType::MXFP4));
 
     let roofline = UniversalRoofline {
         raw_flops,

@@ -466,3 +466,56 @@ pub fn glm106b_moe_nvme(
     let tpu_d = emit_cuda_tpu::emit_universal_stablehlo(&on[0]);
     assert!(tpu_d.contains("mhlo.memory_kind=\"pinned_host\""));
 }
+
+#[test]
+fn stage6_v5_tp_multi_gpu_mla_latent_kv_and_extreme_low_bit_quants() {
+    let src = r#"
+@gpu_graph("stream:vram=24G,ram=64G,layers=80,experts=0,ctx=16384,kv=auto,tp=2,spec=4")
+fn llama70b_tp2_iq4xs(
+    x       Matrix[1, 8192, Float16],
+    w_qkv   Matrix[8192, 10240, IQ4_XS],
+    w_gate  Matrix[8192, 28672, Q3_K],
+    w_up    Matrix[8192, 28672, Q2_K],
+    w_down  Matrix[28672, 8192, IQ4_XS],
+) Matrix[1, 8192, Float16] {
+    let qkv = tg_matmul(x, w_qkv)
+    let g = tg_silu(tg_matmul(x, w_gate))
+    let u = tg_matmul(x, w_up)
+    let h = tg_mul(g, u)
+    tg_matmul(h, w_down)
+}
+
+@gpu_graph("stream:vram=24G,ram=128G,layers=61,experts=256,topk=8,ctx=16384,kv_dim=16384,mla=576,spec=4")
+fn deepseek_v3_mla_latent(
+    x        Matrix[1, 7168, Float16],
+    w_kv_a   Matrix[7168, 576, Q4_K],
+    exp_gate Matrix[7168, 2048, Q4_K],
+    exp_up   Matrix[7168, 2048, Q4_K],
+    exp_down Matrix[2048, 7168, Q4_K],
+) Matrix[1, 7168, Float16] {
+    let g = tg_silu(tg_matmul(x, exp_gate))
+    let u = tg_matmul(x, exp_up)
+    let h = tg_mul(g, u)
+    tg_matmul(h, exp_down)
+}
+"#;
+    let prog = tenon_syntax::parse(src).expect("parse v5 stage6");
+    let on = compile_universal_graphs(&prog, GpuOptConfig::default());
+    assert_eq!(on.len(), 2);
+
+    // 1. 2x 24GB GPUs (TP=2 -> 48GB aggregate VRAM!) with IQ4_XS / Q3_K / Q2_K fits 70B 100% ResidentGpu!
+    let hp_tp2 = &on[0].hetero_plan;
+    assert_eq!(hp_tp2.tp_devices, 2);
+    assert_eq!(hp_tp2.speculative_k, 4);
+    assert_eq!(hp_tp2.dispatch_mode, hetero_stream::HeteroDispatchMode::ResidentGpu);
+    assert_eq!(hp_tp2.pinned_gpu_ffn_layers, 80);
+
+    // 2. DeepSeek-V3 Compressed Latent MLA KV-Cache (`mla=576` vs `2 * 16384` FP16 -> >50x KV VRAM reduction!)
+    let hp_mla = &on[1].hetero_plan;
+    assert_eq!(hp_mla.mla_latent_dim, 576);
+    assert!(hp_mla.kv_bytes_saved > 50_000_000_000, "MLA latent KV should save >50 GB on 61L 16K ctx!");
+    let cuda_tp2 = emit_cuda_tpu::emit_universal_cuda(&on[0]);
+    assert!(cuda_tp2.contains("tp=2 (P2P AllReduce)") && cuda_tp2.contains("mma.sync m16n8k16"));
+    let (_, plan_mla) = emit_metal::emit_metal_graph_and_plan(&on[1]);
+    assert!(plan_mla.contains("mla_latent=576") && plan_mla.contains("spec_k=4"));
+}

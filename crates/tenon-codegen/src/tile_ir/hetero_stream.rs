@@ -63,6 +63,11 @@ pub struct HeteroStreamPlan {
     pub async_promoter: bool,
     pub purgeable_reclaim: bool,
     pub cgroup_main_tid0: bool,
+    pub tp_devices: usize,
+    pub mla_latent_dim: usize,
+    pub paged_kv_block_size: usize,
+    pub radix_prefix_cache: bool,
+    pub speculative_k: usize,
     pub dispatch_mode: HeteroDispatchMode,
     pub numa_repack_weights: Vec<(String, LayoutTag)>,
     pub projected_decode_tok_s: f64,
@@ -93,6 +98,11 @@ impl Default for HeteroStreamPlan {
             async_promoter: false,
             purgeable_reclaim: false,
             cgroup_main_tid0: false,
+            tp_devices: 1,
+            mla_latent_dim: 0,
+            paged_kv_block_size: 16,
+            radix_prefix_cache: false,
+            speculative_k: 0,
             dispatch_mode: HeteroDispatchMode::ResidentGpu,
             numa_repack_weights: Vec::new(),
             projected_decode_tok_s: 0.0,
@@ -137,6 +147,10 @@ pub fn plan_hetero_stream(
     let mut pcie_bw_gbs: f64 = 24.0;
     let mut gpu_bw_gbs: f64 = 854.0;
     let mut explicit_kv_dim: Option<usize> = None;
+    let mut tp_devices: usize = cfg.spmd_devices.max(1);
+    let mut mla_latent_dim: usize = 0;
+    let mut speculative_k: usize = 0;
+    let mut radix_prefix_cache: bool = cfg.vram_budget_plan;
 
     if let Some(rest) = g.attr_mode.strip_prefix("stream:") {
         for part in rest.split(',') {
@@ -195,6 +209,22 @@ pub fn plan_hetero_stream(
                         gpu_bw_gbs = f.max(10.0);
                     }
                 }
+                "tp" | "tp_devices" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        tp_devices = n.max(1);
+                    }
+                }
+                "mla" | "mla_latent" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        mla_latent_dim = n;
+                    }
+                }
+                "spec" | "mtp" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        speculative_k = n;
+                    }
+                }
+                "prefix" => radix_prefix_cache = v != "0" && v != "false",
                 _ => {}
             }
         }
@@ -225,7 +255,7 @@ pub fn plan_hetero_stream(
             single_layer_ffn_bytes += sz;
             if cfg.numa_repack_layout {
                 let tag = match pdesc.dtype {
-                    IrDType::Q4_K | IrDType::Q5_K | IrDType::Q6_K => Some(LayoutTag::NumaRepackQ4K_4R),
+                    IrDType::Q2_K | IrDType::Q3_K | IrDType::IQ4_XS | IrDType::Q4_K | IrDType::Q5_K | IrDType::Q6_K => Some(LayoutTag::NumaRepackQ4K_4R),
                     IrDType::Q4_0 | IrDType::I4 | IrDType::MXFP4 => Some(LayoutTag::NumaRepackQ4_4R),
                     _ => None,
                 };
@@ -251,10 +281,18 @@ pub fn plan_hetero_stream(
     let head_overhead_bytes: u64 = if n_layers >= 32 { 1_100_000_000 } else { 0 };
     let total_model_bytes = total_attn_bytes + total_ffn_bytes + head_overhead_bytes;
 
-    // Facility #14: Hard-VRAM-Cap Budget Solver + KV-Cache Q8_0 Auto-Upgrade!
+    // Facility #14: Hard-VRAM-Cap Budget Solver + Compressed Latent MLA KV + Q8_0 KV-Cache + Multi-GPU TP!
     let kv_fp16_bytes = (n_layers as u64) * 2 * (max_ctx as u64) * (kv_dim as u64) * 2;
+    let kv_mla_bytes = if mla_latent_dim > 0 {
+        // Matrix-Absorbed MLA stores ONLY compressed `[c_kv || k_pe]` (single FP16 vector, NO separate V cache!)
+        (n_layers as u64) * (max_ctx as u64) * (mla_latent_dim as u64) * 2
+    } else {
+        0
+    };
     let kv_q8_bytes = ((n_layers as u64) * 2 * (max_ctx as u64) * (kv_dim as u64) * 17) / 16; // 34B per 32 elems = 1.0625 B/elem!
-    let kv_quant_q8 = if !cfg.vram_budget_plan {
+    let kv_quant_q8 = if mla_latent_dim > 0 {
+        false
+    } else if !cfg.vram_budget_plan {
         kv_mode == "q8"
     } else {
         match kv_mode {
@@ -263,10 +301,18 @@ pub fn plan_hetero_stream(
             _ => max_ctx > 2048 || kv_fp16_bytes > (vram_cap_bytes / 10),
         }
     };
-    let kv_cache_bytes = if kv_quant_q8 { kv_q8_bytes } else { kv_fp16_bytes };
+    let kv_cache_bytes = if mla_latent_dim > 0 {
+        kv_mla_bytes
+    } else if kv_quant_q8 {
+        kv_q8_bytes
+    } else {
+        kv_fp16_bytes
+    };
     let kv_bytes_saved = kv_fp16_bytes.saturating_sub(kv_cache_bytes);
 
-    let usable_vram = (vram_cap_bytes as f64 * 0.94) as u64;
+    // Multi-GPU Tensor Parallelism (`tp_devices > 1`): aggregate VRAM scales linearly across TP ranks!
+    let total_vram_cap = vram_cap_bytes.saturating_mul(tp_devices as u64);
+    let usable_vram = (total_vram_cap as f64 * 0.94) as u64;
     let base_core = total_attn_bytes + kv_cache_bytes + head_overhead_bytes + (64 * 1024 * 1024);
 
     let (pinned_gpu_ffn_layers, lru_slots_per_layer, cpu_offload_layers, core_vram_bytes) = if !cfg.vram_budget_plan {
@@ -359,7 +405,7 @@ pub fn plan_hetero_stream(
     } else {
         (cpu_offload_layers as f64) * (single_layer_ffn_bytes as f64)
     };
-    let t_gpu_s = gpu_bytes_per_tok / (gpu_bw_gbs * 1e9);
+    let t_gpu_s = gpu_bytes_per_tok / (gpu_bw_gbs * (tp_devices as f64) * 1e9);
     let offload_bw = match dispatch_mode {
         HeteroDispatchMode::ResidentGpu => gpu_bw_gbs,
         HeteroDispatchMode::HybridCpuInt16 => ddr_bw_gbs,
@@ -398,6 +444,11 @@ pub fn plan_hetero_stream(
         async_promoter,
         purgeable_reclaim,
         cgroup_main_tid0: cfg.hetero_dispatch,
+        tp_devices,
+        mla_latent_dim,
+        paged_kv_block_size: 16,
+        radix_prefix_cache,
+        speculative_k,
         dispatch_mode,
         numa_repack_weights,
         projected_decode_tok_s,

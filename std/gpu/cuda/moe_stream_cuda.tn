@@ -29,11 +29,15 @@ extern "C" {
     ///   8=core_vram_bytes, 9=cache_vram_bytes, 10=total_streamable_bytes,
     ///   11=bos_id, 12=eos_id, 13=cache_hits, 14=cache_misses, 15=prefetch_hits, 16=io_bytes_read,
     ///   17=os_rss_bytes, 18=os_peak_rss_bytes, 19=total_model_disk_bytes, 20=num_shards,
-    ///   21=pcie_h2d_bytes, 22=max_ctx, 23=kv_quant_q8, 24=is_mla, 25=fast_dp4a
+    ///   21=pcie_h2d_bytes, 22=max_ctx, 23=kv_quant_q8, 24=is_mla, 25=fast_dp4a,
+    ///   26=mla_latent_kv, 27=n_kv_slots, 28=slot_ctx, 29=n_bpe_merges, 30=has_mtp, 31=tp_size
     fn tn_cumoe_info(handle Int, field_id Int) Int
     fn tn_cumoe_reset(handle Int) Int
+    fn tn_cumoe_kv_slot_set(handle Int, slot_id Int) Int
+    fn tn_cumoe_copy_logits(handle Int, out_f32_ptr Ptr[UInt8], max_vocab Int) Int
     fn tn_cumoe_step(handle Int, tok_id Int, pos Int) Int
     fn tn_cumoe_prefill(handle Int, tok_ids_ptr Ptr[UInt8], n_toks Int, start_pos Int) Int
+    fn tn_cumoe_verify_batch(handle Int, tok_ids_ptr Ptr[UInt8], n_toks Int, start_pos Int, out_argmax_ptr Ptr[UInt8]) Int
     fn tn_cumoe_auto_plan(path_cstr Ptr[UInt8], max_vram_gb Float, max_ctx Int, kv_mode Int, out_plan_ptr Ptr[UInt8]) Int
     fn tn_cumoe_sample_next(
         handle Int, tok_id Int, pos Int,
@@ -107,9 +111,19 @@ impl CudaStreamingMoeModel {
     pub fn kv_quant_q8(inout self) Bool { unsafe { tn_cumoe_info(self.handle, 23) != 0 } }
     pub fn is_mla(inout self) Bool { unsafe { tn_cumoe_info(self.handle, 24) != 0 } }
     pub fn fast_dp4a(inout self) Bool { unsafe { tn_cumoe_info(self.handle, 25) != 0 } }
+    pub fn mla_latent_kv(inout self) Bool { unsafe { tn_cumoe_info(self.handle, 26) != 0 } }
+    pub fn n_kv_slots(inout self) Int { unsafe { tn_cumoe_info(self.handle, 27) } }
+    pub fn slot_ctx(inout self) Int { unsafe { tn_cumoe_info(self.handle, 28) } }
+    pub fn n_bpe_merges(inout self) Int { unsafe { tn_cumoe_info(self.handle, 29) } }
+    pub fn has_mtp(inout self) Bool { unsafe { tn_cumoe_info(self.handle, 30) != 0 } }
+    pub fn tp_size(inout self) Int { unsafe { tn_cumoe_info(self.handle, 31) } }
 
     pub fn reset(inout self) {
         let _ = unsafe { tn_cumoe_reset(self.handle) }
+    }
+
+    pub fn set_kv_slot(inout self, slot_id Int) Bool {
+        unsafe { tn_cumoe_kv_slot_set(self.handle, slot_id) != 0 }
     }
 
     pub fn step(inout self, tok_id Int, pos Int) Int {

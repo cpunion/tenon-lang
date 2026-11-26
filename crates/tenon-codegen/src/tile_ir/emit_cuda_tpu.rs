@@ -43,11 +43,13 @@ pub fn emit_universal_cuda(cg: &CompiledUniversalGraph) -> String {
         let hp = &cg.hetero_plan;
         out.push_str(&format!(
             "// [Stage 6 Heterogeneous Streaming Plan]\n\
-             //   mode={} | vram_cap={:.2}GiB | core_vram={:.2}GiB | pinned_ffn={}/{} | lru_slots={}/{} | kv_q8={} (saved {:.1}MB)\n\
+             //   mode={} | tp={} (P2P AllReduce) | mla_latent={} | vram_cap={:.2}GiB | core_vram={:.2}GiB | pinned_ffn={}/{} | lru_slots={}/{} | kv_q8={} (saved {:.1}MB)\n\
              //   dma_ring={} (cuStreamWaitEvent compute_stream || dma_stream, indirect d_step_args CUDA Graph, async_promoter={})\n\
-             //   cpu_hybrid: NUMA_first_touch_4R={} | cgroup_main_tid0={} | AVX2 _mm256_madd_epi16 INT16 | prefill_B={}\n\
+             //   cpu_hybrid: NUMA_first_touch_4R={} | cgroup_main_tid0={} | AVX2 _mm256_madd_epi16 INT16 (B=4 shared-weight) | prefill_B={} (TensorCore mma.sync m16n8k16) | spec_k={}\n\
              //   roofline_proj: decode={:.2} tok/s | batched_prefill={:.1} tok/s\n",
             hp.dispatch_mode.tag(),
+            hp.tp_devices,
+            hp.mla_latent_dim,
             hp.vram_cap_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             hp.core_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             hp.pinned_gpu_ffn_layers,
@@ -61,6 +63,7 @@ pub fn emit_universal_cuda(cg: &CompiledUniversalGraph) -> String {
             hp.numa_repack_weights.len(),
             hp.cgroup_main_tid0,
             hp.prefill_chunk_tokens,
+            hp.speculative_k,
             hp.projected_decode_tok_s,
             hp.projected_prefill_tok_s,
         ));
@@ -540,11 +543,13 @@ pub fn emit_universal_stablehlo(cg: &CompiledUniversalGraph) -> String {
         let hp = &cg.hetero_plan;
         out.push_str(&format!(
             "// [Stage 6 Heterogeneous Streaming Plan]\n\
-             //   mode={} | vram_cap={:.2}GiB | core_vram={:.2}GiB | pinned_ffn={}/{} | lru_slots={}/{} | kv_q8={} (saved {:.1}MB)\n\
+             //   mode={} | tp={} (P2P AllReduce) | mla_latent={} | vram_cap={:.2}GiB | core_vram={:.2}GiB | pinned_ffn={}/{} | lru_slots={}/{} | kv_q8={} (saved {:.1}MB)\n\
              //   dma_ring={} (cuStreamWaitEvent compute_stream || dma_stream, indirect d_step_args CUDA Graph, async_promoter={})\n\
-             //   cpu_hybrid: NUMA_first_touch_4R={} | cgroup_main_tid0={} | AVX2 _mm256_madd_epi16 INT16 | prefill_B={}\n\
+             //   cpu_hybrid: NUMA_first_touch_4R={} | cgroup_main_tid0={} | AVX2 _mm256_madd_epi16 INT16 (B=4 shared-weight) | prefill_B={} (TensorCore mma.sync m16n8k16) | spec_k={}\n\
              //   roofline_proj: decode={:.2} tok/s | batched_prefill={:.1} tok/s\n",
             hp.dispatch_mode.tag(),
+            hp.tp_devices,
+            hp.mla_latent_dim,
             hp.vram_cap_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             hp.core_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             hp.pinned_gpu_ffn_layers,
@@ -558,6 +563,7 @@ pub fn emit_universal_stablehlo(cg: &CompiledUniversalGraph) -> String {
             hp.numa_repack_weights.len(),
             hp.cgroup_main_tid0,
             hp.prefill_chunk_tokens,
+            hp.speculative_k,
             hp.projected_decode_tok_s,
             hp.projected_prefill_tok_s,
         ));
