@@ -163,12 +163,16 @@ typedef struct {
     int has_rope_freqs;
     MoeLayer layers[MOE_MAX_LAYERS];
 
-    // Dense Mode 2-Layer Ping-Pong Ring Buffer Pool (strictly O(1) memory: 2 * ~500 MB = ~1 GiB!)
-    id<MTLBuffer> dense_ping[2];
+    // Dense Mode Streaming Pools:
+    //   - Ultra-low (<2.5 GiB, cache_slots==0): 2-Layer Ping-Pong (streams Attn+FFN, ~0.92 GiB pool)
+    //   - Role-Aware (cache_slots>0, <=16 GiB): Pins ALL Attention on GPU + N FFNs + 4-Slot Continuous FFN Ring (~1.6 GiB)!
+    int dense_pin_all_attn;
+    id<MTLBuffer> dense_ping[4];
     uint64_t dense_ping_stride;
     uint64_t dense_off_wq, dense_off_wk, dense_off_wv, dense_off_wo;
     uint64_t dense_off_gate, dense_off_up, dense_off_down;
     dispatch_group_t dense_io_grp;
+    dispatch_queue_t ring_prod_q;
 
     // Working activations in GPU Unified Memory
     id<MTLBuffer> buf_emb_row; // Tiny 64KB buffer for zero-VRAM on-demand `token_embd` row pread!
@@ -1456,26 +1460,28 @@ static void load_expert_into_slot(MoeModel* m, int L, int eid, int slot) {
     __sync_fetch_and_add(&m->ssd_bytes_read, (int64_t)(ly->gate_exp_bytes + ly->up_exp_bytes + ly->down_exp_bytes));
 }
 
-// Parallel multi-chunk NVMe `pread()` of an entire Dense layer (~496 MB) into Ping-Pong slot `pidx`!
+// Parallel multi-chunk NVMe `pread()` of Dense layer weights into ring slot `pidx`!
+// When `m->dense_pin_all_attn` is 1, streams ONLY FFN (`gate/up/down`, ~396 MB) since all Attention is GPU-pinned!
 static void load_dense_layer_into_ping(MoeModel* m, int L, int pidx, int parallel) {
     MoeLayer* ly = &m->layers[L];
     uint8_t* base = (uint8_t*)[m->dense_ping[pidx] contents];
     typedef struct { int fd; uint8_t* dst; size_t len; uint64_t off; } IoChunk;
-    IoChunk chunks[24];
+    IoChunk chunks[32];
     int nc = 0;
 
     MoeWeightRef* refs[7] = { &ly->wq, &ly->wk, &ly->wv, &ly->wo, &ly->ffn_gate, &ly->ffn_up, &ly->ffn_down };
     uint64_t offs[7] = { m->dense_off_wq, m->dense_off_wk, m->dense_off_wv, m->dense_off_wo,
                          m->dense_off_gate, m->dense_off_up, m->dense_off_down };
+    int start_i = m->dense_pin_all_attn ? 4 : 0;
     uint64_t total_b = 0;
-    for (int i = 0; i < 7; i++) {
+    for (int i = start_i; i < 7; i++) {
         uint64_t sz = refs[i]->byte_size;
         if (sz == 0) continue;
         total_b += sz;
-        int splits = (parallel && sz >= 64ull * 1024ull * 1024ull) ? 4 : 1;
+        int splits = (parallel && sz >= 64ull * 1024ull * 1024ull) ? 6 : 1;
         size_t chunk_sz = (size_t)((sz + (uint64_t)splits - 1ull) / (uint64_t)splits);
         chunk_sz = (chunk_sz + 4095ull) & ~4095ull; // 4KB page-aligned chunks for raw NVMe DMA!
-        for (int s = 0; s < splits && nc < 24; s++) {
+        for (int s = 0; s < splits && nc < 32; s++) {
             uint64_t rel = (uint64_t)s * (uint64_t)chunk_sz;
             if (rel >= sz) break;
             size_t len = (rel + chunk_sz <= sz) ? chunk_sz : (size_t)(sz - rel);
@@ -1675,7 +1681,10 @@ int64_t tn_moe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int64
 
         if (m->dense_model) {
             m->resident_mode = (cache_slots_per_layer < 0 || cache_slots_per_layer >= m->n_layers) ? 1 : 0;
-            m->cache_slots_per_layer = m->resident_mode ? m->n_layers : (int)cache_slots_per_layer; // # pinned prefix layers
+            m->cache_slots_per_layer = m->resident_mode ? m->n_layers : (int)cache_slots_per_layer;
+            // Role-Aware Attention Pinning: when budget allows >0 pinned FFN layers, pin ALL Attention blocks on GPU
+            // (~17% of model size) and stream ONLY FFN through a 4-slot continuous ring buffer!
+            m->dense_pin_all_attn = (!m->resident_mode && m->cache_slots_per_layer > 0) ? 1 : 0;
         } else {
             m->resident_mode = (cache_slots_per_layer <= 0 || cache_slots_per_layer >= m->n_experts) ? 1 : 0;
             m->cache_slots_per_layer = m->resident_mode ? m->n_experts : (int)cache_slots_per_layer;
@@ -1757,16 +1766,16 @@ int64_t tn_moe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int64
                 } else if (strcmp(sub, "attn_k_norm.weight") == 0) {
                     load_pinned_weight(m, &ly->k_norm, ti);
                 } else if (strcmp(sub, "attn_q.weight") == 0) {
-                    if (stream_dense_w) { record_weight_meta(&ly->wq, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; }
+                    if (stream_dense_w && !m->dense_pin_all_attn) { record_weight_meta(&ly->wq, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; }
                     else load_pinned_weight(m, &ly->wq, ti);
                 } else if (strcmp(sub, "attn_k.weight") == 0) {
-                    if (stream_dense_w) { record_weight_meta(&ly->wk, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; }
+                    if (stream_dense_w && !m->dense_pin_all_attn) { record_weight_meta(&ly->wk, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; }
                     else load_pinned_weight(m, &ly->wk, ti);
                 } else if (strcmp(sub, "attn_v.weight") == 0) {
-                    if (stream_dense_w) { record_weight_meta(&ly->wv, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; }
+                    if (stream_dense_w && !m->dense_pin_all_attn) { record_weight_meta(&ly->wv, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; }
                     else load_pinned_weight(m, &ly->wv, ti);
                 } else if (strcmp(sub, "attn_output.weight") == 0) {
-                    if (stream_dense_w) { record_weight_meta(&ly->wo, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; }
+                    if (stream_dense_w && !m->dense_pin_all_attn) { record_weight_meta(&ly->wo, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; }
                     else load_pinned_weight(m, &ly->wo, ti);
                 } else if (strcmp(sub, "ffn_gate.weight") == 0) {
                     if (stream_dense_w) { record_weight_meta(&ly->ffn_gate, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; }
@@ -1841,17 +1850,21 @@ int64_t tn_moe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int64
         }
         if (m->dense_model && !m->resident_mode) {
             uint64_t off = 0;
-            m->dense_off_wq = off;   off += align64(max_wq);
-            m->dense_off_wk = off;   off += align64(max_wk);
-            m->dense_off_wv = off;   off += align64(max_wv);
-            m->dense_off_wo = off;   off += align64(max_wo);
+            if (!m->dense_pin_all_attn) {
+                m->dense_off_wq = off;   off += align64(max_wq);
+                m->dense_off_wk = off;   off += align64(max_wk);
+                m->dense_off_wv = off;   off += align64(max_wv);
+                m->dense_off_wo = off;   off += align64(max_wo);
+            }
             m->dense_off_gate = off; off += align64(max_fg);
             m->dense_off_up = off;   off += align64(max_fu);
             m->dense_off_down = off; off += align64(max_fd);
             m->dense_ping_stride = off;
-            m->dense_ping[0] = [g_moe_dev newBufferWithLength:(size_t)off options:MTLResourceStorageModeShared];
-            m->dense_ping[1] = [g_moe_dev newBufferWithLength:(size_t)off options:MTLResourceStorageModeShared];
-            m->cache_vram_bytes = (int64_t)(off * 2ull);
+            int n_slots = m->dense_pin_all_attn ? 4 : 2;
+            for (int s = 0; s < n_slots; s++) {
+                m->dense_ping[s] = [g_moe_dev newBufferWithLength:(size_t)off options:MTLResourceStorageModeShared];
+            }
+            m->cache_vram_bytes = (int64_t)(off * (uint64_t)n_slots);
         } else if (m->resident_mode) {
             m->cache_vram_bytes = m->total_streamable_bytes;
         }
@@ -1878,6 +1891,7 @@ int64_t tn_moe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int64
         m->prefetch_grp = dispatch_group_create();
         m->dense_io_grp = dispatch_group_create();
         m->io_queue = dispatch_queue_create("tenon.stream.nvme", DISPATCH_QUEUE_CONCURRENT);
+        m->ring_prod_q = dispatch_queue_create("tenon.stream.ring_prod", DISPATCH_QUEUE_SERIAL);
         m->active = 1;
         return (int64_t)slot;
     }
@@ -2238,11 +2252,30 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
         }
 
         // =========================================================================
-        // PATH B: DENSE 2-LAYER PING-PONG STREAMING MODE (e.g. Llama-3.3-70B in <2.5 GiB or <=16 GiB!)
+        // PATH B: DENSE STREAMING MODE (2-Slot Ultra-Low <2.5 GiB OR Role-Aware All-Attn + 4-Slot Continuous FFN Ring!)
         // =========================================================================
         if (m->dense_model) {
-            // 1. Run Embedding + all pinned prefix layers (0 .. cache_slots_per_layer-1) in ONE CommandBuffer
             int first_stream = m->cache_slots_per_layer;
+            int n_ring = m->dense_pin_all_attn ? 4 : 2;
+            dispatch_semaphore_t sem_empty = nil;
+            dispatch_semaphore_t sem_full = nil;
+
+            // If overlap is enabled and there are layers to stream, kick off a CONTINUOUS producer thread right away!
+            // It immediately starts filling ring slots `0..n_ring-1` WHILE GPU runs pinned prefix layers 0..first_stream-1!
+            if (m->enable_overlap && first_stream < m->n_layers) {
+                sem_empty = dispatch_semaphore_create(n_ring);
+                sem_full  = dispatch_semaphore_create(0);
+                int n_layers_cap = m->n_layers;
+                dispatch_group_async(m->dense_io_grp, m->ring_prod_q, ^{
+                    for (int pL = first_stream; pL < n_layers_cap; pL++) {
+                        dispatch_semaphore_wait(sem_empty, DISPATCH_TIME_FOREVER);
+                        load_dense_layer_into_ping(m, pL, (pL - first_stream) % n_ring, 1);
+                        dispatch_semaphore_signal(sem_full);
+                    }
+                });
+            }
+
+            // 1. Run Embedding + all pinned prefix layers (0 .. first_stream-1) in ONE CommandBuffer!
             {
                 id<MTLCommandBuffer> pcmd = [g_moe_q commandBuffer];
                 id<MTLComputeCommandEncoder> penc = [pcmd computeCommandEncoder];
@@ -2259,36 +2292,27 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                 }
                 [penc endEncoding];
                 [pcmd commit];
-
-                // OVERLAP: While GPU computes pinned prefix layers, preload `first_stream` layer into ping[0]!
-                if (m->enable_overlap && first_stream < m->n_layers) {
-                    double io0 = moe_now_ms();
-                    load_dense_layer_into_ping(m, first_stream, 0, 1);
-                    ssd_acc_ms += (moe_now_ms() - io0);
-                    m->cache_misses++;
-                }
                 [pcmd waitUntilCompleted];
             }
 
-            // 2. Stream remaining layers (first_stream .. n_layers-1) via 2-Slot Ping-Pong Ring Buffer!
+            // 2. Consume remaining layers from continuous 2-slot or 4-slot Ring Buffer (instant slot recycling!)
             for (int L = first_stream; L < m->n_layers; L++) {
                 MoeLayer* ly = &m->layers[L];
-                int cur = (L - first_stream) & 1;
-                int nxt = cur ^ 1;
+                int cur = (L - first_stream) % n_ring;
                 if (!m->enable_overlap) {
-                    // Naive Serial Sync Baseline
                     double io0 = moe_now_ms();
                     load_dense_layer_into_ping(m, L, cur, 0);
                     ssd_acc_ms += (moe_now_ms() - io0);
                     m->cache_misses++;
-                } else if (L > first_stream) {
-                    dispatch_group_wait(m->dense_io_grp, DISPATCH_TIME_FOREVER);
+                } else {
+                    m->cache_misses++;
+                    dispatch_semaphore_wait(sem_full, DISPATCH_TIME_FOREVER);
                 }
 
-                // Launch GPU Layer L reading from `dense_ping[cur]`
                 id<MTLCommandBuffer> lcmd = [g_moe_q commandBuffer];
                 id<MTLComputeCommandEncoder> lenc = [lcmd computeCommandEncoder];
-                encode_layer_attn_body(m, lenc, L, (uint32_t)pos, m->dense_ping[cur]);
+                // When `dense_pin_all_attn == 1`, Attention reads directly from pinned GPU VRAM (`nil`), only FFN reads ring!
+                encode_layer_attn_body(m, lenc, L, (uint32_t)pos, m->dense_pin_all_attn ? nil : m->dense_ping[cur]);
                 encode_dense_ffn_raw(m, lenc,
                     m->dense_ping[cur], m->dense_off_gate, ly->ffn_gate.ggml_type,
                     m->dense_ping[cur], m->dense_off_up,   ly->ffn_up.ggml_type,
@@ -2296,17 +2320,10 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                     (uint32_t)m->d_ff_dense);
                 [lenc endEncoding];
                 [lcmd commit];
-
-                // CONCURRENTLY with GPU computing Layer L: stream Layer L+1 into `dense_ping[nxt]` (instant release of L-1)!
-                if (m->enable_overlap && L + 1 < m->n_layers) {
-                    int next_L = L + 1;
-                    m->cache_misses++;
-                    dispatch_group_async(m->dense_io_grp, m->io_queue, ^{
-                        load_dense_layer_into_ping(m, next_L, nxt, 1);
-                    });
-                }
                 [lcmd waitUntilCompleted];
+                if (m->enable_overlap) dispatch_semaphore_signal(sem_empty); // Instantly recycle slot for producer!
             }
+            if (m->enable_overlap) dispatch_group_wait(m->dense_io_grp, DISPATCH_TIME_FOREVER);
 
             // 3. Final Norm + LM Head + Argmax
             id<MTLCommandBuffer> fcmd = [g_moe_q commandBuffer];
@@ -2680,7 +2697,7 @@ int64_t tn_moe_free(int64_t handle) {
         free(m->vocab_tokens);
         m->vocab_tokens = NULL;
     }
-    m->dense_ping[0] = nil; m->dense_ping[1] = nil;
+    for (int s = 0; s < 4; s++) m->dense_ping[s] = nil;
     m->tok_embd.buf = nil; m->out_norm.buf = nil; m->lm_head.buf = nil; m->rope_freqs.buf = nil;
     m->buf_emb_row = nil; m->buf_x = nil; m->buf_xn = nil; m->buf_q = nil; m->buf_k = nil; m->buf_v = nil;
     m->buf_ctx = nil; m->buf_rlogits = nil; m->buf_eidx = nil; m->buf_ewt = nil;

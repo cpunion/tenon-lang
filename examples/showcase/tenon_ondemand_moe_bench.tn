@@ -150,10 +150,10 @@ fn bench_llama70b() {
         path, prompt_ids, gen_n, 0, true, true, true, ref_ids, false
     )
 
-    // [D2] Tenon Hybrid Prefix (26 Pinned Layers) + Ping-Pong (54 Streamed) strictly <= 14.5 GiB (< 16 GiB!)
+    // [D2] Tenon Role-Aware All-Attn (80/80 Attn GPU) + 15 Pinned FFNs + 4-Slot Continuous FFN Ring (<= 15.5 GiB < 16 GiB!)
     let _ = run_stream_config(
-        "[D2-HYB16] 70B Pin26+Stream (<=15G,  Overlap) ",
-        path, prompt_ids, gen_n, 26, true, true, true, ref_ids, false
+        "[D2-RING16] 70B AllAttn+15FFN (<=15.5G, 4-Ring)",
+        path, prompt_ids, gen_n, 15, true, true, true, ref_ids, false
     )
 }
 
