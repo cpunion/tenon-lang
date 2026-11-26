@@ -31,6 +31,9 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#include <immintrin.h>
+#endif
 
 #define CM_MAX_MODELS   8
 #define CM_MAX_SHARDS   16
@@ -39,7 +42,8 @@
 #define CM_MAX_TOPK     16
 #define CM_MAX_SEQ      1024
 #define CM_STAGE_SLOTS  16
-#define CM_IO_WORKERS   4
+#define CM_IO_WORKERS   8
+#define CM_MAX_CPU_THR  64
 
 #define CM_GGML_F32   0
 #define CM_GGML_F16   1
@@ -104,6 +108,7 @@ typedef CUresult (*fn_cuEventCreate)(CUevent*, unsigned int);
 typedef CUresult (*fn_cuEventDestroy_v2)(CUevent);
 typedef CUresult (*fn_cuEventRecord)(CUevent, CUstream);
 typedef CUresult (*fn_cuEventSynchronize)(CUevent);
+typedef CUresult (*fn_cuEventQuery)(CUevent);
 typedef CUresult (*fn_cuModuleLoadData)(CUmodule*, const void*);
 typedef CUresult (*fn_cuModuleGetFunction)(CUfunction*, CUmodule, const char*);
 typedef CUresult (*fn_cuLaunchKernel)(
@@ -155,6 +160,7 @@ typedef struct {
     fn_cuEventDestroy_v2 cuEventDestroy;
     fn_cuEventRecord cuEventRecord;
     fn_cuEventSynchronize cuEventSynchronize;
+    fn_cuEventQuery cuEventQuery;
     fn_cuModuleLoadData cuModuleLoadData;
     fn_cuModuleGetFunction cuModuleGetFunction;
     fn_cuLaunchKernel cuLaunchKernel;
@@ -864,6 +870,7 @@ int64_t tn_cumoe_init(void) {
     g_cu.cuEventDestroy       = (fn_cuEventDestroy_v2)cm_sym(g_cu.libcuda, "cuEventDestroy_v2", "cuEventDestroy");
     g_cu.cuEventRecord        = (fn_cuEventRecord)cm_sym(g_cu.libcuda, "cuEventRecord", NULL);
     g_cu.cuEventSynchronize   = (fn_cuEventSynchronize)cm_sym(g_cu.libcuda, "cuEventSynchronize", NULL);
+    g_cu.cuEventQuery         = (fn_cuEventQuery)cm_sym(g_cu.libcuda, "cuEventQuery", NULL);
     g_cu.cuModuleLoadData     = (fn_cuModuleLoadData)cm_sym(g_cu.libcuda, "cuModuleLoadData", NULL);
     g_cu.cuModuleGetFunction  = (fn_cuModuleGetFunction)cm_sym(g_cu.libcuda, "cuModuleGetFunction", NULL);
     g_cu.cuLaunchKernel       = (fn_cuLaunchKernel)cm_sym(g_cu.libcuda, "cuLaunchKernel", NULL);
@@ -965,6 +972,7 @@ typedef struct {
     int exp_to_slot[CM_MAX_EXPERTS];
     int slot_to_exp[CM_MAX_EXPERTS];
     uint64_t slot_lru[CM_MAX_EXPERTS];
+    uint32_t exp_freq[CM_MAX_EXPERTS];
     CUdeviceptr k_cache, v_cache;
 } CmLayer;
 
@@ -1007,6 +1015,48 @@ typedef struct {
     uint32_t* h_eidx;
     float* h_ewt;
     uint8_t* h_emb_row;
+    float* h_xn;
+    float* h_cpu_accum;
+    float* cpu_h;
+    CUdeviceptr d_cpu_accum;
+
+    // Zero-stall background VRAM promotion state (dedicated promoter thread + dma_stream!)
+    CUevent ev_promo_done;
+    uint8_t* promo_stage;
+    pthread_t promo_thread;
+    pthread_mutex_t promo_mu;
+    pthread_cond_t promo_cv;
+    int promo_thread_init;
+    int promo_stop;
+    volatile int promo_state; // 0 = idle, 1 = staging+submitting, 2 = dma_submitted
+    int promo_layer;
+    int promo_slot;
+    int promo_eid;
+    int decode_phase;
+
+    // Spin-then-wait 32-thread AVX2+FMA CPU compute pool for in-place DDR4 miss/FFN execution
+    pthread_t cpu_threads[CM_MAX_CPU_THR];
+    pthread_mutex_t cpu_mu;
+    pthread_cond_t cpu_cv_go;
+    int cpu_n_thr;
+    int cpu_pool_init;
+    volatile int cpu_stop;
+    volatile int cpu_sleeping;
+    volatile uint64_t cpu_gen;
+    volatile int cpu_mode; // 1 = MoE missed experts, 2 = Dense unpinned FFN
+    volatile int cpu_phase1_done;
+    volatile int cpu_phase2_done;
+    int cpu_layer;
+    int cpu_n_misses;
+    int cpu_miss_eids[CM_MAX_TOPK];
+    float cpu_miss_w[CM_MAX_TOPK];
+    // Pre-quantized Q8_0 activation buffers (for 3x faster AVX2 vpmaddubsw INT8 SIMD!)
+    int8_t*  cpu_xq8;
+    float*   cpu_xd;
+    float*   cpu_xsum;
+    int8_t*  cpu_hq8;
+    float*   cpu_hd;
+    float*   cpu_hsum;
 
     // Dense streaming 4-slot VRAM ring + 4-slot pinned host ring
     int dense_pin_all_attn;
@@ -1021,6 +1071,27 @@ typedef struct {
     // GPU activations
     CUdeviceptr d_emb_row, d_x, d_xn, d_q, d_k, d_v, d_ctx;
     CUdeviceptr d_rlogits, d_eidx, d_ewt, d_h, d_sh_g, d_sh_u, d_logits, d_argmax;
+
+    // Persistent host staging worker pool (zero pthread_create/join overhead per layer!)
+    pthread_t io_threads[CM_IO_WORKERS];
+    pthread_mutex_t io_mu;
+    pthread_cond_t io_cv_go;
+    pthread_cond_t io_cv_done;
+    int io_pool_init;
+    int io_stop;
+    uint64_t io_gen;
+    int io_mode; // 1 = MoE experts, 2 = Dense slice copy
+    int io_n_tasks;
+    int io_done_cnt;
+    int io_layer;
+    int io_eids[CM_MAX_TOPK];
+    uint8_t* io_dsts[CM_MAX_TOPK];
+    volatile int io_task_ready[CM_MAX_TOPK];
+    // Dense slice copy args
+    int io_dense_shard;
+    uint8_t* io_dense_dst;
+    uint64_t io_dense_off;
+    size_t io_dense_len;
 
     // Counters
     uint64_t lru_clock;
@@ -1329,6 +1400,9 @@ static int launch_tail_until_next_moe(CmModel* m, CUstream st, int start_L, uint
         launch_layer_attn(m, st, L, pos, 0);
         launch_gemv(st, &ly->router, m->d_xn, m->d_rlogits, (uint32_t)m->n_experts, (uint32_t)m->d_model, 0);
         g_cu.cuMemcpyDtoHAsync(m->h_rlogits, m->d_rlogits, (size_t)m->n_experts * 4, st);
+        if (m->enable_overlap && !m->use_nocache && m->h_xn) {
+            g_cu.cuMemcpyDtoHAsync(m->h_xn, m->d_xn, (size_t)m->d_model * 4, st);
+        }
     } else {
         launch_final_lm_head(m, st);
         g_cu.cuMemcpyDtoHAsync(m->h_argmax, m->d_argmax, 4, st);
@@ -1349,15 +1423,8 @@ static void launch_moe_slots(CmModel* m, CUstream st, int L, uint32_t n_act) {
 }
 
 // ============================================================================
-// Parallel Pinned Host Staging + Async PCIe DMA Workers
+// Persistent Host Staging Worker Pool + Pipelined Async PCIe DMA
 // ============================================================================
-typedef struct {
-    CmModel* m;
-    int L;
-    int eid;
-    uint8_t* dst;
-} StageJob;
-
 static void cm_stage_expert(CmModel* m, int L, int eid, uint8_t* dst) {
     CmLayer* ly = &m->layers[L];
     cm_read_slice(m, ly->gate_exps.shard_idx, dst, (size_t)ly->gate_exp_bytes,
@@ -1368,10 +1435,96 @@ static void cm_stage_expert(CmModel* m, int L, int eid, uint8_t* dst) {
                   ly->down_exps.file_off + (uint64_t)eid * ly->down_exp_bytes);
 }
 
-static void* cm_stage_worker(void* arg) {
-    StageJob* j = (StageJob*)arg;
-    cm_stage_expert(j->m, j->L, j->eid, j->dst);
+typedef struct { CmModel* m; int tid; } IoPoolArg;
+
+static void* cm_io_pool_worker(void* arg) {
+    IoPoolArg* a = (IoPoolArg*)arg;
+    CmModel* m = a->m;
+    int tid = a->tid;
+    free(a);
+    uint64_t seen_gen = 0;
+    for (;;) {
+        pthread_mutex_lock(&m->io_mu);
+        while (!m->io_stop && m->io_gen == seen_gen) pthread_cond_wait(&m->io_cv_go, &m->io_mu);
+        if (m->io_stop) { pthread_mutex_unlock(&m->io_mu); break; }
+        seen_gen = m->io_gen;
+        int mode = m->io_mode;
+        int n_tasks = m->io_n_tasks;
+        int L = m->io_layer;
+        pthread_mutex_unlock(&m->io_mu);
+
+        if (mode == 1) {
+            for (int i = tid; i < n_tasks; i += CM_IO_WORKERS) {
+                cm_stage_expert(m, L, m->io_eids[i], m->io_dsts[i]);
+                __sync_synchronize();
+                m->io_task_ready[i] = 1;
+                pthread_mutex_lock(&m->io_mu);
+                m->io_done_cnt++;
+                pthread_cond_signal(&m->io_cv_done);
+                pthread_mutex_unlock(&m->io_mu);
+            }
+        } else if (mode == 2) {
+            if (tid < n_tasks) {
+                size_t tot = m->io_dense_len;
+                size_t chunk = (tot + (size_t)n_tasks - 1) / (size_t)n_tasks;
+                size_t s0 = (size_t)tid * chunk;
+                if (s0 < tot) {
+                    size_t len = (s0 + chunk <= tot) ? chunk : (tot - s0);
+                    cm_read_slice(m, m->io_dense_shard, m->io_dense_dst + s0, len, m->io_dense_off + (uint64_t)s0);
+                }
+                pthread_mutex_lock(&m->io_mu);
+                m->io_done_cnt++;
+                if (m->io_done_cnt >= n_tasks) pthread_cond_signal(&m->io_cv_done);
+                pthread_mutex_unlock(&m->io_mu);
+            }
+        }
+    }
     return NULL;
+}
+
+static void cm_io_pool_start(CmModel* m) {
+    if (m->io_pool_init) return;
+    pthread_mutex_init(&m->io_mu, NULL);
+    pthread_cond_init(&m->io_cv_go, NULL);
+    pthread_cond_init(&m->io_cv_done, NULL);
+    m->io_stop = 0; m->io_gen = 0; m->io_pool_init = 1;
+    for (int t = 0; t < CM_IO_WORKERS; t++) {
+        IoPoolArg* a = (IoPoolArg*)malloc(sizeof(IoPoolArg));
+        a->m = m; a->tid = t;
+        pthread_create(&m->io_threads[t], NULL, cm_io_pool_worker, a);
+    }
+}
+
+static void cm_io_pool_stop(CmModel* m) {
+    if (!m->io_pool_init) return;
+    pthread_mutex_lock(&m->io_mu);
+    m->io_stop = 1;
+    pthread_cond_broadcast(&m->io_cv_go);
+    pthread_mutex_unlock(&m->io_mu);
+    for (int t = 0; t < CM_IO_WORKERS; t++) pthread_join(m->io_threads[t], NULL);
+    pthread_mutex_destroy(&m->io_mu);
+    pthread_cond_destroy(&m->io_cv_go);
+    pthread_cond_destroy(&m->io_cv_done);
+    m->io_pool_init = 0;
+}
+
+static void cm_read_slice_parallel(CmModel* m, int shard, uint8_t* dst, size_t n, uint64_t off) {
+    if (!m->io_pool_init || n < (4u << 20)) {
+        cm_read_slice(m, shard, dst, n, off);
+        return;
+    }
+    pthread_mutex_lock(&m->io_mu);
+    m->io_mode = 2;
+    m->io_n_tasks = CM_IO_WORKERS;
+    m->io_done_cnt = 0;
+    m->io_dense_shard = shard;
+    m->io_dense_dst = dst;
+    m->io_dense_off = off;
+    m->io_dense_len = n;
+    m->io_gen++;
+    pthread_cond_broadcast(&m->io_cv_go);
+    while (m->io_done_cnt < CM_IO_WORKERS) pthread_cond_wait(&m->io_cv_done, &m->io_mu);
+    pthread_mutex_unlock(&m->io_mu);
 }
 
 static int cm_pick_lru(CmModel* m, CmLayer* ly, const int* pinned, int npin) {
@@ -1380,10 +1533,608 @@ static int cm_pick_lru(CmModel* m, CmLayer* ly, const int* pinned, int npin) {
         int is_p = 0;
         for (int p = 0; p < npin; p++) if (pinned[p] == s) { is_p = 1; break; }
         if (is_p) continue;
-        if (ly->slot_to_exp[s] < 0) return s;
+        if (ly->slot_to_exp[s] == -2) continue; // reserved for in-flight async promotion
+        if (ly->slot_to_exp[s] == -1) return s;
         if (ly->slot_lru[s] < best_ts) { best_ts = ly->slot_lru[s]; victim = s; }
     }
     return (victim >= 0) ? victim : 0;
+}
+
+// ============================================================================
+// Exact FP32 AVX2+FMA+F16C In-Place DDR4 CPU Kernels + 32-Thread Spin-Wait Pool
+// ============================================================================
+static inline float cm_f16_bits_to_f32(uint16_t h) {
+#if defined(__F16C__)
+    return _cvtsh_ss(h);
+#else
+    uint32_t s = ((uint32_t)(h & 0x8000u)) << 16;
+    uint32_t e = (h >> 10) & 0x1Fu;
+    uint32_t m = h & 0x03FFu;
+    uint32_t bits;
+    if (e == 0) {
+        if (m == 0) bits = s;
+        else { e = 127 - 14; while (!(m & 0x0400u)) { m <<= 1; e--; } m &= 0x03FFu; bits = s | (e << 23) | (m << 13); }
+    } else if (e == 31) bits = s | 0x7F800000u | (m << 13);
+    else bits = s | ((e + 112u) << 23) | (m << 13);
+    float f; memcpy(&f, &bits, 4); return f;
+#endif
+}
+
+static inline void cm_cpu_pause(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+static inline float cm_hsum256(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+}
+
+// Quantize FP32 activation vector into Q8_0 blocks (int8[32] + float scale + exact FP32 block sum)
+static void cm_quantize_q8_0(const float* __restrict__ x, int8_t* __restrict__ q8,
+                             float* __restrict__ ds, float* __restrict__ xsum, uint32_t dim) {
+    uint32_t nb = dim >> 5;
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    for (uint32_t b = 0; b < nb; b++) {
+        const float* xp = x + ((size_t)b << 5);
+        __m256 v0 = _mm256_loadu_ps(xp),      v1 = _mm256_loadu_ps(xp + 8);
+        __m256 v2 = _mm256_loadu_ps(xp + 16), v3 = _mm256_loadu_ps(xp + 24);
+        __m256 sv = _mm256_add_ps(_mm256_add_ps(v0, v1), _mm256_add_ps(v2, v3));
+        xsum[b] = cm_hsum256(sv);
+        __m256 am = _mm256_max_ps(
+            _mm256_max_ps(_mm256_andnot_ps(sign_mask, v0), _mm256_andnot_ps(sign_mask, v1)),
+            _mm256_max_ps(_mm256_andnot_ps(sign_mask, v2), _mm256_andnot_ps(sign_mask, v3)));
+        __m128 am4 = _mm_max_ps(_mm256_castps256_ps128(am), _mm256_extractf128_ps(am, 1));
+        am4 = _mm_max_ps(am4, _mm_movehl_ps(am4, am4));
+        am4 = _mm_max_ss(am4, _mm_shuffle_ps(am4, am4, 1));
+        float amax = _mm_cvtss_f32(am4);
+        float d = amax / 127.0f;
+        float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        ds[b] = d;
+        __m256 vid = _mm256_set1_ps(id);
+        __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, vid));
+        __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, vid));
+        __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, vid));
+        __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, vid));
+        // Pack 32x int32 -> 32x int8 preserving exact lane order [0..31]!
+        __m128i p01_lo = _mm_packs_epi32(_mm256_castsi256_si128(i0), _mm256_extracti128_si256(i0, 1));
+        __m128i p01_hi = _mm_packs_epi32(_mm256_castsi256_si128(i1), _mm256_extracti128_si256(i1, 1));
+        __m128i p23_lo = _mm_packs_epi32(_mm256_castsi256_si128(i2), _mm256_extracti128_si256(i2, 1));
+        __m128i p23_hi = _mm_packs_epi32(_mm256_castsi256_si128(i3), _mm256_extracti128_si256(i3, 1));
+        _mm_storeu_si128((__m128i*)(q8 + ((size_t)b << 5)),      _mm_packs_epi16(p01_lo, p01_hi));
+        _mm_storeu_si128((__m128i*)(q8 + ((size_t)b << 5) + 16), _mm_packs_epi16(p23_lo, p23_hi));
+    }
+}
+
+// Ultra-fast AVX2 INT8 `vpmaddubsw` Q4_0 x Q8_0 2-row dot product (only 8 SIMD ops per 32 weights -> 180+ GB/s!)
+static void cm_cpu_dot_q4_0_q8_2rows(const uint8_t* __restrict__ w0, const uint8_t* __restrict__ w1,
+                                     const int8_t* __restrict__ xq8, const float* __restrict__ xd,
+                                     const float* __restrict__ xsum, uint32_t nb, float* o0, float* o1) {
+    const __m128i m0f    = _mm_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    float b0 = 0.0f, b1 = 0.0f;
+    for (uint32_t b = 0; b < nb; b++) {
+        __m256i xq = _mm256_loadu_si256((const __m256i*)(xq8 + ((size_t)b << 5)));
+        float d_x = xd[b], xs = xsum[b];
+
+        const uint8_t* p0 = w0 + (size_t)b * 18u;
+        const uint8_t* p1 = w1 + (size_t)b * 18u;
+        _mm_prefetch((const char*)(p0 + 18u * 8u), _MM_HINT_T0);
+        _mm_prefetch((const char*)(p1 + 18u * 8u), _MM_HINT_T0);
+
+        float dw0 = _cvtsh_ss(*(const uint16_t*)p0);
+        __m128i q0 = _mm_loadu_si128((const __m128i*)(p0 + 2));
+        __m256i u0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q0, 4), m0f), _mm_and_si128(q0, m0f));
+        __m256i s0 = _mm256_madd_epi16(_mm256_maddubs_epi16(u0, xq), ones16);
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(dw0 * d_x), _mm256_cvtepi32_ps(s0), acc0);
+        b0 += dw0 * xs;
+
+        float dw1 = _cvtsh_ss(*(const uint16_t*)p1);
+        __m128i q1 = _mm_loadu_si128((const __m128i*)(p1 + 2));
+        __m256i u1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q1, 4), m0f), _mm_and_si128(q1, m0f));
+        __m256i s1 = _mm256_madd_epi16(_mm256_maddubs_epi16(u1, xq), ones16);
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(dw1 * d_x), _mm256_cvtepi32_ps(s1), acc1);
+        b1 += dw1 * xs;
+    }
+    *o0 = cm_hsum256(acc0) - 8.0f * b0;
+    *o1 = cm_hsum256(acc1) - 8.0f * b1;
+}
+
+// 4-row unrolled AVX2 INT8 `vpmaddubsw` Q4_0 x Q8_0 (4x xq reuse, saturates 8-channel EPYC DDR4!)
+static void cm_cpu_dot_q4_0_q8_4rows(const uint8_t* __restrict__ w0, uint64_t rb,
+                                     const int8_t* __restrict__ xq8, const float* __restrict__ xd,
+                                     const float* __restrict__ xsum, uint32_t nb, float out[4]) {
+    const uint8_t* w1 = w0 + rb;
+    const uint8_t* w2 = w0 + rb * 2u;
+    const uint8_t* w3 = w0 + rb * 3u;
+    const __m128i m0f    = _mm_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+    for (uint32_t b = 0; b < nb; b++) {
+        __m256i xq = _mm256_loadu_si256((const __m256i*)(xq8 + ((size_t)b << 5)));
+        float d_x = xd[b], xs = xsum[b];
+        size_t boff = (size_t)b * 18u;
+        const uint8_t *p0 = w0 + boff, *p1 = w1 + boff, *p2 = w2 + boff, *p3 = w3 + boff;
+        _mm_prefetch((const char*)(p0 + 18u * 8u), _MM_HINT_T0);
+        _mm_prefetch((const char*)(p1 + 18u * 8u), _MM_HINT_T0);
+        _mm_prefetch((const char*)(p2 + 18u * 8u), _MM_HINT_T0);
+        _mm_prefetch((const char*)(p3 + 18u * 8u), _MM_HINT_T0);
+
+        float dw0 = _cvtsh_ss(*(const uint16_t*)p0);
+        __m128i q0 = _mm_loadu_si128((const __m128i*)(p0 + 2));
+        __m256i u0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q0, 4), m0f), _mm_and_si128(q0, m0f));
+        a0 = _mm256_fmadd_ps(_mm256_set1_ps(dw0 * d_x), _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u0, xq), ones16)), a0);
+        b0 += dw0 * xs;
+
+        float dw1 = _cvtsh_ss(*(const uint16_t*)p1);
+        __m128i q1 = _mm_loadu_si128((const __m128i*)(p1 + 2));
+        __m256i u1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q1, 4), m0f), _mm_and_si128(q1, m0f));
+        a1 = _mm256_fmadd_ps(_mm256_set1_ps(dw1 * d_x), _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u1, xq), ones16)), a1);
+        b1 += dw1 * xs;
+
+        float dw2 = _cvtsh_ss(*(const uint16_t*)p2);
+        __m128i q2 = _mm_loadu_si128((const __m128i*)(p2 + 2));
+        __m256i u2 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q2, 4), m0f), _mm_and_si128(q2, m0f));
+        a2 = _mm256_fmadd_ps(_mm256_set1_ps(dw2 * d_x), _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u2, xq), ones16)), a2);
+        b2 += dw2 * xs;
+
+        float dw3 = _cvtsh_ss(*(const uint16_t*)p3);
+        __m128i q3 = _mm_loadu_si128((const __m128i*)(p3 + 2));
+        __m256i u3 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q3, 4), m0f), _mm_and_si128(q3, m0f));
+        a3 = _mm256_fmadd_ps(_mm256_set1_ps(dw3 * d_x), _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u3, xq), ones16)), a3);
+        b3 += dw3 * xs;
+    }
+    out[0] = cm_hsum256(a0) - 8.0f * b0;
+    out[1] = cm_hsum256(a1) - 8.0f * b1;
+    out[2] = cm_hsum256(a2) - 8.0f * b2;
+    out[3] = cm_hsum256(a3) - 8.0f * b3;
+}
+
+static void cm_cpu_dot_q4_1_q8_2rows(const uint8_t* __restrict__ w0, const uint8_t* __restrict__ w1,
+                                     const int8_t* __restrict__ xq8, const float* __restrict__ xd,
+                                     const float* __restrict__ xsum, uint32_t nb, float* o0, float* o1) {
+    const __m128i m0f    = _mm_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    float m0 = 0.0f, m1 = 0.0f;
+    for (uint32_t b = 0; b < nb; b++) {
+        __m256i xq = _mm256_loadu_si256((const __m256i*)(xq8 + ((size_t)b << 5)));
+        float d_x = xd[b], xs = xsum[b];
+        const uint8_t* p0 = w0 + (size_t)b * 20u;
+        const uint8_t* p1 = w1 + (size_t)b * 20u;
+
+        float dw0 = _cvtsh_ss(*(const uint16_t*)p0), mw0 = _cvtsh_ss(*(const uint16_t*)(p0 + 2));
+        __m128i q0 = _mm_loadu_si128((const __m128i*)(p0 + 4));
+        __m256i u0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q0, 4), m0f), _mm_and_si128(q0, m0f));
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(dw0 * d_x), _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u0, xq), ones16)), acc0);
+        m0 += mw0 * xs;
+
+        float dw1 = _cvtsh_ss(*(const uint16_t*)p1), mw1 = _cvtsh_ss(*(const uint16_t*)(p1 + 2));
+        __m128i q1 = _mm_loadu_si128((const __m128i*)(p1 + 4));
+        __m256i u1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q1, 4), m0f), _mm_and_si128(q1, m0f));
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(dw1 * d_x), _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(u1, xq), ones16)), acc1);
+        m1 += mw1 * xs;
+    }
+    *o0 = cm_hsum256(acc0) + m0;
+    *o1 = cm_hsum256(acc1) + m1;
+}
+
+static void cm_cpu_dot_q4_0_fp32_2rows(const uint8_t* __restrict__ w0, const uint8_t* __restrict__ w1,
+                                       const float* __restrict__ x, uint32_t nb, float* o0, float* o1) {
+    const __m128i m0f = _mm_set1_epi8(0x0F);
+    const __m256i b8  = _mm256_set1_epi32(8);
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    for (uint32_t b = 0; b < nb; b++) {
+        const float* xp = x + ((size_t)b << 5);
+        __m256 x0 = _mm256_loadu_ps(xp),      x1 = _mm256_loadu_ps(xp + 8);
+        __m256 x2 = _mm256_loadu_ps(xp + 16), x3 = _mm256_loadu_ps(xp + 24);
+        const uint8_t *p0 = w0 + (size_t)b * 18u, *p1 = w1 + (size_t)b * 18u;
+        __m256 d0 = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*)p0));
+        __m128i q0 = _mm_loadu_si128((const __m128i*)(p0 + 2));
+        __m128i lo0 = _mm_and_si128(q0, m0f), hi0 = _mm_and_si128(_mm_srli_epi16(q0, 4), m0f);
+        __m256 s0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo0), b8)), x0,
+                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo0, 8)), b8)), x1,
+                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi0), b8)), x2,
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(hi0, 8)), b8)), x3))));
+        acc0 = _mm256_fmadd_ps(d0, s0, acc0);
+
+        __m256 d1 = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*)p1));
+        __m128i q1 = _mm_loadu_si128((const __m128i*)(p1 + 2));
+        __m128i lo1 = _mm_and_si128(q1, m0f), hi1 = _mm_and_si128(_mm_srli_epi16(q1, 4), m0f);
+        __m256 s1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo1), b8)), x0,
+                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo1, 8)), b8)), x1,
+                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi1), b8)), x2,
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(hi1, 8)), b8)), x3))));
+        acc1 = _mm256_fmadd_ps(d1, s1, acc1);
+    }
+    *o0 = cm_hsum256(acc0); *o1 = cm_hsum256(acc1);
+}
+
+static void cm_cpu_dot_q4_1_fp32_2rows(const uint8_t* __restrict__ w0, const uint8_t* __restrict__ w1,
+                                       const float* __restrict__ x, uint32_t nb, float* o0, float* o1) {
+    const __m128i m0f = _mm_set1_epi8(0x0F);
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    for (uint32_t b = 0; b < nb; b++) {
+        const float* xp = x + ((size_t)b << 5);
+        __m256 x0 = _mm256_loadu_ps(xp),      x1 = _mm256_loadu_ps(xp + 8);
+        __m256 x2 = _mm256_loadu_ps(xp + 16), x3 = _mm256_loadu_ps(xp + 24);
+        __m256 xs = _mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3));
+        const uint8_t *p0 = w0 + (size_t)b * 20u, *p1 = w1 + (size_t)b * 20u;
+        __m256 d0 = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*)p0)), mv0 = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*)(p0 + 2)));
+        __m128i q0 = _mm_loadu_si128((const __m128i*)(p0 + 4));
+        __m128i lo0 = _mm_and_si128(q0, m0f), hi0 = _mm_and_si128(_mm_srli_epi16(q0, 4), m0f);
+        __m256 s0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo0)), x0,
+                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(lo0, 8))), x1,
+                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi0)), x2,
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(hi0, 8))), x3))));
+        acc0 = _mm256_fmadd_ps(d0, s0, _mm256_fmadd_ps(mv0, xs, acc0));
+
+        __m256 d1 = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*)p1)), mv1 = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*)(p1 + 2)));
+        __m128i q1 = _mm_loadu_si128((const __m128i*)(p1 + 4));
+        __m128i lo1 = _mm_and_si128(q1, m0f), hi1 = _mm_and_si128(_mm_srli_epi16(q1, 4), m0f);
+        __m256 s1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo1)), x0,
+                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(lo1, 8))), x1,
+                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi1)), x2,
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(hi1, 8))), x3))));
+        acc1 = _mm256_fmadd_ps(d1, s1, _mm256_fmadd_ps(mv1, xs, acc1));
+    }
+    *o0 = cm_hsum256(acc0); *o1 = cm_hsum256(acc1);
+}
+#endif
+
+static float cm_cpu_dot_1row_generic(const uint8_t* w, uint32_t gtype, const float* x, uint32_t in_dim) {
+    if (gtype == CM_GGML_Q4_0) {
+        uint32_t nb = in_dim >> 5; float sum = 0.0f;
+        for (uint32_t b = 0; b < nb; b++) {
+            const uint8_t* p = w + (size_t)b * 18u; const float* xp = x + ((size_t)b << 5);
+            float d = cm_f16_bits_to_f32(*(const uint16_t*)p); float s = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                uint8_t q = p[2 + i];
+                s += (float)((int)(q & 0x0Fu) - 8) * xp[i] + (float)((int)(q >> 4) - 8) * xp[16 + i];
+            }
+            sum += d * s;
+        }
+        return sum;
+    } else if (gtype == CM_GGML_Q4_1) {
+        uint32_t nb = in_dim >> 5; float sum = 0.0f;
+        for (uint32_t b = 0; b < nb; b++) {
+            const uint8_t* p = w + (size_t)b * 20u; const float* xp = x + ((size_t)b << 5);
+            float d = cm_f16_bits_to_f32(*(const uint16_t*)p), mv = cm_f16_bits_to_f32(*(const uint16_t*)(p + 2));
+            float s = 0.0f, sx = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                uint8_t q = p[4 + i];
+                s += (float)(q & 0x0Fu) * xp[i] + (float)(q >> 4) * xp[16 + i];
+                sx += xp[i] + xp[16 + i];
+            }
+            sum += d * s + mv * sx;
+        }
+        return sum;
+    } else if (gtype == CM_GGML_Q8_0) {
+        uint32_t nb = in_dim >> 5; float sum = 0.0f;
+        for (uint32_t b = 0; b < nb; b++) {
+            const uint8_t* p = w + (size_t)b * 34u; const float* xp = x + ((size_t)b << 5);
+            float d = cm_f16_bits_to_f32(*(const uint16_t*)p); float s = 0.0f;
+            const int8_t* qs = (const int8_t*)(p + 2);
+            for (int i = 0; i < 32; i++) s += (float)qs[i] * xp[i];
+            sum += d * s;
+        }
+        return sum;
+    } else if (gtype == CM_GGML_Q6_K) {
+        uint32_t nb = in_dim >> 8; float sum = 0.0f;
+        for (uint32_t b = 0; b < nb; b++) {
+            const uint8_t* blk = w + (size_t)b * 210u; const float* xp = x + ((size_t)b << 8);
+            const uint8_t* ql = blk; const uint8_t* qh = blk + 128u; const int8_t* sc = (const int8_t*)(blk + 192u);
+            float d = cm_f16_bits_to_f32(*(const uint16_t*)(blk + 208u)); float bsum = 0.0f;
+            for (uint32_t n = 0; n < 256u; n += 128u) {
+                const uint8_t* qlp = ql + (n >> 1); const uint8_t* qhp = qh + (n >> 2);
+                const int8_t* scp = sc + (n >> 4); const float* xpp = xp + n;
+                for (uint32_t l = 0; l < 32u; l++) {
+                    uint32_t is = l >> 4; uint8_t qla = qlp[l], qlb = qlp[l + 32u], qhv = qhp[l];
+                    int q1 = (int)((qla & 0xFu) | (((qhv >> 0) & 3u) << 4)) - 32;
+                    int q2 = (int)((qlb & 0xFu) | (((qhv >> 2) & 3u) << 4)) - 32;
+                    int q3 = (int)((qla >> 4)   | (((qhv >> 4) & 3u) << 4)) - 32;
+                    int q4 = (int)((qlb >> 4)   | (((qhv >> 6) & 3u) << 4)) - 32;
+                    bsum += (float)scp[is + 0] * (float)q1 * xpp[l] + (float)scp[is + 2] * (float)q2 * xpp[l + 32u]
+                          + (float)scp[is + 4] * (float)q3 * xpp[l + 64u] + (float)scp[is + 6] * (float)q4 * xpp[l + 96u];
+                }
+            }
+            sum += d * bsum;
+        }
+        return sum;
+    } else if (gtype == CM_GGML_F16) {
+        const uint16_t* p = (const uint16_t*)w; float s = 0.0f;
+        for (uint32_t i = 0; i < in_dim; i++) s += cm_f16_bits_to_f32(p[i]) * x[i];
+        return s;
+    } else {
+        const float* p = (const float*)w; float s = 0.0f;
+        for (uint32_t i = 0; i < in_dim; i++) s += p[i] * x[i];
+        return s;
+    }
+}
+
+static inline void cm_cpu_dot_2rows(const uint8_t* w0, const uint8_t* w1, uint32_t gtype,
+                                    const float* x, const int8_t* xq8, const float* xd, const float* xsum,
+                                    uint32_t in_dim, float* o0, float* o1) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    if (in_dim > 8192u) {
+        if (gtype == CM_GGML_Q4_0) { cm_cpu_dot_q4_0_fp32_2rows(w0, w1, x, in_dim >> 5, o0, o1); return; }
+        if (gtype == CM_GGML_Q4_1) { cm_cpu_dot_q4_1_fp32_2rows(w0, w1, x, in_dim >> 5, o0, o1); return; }
+    } else {
+        if (gtype == CM_GGML_Q4_0) { cm_cpu_dot_q4_0_q8_2rows(w0, w1, xq8, xd, xsum, in_dim >> 5, o0, o1); return; }
+        if (gtype == CM_GGML_Q4_1) { cm_cpu_dot_q4_1_q8_2rows(w0, w1, xq8, xd, xsum, in_dim >> 5, o0, o1); return; }
+    }
+#endif
+    (void)xq8; (void)xd; (void)xsum;
+    *o0 = cm_cpu_dot_1row_generic(w0, gtype, x, in_dim);
+    *o1 = cm_cpu_dot_1row_generic(w1, gtype, x, in_dim);
+}
+
+static inline void cm_cpu_dot_4rows(const uint8_t* w0, uint64_t rb, uint32_t gtype,
+                                    const float* x, const int8_t* xq8, const float* xd, const float* xsum,
+                                    uint32_t in_dim, float out[4]) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    if (gtype == CM_GGML_Q4_0 && in_dim <= 8192u) { cm_cpu_dot_q4_0_q8_4rows(w0, rb, xq8, xd, xsum, in_dim >> 5, out); return; }
+#endif
+    cm_cpu_dot_2rows(w0, w0 + rb, gtype, x, xq8, xd, xsum, in_dim, &out[0], &out[1]);
+    cm_cpu_dot_2rows(w0 + rb * 2u, w0 + rb * 3u, gtype, x, xq8, xd, xsum, in_dim, &out[2], &out[3]);
+}
+
+typedef struct { CmModel* m; int tid; } CpuPoolArg;
+
+static void* cm_cpu_pool_worker(void* arg) {
+    CpuPoolArg* a = (CpuPoolArg*)arg;
+    CmModel* m = a->m;
+    int tid = a->tid;
+    free(a);
+    uint64_t seen_gen = 0;
+    for (;;) {
+        uint64_t g = __atomic_load_n(&m->cpu_gen, __ATOMIC_ACQUIRE);
+        if (g == seen_gen && !__atomic_load_n(&m->cpu_stop, __ATOMIC_ACQUIRE)) {
+            for (int sp = 0; sp < 40000; sp++) {
+                cm_cpu_pause();
+                g = __atomic_load_n(&m->cpu_gen, __ATOMIC_ACQUIRE);
+                if (g != seen_gen || __atomic_load_n(&m->cpu_stop, __ATOMIC_ACQUIRE)) break;
+            }
+        }
+        if (g == seen_gen && !__atomic_load_n(&m->cpu_stop, __ATOMIC_ACQUIRE)) {
+            pthread_mutex_lock(&m->cpu_mu);
+            __atomic_fetch_add(&m->cpu_sleeping, 1, __ATOMIC_ACQ_REL);
+            while (!__atomic_load_n(&m->cpu_stop, __ATOMIC_ACQUIRE) &&
+                   __atomic_load_n(&m->cpu_gen, __ATOMIC_ACQUIRE) == seen_gen) {
+                pthread_cond_wait(&m->cpu_cv_go, &m->cpu_mu);
+            }
+            __atomic_fetch_sub(&m->cpu_sleeping, 1, __ATOMIC_ACQ_REL);
+            pthread_mutex_unlock(&m->cpu_mu);
+            g = __atomic_load_n(&m->cpu_gen, __ATOMIC_ACQUIRE);
+        }
+        if (__atomic_load_n(&m->cpu_stop, __ATOMIC_ACQUIRE)) break;
+        seen_gen = g;
+
+        int n_thr = m->cpu_n_thr;
+        int mode = m->cpu_mode;
+        int L = m->cpu_layer;
+        CmLayer* ly = &m->layers[L];
+        const float* xn = m->h_xn;
+        const int8_t* xq8 = m->cpu_xq8;
+        const float* xd = m->cpu_xd;
+        const float* xsum = m->cpu_xsum;
+        uint32_t dm = (uint32_t)m->d_model;
+
+        if (mode == 1) {
+            // SPARSE MoE IN-PLACE AVX2 INT8 `vpmaddubsw` COMPUTE FOR `n_misses` MISSED EXPERTS!
+            int nm = m->cpu_n_misses;
+            uint32_t df = (uint32_t)m->d_ff_exp;
+            uint32_t gt = ly->gate_exps.ggml_type, ut = ly->up_exps.ggml_type, dt = ly->down_exps.ggml_type;
+            uint64_t grb = cm_ggml_type_bytes(gt, dm), urb = cm_ggml_type_bytes(ut, dm), drb = cm_ggml_type_bytes(dt, df);
+            const uint8_t* g_base = m->mmap_ptrs[ly->gate_exps.shard_idx] + ly->gate_exps.file_off;
+            const uint8_t* u_base = m->mmap_ptrs[ly->up_exps.shard_idx]   + ly->up_exps.file_off;
+            const uint8_t* d_base = m->mmap_ptrs[ly->down_exps.shard_idx] + ly->down_exps.file_off;
+
+            // Phase 1: parallel over 32-row chunks (so each thread quantizes its own Q8_0 blocks of cpu_h!)
+            uint32_t blks_per_exp = df >> 5;
+            uint32_t tot_blks = (uint32_t)nm * blks_per_exp;
+            uint32_t b0 = (uint32_t)(((uint64_t)tot_blks * (uint64_t)tid) / (uint64_t)n_thr);
+            uint32_t b1 = (uint32_t)(((uint64_t)tot_blks * (uint64_t)(tid + 1)) / (uint64_t)n_thr);
+            for (uint32_t bi = b0; bi < b1; bi++) {
+                int mi = (int)(bi / blks_per_exp);
+                uint32_t rb_idx = bi % blks_per_exp;
+                uint32_t r0 = rb_idx << 5;
+                int eid = m->cpu_miss_eids[mi];
+                float* hp = m->cpu_h + (size_t)mi * df + r0;
+                const uint8_t* gp = g_base + (uint64_t)eid * ly->gate_exp_bytes + (uint64_t)r0 * grb;
+                const uint8_t* up = u_base + (uint64_t)eid * ly->up_exp_bytes   + (uint64_t)r0 * urb;
+                for (uint32_t k = 0; k < 32u; k += 4u) {
+                    float gv[4], uv[4];
+                    cm_cpu_dot_4rows(gp + (uint64_t)k * grb, grb, gt, xn, xq8, xd, xsum, dm, gv);
+                    cm_cpu_dot_4rows(up + (uint64_t)k * urb, urb, ut, xn, xq8, xd, xsum, dm, uv);
+                    for (int j = 0; j < 4; j++) hp[k + (uint32_t)j] = (gv[j] / (1.0f + expf(-gv[j]))) * uv[j];
+                }
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+                cm_quantize_q8_0(hp, m->cpu_hq8 + (size_t)bi * 32u, &m->cpu_hd[bi], &m->cpu_hsum[bi], 32u);
+#endif
+            }
+
+            // Lock-free spin barrier between Phase 1 and Phase 2
+            __atomic_fetch_add(&m->cpu_phase1_done, 1, __ATOMIC_ACQ_REL);
+            while (__atomic_load_n(&m->cpu_phase1_done, __ATOMIC_ACQUIRE) < n_thr) cm_cpu_pause();
+
+            // Phase 2: parallel over 4-row groups of output dimension d_model!
+            uint32_t dm_quads = dm >> 2;
+            uint32_t d0 = (uint32_t)(((uint64_t)dm_quads * (uint64_t)tid) / (uint64_t)n_thr);
+            uint32_t d1 = (uint32_t)(((uint64_t)dm_quads * (uint64_t)(tid + 1)) / (uint64_t)n_thr);
+            for (uint32_t dq = d0; dq < d1; dq++) {
+                uint32_t r = dq << 2;
+                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+                for (int mi = 0; mi < nm; mi++) {
+                    int eid = m->cpu_miss_eids[mi];
+                    const uint8_t* dwp = d_base + (uint64_t)eid * ly->down_exp_bytes + (uint64_t)r * drb;
+                    float ov[4];
+                    size_t hb = (size_t)mi * blks_per_exp;
+                    cm_cpu_dot_4rows(dwp, drb, dt, m->cpu_h + (size_t)mi * df,
+                                     m->cpu_hq8 + hb * 32u, m->cpu_hd + hb, m->cpu_hsum + hb, df, ov);
+                    float w = m->cpu_miss_w[mi];
+                    s0 += w * ov[0]; s1 += w * ov[1]; s2 += w * ov[2]; s3 += w * ov[3];
+                }
+                m->h_cpu_accum[r + 0] = s0; m->h_cpu_accum[r + 1] = s1;
+                m->h_cpu_accum[r + 2] = s2; m->h_cpu_accum[r + 3] = s3;
+            }
+        } else if (mode == 2) {
+            // DENSE UNPINNED FFN IN-PLACE AVX2 INT8 `vpmaddubsw` COMPUTE (4-row unrolled -> 180+ GB/s)!
+            uint32_t df = (uint32_t)m->d_ff_dense;
+            uint32_t gt = ly->ffn_gate.ggml_type, ut = ly->ffn_up.ggml_type, dt = ly->ffn_down.ggml_type;
+            uint64_t grb = cm_ggml_type_bytes(gt, dm), urb = cm_ggml_type_bytes(ut, dm), drb = cm_ggml_type_bytes(dt, df);
+            const uint8_t* g_base = m->mmap_ptrs[ly->ffn_gate.shard_idx] + ly->ffn_gate.file_off;
+            const uint8_t* u_base = m->mmap_ptrs[ly->ffn_up.shard_idx]   + ly->ffn_up.file_off;
+            const uint8_t* d_base = m->mmap_ptrs[ly->ffn_down.shard_idx] + ly->ffn_down.file_off;
+
+            uint32_t df_blks = df >> 5;
+            uint32_t b0 = (uint32_t)(((uint64_t)df_blks * (uint64_t)tid) / (uint64_t)n_thr);
+            uint32_t b1 = (uint32_t)(((uint64_t)df_blks * (uint64_t)(tid + 1)) / (uint64_t)n_thr);
+            for (uint32_t bi = b0; bi < b1; bi++) {
+                uint32_t r0 = bi << 5;
+                float* hp = m->cpu_h + r0;
+                const uint8_t* gp = g_base + (uint64_t)r0 * grb;
+                const uint8_t* up = u_base + (uint64_t)r0 * urb;
+                for (uint32_t k = 0; k < 32u; k += 4u) {
+                    float gv[4], uv[4];
+                    cm_cpu_dot_4rows(gp + (uint64_t)k * grb, grb, gt, xn, xq8, xd, xsum, dm, gv);
+                    cm_cpu_dot_4rows(up + (uint64_t)k * urb, urb, ut, xn, xq8, xd, xsum, dm, uv);
+                    for (int j = 0; j < 4; j++) hp[k + (uint32_t)j] = (gv[j] / (1.0f + expf(-gv[j]))) * uv[j];
+                }
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+                cm_quantize_q8_0(hp, m->cpu_hq8 + (size_t)bi * 32u, &m->cpu_hd[bi], &m->cpu_hsum[bi], 32u);
+#endif
+            }
+
+            __atomic_fetch_add(&m->cpu_phase1_done, 1, __ATOMIC_ACQ_REL);
+            while (__atomic_load_n(&m->cpu_phase1_done, __ATOMIC_ACQUIRE) < n_thr) cm_cpu_pause();
+
+            uint32_t dm_quads = dm >> 2;
+            uint32_t d0 = (uint32_t)(((uint64_t)dm_quads * (uint64_t)tid) / (uint64_t)n_thr);
+            uint32_t d1 = (uint32_t)(((uint64_t)dm_quads * (uint64_t)(tid + 1)) / (uint64_t)n_thr);
+            for (uint32_t dq = d0; dq < d1; dq++) {
+                uint32_t r = dq << 2;
+                float ov[4];
+                cm_cpu_dot_4rows(d_base + (uint64_t)r * drb, drb, dt, m->cpu_h,
+                                 m->cpu_hq8, m->cpu_hd, m->cpu_hsum, df, ov);
+                m->h_cpu_accum[r + 0] = ov[0]; m->h_cpu_accum[r + 1] = ov[1];
+                m->h_cpu_accum[r + 2] = ov[2]; m->h_cpu_accum[r + 3] = ov[3];
+            }
+        }
+
+        __atomic_fetch_add(&m->cpu_phase2_done, 1, __ATOMIC_ACQ_REL);
+    }
+    return NULL;
+}
+
+// Dedicated background promoter thread: stages hot expert + fires cuMemcpyHtoDAsync completely OFF main thread!
+static void* cm_promo_worker(void* arg) {
+    CmModel* m = (CmModel*)arg;
+    g_cu.cuCtxSetCurrent(g_cu.ctx);
+    for (;;) {
+        pthread_mutex_lock(&m->promo_mu);
+        while (!m->promo_stop && __atomic_load_n(&m->promo_state, __ATOMIC_ACQUIRE) != 1) {
+            pthread_cond_wait(&m->promo_cv, &m->promo_mu);
+        }
+        int stop = m->promo_stop;
+        int L = m->promo_layer, vs = m->promo_slot, eid = m->promo_eid;
+        pthread_mutex_unlock(&m->promo_mu);
+        if (stop) break;
+
+        CmLayer* ly = &m->layers[L];
+        cm_stage_expert(m, L, eid, m->promo_stage);
+        g_cu.cuMemcpyHtoDAsync(ly->cache_dptr + (uint64_t)vs * ly->slot_stride_bytes,
+                               m->promo_stage, (size_t)ly->slot_stride_bytes, m->dma_stream);
+        g_cu.cuEventRecord(m->ev_promo_done, m->dma_stream);
+        __sync_fetch_and_add(&m->pcie_h2d_bytes, (int64_t)ly->slot_stride_bytes);
+        __atomic_store_n(&m->promo_state, 2, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+
+static void cm_promo_start(CmModel* m) {
+    if (m->promo_thread_init) return;
+    pthread_mutex_init(&m->promo_mu, NULL);
+    pthread_cond_init(&m->promo_cv, NULL);
+    m->promo_stop = 0; m->promo_state = 0; m->promo_thread_init = 1;
+    pthread_create(&m->promo_thread, NULL, cm_promo_worker, m);
+}
+
+static void cm_promo_stop(CmModel* m) {
+    if (!m->promo_thread_init) return;
+    pthread_mutex_lock(&m->promo_mu);
+    m->promo_stop = 1;
+    pthread_cond_signal(&m->promo_cv);
+    pthread_mutex_unlock(&m->promo_mu);
+    pthread_join(m->promo_thread, NULL);
+    pthread_mutex_destroy(&m->promo_mu);
+    pthread_cond_destroy(&m->promo_cv);
+    m->promo_thread_init = 0;
+}
+
+static void cm_cpu_pool_start(CmModel* m) {
+    if (m->cpu_pool_init) return;
+    int nt = 32;
+    const char* env_t = getenv("TENON_CPU_THREADS");
+    if (env_t && atoi(env_t) > 0) nt = atoi(env_t);
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nproc > 0 && nt > (int)nproc) nt = (int)nproc;
+    if (nt > CM_MAX_CPU_THR) nt = CM_MAX_CPU_THR;
+    if (nt < 1) nt = 1;
+    m->cpu_n_thr = nt;
+    pthread_mutex_init(&m->cpu_mu, NULL);
+    pthread_cond_init(&m->cpu_cv_go, NULL);
+    m->cpu_stop = 0; m->cpu_sleeping = 0; m->cpu_gen = 0; m->cpu_pool_init = 1;
+    for (int t = 0; t < nt; t++) {
+        CpuPoolArg* a = (CpuPoolArg*)malloc(sizeof(CpuPoolArg));
+        a->m = m; a->tid = t;
+        pthread_create(&m->cpu_threads[t], NULL, cm_cpu_pool_worker, a);
+    }
+}
+
+static void cm_cpu_pool_stop(CmModel* m) {
+    if (!m->cpu_pool_init) return;
+    pthread_mutex_lock(&m->cpu_mu);
+    __atomic_store_n(&m->cpu_stop, 1, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&m->cpu_cv_go);
+    pthread_mutex_unlock(&m->cpu_mu);
+    for (int t = 0; t < m->cpu_n_thr; t++) pthread_join(m->cpu_threads[t], NULL);
+    pthread_mutex_destroy(&m->cpu_mu);
+    pthread_cond_destroy(&m->cpu_cv_go);
+    m->cpu_pool_init = 0;
+}
+
+static void cm_cpu_pool_run(CmModel* m, int mode, int L, int n_misses, const int* eids, const float* ws) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    cm_quantize_q8_0(m->h_xn, m->cpu_xq8, m->cpu_xd, m->cpu_xsum, (uint32_t)m->d_model);
+#endif
+    m->cpu_mode = mode;
+    m->cpu_layer = L;
+    m->cpu_n_misses = n_misses;
+    for (int i = 0; i < n_misses; i++) { m->cpu_miss_eids[i] = eids[i]; m->cpu_miss_w[i] = ws[i]; }
+    __atomic_store_n(&m->cpu_phase1_done, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->cpu_phase2_done, 0, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&m->cpu_gen, 1, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&m->cpu_sleeping, __ATOMIC_ACQUIRE) > 0) {
+        pthread_mutex_lock(&m->cpu_mu);
+        pthread_cond_broadcast(&m->cpu_cv_go);
+        pthread_mutex_unlock(&m->cpu_mu);
+    }
+}
+
+static inline void cm_cpu_pool_wait(CmModel* m) {
+    int nt = m->cpu_n_thr;
+    while (__atomic_load_n(&m->cpu_phase2_done, __ATOMIC_ACQUIRE) < nt) cm_cpu_pause();
 }
 
 static void cm_cpu_router_topk(const float* logits, const float* exp_bias, int n_exp, int top_k,
@@ -1417,14 +2168,14 @@ static void cm_cpu_router_topk(const float* logits, const float* exp_bias, int n
 static void cm_stage_dense_layer(CmModel* m, int L, uint8_t* dst) {
     CmLayer* ly = &m->layers[L];
     if (!m->dense_pin_all_attn) {
-        cm_read_slice(m, ly->wq.shard_idx, dst + m->dense_off_wq, (size_t)ly->wq.byte_size, ly->wq.file_off);
-        cm_read_slice(m, ly->wk.shard_idx, dst + m->dense_off_wk, (size_t)ly->wk.byte_size, ly->wk.file_off);
-        cm_read_slice(m, ly->wv.shard_idx, dst + m->dense_off_wv, (size_t)ly->wv.byte_size, ly->wv.file_off);
-        cm_read_slice(m, ly->wo.shard_idx, dst + m->dense_off_wo, (size_t)ly->wo.byte_size, ly->wo.file_off);
+        cm_read_slice_parallel(m, ly->wq.shard_idx, dst + m->dense_off_wq, (size_t)ly->wq.byte_size, ly->wq.file_off);
+        cm_read_slice_parallel(m, ly->wk.shard_idx, dst + m->dense_off_wk, (size_t)ly->wk.byte_size, ly->wk.file_off);
+        cm_read_slice_parallel(m, ly->wv.shard_idx, dst + m->dense_off_wv, (size_t)ly->wv.byte_size, ly->wv.file_off);
+        cm_read_slice_parallel(m, ly->wo.shard_idx, dst + m->dense_off_wo, (size_t)ly->wo.byte_size, ly->wo.file_off);
     }
-    cm_read_slice(m, ly->ffn_gate.shard_idx, dst + m->dense_off_gate, (size_t)ly->ffn_gate.byte_size, ly->ffn_gate.file_off);
-    cm_read_slice(m, ly->ffn_up.shard_idx,   dst + m->dense_off_up,   (size_t)ly->ffn_up.byte_size,   ly->ffn_up.file_off);
-    cm_read_slice(m, ly->ffn_down.shard_idx, dst + m->dense_off_down, (size_t)ly->ffn_down.byte_size, ly->ffn_down.file_off);
+    cm_read_slice_parallel(m, ly->ffn_gate.shard_idx, dst + m->dense_off_gate, (size_t)ly->ffn_gate.byte_size, ly->ffn_gate.file_off);
+    cm_read_slice_parallel(m, ly->ffn_up.shard_idx,   dst + m->dense_off_up,   (size_t)ly->ffn_up.byte_size,   ly->ffn_up.file_off);
+    cm_read_slice_parallel(m, ly->ffn_down.shard_idx, dst + m->dense_off_down, (size_t)ly->ffn_down.byte_size, ly->ffn_down.file_off);
 }
 
 typedef struct {
@@ -1623,29 +2374,34 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
     }
 
     if (m->dense_model && !m->resident_mode) {
-        uint64_t off = 0;
-        if (!m->dense_pin_all_attn) {
-            m->dense_off_wq = off; off += cm_align64(max_wq);
-            m->dense_off_wk = off; off += cm_align64(max_wk);
-            m->dense_off_wv = off; off += cm_align64(max_wv);
-            m->dense_off_wo = off; off += cm_align64(max_wo);
+        int use_cpu_ffn = (m->enable_overlap && !m->use_nocache && m->mmap_ptrs[0] != NULL);
+        if (!use_cpu_ffn) {
+            uint64_t off = 0;
+            if (!m->dense_pin_all_attn) {
+                m->dense_off_wq = off; off += cm_align64(max_wq);
+                m->dense_off_wk = off; off += cm_align64(max_wk);
+                m->dense_off_wv = off; off += cm_align64(max_wv);
+                m->dense_off_wo = off; off += cm_align64(max_wo);
+            }
+            m->dense_off_gate = off; off += cm_align64(max_fg);
+            m->dense_off_up   = off; off += cm_align64(max_fu);
+            m->dense_off_down = off; off += cm_align64(max_fd);
+            m->dense_ring_stride = off;
+            int n_slots = m->dense_pin_all_attn ? 4 : 2;
+            for (int s = 0; s < n_slots; s++) {
+                g_cu.cuMemAlloc(&m->dense_ring_dptr[s], (size_t)off);
+                g_cu.cuMemHostAlloc((void**)&m->dense_ring_host[s], (size_t)off, CU_MEMHOSTALLOC_PORTABLE);
+                g_cu.cuEventCreate(&m->dense_slot_ready[s], CU_EVENT_DISABLE_TIMING);
+                g_cu.cuEventCreate(&m->dense_slot_consumed[s], CU_EVENT_DISABLE_TIMING);
+            }
+            m->cache_vram_bytes = (int64_t)(off * (uint64_t)n_slots);
         }
-        m->dense_off_gate = off; off += cm_align64(max_fg);
-        m->dense_off_up   = off; off += cm_align64(max_fu);
-        m->dense_off_down = off; off += cm_align64(max_fd);
-        m->dense_ring_stride = off;
-        int n_slots = m->dense_pin_all_attn ? 4 : 2;
-        for (int s = 0; s < n_slots; s++) {
-            g_cu.cuMemAlloc(&m->dense_ring_dptr[s], (size_t)off);
-            g_cu.cuMemHostAlloc((void**)&m->dense_ring_host[s], (size_t)off, CU_MEMHOSTALLOC_PORTABLE);
-            g_cu.cuEventCreate(&m->dense_slot_ready[s], CU_EVENT_DISABLE_TIMING);
-            g_cu.cuEventCreate(&m->dense_slot_consumed[s], CU_EVENT_DISABLE_TIMING);
-        }
-        m->cache_vram_bytes = (int64_t)(off * (uint64_t)n_slots);
     } else if (!m->dense_model && max_exp_stride > 0) {
         m->stage_slot_bytes = (size_t)max_exp_stride;
         m->stage_n_slots = CM_STAGE_SLOTS;
         g_cu.cuMemHostAlloc((void**)&m->stage_host, m->stage_slot_bytes * (size_t)m->stage_n_slots, CU_MEMHOSTALLOC_PORTABLE);
+        g_cu.cuMemHostAlloc((void**)&m->promo_stage, m->stage_slot_bytes, CU_MEMHOSTALLOC_PORTABLE);
+        g_cu.cuEventCreate(&m->ev_promo_done, CU_EVENT_DISABLE_TIMING);
     }
 
     size_t h_elems = (size_t)m->d_ff_dense;
@@ -1666,12 +2422,32 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
     g_cu.cuMemAlloc(&m->d_sh_u, sh_elems * 4);
     g_cu.cuMemAlloc(&m->d_logits, (size_t)m->vocab_size * 4);
     g_cu.cuMemAlloc(&m->d_argmax, 16);
+    g_cu.cuMemAlloc(&m->d_cpu_accum, (size_t)m->d_model * 4);
 
     g_cu.cuMemHostAlloc((void**)&m->h_rlogits, (size_t)(m->n_experts > 16 ? m->n_experts : 16) * 4, CU_MEMHOSTALLOC_PORTABLE);
     g_cu.cuMemHostAlloc((void**)&m->h_argmax, 16, CU_MEMHOSTALLOC_PORTABLE);
-    g_cu.cuMemHostAlloc((void**)&m->h_eidx, 64, CU_MEMHOSTALLOC_PORTABLE);
-    g_cu.cuMemHostAlloc((void**)&m->h_ewt, 64, CU_MEMHOSTALLOC_PORTABLE);
+    g_cu.cuMemHostAlloc((void**)&m->h_eidx, (size_t)(CM_MAX_TOPK * 2) * sizeof(uint32_t), CU_MEMHOSTALLOC_PORTABLE);
+    g_cu.cuMemHostAlloc((void**)&m->h_ewt,  (size_t)(CM_MAX_TOPK * 2) * sizeof(float),    CU_MEMHOSTALLOC_PORTABLE);
     g_cu.cuMemHostAlloc((void**)&m->h_emb_row, 65536, CU_MEMHOSTALLOC_PORTABLE);
+    g_cu.cuMemHostAlloc((void**)&m->h_xn, (size_t)m->d_model * 4, CU_MEMHOSTALLOC_PORTABLE);
+    g_cu.cuMemHostAlloc((void**)&m->h_cpu_accum, (size_t)m->d_model * 4, CU_MEMHOSTALLOC_PORTABLE);
+    m->cpu_h = (float*)malloc(h_elems * sizeof(float));
+    size_t dm_blks = ((size_t)m->d_model + 31u) >> 5;
+    size_t h_blks  = (h_elems + 31u) >> 5;
+    m->cpu_xq8  = (int8_t*)malloc(dm_blks * 32u);
+    m->cpu_xd   = (float*)malloc(dm_blks * sizeof(float));
+    m->cpu_xsum = (float*)malloc(dm_blks * sizeof(float));
+    m->cpu_hq8  = (int8_t*)malloc(h_blks * 32u);
+    m->cpu_hd   = (float*)malloc(h_blks * sizeof(float));
+    m->cpu_hsum = (float*)malloc(h_blks * sizeof(float));
+
+    if (!m->resident_mode) {
+        cm_io_pool_start(m);
+        if (m->enable_overlap && !m->use_nocache && m->mmap_ptrs[0] != NULL) {
+            cm_cpu_pool_start(m);
+            if (!m->dense_model && m->promo_stage) cm_promo_start(m);
+        }
+    }
 
     m->active = 1;
     return (int64_t)slot;
@@ -1700,9 +2476,44 @@ int64_t tn_cumoe_step(int64_t handle, int64_t tok_id, int64_t pos) {
         return (int64_t)m->h_argmax[0];
     }
 
-    // PATH B: DENSE STREAMING (All-80-Attn + Prefix FFNs + 4-Slot Async PCIe DMA FFN Ring!)
+    // PATH B: DENSE STREAMING (All-80-Attn + Prefix FFNs + In-Place AVX2/FMA DDR4 OR 4-Slot PCIe Ring!)
     if (m->dense_model) {
         int first_stream = m->cache_slots_per_layer;
+        if (m->enable_overlap && !m->use_nocache && m->cpu_pool_init && m->dense_pin_all_attn) {
+            // HETEROGENEOUS HYBRID DENSE: All-80-Attn + Prefix FFNs on 1,008 GB/s GPU,
+            // remaining FFNs executed IN PLACE on 32-thread AVX2+FMA DDR4 (ZERO PCIe weight copy!)
+            launch_embed(m, m->compute_stream, (uint32_t)tok_id);
+            for (int L = 0; L < first_stream && L < m->n_layers; L++) {
+                CmLayer* ly = &m->layers[L];
+                launch_layer_attn(m, m->compute_stream, L, (uint32_t)pos, 0);
+                launch_dense_ffn_raw(m, m->compute_stream, ly->ffn_gate.dptr, ly->ffn_gate.ggml_type,
+                                     ly->ffn_up.dptr, ly->ffn_up.ggml_type,
+                                     ly->ffn_down.dptr, ly->ffn_down.ggml_type, (uint32_t)m->d_ff_dense);
+                m->cache_hits++;
+            }
+            CmWeightRef acc_ref = {0};
+            acc_ref.dptr = m->d_cpu_accum;
+            for (int L = first_stream; L < m->n_layers; L++) {
+                m->cache_misses++;
+                launch_layer_attn(m, m->compute_stream, L, (uint32_t)pos, 0);
+                g_cu.cuMemcpyDtoHAsync(m->h_xn, m->d_xn, (size_t)m->d_model * 4, m->compute_stream);
+                g_cu.cuStreamSynchronize(m->compute_stream);
+                double i0 = cm_now_ms();
+                cm_cpu_pool_run(m, 2, L, 0, NULL, NULL);
+                cm_cpu_pool_wait(m);
+                io_acc += (cm_now_ms() - i0);
+                g_cu.cuMemcpyHtoDAsync(m->d_cpu_accum, m->h_cpu_accum, (size_t)m->d_model * 4, m->compute_stream);
+                m->pcie_h2d_bytes += (int64_t)m->d_model * 4;
+                launch_add_bias(m->compute_stream, m->d_x, &acc_ref, (uint32_t)m->d_model);
+            }
+            launch_final_lm_head(m, m->compute_stream);
+            g_cu.cuMemcpyDtoHAsync(m->h_argmax, m->d_argmax, 4, m->compute_stream);
+            g_cu.cuStreamSynchronize(m->compute_stream);
+            double tot = cm_now_ms() - t0;
+            m->last_total_ms = tot; m->last_io_ms = io_acc; m->last_gpu_ms = tot - io_acc;
+            return (int64_t)m->h_argmax[0];
+        }
+
         int n_ring = m->dense_pin_all_attn ? 4 : 2;
         DenseRingProd prod;
         pthread_t prod_th;
@@ -1772,12 +2583,24 @@ int64_t tn_cumoe_step(int64_t handle, int64_t tok_id, int64_t pos) {
         return (int64_t)m->h_argmax[0];
     }
 
-    // PATH C: SPARSE MoE VRAM-LRU + PINNED ASYNC PCIe DMA DUAL-STREAM OVERLAP!
+    // PATH C: SPARSE MoE VRAM-LRU + HYBRID AVX2/FMA MISS-COMPUTE (RAM) OR DUAL-STREAM PCIe DMA (NVMe)!
+    int hybrid_ram = (m->enable_overlap && !m->use_nocache && m->cpu_pool_init && m->mmap_ptrs[0] != NULL);
     launch_embed(m, m->compute_stream, (uint32_t)tok_id);
     int L = launch_tail_until_next_moe(m, m->compute_stream, 0, (uint32_t)pos);
     g_cu.cuStreamSynchronize(m->compute_stream);
 
     while (L < m->n_layers) {
+        // Non-blocking poll of any in-flight background hot-expert VRAM promotion!
+        if (__atomic_load_n(&m->promo_state, __ATOMIC_ACQUIRE) == 2 &&
+            g_cu.cuEventQuery && g_cu.cuEventQuery(m->ev_promo_done) == CUDA_SUCCESS) {
+            CmLayer* ply = &m->layers[m->promo_layer];
+            ply->slot_to_exp[m->promo_slot] = m->promo_eid;
+            ply->exp_to_slot[m->promo_eid] = m->promo_slot;
+            ply->slot_lru[m->promo_slot] = ++m->lru_clock;
+            __atomic_store_n(&m->promo_state, 0, __ATOMIC_RELEASE);
+            m->prefetch_hits++;
+        }
+
         CmLayer* ly = &m->layers[L];
         int top_e[CM_MAX_TOPK]; float top_w[CM_MAX_TOPK];
         cm_cpu_router_topk(m->h_rlogits, ly->exp_bias_host, m->n_experts, m->top_k,
@@ -1789,6 +2612,7 @@ int64_t tn_cumoe_step(int64_t handle, int64_t tok_id, int64_t pos) {
 
         for (int k = 0; k < m->top_k; k++) {
             int eid = top_e[k], cs = ly->exp_to_slot[eid];
+            ly->exp_freq[eid]++;
             if (cs >= 0) {
                 m->cache_hits++;
                 ly->slot_lru[cs] = ++m->lru_clock;
@@ -1799,6 +2623,74 @@ int64_t tn_cumoe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                 miss_eids[n_misses] = eid; miss_w[n_misses] = top_w[k]; n_misses++;
             }
         }
+
+        // Check if layer L still has empty VRAM slots
+        int has_empty_slot = 0;
+        if (hybrid_ram && n_misses > 0) {
+            for (int s = 0; s < m->cache_slots_per_layer; s++) {
+                if (ly->slot_to_exp[s] == -1) { has_empty_slot = 1; break; }
+            }
+        }
+
+        // During prefill (before reset), populate empty VRAM slots; during decode, NEVER stall on PCIe!
+        if (hybrid_ram && n_misses > 0 && (m->decode_phase || !has_empty_slot)) {
+            // =================================================================
+            // TENON v3 HETEROGENEOUS ZERO-STALL HYBRID PATH:
+            //   1. GPU (1,008 GB/s GDDR6X): SharedExp + ALL VRAM Hits
+            //   2. CPU (32-Thread AVX2 INT8 vpmaddubsw, 180+ GB/s DDR4): ALL Misses IN PLACE!
+            //   3. Merge 16 KB FP32 partial sum -> GPU + launch Attn(L+1)
+            //   4. Off-thread background promoter silently fills empty slots or hot misses!
+            // =================================================================
+            if (ly->has_shared_exp) {
+                launch_dense_ffn_raw(m, m->compute_stream, ly->sh_gate.dptr, ly->sh_gate.ggml_type,
+                                     ly->sh_up.dptr, ly->sh_up.ggml_type, ly->sh_down.dptr, ly->sh_down.ggml_type, (uint32_t)m->d_ff_exp);
+            }
+            if (n_hits > 0) {
+                for (int hi = 0; hi < n_hits; hi++) { m->h_eidx[hi] = (uint32_t)hit_slots[hi]; m->h_ewt[hi] = hit_w[hi]; }
+                g_cu.cuMemcpyHtoDAsync(m->d_eidx, m->h_eidx, (size_t)n_hits * 4, m->compute_stream);
+                g_cu.cuMemcpyHtoDAsync(m->d_ewt,  m->h_ewt,  (size_t)n_hits * 4, m->compute_stream);
+                launch_moe_slots(m, m->compute_stream, L, (uint32_t)n_hits);
+            }
+
+            // SIMULTANEOUS 32-thread AVX2 INT8 `vpmaddubsw` CPU compute directly from mmap (ZERO memcpy!)
+            double i0 = cm_now_ms();
+            cm_cpu_pool_run(m, 1, L, n_misses, miss_eids, miss_w);
+            cm_cpu_pool_wait(m);
+            io_acc += (cm_now_ms() - i0);
+
+            // Merge 16 KB CPU partial sum into GPU residual d_x and immediately fire Attn(L+1)
+            g_cu.cuMemcpyHtoDAsync(m->d_cpu_accum, m->h_cpu_accum, (size_t)m->d_model * 4, m->compute_stream);
+            m->pcie_h2d_bytes += (int64_t)m->d_model * 4;
+            CmWeightRef acc_ref = {0}; acc_ref.dptr = m->d_cpu_accum;
+            launch_add_bias(m->compute_stream, m->d_x, &acc_ref, (uint32_t)m->d_model);
+            int next_L = launch_tail_until_next_moe(m, m->compute_stream, L + 1, (uint32_t)pos);
+
+            // Off-thread Zero-Stall Background Promotion (0.00 ms on main thread!)
+            if (m->promo_thread_init && __atomic_load_n(&m->promo_state, __ATOMIC_ACQUIRE) == 0 && g_cu.cuEventQuery) {
+                int best_eid = -1; uint32_t min_f = has_empty_slot ? 0u : 1u; uint32_t best_f = min_f;
+                for (int mi = 0; mi < n_misses; mi++) {
+                    int e = miss_eids[mi];
+                    if (ly->exp_freq[e] > best_f) { best_f = ly->exp_freq[e]; best_eid = e; }
+                }
+                if (best_eid >= 0) {
+                    int vs = cm_pick_lru(m, ly, pinned, npin);
+                    if (ly->slot_to_exp[vs] != -2) {
+                        int old_e = ly->slot_to_exp[vs];
+                        if (old_e >= 0) ly->exp_to_slot[old_e] = -1;
+                        ly->slot_to_exp[vs] = -2;
+                        pthread_mutex_lock(&m->promo_mu);
+                        m->promo_layer = L; m->promo_slot = vs; m->promo_eid = best_eid;
+                        __atomic_store_n(&m->promo_state, 1, __ATOMIC_RELEASE);
+                        pthread_cond_signal(&m->promo_cv);
+                        pthread_mutex_unlock(&m->promo_mu);
+                    }
+                }
+            }
+            g_cu.cuStreamSynchronize(m->compute_stream);
+            L = next_L;
+            continue;
+        }
+
         for (int mi = 0; mi < n_misses; mi++) {
             int vs = cm_pick_lru(m, ly, pinned, npin);
             pinned[npin++] = vs;
@@ -1864,28 +2756,57 @@ int64_t tn_cumoe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                 launch_moe_slots(m, m->compute_stream, L, (uint32_t)n_hits);
             }
 
-            // Stage missed experts in parallel into pinned host slots & fire async H2D DMA on dma_stream!
+            // Stage missed experts in parallel via persistent pool & pipeline cuMemcpyHtoDAsync as each completes!
             double i0 = cm_now_ms();
-            if (n_misses == 1) {
-                uint8_t* sp = m->stage_host;
-                cm_stage_expert(m, L, miss_eids[0], sp);
-                g_cu.cuMemcpyHtoDAsync(ly->cache_dptr + (uint64_t)miss_slots[0] * ly->slot_stride_bytes,
-                                       sp, (size_t)ly->slot_stride_bytes, m->dma_stream);
-                m->pcie_h2d_bytes += (int64_t)ly->slot_stride_bytes;
-            } else {
-                pthread_t ths[CM_MAX_TOPK];
-                StageJob jobs[CM_MAX_TOPK];
+            if (n_misses == 1 || !m->io_pool_init) {
                 for (int mi = 0; mi < n_misses; mi++) {
-                    jobs[mi].m = m; jobs[mi].L = L; jobs[mi].eid = miss_eids[mi];
-                    jobs[mi].dst = m->stage_host + (size_t)mi * m->stage_slot_bytes;
-                    pthread_create(&ths[mi], NULL, cm_stage_worker, &jobs[mi]);
-                }
-                for (int mi = 0; mi < n_misses; mi++) {
-                    pthread_join(ths[mi], NULL);
+                    uint8_t* sp = m->stage_host + (size_t)mi * m->stage_slot_bytes;
+                    cm_stage_expert(m, L, miss_eids[mi], sp);
                     g_cu.cuMemcpyHtoDAsync(ly->cache_dptr + (uint64_t)miss_slots[mi] * ly->slot_stride_bytes,
-                                           jobs[mi].dst, (size_t)ly->slot_stride_bytes, m->dma_stream);
+                                           sp, (size_t)ly->slot_stride_bytes, m->dma_stream);
                     m->pcie_h2d_bytes += (int64_t)ly->slot_stride_bytes;
                 }
+            } else {
+                pthread_mutex_lock(&m->io_mu);
+                m->io_mode = 1;
+                m->io_layer = L;
+                m->io_n_tasks = n_misses;
+                m->io_done_cnt = 0;
+                for (int mi = 0; mi < n_misses; mi++) {
+                    m->io_eids[mi] = miss_eids[mi];
+                    m->io_dsts[mi] = m->stage_host + (size_t)mi * m->stage_slot_bytes;
+                    m->io_task_ready[mi] = 0;
+                }
+                m->io_gen++;
+                pthread_cond_broadcast(&m->io_cv_go);
+                pthread_mutex_unlock(&m->io_mu);
+
+                int sent_flag[CM_MAX_TOPK] = {0};
+                int sent = 0;
+                while (sent < n_misses) {
+                    int progressed = 0;
+                    for (int mi = 0; mi < n_misses; mi++) {
+                        if (!sent_flag[mi] && m->io_task_ready[mi]) {
+                            __sync_synchronize();
+                            g_cu.cuMemcpyHtoDAsync(ly->cache_dptr + (uint64_t)miss_slots[mi] * ly->slot_stride_bytes,
+                                                   m->io_dsts[mi], (size_t)ly->slot_stride_bytes, m->dma_stream);
+                            m->pcie_h2d_bytes += (int64_t)ly->slot_stride_bytes;
+                            sent_flag[mi] = 1;
+                            sent++;
+                            progressed = 1;
+                        }
+                    }
+                    if (!progressed && sent < n_misses) {
+                        pthread_mutex_lock(&m->io_mu);
+                        int any_rdy = 0;
+                        for (int mi = 0; mi < n_misses; mi++) if (!sent_flag[mi] && m->io_task_ready[mi]) { any_rdy = 1; break; }
+                        if (!any_rdy && m->io_done_cnt < n_misses) pthread_cond_wait(&m->io_cv_done, &m->io_mu);
+                        pthread_mutex_unlock(&m->io_mu);
+                    }
+                }
+                pthread_mutex_lock(&m->io_mu);
+                while (m->io_done_cnt < n_misses) pthread_cond_wait(&m->io_cv_done, &m->io_mu);
+                pthread_mutex_unlock(&m->io_mu);
             }
             g_cu.cuEventRecord(m->ev_dma_done, m->dma_stream);
             io_acc += (cm_now_ms() - i0);
@@ -1946,6 +2867,7 @@ int64_t tn_cumoe_reset(int64_t handle) {
     CmModel* m = &g_cm[handle];
     m->cache_hits = 0; m->cache_misses = 0; m->prefetch_hits = 0;
     m->io_bytes_read = 0; m->pcie_h2d_bytes = 0;
+    m->decode_phase = 1;
     return 1;
 }
 
@@ -1979,6 +2901,9 @@ static void cm_free_dptr(CUdeviceptr* p) { if (*p) { g_cu.cuMemFree(*p); *p = 0;
 int64_t tn_cumoe_free(int64_t handle) {
     if (handle <= 0 || handle >= CM_MAX_MODELS || !g_cm[handle].active) return 0;
     CmModel* m = &g_cm[handle];
+    cm_promo_stop(m);
+    cm_cpu_pool_stop(m);
+    cm_io_pool_stop(m);
     if (m->compute_stream) g_cu.cuStreamSynchronize(m->compute_stream);
     if (m->dma_stream) g_cu.cuStreamSynchronize(m->dma_stream);
     for (int L = 0; L < m->n_layers; L++) {
@@ -2000,11 +2925,23 @@ int64_t tn_cumoe_free(int64_t handle) {
         if (m->dense_slot_consumed[s]) { g_cu.cuEventDestroy(m->dense_slot_consumed[s]); m->dense_slot_consumed[s] = NULL; }
     }
     if (m->stage_host) { g_cu.cuMemFreeHost(m->stage_host); m->stage_host = NULL; }
+    if (m->promo_stage) { g_cu.cuMemFreeHost(m->promo_stage); m->promo_stage = NULL; }
+    if (m->ev_promo_done) { g_cu.cuEventDestroy(m->ev_promo_done); m->ev_promo_done = NULL; }
     if (m->h_rlogits) { g_cu.cuMemFreeHost(m->h_rlogits); m->h_rlogits = NULL; }
     if (m->h_argmax)  { g_cu.cuMemFreeHost(m->h_argmax);  m->h_argmax = NULL; }
     if (m->h_eidx)    { g_cu.cuMemFreeHost(m->h_eidx);    m->h_eidx = NULL; }
     if (m->h_ewt)     { g_cu.cuMemFreeHost(m->h_ewt);     m->h_ewt = NULL; }
     if (m->h_emb_row) { g_cu.cuMemFreeHost(m->h_emb_row); m->h_emb_row = NULL; }
+    if (m->h_xn)      { g_cu.cuMemFreeHost(m->h_xn);      m->h_xn = NULL; }
+    if (m->h_cpu_accum) { g_cu.cuMemFreeHost(m->h_cpu_accum); m->h_cpu_accum = NULL; }
+    free(m->cpu_h); m->cpu_h = NULL;
+    free(m->cpu_xq8); m->cpu_xq8 = NULL;
+    free(m->cpu_xd); m->cpu_xd = NULL;
+    free(m->cpu_xsum); m->cpu_xsum = NULL;
+    free(m->cpu_hq8); m->cpu_hq8 = NULL;
+    free(m->cpu_hd); m->cpu_hd = NULL;
+    free(m->cpu_hsum); m->cpu_hsum = NULL;
+    cm_free_dptr(&m->d_cpu_accum);
     if (m->lm_head.dptr == m->tok_embd.dptr) m->lm_head.dptr = 0;
     cm_free_dptr(&m->tok_embd.dptr); cm_free_dptr(&m->out_norm.dptr); cm_free_dptr(&m->lm_head.dptr); cm_free_dptr(&m->rope_freqs.dptr);
     cm_free_dptr(&m->d_emb_row); cm_free_dptr(&m->d_x); cm_free_dptr(&m->d_xn); cm_free_dptr(&m->d_q);

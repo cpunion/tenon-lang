@@ -4,6 +4,8 @@ Cargo.lock
 *.sqlite-wal
 *.sqlite-shm
 .DS_Store
+.env
+.env.*
 .tenon-cache/
 benchmarks/bin/
 editors/vscode/node_modules/
