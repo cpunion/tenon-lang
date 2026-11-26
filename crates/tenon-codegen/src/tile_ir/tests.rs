@@ -283,11 +283,13 @@ pub fn ssm_scan(
     assert!(msl_scan_on.contains("simd_shuffle_up"));
     assert!(!msl_scan_off.contains("simd_shuffle_up"));
 
-    // Multi-backend CUDA & TPU StableHLO emission check across Stage-4 ops!
+    // Multi-backend CUDA & TPU StableHLO emission check across Stage-4 ops — ZERO stub kernels!
     for cg in &on {
         let cuda = emit_cuda_tpu::emit_universal_cuda(cg);
         let tpu = emit_cuda_tpu::emit_universal_stablehlo(cg);
         assert!(cuda.contains("__global__"));
+        assert!(!cuda.contains("(void)a;") && !cuda.contains("(void)x;") && !cuda.contains("(void)logits;"),
+            "found stub CUDA kernel in {}: {}", cg.graph.fn_name, cuda);
         assert!(tpu.contains("func.func"));
     }
 }

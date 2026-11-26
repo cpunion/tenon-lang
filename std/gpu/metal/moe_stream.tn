@@ -1,0 +1,137 @@
+// std/gpu/metal/moe_stream.tn — Universal Hard-Memory-Capped On-Demand SSD Streaming Engine (`@linear`)
+//
+// Zero-Rust Native Metal GGUF v3 Multi-Shard Streaming Engine for BOTH Oversized Sparse MoE & Oversized Dense LLMs:
+//   - Multi-Shard GGUF v3 (`-00001-of-0000N.gguf` auto-discovery) + `F_NOCACHE` raw NVMe SSD I/O (zero OS page-cache bloat!)
+//   - All 8 GGML quant formats: F32, F16, Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K
+//   - Architectures: Llama-3.3-70B (YaRN `rope_freqs`), GLM-4.5-Air (`glm4moe`: 128E Top-8, Sigmoid+Bias router,
+//     Shared Expert, Leading Dense Block, Partial RoPE, QKV Bias), OLMoE, Qwen3-MoE, Mixtral
+//   - Sparse MoE Mode: Bounded Per-Layer GPU LRU Expert Pool + Parallel NVMe `pread()` + Hit||Miss+SharedExp Overlap + L+1 Prefetch
+//   - Dense Mode: 2-Layer Ping-Pong Double-Buffer Ring Pool (GPU Layer L || NVMe Layer L+1, instant overwrite release, <3 GiB RAM!)
+//   - Kernel-Verified Process Memory Telemetry (`phys_footprint` via Mach `task_vm_info` + `ru_maxrss`)!
+
+import "std/core/types.tn"
+
+@c_src("moe_stream_shim.m")
+@link(framework = "Metal")
+@link(framework = "Foundation")
+extern "C" {
+    /// Loads single-file or multi-shard GGUF v3 model from `path_cstr` (pass shard-1 path for split GGUFs).
+    ///   - MoE models (`n_experts > 0`): `cache_slots_per_layer` = GPU LRU expert slots/layer (`<=0` or `>=n_experts` -> Resident).
+    ///   - Dense models (`n_experts == 0`): `cache_slots_per_layer` = pinned prefix layers (`0` = pure 2-Layer Ping-Pong ~2.5 GiB;
+    ///     `N` = pin layers `0..N-1` + Ping-Pong stream rest; `<0` or `>=n_layers` -> Resident).
+    ///   - `use_nocache`: `1` enables `fcntl(fd, F_NOCACHE, 1)` on ALL shard fds (strict uncached NVMe, ZERO OS page cache!).
+    ///   - `enable_overlap`: `1` enables async GPU||NVMe double-buffering / Hit||Miss overlap + parallel pread + prefetch;
+    ///     `0` runs naive synchronous serial pread baseline for strict ablation!
+    fn tn_moe_load_gguf(
+        path_cstr Ptr[UInt8],
+        cache_slots_per_layer Int,
+        use_nocache Int,
+        enable_overlap Int,
+    ) Int
+
+    /// Queries integer model/cache/OS-memory metadata:
+    ///   0=n_layers, 1=d_model, 2=d_ff, 3=n_heads, 4=n_kv, 5=n_experts, 6=top_k, 7=vocab,
+    ///   8=core_vram_bytes, 9=cache_vram_bytes, 10=total_streamable_bytes,
+    ///   11=bos_id, 12=eos_id, 13=cache_hits, 14=cache_misses, 15=prefetch_hits, 16=ssd_bytes_read,
+    ///   17=os_phys_footprint_bytes, 18=os_peak_rss_bytes, 19=total_model_disk_bytes, 20=num_shards
+    fn tn_moe_info(handle Int, field_id Int) Int
+
+    /// Resets per-run hit/miss/prefetch/SSD counters (preserving warm cache & KV state).
+    fn tn_moe_reset(handle Int) Int
+
+    /// Runs a single forward step at `pos` for token `tok_id` and returns argmax next token ID!
+    fn tn_moe_step(handle Int, tok_id Int, pos Int) Int
+
+    /// Decodes a token ID to a UTF-8 C string from the GGUF's embedded vocabulary.
+    fn tn_moe_token_cstr(handle Int, tok_id Int) Ptr[UInt8]
+
+    /// Greedy longest-match tokenizer over GGUF `tokenizer.ggml.tokens`.
+    fn tn_moe_tokenize(handle Int, text_cstr Ptr[UInt8], out_ids_ptr Ptr[UInt8], max_tokens Int) Int
+
+    /// Returns last step timing breakdown in milliseconds (`0=total_ms, 1=ssd_io_ms, 2=gpu_ms`).
+    fn tn_moe_last_timing_ms(handle Int, which Int) Float
+
+    /// Returns monotonic wall-clock timestamp in milliseconds.
+    fn tn_moe_now_ms() Float
+
+    /// Frees all GPU Metal buffers, LRU/Ping-Pong pools, file descriptors, and host tables.
+    fn tn_moe_free(handle Int) Int
+}
+
+pub fn moe_now_ms() Float {
+    unsafe { tn_moe_now_ms() }
+}
+
+/// `@linear` Leak-Free Hard-Memory-Capped Streaming LLM/MoE Engine Handle!
+@linear
+pub record StreamingMoeModel {
+    handle Int
+}
+
+impl StreamingMoeModel {
+    pub fn open_gguf(
+        path Text,
+        cache_slots_per_layer Int,
+        use_nocache Bool,
+        enable_overlap Bool,
+    ) StreamingMoeModel {
+        let nc = if use_nocache { 1 } else { 0 }
+        let ov = if enable_overlap { 1 } else { 0 }
+        let h = unsafe { tn_moe_load_gguf(text_cstr_ptr(path), cache_slots_per_layer, nc, ov) }
+        StreamingMoeModel { handle = h }
+    }
+
+    pub fn is_valid(inout self) Bool { self.handle > 0 }
+    pub fn n_layers(inout self) Int { unsafe { tn_moe_info(self.handle, 0) } }
+    pub fn d_model(inout self) Int { unsafe { tn_moe_info(self.handle, 1) } }
+    pub fn d_ff(inout self) Int { unsafe { tn_moe_info(self.handle, 2) } }
+    pub fn n_heads(inout self) Int { unsafe { tn_moe_info(self.handle, 3) } }
+    pub fn n_kv(inout self) Int { unsafe { tn_moe_info(self.handle, 4) } }
+    pub fn n_experts(inout self) Int { unsafe { tn_moe_info(self.handle, 5) } }
+    pub fn top_k(inout self) Int { unsafe { tn_moe_info(self.handle, 6) } }
+    pub fn vocab_size(inout self) Int { unsafe { tn_moe_info(self.handle, 7) } }
+    pub fn core_vram_bytes(inout self) Int { unsafe { tn_moe_info(self.handle, 8) } }
+    pub fn cache_vram_bytes(inout self) Int { unsafe { tn_moe_info(self.handle, 9) } }
+    pub fn total_expert_bytes(inout self) Int { unsafe { tn_moe_info(self.handle, 10) } }
+    pub fn bos_id(inout self) Int { unsafe { tn_moe_info(self.handle, 11) } }
+    pub fn eos_id(inout self) Int { unsafe { tn_moe_info(self.handle, 12) } }
+    pub fn cache_hits(inout self) Int { unsafe { tn_moe_info(self.handle, 13) } }
+    pub fn cache_misses(inout self) Int { unsafe { tn_moe_info(self.handle, 14) } }
+    pub fn prefetch_hits(inout self) Int { unsafe { tn_moe_info(self.handle, 15) } }
+    pub fn ssd_bytes_read(inout self) Int { unsafe { tn_moe_info(self.handle, 16) } }
+    pub fn os_phys_footprint_bytes(inout self) Int { unsafe { tn_moe_info(self.handle, 17) } }
+    pub fn os_peak_rss_bytes(inout self) Int { unsafe { tn_moe_info(self.handle, 18) } }
+    pub fn total_disk_bytes(inout self) Int { unsafe { tn_moe_info(self.handle, 19) } }
+    pub fn num_shards(inout self) Int { unsafe { tn_moe_info(self.handle, 20) } }
+
+    pub fn reset(inout self) {
+        let _ = unsafe { tn_moe_reset(self.handle) }
+    }
+
+    pub fn step(inout self, tok_id Int, pos Int) Int {
+        unsafe { tn_moe_step(self.handle, tok_id, pos) }
+    }
+
+    pub fn token_text(inout self, tok_id Int) Text {
+        unsafe { cstr_to_text(tn_moe_token_cstr(self.handle, tok_id)) }
+    }
+
+    pub fn tokenize(inout self, prompt Text, max_tokens Int) List[Int] {
+        var ids List[Int] = list_filled(max_tokens, 0)
+        let n = unsafe { tn_moe_tokenize(self.handle, text_cstr_ptr(prompt), list_data_ptr(ids), max_tokens) }
+        var out List[Int] = list_filled(n, 0)
+        var i = 0
+        while i < n {
+            out[i] = ids[i]
+            i += 1
+        }
+        out
+    }
+
+    pub fn last_ssd_ms(inout self) Float { unsafe { tn_moe_last_timing_ms(self.handle, 1) } }
+    pub fn last_gpu_ms(inout self) Float { unsafe { tn_moe_last_timing_ms(self.handle, 2) } }
+
+    pub fn destroy(self) {
+        let _ = unsafe { tn_moe_free(self.handle) }
+    }
+}

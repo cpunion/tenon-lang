@@ -2111,7 +2111,7 @@ fn emit_msl_flash_attention_mma(
          \t\t#pragma unroll\n\
          \t\tfor (uint t = 0; t < 4u; t++) simdgroup_store(ms[t], &sS[sg][t * 8u], 32ul);\n\
          \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
-         \t\t// Stage B: Vectorized float4/half4 + single-cycle `exp2()` Online Block-Row Softmax!\n\
+         \t\t// Stage B: Vectorized float4/half4 + single-cycle `exp2()` Online Block-Row Softmax (<16KB SMEM = 2 TGs/core!)\n\
          \t\tfloat4 sv0 = *(threadgroup const float4*)(&sS[sg][r_sm * 32u + c_sm]) * {scale_log2:.8}f;\n\
          \t\tfloat4 sv1 = *(threadgroup const float4*)(&sS[sg][r_sm * 32u + c_sm + 4u]) * {scale_log2:.8}f;\n\
          \t\tif (!({unmasked})) {{\n\
@@ -2147,7 +2147,7 @@ fn emit_msl_flash_attention_mma(
          \t\t\ts_alpha[sg][r_sm] = alpha;\n\
          \t\t}}\n\
          \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
-         \t\t// Rescale running AMX output accumulator `mo` ONLY when at least one row max increased (`simd_any`)!\n\
+         \t\t// Rescale AMX accumulator tiles ONLY when row max increased (`simd_any`, keeping `mo` pinned in AMX regs!)\n\
          \t\tfloat al = s_alpha[sg][r_sm];\n\
          \t\tif (kb > 0u && simd_any(al != 1.0f)) {{\n\
          \t\t\t#pragma unroll\n\
