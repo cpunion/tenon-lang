@@ -46,12 +46,14 @@ pub struct TileSchedule {
     pub use_mma: bool,
     pub stream_k: bool,
     pub warp_specialized: bool,
+    /// Facility #1: 2D L2/SLC Tile Swizzling (`GROUP_M = 8` block rasterization order).
+    pub tile_swizzle: bool,
 }
 
 impl TileSchedule {
     pub fn tag(&self) -> String {
         format!(
-            "m{}n{}k{}_sg{}_r{}_sk{}{}{}",
+            "m{}n{}k{}_sg{}_r{}_sk{}{}{}{}",
             self.bm,
             self.bn,
             self.bk,
@@ -59,7 +61,8 @@ impl TileSchedule {
             self.rows_per_sg,
             self.split_k,
             if self.double_buf { "_db" } else { "" },
-            if self.swizzle_pad > 0 { "_swz" } else { "" }
+            if self.swizzle_pad > 0 { "_swz" } else { "" },
+            if self.tile_swizzle { "_l2" } else { "" }
         )
     }
 
@@ -211,6 +214,109 @@ pub enum TileStage {
         devices: usize,
         out: String,
     },
+    /// Facility #2: Horizontal Weight-Packed N-way Projection (`PACK_CONCAT_NK` -> 1 wide `64x64` AMX GEMM).
+    ConcatContraction {
+        stage_id: usize,
+        name: String,
+        a: String,
+        weights: Vec<String>,
+        m: usize,
+        k: usize,
+        n_per: usize,
+        total_n: usize,
+        dtype: IrDType,
+        packed_enabled: bool,
+        schedule: TileSchedule,
+        out: String,
+    },
+    /// Facility #3: Zero-Copy Buffer-Donated Fused 128-bit AdamW Update (`llm.c` `adamw_kernel3`!).
+    InPlaceAdamW {
+        stage_id: usize,
+        name: String,
+        param: String,
+        grad: String,
+        m: String,
+        v: String,
+        numel: usize,
+        dtype: IrDType,
+        donate_enabled: bool,
+        out: String,
+    },
+    /// Facility #5: Online Monoid Fused Cross-Entropy Loss + In-Place Backward `dlogits` (`llm.c` `fused_classifier3`!).
+    CrossEntropyStage {
+        stage_id: usize,
+        name: String,
+        logits: String,
+        targets: String,
+        rows: usize,
+        vocab: usize,
+        dtype: IrDType,
+        online_fused: bool,
+        donate_enabled: bool,
+        scratch_probs: Option<String>,
+        out: String,
+    },
+    /// Facility #6: Auto Mixed-Precision Fused Single-Pass RMSNorm + Dynamic Quant W8A8/FP8 Contraction.
+    AmpQuantContraction {
+        stage_id: usize,
+        name: String,
+        x: String,
+        nw: String,
+        w: String,
+        m: usize,
+        k: usize,
+        n: usize,
+        dtype: IrDType,
+        quant_enabled: bool,
+        weight_layout: LayoutTag,
+        schedule: TileSchedule,
+        out: String,
+    },
+    /// Facility #7: Symbolic Dynamic-Shape Multi-Version Bucketed Contraction (O(1) dispatch, zero padding!).
+    DynBucketContraction {
+        stage_id: usize,
+        name: String,
+        a: String,
+        b: String,
+        max_m: usize,
+        k: usize,
+        n: usize,
+        dtype: IrDType,
+        weight_layout: LayoutTag,
+        bucket_enabled: bool,
+        tile_swizzle: bool,
+        out: String,
+    },
+    /// Facility #8A: Implicit GEMM 3x3 Conv2d (zero `im2col` HBM expansion!) vs explicit `im2col` + MatMul.
+    Conv2dStage {
+        stage_id: usize,
+        name: String,
+        x: String,
+        w: String,
+        in_h: usize,
+        in_w: usize,
+        c_in: usize,
+        c_out: usize,
+        kh: usize,
+        kw: usize,
+        dtype: IrDType,
+        weight_layout: LayoutTag,
+        implicit_enabled: bool,
+        im2col_scratch: Option<String>,
+        out: String,
+    },
+    /// Facility #8B: First-Class Associative Parallel Scan (`h_t = a_t * h_{t-1} + b_t`, Mamba/SSM/Linear-Attn).
+    ParallelScanStage {
+        stage_id: usize,
+        name: String,
+        a: String,
+        b: String,
+        batch: usize,
+        seq_len: usize,
+        dtype: IrDType,
+        parallel_enabled: bool,
+        out: String,
+    },
 }
 
 /// Static compile-time Arena memory layout computed via interval graph coloring!
@@ -220,6 +326,8 @@ pub struct StaticArenaPlan {
     pub total_arena_bytes: usize,
     pub naive_total_bytes: usize,
     pub vram_saved_pct: f64,
+    /// Bytes saved via Facility #3 Zero-Copy `inout` Buffer Donation (`DONATE_INOUT`).
+    pub donated_bytes: usize,
     /// Maps each intermediate tensor name -> `(byte_offset_in_arena, byte_size)`.
     pub allocations: BTreeMap<String, (usize, usize)>,
 }
@@ -243,8 +351,28 @@ pub fn lower_to_tile_stages(
             IrOp::MatMul { a, .. }
             | IrOp::Conv2d { x: a, .. }
             | IrOp::RaggedMatMul { a, .. }
-            | IrOp::BlockSparseMatMul { a, .. } => {
+            | IrOp::BlockSparseMatMul { a, .. }
+            | IrOp::DynMatMul { a, .. }
+            | IrOp::ConcatMatMul { a, .. } => {
                 non_weight_uses.insert(a.clone());
+            }
+            IrOp::AmpNormMatMul { x, nw, .. } => {
+                non_weight_uses.insert(x.clone());
+                non_weight_uses.insert(nw.clone());
+            }
+            IrOp::AdamWStep { param, grad, m, v } => {
+                non_weight_uses.insert(param.clone());
+                non_weight_uses.insert(grad.clone());
+                non_weight_uses.insert(m.clone());
+                non_weight_uses.insert(v.clone());
+            }
+            IrOp::CrossEntropy { logits, targets } => {
+                non_weight_uses.insert(logits.clone());
+                non_weight_uses.insert(targets.clone());
+            }
+            IrOp::ParallelScan { a, b } => {
+                non_weight_uses.insert(a.clone());
+                non_weight_uses.insert(b.clone());
             }
             IrOp::Binary { a, b, .. } => {
                 non_weight_uses.insert(a.clone());
@@ -271,6 +399,8 @@ pub fn lower_to_tile_stages(
     // Track which weights should be repacked at load time (`input_repacks`)
     let mut weight_layouts: BTreeMap<String, LayoutTag> = BTreeMap::new();
     let mut bsr32_weights: Vec<String> = Vec::new();
+    let mut int8_weights: Vec<String> = Vec::new();
+    let mut donated_bytes_total: usize = 0;
     let mut resolve_weight_layout = |w_name: &str, m: usize, k: usize, n: usize, w_dtype: IrDType, trans_b: bool| -> (IrDType, LayoutTag) {
         // If this parameter was already assigned a physical layout by an earlier stage (e.g. Forward
         // repacked `w1` to `ColMajorNK` and Backward reads `w1^T`), ALWAYS return its TRUE physical layout
@@ -522,40 +652,221 @@ pub fn lower_to_tile_stages(
                     split_k_scratch,
                 });
             }
-            IrOp::Conv2d { x, w, .. } => {
+            IrOp::Conv2d { x, w, in_h, in_w, kh, kw } => {
+                let sx = &g.tensors[x];
+                let sw = &g.tensors[w];
+                let c_in = sx.cols();
+                let c_out = sw.cols();
+                consumed[i] = true;
+                if *kh == 1 && *kw == 1 {
+                    let (m, k, n) = (sx.rows(), sx.cols(), sw.cols());
+                    let (epilogue, final_out) = if cfg.general_fusion {
+                        absorb_epilogue_chain(g, &mut consumed, &use_count, &output_set, node.out.clone())
+                    } else {
+                        (Vec::new(), node.out.clone())
+                    };
+                    let (eff_wdt, wlayout) = resolve_weight_layout(w, m, k, n, sw.dtype, false);
+                    let (schedule, pgo_candidates) = solve_tile_schedule(m, k, n, sx.dtype, eff_wdt, wlayout, false, cfg);
+                    stages.push(TileStage::Contraction {
+                        stage_id,
+                        name: format!("{}_s{}_conv2d_mm", g.fn_name, stage_id),
+                        a: x.clone(),
+                        b: w.clone(),
+                        trans_a: false,
+                        trans_b: false,
+                        m,
+                        k,
+                        n,
+                        act_dtype: sx.dtype,
+                        weight_dtype: eff_wdt,
+                        weight_layout: wlayout,
+                        prologue: None,
+                        dual_b: None,
+                        dual_swiglu: false,
+                        extra_siblings: Vec::new(),
+                        epilogue,
+                        out: final_out,
+                        schedule,
+                        pgo_candidates,
+                        split_k_scratch: None,
+                    });
+                } else {
+                    let k_eff = c_in * (*kh) * (*kw);
+                    let m_eff = (*in_h) * (*in_w);
+                    let (_, wlayout) = resolve_weight_layout(w, m_eff, k_eff, c_out, sw.dtype, false);
+                    let implicit_enabled = cfg.non_tf_ops;
+                    let im2col_scratch = if !implicit_enabled {
+                        let sc = format!("__im2col_{}", stage_id);
+                        extra_scratch_sizes.insert(sc.clone(), m_eff * k_eff * (sx.dtype.bytes_f64() as usize));
+                        Some(sc)
+                    } else {
+                        None
+                    };
+                    stages.push(TileStage::Conv2dStage {
+                        stage_id,
+                        name: format!("{}_s{}_conv2d", g.fn_name, stage_id),
+                        x: x.clone(),
+                        w: w.clone(),
+                        in_h: *in_h,
+                        in_w: *in_w,
+                        c_in,
+                        c_out,
+                        kh: *kh,
+                        kw: *kw,
+                        dtype: sx.dtype,
+                        weight_layout: wlayout,
+                        implicit_enabled,
+                        im2col_scratch,
+                        out: node.out.clone(),
+                    });
+                }
+            }
+            IrOp::ConcatMatMul { a, weights } => {
+                consumed[i] = true;
+                let sa = &g.tensors[a];
+                let m = sa.rows();
+                let k = sa.cols();
+                let n_per = g.tensors[&weights[0]].cols();
+                let total_n = n_per * weights.len();
+                // Repack each weight NK when not horiz-packed; when horiz-packed `CONCAT_NK` packs all of them into ONE buffer!
+                if !cfg.horiz_pack {
+                    for w in weights {
+                        let _ = resolve_weight_layout(w, m, k, n_per, g.tensors[w].dtype, false);
+                    }
+                }
+                let (schedule, _) = solve_tile_schedule(m, k, total_n, sa.dtype, sa.dtype, LayoutTag::ColMajorNK, false, cfg);
+                stages.push(TileStage::ConcatContraction {
+                    stage_id,
+                    name: format!("{}_s{}_concat_mm", g.fn_name, stage_id),
+                    a: a.clone(),
+                    weights: weights.clone(),
+                    m,
+                    k,
+                    n_per,
+                    total_n,
+                    dtype: sa.dtype,
+                    packed_enabled: cfg.horiz_pack,
+                    schedule,
+                    out: node.out.clone(),
+                });
+            }
+            IrOp::AdamWStep { param, grad, m, v } => {
+                consumed[i] = true;
+                let sp = &g.tensors[param];
+                let numel = sp.numel();
+                let donate_enabled = cfg.buffer_donation;
+                if donate_enabled {
+                    // Donates param + m + v in-place (ZERO extra output allocation!)
+                    donated_bytes_total += sp.alloc_bytes() * 3;
+                }
+                stages.push(TileStage::InPlaceAdamW {
+                    stage_id,
+                    name: format!("{}_s{}_adamw", g.fn_name, stage_id),
+                    param: param.clone(),
+                    grad: grad.clone(),
+                    m: m.clone(),
+                    v: v.clone(),
+                    numel,
+                    dtype: sp.dtype,
+                    donate_enabled,
+                    out: node.out.clone(),
+                });
+            }
+            IrOp::CrossEntropy { logits, targets } => {
+                consumed[i] = true;
+                let sl = &g.tensors[logits];
+                let rows = sl.rows();
+                let vocab = sl.cols();
+                let online_fused = cfg.online_monoid;
+                let donate_enabled = cfg.buffer_donation;
+                if donate_enabled {
+                    donated_bytes_total += sl.alloc_bytes();
+                }
+                let scratch_probs = if !online_fused {
+                    let sc = format!("__ce_probs_{}", stage_id);
+                    extra_scratch_sizes.insert(sc.clone(), rows * vocab * 4);
+                    Some(sc)
+                } else {
+                    None
+                };
+                stages.push(TileStage::CrossEntropyStage {
+                    stage_id,
+                    name: format!("{}_s{}_xent", g.fn_name, stage_id),
+                    logits: logits.clone(),
+                    targets: targets.clone(),
+                    rows,
+                    vocab,
+                    dtype: sl.dtype,
+                    online_fused,
+                    donate_enabled,
+                    scratch_probs,
+                    out: node.out.clone(),
+                });
+            }
+            IrOp::AmpNormMatMul { x, nw, w } => {
+                consumed[i] = true;
                 let sx = &g.tensors[x];
                 let sw = &g.tensors[w];
                 let (m, k, n) = (sx.rows(), sx.cols(), sw.cols());
-                consumed[i] = true;
-                let (epilogue, final_out) = if cfg.general_fusion {
-                    absorb_epilogue_chain(g, &mut consumed, &use_count, &output_set, node.out.clone())
+                let quant_enabled = cfg.amp_dyn_quant;
+                let wlayout = if quant_enabled && input_set.contains(w) && k % 8 == 0 && n % 8 == 0 {
+                    int8_weights.push(w.clone());
+                    LayoutTag::Int8RowScaleNK
                 } else {
-                    (Vec::new(), node.out.clone())
+                    let (_, wl) = resolve_weight_layout(w, m, k, n, sw.dtype, false);
+                    wl
                 };
-                let (eff_wdt, wlayout) = resolve_weight_layout(w, m, k, n, sw.dtype, false);
-                let (schedule, pgo_candidates) = solve_tile_schedule(m, k, n, sx.dtype, eff_wdt, wlayout, false, cfg);
-                stages.push(TileStage::Contraction {
+                let (schedule, _) = solve_tile_schedule(m, k, n, sx.dtype, sw.dtype, wlayout, false, cfg);
+                stages.push(TileStage::AmpQuantContraction {
                     stage_id,
-                    name: format!("{}_s{}_conv2d_mm", g.fn_name, stage_id),
-                    a: x.clone(),
-                    b: w.clone(),
-                    trans_a: false,
-                    trans_b: false,
+                    name: format!("{}_s{}_amp_mm", g.fn_name, stage_id),
+                    x: x.clone(),
+                    nw: nw.clone(),
+                    w: w.clone(),
                     m,
                     k,
                     n,
-                    act_dtype: sx.dtype,
-                    weight_dtype: eff_wdt,
+                    dtype: sx.dtype,
+                    quant_enabled,
                     weight_layout: wlayout,
-                    prologue: None,
-                    dual_b: None,
-                    dual_swiglu: false,
-                    extra_siblings: Vec::new(),
-                    epilogue,
-                    out: final_out,
                     schedule,
-                    pgo_candidates,
-                    split_k_scratch: None,
+                    out: node.out.clone(),
+                });
+            }
+            IrOp::DynMatMul { a, b, max_m } => {
+                consumed[i] = true;
+                let sa = &g.tensors[a];
+                let sb = &g.tensors[b];
+                let (k, n) = (sa.cols(), sb.cols());
+                let (_, wlayout) = resolve_weight_layout(b, *max_m, k, n, sb.dtype, false);
+                stages.push(TileStage::DynBucketContraction {
+                    stage_id,
+                    name: format!("{}_s{}_dyn_mm", g.fn_name, stage_id),
+                    a: a.clone(),
+                    b: b.clone(),
+                    max_m: *max_m,
+                    k,
+                    n,
+                    dtype: sa.dtype,
+                    weight_layout: wlayout,
+                    bucket_enabled: cfg.dyn_bucket,
+                    tile_swizzle: cfg.tile_swizzle,
+                    out: node.out.clone(),
+                });
+            }
+            IrOp::ParallelScan { a, b } => {
+                consumed[i] = true;
+                let sa = &g.tensors[a];
+                stages.push(TileStage::ParallelScanStage {
+                    stage_id,
+                    name: format!("{}_s{}_scan", g.fn_name, stage_id),
+                    a: a.clone(),
+                    b: b.clone(),
+                    batch: sa.rows(),
+                    seq_len: sa.cols(),
+                    dtype: sa.dtype,
+                    parallel_enabled: cfg.non_tf_ops,
+                    out: node.out.clone(),
                 });
             }
             IrOp::RaggedMatMul { a, b, valid_pct } => {
@@ -833,6 +1144,9 @@ pub fn lower_to_tile_stages(
     for bname in bsr32_weights {
         weight_layouts.insert(bname, LayoutTag::Bsr32NK);
     }
+    for iname in int8_weights {
+        weight_layouts.insert(iname, LayoutTag::Int8RowScaleNK);
+    }
     let mut input_repacks = Vec::new();
     for (p_name, p_desc) in &mut g.params {
         if let Some(&lay) = weight_layouts.get(p_name) {
@@ -851,7 +1165,8 @@ pub fn lower_to_tile_stages(
     }
 
     // Build Static Arena Plan via interval graph coloring across all stage intermediates & scratch!
-    let arena = build_static_arena(&stages, g, &input_set, &output_set, &extra_scratch_sizes, cfg.arena_async);
+    let mut arena = build_static_arena(&stages, g, &input_set, &output_set, &extra_scratch_sizes, cfg.arena_async);
+    arena.donated_bytes = donated_bytes_total;
 
     (stages, arena, input_repacks)
 }
@@ -955,6 +1270,7 @@ pub fn solve_tile_schedule(
             use_mma: false,
             stream_k: false,
             warp_specialized: false,
+            tile_swizzle: false,
         };
         return (sched, vec![sched]);
     }
@@ -985,6 +1301,7 @@ pub fn solve_tile_schedule(
             use_mma: true,
             stream_k: cfg.stream_k && split_k > 1,
             warp_specialized: cfg.warp_spec,
+            tile_swizzle: false,
         };
         let mut cands = vec![sched];
         if cfg.pgo_autotune {
@@ -1044,6 +1361,7 @@ pub fn solve_tile_schedule(
         use_mma: true,
         stream_k: cfg.stream_k && split_k > 1,
         warp_specialized: cfg.warp_spec,
+        tile_swizzle: cfg.tile_swizzle,
     };
 
     let mut cands = vec![default_sched];
@@ -1124,6 +1442,14 @@ fn build_static_arena(
             let sz = extra_scratch.get(sc).copied().unwrap_or(4096);
             intervals.insert(sc.clone(), (idx, idx, (sz + 255) & !255));
         }
+        if let TileStage::CrossEntropyStage { scratch_probs: Some(sc), .. } = st {
+            let sz = extra_scratch.get(sc).copied().unwrap_or(4096);
+            intervals.insert(sc.clone(), (idx, idx, (sz + 255) & !255));
+        }
+        if let TileStage::Conv2dStage { im2col_scratch: Some(sc), .. } = st {
+            let sz = extra_scratch.get(sc).copied().unwrap_or(4096);
+            intervals.insert(sc.clone(), (idx, idx, (sz + 255) & !255));
+        }
     }
 
     let naive_total: usize = intervals.values().map(|(_, _, sz)| *sz).sum();
@@ -1141,6 +1467,7 @@ fn build_static_arena(
             total_arena_bytes: cur.max(256),
             naive_total_bytes: naive_total,
             vram_saved_pct: 0.0,
+            donated_bytes: 0,
             allocations,
         };
     }
@@ -1186,6 +1513,7 @@ fn build_static_arena(
         total_arena_bytes: peak_bytes.max(256),
         naive_total_bytes: naive_total,
         vram_saved_pct: saved_pct,
+        donated_bytes: 0,
         allocations,
     }
 }
@@ -1255,6 +1583,36 @@ pub fn collect_stage_io(st: &TileStage, ins: &mut Vec<String>, outs: &mut Vec<St
             ins.push(x.clone());
             outs.push(out.clone());
         }
+        TileStage::ConcatContraction { a, weights, out, .. } => {
+            ins.push(a.clone());
+            ins.extend(weights.iter().cloned());
+            outs.push(out.clone());
+        }
+        TileStage::InPlaceAdamW { param, grad, m, v, out, .. } => {
+            ins.push(param.clone());
+            ins.push(grad.clone());
+            ins.push(m.clone());
+            ins.push(v.clone());
+            outs.push(out.clone());
+        }
+        TileStage::CrossEntropyStage { logits, targets, out, .. } => {
+            ins.push(logits.clone());
+            ins.push(targets.clone());
+            outs.push(out.clone());
+        }
+        TileStage::AmpQuantContraction { x, nw, w, out, .. } => {
+            ins.push(x.clone());
+            ins.push(nw.clone());
+            ins.push(w.clone());
+            outs.push(out.clone());
+        }
+        TileStage::DynBucketContraction { a, b, out, .. }
+        | TileStage::Conv2dStage { x: a, w: b, out, .. }
+        | TileStage::ParallelScanStage { a, b, out, .. } => {
+            ins.push(a.clone());
+            ins.push(b.clone());
+            outs.push(out.clone());
+        }
     }
 }
 
@@ -1308,6 +1666,36 @@ pub fn estimate_fused_bytes(stages: &[TileStage]) -> f64 {
             TileStage::CollectiveStage { numel, dtype, .. } => {
                 total += 2.0 * (*numel as f64) * dtype.bytes_f64();
             }
+            TileStage::ConcatContraction { m, k, total_n, dtype, .. } => {
+                let b = dtype.bytes_f64();
+                total += ((*m * *k + *k * *total_n + *m * *total_n) as f64) * b;
+            }
+            TileStage::InPlaceAdamW { numel, dtype, donate_enabled, .. } => {
+                let mult = if *donate_enabled { 7.0 } else { 10.0 };
+                total += (*numel as f64) * dtype.bytes_f64() * mult;
+            }
+            TileStage::CrossEntropyStage { rows, vocab, dtype, online_fused, .. } => {
+                let mult = if *online_fused { 2.0 } else { 5.0 };
+                total += (*rows * *vocab) as f64 * dtype.bytes_f64() * mult;
+            }
+            TileStage::AmpQuantContraction { m, k, n, dtype, quant_enabled, .. } => {
+                let ab = dtype.bytes_f64();
+                let wb = if *quant_enabled { 1.0 } else { ab };
+                total += (*m * *k) as f64 * ab + (*k * *n) as f64 * wb + (*m * *n) as f64 * ab;
+            }
+            TileStage::DynBucketContraction { max_m, k, n, dtype, .. } => {
+                let b = dtype.bytes_f64();
+                total += ((*max_m * *k + *k * *n + *max_m * *n) as f64) * b;
+            }
+            TileStage::Conv2dStage { in_h, in_w, c_in, c_out, kh, kw, dtype, implicit_enabled, .. } => {
+                let b = dtype.bytes_f64();
+                let m = (*in_h) * (*in_w);
+                let im2col_b = if *implicit_enabled { 0.0 } else { 2.0 * (m * *c_in * *kh * *kw) as f64 * b };
+                total += ((m * *c_in + *c_in * *kh * *kw * *c_out + m * *c_out) as f64) * b + im2col_b;
+            }
+            TileStage::ParallelScanStage { batch, seq_len, dtype, .. } => {
+                total += 3.0 * (*batch * *seq_len) as f64 * dtype.bytes_f64();
+            }
         }
     }
     total
@@ -1320,9 +1708,22 @@ fn bump_node_uses(op: &IrOp, uses: &mut BTreeMap<String, usize>) {
         | IrOp::Conv2d { x: a, w: wb, .. }
         | IrOp::RaggedMatMul { a, b: wb, .. }
         | IrOp::BlockSparseMatMul { a, b: wb, .. }
+        | IrOp::DynMatMul { a, b: wb, .. }
+        | IrOp::ParallelScan { a, b: wb }
+        | IrOp::CrossEntropy { logits: a, targets: wb }
         | IrOp::Binary { a, b: wb, .. } => {
             b(a);
             b(wb);
+        }
+        IrOp::ConcatMatMul { a, weights } => {
+            b(a);
+            for w in weights { b(w); }
+        }
+        IrOp::AdamWStep { param, grad, m, v } => {
+            b(param); b(grad); b(m); b(v);
+        }
+        IrOp::AmpNormMatMul { x, nw, w } => {
+            b(x); b(nw); b(w);
         }
         IrOp::Unary { x, .. } | IrOp::Rope { x } | IrOp::Transpose { x } | IrOp::Collective { x, .. } => b(x),
         IrOp::Reduce { x, weight, .. } => {

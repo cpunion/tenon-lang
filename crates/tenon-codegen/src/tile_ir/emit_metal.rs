@@ -48,13 +48,16 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
 
     // Plan header line for this graph
     plan.push_str(&format!(
-        "GRAPH|{}|opts={}|arena={}|naive_arena={}|single_cb={}|pgo={}|flops={:.0}|bytes={:.0}|t_min_ms={:.6}\n",
+        "GRAPH|{}|opts={}|arena={}|naive_arena={}|donated={}|single_cb={}|pgo={}|replay={}|overlap={}|flops={:.0}|bytes={:.0}|t_min_ms={:.6}\n",
         cg.graph.fn_name,
         cg.config.summary_tag(),
         cg.arena.total_arena_bytes,
         cg.arena.naive_total_bytes,
+        cg.arena.donated_bytes,
         if cg.config.arena_async { 1 } else { 0 },
         if cg.config.pgo_autotune { 1 } else { 0 },
+        if cg.config.graph_replay { 1 } else { 0 },
+        if cg.config.async_overlap { 1 } else { 0 },
         r.opt_flops,
         r.fused_bytes,
         r.m4_t_min_ms,
@@ -496,6 +499,201 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
                     "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{}\n",
                     name, (*numel + 255) / 256, x, out
                 ));
+            }
+            TileStage::ConcatContraction { stage_id, name, a, weights, m, k, n_per, total_n, dtype, packed_enabled, schedule, out } => {
+                let mut sc = *schedule;
+                sc.split_k = 1;
+                if *packed_enabled {
+                    // Facility #2: Pack `[W0 || W1 || W2]` into ONE contiguous `[total_n, k]` buffer at load time -> 1 wide 64x64 AMX GEMM!
+                    let packed_w = format!("__hpack_{}", stage_id);
+                    plan.push_str(&format!(
+                        "CONCAT_NK|{}|{}|{}|{}\n",
+                        packed_w, k, n_per, weights.join(",")
+                    ));
+                    emit_msl_amx_gemm(&mut msl, name, *m, *k, *total_n, false, false, *dtype, LayoutTag::ColMajorNK, false, false, &[], sc);
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},{},1|th={},1,1|smem=0|args={},{},{}\n",
+                        name, (*total_n + sc.bn - 1) / sc.bn, (*m + sc.bm - 1) / sc.bm, sc.num_sgs * 32, a, packed_w, out
+                    ));
+                } else {
+                    // Unpacked baseline: N separate GEMMs writing strided column slices of `out[m, total_n]`!
+                    for (wi, wname) in weights.iter().enumerate() {
+                        let kslice = format!("{}_w{}", name, wi);
+                        let col_off = wi * (*n_per);
+                        emit_msl_amx_gemm_col_slice(&mut msl, &kslice, *m, *k, *n_per, *total_n, col_off, *dtype, sc);
+                        plan.push_str(&format!(
+                            "DISPATCH|{}|tg={},{},1|th={},1,1|smem=0|args={},{},{}\n",
+                            kslice, (*n_per + sc.bn - 1) / sc.bn, (*m + sc.bm - 1) / sc.bm, sc.num_sgs * 32, a, wname, out
+                        ));
+                    }
+                }
+            }
+            TileStage::InPlaceAdamW { stage_id, name, param, grad, m, v, numel, dtype, donate_enabled, out } => {
+                emit_msl_adamw(&mut msl, name, *numel, *dtype, *donate_enabled);
+                let n4 = (*numel + 3) / 4;
+                let tgx = (n4 + 255) / 256;
+                if *donate_enabled {
+                    // Facility #3: Zero-Copy Buffer Donation (`out` aliases `param`, `m`/`v` updated in-place -> 0 B extra VRAM!)
+                    plan.push_str("DONATE|0|0\n");
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{},{}\n",
+                        name, tgx, param, grad, m, v
+                    ));
+                } else {
+                    let elem_b = dtype.bytes_f64() as usize;
+                    let sz = ((*numel * elem_b) + 255) & !255;
+                    let nm = format!("__adamw_nm_{}", stage_id);
+                    let nv = format!("__adamw_nv_{}", stage_id);
+                    plan.push_str(&format!("SCRATCH|{}|{}\nSCRATCH|{}|{}\n", nm, sz, nv, sz));
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{},{},{},{},{}\n",
+                        name, tgx, param, grad, m, v, out, nm, nv
+                    ));
+                }
+            }
+            TileStage::CrossEntropyStage { name, logits, targets, rows, vocab, dtype, online_fused, donate_enabled, scratch_probs, out, .. } => {
+                if *online_fused {
+                    // Facility #5: Single-Pass Online Monoid Fused Cross-Entropy + In-Place Backward (`llm.c` `fused_classifier3`!)
+                    emit_msl_online_cross_entropy(&mut msl, name, *rows, *vocab, *dtype);
+                    if *donate_enabled {
+                        plan.push_str("DONATE|0|0\n");
+                        plan.push_str(&format!(
+                            "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{}\n",
+                            name, rows, logits, targets, logits
+                        ));
+                    } else {
+                        plan.push_str(&format!(
+                            "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{}\n",
+                            name, rows, logits, targets, out
+                        ));
+                    }
+                } else {
+                    let pb = scratch_probs.clone().unwrap_or_else(|| format!("__ce_probs_{}", name));
+                    let k1 = format!("{}_probs", name);
+                    let k2 = format!("{}_dlogits", name);
+                    emit_msl_naive_cross_entropy(&mut msl, &k1, &k2, *rows, *vocab, *dtype);
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{}\n",
+                        k1, rows, logits, pb
+                    ));
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{}\n",
+                        k2, rows, pb, targets, out
+                    ));
+                }
+            }
+            TileStage::AmpQuantContraction { stage_id, name, x, nw, w, m, k, n, dtype, quant_enabled, weight_layout, schedule, out } => {
+                let norm_tmp = format!("__amp_norm_{}", stage_id);
+                let norm_k = format!("{}_norm", name);
+                emit_msl_row_reduce(&mut msl, &norm_k, ReduceOp::RmsNorm, *m, *k, *dtype, &[], true);
+                let nb = ((*m * *k * (dtype.bytes_f64() as usize)) + 255) & !255;
+                plan.push_str(&format!("SCRATCH|{}|{}\n", norm_tmp, nb));
+                plan.push_str(&format!(
+                    "DISPATCH|{}|tg={},1,1|th=128,1,1|smem=0|args={},{},{}\n",
+                    norm_k, m, x, nw, norm_tmp
+                ));
+                let mut sc = *schedule;
+                sc.split_k = 1;
+                if *quant_enabled && *weight_layout == LayoutTag::Int8RowScaleNK && *dtype == IrDType::F16 {
+                    // Facility #6: W8A8/W8A16 INT8-Weight AMX Contraction (-50% weight DRAM + per-row dynamic scale epilogue!)
+                    let (bm_w8, bn_w8) = if *m < 64 { (32usize, 32usize) } else { (64usize, 64usize) };
+                    emit_msl_amx_w8_gemm(&mut msl, name, *m, *k, *n, bm_w8, bn_w8, sc);
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},{},1|th=128,1,1|smem=0|args={},{},{}\n",
+                        name, (*n + bn_w8 - 1) / bn_w8, (*m + bm_w8 - 1) / bm_w8, norm_tmp, w, out
+                    ));
+                } else {
+                    emit_msl_amx_gemm(&mut msl, name, *m, *k, *n, false, false, *dtype, *weight_layout, false, false, &[], sc);
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},{},1|th={},1,1|smem=0|args={},{},{}\n",
+                        name, (*n + sc.bn - 1) / sc.bn, (*m + sc.bm - 1) / sc.bm, sc.num_sgs * 32, norm_tmp, w, out
+                    ));
+                }
+            }
+            TileStage::DynBucketContraction { stage_id, name, a, b, max_m, k, n, dtype, weight_layout, bucket_enabled, tile_swizzle, out } => {
+                let ctrl = format!("__dyn_ctrl_{}", stage_id);
+                plan.push_str(&format!("DYN_CTRL|{}|{}\n", ctrl, max_m));
+                if *bucket_enabled {
+                    // Facility #7: 3-Bucket O(1) Multi-Version Dynamic Dispatch (ZERO padding, ZERO JIT recompile!)
+                    let kb0 = format!("{}_b0_gemv", name);
+                    let kb1 = format!("{}_b1_amx32", name);
+                    let kb2 = format!("{}_b2_amx64", name);
+                    emit_msl_dyn_gemv(&mut msl, &kb0, *k, *n, *dtype);
+                    emit_msl_dyn_amx(&mut msl, &kb1, 32, 32, 32, *k, *n, *dtype, false);
+                    emit_msl_dyn_amx(&mut msl, &kb2, 64, 64, 16, *k, *n, *dtype, *tile_swizzle);
+                    plan.push_str(&format!(
+                        "DYN_BUCKET|1|8|{}|tgx={}|tgy_mode=DYN_M|th=128,1,1|args={},{},{},{}\n",
+                        kb0, (*n + 3) / 4, a, b, ctrl, out
+                    ));
+                    plan.push_str(&format!(
+                        "DYN_BUCKET|9|64|{}|tgx={}|tgy_mode=CEIL32|th=128,1,1|args={},{},{},{}\n",
+                        kb1, (*n + 31) / 32, a, b, ctrl, out
+                    ));
+                    plan.push_str(&format!(
+                        "DYN_BUCKET|65|{}|{}|tgx={}|tgy_mode=CEIL64|th=128,1,1|args={},{},{},{}\n",
+                        max_m, kb2, (*n + 63) / 64, a, b, ctrl, out
+                    ));
+                } else {
+                    // Static padded baseline: ALWAYS launches full `max_m` rows!
+                    let sc = TileSchedule {
+                        bm: 64, bn: 64, bk: 16, num_sgs: 4, rows_per_sg: 1, split_k: 1,
+                        double_buf: true, swizzle_pad: 8, use_mma: true, stream_k: false,
+                        warp_specialized: true, tile_swizzle: *tile_swizzle,
+                    };
+                    emit_msl_amx_gemm(&mut msl, name, *max_m, *k, *n, false, false, *dtype, *weight_layout, false, false, &[], sc);
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},{},1|th=128,1,1|smem=0|args={},{},{}\n",
+                        name, (*n + 63) / 64, (*max_m + 63) / 64, a, b, out
+                    ));
+                }
+            }
+            TileStage::Conv2dStage { name, x, w, in_h, in_w, c_in, c_out, kh, kw, dtype, weight_layout, implicit_enabled, im2col_scratch, out, .. } => {
+                let m = (*in_h) * (*in_w);
+                let k_eff = (*c_in) * (*kh) * (*kw);
+                if *implicit_enabled {
+                    // Facility #8A: Zero-`im2col` Implicit GEMM 3x3 Conv2d AMX Kernel (0 KB im2col VRAM!)
+                    emit_msl_implicit_conv2d_3x3(&mut msl, name, *in_h, *in_w, *c_in, *c_out, *dtype);
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},{},1|th=128,1,1|smem=0|args={},{},{}\n",
+                        name, (*c_out + 63) / 64, (m + 63) / 64, x, w, out
+                    ));
+                } else {
+                    let sc_buf = im2col_scratch.clone().unwrap_or_else(|| format!("__im2col_{}", name));
+                    let k_i2c = format!("{}_im2col", name);
+                    let k_mm = format!("{}_gemm", name);
+                    emit_msl_explicit_im2col_3x3(&mut msl, &k_i2c, *in_h, *in_w, *c_in, *dtype);
+                    let sc = TileSchedule {
+                        bm: 64, bn: 64, bk: 16, num_sgs: 4, rows_per_sg: 1, split_k: 1,
+                        double_buf: true, swizzle_pad: 8, use_mma: true, stream_k: false,
+                        warp_specialized: true, tile_swizzle: false,
+                    };
+                    emit_msl_amx_gemm(&mut msl, &k_mm, m, k_eff, *c_out, false, false, *dtype, *weight_layout, false, false, &[], sc);
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{}\n",
+                        k_i2c, (m * k_eff + 255) / 256, x, sc_buf
+                    ));
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},{},1|th=128,1,1|smem=0|args={},{},{}\n",
+                        k_mm, (*c_out + 63) / 64, (m + 63) / 64, sc_buf, w, out
+                    ));
+                }
+            }
+            TileStage::ParallelScanStage { name, a, b, batch, seq_len, dtype, parallel_enabled, out, .. } => {
+                if *parallel_enabled {
+                    // Facility #8B: 2-Level SIMD+TG Associative Parallel Prefix Scan (`O(log L)` depth, 128-bit float4!)
+                    emit_msl_parallel_scan(&mut msl, name, *batch, *seq_len, *dtype);
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},1,1|th=256,1,1|smem=0|args={},{},{}\n",
+                        name, batch, a, b, out
+                    ));
+                } else {
+                    // Sequential O(L) baseline
+                    emit_msl_sequential_scan(&mut msl, name, *batch, *seq_len, *dtype);
+                    plan.push_str(&format!(
+                        "DISPATCH|{}|tg={},1,1|th=64,1,1|smem=0|args={},{},{}\n",
+                        name, (*batch + 63) / 64, a, b, out
+                    ));
+                }
             }
         }
     }
@@ -1062,6 +1260,27 @@ fn emit_msl_amx_gemm(
         )
     };
 
+    let tiles_m_grid = (m + bm - 1) / bm;
+    let tiles_n_grid = (n + bn - 1) / bn;
+    let group_m = 8usize.min(tiles_m_grid);
+    let tile_coord_code = if sc.tile_swizzle && tiles_m_grid >= 8 && tiles_n_grid >= 8 {
+        // Facility #1: 2D Serpentine L2/SLC Tile Swizzling (`GROUP_M = 8` + alternating N-sweep!)
+        // Keeps concurrently executing TGs on shared A/B tiles AND reuses hot SLC `B` tiles across M-group boundaries!
+        format!(
+            "\tuint _pid = tgid.y * {tiles_n_grid}u + tgid.x;\n\
+             \tuint _grp_sz = {group_m}u * {tiles_n_grid}u;\n\
+             \tuint _gid = _pid / _grp_sz;\n\
+             \tuint _first_m = _gid * {group_m}u;\n\
+             \tuint _gm = min({tiles_m_grid}u - _first_m, {group_m}u);\n\
+             \tuint _rem = _pid % _grp_sz;\n\
+             \tuint _nt_raw = _rem / _gm;\n\
+             \tuint _nt = ((_gid & 1u) != 0u) ? ({tiles_n_grid}u - 1u - _nt_raw) : _nt_raw;\n\
+             \tuint m0 = (_first_m + (_rem % _gm)) * {bm}u, n0 = _nt * {bn}u;\n"
+        )
+    } else {
+        format!("\tuint m0 = tgid.y * {bm}u, n0 = tgid.x * {bn}u;\n")
+    };
+
     msl.push_str(&format!(
         "kernel void {kname}(\n\
          \tdevice const {mt}* a [[buffer(0)]], device const {mt}* b [[buffer(1)]]{dual_param}{ep_params},\n\
@@ -1071,7 +1290,7 @@ fn emit_msl_amx_gemm(
          ) {{\n\
          \tthreadgroup half sA[{nbufs}][{sa_elems}];\n\
          \tthreadgroup half sB[{nbufs}][{sb_elems}];\n\
-         {sb2_decl}{sc_decls}\tuint m0 = tgid.y * {bm}u, n0 = tgid.x * {bn}u;\n\
+         {sb2_decl}{sc_decls}{tile_coord_code}\
          \tuint sg_r = {sg_r_expr} * {sg_m}u, sg_c = {sg_c_expr} * {sg_n}u;\n\
          \t{acc_ty} mc[{tm}][{tn}];\n\
          \t#pragma unroll\n\
@@ -2163,6 +2382,632 @@ fn emit_msl_block_sparse_amx(
          \t\t\t}}\n\
          \t\t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
          \t\t}}\n\
+         \t}}\n\
+         }}\n\n"
+    ));
+}
+
+// =========================================================================
+// Stage 4 Universal Compiler Facility Kernels (#2, #3, #5, #6, #7, #8A, #8B)
+// =========================================================================
+
+/// Facility #2 (Unpacked Baseline): AMX GEMM writing to strided column slice `[col_off .. col_off + n_slice]` of `[m, total_n]`.
+#[allow(clippy::too_many_arguments)]
+fn emit_msl_amx_gemm_col_slice(
+    msl: &mut String,
+    kname: &str,
+    m: usize,
+    k: usize,
+    n_slice: usize,
+    total_n: usize,
+    col_off: usize,
+    dt: IrDType,
+    sc: TileSchedule,
+) {
+    let mt = dt.msl_ty();
+    let bm = 64usize;
+    let bn = 64usize;
+    let bk = 16usize;
+    let sa_st = bk + sc.swizzle_pad;
+    let sb_st = bk + sc.swizzle_pad;
+    msl.push_str(&format!(
+        "kernel void {kname}(\n\
+         \tdevice const {mt}* a [[buffer(0)]], device const {mt}* b [[buffer(1)]], device {mt}* out [[buffer(2)]],\n\
+         \tuint3 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+         \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+         ) {{\n\
+         \tthreadgroup half sA[64 * {sa_st}];\n\
+         \tthreadgroup half sB[64 * {sb_st}];\n\
+         \tthreadgroup float sC[4][128];\n\
+         \tuint m0 = tgid.y * {bm}u, n0 = tgid.x * {bn}u;\n\
+         \tuint sg_r = (sg >> 1) * 32u, sg_c = (sg & 1u) * 32u;\n\
+         \tsimdgroup_float8x8 mc[4][4];\n\
+         \t#pragma unroll\n\
+         \tfor (uint r = 0; r < 4u; r++) for (uint c = 0; c < 4u; c++) mc[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\
+         \tfor (uint kt = 0; kt < {k}u; kt += 16u) {{\n\
+         \t\tuint r = lid >> 1, c8 = (lid & 1u) * 8u;\n\
+         \t\t*(threadgroup uint4*)(&sA[r * {sa_st}u + c8]) = *(device const uint4*)(&a[(m0 + r) * {k}u + kt + c8]);\n\
+         \t\t*(threadgroup uint4*)(&sB[r * {sb_st}u + c8]) = *(device const uint4*)(&b[(n0 + r) * {k}u + kt + c8]);\n\
+         \t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t\t#pragma unroll\n\
+         \t\tfor (uint kk = 0; kk < 16u; kk += 8u) {{\n\
+         \t\t\tsimdgroup_half8x8 ma[4], mb[4];\n\
+         \t\t\tfor (uint rr = 0; rr < 4u; rr++) simdgroup_load(ma[rr], &sA[(sg_r + rr * 8u) * {sa_st}u + kk], {sa_st}ul);\n\
+         \t\t\tfor (uint cc = 0; cc < 4u; cc++) simdgroup_load(mb[cc], &sB[(sg_c + cc * 8u) * {sb_st}u + kk], {sb_st}ul, ulong2(0, 0), true);\n\
+         \t\t\tfor (uint rr = 0; rr < 4u; rr++) for (uint cc = 0; cc < 4u; cc++) simdgroup_multiply_accumulate(mc[rr][cc], ma[rr], mb[cc], mc[rr][cc]);\n\
+         \t\t}}\n\
+         \t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t}}\n\
+         \tuint er = lane >> 2, ec4 = (lane & 3u) * 4u;\n\
+         \tfor (uint r = 0; r < 4u; r++) for (uint c = 0; c < 4u; c += 2u) {{\n\
+         \t\tsimdgroup_store(mc[r][c], &sC[sg][0], 16ul);\n\
+         \t\tsimdgroup_store(mc[r][c + 1u], &sC[sg][8], 16ul);\n\
+         \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t\tuint gr = m0 + sg_r + r * 8u + er, gc = n0 + sg_c + c * 8u + ec4;\n\
+         \t\tif (gr < {m}u && gc < {n_slice}u) *(device half4*)(&out[gr * {total_n}u + {col_off}u + gc]) = half4(*(threadgroup const float4*)(&sC[sg][er * 16u + ec4]));\n\
+         \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t}}\n\
+         }}\n\n"
+    ));
+}
+
+/// Facility #3: `llm.c` `x128` 128-bit Vectorized Fused AdamW (`donate=true`: Zero-Copy In-Place Buffer Donation!).
+fn emit_msl_adamw(msl: &mut String, kname: &str, numel: usize, dt: IrDType, in_place: bool) {
+    let n4 = numel / 4;
+    let is_f32 = dt == IrDType::F32;
+    let vec_ty = if is_f32 { "float4" } else { "half4" };
+    if in_place {
+        msl.push_str(&format!(
+            "kernel void {kname}(\n\
+             \tdevice {vec_ty}* param [[buffer(0)]], device const {vec_ty}* grad [[buffer(1)]],\n\
+             \tdevice {vec_ty}* m_buf [[buffer(2)]], device {vec_ty}* v_buf [[buffer(3)]],\n\
+             \tuint gid [[thread_position_in_grid]]\n\
+             ) {{\n\
+             \tif (gid >= {n4}u) return;\n\
+             \tfloat4 p = float4(param[gid]);\n\
+             \tfloat4 g = float4(grad[gid]);\n\
+             \tfloat4 m = float4(m_buf[gid]);\n\
+             \tfloat4 v = float4(v_buf[gid]);\n\
+             \tm = fma(float4(0.9f), m, 0.1f * g);\n\
+             \tv = fma(float4(0.999f), v, 0.001f * g * g);\n\
+             \tfloat4 m_hat = m * 10.0f;\n\
+             \tfloat4 v_hat = v * 1000.0f;\n\
+             \tp = p * (1.0f - 1e-5f) - 1e-3f * m_hat / (sqrt(v_hat) + 1e-8f);\n\
+             \tm_buf[gid] = {vec_ty}(m);\n\
+             \tv_buf[gid] = {vec_ty}(v);\n\
+             \tparam[gid] = {vec_ty}(p);\n\
+             }}\n\n"
+        ));
+    } else {
+        msl.push_str(&format!(
+            "kernel void {kname}(\n\
+             \tdevice const {vec_ty}* param [[buffer(0)]], device const {vec_ty}* grad [[buffer(1)]],\n\
+             \tdevice const {vec_ty}* m_buf [[buffer(2)]], device const {vec_ty}* v_buf [[buffer(3)]],\n\
+             \tdevice {vec_ty}* out_p [[buffer(4)]], device {vec_ty}* out_m [[buffer(5)]], device {vec_ty}* out_v [[buffer(6)]],\n\
+             \tuint gid [[thread_position_in_grid]]\n\
+             ) {{\n\
+             \tif (gid >= {n4}u) return;\n\
+             \tfloat4 p = float4(param[gid]);\n\
+             \tfloat4 g = float4(grad[gid]);\n\
+             \tfloat4 m = float4(m_buf[gid]);\n\
+             \tfloat4 v = float4(v_buf[gid]);\n\
+             \tm = fma(float4(0.9f), m, 0.1f * g);\n\
+             \tv = fma(float4(0.999f), v, 0.001f * g * g);\n\
+             \tfloat4 m_hat = m * 10.0f;\n\
+             \tfloat4 v_hat = v * 1000.0f;\n\
+             \tp = p * (1.0f - 1e-5f) - 1e-3f * m_hat / (sqrt(v_hat) + 1e-8f);\n\
+             \tout_m[gid] = {vec_ty}(m);\n\
+             \tout_v[gid] = {vec_ty}(v);\n\
+             \tout_p[gid] = {vec_ty}(p);\n\
+             }}\n\n"
+        ));
+    }
+}
+
+/// Facility #5: Online Monoid Fused Cross-Entropy + In-Place Backward `dlogits` (`llm.c` `fused_classifier3` — ZERO O(BT*V) HBM!).
+fn emit_msl_online_cross_entropy(msl: &mut String, kname: &str, rows: usize, vocab: usize, dt: IrDType) {
+    let v4 = vocab / 4;
+    let inv_rows = 1.0f32 / (rows as f32);
+    let vec_ty = if dt == IrDType::F32 { "float4" } else { "half4" };
+    let sc_ty = dt.msl_ty();
+    msl.push_str(&format!(
+        "kernel void {kname}(\n\
+         \tdevice const {vec_ty}* logits [[buffer(0)]], device const {sc_ty}* targets [[buffer(1)]],\n\
+         \tdevice {vec_ty}* dlogits [[buffer(2)]],\n\
+         \tuint row [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+         \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+         ) {{\n\
+         \tif (row >= {rows}u) return;\n\
+         \tthreadgroup float s_m[8];\n\
+         \tthreadgroup float s_l[8];\n\
+         \tulong base4 = (ulong)row * {v4}ul;\n\
+         \t// Pass 1: Single-pass 128-bit Online Monoid (m, l) — ZERO O(BT*V) HBM probs materialization!\n\
+         \tfloat lm = -1e30f, ll = 0.0f;\n\
+         \tfor (uint c4 = lid; c4 < {v4}u; c4 += 256u) {{\n\
+         \t\tfloat4 v = float4(logits[base4 + c4]);\n\
+         \t\tfloat bm = max(max(v.x, v.y), max(v.z, v.w));\n\
+         \t\tfloat nm = max(lm, bm);\n\
+         \t\tll = ll * exp(lm - nm) + exp(v.x - nm) + exp(v.y - nm) + exp(v.z - nm) + exp(v.w - nm);\n\
+         \t\tlm = nm;\n\
+         \t}}\n\
+         \tfloat sg_m = simd_max(lm);\n\
+         \tfloat sg_l = simd_sum(ll * exp(lm - sg_m));\n\
+         \tif (lane == 0u) {{ s_m[sg] = sg_m; s_l[sg] = sg_l; }}\n\
+         \tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \tfloat gm = -1e30f;\n\
+         \tfor (uint s = 0; s < 8u; s++) gm = max(gm, s_m[s]);\n\
+         \tfloat gl = 0.0f;\n\
+         \tfor (uint s = 0; s < 8u; s++) gl += s_l[s] * exp(s_m[s] - gm);\n\
+         \tfloat inv_l = 1.0f / max(gl, 1e-12f);\n\
+         \tuint tgt = (uint)((float)targets[row]);\n\
+         \t// Pass 2: Fused 128-bit in-place dlogits = (softmax(logits) - one_hot(tgt)) / BT!\n\
+         \tfor (uint c4 = lid; c4 < {v4}u; c4 += 256u) {{\n\
+         \t\tfloat4 v = float4(logits[base4 + c4]);\n\
+         \t\tfloat4 p = exp(v - gm) * inv_l;\n\
+         \t\tuint bcol = c4 * 4u;\n\
+         \t\tif (tgt >= bcol && tgt < bcol + 4u) {{\n\
+         \t\t\tuint r = tgt - bcol;\n\
+         \t\t\tif (r == 0u) p.x -= 1.0f; else if (r == 1u) p.y -= 1.0f; else if (r == 2u) p.z -= 1.0f; else p.w -= 1.0f;\n\
+         \t\t}}\n\
+         \t\tdlogits[base4 + c4] = {vec_ty}(p * {inv_rows:.10}f);\n\
+         \t}}\n\
+         }}\n\n"
+    ));
+}
+
+/// Facility #5 Baseline: Naive 2-stage materializing `[BT, V]` FP32 probs in Arena HBM!
+fn emit_msl_naive_cross_entropy(msl: &mut String, k1: &str, k2: &str, rows: usize, vocab: usize, dt: IrDType) {
+    let v4 = vocab / 4;
+    let inv_rows = 1.0f32 / (rows as f32);
+    let vec_ty = if dt == IrDType::F32 { "float4" } else { "half4" };
+    let sc_ty = dt.msl_ty();
+    msl.push_str(&format!(
+        "kernel void {k1}(\n\
+         \tdevice const {vec_ty}* logits [[buffer(0)]], device float4* probs [[buffer(1)]],\n\
+         \tuint row [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+         \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+         ) {{\n\
+         \tif (row >= {rows}u) return;\n\
+         \tthreadgroup float s_m[8]; threadgroup float s_l[8];\n\
+         \tulong base4 = (ulong)row * {v4}ul;\n\
+         \tfloat lm = -1e30f;\n\
+         \tfor (uint c4 = lid; c4 < {v4}u; c4 += 256u) {{ float4 v = float4(logits[base4 + c4]); lm = max(lm, max(max(v.x, v.y), max(v.z, v.w))); }}\n\
+         \tlm = simd_max(lm); if (lane == 0u) s_m[sg] = lm;\n\
+         \tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \tfloat gm = -1e30f; for (uint s = 0; s < 8u; s++) gm = max(gm, s_m[s]);\n\
+         \tfloat ll = 0.0f;\n\
+         \tfor (uint c4 = lid; c4 < {v4}u; c4 += 256u) {{\n\
+         \t\tfloat4 e = exp(float4(logits[base4 + c4]) - gm);\n\
+         \t\tprobs[base4 + c4] = e;\n\
+         \t\tll += (e.x + e.y) + (e.z + e.w);\n\
+         \t}}\n\
+         \tll = simd_sum(ll); if (lane == 0u) s_l[sg] = ll;\n\
+         \tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \tfloat gl = 0.0f; for (uint s = 0; s < 8u; s++) gl += s_l[s];\n\
+         \tfloat inv_l = 1.0f / max(gl, 1e-12f);\n\
+         \tfor (uint c4 = lid; c4 < {v4}u; c4 += 256u) probs[base4 + c4] *= inv_l;\n\
+         }}\n\n\
+         kernel void {k2}(\n\
+         \tdevice const float4* probs [[buffer(0)]], device const {sc_ty}* targets [[buffer(1)]],\n\
+         \tdevice {vec_ty}* dlogits [[buffer(2)]],\n\
+         \tuint row [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]]\n\
+         ) {{\n\
+         \tif (row >= {rows}u) return;\n\
+         \tulong base4 = (ulong)row * {v4}ul;\n\
+         \tuint tgt = (uint)((float)targets[row]);\n\
+         \tfor (uint c4 = lid; c4 < {v4}u; c4 += 256u) {{\n\
+         \t\tfloat4 p = probs[base4 + c4];\n\
+         \t\tuint bcol = c4 * 4u;\n\
+         \t\tif (tgt >= bcol && tgt < bcol + 4u) {{\n\
+         \t\t\tuint r = tgt - bcol;\n\
+         \t\t\tif (r == 0u) p.x -= 1.0f; else if (r == 1u) p.y -= 1.0f; else if (r == 2u) p.z -= 1.0f; else p.w -= 1.0f;\n\
+         \t\t}}\n\
+         \t\tdlogits[base4 + c4] = {vec_ty}(p * {inv_rows:.10}f);\n\
+         \t}}\n\
+         }}\n\n"
+    ));
+}
+
+/// Facility #6: Auto Mixed-Precision W8A16/W8A8 AMX Contraction reading 1-byte INT8 weights (-50% weight DRAM!)
+/// via 128-bit `char16` (`uint4`) loads + double-buffered BK=32 pipeline + per-row FP32 dequant epilogue!
+#[allow(clippy::too_many_arguments)]
+fn emit_msl_amx_w8_gemm(msl: &mut String, kname: &str, m: usize, k: usize, n: usize, bm: usize, bn: usize, sc: TileSchedule) {
+    let bk = if bm == 32 { 32usize } else { 16usize };
+    let sa_st = bk + 8;
+    let sb_st = bk + 8;
+    let tm = (bm / 2) / 8;
+    let tn = (bn / 2) / 8;
+    let sg_m = bm / 2;
+    let sg_n = bn / 2;
+    let q_bytes_aligned = ((n * k) + 15) & !15;
+    let tiles_m = (m + bm - 1) / bm;
+    let tiles_n = (n + bn - 1) / bn;
+    let group_m = 8usize.min(tiles_m);
+    let tile_coord = if sc.tile_swizzle && tiles_m >= 8 && tiles_n >= 8 {
+        format!(
+            "\tuint _pid = tgid.y * {tiles_n}u + tgid.x; uint _gsz = {group_m}u * {tiles_n}u;\n\
+             \tuint _fm = (_pid / _gsz) * {group_m}u; uint _gm = min({tiles_m}u - _fm, {group_m}u); uint _rem = _pid % _gsz;\n\
+             \tuint m0 = (_fm + (_rem % _gm)) * {bm}u, n0 = (_rem / _gm) * {bn}u;\n"
+        )
+    } else {
+        format!("\tuint m0 = tgid.y * {bm}u, n0 = tgid.x * {bn}u;\n")
+    };
+
+    if bm == 32 && bn == 32 && bk == 32 {
+        // High-throughput Double-Buffered 32x32x32 W8A16 AMX (10.2 KB SMEM -> 2 TGs/core, 1 barrier/K-tile,
+        // 128-bit `uint4` loads of 16x int8 = HALF the load instructions & HALF the weight DRAM bytes of FP16!)
+        let load_a = |buf: &str, k_ex: &str| {
+            format!(
+                "\t{{ uint r = lid >> 2, c8 = (lid & 3u) * 8u;\n\
+                 \t\t*(threadgroup uint4*)(&sA[{buf}][r * {sa_st}u + c8]) = (m0 + r < {m}u) ? *(device const uint4*)(&a[(m0 + r) * {k}u + ({k_ex}) + c8]) : uint4(0u); }}\n"
+            )
+        };
+        // Only 64 threads needed to load 32x32 int8 (1024 bytes = 64 x 16B `uint4` = 1 instruction per thread!)
+        let load_b = |buf: &str, k_ex: &str| {
+            format!(
+                "\tif (lid < 64u) {{\n\
+                 \t\tuint r = lid >> 1, c16 = (lid & 1u) * 16u;\n\
+                 \t\tuint4 raw = *(const device uint4*)(&w_i8[(n0 + r) * {k}u + ({k_ex}) + c16]);\n\
+                 \t\t*(threadgroup half4*)(&sB[{buf}][r * {sb_st}u + c16 + 0u])  = half4(as_type<char4>(raw.x));\n\
+                 \t\t*(threadgroup half4*)(&sB[{buf}][r * {sb_st}u + c16 + 4u])  = half4(as_type<char4>(raw.y));\n\
+                 \t\t*(threadgroup half4*)(&sB[{buf}][r * {sb_st}u + c16 + 8u])  = half4(as_type<char4>(raw.z));\n\
+                 \t\t*(threadgroup half4*)(&sB[{buf}][r * {sb_st}u + c16 + 12u]) = half4(as_type<char4>(raw.w));\n\
+                 \t}}\n"
+            )
+        };
+        msl.push_str(&format!(
+            "kernel void {kname}(\n\
+             \tdevice const half* a [[buffer(0)]], device const char* w_i8 [[buffer(1)]], device half* out [[buffer(2)]],\n\
+             \tuint3 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+             \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+             ) {{\n\
+             \tconst device float* w_scale = (const device float*)(w_i8 + {q_bytes_aligned}ul);\n\
+             \tthreadgroup half sA[2][32 * {sa_st}];\n\
+             \tthreadgroup half sB[2][32 * {sb_st}];\n\
+             \tthreadgroup float sC[4][128];\n\
+             {tile_coord}\
+             \tuint sg_r = (sg >> 1) * 16u, sg_c = (sg & 1u) * 16u;\n\
+             \tsimdgroup_float8x8 mc[2][2];\n\
+             \t#pragma unroll\n\
+             \tfor (uint r = 0; r < 2u; r++) for (uint c = 0; c < 2u; c++) mc[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\
+             {la0}{lb0}\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+             \tuint buf = 0u;\n\
+             \tfor (uint kt = 0; kt < {k}u; kt += 32u) {{\n\
+             \t\tuint nkt = kt + 32u, nbuf = buf ^ 1u;\n\
+             \t\tif (nkt < {k}u) {{\n\
+             {lan}{lbn}\t\t}}\n\
+             \t\t#pragma unroll\n\
+             \t\tfor (uint kk = 0; kk < 32u; kk += 8u) {{\n\
+             \t\t\tsimdgroup_half8x8 ma[2], mb[2];\n\
+             \t\t\tfor (uint rr = 0; rr < 2u; rr++) simdgroup_load(ma[rr], &sA[buf][(sg_r + rr * 8u) * {sa_st}u + kk], {sa_st}ul);\n\
+             \t\t\tfor (uint cc = 0; cc < 2u; cc++) simdgroup_load(mb[cc], &sB[buf][(sg_c + cc * 8u) * {sb_st}u + kk], {sb_st}ul, ulong2(0, 0), true);\n\
+             \t\t\tfor (uint rr = 0; rr < 2u; rr++) for (uint cc = 0; cc < 2u; cc++) simdgroup_multiply_accumulate(mc[rr][cc], ma[rr], mb[cc], mc[rr][cc]);\n\
+             \t\t}}\n\
+             \t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+             \t\tbuf = nbuf;\n\
+             \t}}\n\
+             \tuint er = lane >> 2, ec4 = (lane & 3u) * 4u;\n\
+             \t#pragma unroll\n\
+             \tfor (uint r = 0; r < 2u; r++) {{\n\
+             \t\tsimdgroup_store(mc[r][0], &sC[sg][0], 16ul);\n\
+             \t\tsimdgroup_store(mc[r][1], &sC[sg][8], 16ul);\n\
+             \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+             \t\tuint gr = m0 + sg_r + r * 8u + er, gc = n0 + sg_c + ec4;\n\
+             \t\tif (gr < {m}u && gc < {n}u) {{\n\
+             \t\t\tfloat4 v4 = *(threadgroup const float4*)(&sC[sg][er * 16u + ec4]) * *(const device float4*)(&w_scale[gc]);\n\
+             \t\t\t*(device half4*)(&out[gr * {n}u + gc]) = half4(v4);\n\
+             \t\t}}\n\
+             \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+             \t}}\n\
+             }}\n\n",
+            la0 = load_a("0", "0u"),
+            lb0 = load_b("0", "0u"),
+            lan = load_a("nbuf", "nkt"),
+            lbn = load_b("nbuf", "nkt"),
+        ));
+        return;
+    }
+
+    // 64x64x16 Double-Buffered W8A16 AMX (`128-bit uint4` loads of 16x int8 -> 64 threads load entire 64x16 B tile in 1 op!)
+    let load_a64 = |buf: &str, k_ex: &str| {
+        format!(
+            "\t{{ uint r = lid >> 1, c8 = (lid & 1u) * 8u;\n\
+             \t\t*(threadgroup uint4*)(&sA[{buf}][r * {sa_st}u + c8]) = (m0 + r < {m}u) ? *(device const uint4*)(&a[(m0 + r) * {k}u + ({k_ex}) + c8]) : uint4(0u); }}\n"
+        )
+    };
+    let load_b64 = |buf: &str, k_ex: &str| {
+        format!(
+            "\tif (lid < 64u) {{\n\
+             \t\tuint4 raw = *(const device uint4*)(&w_i8[(n0 + lid) * {k}u + ({k_ex})]);\n\
+             \t\t*(threadgroup half4*)(&sB[{buf}][lid * {sb_st}u + 0u])  = half4(as_type<char4>(raw.x));\n\
+             \t\t*(threadgroup half4*)(&sB[{buf}][lid * {sb_st}u + 4u])  = half4(as_type<char4>(raw.y));\n\
+             \t\t*(threadgroup half4*)(&sB[{buf}][lid * {sb_st}u + 8u])  = half4(as_type<char4>(raw.z));\n\
+             \t\t*(threadgroup half4*)(&sB[{buf}][lid * {sb_st}u + 12u]) = half4(as_type<char4>(raw.w));\n\
+             \t}}\n"
+        )
+    };
+    msl.push_str(&format!(
+        "kernel void {kname}(\n\
+         \tdevice const half* a [[buffer(0)]], device const char* w_i8 [[buffer(1)]], device half* out [[buffer(2)]],\n\
+         \tuint3 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+         \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+         ) {{\n\
+         \tconst device float* w_scale = (const device float*)(w_i8 + {q_bytes_aligned}ul);\n\
+         \tthreadgroup half sA[2][{bm} * {sa_st}];\n\
+         \tthreadgroup half sB[2][{bn} * {sb_st}];\n\
+         \tthreadgroup float sC[4][128];\n\
+         {tile_coord}\
+         \tuint sg_r = (sg >> 1) * {sg_m}u, sg_c = (sg & 1u) * {sg_n}u;\n\
+         \tsimdgroup_float8x8 mc[{tm}][{tn}];\n\
+         \t#pragma unroll\n\
+         \tfor (uint r = 0; r < {tm}u; r++) for (uint c = 0; c < {tn}u; c++) mc[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\
+         {la0}{lb0}\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \tuint buf = 0u;\n\
+         \tfor (uint kt = 0; kt < {k}u; kt += 16u) {{\n\
+         \t\tuint nkt = kt + 16u, nbuf = buf ^ 1u;\n\
+         \t\tif (nkt < {k}u) {{\n\
+         {lan}{lbn}\t\t}}\n\
+         \t\t#pragma unroll\n\
+         \t\tfor (uint kk = 0; kk < 16u; kk += 8u) {{\n\
+         \t\t\tsimdgroup_half8x8 ma[{tm}], mb[{tn}];\n\
+         \t\t\tfor (uint rr = 0; rr < {tm}u; rr++) simdgroup_load(ma[rr], &sA[buf][(sg_r + rr * 8u) * {sa_st}u + kk], {sa_st}ul);\n\
+         \t\t\tfor (uint cc = 0; cc < {tn}u; cc++) simdgroup_load(mb[cc], &sB[buf][(sg_c + cc * 8u) * {sb_st}u + kk], {sb_st}ul, ulong2(0, 0), true);\n\
+         \t\t\tfor (uint rr = 0; rr < {tm}u; rr++) for (uint cc = 0; cc < {tn}u; cc++) simdgroup_multiply_accumulate(mc[rr][cc], ma[rr], mb[cc], mc[rr][cc]);\n\
+         \t\t}}\n\
+         \t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t\tbuf = nbuf;\n\
+         \t}}\n\
+         \tuint er = lane >> 2, ec4 = (lane & 3u) * 4u;\n\
+         \t#pragma unroll\n\
+         \tfor (uint r = 0; r < {tm}u; r++) for (uint c = 0; c < {tn}u; c += 2u) {{\n\
+         \t\tsimdgroup_store(mc[r][c], &sC[sg][0], 16ul);\n\
+         \t\tsimdgroup_store(mc[r][c + 1u], &sC[sg][8], 16ul);\n\
+         \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t\tuint gr = m0 + sg_r + r * 8u + er, gc = n0 + sg_c + c * 8u + ec4;\n\
+         \t\tif (gr < {m}u && gc < {n}u) {{\n\
+         \t\t\tfloat4 v4 = *(threadgroup const float4*)(&sC[sg][er * 16u + ec4]) * *(const device float4*)(&w_scale[gc]);\n\
+         \t\t\t*(device half4*)(&out[gr * {n}u + gc]) = half4(v4);\n\
+         \t\t}}\n\
+         \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t}}\n\
+         }}\n\n",
+        la0 = load_a64("0", "0u"),
+        lb0 = load_b64("0", "0u"),
+        lan = load_a64("nbuf", "nkt"),
+        lbn = load_b64("nbuf", "nkt"),
+    ));
+}
+
+/// Facility #7 (Bucket 0: `M <= 8`): Dynamic-Shape Coalesced SIMD GEMV (`m_actual` read from ctrl buffer!).
+fn emit_msl_dyn_gemv(msl: &mut String, kname: &str, k: usize, n: usize, dt: IrDType) {
+    let mt = dt.msl_ty();
+    let k8 = k / 8;
+    msl.push_str(&format!(
+        "kernel void {kname}(\n\
+         \tdevice const {mt}* a [[buffer(0)]], device const {mt}* b [[buffer(1)]],\n\
+         \tdevice const uint* ctrl [[buffer(2)]], device {mt}* out [[buffer(3)]],\n\
+         \tuint3 tgid [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+         ) {{\n\
+         \tuint m_act = ctrl[0], row = tgid.y, col = tgid.x * 4u + sg;\n\
+         \tif (row >= m_act || col >= {n}u) return;\n\
+         \tfloat4 acc = float4(0.0f);\n\
+         \tfor (uint kk8 = lane; kk8 < {k8}u; kk8 += 32u) {{\n\
+         \t\tfloat4 x0 = float4(*(device const half4*)(&a[row * {k}u + kk8 * 8u]));\n\
+         \t\tfloat4 x1 = float4(*(device const half4*)(&a[row * {k}u + kk8 * 8u + 4u]));\n\
+         \t\tfloat4 w0 = float4(*(device const half4*)(&b[col * {k}u + kk8 * 8u]));\n\
+         \t\tfloat4 w1 = float4(*(device const half4*)(&b[col * {k}u + kk8 * 8u + 4u]));\n\
+         \t\tacc = fma(x0, w0, acc); acc = fma(x1, w1, acc);\n\
+         \t}}\n\
+         \tfloat res = simd_sum((acc.x + acc.y) + (acc.z + acc.w));\n\
+         \tif (lane == 0u) out[row * {n}u + col] = ({mt})res;\n\
+         }}\n\n"
+    ));
+}
+
+/// Facility #7 (Bucket 1/2: `9..64` / `65..M_max`): Dynamic-Shape AMX GEMM with exact `m_actual` masking (ZERO padding!).
+#[allow(clippy::too_many_arguments)]
+fn emit_msl_dyn_amx(msl: &mut String, kname: &str, bm: usize, bn: usize, bk: usize, k: usize, n: usize, dt: IrDType, _swz: bool) {
+    let mt = dt.msl_ty();
+    let sa_st = bk + 8;
+    let sb_st = bk + 8;
+    let tm = (bm / 2) / 8;
+    let tn = (bn / 2) / 8;
+    let n_u4_a = (bm * bk) / 8;
+    let n_u4_b = (bn * bk) / 8;
+    let k8 = bk / 8;
+    msl.push_str(&format!(
+        "kernel void {kname}(\n\
+         \tdevice const {mt}* a [[buffer(0)]], device const {mt}* b [[buffer(1)]],\n\
+         \tdevice const uint* ctrl [[buffer(2)]], device {mt}* out [[buffer(3)]],\n\
+         \tuint3 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+         \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+         ) {{\n\
+         \tuint m_act = ctrl[0];\n\
+         \tuint m0 = tgid.y * {bm}u, n0 = tgid.x * {bn}u;\n\
+         \tif (m0 >= m_act) return;\n\
+         \tthreadgroup half sA[{bm} * {sa_st}];\n\
+         \tthreadgroup half sB[{bn} * {sb_st}];\n\
+         \tthreadgroup float sC[4][128];\n\
+         \tuint sg_r = (sg >> 1) * {sg_m}u, sg_c = (sg & 1u) * {sg_n}u;\n\
+         \tsimdgroup_float8x8 mc[{tm}][{tn}];\n\
+         \t#pragma unroll\n\
+         \tfor (uint r = 0; r < {tm}u; r++) for (uint c = 0; c < {tn}u; c++) mc[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\
+         \tfor (uint kt = 0; kt < {k}u; kt += {bk}u) {{\n\
+         \t\tfor (uint idx = lid; idx < {n_u4_a}u; idx += 128u) {{\n\
+         \t\t\tuint r = idx / {k8}u, c8 = (idx % {k8}u) * 8u;\n\
+         \t\t\tuint gr = m0 + r;\n\
+         \t\t\t*(threadgroup uint4*)(&sA[r * {sa_st}u + c8]) = (gr < m_act) ? *(device const uint4*)(&a[gr * {k}u + kt + c8]) : uint4(0u);\n\
+         \t\t}}\n\
+         \t\tfor (uint idx = lid; idx < {n_u4_b}u; idx += 128u) {{\n\
+         \t\t\tuint r = idx / {k8}u, c8 = (idx % {k8}u) * 8u;\n\
+         \t\t\t*(threadgroup uint4*)(&sB[r * {sb_st}u + c8]) = *(device const uint4*)(&b[(n0 + r) * {k}u + kt + c8]);\n\
+         \t\t}}\n\
+         \t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t\t#pragma unroll\n\
+         \t\tfor (uint kk = 0; kk < {bk}u; kk += 8u) {{\n\
+         \t\t\tsimdgroup_half8x8 ma[{tm}], mb[{tn}];\n\
+         \t\t\tfor (uint rr = 0; rr < {tm}u; rr++) simdgroup_load(ma[rr], &sA[(sg_r + rr * 8u) * {sa_st}u + kk], {sa_st}ul);\n\
+         \t\t\tfor (uint cc = 0; cc < {tn}u; cc++) simdgroup_load(mb[cc], &sB[(sg_c + cc * 8u) * {sb_st}u + kk], {sb_st}ul, ulong2(0, 0), true);\n\
+         \t\t\tfor (uint rr = 0; rr < {tm}u; rr++) for (uint cc = 0; cc < {tn}u; cc++) simdgroup_multiply_accumulate(mc[rr][cc], ma[rr], mb[cc], mc[rr][cc]);\n\
+         \t\t}}\n\
+         \t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t}}\n\
+         \tuint er = lane >> 2, ec4 = (lane & 3u) * 4u;\n\
+         \tfor (uint r = 0; r < {tm}u; r++) for (uint c = 0; c < {tn}u; c += 2u) {{\n\
+         \t\tsimdgroup_store(mc[r][c], &sC[sg][0], 16ul);\n\
+         \t\tsimdgroup_store(mc[r][c + 1u], &sC[sg][8], 16ul);\n\
+         \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t\tuint gr = m0 + sg_r + r * 8u + er, gc = n0 + sg_c + c * 8u + ec4;\n\
+         \t\tif (gr < m_act && gc < {n}u) *(device half4*)(&out[gr * {n}u + gc]) = half4(*(threadgroup const float4*)(&sC[sg][er * 16u + ec4]));\n\
+         \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t}}\n\
+         }}\n\n",
+        sg_m = bm / 2,
+        sg_n = bn / 2,
+    ));
+}
+
+/// Facility #8A: Zero-`im2col` Implicit GEMM 3x3 Conv2d AMX Kernel (0 KB `im2col` HBM expansion!).
+fn emit_msl_implicit_conv2d_3x3(msl: &mut String, kname: &str, in_h: usize, in_w: usize, c_in: usize, c_out: usize, dt: IrDType) {
+    let mt = dt.msl_ty();
+    let m = in_h * in_w;
+    let k_eff = c_in * 9;
+    let sa_st = 24usize;
+    let sb_st = 24usize;
+    msl.push_str(&format!(
+        "kernel void {kname}(\n\
+         \tdevice const {mt}* x [[buffer(0)]], device const {mt}* w [[buffer(1)]], device {mt}* out [[buffer(2)]],\n\
+         \tuint3 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+         \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+         ) {{\n\
+         \tthreadgroup half sA[64 * {sa_st}];\n\
+         \tthreadgroup half sB[64 * {sb_st}];\n\
+         \tthreadgroup float sC[4][128];\n\
+         \tuint m0 = tgid.y * 64u, n0 = tgid.x * 64u;\n\
+         \tuint sg_r = (sg >> 1) * 32u, sg_c = (sg & 1u) * 32u;\n\
+         \tsimdgroup_float8x8 mc[4][4];\n\
+         \t#pragma unroll\n\
+         \tfor (uint r = 0; r < 4u; r++) for (uint c = 0; c < 4u; c++) mc[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\
+         \tuint r_ld = lid >> 1, c8_ld = (lid & 1u) * 8u;\n\
+         \tuint gm = m0 + r_ld;\n\
+         \tint oh = (int)(gm / {in_w}u), ow = (int)(gm % {in_w}u);\n\
+         \tfor (uint kt = 0; kt < {k_eff}u; kt += 16u) {{\n\
+         \t\t// Implicit GEMM: compute (ih, iw, ci) on the fly for 128-bit uint4 load -> ZERO im2col buffer!\n\
+         \t\tuint gk = kt + c8_ld;\n\
+         \t\tuint tap = gk / {c_in}u, ci = gk % {c_in}u;\n\
+         \t\tint ih = oh + (int)(tap / 3u) - 1, iw = ow + (int)(tap % 3u) - 1;\n\
+         \t\tbool inb = (gm < {m}u) && (ih >= 0) && (ih < {in_h}) && (iw >= 0) && (iw < {in_w});\n\
+         \t\t*(threadgroup uint4*)(&sA[r_ld * {sa_st}u + c8_ld]) = inb ? *(device const uint4*)(&x[((uint)ih * {in_w}u + (uint)iw) * {c_in}u + ci]) : uint4(0u);\n\
+         \t\t*(threadgroup uint4*)(&sB[r_ld * {sb_st}u + c8_ld]) = *(device const uint4*)(&w[(n0 + r_ld) * {k_eff}u + gk]);\n\
+         \t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t\t#pragma unroll\n\
+         \t\tfor (uint kk = 0; kk < 16u; kk += 8u) {{\n\
+         \t\t\tsimdgroup_half8x8 ma[4], mb[4];\n\
+         \t\t\tfor (uint rr = 0; rr < 4u; rr++) simdgroup_load(ma[rr], &sA[(sg_r + rr * 8u) * {sa_st}u + kk], {sa_st}ul);\n\
+         \t\t\tfor (uint cc = 0; cc < 4u; cc++) simdgroup_load(mb[cc], &sB[(sg_c + cc * 8u) * {sb_st}u + kk], {sb_st}ul, ulong2(0, 0), true);\n\
+         \t\t\tfor (uint rr = 0; rr < 4u; rr++) for (uint cc = 0; cc < 4u; cc++) simdgroup_multiply_accumulate(mc[rr][cc], ma[rr], mb[cc], mc[rr][cc]);\n\
+         \t\t}}\n\
+         \t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t}}\n\
+         \tuint er = lane >> 2, ec4 = (lane & 3u) * 4u;\n\
+         \tfor (uint r = 0; r < 4u; r++) for (uint c = 0; c < 4u; c += 2u) {{\n\
+         \t\tsimdgroup_store(mc[r][c], &sC[sg][0], 16ul);\n\
+         \t\tsimdgroup_store(mc[r][c + 1u], &sC[sg][8], 16ul);\n\
+         \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t\tuint gr = m0 + sg_r + r * 8u + er, gc = n0 + sg_c + c * 8u + ec4;\n\
+         \t\tif (gr < {m}u && gc < {c_out}u) *(device half4*)(&out[gr * {c_out}u + gc]) = half4(*(threadgroup const float4*)(&sC[sg][er * 16u + ec4]));\n\
+         \t\tsimdgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t}}\n\
+         }}\n\n"
+    ));
+}
+
+/// Facility #8A Baseline: Explicit `im2col` materialization `[H*W, 9*C_in]` in Arena HBM!
+fn emit_msl_explicit_im2col_3x3(msl: &mut String, kname: &str, in_h: usize, in_w: usize, c_in: usize, dt: IrDType) {
+    let mt = dt.msl_ty();
+    let m = in_h * in_w;
+    let k_eff = c_in * 9;
+    let total = m * k_eff;
+    msl.push_str(&format!(
+        "kernel void {kname}(device const {mt}* x [[buffer(0)]], device {mt}* col [[buffer(1)]], uint gid [[thread_position_in_grid]]) {{\n\
+         \tif (gid >= {total}u) return;\n\
+         \tuint m_idx = gid / {k_eff}u, k_idx = gid % {k_eff}u;\n\
+         \tint oh = (int)(m_idx / {in_w}u), ow = (int)(m_idx % {in_w}u);\n\
+         \tuint tap = k_idx / {c_in}u, ci = k_idx % {c_in}u;\n\
+         \tint ih = oh + (int)(tap / 3u) - 1, iw = ow + (int)(tap % 3u) - 1;\n\
+         \tbool inb = (ih >= 0) && (ih < {in_h}) && (iw >= 0) && (iw < {in_w});\n\
+         \tcol[gid] = inb ? x[((uint)ih * {in_w}u + (uint)iw) * {c_in}u + ci] : ({mt})0;\n\
+         }}\n\n"
+    ));
+}
+
+/// Facility #8B: Work-Efficient 2-Level SIMD+TG Associative Parallel Scan (`h_t = a_t*h_{t-1} + b_t`, `O(log L)` depth!).
+fn emit_msl_parallel_scan(msl: &mut String, kname: &str, batch: usize, seq_len: usize, dt: IrDType) {
+    let l4 = seq_len / 4;
+    let vec_ty = if dt == IrDType::F32 { "float4" } else { "half4" };
+    msl.push_str(&format!(
+        "kernel void {kname}(\n\
+         \tdevice const {vec_ty}* a_in [[buffer(0)]], device const {vec_ty}* b_in [[buffer(1)]], device {vec_ty}* out [[buffer(2)]],\n\
+         \tuint row [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],\n\
+         \tuint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]\n\
+         ) {{\n\
+         \tif (row >= {batch}u) return;\n\
+         \tthreadgroup float s_a[8];\n\
+         \tthreadgroup float s_b[8];\n\
+         \tthreadgroup float s_pa[8];\n\
+         \tthreadgroup float s_pb[8];\n\
+         \tulong base4 = (ulong)row * {l4}ul;\n\
+         \tfloat4 va = (lid < {l4}u) ? float4(a_in[base4 + lid]) : float4(1.0f);\n\
+         \tfloat4 vb = (lid < {l4}u) ? float4(b_in[base4 + lid]) : float4(0.0f);\n\
+         \t// Step 1: Local 4-element associative prefix in registers\n\
+         \tfloat a0 = va.x, b0 = vb.x;\n\
+         \tfloat a1 = va.y * a0, b1 = fma(va.y, b0, vb.y);\n\
+         \tfloat a2 = va.z * a1, b2 = fma(va.z, b1, vb.z);\n\
+         \tfloat a3 = va.w * a2, b3 = fma(va.w, b2, vb.w);\n\
+         \t// Step 2: 5-step SIMD associative prefix scan (`simd_shuffle_up`)\n\
+         \tfloat ia = a3, ib = b3;\n\
+         \tfor (uint off = 1u; off < 32u; off <<= 1) {{\n\
+         \t\tfloat pa = simd_shuffle_up(ia, off);\n\
+         \t\tfloat pb = simd_shuffle_up(ib, off);\n\
+         \t\tif (lane >= off) {{ ib = fma(ia, pb, ib); ia = ia * pa; }}\n\
+         \t}}\n\
+         \tfloat ex_a = simd_shuffle_up(ia, 1u), ex_b = simd_shuffle_up(ib, 1u);\n\
+         \tif (lane == 0u) {{ ex_a = 1.0f; ex_b = 0.0f; }}\n\
+         \tif (lane == 31u) {{ s_a[sg] = ia; s_b[sg] = ib; }}\n\
+         \tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t// Step 3: 3-step 8-SG prefix scan in SG 0\n\
+         \tif (sg == 0u) {{\n\
+         \t\tfloat ga = (lane < 8u) ? s_a[lane] : 1.0f;\n\
+         \t\tfloat gb = (lane < 8u) ? s_b[lane] : 0.0f;\n\
+         \t\tfor (uint off = 1u; off < 8u; off <<= 1) {{\n\
+         \t\t\tfloat pa = simd_shuffle_up(ga, off);\n\
+         \t\t\tfloat pb = simd_shuffle_up(gb, off);\n\
+         \t\t\tif (lane >= off && lane < 8u) {{ gb = fma(ga, pb, gb); ga = ga * pa; }}\n\
+         \t\t}}\n\
+         \t\tfloat pga = simd_shuffle_up(ga, 1u), pgb = simd_shuffle_up(gb, 1u);\n\
+         \t\tif (lane < 8u) {{ s_pa[lane] = (lane == 0u) ? 1.0f : pga; s_pb[lane] = (lane == 0u) ? 0.0f : pgb; }}\n\
+         \t}}\n\
+         \tthreadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \t// Step 4: Apply exact incoming state `h_prev = ex_a * s_pb[sg] + ex_b` to all 4 local elements!\n\
+         \tfloat h_prev = fma(ex_a, s_pb[sg], ex_b);\n\
+         \tif (lid < {l4}u) {{\n\
+         \t\tout[base4 + lid] = {vec_ty}(fma(a0, h_prev, b0), fma(a1, h_prev, b1), fma(a2, h_prev, b2), fma(a3, h_prev, b3));\n\
+         \t}}\n\
+         }}\n\n"
+    ));
+}
+
+/// Facility #8B Baseline: Sequential `O(L)` recurrence per batch row!
+fn emit_msl_sequential_scan(msl: &mut String, kname: &str, batch: usize, seq_len: usize, dt: IrDType) {
+    let mt = dt.msl_ty();
+    msl.push_str(&format!(
+        "kernel void {kname}(device const {mt}* a_in [[buffer(0)]], device const {mt}* b_in [[buffer(1)]], device {mt}* out [[buffer(2)]], uint row [[thread_position_in_grid]]) {{\n\
+         \tif (row >= {batch}u) return;\n\
+         \tulong base = (ulong)row * {seq_len}ul;\n\
+         \tfloat h = 0.0f;\n\
+         \tfor (uint t = 0; t < {seq_len}u; t++) {{\n\
+         \t\th = fma((float)a_in[base + t], h, (float)b_in[base + t]);\n\
+         \t\tout[base + t] = ({mt})h;\n\
          \t}}\n\
          }}\n\n"
     ));

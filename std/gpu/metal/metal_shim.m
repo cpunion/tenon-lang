@@ -10,6 +10,7 @@
 
 static id<MTLDevice> g_mtl_device = nil;
 static id<MTLCommandQueue> g_mtl_queue = nil;
+static id<MTLCommandQueue> g_mtl_copy_queue = nil;
 static char g_device_name_buf[256] = "Unavailable";
 
 #define MAX_HANDLES 4096
@@ -24,6 +25,7 @@ static int64_t ensure_metal_init(void) {
         if (g_mtl_device == nil) return 0;
         g_mtl_queue = [g_mtl_device newCommandQueue];
         if (g_mtl_queue == nil) return 0;
+        g_mtl_copy_queue = [g_mtl_device newCommandQueue];
         const char* nm = [[g_mtl_device name] UTF8String];
         if (nm != NULL) {
             strncpy(g_device_name_buf, nm, sizeof(g_device_name_buf) - 1);
@@ -404,22 +406,57 @@ typedef struct {
 } TnPgoGroup;
 
 typedef struct {
+    int dst_buf_idx;
+    size_t k;
+    size_t n_per;
+    int n_srcs;
+    int src_buf_idx[8];
+    int built;
+} TnConcatSpec;
+
+typedef struct {
+    int min_m;
+    int max_m;
+    int tgy_mode; // 0=DYN_M, 1=CEIL32, 2=CEIL64
+    TnPlanStep step;
+} TnDynBucket;
+
+typedef struct {
     int active;
     char graph_name[96];
     char opts_tag[256];
     size_t arena_bytes;
     size_t naive_arena_bytes;
+    size_t donated_bytes;
     int single_cb;
     int pgo_enabled;
     int pgo_tuned;
+    int replay_enabled;
+    int overlap_enabled;
     id<MTLLibrary> lib;
     id<MTLBuffer> arena_buf;
+    id<MTLIndirectCommandBuffer> icb;
+    int icb_steps;
     int n_bufs;
     TnPlanBuf bufs[MAX_PLAN_BUFS];
     int n_steps;
     TnPlanStep steps[MAX_PLAN_DISPATCHES];
     int n_pgo;
     TnPgoGroup pgo[16];
+    // Facility #2: Horizontal Weight Packing (`CONCAT_NK`)
+    int n_concats;
+    TnConcatSpec concats[8];
+    // Facility #3: Buffer Donation (`DONATE|out_idx|in_idx`)
+    int n_donates;
+    int donate_out[8];
+    int donate_in[8];
+    // Facility #7: Symbolic Dynamic-Shape Bucketing (`DYN_CTRL` + `DYN_BUCKET`)
+    int dyn_ctrl_buf_idx;
+    int dyn_m_actual;
+    int dyn_step_idx;
+    int active_bucket;
+    int n_buckets;
+    TnDynBucket buckets[4];
 } TnMetalPlan;
 
 static TnMetalPlan g_plans[MAX_PLANS];
@@ -441,7 +478,7 @@ static int plan_find_or_add_buf(TnMetalPlan* p, const char* name) {
     return idx;
 }
 
-static id<MTLComputePipelineState> plan_compile_fn(TnMetalPlan* p, const char* fn_name) {
+static id<MTLComputePipelineState> plan_compile_fn_icb(TnMetalPlan* p, const char* fn_name, int for_icb) {
     NSString* ns = [NSString stringWithUTF8String:fn_name];
     id<MTLFunction> fn = [p->lib newFunctionWithName:ns];
     if (!fn) {
@@ -449,11 +486,30 @@ static id<MTLComputePipelineState> plan_compile_fn(TnMetalPlan* p, const char* f
         return nil;
     }
     NSError* err = nil;
-    id<MTLComputePipelineState> pso = [g_mtl_device newComputePipelineStateWithFunction:fn error:&err];
+    id<MTLComputePipelineState> pso = nil;
+    if (for_icb) {
+        MTLComputePipelineDescriptor* desc = [[MTLComputePipelineDescriptor alloc] init];
+        desc.computeFunction = fn;
+        desc.supportIndirectCommandBuffers = YES;
+        pso = [g_mtl_device newComputePipelineStateWithDescriptor:desc
+                                                          options:MTLPipelineOptionNone
+                                                       reflection:nil
+                                                            error:&err];
+    }
+    if (!pso) {
+        err = nil;
+        pso = [g_mtl_device newComputePipelineStateWithFunction:fn error:&err];
+    }
     if (!pso) {
         fprintf(stderr, "[tenon-plan] PSO error for `%s`: %s\n", fn_name, [[err localizedDescription] UTF8String]);
     }
     return pso;
+}
+
+static id<MTLComputePipelineState> plan_compile_fn(TnMetalPlan* p, const char* fn_name) {
+    // Keep direct-dispatch PSOs at full Metal peak speed (do NOT set supportIndirectCommandBuffers
+    // globally, which forces argument-buffer ABI and hurts AMX register allocation by ~35%!).
+    return plan_compile_fn_icb(p, fn_name, 0);
 }
 
 static void parse_step_line(TnMetalPlan* p, TnPlanStep* st, const char* rest) {
@@ -530,6 +586,8 @@ int64_t tn_metal_plan_create(int64_t msl_cstr, int64_t plan_cstr, int64_t graph_
         if (slot < 0) return 0;
         TnMetalPlan* p = &g_plans[slot];
         memset(p, 0, sizeof(TnMetalPlan));
+        p->dyn_ctrl_buf_idx = -1;
+        p->dyn_step_idx = -1;
 
         NSString* src = [NSString stringWithUTF8String:(const char*)(uintptr_t)msl_cstr];
         MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
@@ -565,8 +623,11 @@ int64_t tn_metal_plan_create(int64_t msl_cstr, int64_t plan_cstr, int64_t graph_
                         if (strncmp(k, "opts=", 5) == 0) strncpy(p->opts_tag, k + 5, sizeof(p->opts_tag) - 1);
                         else if (strncmp(k, "arena=", 6) == 0) p->arena_bytes = (size_t)strtoull(k + 6, NULL, 10);
                         else if (strncmp(k, "naive_arena=", 12) == 0) p->naive_arena_bytes = (size_t)strtoull(k + 12, NULL, 10);
+                        else if (strncmp(k, "donated=", 8) == 0) p->donated_bytes = (size_t)strtoull(k + 8, NULL, 10);
                         else if (strncmp(k, "single_cb=", 10) == 0) p->single_cb = atoi(k + 10);
                         else if (strncmp(k, "pgo=", 4) == 0) p->pgo_enabled = atoi(k + 4);
+                        else if (strncmp(k, "replay=", 7) == 0) p->replay_enabled = atoi(k + 7);
+                        else if (strncmp(k, "overlap=", 8) == 0) p->overlap_enabled = atoi(k + 8);
                         k = strtok_r(NULL, "|", &ksave);
                     }
                     if (p->arena_bytes < 256) p->arena_bytes = 256;
@@ -620,6 +681,110 @@ int64_t tn_metal_plan_create(int64_t msl_cstr, int64_t plan_cstr, int64_t graph_
                         p->bufs[bi].offset = 0;
                         p->bufs[bi].buf = [g_mtl_device newBufferWithLength:(NSUInteger)p->bufs[bi].size
                                                                    options:MTLResourceStorageModeShared];
+                    }
+                } else if (strncmp(line, "CONCAT_NK|", 10) == 0) {
+                    // Format: CONCAT_NK|dst_name|k|n_per|w0,w1,w2
+                    if (p->n_concats < 8) {
+                        char copy[512];
+                        strncpy(copy, line + 10, sizeof(copy) - 1);
+                        copy[sizeof(copy) - 1] = 0;
+                        char* cs = NULL;
+                        char* dst_nm = strtok_r(copy, "|", &cs);
+                        char* k_str = strtok_r(NULL, "|", &cs);
+                        char* np_str = strtok_r(NULL, "|", &cs);
+                        char* ws_str = strtok_r(NULL, "|", &cs);
+                        if (dst_nm && k_str && np_str && ws_str) {
+                            TnConcatSpec* sp = &p->concats[p->n_concats++];
+                            memset(sp, 0, sizeof(TnConcatSpec));
+                            sp->dst_buf_idx = plan_find_or_add_buf(p, dst_nm);
+                            sp->k = (size_t)strtoull(k_str, NULL, 10);
+                            sp->n_per = (size_t)strtoull(np_str, NULL, 10);
+                            if (sp->dst_buf_idx >= 0) p->bufs[sp->dst_buf_idx].kind = 5;
+                            char* ws = NULL;
+                            char* wt = strtok_r(ws_str, ",", &ws);
+                            while (wt && sp->n_srcs < 8) {
+                                sp->src_buf_idx[sp->n_srcs++] = plan_find_or_add_buf(p, wt);
+                                wt = strtok_r(NULL, ",", &ws);
+                            }
+                        }
+                    }
+                } else if (strncmp(line, "DONATE|", 7) == 0) {
+                    int oi = 0, ii = 0;
+                    if (sscanf(line + 7, "%d|%d", &oi, &ii) == 2 && p->n_donates < 8) {
+                        p->donate_out[p->n_donates] = oi;
+                        p->donate_in[p->n_donates] = ii;
+                        p->n_donates++;
+                    }
+                } else if (strncmp(line, "DYN_CTRL|", 9) == 0) {
+                    char nm[96] = {0}; int max_m = 1;
+                    if (sscanf(line + 9, "%95[^|]|%d", nm, &max_m) == 2) {
+                        int bi = plan_find_or_add_buf(p, nm);
+                        if (bi >= 0) {
+                            p->bufs[bi].kind = 3;
+                            p->bufs[bi].size = 64;
+                            p->bufs[bi].offset = 0;
+                            p->bufs[bi].buf = [g_mtl_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+                            uint32_t* cp = (uint32_t*)[p->bufs[bi].buf contents];
+                            cp[0] = (uint32_t)max_m;
+                            p->dyn_ctrl_buf_idx = bi;
+                            p->dyn_m_actual = max_m;
+                        }
+                    }
+                } else if (strncmp(line, "DYN_BUCKET|", 11) == 0) {
+                    // Format: DYN_BUCKET|min_m|max_m|kname|tgx=N|tgy_mode=DYN_M/CEIL32/CEIL64|th=x,y,z|args=a,b,ctrl,out
+                    if (p->n_buckets < 4) {
+                        if (p->dyn_step_idx < 0 && p->n_steps < MAX_PLAN_DISPATCHES) {
+                            p->dyn_step_idx = p->n_steps++;
+                            memset(&p->steps[p->dyn_step_idx], 0, sizeof(TnPlanStep));
+                        }
+                        char copy[1024];
+                        strncpy(copy, line + 11, sizeof(copy) - 1);
+                        copy[sizeof(copy) - 1] = 0;
+                        char* bs = NULL;
+                        char* min_s = strtok_r(copy, "|", &bs);
+                        char* max_s = strtok_r(NULL, "|", &bs);
+                        char* kn_s = strtok_r(NULL, "|", &bs);
+                        if (min_s && max_s && kn_s) {
+                            int bi = p->n_buckets++;
+                            TnDynBucket* bk = &p->buckets[bi];
+                            memset(bk, 0, sizeof(TnDynBucket));
+                            bk->min_m = atoi(min_s);
+                            bk->max_m = atoi(max_s);
+                            strncpy(bk->step.kname, kn_s, sizeof(bk->step.kname) - 1);
+                            bk->step.pso = plan_compile_fn(p, bk->step.kname);
+                            bk->step.tgx = 1; bk->step.tgy = 1; bk->step.tgz = 1;
+                            bk->step.tx = 128; bk->step.ty = 1; bk->step.tz = 1;
+                            char* tok = NULL;
+                            while ((tok = strtok_r(NULL, "|", &bs)) != NULL) {
+                                if (strncmp(tok, "tgx=", 4) == 0) {
+                                    bk->step.tgx = (NSUInteger)strtoull(tok + 4, NULL, 10);
+                                } else if (strncmp(tok, "tgy_mode=", 9) == 0) {
+                                    if (strcmp(tok + 9, "CEIL32") == 0) bk->tgy_mode = 1;
+                                    else if (strcmp(tok + 9, "CEIL64") == 0) bk->tgy_mode = 2;
+                                    else bk->tgy_mode = 0;
+                                } else if (strncmp(tok, "th=", 3) == 0) {
+                                    unsigned long x = 128, y = 1, z = 1;
+                                    sscanf(tok + 3, "%lu,%lu,%lu", &x, &y, &z);
+                                    bk->step.tx = x; bk->step.ty = y; bk->step.tz = z;
+                                } else if (strncmp(tok, "args=", 5) == 0) {
+                                    char* as = NULL;
+                                    char* at = strtok_r(tok + 5, ",", &as);
+                                    bk->step.n_args = 0;
+                                    while (at && bk->step.n_args < 16) {
+                                        bk->step.arg_idx[bk->step.n_args++] = plan_find_or_add_buf(p, at);
+                                        at = strtok_r(NULL, ",", &as);
+                                    }
+                                }
+                            }
+                            if (p->dyn_step_idx >= 0 && p->dyn_m_actual >= bk->min_m && p->dyn_m_actual <= bk->max_m) {
+                                p->active_bucket = bi;
+                                p->steps[p->dyn_step_idx] = bk->step;
+                                int m_act = p->dyn_m_actual;
+                                p->steps[p->dyn_step_idx].tgy = (bk->tgy_mode == 1) ? (NSUInteger)((m_act + 31) / 32)
+                                                              : (bk->tgy_mode == 2) ? (NSUInteger)((m_act + 63) / 64)
+                                                              : (NSUInteger)m_act;
+                            }
+                        }
                     }
                 } else if (strncmp(line, "DISPATCH|", 9) == 0) {
                     if (p->n_steps < MAX_PLAN_DISPATCHES) {
@@ -861,10 +1026,45 @@ int64_t tn_metal_plan_set_input(int64_t plan_h, int64_t input_idx, int64_t buf_h
                         }
                     }
                     p->bufs[i].buf = dst;
+                } else if (strcmp(p->bufs[i].repack, "PACK_INT8_ROW_NK") == 0 && p->bufs[i].rows > 0 && p->bufs[i].cols > 0) {
+                    // Facility #6: Dynamic Per-Row INT8 Quantization [K, N] FP16 -> [N, K] int8_t + aligned [N] FP32 scales (-50% weight DRAM!)
+                    size_t K = (size_t)p->bufs[i].rows;
+                    size_t N = (size_t)p->bufs[i].cols;
+                    size_t q_bytes_aligned = ((N * K) + 15) & ~((size_t)15);
+                    size_t total_bytes = q_bytes_aligned + N * sizeof(float);
+                    id<MTLBuffer> dst = [g_mtl_device newBufferWithLength:(total_bytes > 64 ? total_bytes : 64)
+                                                               options:MTLResourceStorageModeShared];
+                    const uint16_t* sp = (const uint16_t*)[src contents];
+                    int8_t* qp = (int8_t*)[dst contents];
+                    float* scales = (float*)(((uint8_t*)[dst contents]) + q_bytes_aligned);
+                    for (size_t n = 0; n < N; n++) {
+                        float mx = 0.0f;
+                        for (size_t k = 0; k < K; k++) {
+                            float av = fabsf(tn_f16_to_f32(sp[k * N + n]));
+                            if (av > mx) mx = av;
+                        }
+                        float sc = (mx > 1e-12f) ? (mx / 127.0f) : 1.0f;
+                        float inv_sc = 1.0f / sc;
+                        scales[n] = sc;
+                        for (size_t k = 0; k < K; k++) {
+                            float v = tn_f16_to_f32(sp[k * N + n]) * inv_sc;
+                            long qv = lroundf(v);
+                            if (qv < -127) qv = -127;
+                            if (qv > 127) qv = 127;
+                            qp[n * K + k] = (int8_t)qv;
+                        }
+                    }
+                    p->bufs[i].buf = dst;
                 } else {
                     p->bufs[i].buf = src;
                 }
                 p->bufs[i].offset = 0;
+                p->icb = nil;
+                for (int ci = 0; ci < p->n_concats; ci++) {
+                    for (int si = 0; si < p->concats[ci].n_srcs; si++) {
+                        if (p->concats[ci].src_buf_idx[si] == i) p->concats[ci].built = 0;
+                    }
+                }
                 return 1;
             }
         }
@@ -880,10 +1080,98 @@ int64_t tn_metal_plan_set_output(int64_t plan_h, int64_t output_idx, int64_t buf
         if (p->bufs[i].kind == 1 && p->bufs[i].io_idx == (int)output_idx) {
             p->bufs[i].buf = g_buffers[buf_handle];
             p->bufs[i].offset = 0;
+            p->icb = nil;
             return 1;
         }
     }
     return 0;
+}
+
+static void plan_prepare_derived(TnMetalPlan* p) {
+    // Facility #2: Build horizontal packed `[total_n, k]` weight buffer once from sibling `[k, n_per]` inputs!
+    for (int ci = 0; ci < p->n_concats; ci++) {
+        TnConcatSpec* c = &p->concats[ci];
+        if (c->built || c->dst_buf_idx < 0 || c->n_srcs <= 0) continue;
+        int ready = 1;
+        for (int s = 0; s < c->n_srcs; s++) {
+            int bi = c->src_buf_idx[s];
+            if (bi < 0 || p->bufs[bi].buf == nil) { ready = 0; break; }
+        }
+        if (!ready) continue;
+        size_t total_n = c->n_per * (size_t)c->n_srcs;
+        size_t src_bytes = [p->bufs[c->src_buf_idx[0]].buf length];
+        size_t elem_b = (src_bytes == c->k * c->n_per * 4) ? 4 : 2;
+        size_t dst_bytes = total_n * c->k * elem_b;
+        id<MTLBuffer> dst = [g_mtl_device newBufferWithLength:(dst_bytes > 64 ? dst_bytes : 64)
+                                                   options:MTLResourceStorageModeShared];
+        if (elem_b == 2) {
+            uint16_t* dp = (uint16_t*)[dst contents];
+            for (int s = 0; s < c->n_srcs; s++) {
+                const uint16_t* sp = (const uint16_t*)[p->bufs[c->src_buf_idx[s]].buf contents];
+                size_t n_off = (size_t)s * c->n_per;
+                for (size_t kk = 0; kk < c->k; kk++) {
+                    for (size_t nn = 0; nn < c->n_per; nn++) {
+                        dp[(n_off + nn) * c->k + kk] = sp[kk * c->n_per + nn];
+                    }
+                }
+            }
+        } else {
+            uint32_t* dp = (uint32_t*)[dst contents];
+            for (int s = 0; s < c->n_srcs; s++) {
+                const uint32_t* sp = (const uint32_t*)[p->bufs[c->src_buf_idx[s]].buf contents];
+                size_t n_off = (size_t)s * c->n_per;
+                for (size_t kk = 0; kk < c->k; kk++) {
+                    for (size_t nn = 0; nn < c->n_per; nn++) {
+                        dp[(n_off + nn) * c->k + kk] = sp[kk * c->n_per + nn];
+                    }
+                }
+            }
+        }
+        p->bufs[c->dst_buf_idx].buf = dst;
+        p->bufs[c->dst_buf_idx].offset = 0;
+        p->bufs[c->dst_buf_idx].size = dst_bytes;
+        c->built = 1;
+    }
+    // Facility #3: Zero-Copy Buffer Donation (`DONATE|out_idx|in_idx`)
+    for (int di = 0; di < p->n_donates; di++) {
+        int in_bi = -1, out_bi = -1;
+        for (int i = 0; i < p->n_bufs; i++) {
+            if (p->bufs[i].kind == 0 && p->bufs[i].io_idx == p->donate_in[di]) in_bi = i;
+            if (p->bufs[i].kind == 1 && p->bufs[i].io_idx == p->donate_out[di]) out_bi = i;
+        }
+        if (in_bi >= 0 && out_bi >= 0 && p->bufs[in_bi].buf != nil) {
+            p->bufs[out_bi].buf = p->bufs[in_bi].buf;
+            p->bufs[out_bi].offset = p->bufs[in_bi].offset;
+        }
+    }
+}
+
+int64_t tn_metal_plan_set_dyn_m(int64_t plan_h, int64_t m_actual) {
+    if (plan_h <= 0 || plan_h >= MAX_PLANS || !g_plans[plan_h].active) return 0;
+    if (m_actual < 1) m_actual = 1;
+    TnMetalPlan* p = &g_plans[plan_h];
+    p->dyn_m_actual = (int)m_actual;
+    if (p->dyn_ctrl_buf_idx >= 0 && p->bufs[p->dyn_ctrl_buf_idx].buf != nil) {
+        uint32_t* cp = (uint32_t*)[p->bufs[p->dyn_ctrl_buf_idx].buf contents];
+        cp[0] = (uint32_t)m_actual;
+    }
+    if (p->n_buckets > 0 && p->dyn_step_idx >= 0) {
+        int chosen = p->n_buckets - 1;
+        for (int b = 0; b < p->n_buckets; b++) {
+            if ((int)m_actual >= p->buckets[b].min_m && (int)m_actual <= p->buckets[b].max_m) {
+                chosen = b;
+                break;
+            }
+        }
+        TnDynBucket* bk = &p->buckets[chosen];
+        p->active_bucket = chosen;
+        p->steps[p->dyn_step_idx] = bk->step;
+        p->steps[p->dyn_step_idx].tgy = (bk->tgy_mode == 1) ? (NSUInteger)((m_actual + 31) / 32)
+                                      : (bk->tgy_mode == 2) ? (NSUInteger)((m_actual + 63) / 64)
+                                      : (NSUInteger)m_actual;
+        p->icb = nil;
+    }
+    return 1;
 }
 
 static void plan_encode_step(TnMetalPlan* p, id<MTLComputeCommandEncoder> enc, const TnPlanStep* st) {
@@ -1068,6 +1356,7 @@ double tn_metal_plan_bench_ms(int64_t plan_h, int64_t warmup, int64_t iters) {
     if (iters <= 0) iters = 1;
     @autoreleasepool {
         TnMetalPlan* p = &g_plans[plan_h];
+        plan_prepare_derived(p);
         plan_run_pgo_autotune(p);
         if (warmup > 0) {
             // Ensure Apple Silicon GPU exits idle DVFS P-state cleanly before timed runs
@@ -1091,6 +1380,217 @@ double tn_metal_plan_bench_ms(int64_t plan_h, int64_t warmup, int64_t iters) {
     }
 }
 
+static void plan_build_icb(TnMetalPlan* p) {
+    if (p->icb != nil || !p->replay_enabled || p->n_steps <= 0) return;
+    // Count total compute commands including any post-reduction steps
+    int total_cmds = 0;
+    for (int s = 0; s < p->n_steps; s++) {
+        if (p->steps[s].pso) total_cmds++;
+        if (p->steps[s].has_post && p->steps[s].post_pso) total_cmds++;
+    }
+    if (total_cmds <= 0) return;
+    MTLIndirectCommandBufferDescriptor* desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
+    desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+    desc.inheritBuffers = NO;
+    desc.inheritPipelineState = NO;
+    desc.maxKernelBufferBindCount = 16;
+    id<MTLIndirectCommandBuffer> icb = [g_mtl_device newIndirectCommandBufferWithDescriptor:desc
+                                                                            maxCommandCount:(NSUInteger)total_cmds
+                                                                                    options:MTLResourceStorageModeShared];
+    if (!icb) return;
+    NSUInteger ci = 0;
+    for (int s = 0; s < p->n_steps; s++) {
+        const TnPlanStep* st = &p->steps[s];
+        if (st->pso) {
+            id<MTLComputePipelineState> icb_pso = plan_compile_fn_icb(p, st->kname, 1);
+            id<MTLIndirectComputeCommand> cmd = [icb indirectComputeCommandAtIndex:ci++];
+            [cmd setComputePipelineState:(icb_pso ? icb_pso : st->pso)];
+            for (int a = 0; a < st->n_args; a++) {
+                int bi = st->arg_idx[a];
+                if (bi >= 0 && bi < p->n_bufs && p->bufs[bi].buf != nil) {
+                    [cmd setKernelBuffer:p->bufs[bi].buf offset:p->bufs[bi].offset atIndex:(NSUInteger)a];
+                }
+            }
+            if (st->smem > 0) [cmd setThreadgroupMemoryLength:st->smem atIndex:0];
+            [cmd concurrentDispatchThreadgroups:MTLSizeMake(st->tgx, st->tgy, st->tgz)
+                          threadsPerThreadgroup:MTLSizeMake(st->tx, st->ty, st->tz)];
+        }
+        if (st->has_post && st->post_pso) {
+            id<MTLComputePipelineState> icb_post = plan_compile_fn_icb(p, st->post_kname, 1);
+            id<MTLIndirectComputeCommand> cmd = [icb indirectComputeCommandAtIndex:ci++];
+            [cmd setComputePipelineState:(icb_post ? icb_post : st->post_pso)];
+            for (int a = 0; a < st->post_n_args; a++) {
+                int bi = st->post_arg_idx[a];
+                if (bi >= 0 && bi < p->n_bufs && p->bufs[bi].buf != nil) {
+                    [cmd setKernelBuffer:p->bufs[bi].buf offset:p->bufs[bi].offset atIndex:(NSUInteger)a];
+                }
+            }
+            [cmd concurrentDispatchThreadgroups:MTLSizeMake(st->post_tgx, st->post_tgy, st->post_tgz)
+                          threadsPerThreadgroup:MTLSizeMake(st->post_tx, st->post_ty, st->post_tz)];
+        }
+    }
+    p->icb = icb;
+    p->icb_steps = (int)ci;
+}
+
+static void plan_exec_icb_steps(TnMetalPlan* p, int64_t steps) {
+    id<MTLCommandBuffer> cmd = [g_mtl_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    for (int i = 0; i < p->n_bufs; i++) {
+        if (p->bufs[i].buf != nil) {
+            [enc useResource:p->bufs[i].buf usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
+        }
+    }
+    NSRange rng = NSMakeRange(0, (NSUInteger)p->icb_steps);
+    for (int64_t s = 0; s < steps; s++) {
+        [enc executeCommandsInBuffer:p->icb withRange:rng];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+}
+
+static void plan_exec_host_eager_steps(TnMetalPlan* p, int64_t steps) {
+    // Realistic per-step eager host command-buffer allocation + kernel bind + commit!
+    id<MTLCommandBuffer> last_cmd = nil;
+    for (int64_t s = 0; s < steps; s++) {
+        id<MTLCommandBuffer> cmd = [g_mtl_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        for (int k = 0; k < p->n_steps; k++) {
+            plan_encode_step(p, enc, &p->steps[k]);
+        }
+        [enc endEncoding];
+        [cmd commit];
+        last_cmd = cmd;
+    }
+    if (last_cmd) [last_cmd waitUntilCompleted];
+}
+
+/// Facility #4: Device-Side Graph Replay (`MTLIndirectCommandBuffer` ICB vs eager per-step host submission)!
+double tn_metal_plan_bench_replay_ms(int64_t plan_h, int64_t steps, int64_t reps) {
+    if (plan_h <= 0 || plan_h >= MAX_PLANS || !g_plans[plan_h].active) return -1.0;
+    if (steps <= 0) steps = 1;
+    if (reps <= 0) reps = 1;
+    @autoreleasepool {
+        TnMetalPlan* p = &g_plans[plan_h];
+        plan_prepare_derived(p);
+        plan_run_pgo_autotune(p);
+        if (p->replay_enabled) plan_build_icb(p);
+
+        // Warmup 30ms to wake Apple Silicon GPU DVFS cleanly
+        double wt0 = tn_now_ms();
+        int w_it = 0;
+        do {
+            if (p->replay_enabled && p->icb != nil) plan_exec_icb_steps(p, steps);
+            else plan_exec_host_eager_steps(p, steps);
+            w_it++;
+        } while ((tn_now_ms() - wt0) < 30.0 && w_it < 32);
+
+        double t0 = tn_now_ms();
+        for (int64_t r = 0; r < reps; r++) {
+            if (p->replay_enabled && p->icb != nil) plan_exec_icb_steps(p, steps);
+            else plan_exec_host_eager_steps(p, steps);
+        }
+        return (tn_now_ms() - t0) / (double)reps;
+    }
+}
+
+/// Facility #9: Dual-Queue Async Blit-Prefetch || Compute Overlap (`g_mtl_copy_queue` + `MTLEvent` ping-pong staging)!
+double tn_metal_plan_bench_stream_ms(int64_t plan_h, int64_t weight_input_idx, int64_t layers, int64_t overlap, int64_t iters) {
+    if (plan_h <= 0 || plan_h >= MAX_PLANS || !g_plans[plan_h].active) return -1.0;
+    if (layers <= 0) layers = 1;
+    if (iters <= 0) iters = 1;
+    @autoreleasepool {
+        TnMetalPlan* p = &g_plans[plan_h];
+        plan_prepare_derived(p);
+        plan_run_pgo_autotune(p);
+
+        int w_bi = -1;
+        for (int i = 0; i < p->n_bufs; i++) {
+            if (p->bufs[i].kind == 0 && p->bufs[i].io_idx == (int)weight_input_idx) { w_bi = i; break; }
+        }
+        if (w_bi < 0 || p->bufs[w_bi].buf == nil) return -1.0;
+
+        id<MTLBuffer> orig_w = p->bufs[w_bi].buf;
+        NSUInteger w_len = [orig_w length];
+        if (layers > 16) layers = 16;
+
+        // Allocate `layers` distinct shared host-staged weight copies + 2 Private GPU ping-pong buffers
+        NSMutableArray<id<MTLBuffer>>* host_layers = [NSMutableArray arrayWithCapacity:(NSUInteger)layers];
+        for (int64_t l = 0; l < layers; l++) {
+            id<MTLBuffer> sb = [g_mtl_device newBufferWithLength:w_len options:MTLResourceStorageModeShared];
+            memcpy([sb contents], [orig_w contents], w_len);
+            [host_layers addObject:sb];
+        }
+        id<MTLBuffer> priv0 = [g_mtl_device newBufferWithLength:w_len options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> priv1 = [g_mtl_device newBufferWithLength:w_len options:MTLResourceStorageModePrivate];
+        id<MTLEvent> ev_ready = [g_mtl_device newEvent];
+        id<MTLEvent> ev_done = [g_mtl_device newEvent];
+        __block uint64_t sig_val = 0;
+
+        void (^run_once)(void) = ^{
+            if (!overlap || !p->overlap_enabled || !g_mtl_copy_queue) {
+                // Serialized baseline: blit layer L -> compute layer L strictly back-to-back on ONE queue!
+                id<MTLCommandBuffer> cmd = [g_mtl_queue commandBuffer];
+                for (int64_t l = 0; l < layers; l++) {
+                    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+                    [blit copyFromBuffer:host_layers[(NSUInteger)l] sourceOffset:0 toBuffer:priv0 destinationOffset:0 size:w_len];
+                    [blit endEncoding];
+                    p->bufs[w_bi].buf = priv0;
+                    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                    for (int s = 0; s < p->n_steps; s++) plan_encode_step(p, enc, &p->steps[s]);
+                    [enc endEncoding];
+                }
+                [cmd commit];
+                [cmd waitUntilCompleted];
+            } else {
+                // Async Dual-Queue Overlap: `g_mtl_copy_queue` blits layer `L+1` into `priv[(L+1)&1]`
+                // IN PARALLEL with `g_mtl_queue` running AMX compute on `priv[L&1]`, synced purely on GPU via `MTLEvent`!
+                uint64_t base = sig_val;
+                sig_val += (uint64_t)layers + 2ull;
+                id<MTLCommandBuffer> last_comp = nil;
+                for (int64_t l = 0; l < layers; l++) {
+                    id<MTLBuffer> pbuf = (l & 1) ? priv1 : priv0;
+                    id<MTLCommandBuffer> bcmd = [g_mtl_copy_queue commandBuffer];
+                    if (l >= 2) {
+                        // Wait until compute finished consuming `pbuf` from layer `l - 2`!
+                        [bcmd encodeWaitForEvent:ev_done value:(base + (uint64_t)(l - 1))];
+                    }
+                    id<MTLBlitCommandEncoder> blit = [bcmd blitCommandEncoder];
+                    [blit copyFromBuffer:host_layers[(NSUInteger)l] sourceOffset:0 toBuffer:pbuf destinationOffset:0 size:w_len];
+                    [blit endEncoding];
+                    [bcmd encodeSignalEvent:ev_ready value:(base + (uint64_t)(l + 1))];
+                    [bcmd commit];
+
+                    id<MTLCommandBuffer> ccmd = [g_mtl_queue commandBuffer];
+                    [ccmd encodeWaitForEvent:ev_ready value:(base + (uint64_t)(l + 1))];
+                    p->bufs[w_bi].buf = pbuf;
+                    id<MTLComputeCommandEncoder> enc = [ccmd computeCommandEncoder];
+                    for (int s = 0; s < p->n_steps; s++) plan_encode_step(p, enc, &p->steps[s]);
+                    [enc endEncoding];
+                    [ccmd encodeSignalEvent:ev_done value:(base + (uint64_t)(l + 1))];
+                    [ccmd commit];
+                    last_comp = ccmd;
+                }
+                if (last_comp) [last_comp waitUntilCompleted];
+            }
+        };
+
+        // Warmup 30ms for stable DVFS
+        double wt0 = tn_now_ms();
+        int w_it = 0;
+        do { run_once(); w_it++; } while ((tn_now_ms() - wt0) < 30.0 && w_it < 16);
+
+        double t0 = tn_now_ms();
+        for (int64_t it = 0; it < iters; it++) run_once();
+        double avg_ms = (tn_now_ms() - t0) / (double)iters;
+
+        p->bufs[w_bi].buf = orig_w;
+        return avg_ms;
+    }
+}
+
 int64_t tn_metal_plan_info(int64_t plan_h, int64_t field_id) {
     if (plan_h <= 0 || plan_h >= MAX_PLANS || !g_plans[plan_h].active) return 0;
     TnMetalPlan* p = &g_plans[plan_h];
@@ -1100,6 +1600,9 @@ int64_t tn_metal_plan_info(int64_t plan_h, int64_t field_id) {
         case 2: return (p->n_pgo > 0) ? (int64_t)p->pgo[0].n_cands : 1;
         case 3: return (p->n_pgo > 0) ? (int64_t)p->pgo[0].winner : 0;
         case 4: return (int64_t)p->n_steps;
+        case 5: return (int64_t)p->donated_bytes;
+        case 6: return (int64_t)p->active_bucket;
+        case 7: return (p->icb != nil) ? 1 : 0;
         default: return 0;
     }
 }
@@ -1109,6 +1612,7 @@ int64_t tn_metal_plan_free(int64_t plan_h) {
     TnMetalPlan* p = &g_plans[plan_h];
     p->lib = nil;
     p->arena_buf = nil;
+    p->icb = nil;
     for (int i = 0; i < p->n_bufs; i++) p->bufs[i].buf = nil;
     for (int s = 0; s < p->n_steps; s++) { p->steps[s].pso = nil; p->steps[s].post_pso = nil; }
     for (int g = 0; g < p->n_pgo; g++) {
@@ -1116,6 +1620,10 @@ int64_t tn_metal_plan_free(int64_t plan_h) {
             p->pgo[g].cands[c].pso = nil;
             p->pgo[g].cands[c].post_pso = nil;
         }
+    }
+    for (int b = 0; b < p->n_buckets; b++) {
+        p->buckets[b].step.pso = nil;
+        p->buckets[b].step.post_pso = nil;
     }
     p->active = 0;
     return 1;

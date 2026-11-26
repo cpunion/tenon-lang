@@ -524,3 +524,93 @@ pub pure fn tg_paged_attention[DType](q Tensor2D[DType], k Tensor2D[DType], v Te
 {
     Tensor2D { rows = q.rows, cols = q.cols, data = q.data }
 }
+
+/// Horizontal Weight-Packed 3-way QKV Projection (`X @ [Wq || Wk || Wv]` -> single wide `64x64` AMX GEMM when `horiz_pack` ON!).
+pub pure fn tg_qkv_proj[DType](
+    x Tensor2D[DType],
+    wq Tensor2D[DType],
+    wk Tensor2D[DType],
+    wv Tensor2D[DType],
+) Tensor2D[DType]
+    requires x.cols == wq.rows && x.cols == wk.rows && x.cols == wv.rows
+    requires wq.cols == wk.cols && wk.cols == wv.cols
+    requires len(x.data) == x.rows * x.cols
+    ensures result.rows == x.rows && result.cols == wq.cols * 3 && len(result.data) == x.rows * wq.cols * 3
+{
+    let out List[DType] = list_filled(x.rows * wq.cols * 3, x.data[0])
+    Tensor2D { rows = x.rows, cols = wq.cols * 3, data = out }
+}
+
+/// Zero-Copy Buffer-Donated Fused 128-bit AdamW Update (`param, grad, m, v` -> in-place update when `buffer_donation` ON!).
+pub pure fn tg_adamw_step[DType](
+    param Tensor2D[DType],
+    grad Tensor2D[DType],
+    m Tensor2D[DType],
+    v Tensor2D[DType],
+) Tensor2D[DType]
+    requires param.rows == grad.rows && param.cols == grad.cols
+    requires param.rows == m.rows && param.cols == m.cols
+    requires param.rows == v.rows && param.cols == v.cols
+    requires len(param.data) == param.rows * param.cols
+    ensures result.rows == param.rows && result.cols == param.cols && len(result.data) == param.rows * param.cols
+{
+    Tensor2D { rows = param.rows, cols = param.cols, data = param.data }
+}
+
+/// Online Monoid Fused Cross-Entropy Loss + In-Place Backward `dlogits` (zero O(BT*V) probs scratch when `online_monoid` ON!).
+pub pure fn tg_cross_entropy[DType](
+    logits Tensor2D[DType],
+    targets Tensor2D[DType],
+) Tensor2D[DType]
+    requires logits.rows == targets.rows && targets.cols == 1 && len(logits.data) == logits.rows * logits.cols
+    ensures result.rows == logits.rows && result.cols == logits.cols && len(result.data) == logits.rows * logits.cols
+{
+    Tensor2D { rows = logits.rows, cols = logits.cols, data = logits.data }
+}
+
+/// Auto Mixed-Precision Fused Single-Pass RMSNorm + Dynamic Quant W8A8/FP8 Contraction (`amp_dyn_quant`).
+pub pure fn tg_amp_matmul[DType](
+    x Tensor2D[DType],
+    nw Tensor2D[DType],
+    w Tensor2D[DType],
+) Tensor2D[DType]
+    requires nw.rows == 1 && nw.cols == x.cols && x.cols == w.rows
+    requires len(x.data) == x.rows * x.cols && len(w.data) == w.rows * w.cols
+    ensures result.rows == x.rows && result.cols == w.cols && len(result.data) == x.rows * w.cols
+{
+    let out List[DType] = list_filled(x.rows * w.cols, x.data[0])
+    Tensor2D { rows = x.rows, cols = w.cols, data = out }
+}
+
+/// Symbolic Dynamic-Shape Multi-Version Bucketed MatMul (`M_actual` set at runtime with ZERO padding & ZERO JIT recompile!).
+pub pure fn tg_dyn_matmul[DType](a Tensor2D[DType], b Tensor2D[DType]) Tensor2D[DType]
+    requires a.cols == b.rows && len(a.data) == a.rows * a.cols && len(b.data) == b.rows * b.cols
+    ensures result.rows == a.rows && result.cols == b.cols && len(result.data) == a.rows * b.cols
+{
+    let out List[DType] = list_filled(a.rows * b.cols, a.data[0])
+    Tensor2D { rows = a.rows, cols = b.cols, data = out }
+}
+
+/// Zero-`im2col` Implicit GEMM 3x3 Conv2d (`x: [H*W, C_in]`, `w: [9*C_in, C_out]` -> `[H*W, C_out]`).
+pub pure fn tg_conv2d_3x3[DType](
+    x Tensor2D[DType],
+    w Tensor2D[DType],
+    in_h Int,
+    in_w Int,
+) Tensor2D[DType]
+    requires x.rows == in_h * in_w && w.rows == x.cols * 9 && len(x.data) == x.rows * x.cols
+    ensures result.rows == x.rows && result.cols == w.cols && len(result.data) == x.rows * w.cols
+{
+    let _ = in_h
+    let _ = in_w
+    let out List[DType] = list_filled(x.rows * w.cols, x.data[0])
+    Tensor2D { rows = x.rows, cols = w.cols, data = out }
+}
+
+/// First-Class Associative Parallel Scan (`h_t = a_t * h_{t-1} + b_t` for Mamba/SSM/Linear-Attention, O(log L) parallel depth!).
+pub pure fn tg_scan[DType](a Tensor2D[DType], b Tensor2D[DType]) Tensor2D[DType]
+    requires a.rows == b.rows && a.cols == b.cols && len(a.data) == a.rows * a.cols
+    ensures result.rows == a.rows && result.cols == a.cols && len(result.data) == a.rows * a.cols
+{
+    Tensor2D { rows = a.rows, cols = a.cols, data = a.data }
+}

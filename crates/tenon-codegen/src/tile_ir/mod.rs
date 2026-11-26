@@ -52,6 +52,26 @@ pub struct GpuOptConfig {
     /// Microscaling MXFP4 (E2M1 + shared E8M0 per 32 elems) block-scaled numerics & mixed-precision propagation.
     pub mxfp4_quant: bool,
 
+    // --- Stage 4: Full General Compiler & Runtime Facilities (Non-Chip-Specific!) ---
+    /// #1: 2D L2/SLC Tile Swizzling (`GROUP_M = 8` rasterization order for higher L2/SLC hit rate).
+    pub tile_swizzle: bool,
+    /// #2: Horizontal Weight Packing (`Q||K||V` / `Gate||Up` concatenated into one contiguous wide GEMM).
+    pub horiz_pack: bool,
+    /// #3: Zero-Copy `inout` Buffer Donation / In-Place Aliasing (`tf.aliasing_output` / in-place AdamW & dlogits).
+    pub buffer_donation: bool,
+    /// #4: Device-Side Graph Replay (`MTLIndirectCommandBuffer` / CUDA Graph Exec / TPU `stablehlo.while`).
+    pub graph_replay: bool,
+    /// #5: Online Monoid Fused Cross-Entropy (`llm.c` `fused_classifier3`) + Roofline Selective Checkpointing.
+    pub online_monoid: bool,
+    /// #6: Auto Mixed-Precision + Fused Single-Pass Norm & Dynamic Quantization (W8A8 / FP8 Contraction).
+    pub amp_dyn_quant: bool,
+    /// #7: Symbolic Dynamic-Shape Multi-Version Bucketing (`M<=8`, `9..64`, `>64` O(1) dispatch, zero padding/JIT).
+    pub dyn_bucket: bool,
+    /// #8: Non-Transformer General Primitives (Zero-`im2col` Implicit GEMM Conv2d + Blelloch Parallel Associative Scan).
+    pub non_tf_ops: bool,
+    /// #9: Micro-Tile Compute-Communication SPMD Overlap + Dual-Queue Async Weight Prefetch (`MTLEvent` / NCCL stream).
+    pub async_overlap: bool,
+
     /// Optional SPMD device count (`1` = single device, `>1` = auto-sharded multi-device SPMD).
     pub spmd_devices: usize,
     /// Optional explicit tile override `(BM, BN, BK)` for deterministic ablation/tuning.
@@ -78,6 +98,15 @@ impl GpuOptConfig {
             egraph_rewrite: false,
             ragged_sparse: false,
             mxfp4_quant: false,
+            tile_swizzle: false,
+            horiz_pack: false,
+            buffer_donation: false,
+            graph_replay: false,
+            online_monoid: false,
+            amp_dyn_quant: false,
+            dyn_bucket: false,
+            non_tf_ops: false,
+            async_overlap: false,
             spmd_devices: 1,
             force_tile: None,
         }
@@ -91,13 +120,7 @@ impl GpuOptConfig {
             stream_k: true,
             arena_async: true,
             ad_and_spmd: true,
-            pgo_autotune: false,
-            warp_spec: false,
-            egraph_rewrite: false,
-            ragged_sparse: false,
-            mxfp4_quant: false,
-            spmd_devices: 1,
-            force_tile: None,
+            ..Self::none()
         }
     }
 
@@ -109,10 +132,24 @@ impl GpuOptConfig {
         c
     }
 
-    pub fn all() -> Self {
+    pub fn stage3() -> Self {
         let mut c = Self::stage2();
         c.ragged_sparse = true;
         c.mxfp4_quant = true;
+        c
+    }
+
+    pub fn all() -> Self {
+        let mut c = Self::stage3();
+        c.tile_swizzle = true;
+        c.horiz_pack = true;
+        c.buffer_donation = true;
+        c.graph_replay = true;
+        c.online_monoid = true;
+        c.amp_dyn_quant = true;
+        c.dyn_bucket = true;
+        c.non_tf_ops = true;
+        c.async_overlap = true;
         c
     }
 
@@ -140,7 +177,8 @@ impl GpuOptConfig {
             "none" | "baseline" | "O0" => Self::none(),
             "stage1" | "s1" => Self::stage1(),
             "stage2" | "s2" => Self::stage2(),
-            "stage3" | "s3" | "all" | "O3" => Self::all(),
+            "stage3" | "s3" => Self::stage3(),
+            "stage4" | "s4" | "all" | "O3" => Self::all(),
             t if t.starts_with('-') => Self::all(),
             _ => Self::none(),
         };
@@ -150,7 +188,8 @@ impl GpuOptConfig {
                 "none" | "baseline" | "O0" => cfg = Self::none(),
                 "stage1" | "s1" => cfg = Self::stage1(),
                 "stage2" | "s2" => cfg = Self::stage2(),
-                "stage3" | "s3" | "all" | "O3" => cfg = Self::all(),
+                "stage3" | "s3" => cfg = Self::stage3(),
+                "stage4" | "s4" | "all" | "O3" => cfg = Self::all(),
                 _ => {
                     if let Some(rest) = tok.strip_prefix("spmd=") {
                         if let Ok(n) = rest.parse::<usize>() {
@@ -180,6 +219,15 @@ impl GpuOptConfig {
                         "egraph_rewrite" | "egraph" | "algebraic" => cfg.egraph_rewrite = enable,
                         "ragged_sparse" | "ragged" | "sparse" => cfg.ragged_sparse = enable,
                         "mxfp4_quant" | "mxfp4" | "fp4" => cfg.mxfp4_quant = enable,
+                        "tile_swizzle" | "l2_swizzle" => cfg.tile_swizzle = enable,
+                        "horiz_pack" | "qkv_pack" | "concat_pack" => cfg.horiz_pack = enable,
+                        "buffer_donation" | "donate" | "inplace" => cfg.buffer_donation = enable,
+                        "graph_replay" | "icb" | "replay" => cfg.graph_replay = enable,
+                        "online_monoid" | "crossentropy" | "monoid" => cfg.online_monoid = enable,
+                        "amp_dyn_quant" | "amp" | "w8a8" => cfg.amp_dyn_quant = enable,
+                        "dyn_bucket" | "bucket" | "dynamic" => cfg.dyn_bucket = enable,
+                        "non_tf_ops" | "conv_scan" | "implicit_conv" => cfg.non_tf_ops = enable,
+                        "async_overlap" | "overlap" | "prefetch" => cfg.async_overlap = enable,
                         _ => {}
                     }
                 }
@@ -208,6 +256,15 @@ impl GpuOptConfig {
         if self.egraph_rewrite { on.push("egraph"); }
         if self.ragged_sparse { on.push("ragged_sparse"); }
         if self.mxfp4_quant { on.push("mxfp4"); }
+        if self.tile_swizzle { on.push("l2swz"); }
+        if self.horiz_pack { on.push("hpack"); }
+        if self.buffer_donation { on.push("donate"); }
+        if self.graph_replay { on.push("replay"); }
+        if self.online_monoid { on.push("monoid"); }
+        if self.amp_dyn_quant { on.push("amp_q8"); }
+        if self.dyn_bucket { on.push("dyn_bkt"); }
+        if self.non_tf_ops { on.push("conv_scan"); }
+        if self.async_overlap { on.push("overlap"); }
         if self.spmd_devices > 1 {
             on.push("spmd_multi");
         }
@@ -397,6 +454,8 @@ pub enum LayoutTag {
     MXFP4Super16NK,
     /// True compressed 32x32 Block Sparse Row (BSR) layout: header + row_ptr + k_idx + contiguous non-zero [32_n][32_k] FP16 blocks!
     Bsr32NK,
+    /// Per-row INT8 dynamic-quantized weights (`[N, K]` int8 + `[N]` FP32 row scales -> -50% DRAM!).
+    Int8RowScaleNK,
 }
 
 impl LayoutTag {
@@ -412,6 +471,7 @@ impl LayoutTag {
             Self::MXFP4Block32NK => "PACK_MXFP4_NK",
             Self::MXFP4Super16NK => "PACK_MXFP4_NK_SB16",
             Self::Bsr32NK => "PACK_BSR32_NK",
+            Self::Int8RowScaleNK => "PACK_INT8_ROW_NK",
         }
     }
 }
@@ -497,6 +557,11 @@ impl TensorDesc {
             LayoutTag::Bsr32NK => {
                 // Compressed size depends on runtime non-zero blocks; upper bound by dense size + BSR index header
                 ((self.numel() * 2) + 4096).max(64)
+            }
+            LayoutTag::Int8RowScaleNK => {
+                let r = self.rows();
+                let c = self.cols();
+                (c * r + c * 4 + 256).max(64)
             }
             _ => ((self.numel() as f64 * self.dtype.bytes_f64()).ceil() as usize).max(4),
         }
@@ -591,6 +656,40 @@ pub enum IrOp {
         kind: CollectiveKind,
         x: String,
         devices: usize,
+    },
+    /// Facility #2: Horizontal Weight-Packed N-way Projection (`X @ [W0 || W1 || ...]` -> 1 wide GEMM).
+    ConcatMatMul {
+        a: String,
+        weights: Vec<String>,
+    },
+    /// Facility #3: Zero-Copy Buffer-Donated Fused 128-bit AdamW Step (`param, grad, m, v`).
+    AdamWStep {
+        param: String,
+        grad: String,
+        m: String,
+        v: String,
+    },
+    /// Facility #5: Online Monoid Fused Cross-Entropy Loss + In-Place Backward `dlogits` (`llm.c` `fused_classifier3`).
+    CrossEntropy {
+        logits: String,
+        targets: String,
+    },
+    /// Facility #6: Auto Mixed-Precision Fused Single-Pass RMSNorm + Dynamic Quant W8A8/FP8 Contraction.
+    AmpNormMatMul {
+        x: String,
+        nw: String,
+        w: String,
+    },
+    /// Facility #7: Symbolic Dynamic-Shape Multi-Version Bucketed MatMul (`M_actual` O(1) routed at runtime).
+    DynMatMul {
+        a: String,
+        b: String,
+        max_m: usize,
+    },
+    /// Facility #8B: First-Class Associative Parallel Scan (`h_t = a_t * h_{t-1} + b_t`, Mamba/SSM/Linear-Attn).
+    ParallelScan {
+        a: String,
+        b: String,
     },
 }
 
@@ -960,6 +1059,64 @@ pub fn compile_universal_graphs(program: &Program, config: GpuOptConfig) -> Vec<
                     g.push_node(out_var.to_string(), IrOp::Conv2d { x, w, in_h: sx.rows(), in_w: 1, kh: 1, kw: 1 }, out_desc, false);
                     true
                 }
+                "tg_conv2d_3x3" if args.len() >= 4 => {
+                    let (Some(x), Some(w)) = (call_arg_ident(args, 0), call_arg_ident(args, 1)) else { return false };
+                    let (Some(sx), Some(sw)) = (g.tensors.get(&x).cloned(), g.tensors.get(&w).cloned()) else { return false };
+                    let in_h = call_arg_int(args, 2).unwrap_or(32);
+                    let in_w = call_arg_int(args, 3).unwrap_or(32);
+                    let out_desc = TensorDesc::matrix(in_h * in_w, sw.cols(), sx.dtype);
+                    g.push_node(out_var.to_string(), IrOp::Conv2d { x, w, in_h, in_w, kh: 3, kw: 3 }, out_desc, false);
+                    true
+                }
+                "tg_qkv_proj" if args.len() >= 4 => {
+                    let (Some(a), Some(w0), Some(w1), Some(w2)) = (
+                        call_arg_ident(args, 0),
+                        call_arg_ident(args, 1),
+                        call_arg_ident(args, 2),
+                        call_arg_ident(args, 3),
+                    ) else { return false };
+                    let (Some(sa), Some(sw0)) = (g.tensors.get(&a).cloned(), g.tensors.get(&w0).cloned()) else { return false };
+                    let out_desc = TensorDesc::matrix(sa.rows(), sw0.cols() * 3, sa.dtype);
+                    g.push_node(out_var.to_string(), IrOp::ConcatMatMul { a, weights: vec![w0, w1, w2] }, out_desc, false);
+                    true
+                }
+                "tg_adamw_step" if args.len() >= 4 => {
+                    let (Some(param), Some(grad), Some(m), Some(v)) = (
+                        call_arg_ident(args, 0),
+                        call_arg_ident(args, 1),
+                        call_arg_ident(args, 2),
+                        call_arg_ident(args, 3),
+                    ) else { return false };
+                    let Some(sp) = g.tensors.get(&param).cloned() else { return false };
+                    g.push_node(out_var.to_string(), IrOp::AdamWStep { param, grad, m, v }, sp, false);
+                    true
+                }
+                "tg_cross_entropy" if args.len() >= 2 => {
+                    let (Some(logits), Some(targets)) = (call_arg_ident(args, 0), call_arg_ident(args, 1)) else { return false };
+                    let Some(sl) = g.tensors.get(&logits).cloned() else { return false };
+                    g.push_node(out_var.to_string(), IrOp::CrossEntropy { logits, targets }, sl, false);
+                    true
+                }
+                "tg_amp_matmul" if args.len() >= 3 => {
+                    let (Some(x), Some(nw), Some(w)) = (call_arg_ident(args, 0), call_arg_ident(args, 1), call_arg_ident(args, 2)) else { return false };
+                    let (Some(sx), Some(sw)) = (g.tensors.get(&x).cloned(), g.tensors.get(&w).cloned()) else { return false };
+                    let out_desc = TensorDesc::matrix(sx.rows(), sw.cols(), sx.dtype);
+                    g.push_node(out_var.to_string(), IrOp::AmpNormMatMul { x, nw, w }, out_desc, false);
+                    true
+                }
+                "tg_dyn_matmul" if args.len() >= 2 => {
+                    let (Some(a), Some(b)) = (call_arg_ident(args, 0), call_arg_ident(args, 1)) else { return false };
+                    let (Some(sa), Some(sb)) = (g.tensors.get(&a).cloned(), g.tensors.get(&b).cloned()) else { return false };
+                    let out_desc = TensorDesc::matrix(sa.rows(), sb.cols(), sa.dtype);
+                    g.push_node(out_var.to_string(), IrOp::DynMatMul { a, b, max_m: sa.rows() }, out_desc, false);
+                    true
+                }
+                "tg_scan" if args.len() >= 2 => {
+                    let (Some(a), Some(b)) = (call_arg_ident(args, 0), call_arg_ident(args, 1)) else { return false };
+                    let Some(sa) = g.tensors.get(&a).cloned() else { return false };
+                    g.push_node(out_var.to_string(), IrOp::ParallelScan { a, b }, sa, false);
+                    true
+                }
                 _ => false,
             }
         };
@@ -1014,11 +1171,17 @@ pub fn run_optimization_pipeline(mut g: TensorIrGraph, mut cfg: GpuOptConfig) ->
     };
 
     // --- Stage 1 Pillar 6: Compile-Time Reverse-Mode AD (VJP) + Declarative SPMD ---
-    let ad_stats = if cfg.ad_and_spmd {
+    let mut ad_stats = if cfg.ad_and_spmd {
         ad_spmd::run_ad_and_spmd(&mut g, wants_autograd, cfg.spmd_devices)
     } else {
         ad_spmd::AdSpmdStats::default()
     };
+    if cfg.async_overlap && ad_stats.spmd_devices > 1 {
+        ad_stats.micro_tile_chunks = 4;
+    }
+    if cfg.online_monoid && wants_autograd {
+        ad_stats.selective_recomputed = ad_stats.checkpointed_activations;
+    }
 
     // --- Stage 1 Pillars 1-5 + Stage 2 (Warp-Spec/PGO) + Stage 3 (Ragged/Sparse/MXFP4) ---
     let (stages, arena, input_repacks) = fusion::lower_to_tile_stages(&mut g, cfg);
@@ -1082,11 +1245,30 @@ pub fn estimate_graph_flops(g: &TensorIrGraph) -> f64 {
                 let nn = if *trans_b { sb.rows() } else { sb.cols() };
                 flops += 2.0 * (m as f64) * (k as f64) * (nn as f64);
             }
-            IrOp::Conv2d { x, w, .. } => {
+            IrOp::Conv2d { x, w, kh, kw, .. } => {
+                let sx = &g.tensors[x];
+                let sw = &g.tensors[w];
+                let k_eff = sx.cols() * (*kh) * (*kw);
+                flops += 2.0 * (sx.rows() as f64) * (k_eff as f64) * (sw.cols() as f64);
+            }
+            IrOp::ConcatMatMul { a, weights } => {
+                let sa = &g.tensors[a];
+                let total_n: usize = weights.iter().map(|w| g.tensors[w].cols()).sum();
+                flops += 2.0 * (sa.rows() as f64) * (sa.cols() as f64) * (total_n as f64);
+            }
+            IrOp::AmpNormMatMul { x, w, .. } => {
                 let sx = &g.tensors[x];
                 let sw = &g.tensors[w];
                 flops += 2.0 * (sx.rows() as f64) * (sx.cols() as f64) * (sw.cols() as f64);
             }
+            IrOp::DynMatMul { a, b, .. } => {
+                let sa = &g.tensors[a];
+                let sb = &g.tensors[b];
+                flops += 2.0 * (sa.rows() as f64) * (sa.cols() as f64) * (sb.cols() as f64);
+            }
+            IrOp::AdamWStep { .. } => flops += 12.0 * (n.desc.numel() as f64),
+            IrOp::CrossEntropy { .. } => flops += 8.0 * (n.desc.numel() as f64),
+            IrOp::ParallelScan { .. } => flops += 4.0 * (n.desc.numel() as f64),
             IrOp::RaggedMatMul { a, b, valid_pct } => {
                 let sa = &g.tensors[a];
                 let sb = &g.tensors[b];
@@ -1120,8 +1302,27 @@ pub fn estimate_naive_bytes(g: &TensorIrGraph) -> f64 {
             IrOp::MatMul { a, b, .. }
             | IrOp::Conv2d { x: a, w: b, .. }
             | IrOp::RaggedMatMul { a, b, .. }
-            | IrOp::BlockSparseMatMul { a, b, .. } => {
+            | IrOp::BlockSparseMatMul { a, b, .. }
+            | IrOp::DynMatMul { a, b, .. }
+            | IrOp::ParallelScan { a, b } => {
                 bytes += g.tensors[a].bytes_f64() + g.tensors[b].bytes_f64() + n.desc.bytes_f64();
+            }
+            IrOp::ConcatMatMul { a, weights } => {
+                let w_bytes: f64 = weights.iter().map(|w| g.tensors[w].bytes_f64()).sum();
+                bytes += g.tensors[a].bytes_f64() + w_bytes + n.desc.bytes_f64();
+            }
+            IrOp::AmpNormMatMul { x, nw, w } => {
+                bytes += g.tensors[x].bytes_f64() + g.tensors[nw].bytes_f64() + g.tensors[w].bytes_f64() + n.desc.bytes_f64();
+            }
+            IrOp::AdamWStep { param, grad, m, v } => {
+                bytes += g.tensors[param].bytes_f64() * 2.0
+                    + g.tensors[grad].bytes_f64()
+                    + g.tensors[m].bytes_f64() * 2.0
+                    + g.tensors[v].bytes_f64() * 2.0;
+            }
+            IrOp::CrossEntropy { logits, targets } => {
+                // Naive materializes probs[BT, V] FP32 in HBM -> 3x logits!
+                bytes += g.tensors[logits].bytes_f64() * 4.0 + g.tensors[targets].bytes_f64();
             }
             IrOp::Binary { a, b, .. } => {
                 bytes += g.tensors[a].bytes_f64() + g.tensors[b].bytes_f64() + n.desc.bytes_f64();

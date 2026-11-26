@@ -214,9 +214,22 @@ fn count_uses(op: &IrOp, uses: &mut BTreeMap<String, usize>) {
         | IrOp::Conv2d { x: a, w: b, .. }
         | IrOp::RaggedMatMul { a, b, .. }
         | IrOp::BlockSparseMatMul { a, b, .. }
+        | IrOp::DynMatMul { a, b, .. }
+        | IrOp::ParallelScan { a, b }
+        | IrOp::CrossEntropy { logits: a, targets: b }
         | IrOp::Binary { a, b, .. } => {
             bump(a);
             bump(b);
+        }
+        IrOp::ConcatMatMul { a, weights } => {
+            bump(a);
+            for w in weights { bump(w); }
+        }
+        IrOp::AdamWStep { param, grad, m, v } => {
+            bump(param); bump(grad); bump(m); bump(v);
+        }
+        IrOp::AmpNormMatMul { x, nw, w } => {
+            bump(x); bump(nw); bump(w);
         }
         IrOp::Unary { x, .. } | IrOp::Rope { x } | IrOp::Transpose { x } | IrOp::Collective { x, .. } => bump(x),
         IrOp::Reduce { x, weight, .. } => {

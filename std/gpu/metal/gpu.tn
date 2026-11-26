@@ -50,12 +50,15 @@ extern "C" {
     fn tn_metal_plan_create(msl_cstr Ptr[UInt8], plan_cstr Ptr[UInt8], graph_cstr Ptr[UInt8]) Int
     fn tn_metal_plan_set_input(plan_h Int, input_idx Int, buf_handle Int) Int
     fn tn_metal_plan_set_output(plan_h Int, output_idx Int, buf_handle Int) Int
+    fn tn_metal_plan_set_dyn_m(plan_h Int, m_actual Int) Int
     fn tn_metal_plan_bench_ms(plan_h Int, warmup Int, iters Int) Float
+    fn tn_metal_plan_bench_replay_ms(plan_h Int, steps Int, reps Int) Float
+    fn tn_metal_plan_bench_stream_ms(plan_h Int, weight_input_idx Int, layers Int, overlap Int, iters Int) Float
     fn tn_metal_plan_info(plan_h Int, field_id Int) Int
     fn tn_metal_plan_free(plan_h Int) Int
 }
 
-/// `@linear` Op-Agnostic Compiled `@gpu_graph` Execution Plan (Static Arena + PGO Auto-Tune + Single-CB).
+/// `@linear` Op-Agnostic Compiled `@gpu_graph` Execution Plan (Static Arena + PGO Auto-Tune + Single-CB + ICB Replay + Async Overlap).
 @linear
 pub record GpuGraphPlan {
     handle Int
@@ -75,8 +78,21 @@ impl GpuGraphPlan {
         unsafe { tn_metal_plan_set_output(self.handle, idx, buf.handle) != 0 }
     }
 
+    pub fn set_dyn_m(inout self, m_actual Int) Bool {
+        unsafe { tn_metal_plan_set_dyn_m(self.handle, m_actual) != 0 }
+    }
+
     pub fn bench_ms(inout self, warmup Int, iters Int) Float {
         unsafe { tn_metal_plan_bench_ms(self.handle, warmup, iters) }
+    }
+
+    pub fn bench_replay_ms(inout self, steps Int, reps Int) Float {
+        unsafe { tn_metal_plan_bench_replay_ms(self.handle, steps, reps) }
+    }
+
+    pub fn bench_stream_ms(inout self, weight_input_idx Int, layers Int, overlap Bool, iters Int) Float {
+        let ov = if overlap { 1 } else { 0 }
+        unsafe { tn_metal_plan_bench_stream_ms(self.handle, weight_input_idx, layers, ov, iters) }
     }
 
     pub fn arena_bytes(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 0) } }
@@ -84,6 +100,9 @@ impl GpuGraphPlan {
     pub fn pgo_cands(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 2) } }
     pub fn pgo_winner(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 3) } }
     pub fn num_dispatches(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 4) } }
+    pub fn donated_bytes(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 5) } }
+    pub fn active_bucket(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 6) } }
+    pub fn icb_active(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 7) } }
 
     pub fn destroy(self) {
         let _ = unsafe { tn_metal_plan_free(self.handle) }

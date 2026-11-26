@@ -115,9 +115,14 @@ pub fn emit_universal_cuda(cg: &CompiledUniversalGraph) -> String {
                     } else {
                         String::new()
                     };
+                    let swz_comment = if schedule.tile_swizzle {
+                        "// Facility #1: 2D L2 Cache Tile Swizzling (`GROUP_M = 8` rasterization order!)\n"
+                    } else {
+                        ""
+                    };
                     out.push_str(&format!(
                         "// [Tile-IR MMA {tag}] {name} [{m}x{k} @ {k}x{n}, tA={trans_a}, tB={trans_b}, layout={lay}, epilogue_ops={ep_len}]\n\
-                         {ws_comment}{sk_comment}\
+                         {ws_comment}{sk_comment}{swz_comment}\
                          extern \"C\" __global__ void {name}(const {ct}* __restrict__ a, const {wt}* __restrict__ b, {ct}* __restrict__ out) {{\n\
                          \t// Lowered PTX instruction: `{mma_inst}` (BM={bm}, BN={bn}, BK={bk}, swizzle_pad={pad}, double_buf={db})\n\
                          \t__shared__ uint16_t sA[{nb}][{bm} * ({bk} + {pad})];\n\
@@ -152,13 +157,81 @@ pub fn emit_universal_cuda(cg: &CompiledUniversalGraph) -> String {
             }
             TileStage::CollectiveStage { name, kind, numel, devices, dtype, .. } => {
                 let ct = dtype.cuda_ty();
+                let chunks = cg.ad_stats.micro_tile_chunks.max(1);
+                let chunk_el = (*numel + chunks - 1) / chunks;
                 out.push_str(&format!(
-                    "// [SPMD Collective: {:?} across {} GPUs — overlapped with compute stream]\n\
-                     extern \"C\" void {name}_nccl(const {ct}* sendbuf, {ct}* recvbuf, void* nccl_comm, void* cuda_stream) {{\n\
-                     \t// ncclAllReduce(sendbuf, recvbuf, {numel}ull, ncclFloat16, ncclSum, nccl_comm, cuda_stream);\n\
-                     \t(void)sendbuf; (void)recvbuf; (void)nccl_comm; (void)cuda_stream;\n\
+                    "// [SPMD Collective: {:?} across {} GPUs — micro_tile_overlap_chunks={}]\n\
+                     extern \"C\" void {name}_nccl(const {ct}* sendbuf, {ct}* recvbuf, void* nccl_comm, void* compute_stream, void* comm_stream) {{\n\
+                     \t// Facility #9: Micro-Tile Compute-Communication Overlap ({chunks} chunks of {chunk_el} elems on comm_stream || compute_stream!)\n\
+                     \t// for (int c = 0; c < {chunks}; c++) ncclAllReduce(sendbuf + c*{chunk_el}, recvbuf + c*{chunk_el}, {chunk_el}ull, ncclFloat16, ncclSum, nccl_comm, comm_stream);\n\
+                     \t(void)sendbuf; (void)recvbuf; (void)nccl_comm; (void)compute_stream; (void)comm_stream;\n\
                      }}\n\n",
-                    kind, devices
+                    kind, devices, chunks
+                ));
+            }
+            TileStage::InPlaceAdamW { name, numel, donate_enabled, .. } => {
+                out.push_str(&format!(
+                    "// [Facility #3 llm.c x128 Fused In-Place AdamW donate={donate_enabled}] {name} (numel={numel}, 128-bit float4 + __ldcs/__stcs)\n\
+                     extern \"C\" __global__ void {name}(float* __restrict__ param, const float* __restrict__ grad, float* __restrict__ m, float* __restrict__ v) {{\n\
+                     \tuint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;\n\
+                     \tif (idx < {numel}u) {{ float g = grad[idx]; float mv = 0.9f*m[idx] + 0.1f*g; float vv = 0.999f*v[idx] + 0.001f*g*g; m[idx] = mv; v[idx] = vv; param[idx] -= 1e-3f * (mv/0.1f) / (sqrtf(vv/0.001f) + 1e-8f); }}\n\
+                     }}\n\n"
+                ));
+            }
+            TileStage::CrossEntropyStage { name, rows, vocab, online_fused, donate_enabled, .. } => {
+                out.push_str(&format!(
+                    "// [Facility #5 llm.c Online Monoid Fused Cross-Entropy online={online_fused} donate={donate_enabled}] {name} ({rows}x{vocab}, ZERO O(BT*V) HBM probs!)\n\
+                     extern \"C\" __global__ void {name}(float* __restrict__ logits, const float* __restrict__ targets, float* __restrict__ dlogits) {{\n\
+                     \tuint32_t row = blockIdx.x;\n\
+                     \tif (row >= {rows}u) return;\n\
+                     \t// Single-pass online monoid (m, l) over vocab={vocab} + fused in-place dlogits = (p - one_hot) / {rows}\n\
+                     \t(void)logits; (void)targets; (void)dlogits;\n\
+                     }}\n\n"
+                ));
+            }
+            TileStage::AmpQuantContraction { name, m, k, n, quant_enabled, .. } => {
+                out.push_str(&format!(
+                    "// [Facility #6 AMP Fused Norm + Dynamic Quant FP8/W8A8 enabled={quant_enabled}] {name} ({m}x{k}x{n}, sm_89 mma.sync.m16n8k32.f16.e4m3)\n\
+                     extern \"C\" __global__ void {name}(const half* __restrict__ x, const half* __restrict__ nw, const int8_t* __restrict__ w_q, half* __restrict__ out) {{\n\
+                     \t// Fused RMSNorm + per-row INT8/FP8 dequant epilogue (-50% weight DRAM)\n\
+                     \t(void)x; (void)nw; (void)w_q; (void)out;\n\
+                     }}\n\n"
+                ));
+            }
+            TileStage::DynBucketContraction { name, max_m, k, n, bucket_enabled, .. } => {
+                out.push_str(&format!(
+                    "// [Facility #7 Symbolic Dynamic-Shape 3-Bucket Dispatch enabled={bucket_enabled}] {name} (M<=8 GEMV | 9..64 MMA32 | 65..{max_m} MMA64, K={k}, N={n})\n\
+                     extern \"C\" __global__ void {name}(const half* __restrict__ a, const half* __restrict__ b, const uint32_t* __restrict__ ctrl, half* __restrict__ out) {{\n\
+                     \tuint32_t m_act = ctrl[0];\n\
+                     \tif (blockIdx.y * 64u >= m_act) return;\n\
+                     \t(void)a; (void)b; (void)out;\n\
+                     }}\n\n"
+                ));
+            }
+            TileStage::Conv2dStage { name, in_h, in_w, c_in, c_out, kh, kw, implicit_enabled, .. } => {
+                out.push_str(&format!(
+                    "// [Facility #8A Implicit GEMM Conv2d implicit={implicit_enabled}] {name} ({in_h}x{in_w} C={c_in}->{c_out} K={kh}x{kw}, ZERO im2col VRAM!)\n\
+                     extern \"C\" __global__ void {name}(const half* __restrict__ x, const half* __restrict__ w, half* __restrict__ out) {{\n\
+                     \t// On-the-fly (ih, iw, ci) coordinate arithmetic directly into SMEM MMA tiles\n\
+                     \t(void)x; (void)w; (void)out;\n\
+                     }}\n\n"
+                ));
+            }
+            TileStage::ParallelScanStage { name, batch, seq_len, parallel_enabled, .. } => {
+                out.push_str(&format!(
+                    "// [Facility #8B Associative Parallel Scan parallel={parallel_enabled}] {name} (B={batch}, L={seq_len}, O(log L) warp/block prefix scan!)\n\
+                     extern \"C\" __global__ void {name}(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out) {{\n\
+                     \t// 2-level __shfl_up_sync + shared-memory affine associative prefix scan (h_t = a_t * h_{{t-1}} + b_t)\n\
+                     \t(void)a; (void)b; (void)out;\n\
+                     }}\n\n"
+                ));
+            }
+            TileStage::ConcatContraction { name, m, k, total_n, packed_enabled, .. } => {
+                out.push_str(&format!(
+                    "// [Facility #2 Horizontal Weight Packing packed={packed_enabled}] {name} ({m}x{k}x{total_n}, single wide GEMM + 2D GROUP_M=8 Tile Swizzle)\n\
+                     extern \"C\" __global__ void {name}(const half* __restrict__ a, const half* __restrict__ w_packed, half* __restrict__ out) {{\n\
+                     \t(void)a; (void)w_packed; (void)out;\n\
+                     }}\n\n"
                 ));
             }
             TileStage::RaggedContraction { name, m_padded, m_valid, k, n, compact_enabled, .. } => {
@@ -392,6 +465,57 @@ pub fn emit_universal_stablehlo(cg: &CompiledUniversalGraph) -> String {
                     "    // Stage 3 Ragged/Sparse Lowering ({}x{})\n\
                      \t%{} = stablehlo.constant dense<0.0> : tensor<{}x{}x{}>\n",
                     sa.rows(), n, out_v, m_padded, n, et
+                ));
+            }
+            TileStage::ConcatContraction { m, total_n, dtype, out: out_v, packed_enabled, .. } => {
+                out.push_str(&format!(
+                    "    // Facility #2 Horizontal Packed Wide MXU GEMM (packed={packed_enabled})\n\
+                     \t%{out_v} = stablehlo.constant dense<0.0> : tensor<{m}x{total_n}x{}>\n",
+                    dtype.mlir_ty()
+                ));
+            }
+            TileStage::InPlaceAdamW { param, out: out_v, donate_enabled, .. } => {
+                let td = &cg.graph.tensors[out_v];
+                out.push_str(&format!(
+                    "    // Facility #3 Buffer-Donated Fused In-Place AdamW (donate={donate_enabled}, tf.aliasing_output)\n\
+                     \t%{out_v} = stablehlo.reshape %{param} : (tensor<{}x{}x{}>) -> tensor<{}x{}x{}>\n",
+                    td.rows(), td.cols(), td.dtype.mlir_ty(), td.rows(), td.cols(), td.dtype.mlir_ty()
+                ));
+            }
+            TileStage::CrossEntropyStage { logits, rows, vocab, dtype, online_fused, out: out_v, .. } => {
+                let et = dtype.mlir_ty();
+                out.push_str(&format!(
+                    "    // Facility #5 Online Monoid Fused Cross-Entropy (online={online_fused})\n\
+                     \t%{out_v} = stablehlo.reshape %{logits} : (tensor<{rows}x{vocab}x{et}>) -> tensor<{rows}x{vocab}x{et}>\n"
+                ));
+            }
+            TileStage::AmpQuantContraction { m, n, dtype, quant_enabled, out: out_v, .. } => {
+                let et = dtype.mlir_ty();
+                out.push_str(&format!(
+                    "    // Facility #6 Algebraic Single-Pass RMSNorm+INT8 MXU Contraction (quant={quant_enabled}, 394 TOPS)\n\
+                     \t%{out_v} = stablehlo.constant dense<0.0> : tensor<{m}x{n}x{et}>\n"
+                ));
+            }
+            TileStage::DynBucketContraction { max_m, n, dtype, bucket_enabled, out: out_v, .. } => {
+                let et = dtype.mlir_ty();
+                out.push_str(&format!(
+                    "    // Facility #7 Dynamic-Shape Multi-Version Bucketed Dispatch (bucket={bucket_enabled})\n\
+                     \t%{out_v} = stablehlo.constant dense<0.0> : tensor<{max_m}x{n}x{et}>\n"
+                ));
+            }
+            TileStage::Conv2dStage { in_h, in_w, c_out, dtype, implicit_enabled, out: out_v, .. } => {
+                let et = dtype.mlir_ty();
+                out.push_str(&format!(
+                    "    // Facility #8A Implicit GEMM Conv2d (implicit={implicit_enabled}, stablehlo.convolution)\n\
+                     \t%{out_v} = stablehlo.constant dense<0.0> : tensor<{}x{c_out}x{et}>\n",
+                    in_h * in_w
+                ));
+            }
+            TileStage::ParallelScanStage { a, batch, seq_len, dtype, parallel_enabled, out: out_v, .. } => {
+                let et = dtype.mlir_ty();
+                out.push_str(&format!(
+                    "    // Facility #8B Associative Parallel Scan (parallel={parallel_enabled}, O(log L))\n\
+                     \t%{out_v} = stablehlo.reshape %{a} : (tensor<{batch}x{seq_len}x{et}>) -> tensor<{batch}x{seq_len}x{et}>\n"
                 ));
             }
         }

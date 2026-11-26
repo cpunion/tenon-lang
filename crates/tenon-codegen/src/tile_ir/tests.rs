@@ -162,3 +162,132 @@ pub fn sparse_and_ragged(
     assert!(plan_sp.contains("PACK_BSR32_NK"), "expected true BSR-32 compressed weight repack!");
     assert!(on[2].roofline.fused_bytes < off[2].roofline.fused_bytes);
 }
+
+#[test]
+fn stage4_all_9_general_facilities_toggle_and_emit_metal_cuda_tpu() {
+    let cfg_s3 = GpuOptConfig::parse_spec("stage3");
+    assert!(cfg_s3.mxfp4_quant && !cfg_s3.tile_swizzle && !cfg_s3.horiz_pack && !cfg_s3.buffer_donation);
+    let cfg_all = GpuOptConfig::parse_spec("all,-tile_swizzle,-async_overlap");
+    assert!(!cfg_all.tile_swizzle && !cfg_all.async_overlap);
+    assert!(cfg_all.horiz_pack && cfg_all.buffer_donation && cfg_all.graph_replay);
+    assert!(cfg_all.online_monoid && cfg_all.amp_dyn_quant && cfg_all.dyn_bucket && cfg_all.non_tf_ops);
+
+    let src = r#"
+@gpu_graph("tensor_dataflow")
+pub fn qkv_packed(
+    x  Matrix[512, 2048, Float16],
+    wq Matrix[2048, 2048, Float16],
+    wk Matrix[2048, 2048, Float16],
+    wv Matrix[2048, 2048, Float16],
+) Matrix[512, 6144, Float16] {
+    tg_qkv_proj(x, wq, wk, wv)
+}
+
+@gpu_graph("tensor_dataflow")
+pub fn opt_adamw(
+    p Matrix[512, 512, Float32],
+    g Matrix[512, 512, Float32],
+    m Matrix[512, 512, Float32],
+    v Matrix[512, 512, Float32],
+) Matrix[512, 512, Float32] {
+    tg_adamw_step(p, g, m, v)
+}
+
+@gpu_graph("tensor_dataflow")
+pub fn fused_xent(
+    logits  Matrix[128, 4096, Float32],
+    targets Matrix[128, 1, Float32],
+) Matrix[128, 4096, Float32] {
+    tg_cross_entropy(logits, targets)
+}
+
+@gpu_graph("tensor_dataflow")
+pub fn amp_int8_mm(
+    x  Matrix[512, 2048, Float16],
+    nw Matrix[1, 2048, Float16],
+    w  Matrix[2048, 2048, Float16],
+) Matrix[512, 2048, Float16] {
+    tg_amp_matmul(x, nw, w)
+}
+
+@gpu_graph("tensor_dataflow")
+pub fn dyn_mm(
+    a Matrix[512, 2048, Float16],
+    b Matrix[2048, 2048, Float16],
+) Matrix[512, 2048, Float16] {
+    tg_dyn_matmul(a, b)
+}
+
+@gpu_graph("tensor_dataflow")
+pub fn conv3x3_implicit(
+    x Matrix[1024, 128, Float16],
+    w Matrix[1152, 128, Float16],
+) Matrix[1024, 128, Float16] {
+    tg_conv2d_3x3(x, w, 32, 32)
+}
+
+@gpu_graph("tensor_dataflow")
+pub fn ssm_scan(
+    a Matrix[256, 512, Float32],
+    b Matrix[256, 512, Float32],
+) Matrix[256, 512, Float32] {
+    tg_scan(a, b)
+}
+"#;
+    let prog = tenon_syntax::parse(src).expect("parse stage4");
+    let off = compile_universal_graphs(&prog, GpuOptConfig::stage3());
+    let on = compile_universal_graphs(&prog, GpuOptConfig::all());
+    assert_eq!(on.len(), 7);
+
+    // #1 tile_swizzle + #2 horiz_pack
+    let (msl_qkv_on, plan_qkv_on) = emit_metal::emit_metal_graph_and_plan(&on[0]);
+    let (_, plan_qkv_off) = emit_metal::emit_metal_graph_and_plan(&off[0]);
+    assert!(plan_qkv_on.contains("CONCAT_NK|"));
+    assert!(msl_qkv_on.contains("_grp_sz = 8u"));
+    assert!(!plan_qkv_off.contains("CONCAT_NK|"));
+
+    // #3 buffer_donation (AdamW in-place)
+    let (_, plan_adam_on) = emit_metal::emit_metal_graph_and_plan(&on[1]);
+    let (_, plan_adam_off) = emit_metal::emit_metal_graph_and_plan(&off[1]);
+    assert!(plan_adam_on.contains("DONATE|0|0"));
+    assert!(on[1].arena.donated_bytes > 0);
+    assert_eq!(off[1].arena.donated_bytes, 0);
+    assert!(!plan_adam_off.contains("DONATE|0|0"));
+
+    // #4 graph_replay + #5 online_monoid (Cross-Entropy zero probs scratch!)
+    let (_, plan_ce_on) = emit_metal::emit_metal_graph_and_plan(&on[2]);
+    let (_, plan_ce_off) = emit_metal::emit_metal_graph_and_plan(&off[2]);
+    assert!(plan_ce_on.contains("replay=1|overlap=1"));
+    assert!(off[2].arena.total_arena_bytes > on[2].arena.total_arena_bytes * 10);
+    assert!(!plan_ce_off.contains("DONATE|0|0"));
+
+    // #6 amp_dyn_quant (PACK_INT8_ROW_NK -50% weight DRAM)
+    let (msl_amp_on, plan_amp_on) = emit_metal::emit_metal_graph_and_plan(&on[3]);
+    assert!(plan_amp_on.contains("PACK_INT8_ROW_NK"));
+    assert!(msl_amp_on.contains("w_scale"));
+
+    // #7 dyn_bucket (3-bucket O(1) dispatch)
+    let (_, plan_dyn_on) = emit_metal::emit_metal_graph_and_plan(&on[4]);
+    let (_, plan_dyn_off) = emit_metal::emit_metal_graph_and_plan(&off[4]);
+    assert_eq!(plan_dyn_on.matches("DYN_BUCKET|").count(), 3);
+    assert_eq!(plan_dyn_off.matches("DYN_BUCKET|").count(), 0);
+
+    // #8A non_tf_ops Conv2d Implicit GEMM vs explicit im2col
+    let (msl_conv_on, _) = emit_metal::emit_metal_graph_and_plan(&on[5]);
+    assert!(msl_conv_on.contains("Implicit GEMM"));
+    assert!(off[5].arena.total_arena_bytes > on[5].arena.total_arena_bytes * 10);
+
+    // #8B non_tf_ops Parallel Scan vs Sequential
+    let (msl_scan_on, _) = emit_metal::emit_metal_graph_and_plan(&on[6]);
+    let (msl_scan_off, _) = emit_metal::emit_metal_graph_and_plan(&off[6]);
+    assert!(msl_scan_on.contains("simd_shuffle_up"));
+    assert!(!msl_scan_off.contains("simd_shuffle_up"));
+
+    // Multi-backend CUDA & TPU StableHLO emission check across Stage-4 ops!
+    for cg in &on {
+        let cuda = emit_cuda_tpu::emit_universal_cuda(cg);
+        let tpu = emit_cuda_tpu::emit_universal_stablehlo(cg);
+        assert!(cuda.contains("__global__"));
+        assert!(tpu.contains("func.func"));
+    }
+}

@@ -23,11 +23,16 @@ pub struct AdSpmdStats {
     pub spmd_devices: usize,
     pub collectives_inserted: usize,
     pub sharded_ops: usize,
+    /// Micro-tile async compute-communication overlap chunks (`>1` when `async_overlap && spmd_devices > 1`).
+    pub micro_tile_chunks: usize,
+    /// Selective Roofline recomputed activations (`online_monoid`).
+    pub selective_recomputed: usize,
 }
 
 pub fn run_ad_and_spmd(g: &mut TensorIrGraph, wants_autograd: bool, spmd_devices: usize) -> AdSpmdStats {
     let mut stats = AdSpmdStats {
         spmd_devices: spmd_devices.max(1),
+        micro_tile_chunks: 1,
         ..Default::default()
     };
 
