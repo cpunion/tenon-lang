@@ -1,6 +1,7 @@
 pub mod bindings;
 pub mod gpu_shader;
 pub mod tensor_graph;
+pub mod tile_ir;
 pub mod llvm_aot;
 pub(crate) mod llvm_aot_rt;
 pub mod llvm_runtime;

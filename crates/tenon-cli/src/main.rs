@@ -2012,6 +2012,11 @@ fn cmd_build_aot(args: &[String]) -> ExitCode {
                 emit_stablehlo = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--gpu-opt" if i + 1 < args.len() => {
+                // Safety: single-threaded CLI option setup before compilation
+                unsafe { env::set_var("TENON_GPU_OPT", &args[i + 1]); }
+                i += 2;
+            }
             "--emit-header" if i + 1 < args.len() => {
                 opts.emit_header_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;

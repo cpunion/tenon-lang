@@ -349,3 +349,670 @@ int64_t tn_metal_render_quads_offscreen(
         return 1;
     }
 }
+
+// =========================================================================
+// Generic Op-Agnostic Metal Graph Plan Executor & Live PGO Auto-Tuner
+// (Zero knowledge of MatMul/Norm/Attention/MXFP4 — 100% driven by Tenon's
+//  compile-time `tile_ir` Execution Plan + MSL source!)
+// =========================================================================
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+#define MAX_PLANS 64
+#define MAX_PLAN_BUFS 128
+#define MAX_PLAN_DISPATCHES 128
+#define MAX_PGO_CANDS 16
+
+typedef struct {
+    char name[96];
+    int kind; // 0=input, 1=output, 2=arena, 3=scratch, 4=zero_scratch
+    int io_idx;
+    int64_t rows;
+    int64_t cols;
+    size_t offset;
+    size_t size;
+    char repack[32];
+    id<MTLBuffer> buf; // non-nil for arena/scratch/repacked input or bound io
+} TnPlanBuf;
+
+typedef struct {
+    char kname[128];
+    id<MTLComputePipelineState> pso;
+    NSUInteger tgx, tgy, tgz;
+    NSUInteger tx, ty, tz;
+    NSUInteger smem;
+    int n_args;
+    int arg_idx[16]; // index into plan->bufs
+    int has_post;
+    char post_kname[128];
+    id<MTLComputePipelineState> post_pso;
+    NSUInteger post_tgx, post_tgy, post_tgz;
+    NSUInteger post_tx, post_ty, post_tz;
+    int post_n_args;
+    int post_arg_idx[16];
+} TnPlanStep;
+
+typedef struct {
+    char group_name[128];
+    int step_idx; // slot in plan->steps replaced by winning candidate
+    int n_cands;
+    int winner;
+    double winner_ms;
+    TnPlanStep cands[MAX_PGO_CANDS];
+} TnPgoGroup;
+
+typedef struct {
+    int active;
+    char graph_name[96];
+    char opts_tag[256];
+    size_t arena_bytes;
+    size_t naive_arena_bytes;
+    int single_cb;
+    int pgo_enabled;
+    int pgo_tuned;
+    id<MTLLibrary> lib;
+    id<MTLBuffer> arena_buf;
+    int n_bufs;
+    TnPlanBuf bufs[MAX_PLAN_BUFS];
+    int n_steps;
+    TnPlanStep steps[MAX_PLAN_DISPATCHES];
+    int n_pgo;
+    TnPgoGroup pgo[16];
+} TnMetalPlan;
+
+static TnMetalPlan g_plans[MAX_PLANS];
+
+static double tn_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
+}
+
+static int plan_find_or_add_buf(TnMetalPlan* p, const char* name) {
+    for (int i = 0; i < p->n_bufs; i++) {
+        if (strcmp(p->bufs[i].name, name) == 0) return i;
+    }
+    if (p->n_bufs >= MAX_PLAN_BUFS) return -1;
+    int idx = p->n_bufs++;
+    memset(&p->bufs[idx], 0, sizeof(TnPlanBuf));
+    strncpy(p->bufs[idx].name, name, sizeof(p->bufs[idx].name) - 1);
+    return idx;
+}
+
+static id<MTLComputePipelineState> plan_compile_fn(TnMetalPlan* p, const char* fn_name) {
+    NSString* ns = [NSString stringWithUTF8String:fn_name];
+    id<MTLFunction> fn = [p->lib newFunctionWithName:ns];
+    if (!fn) {
+        fprintf(stderr, "[tenon-plan] kernel `%s` not found in compiled MSL\n", fn_name);
+        return nil;
+    }
+    NSError* err = nil;
+    id<MTLComputePipelineState> pso = [g_mtl_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!pso) {
+        fprintf(stderr, "[tenon-plan] PSO error for `%s`: %s\n", fn_name, [[err localizedDescription] UTF8String]);
+    }
+    return pso;
+}
+
+static void parse_step_line(TnMetalPlan* p, TnPlanStep* st, const char* rest) {
+    // Format: kname|tg=x,y,z|th=x,y,z|smem=S|args=a,b,c
+    char copy[1024];
+    strncpy(copy, rest, sizeof(copy) - 1);
+    copy[sizeof(copy) - 1] = 0;
+    char* save = NULL;
+    char* tok = strtok_r(copy, "|", &save);
+    if (!tok) return;
+    strncpy(st->kname, tok, sizeof(st->kname) - 1);
+    st->pso = plan_compile_fn(p, st->kname);
+    while ((tok = strtok_r(NULL, "|", &save)) != NULL) {
+        if (strncmp(tok, "tg=", 3) == 0) {
+            unsigned long x = 1, y = 1, z = 1;
+            sscanf(tok + 3, "%lu,%lu,%lu", &x, &y, &z);
+            st->tgx = x; st->tgy = y; st->tgz = z;
+        } else if (strncmp(tok, "th=", 3) == 0) {
+            unsigned long x = 1, y = 1, z = 1;
+            sscanf(tok + 3, "%lu,%lu,%lu", &x, &y, &z);
+            st->tx = x; st->ty = y; st->tz = z;
+        } else if (strncmp(tok, "smem=", 5) == 0) {
+            st->smem = (NSUInteger)strtoull(tok + 5, NULL, 10);
+        } else if (strncmp(tok, "args=", 5) == 0) {
+            char* asave = NULL;
+            char* at = strtok_r(tok + 5, ",", &asave);
+            st->n_args = 0;
+            while (at && st->n_args < 16) {
+                st->arg_idx[st->n_args++] = plan_find_or_add_buf(p, at);
+                at = strtok_r(NULL, ",", &asave);
+            }
+        }
+    }
+}
+
+static void parse_post_line(TnMetalPlan* p, TnPlanStep* st, const char* rest) {
+    char copy[1024];
+    strncpy(copy, rest, sizeof(copy) - 1);
+    copy[sizeof(copy) - 1] = 0;
+    char* save = NULL;
+    char* tok = strtok_r(copy, "|", &save);
+    if (!tok) return;
+    st->has_post = 1;
+    strncpy(st->post_kname, tok, sizeof(st->post_kname) - 1);
+    st->post_pso = plan_compile_fn(p, st->post_kname);
+    while ((tok = strtok_r(NULL, "|", &save)) != NULL) {
+        if (strncmp(tok, "tg=", 3) == 0) {
+            unsigned long x = 1, y = 1, z = 1;
+            sscanf(tok + 3, "%lu,%lu,%lu", &x, &y, &z);
+            st->post_tgx = x; st->post_tgy = y; st->post_tgz = z;
+        } else if (strncmp(tok, "th=", 3) == 0) {
+            unsigned long x = 1, y = 1, z = 1;
+            sscanf(tok + 3, "%lu,%lu,%lu", &x, &y, &z);
+            st->post_tx = x; st->post_ty = y; st->post_tz = z;
+        } else if (strncmp(tok, "args=", 5) == 0) {
+            char* asave = NULL;
+            char* at = strtok_r(tok + 5, ",", &asave);
+            st->post_n_args = 0;
+            while (at && st->post_n_args < 16) {
+                st->post_arg_idx[st->post_n_args++] = plan_find_or_add_buf(p, at);
+                at = strtok_r(NULL, ",", &asave);
+            }
+        }
+    }
+}
+
+int64_t tn_metal_plan_create(int64_t msl_cstr, int64_t plan_cstr, int64_t graph_cstr) {
+    if (!ensure_metal_init() || !msl_cstr || !plan_cstr || !graph_cstr) return 0;
+    @autoreleasepool {
+        int slot = -1;
+        for (int i = 1; i < MAX_PLANS; i++) {
+            if (!g_plans[i].active) { slot = i; break; }
+        }
+        if (slot < 0) return 0;
+        TnMetalPlan* p = &g_plans[slot];
+        memset(p, 0, sizeof(TnMetalPlan));
+
+        NSString* src = [NSString stringWithUTF8String:(const char*)(uintptr_t)msl_cstr];
+        MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
+        opts.fastMathEnabled = YES;
+        NSError* err = nil;
+        p->lib = [g_mtl_device newLibraryWithSource:src options:opts error:&err];
+        if (!p->lib) {
+            fprintf(stderr, "[tenon-plan] MSL compile error: %s\n", [[err localizedDescription] UTF8String]);
+            return 0;
+        }
+
+        const char* want = (const char*)(uintptr_t)graph_cstr;
+        const char* plan_txt = (const char*)(uintptr_t)plan_cstr;
+        char* dup = strdup(plan_txt);
+        int in_graph = 0;
+        int cur_pgo = -1;
+
+        char* lsave = NULL;
+        char* line = strtok_r(dup, "\n", &lsave);
+        while (line) {
+            if (strncmp(line, "GRAPH|", 6) == 0) {
+                char gname[96] = {0};
+                const char* bar = strchr(line + 6, '|');
+                size_t len = bar ? (size_t)(bar - (line + 6)) : strlen(line + 6);
+                if (len >= sizeof(gname)) len = sizeof(gname) - 1;
+                memcpy(gname, line + 6, len);
+                if (strcmp(gname, want) == 0) {
+                    in_graph = 1;
+                    strncpy(p->graph_name, gname, sizeof(p->graph_name) - 1);
+                    char* ksave = NULL;
+                    char* k = strtok_r((char*)(bar ? bar + 1 : ""), "|", &ksave);
+                    while (k) {
+                        if (strncmp(k, "opts=", 5) == 0) strncpy(p->opts_tag, k + 5, sizeof(p->opts_tag) - 1);
+                        else if (strncmp(k, "arena=", 6) == 0) p->arena_bytes = (size_t)strtoull(k + 6, NULL, 10);
+                        else if (strncmp(k, "naive_arena=", 12) == 0) p->naive_arena_bytes = (size_t)strtoull(k + 12, NULL, 10);
+                        else if (strncmp(k, "single_cb=", 10) == 0) p->single_cb = atoi(k + 10);
+                        else if (strncmp(k, "pgo=", 4) == 0) p->pgo_enabled = atoi(k + 4);
+                        k = strtok_r(NULL, "|", &ksave);
+                    }
+                    if (p->arena_bytes < 256) p->arena_bytes = 256;
+                    if (p->single_cb) {
+                        p->arena_buf = [g_mtl_device newBufferWithLength:p->arena_bytes options:MTLResourceStorageModeShared];
+                    }
+                }
+            } else if (in_graph) {
+                if (strcmp(line, "END_GRAPH") == 0) {
+                    break;
+                } else if (strncmp(line, "INPUT|", 6) == 0) {
+                    int io_i = 0; char nm[96]={0}, dt[32]={0}, rp[32]={0}; long long r=0,c=0,sz=0;
+                    sscanf(line + 6, "%d|%95[^|]|%lld|%lld|%31[^|]|%lld|%31s", &io_i, nm, &r, &c, dt, &sz, rp);
+                    int bi = plan_find_or_add_buf(p, nm);
+                    if (bi >= 0) {
+                        p->bufs[bi].kind = 0; p->bufs[bi].io_idx = io_i;
+                        p->bufs[bi].rows = r; p->bufs[bi].cols = c; p->bufs[bi].size = (size_t)sz;
+                        strncpy(p->bufs[bi].repack, rp, sizeof(p->bufs[bi].repack) - 1);
+                    }
+                } else if (strncmp(line, "OUTPUT|", 7) == 0) {
+                    int io_i = 0; char nm[96]={0}, dt[32]={0}; long long r=0,c=0,sz=0;
+                    sscanf(line + 7, "%d|%95[^|]|%lld|%lld|%31[^|]|%lld", &io_i, nm, &r, &c, dt, &sz);
+                    int bi = plan_find_or_add_buf(p, nm);
+                    if (bi >= 0) {
+                        p->bufs[bi].kind = 1; p->bufs[bi].io_idx = io_i;
+                        p->bufs[bi].rows = r; p->bufs[bi].cols = c; p->bufs[bi].size = (size_t)sz;
+                    }
+                } else if (strncmp(line, "ARENA|", 6) == 0) {
+                    char nm[96]={0}; unsigned long long off=0, sz=0;
+                    sscanf(line + 6, "%95[^|]|%llu|%llu", nm, &off, &sz);
+                    int bi = plan_find_or_add_buf(p, nm);
+                    if (bi >= 0) {
+                        p->bufs[bi].kind = 2; p->bufs[bi].size = (size_t)sz;
+                        if (p->single_cb && p->arena_buf) {
+                            p->bufs[bi].offset = (size_t)off;
+                            p->bufs[bi].buf = p->arena_buf;
+                        } else {
+                            p->bufs[bi].offset = 0;
+                            p->bufs[bi].buf = [g_mtl_device newBufferWithLength:(NSUInteger)(sz > 64 ? sz : 64)
+                                                                       options:MTLResourceStorageModeShared];
+                        }
+                    }
+                } else if (strncmp(line, "SCRATCH|", 8) == 0 || strncmp(line, "ZERO_SCRATCH|", 13) == 0) {
+                    int is_z = (strncmp(line, "ZERO_SCRATCH|", 13) == 0);
+                    char nm[96]={0}; unsigned long long sz=0;
+                    sscanf(line + (is_z ? 13 : 8), "%95[^|]|%llu", nm, &sz);
+                    int bi = plan_find_or_add_buf(p, nm);
+                    if (bi >= 0) {
+                        p->bufs[bi].kind = is_z ? 4 : 3;
+                        p->bufs[bi].size = (size_t)(sz > 64 ? sz : 64);
+                        p->bufs[bi].offset = 0;
+                        p->bufs[bi].buf = [g_mtl_device newBufferWithLength:(NSUInteger)p->bufs[bi].size
+                                                                   options:MTLResourceStorageModeShared];
+                    }
+                } else if (strncmp(line, "DISPATCH|", 9) == 0) {
+                    if (p->n_steps < MAX_PLAN_DISPATCHES) {
+                        TnPlanStep* st = &p->steps[p->n_steps++];
+                        memset(st, 0, sizeof(TnPlanStep));
+                        parse_step_line(p, st, line + 9);
+                    }
+                } else if (strncmp(line, "PGO_BEGIN|", 10) == 0) {
+                    if (p->n_pgo < 16 && p->n_steps < MAX_PLAN_DISPATCHES) {
+                        cur_pgo = p->n_pgo++;
+                        TnPgoGroup* g = &p->pgo[cur_pgo];
+                        memset(g, 0, sizeof(TnPgoGroup));
+                        const char* bar = strchr(line + 10, '|');
+                        size_t len = bar ? (size_t)(bar - (line + 10)) : strlen(line + 10);
+                        if (len >= sizeof(g->group_name)) len = sizeof(g->group_name) - 1;
+                        memcpy(g->group_name, line + 10, len);
+                        g->step_idx = p->n_steps++;
+                    }
+                } else if (strncmp(line, "PGO_CAND|", 9) == 0 && cur_pgo >= 0) {
+                    TnPgoGroup* g = &p->pgo[cur_pgo];
+                    if (g->n_cands < MAX_PGO_CANDS) {
+                        TnPlanStep* st = &g->cands[g->n_cands++];
+                        memset(st, 0, sizeof(TnPlanStep));
+                        parse_step_line(p, st, line + 9);
+                    }
+                } else if (strncmp(line, "PGO_POST|", 9) == 0 && cur_pgo >= 0) {
+                    TnPgoGroup* g = &p->pgo[cur_pgo];
+                    if (g->n_cands > 0) {
+                        parse_post_line(p, &g->cands[g->n_cands - 1], line + 9);
+                    }
+                } else if (strcmp(line, "PGO_END") == 0 && cur_pgo >= 0) {
+                    TnPgoGroup* g = &p->pgo[cur_pgo];
+                    if (g->n_cands > 0) {
+                        p->steps[g->step_idx] = g->cands[0];
+                    }
+                    cur_pgo = -1;
+                }
+            }
+            line = strtok_r(NULL, "\n", &lsave);
+        }
+        free(dup);
+        if (!in_graph) {
+            p->lib = nil; p->arena_buf = nil;
+            return 0;
+        }
+        p->active = 1;
+        return (int64_t)slot;
+    }
+}
+
+static inline float tn_f16_to_f32(uint16_t h) {
+    __fp16 v;
+    memcpy(&v, &h, 2);
+    return (float)v;
+}
+
+static inline uint8_t tn_quant_e2m1(float x) {
+    static const float pos[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    uint8_t sign = (x < 0.0f) ? 8u : 0u;
+    float ax = fabsf(x);
+    uint8_t best = 0;
+    float best_d = 1e30f;
+    for (uint8_t i = 0; i < 8; i++) {
+        float d = fabsf(ax - pos[i]);
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return (uint8_t)(sign | best);
+}
+
+int64_t tn_metal_plan_set_input(int64_t plan_h, int64_t input_idx, int64_t buf_handle) {
+    if (plan_h <= 0 || plan_h >= MAX_PLANS || !g_plans[plan_h].active) return 0;
+    if (buf_handle <= 0 || buf_handle >= MAX_HANDLES || g_buffers[buf_handle] == nil) return 0;
+    @autoreleasepool {
+        TnMetalPlan* p = &g_plans[plan_h];
+        for (int i = 0; i < p->n_bufs; i++) {
+            if (p->bufs[i].kind == 0 && p->bufs[i].io_idx == (int)input_idx) {
+                id<MTLBuffer> src = g_buffers[buf_handle];
+                if (strcmp(p->bufs[i].repack, "TRANSPOSE_NK") == 0 && p->bufs[i].rows > 0 && p->bufs[i].cols > 0) {
+                    // Generic load-time 2D transpose [K, N] -> [N, K] (128-bit coalesced weight layout!)
+                    size_t K = (size_t)p->bufs[i].rows;
+                    size_t N = (size_t)p->bufs[i].cols;
+                    size_t bytes = [src length];
+                    id<MTLBuffer> dst = [g_mtl_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+                    if (bytes == K * N * 2) {
+                        const uint16_t* sp = (const uint16_t*)[src contents];
+                        uint16_t* dp = (uint16_t*)[dst contents];
+                        for (size_t k = 0; k < K; k++)
+                            for (size_t n = 0; n < N; n++)
+                                dp[n * K + k] = sp[k * N + n];
+                    } else if (bytes == K * N * 4) {
+                        const uint32_t* sp = (const uint32_t*)[src contents];
+                        uint32_t* dp = (uint32_t*)[dst contents];
+                        for (size_t k = 0; k < K; k++)
+                            for (size_t n = 0; n < N; n++)
+                                dp[n * K + k] = sp[k * N + n];
+                    }
+                    p->bufs[i].buf = dst;
+                } else if (strcmp(p->bufs[i].repack, "PACK_MXFP4_NK") == 0 && p->bufs[i].rows > 0 && p->bufs[i].cols > 0) {
+                    // Generic load-time OCP MXFP4 packing: [K, N] FP16 -> [N, K/2] 128-bit aligned E2M1 nibbles + [N, K/32] E8M0 scales!
+                    size_t K = (size_t)p->bufs[i].rows;
+                    size_t N = (size_t)p->bufs[i].cols;
+                    size_t n_blk = K / 32;
+                    size_t nib_bytes = N * n_blk * 16;
+                    size_t total_bytes = nib_bytes + N * n_blk;
+                    id<MTLBuffer> dst = [g_mtl_device newBufferWithLength:(total_bytes > 64 ? total_bytes : 64)
+                                                               options:MTLResourceStorageModeShared];
+                    const uint16_t* sp = (const uint16_t*)[src contents];
+                    uint8_t* nib_out = (uint8_t*)[dst contents];
+                    uint8_t* sc_out = nib_out + nib_bytes;
+                    for (size_t n = 0; n < N; n++) {
+                        for (size_t blk = 0; blk < n_blk; blk++) {
+                            float vals[32];
+                            float mx = 0.0f;
+                            for (size_t j = 0; j < 32; j++) {
+                                float v = tn_f16_to_f32(sp[(blk * 32 + j) * N + n]);
+                                vals[j] = v;
+                                float av = fabsf(v);
+                                if (av > mx) mx = av;
+                            }
+                            int exp_i = (mx > 1e-12f) ? (int)ceilf(log2f(mx / 6.0f)) : -126;
+                            if (exp_i < -126) exp_i = -126;
+                            if (exp_i > 127) exp_i = 127;
+                            uint8_t e8m0 = (uint8_t)(exp_i + 127);
+                            uint32_t fbits = ((uint32_t)e8m0) << 23;
+                            float sc = 1.0f;
+                            memcpy(&sc, &fbits, 4);
+                            float inv_sc = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+                            sc_out[n * n_blk + blk] = e8m0;
+                            uint8_t* bp = nib_out + (n * n_blk + blk) * 16;
+                            for (size_t j = 0; j < 16; j++) {
+                                uint8_t lo = tn_quant_e2m1(vals[j * 2] * inv_sc);
+                                uint8_t hi = tn_quant_e2m1(vals[j * 2 + 1] * inv_sc);
+                                bp[j] = (uint8_t)((hi << 4) | (lo & 0x0Fu));
+                            }
+                        }
+                    }
+                    p->bufs[i].buf = dst;
+                } else {
+                    p->bufs[i].buf = src;
+                }
+                p->bufs[i].offset = 0;
+                return 1;
+            }
+        }
+        return 0;
+    }
+}
+
+int64_t tn_metal_plan_set_output(int64_t plan_h, int64_t output_idx, int64_t buf_handle) {
+    if (plan_h <= 0 || plan_h >= MAX_PLANS || !g_plans[plan_h].active) return 0;
+    if (buf_handle <= 0 || buf_handle >= MAX_HANDLES || g_buffers[buf_handle] == nil) return 0;
+    TnMetalPlan* p = &g_plans[plan_h];
+    for (int i = 0; i < p->n_bufs; i++) {
+        if (p->bufs[i].kind == 1 && p->bufs[i].io_idx == (int)output_idx) {
+            p->bufs[i].buf = g_buffers[buf_handle];
+            p->bufs[i].offset = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void plan_encode_step(TnMetalPlan* p, id<MTLComputeCommandEncoder> enc, const TnPlanStep* st) {
+    if (!st->pso) return;
+    [enc setComputePipelineState:st->pso];
+    for (int a = 0; a < st->n_args; a++) {
+        int bi = st->arg_idx[a];
+        if (bi >= 0 && bi < p->n_bufs && p->bufs[bi].buf != nil) {
+            [enc setBuffer:p->bufs[bi].buf offset:p->bufs[bi].offset atIndex:(NSUInteger)a];
+        }
+    }
+    if (st->smem > 0) {
+        [enc setThreadgroupMemoryLength:st->smem atIndex:0];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(st->tgx, st->tgy, st->tgz)
+        threadsPerThreadgroup:MTLSizeMake(st->tx, st->ty, st->tz)];
+    if (st->has_post && st->post_pso) {
+        [enc setComputePipelineState:st->post_pso];
+        for (int a = 0; a < st->post_n_args; a++) {
+            int bi = st->post_arg_idx[a];
+            if (bi >= 0 && bi < p->n_bufs && p->bufs[bi].buf != nil) {
+                [enc setBuffer:p->bufs[bi].buf offset:p->bufs[bi].offset atIndex:(NSUInteger)a];
+            }
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(st->post_tgx, st->post_tgy, st->post_tgz)
+            threadsPerThreadgroup:MTLSizeMake(st->post_tx, st->post_ty, st->post_tz)];
+    }
+}
+
+static void plan_run_pgo_autotune(TnMetalPlan* p) {
+    if (!p->pgo_enabled || p->pgo_tuned || p->n_pgo == 0) return;
+    p->pgo_tuned = 1;
+    const char* cache_path = getenv("TENON_GPU_CACHE");
+    if (!cache_path || !*cache_path) cache_path = "/tmp/.tenon-gpu-cache";
+    int force_fresh = getenv("TENON_GPU_PGO_FRESH") != NULL;
+
+    for (int gi = 0; gi < p->n_pgo; gi++) {
+        TnPgoGroup* g = &p->pgo[gi];
+        if (g->n_cands <= 1) continue;
+        // Include full input shape signature + candidate count so shape/compiler changes never hit stale entries!
+        uint64_t shape_sig = (uint64_t)g->n_cands * 1315423911ull;
+        for (int bi = 0; bi < p->n_bufs; bi++) {
+            if (p->bufs[bi].kind == 0) {
+                shape_sig = shape_sig * 1099511628211ull ^ ((uint64_t)p->bufs[bi].rows << 16) ^ (uint64_t)p->bufs[bi].cols;
+            }
+        }
+        char key[384];
+        snprintf(key, sizeof(key), "%s|%s|%s|%016llx|%s", g_device_name_buf, p->graph_name, g->group_name, (unsigned long long)shape_sig, p->opts_tag);
+
+        int cached_winner = -1;
+        if (!force_fresh) {
+            FILE* cf = fopen(cache_path, "r");
+            if (cf) {
+                char line[512];
+                while (fgets(line, sizeof(line), cf)) {
+                    char* eq = strchr(line, '=');
+                    if (eq) {
+                        *eq = 0;
+                        if (strcmp(line, key) == 0) {
+                            cached_winner = atoi(eq + 1); // keep scanning so latest entry wins
+                        }
+                    }
+                }
+                fclose(cf);
+            }
+        }
+
+        if (cached_winner >= 0 && cached_winner < g->n_cands) {
+            g->winner = cached_winner;
+            p->steps[g->step_idx] = g->cands[cached_winner];
+            continue;
+        }
+
+        // Live hardware micro-benchmark of EVERY compiler-emitted Tile-IR candidate!
+        // First wake GPU clocks out of idle DVFS so candidate 0 isn't penalized vs candidate N!
+        if (g->cands[0].pso) {
+            double wt0 = tn_now_ms();
+            int wakes = 0;
+            while ((tn_now_ms() - wt0) < 12.0 && wakes < 16) {
+                id<MTLCommandBuffer> wcmd = [g_mtl_queue commandBuffer];
+                id<MTLComputeCommandEncoder> wenc = [wcmd computeCommandEncoder];
+                for (int w = 0; w < 4; w++) plan_encode_step(p, wenc, &g->cands[0]);
+                [wenc endEncoding];
+                [wcmd commit];
+                [wcmd waitUntilCompleted];
+                wakes++;
+            }
+        }
+        int best_c = 0;
+        double best_ms = 1e30;
+        for (int c = 0; c < g->n_cands; c++) {
+            const TnPlanStep* cand = &g->cands[c];
+            if (!cand->pso) continue;
+            // Warmup 2
+            id<MTLCommandBuffer> wcmd = [g_mtl_queue commandBuffer];
+            id<MTLComputeCommandEncoder> wenc = [wcmd computeCommandEncoder];
+            for (int w = 0; w < 2; w++) plan_encode_step(p, wenc, cand);
+            [wenc endEncoding];
+            [wcmd commit];
+            [wcmd waitUntilCompleted];
+            if ([wcmd status] != MTLCommandBufferStatusCompleted) continue;
+
+            // Timed 12 back-to-back GPU runs inside ONE CB
+            double t0 = tn_now_ms();
+            id<MTLCommandBuffer> tcmd = [g_mtl_queue commandBuffer];
+            id<MTLComputeCommandEncoder> tenc = [tcmd computeCommandEncoder];
+            for (int it = 0; it < 12; it++) plan_encode_step(p, tenc, cand);
+            [tenc endEncoding];
+            [tcmd commit];
+            [tcmd waitUntilCompleted];
+            double dt = (tn_now_ms() - t0) / 12.0;
+            if ([tcmd status] == MTLCommandBufferStatusCompleted && dt < best_ms) {
+                best_ms = dt;
+                best_c = c;
+            }
+        }
+        g->winner = best_c;
+        g->winner_ms = best_ms;
+        p->steps[g->step_idx] = g->cands[best_c];
+
+        // Persist empirical winner into `.tenon-gpu-cache`
+        FILE* wf = fopen(cache_path, "a");
+        if (wf) {
+            fprintf(wf, "%s=%d\n", key, best_c);
+            fclose(wf);
+        }
+    }
+}
+
+static void plan_exec_once_sync_per_op(TnMetalPlan* p) {
+    for (int i = 0; i < p->n_bufs; i++) {
+        if (p->bufs[i].kind == 4 && p->bufs[i].buf != nil) {
+            memset([p->bufs[i].buf contents], 0, p->bufs[i].size);
+        }
+    }
+    for (int s = 0; s < p->n_steps; s++) {
+        id<MTLCommandBuffer> cmd = [g_mtl_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        plan_encode_step(p, enc, &p->steps[s]);
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+}
+
+static void plan_exec_batch_single_cb(TnMetalPlan* p, int64_t reps) {
+    id<MTLCommandBuffer> cmd = [g_mtl_queue commandBuffer];
+    int has_zero_scratch = 0;
+    for (int i = 0; i < p->n_bufs; i++) {
+        if (p->bufs[i].kind == 4 && p->bufs[i].buf != nil) { has_zero_scratch = 1; break; }
+    }
+    if (!has_zero_scratch) {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        for (int64_t r = 0; r < reps; r++) {
+            for (int s = 0; s < p->n_steps; s++) {
+                plan_encode_step(p, enc, &p->steps[s]);
+            }
+        }
+        [enc endEncoding];
+    } else {
+        for (int64_t r = 0; r < reps; r++) {
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            for (int i = 0; i < p->n_bufs; i++) {
+                if (p->bufs[i].kind == 4 && p->bufs[i].buf != nil) {
+                    [blit fillBuffer:p->bufs[i].buf range:NSMakeRange(0, p->bufs[i].size) value:0];
+                }
+            }
+            [blit endEncoding];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            for (int s = 0; s < p->n_steps; s++) {
+                plan_encode_step(p, enc, &p->steps[s]);
+            }
+            [enc endEncoding];
+        }
+    }
+    [cmd commit];
+    [cmd waitUntilCompleted];
+}
+
+double tn_metal_plan_bench_ms(int64_t plan_h, int64_t warmup, int64_t iters) {
+    if (plan_h <= 0 || plan_h >= MAX_PLANS || !g_plans[plan_h].active) return -1.0;
+    if (iters <= 0) iters = 1;
+    @autoreleasepool {
+        TnMetalPlan* p = &g_plans[plan_h];
+        plan_run_pgo_autotune(p);
+        if (warmup > 0) {
+            // Ensure Apple Silicon GPU exits idle DVFS P-state cleanly before timed runs
+            // (identical to Triton do_bench ~15ms warmup so cached PGO & fresh PGO measure at peak clock!)
+            double wt0 = tn_now_ms();
+            int64_t w_done = 0;
+            do {
+                int64_t chunk = (w_done == 0) ? warmup : (warmup > 4 ? warmup : 4);
+                if (p->single_cb) plan_exec_batch_single_cb(p, chunk);
+                else for (int64_t w = 0; w < chunk; w++) plan_exec_once_sync_per_op(p);
+                w_done += chunk;
+            } while ((tn_now_ms() - wt0) < 15.0 && w_done < 96);
+        }
+        double t0 = tn_now_ms();
+        if (p->single_cb) {
+            plan_exec_batch_single_cb(p, iters);
+        } else {
+            for (int64_t i = 0; i < iters; i++) plan_exec_once_sync_per_op(p);
+        }
+        return (tn_now_ms() - t0) / (double)iters;
+    }
+}
+
+int64_t tn_metal_plan_info(int64_t plan_h, int64_t field_id) {
+    if (plan_h <= 0 || plan_h >= MAX_PLANS || !g_plans[plan_h].active) return 0;
+    TnMetalPlan* p = &g_plans[plan_h];
+    switch (field_id) {
+        case 0: return (int64_t)p->arena_bytes;
+        case 1: return (int64_t)p->naive_arena_bytes;
+        case 2: return (p->n_pgo > 0) ? (int64_t)p->pgo[0].n_cands : 1;
+        case 3: return (p->n_pgo > 0) ? (int64_t)p->pgo[0].winner : 0;
+        case 4: return (int64_t)p->n_steps;
+        default: return 0;
+    }
+}
+
+int64_t tn_metal_plan_free(int64_t plan_h) {
+    if (plan_h <= 0 || plan_h >= MAX_PLANS || !g_plans[plan_h].active) return 0;
+    TnMetalPlan* p = &g_plans[plan_h];
+    p->lib = nil;
+    p->arena_buf = nil;
+    for (int i = 0; i < p->n_bufs; i++) p->bufs[i].buf = nil;
+    for (int s = 0; s < p->n_steps; s++) { p->steps[s].pso = nil; p->steps[s].post_pso = nil; }
+    for (int g = 0; g < p->n_pgo; g++) {
+        for (int c = 0; c < p->pgo[g].n_cands; c++) {
+            p->pgo[g].cands[c].pso = nil;
+            p->pgo[g].cands[c].post_pso = nil;
+        }
+    }
+    p->active = 0;
+    return 1;
+}

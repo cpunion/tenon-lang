@@ -47,6 +47,47 @@ extern "C" {
         height Int,
         out_rgba_ptr Ptr[UInt8],
     ) Int
+    fn tn_metal_plan_create(msl_cstr Ptr[UInt8], plan_cstr Ptr[UInt8], graph_cstr Ptr[UInt8]) Int
+    fn tn_metal_plan_set_input(plan_h Int, input_idx Int, buf_handle Int) Int
+    fn tn_metal_plan_set_output(plan_h Int, output_idx Int, buf_handle Int) Int
+    fn tn_metal_plan_bench_ms(plan_h Int, warmup Int, iters Int) Float
+    fn tn_metal_plan_info(plan_h Int, field_id Int) Int
+    fn tn_metal_plan_free(plan_h Int) Int
+}
+
+/// `@linear` Op-Agnostic Compiled `@gpu_graph` Execution Plan (Static Arena + PGO Auto-Tune + Single-CB).
+@linear
+pub record GpuGraphPlan {
+    handle Int
+}
+
+impl GpuGraphPlan {
+    pub fn compile(msl_src Text, plan_src Text, graph_name Text) GpuGraphPlan {
+        let h = unsafe { tn_metal_plan_create(text_cstr_ptr(msl_src), text_cstr_ptr(plan_src), text_cstr_ptr(graph_name)) }
+        GpuGraphPlan { handle = h }
+    }
+
+    pub fn bind_input(inout self, idx Int, inout buf GpuBuffer) Bool {
+        unsafe { tn_metal_plan_set_input(self.handle, idx, buf.handle) != 0 }
+    }
+
+    pub fn bind_output(inout self, idx Int, inout buf GpuBuffer) Bool {
+        unsafe { tn_metal_plan_set_output(self.handle, idx, buf.handle) != 0 }
+    }
+
+    pub fn bench_ms(inout self, warmup Int, iters Int) Float {
+        unsafe { tn_metal_plan_bench_ms(self.handle, warmup, iters) }
+    }
+
+    pub fn arena_bytes(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 0) } }
+    pub fn naive_arena_bytes(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 1) } }
+    pub fn pgo_cands(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 2) } }
+    pub fn pgo_winner(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 3) } }
+    pub fn num_dispatches(inout self) Int { unsafe { tn_metal_plan_info(self.handle, 4) } }
+
+    pub fn destroy(self) {
+        let _ = unsafe { tn_metal_plan_free(self.handle) }
+    }
 }
 
 /// Bit-exact 48-byte GPU POD instance descriptor shared across CPU, Metal MSL, and WebGPU WGSL.

@@ -23,10 +23,12 @@ import "std/core/types.tn"
 ///   - NVIDIA CUDA (`sm_89+`): 128-bit aligned superblocks (`Q4_0_SB8` / `Q8_0_SB8`) or `e4m3fn` FP8 Tensor Cores
 ///   - Apple Silicon Metal: 128-bit aligned `Q4_0_SB8` / `Q8_0_SB8` + `simdgroup_half8x8` batch MMA
 ///   - Google Cloud TPU: native hardware sub-byte `tensor<...xi4>` (`PJRT_Buffer_Type_S4`) + 394 TOPS INT8 MXU (`W4A8`)
-pub type Int4 = Int8
-pub type FP8  = UInt8
-pub type Q4_0 = UInt8
-pub type Q8_0 = UInt8
+pub type Int4  = Int8
+pub type FP8   = UInt8
+pub type Q4_0  = UInt8
+pub type Q8_0  = UInt8
+/// OCP Microscaling FP4 (32 E2M1 4-bit elements + 1 shared E8M0 exponent = 17 B / 32 weights = 0.531 B/wt).
+pub type MXFP4 = UInt8
 
 @gpu_struct("std430")
 pub record MatMulParams {
@@ -440,4 +442,85 @@ pub pure fn tg_relu[DType](x Tensor2D[DType]) Tensor2D[DType]
     ensures result.rows == x.rows && result.cols == x.cols && len(result.data) == x.rows * x.cols
 {
     Tensor2D { rows = x.rows, cols = x.cols, data = x.data }
+}
+
+pub pure fn tg_gelu[DType](x Tensor2D[DType]) Tensor2D[DType]
+    requires len(x.data) == x.rows * x.cols
+    ensures result.rows == x.rows && result.cols == x.cols && len(result.data) == x.rows * x.cols
+{
+    Tensor2D { rows = x.rows, cols = x.cols, data = x.data }
+}
+
+pub pure fn tg_sub[DType](a Tensor2D[DType], b Tensor2D[DType]) Tensor2D[DType]
+    requires a.rows == b.rows && a.cols == b.cols && len(a.data) == a.rows * a.cols
+    ensures result.rows == a.rows && result.cols == a.cols && len(result.data) == a.rows * a.cols
+{
+    Tensor2D { rows = a.rows, cols = a.cols, data = a.data }
+}
+
+pub pure fn tg_scale[DType](x Tensor2D[DType], factor Float) Tensor2D[DType]
+    requires len(x.data) == x.rows * x.cols
+    ensures result.rows == x.rows && result.cols == x.cols && len(result.data) == x.rows * x.cols
+{
+    let _ = factor
+    Tensor2D { rows = x.rows, cols = x.cols, data = x.data }
+}
+
+pub pure fn tg_layernorm[DType](x Tensor2D[DType], nw Tensor2D[DType]) Tensor2D[DType]
+    requires nw.rows == 1 && nw.cols == x.cols && len(x.data) == x.rows * x.cols
+    ensures result.rows == x.rows && result.cols == x.cols && len(result.data) == x.rows * x.cols
+{
+    Tensor2D { rows = x.rows, cols = x.cols, data = x.data }
+}
+
+pub pure fn tg_softmax[DType](x Tensor2D[DType]) Tensor2D[DType]
+    requires len(x.data) == x.rows * x.cols
+    ensures result.rows == x.rows && result.cols == x.cols && len(result.data) == x.rows * x.cols
+{
+    Tensor2D { rows = x.rows, cols = x.cols, data = x.data }
+}
+
+pub pure fn tg_transpose[DType](x Tensor2D[DType]) Tensor2D[DType]
+    requires len(x.data) == x.rows * x.cols
+    ensures result.rows == x.cols && result.cols == x.rows && len(result.data) == x.rows * x.cols
+{
+    Tensor2D { rows = x.cols, cols = x.rows, data = x.data }
+}
+
+pub pure fn tg_conv2d[DType](x Tensor2D[DType], w Tensor2D[DType]) Tensor2D[DType]
+    requires x.cols == w.rows && len(x.data) == x.rows * x.cols && len(w.data) == w.rows * w.cols
+    ensures result.rows == x.rows && result.cols == w.cols && len(result.data) == x.rows * w.cols
+{
+    let out List[DType] = list_filled(x.rows * w.cols, x.data[0])
+    Tensor2D { rows = x.rows, cols = w.cols, data = out }
+}
+
+/// Stage 3 First-Class Ragged-Batch MatMul (`valid_pct` real tokens packed without zero-padding).
+pub pure fn tg_ragged_matmul[DType](a Tensor2D[DType], b Tensor2D[DType], valid_pct Int) Tensor2D[DType]
+    requires a.cols == b.rows && len(a.data) == a.rows * a.cols && len(b.data) == b.rows * b.cols
+    ensures result.rows == a.rows && result.cols == b.cols && len(result.data) == a.rows * b.cols
+{
+    let _ = valid_pct
+    let out List[DType] = list_filled(a.rows * b.cols, a.data[0])
+    Tensor2D { rows = a.rows, cols = b.cols, data = out }
+}
+
+/// Stage 3 First-Class Structured Block-Sparse MatMul (`density_pct` non-zero `block_size x block_size` tiles).
+pub pure fn tg_block_sparse_matmul[DType](a Tensor2D[DType], b Tensor2D[DType], density_pct Int, block_size Int) Tensor2D[DType]
+    requires a.cols == b.rows && len(a.data) == a.rows * a.cols && len(b.data) == b.rows * b.cols
+    ensures result.rows == a.rows && result.cols == b.cols && len(result.data) == a.rows * b.cols
+{
+    let _ = density_pct
+    let _ = block_size
+    let out List[DType] = list_filled(a.rows * b.cols, a.data[0])
+    Tensor2D { rows = a.rows, cols = b.cols, data = out }
+}
+
+/// Stage 3 First-Class Paged KV-Cache Attention inside `@gpu_graph`.
+pub pure fn tg_paged_attention[DType](q Tensor2D[DType], k Tensor2D[DType], v Tensor2D[DType]) Tensor2D[DType]
+    requires q.rows == k.rows && k.rows == v.rows && k.cols == v.cols && q.cols % k.cols == 0
+    requires len(q.data) == q.rows * q.cols
+    ensures result.rows == q.rows && result.cols == q.cols && len(result.data) == q.rows * q.cols
+{
+    Tensor2D { rows = q.rows, cols = q.cols, data = q.data }
 }
