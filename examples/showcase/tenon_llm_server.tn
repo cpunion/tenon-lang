@@ -1,12 +1,13 @@
 // examples/showcase/tenon_llm_server.tn
-// Pure-Tenon Zero-Rust Single-Binary Production LLM Server v8 (< 500 KiB, Apple Metal)!
+// Pure-Tenon Zero-Rust Single-Binary Production LLM Server v9 (< 750 KiB, Apple Metal)!
 //
-// Tenon v8 Features:
-//   - Zero Rust, Zero Tokio, Zero Python, Zero Docker — compiles via `tenon build` to a < 500 KiB native binary!
+// Tenon v9 Features:
+//   - Zero Rust, Zero Tokio, Zero Python, Zero Docker — compiles via `tenon build` to a < 750 KiB native binary!
 //   - Single-threaded OS `kqueue` Reactor (`std/net/reactor.tn`) multiplexing up to 8 concurrent LLM clients!
 //   - Universal PagedAttention Continuous Batching (`tn_moe_step_batch`) + Zero-Copy COW Prefix Fork (`tn_moe_paged_seq_fork`)!
-//   - Chunked Prefill Interleaving (`TENON_PREFILL_CHUNK`, default 64 tokens/tick) so long prompts never stall active decoders!
-//   - Multi-Tenant Zero-Copy Runtime LoRA Hot-Swapping (`TENON_LORA=name=path,name2=path2`, JSON `"lora":"name"`)!
+//   - Single-Launch Mixed-Batch Heterogeneous Multi-Tenant LoRA BGMV (`tn_moe_lora_set_batch`) — zero tenant splitting!
+//   - Disaggregated Prefill-Decode (PD) PagedKV Transfer (`POST /v1/pd/prefill` & `POST /v1/pd/decode`, TNKV + FNV-1a checksum)!
+//   - OpenAI `tools` + `response_format` JSON mode + Chunked Prefill Interleaving (`TENON_PREFILL_CHUNK`)!
 //   - Prometheus `GET /metrics` (OpenMetrics text/plain) + `GET /health` + `POST /shutdown` Graceful Drain!
 //   - Cross-platform Linux/NVIDIA CUDA counterpart: `examples/showcase/tenon_llm_server_cuda.tn`!
 //
@@ -102,11 +103,59 @@ fn write_text_http(cfd Int, status Int, reason Text, ctype Text, body Text) {
     let _ = net_write_text(cfd, resp)
 }
 
-fn format_chat(arch Text, msgs JsonValue) Text {
+pure fn hex_nibble_char(v Int) Text {
+    let lut = "0123456789abcdef"
+    str_slice(lut, v & 15, (v & 15) + 1)
+}
+
+pure fn hex_char_val(c Int) Int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    -1
+}
+
+fn words_to_hex(words List[Int], n_bytes Int) Text {
+    var tb = TextBuilder.new()
+    var i = 0
+    while i < n_bytes {
+        let w = words[i / 8]
+        let sh = (i & 7) * 8
+        let b = (w >> sh) & 255
+        tb.push_str(hex_nibble_char(b >> 4))
+        tb.push_str(hex_nibble_char(b & 15))
+        i += 1
+    }
+    tb.finish()
+}
+
+fn hex_to_words(hex Text) List[Int] {
+    let n_bytes = len(hex) / 2
+    var words List[Int] = list_filled((n_bytes + 7) / 8, 0)
+    var i = 0
+    while i < n_bytes {
+        let hi = hex_char_val(byte_at(hex, i * 2))
+        let lo = hex_char_val(byte_at(hex, i * 2 + 1))
+        if hi < 0 || lo < 0 { return [] }
+        let b = (hi << 4) | lo
+        let wi = i / 8
+        let sh = (i & 7) * 8
+        words[wi] = words[wi] | (b << sh)
+        i += 1
+    }
+    words
+}
+
+fn format_chat(arch Text, msgs JsonValue, extra_sys Text) Text {
     var tb = TextBuilder.new()
     let n = json_len(msgs)
     var i = 0
     if arch == "llama" {
+        if len(extra_sys) > 0 {
+            tb.push_str("<|start_header_id|>system<|end_header_id|>\n\n")
+            tb.push_str(extra_sys)
+            tb.push_str("<|eot_id|>")
+        }
         while i < n {
             match json_at(msgs, i) {
                 Some(m) => {
@@ -124,6 +173,11 @@ fn format_chat(arch Text, msgs JsonValue) Text {
         }
         tb.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n")
     } else if arch == "qwen3moe" || arch == "qwen2" {
+        if len(extra_sys) > 0 {
+            tb.push_str("<|im_start|>system\n")
+            tb.push_str(extra_sys)
+            tb.push_str("<|im_end|>\n")
+        }
         while i < n {
             match json_at(msgs, i) {
                 Some(m) => {
@@ -141,6 +195,11 @@ fn format_chat(arch Text, msgs JsonValue) Text {
         }
         tb.push_str("<|im_start|>assistant\n")
     } else {
+        if len(extra_sys) > 0 {
+            tb.push_str("system: ")
+            tb.push_str(extra_sys)
+            tb.push_str("\n")
+        }
         while i < n {
             match json_at(msgs, i) {
                 Some(m) => {
@@ -253,7 +312,7 @@ fn send_final_cb_response(
     timings = json_obj_set(timings, "decode_ms", JFloat(dec_ms))
 
     var resp = json_obj_new()
-    resp = json_obj_set(resp, "id", JStr("chatcmpl-tenon-native-v8"))
+    resp = json_obj_set(resp, "id", JStr("chatcmpl-tenon-native-v9"))
     resp = json_obj_set(resp, "object", JStr(if is_chat { "chat.completion" } else { "text_completion" }))
     resp = json_obj_set(resp, "model", JStr(model_name))
     resp = json_obj_set(resp, "choices", choices)
@@ -305,6 +364,126 @@ fn handle_embeddings(cfd Int, handle Int, model_name Text, body Text) {
         }
     }
     let _ = net_close(cfd)
+}
+
+fn handle_pd_prefill(cfd Int, handle Int, arch Text, model_name Text, body Text) Int {
+    match JsonValue.parse(body) {
+        Err(_) => {
+            write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid json\"}")
+            let _ = net_close(cfd)
+            0
+        }
+        Ok(jv) => {
+            let prompt = match json_get(jv, "messages") {
+                Some(msgs) => format_chat(arch, msgs, "")
+                None => match json_get_str(jv, "prompt") { Some(p) => p, None => "" }
+            }
+            if len(prompt) == 0 {
+                write_json_http(cfd, 400, "Bad Request", "{\"error\":\"missing prompt\"}")
+                let _ = net_close(cfd)
+                return 0
+            }
+            let bos = unsafe { tn_moe_info(handle, 11) }
+            var tok_buf List[Int] = list_filled(HIST_STRIDE, 0)
+            let nt = unsafe { tn_moe_tokenize(handle, text_cstr_ptr(prompt), list_data_ptr(tok_buf), HIST_STRIDE - 2) }
+            let n_prompt = nt + 1
+            var ids List[Int] = list_filled(n_prompt, 0)
+            ids[0] = bos
+            var i = 0
+            while i < nt { ids[i + 1] = tok_buf[i]; i += 1 }
+            let pd_slot = 24
+            let _ = unsafe { tn_moe_paged_seq_free(handle, pd_slot) }
+            let t0 = moe_now_ms()
+            let first_tok = unsafe { tn_moe_paged_prefill(handle, pd_slot, list_data_ptr(ids), n_prompt, 0) }
+            let pf_ms = moe_now_ms() - t0
+            let kv_sz = unsafe { tn_moe_kv_slot_bytes(handle, pd_slot, n_prompt) }
+            var blob List[Int] = list_filled((kv_sz + 7) / 8, 0)
+            let wrote = unsafe { tn_moe_kv_export_slot(handle, pd_slot, n_prompt, list_data_ptr(blob), kv_sz) }
+            let _ = unsafe { tn_moe_paged_seq_free(handle, pd_slot) }
+            if wrote <= 0 {
+                write_json_http(cfd, 500, "Internal Server Error", "{\"error\":\"kv export failed\"}")
+                let _ = net_close(cfd)
+                return 0
+            }
+            let hex = words_to_hex(blob, wrote)
+            let piece0 = unsafe { cstr_to_text(tn_moe_token_cstr(handle, first_tok)) }
+            var out = json_obj_new()
+            out = json_obj_set(out, "object", JStr("tenon.pd.prefill"))
+            out = json_obj_set(out, "model", JStr(model_name))
+            out = json_obj_set(out, "first_tok", JInt(first_tok))
+            out = json_obj_set(out, "first_piece", JStr(piece0))
+            out = json_obj_set(out, "prompt_tokens", JInt(n_prompt))
+            out = json_obj_set(out, "kv_bytes", JInt(wrote))
+            out = json_obj_set(out, "prefill_ms", JFloat(pf_ms))
+            out = json_obj_set(out, "kv_blob_hex", JStr(hex))
+            write_json_http(cfd, 200, "OK", out.stringify())
+            let _ = net_close(cfd)
+            1
+        }
+    }
+}
+
+fn handle_pd_decode(cfd Int, handle Int, eos Int, model_name Text, body Text) Int {
+    match JsonValue.parse(body) {
+        Err(_) => {
+            write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid json\"}")
+            let _ = net_close(cfd)
+            0
+        }
+        Ok(jv) => {
+            let hex = match json_get_str(jv, "kv_blob_hex") { Some(s) => s, None => "" }
+            let first_tok = match json_get_int(jv, "first_tok") { Some(n) => n, None => 0 }
+            let max_toks = match json_get_int(jv, "max_tokens") { Some(n) => n, None => 16 }
+            if len(hex) < 128 || (len(hex) & 1) != 0 {
+                write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid kv_blob_hex\"}")
+                let _ = net_close(cfd)
+                return 0
+            }
+            let n_bytes = len(hex) / 2
+            let blob = hex_to_words(hex)
+            if len(blob) == 0 {
+                write_json_http(cfd, 400, "Bad Request", "{\"error\":\"malformed hex\"}")
+                let _ = net_close(cfd)
+                return 0
+            }
+            let pd_slot = 25
+            let imported = unsafe { tn_moe_kv_import_slot(handle, pd_slot, list_data_ptr(blob), n_bytes) }
+            if imported <= 0 {
+                write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid or corrupted TNKV blob\"}")
+                let _ = net_close(cfd)
+                return 0
+            }
+            let t0 = moe_now_ms()
+            var tb = TextBuilder.new()
+            var gen = 0
+            var cur = first_tok
+            var pos = imported
+            var ta List[Int] = list_filled(1, 0)
+            var pa List[Int] = list_filled(1, 0)
+            var sa List[Int] = list_filled(1, pd_slot)
+            var oa List[Int] = list_filled(1, 0)
+            var finish_reason = "length"
+            while gen < max_toks {
+                let piece = unsafe { cstr_to_text(tn_moe_token_cstr(handle, cur)) }
+                if is_stop_piece(cur, eos, piece) {
+                    finish_reason = "stop"
+                    break
+                }
+                tb.push_str(piece)
+                gen += 1
+                if gen >= max_toks { break }
+                ta[0] = cur
+                pa[0] = pos
+                let _ = unsafe { tn_moe_step_batch(handle, list_data_ptr(ta), list_data_ptr(pa), list_data_ptr(sa), 1, list_data_ptr(oa)) }
+                cur = oa[0]
+                pos += 1
+            }
+            let dec_ms = moe_now_ms() - t0
+            let _ = unsafe { tn_moe_paged_seq_free(handle, pd_slot) }
+            send_final_cb_response(cfd, model_name, false, false, tb.finish(), imported, imported, gen, pd_slot, 0.0, dec_ms, finish_reason)
+            1
+        }
+    }
 }
 
 fn main() Int {
@@ -371,9 +550,9 @@ fn main() Int {
     let rfd = reactor_new()
     let _ = reactor_add(rfd, lfd, EVENT_READ, 0)
 
-    println("[tenon-native-v8] Pure-Tenon Zero-Rust Unified Server v8 (Metal) listening on http://" ++ addr
+    println("[tenon-native-v9] Pure-Tenon Zero-Rust Unified Server v9 (Metal) listening on http://" ++ addr
         ++ " (port=" ++ int_to_text(port) ++ ", arch=" ++ arch ++ ", pa_blks=" ++ int_to_text(pa_init_blks)
-        ++ ", chunk=" ++ int_to_text(prefill_chunk) ++ ", loras=" ++ int_to_text(len(lora_names)) ++ ", max_cb=" ++ int_to_text(MAX_CB) ++ ")")
+        ++ ", chunk=" ++ int_to_text(prefill_chunk) ++ ", loras=" ++ int_to_text(len(lora_names)) ++ ", hetero_bgmv=true, pd=true, max_cb=" ++ int_to_text(MAX_CB) ++ ")")
 
     // Non-blocking HTTP connection read slots (`rd_fds[i] == -1` => free)
     var rd_fds List[Int] = list_filled(MAX_RD, -1)
@@ -413,6 +592,7 @@ fn main() Int {
     var b_toks List[Int] = list_filled(MAX_CB, 0)
     var b_pos List[Int] = list_filled(MAX_CB, 0)
     var b_slots List[Int] = list_filled(MAX_CB, 0)
+    var b_loras List[Int] = list_filled(MAX_CB, 0)
     var b_out List[Int] = list_filled(MAX_CB, 0)
     var tok_scratch List[Int] = list_filled(HIST_STRIDE, 0)
     var chunk_buf List[Int] = list_filled(HIST_STRIDE, 0)
@@ -427,6 +607,8 @@ fn main() Int {
     var chunked_prefill_chunks = 0
     var active_lora_id = 0
     var lora_swaps = 0
+    var hetero_lora_batches = 0
+    var pd_transfers = 0
     var draining = false
 
     var running = true
@@ -548,7 +730,7 @@ fn main() Int {
                                 }
                                 var obj = json_obj_new()
                                 obj = json_obj_set(obj, "status", JStr(if draining { "draining" } else { "ok" }))
-                                obj = json_obj_set(obj, "engine", JStr("tenon-native-zero-rust-v8-metal"))
+                                obj = json_obj_set(obj, "engine", JStr("tenon-native-zero-rust-v9-metal"))
                                 obj = json_obj_set(obj, "arch", JStr(arch))
                                 obj = json_obj_set(obj, "model", JStr(model_name))
                                 obj = json_obj_set(obj, "n_layers", JInt(n_layers))
@@ -557,6 +739,8 @@ fn main() Int {
                                 obj = json_obj_set(obj, "chunked_prefill_chunks", JInt(chunked_prefill_chunks))
                                 obj = json_obj_set(obj, "lora_adapters", la)
                                 obj = json_obj_set(obj, "lora_swaps", JInt(lora_swaps))
+                                obj = json_obj_set(obj, "hetero_lora_batches", JInt(hetero_lora_batches))
+                                obj = json_obj_set(obj, "pd_transfers", JInt(pd_transfers))
                                 obj = json_obj_set(obj, "paged_kv_blocks", JInt(pa_tot))
                                 obj = json_obj_set(obj, "paged_kv_free_blocks", JInt(pa_free))
                                 obj = json_obj_set(obj, "paged_cow_forks", JInt(pa_forks))
@@ -596,6 +780,10 @@ fn main() Int {
                                 mt.push_str(int_to_text(chunked_prefill_chunks))
                                 mt.push_str("\n# HELP tenon_lora_swaps_total Runtime LoRA swaps\n# TYPE tenon_lora_swaps_total counter\ntenon_lora_swaps_total ")
                                 mt.push_str(int_to_text(lora_swaps))
+                                mt.push_str("\n# HELP tenon_hetero_lora_batches_total Single-launch mixed-tenant BGMV LoRA batches\n# TYPE tenon_hetero_lora_batches_total counter\ntenon_hetero_lora_batches_total ")
+                                mt.push_str(int_to_text(hetero_lora_batches))
+                                mt.push_str("\n# HELP tenon_pd_transfers_total Disaggregated PD PagedKV transfers\n# TYPE tenon_pd_transfers_total counter\ntenon_pd_transfers_total ")
+                                mt.push_str(int_to_text(pd_transfers))
                                 mt.push_str("\n# HELP tenon_draining Graceful shutdown drain state\n# TYPE tenon_draining gauge\ntenon_draining ")
                                 mt.push_str(if draining { "1" } else { "0" })
                                 mt.push_str("\n")
@@ -617,6 +805,20 @@ fn main() Int {
                                 obj = json_obj_set(obj, "data", data)
                                 write_json_http(tok, 200, "OK", obj.stringify())
                                 let _ = net_close(tok)
+                            } else if method == "POST" && path == "/v1/pd/prefill" {
+                                if draining {
+                                    write_json_http(tok, 503, "Service Unavailable", "{\"error\":\"server draining\"}")
+                                    let _ = net_close(tok)
+                                } else {
+                                    pd_transfers += handle_pd_prefill(tok, handle, arch, model_name, body)
+                                }
+                            } else if method == "POST" && path == "/v1/pd/decode" {
+                                if draining {
+                                    write_json_http(tok, 503, "Service Unavailable", "{\"error\":\"server draining\"}")
+                                    let _ = net_close(tok)
+                                } else {
+                                    pd_transfers += handle_pd_decode(tok, handle, eos, model_name, body)
+                                }
                             } else if method == "POST" && path == "/v1/embeddings" {
                                 if draining {
                                     write_json_http(tok, 503, "Service Unavailable", "{\"error\":\"server draining\"}")
@@ -691,9 +893,22 @@ fn main() Int {
                             }
                         }
                     }
+                    var extra_sys = ""
+                    match json_get(jv, "tools") {
+                        Some(tl) => {
+                            extra_sys = extra_sys ++ "You may call tools by responding with JSON {\"tool_calls\":[{\"name\":\"...\",\"arguments\":{...}}]}. Tools: " ++ tl.stringify() ++ "\n"
+                        }
+                        None => {}
+                    }
+                    match json_get(jv, "response_format") {
+                        Some(_) => {
+                            extra_sys = extra_sys ++ "Respond strictly with a valid JSON object."
+                        }
+                        None => {}
+                    }
                     let prompt = if is_chat {
                         match json_get(jv, "messages") {
-                            Some(msgs) => format_chat(arch, msgs)
+                            Some(msgs) => format_chat(arch, msgs, extra_sys)
                             None => match json_get_str(jv, "prompt") { Some(p) => p, None => "Hello" }
                         }
                     } else {
@@ -884,83 +1099,84 @@ fn main() Int {
             pfs += 1
         }
 
-        // Gather active decoding slots, partitioned cleanly by `cb_lora[s]` (zero cross-tenant interference!)
-        var total_dec = 0
+        // Tenon v9: ONE Single-Launch Mixed-Batch Heterogeneous Multi-Tenant LoRA BGMV `step_batch`!
+        var b_sz = 0
+        var first_lid = -1
+        var has_hetero = false
         var si = 0
         while si < MAX_CB {
-            if cb_state[si] == 2 { total_dec += 1 }
+            if cb_state[si] == 2 {
+                b_toks[b_sz] = cb_tok[si]
+                b_pos[b_sz] = cb_pos[si]
+                b_slots[b_sz] = si
+                let lid = cb_lora[si]
+                b_loras[b_sz] = lid
+                if first_lid < 0 { first_lid = lid } else if lid != first_lid { has_hetero = true }
+                b_sz += 1
+            }
             si += 1
         }
-        if total_dec > 0 {
-            if total_dec > max_batch_seen { max_batch_seen = total_dec }
-            var lid_try = 0
-            while lid_try <= MAX_LORAS {
-                var b_sz = 0
-                si = 0
-                while si < MAX_CB {
-                    if cb_state[si] == 2 && cb_lora[si] == lid_try {
-                        b_toks[b_sz] = cb_tok[si]
-                        b_pos[b_sz] = cb_pos[si]
-                        b_slots[b_sz] = si
-                        b_sz += 1
-                    }
-                    si += 1
+        if b_sz > 0 {
+            if b_sz > max_batch_seen { max_batch_seen = b_sz }
+            if has_hetero {
+                let _ = unsafe { tn_moe_lora_set_batch(handle, list_data_ptr(b_loras), b_sz) }
+                hetero_lora_batches += 1
+            } else {
+                if first_lid != active_lora_id {
+                    let _ = unsafe { tn_moe_lora_set(handle, first_lid, 1.0) }
+                    active_lora_id = first_lid
+                    lora_swaps += 1
                 }
-                if b_sz > 0 {
-                    if lid_try != active_lora_id {
-                        let _ = unsafe { tn_moe_lora_set(handle, lid_try, 1.0) }
-                        active_lora_id = lid_try
-                        lora_swaps += 1
+            }
+            cb_batches_run += 1
+            let _ = unsafe {
+                tn_moe_step_batch(
+                    handle,
+                    list_data_ptr(b_toks),
+                    list_data_ptr(b_pos),
+                    list_data_ptr(b_slots),
+                    b_sz,
+                    list_data_ptr(b_out)
+                )
+            }
+            if has_hetero {
+                let _ = unsafe { tn_moe_lora_set_batch(handle, list_data_ptr(b_loras), 0) }
+            }
+            var bi = 0
+            while bi < b_sz {
+                let s = b_slots[bi]
+                let chosen = b_out[bi]
+                let piece = unsafe { cstr_to_text(tn_moe_token_cstr(handle, chosen)) }
+                let is_chat = cb_chat[s] != 0
+                let want_stream = cb_stream[s] != 0
+                if is_stop_piece(chosen, eos, piece) {
+                    let dec_ms = moe_now_ms() - cb_tdec[s]
+                    send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, "stop")
+                    cb_state[s] = 0
+                    cb_cfd[s] = -1
+                    cb_text[s] = ""
+                } else {
+                    cb_tok[s] = chosen
+                    cb_pos[s] = cb_pos[s] + 1
+                    cb_gen[s] = cb_gen[s] + 1
+                    cb_text[s] = cb_text[s] ++ piece
+                    let hl = hist_len[s]
+                    if hl < HIST_STRIDE {
+                        hist_ids[s * HIST_STRIDE + hl] = chosen
+                        hist_len[s] = hl + 1
                     }
-                    cb_batches_run += 1
-                    let _ = unsafe {
-                        tn_moe_step_batch(
-                            handle,
-                            list_data_ptr(b_toks),
-                            list_data_ptr(b_pos),
-                            list_data_ptr(b_slots),
-                            b_sz,
-                            list_data_ptr(b_out)
-                        )
-                    }
-                    var bi = 0
-                    while bi < b_sz {
-                        let s = b_slots[bi]
-                        let chosen = b_out[bi]
-                        let piece = unsafe { cstr_to_text(tn_moe_token_cstr(handle, chosen)) }
-                        let is_chat = cb_chat[s] != 0
-                        let want_stream = cb_stream[s] != 0
-                        if is_stop_piece(chosen, eos, piece) {
-                            let dec_ms = moe_now_ms() - cb_tdec[s]
-                            send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, "stop")
-                            cb_state[s] = 0
-                            cb_cfd[s] = -1
-                            cb_text[s] = ""
-                        } else {
-                            cb_tok[s] = chosen
-                            cb_pos[s] = cb_pos[s] + 1
-                            cb_gen[s] = cb_gen[s] + 1
-                            cb_text[s] = cb_text[s] ++ piece
-                            let hl = hist_len[s]
-                            if hl < HIST_STRIDE {
-                                hist_ids[s * HIST_STRIDE + hl] = chosen
-                                hist_len[s] = hl + 1
-                            }
-                            var alive = true
-                            if want_stream { alive = write_sse_piece(cb_cfd[s], model_name, is_chat, piece) }
-                            if !alive || cb_gen[s] >= cb_max[s] || cb_pos[s] + 2 >= 4096 {
-                                let dec_ms = moe_now_ms() - cb_tdec[s]
-                                let reason = if !alive { "stop" } else { "length" }
-                                send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, reason)
-                                cb_state[s] = 0
-                                cb_cfd[s] = -1
-                                cb_text[s] = ""
-                            }
-                        }
-                        bi += 1
+                    var alive = true
+                    if want_stream { alive = write_sse_piece(cb_cfd[s], model_name, is_chat, piece) }
+                    if !alive || cb_gen[s] >= cb_max[s] || cb_pos[s] + 2 >= 4096 {
+                        let dec_ms = moe_now_ms() - cb_tdec[s]
+                        let reason = if !alive { "stop" } else { "length" }
+                        send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, reason)
+                        cb_state[s] = 0
+                        cb_cfd[s] = -1
+                        cb_text[s] = ""
                     }
                 }
-                lid_try += 1
+                bi += 1
             }
         }
     }
@@ -969,6 +1185,6 @@ fn main() Int {
     let _ = reactor_close(rfd)
     let _ = net_close(lfd)
     model.destroy()
-    println("[tenon-native-v8] graceful shutdown complete.")
+    println("[tenon-native-v9] graceful shutdown complete.")
     0
 }

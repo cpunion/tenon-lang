@@ -612,3 +612,25 @@ fn dsv2_v8_multimodal_block(x Matrix[8, 2048, Float16], w_q Matrix[2048, 2048, Q
     let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
     assert!(plan.contains("fp8_tc=1|q4k_marlin=1|paged_univ=1|moe_grp=1|audio_mel=128|vis_cache=1"));
 }
+
+#[test]
+fn test_stage6_v9_moe_mega_fp8_k32_hetero_lora_mm_kv_cow_pd_kv() {
+    let src = r#"
+@gpu_graph("stream:vram=48G,ram=128G,layers=27,experts=64,topk=6,ctx=8192,tp=2,ep=2,mla=576,cb=8,lora=16,mmproj=64,audio=128,mrope=1,fp8_mxfp4=1")
+fn dsv2_v9_full_stack(x Matrix[8, 2048, Float16], w_q Matrix[2048, 2048, FP8], w_down Matrix[2048, 1408, Q6_K]) Matrix[8, 1408, Float16] {
+    let h = tg_matmul(x, w_q)
+    tg_matmul(h, w_down)
+}
+"#;
+    let prog = tenon_syntax::parse(src).expect("parse v9 graph");
+    let on = compile_universal_graphs(&prog, GpuOptConfig::default());
+    assert_eq!(on.len(), 1);
+    let hp = &on[0].hetero_plan;
+    assert!(hp.moe_gpu_persistent_mega && hp.fp8_e4m3_m16n8k32_amx_f16 && hp.hetero_lora_bgmv && hp.multimodal_kv_cow_cache && hp.disaggregated_pd_kv);
+    let cuda = emit_cuda_tpu::emit_universal_cuda(&on[0]);
+    assert!(cuda.contains("moe_mega=true") && cuda.contains("fp8_k32=true") && cuda.contains("hetero_lora=true") && cuda.contains("mm_kv_cow=true") && cuda.contains("pd_kv=true"));
+    let tpu = emit_cuda_tpu::emit_universal_stablehlo(&on[0]);
+    assert!(tpu.contains("moe_mega=true") && tpu.contains("fp8_k32=true") && tpu.contains("hetero_lora=true") && tpu.contains("mm_kv_cow=true") && tpu.contains("pd_kv=true"));
+    let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
+    assert!(plan.contains("moe_mega=1|fp8_k32=1|hetero_lora=1|mm_kv_cow=1|pd_kv=1"));
+}

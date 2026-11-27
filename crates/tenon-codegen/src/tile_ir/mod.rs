@@ -120,6 +120,16 @@ pub struct GpuOptConfig {
     pub moe_grouped_gemm_batch: bool,
     /// #36: Auto `Qwen2.5-VL` 2D/3D MRoPE Grid + Native Audio/Whisper Mel-Spectrogram Encoder + Vision Content-Hash Prefix Cache + Prometheus Metrics.
     pub vlm_mrope_audio_prefix_cache: bool,
+    /// #37: Zero-Host-Sync GPU-Resident Persistent Grouped MoE Mega-Kernel (GPU TopK + Counting-Sort + Single-Launch Grouped GEMM).
+    pub moe_gpu_persistent_mega: bool,
+    /// #38: Native Ada/Hopper `mma.sync.m16n8k32.f32.e4m3.e4m3.f32` + Apple Metal `simdgroup_half8x8->float8x8` AMX + TPU W4A8/FP8 Fusion.
+    pub fp8_e4m3_m16n8k32_amx_f16: bool,
+    /// #39: Mixed-Batch Heterogeneous Multi-Tenant LoRA `BGMV` (S-LoRA / Punica) Zero-Split Batched Kernel.
+    pub hetero_lora_bgmv_batch: bool,
+    /// #40: Real `Qwen2.5-VL` Spatial Merger ViT + Real Whisper Transformer Encoder GGUF + PagedKV-Block-Level Multimodal COW Prefix Cache.
+    pub multimodal_real_vit_whisper_kv_cache: bool,
+    /// #41: Disaggregated Prefill-Decode (PD) PagedKV Block Serialization & Zero-Copy Cross-Node KV Transfer.
+    pub disaggregated_pd_kv_transfer: bool,
 
     /// Optional SPMD device count (`1` = single device, `>1` = auto-sharded multi-device SPMD).
     pub spmd_devices: usize,
@@ -178,6 +188,11 @@ impl GpuOptConfig {
             paged_cb_tp_mla_spec: false,
             moe_grouped_gemm_batch: false,
             vlm_mrope_audio_prefix_cache: false,
+            moe_gpu_persistent_mega: false,
+            fp8_e4m3_m16n8k32_amx_f16: false,
+            hetero_lora_bgmv_batch: false,
+            multimodal_real_vit_whisper_kv_cache: false,
+            disaggregated_pd_kv_transfer: false,
             spmd_devices: 1,
             force_tile: None,
         }
@@ -253,6 +268,11 @@ impl GpuOptConfig {
         c.paged_cb_tp_mla_spec = true;
         c.moe_grouped_gemm_batch = true;
         c.vlm_mrope_audio_prefix_cache = true;
+        c.moe_gpu_persistent_mega = true;
+        c.fp8_e4m3_m16n8k32_amx_f16 = true;
+        c.hetero_lora_bgmv_batch = true;
+        c.multimodal_real_vit_whisper_kv_cache = true;
+        c.disaggregated_pd_kv_transfer = true;
         c
     }
 
@@ -361,6 +381,11 @@ impl GpuOptConfig {
                         "paged_cb_tp_mla_spec" | "paged_verify" | "mla_cb" => cfg.paged_cb_tp_mla_spec = enable,
                         "moe_grouped_gemm_batch" | "moe_grouped" => cfg.moe_grouped_gemm_batch = enable,
                         "vlm_mrope_audio_prefix_cache" | "audio_vlm" | "vision_cache" => cfg.vlm_mrope_audio_prefix_cache = enable,
+                        "moe_gpu_persistent_mega" | "moe_mega" => cfg.moe_gpu_persistent_mega = enable,
+                        "fp8_e4m3_m16n8k32_amx_f16" | "fp8_k32" | "amx_f16" => cfg.fp8_e4m3_m16n8k32_amx_f16 = enable,
+                        "hetero_lora_bgmv_batch" | "hetero_lora" | "bgmv" => cfg.hetero_lora_bgmv_batch = enable,
+                        "multimodal_real_vit_whisper_kv_cache" | "mm_kv_cow" => cfg.multimodal_real_vit_whisper_kv_cache = enable,
+                        "disaggregated_pd_kv_transfer" | "pd_kv" => cfg.disaggregated_pd_kv_transfer = enable,
                         _ => {}
                     }
                 }
@@ -420,6 +445,11 @@ impl GpuOptConfig {
         if self.paged_cb_tp_mla_spec { on.push("paged_tp_mla_spec"); }
         if self.moe_grouped_gemm_batch { on.push("moe_grouped"); }
         if self.vlm_mrope_audio_prefix_cache { on.push("vlm_audio_cache"); }
+        if self.moe_gpu_persistent_mega { on.push("moe_mega"); }
+        if self.fp8_e4m3_m16n8k32_amx_f16 { on.push("fp8_k32_amxf16"); }
+        if self.hetero_lora_bgmv_batch { on.push("hetero_lora_bgmv"); }
+        if self.multimodal_real_vit_whisper_kv_cache { on.push("mm_kv_cow"); }
+        if self.disaggregated_pd_kv_transfer { on.push("pd_kv"); }
         if self.spmd_devices > 1 {
             on.push("spmd_multi");
         }

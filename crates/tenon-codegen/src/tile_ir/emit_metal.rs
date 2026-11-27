@@ -118,7 +118,7 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
     if cg.hetero_plan.active {
         let hp = &cg.hetero_plan;
         plan.push_str(&format!(
-            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|tp={}|ep={}|nccl={}|marlin={}|cb_slots={}|cow_kv={}|mla_latent={}|paged_blk={}|radix_prefix={}|spec_k={}|tree_w={}|mtp={}|mmproj={}|sb_shx={}|hybrid_2d={}|chunk_pf={}|lora_r={}|anyres={}|mrope={}|fp8_mxfp4={}|fp8_tc={}|q4k_marlin={}|paged_univ={}|moe_grp={}|audio_mel={}|vis_cache={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
+            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|tp={}|ep={}|nccl={}|marlin={}|cb_slots={}|cow_kv={}|mla_latent={}|paged_blk={}|radix_prefix={}|spec_k={}|tree_w={}|mtp={}|mmproj={}|sb_shx={}|hybrid_2d={}|chunk_pf={}|lora_r={}|anyres={}|mrope={}|fp8_mxfp4={}|fp8_tc={}|q4k_marlin={}|paged_univ={}|moe_grp={}|audio_mel={}|vis_cache={}|moe_mega={}|fp8_k32={}|hetero_lora={}|mm_kv_cow={}|pd_kv={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
             hp.dispatch_mode.tag(),
             hp.vram_cap_bytes,
             hp.core_vram_bytes,
@@ -158,11 +158,16 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             if hp.moe_grouped_gemm { 1 } else { 0 },
             hp.audio_mel_tokens,
             if hp.vision_prefix_cache { 1 } else { 0 },
+            if hp.moe_gpu_persistent_mega { 1 } else { 0 },
+            if hp.fp8_e4m3_m16n8k32_amx_f16 { 1 } else { 0 },
+            if hp.hetero_lora_bgmv { 1 } else { 0 },
+            if hp.multimodal_kv_cow_cache { 1 } else { 0 },
+            if hp.disaggregated_pd_kv { 1 } else { 0 },
             hp.projected_decode_tok_s,
             hp.projected_prefill_tok_s,
         ));
         msl.push_str(&format!(
-            "// [Stage 6 Heterogeneous Streaming] mode={} | tp={} ep={} hybrid_2d={} cb_slots={} cow_kv={} chunk_pf={} mla_latent={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={} sb_shx={} spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} lora_r={} fp8_mxfp4={} fp8_tc={} q4k_marlin={} paged_univ={} moe_grp={} audio_mel={} vis_cache={}\n",
+            "// [Stage 6 Heterogeneous Streaming] mode={} | tp={} ep={} hybrid_2d={} cb_slots={} cow_kv={} chunk_pf={} mla_latent={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={} sb_shx={} spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} lora_r={} fp8_mxfp4={} fp8_tc={} q4k_marlin={} paged_univ={} moe_grp={} audio_mel={} vis_cache={} moe_mega={} fp8_k32={} hetero_lora={} mm_kv_cow={} pd_kv={}\n",
             hp.dispatch_mode.tag(),
             hp.tp_devices,
             hp.ep_devices,
@@ -193,6 +198,11 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             hp.moe_grouped_gemm,
             hp.audio_mel_tokens,
             hp.vision_prefix_cache,
+            hp.moe_gpu_persistent_mega,
+            hp.fp8_e4m3_m16n8k32_amx_f16,
+            hp.hetero_lora_bgmv,
+            hp.multimodal_kv_cow_cache,
+            hp.disaggregated_pd_kv,
         ));
     }
 

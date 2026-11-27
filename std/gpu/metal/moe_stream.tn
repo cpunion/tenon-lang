@@ -87,6 +87,11 @@ extern "C" {
     fn tn_moe_audio_info(audio_h Int, field_id Int) Int
     fn tn_moe_audio_encode_pcm16(audio_h Int, pcm16_ptr Ptr[UInt8], n_samples Int, sample_rate Int, out_embd_ptr Ptr[UInt8], max_vecs Int) Int
     fn tn_moe_audio_free(audio_h Int) Int
+    fn tn_moe_lora_set_batch(handle Int, lora_ids_ptr Ptr[UInt8], n_active Int) Int
+    fn tn_moe_paged_step_embd(handle Int, slot_id Int, embd_f32_ptr Ptr[UInt8], n_vecs Int, start_pos Int, grid_t Int, grid_h Int, grid_w Int) Int
+    fn tn_moe_kv_slot_bytes(handle Int, slot_id Int, n_tokens Int) Int
+    fn tn_moe_kv_export_slot(handle Int, slot_id Int, n_tokens Int, dst_ptr Ptr[UInt8], dst_cap Int) Int
+    fn tn_moe_kv_import_slot(handle Int, slot_id Int, src_ptr Ptr[UInt8], src_len Int) Int
 
     /// Decodes a token ID to a UTF-8 C string from the GGUF's embedded vocabulary.
     fn tn_moe_token_cstr(handle Int, tok_id Int) Ptr[UInt8]
