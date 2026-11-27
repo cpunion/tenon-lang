@@ -83,6 +83,11 @@ type FnKvImportSlot = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
 type FnKvExportShm = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
 type FnKvImportShm = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
 
+// Tenon v11 FFI function signatures (Layer-Wise Streaming PD across Metal & CUDA!)
+type FnKvLayerBytes = unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64;
+type FnKvExportLayer = unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64;
+type FnKvImportLayer = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
+
 struct LlmApi {
     backend: &'static str,
     _dl_handle: *mut c_void,
@@ -141,6 +146,10 @@ struct LlmApi {
     // v10 APIs
     kv_export_shm: FnKvExportShm,
     kv_import_shm: FnKvImportShm,
+    // v11 APIs
+    kv_layer_bytes: FnKvLayerBytes,
+    kv_export_layer: FnKvExportLayer,
+    kv_import_layer: FnKvImportLayer,
 }
 
 unsafe impl Send for LlmApi {}
@@ -266,11 +275,11 @@ fn load_llm_api() -> Result<LlmApi, String> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let lib_path = PathBuf::from(format!("/tmp/tenon_llm_{}_v10_{}.{}", backend, mtime, ext));
+    let lib_path = PathBuf::from(format!("/tmp/tenon_llm_{}_v11_{}.{}", backend, mtime, ext));
 
     if !lib_path.exists() {
         eprintln!(
-            "[tenon llm] compiling {} v10 runtime shim ({}) -> {}",
+            "[tenon llm] compiling {} v11 runtime shim ({}) -> {}",
             backend,
             src.display(),
             lib_path.display()
@@ -387,6 +396,9 @@ fn load_llm_api() -> Result<LlmApi, String> {
         kv_import_slot: load_symbol(dl_handle, &sym("kv_import_slot"))?,
         kv_export_shm: load_symbol(dl_handle, &sym("kv_export_shm"))?,
         kv_import_shm: load_symbol(dl_handle, &sym("kv_import_shm"))?,
+        kv_layer_bytes: load_symbol(dl_handle, &sym("kv_layer_bytes"))?,
+        kv_export_layer: load_symbol(dl_handle, &sym("kv_export_layer"))?,
+        kv_import_layer: load_symbol(dl_handle, &sym("kv_import_layer"))?,
     };
     if let Some(init) = api.init_fn {
         if unsafe { init() } == 0 {
@@ -739,6 +751,48 @@ impl LlmApi {
                 cname.as_ptr() as i64,
                 if unlink_after { 1 } else { 0 },
             )
+        };
+        n.max(0) as usize
+    }
+
+    fn kv_export_layer(
+        &self,
+        h: i64,
+        slot: usize,
+        seq_len: usize,
+        layer_start: usize,
+        layer_count: usize,
+    ) -> Option<Vec<u8>> {
+        let need = unsafe {
+            (self.kv_layer_bytes)(
+                h,
+                slot as i64,
+                seq_len as i64,
+                layer_start as i64,
+                layer_count as i64,
+            )
+        };
+        if need <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; need as usize];
+        let written = unsafe {
+            (self.kv_export_layer)(
+                h,
+                slot as i64,
+                seq_len as i64,
+                layer_start as i64,
+                layer_count as i64,
+                buf.as_mut_ptr() as i64,
+                need,
+            )
+        };
+        if written == need { Some(buf) } else { None }
+    }
+
+    fn kv_import_layer(&self, h: i64, slot: usize, blob: &[u8]) -> usize {
+        let n = unsafe {
+            (self.kv_import_layer)(h, slot as i64, blob.as_ptr() as i64, blob.len() as i64)
         };
         n.max(0) as usize
     }
@@ -3682,7 +3736,7 @@ enum EngineCmd {
         reply: tokio::sync::oneshot::Sender<Result<Vec<(usize, f32)>, String>>,
     },
     PagedStats {
-        reply: tokio::sync::oneshot::Sender<(i64, i64, i64, i64, i64, i64, i64)>,
+        reply: tokio::sync::oneshot::Sender<(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)>,
     },
     PdPrefill {
         prompt: String,
@@ -3694,6 +3748,18 @@ enum EngineCmd {
         add_bos: bool,
         shm_name: String,
         reply: tokio::sync::oneshot::Sender<Result<(i64, String, usize, usize, f64), String>>,
+    },
+    PdPrefillLayers {
+        prompt: String,
+        add_bos: bool,
+        layer_chunk: usize,
+        reply: tokio::sync::oneshot::Sender<Result<(i64, String, usize, usize, Vec<Vec<u8>>, f64), String>>,
+    },
+    PdImportLayer {
+        slot: usize,
+        layer_start: i64,
+        blob: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<usize, String>>,
     },
     PdDecode {
         kv_blob: Vec<u8>,
@@ -3710,6 +3776,27 @@ enum EngineCmd {
         cfg: SamplingCfg,
         tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
         ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    PdDecodeSlot {
+        slot: usize,
+        first_tok: i64,
+        prompt_tokens: usize,
+        cfg: SamplingCfg,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    LoraLoad {
+        name: String,
+        path: String,
+        scale: f64,
+        reply: tokio::sync::oneshot::Sender<Result<(i64, i64, i64), String>>,
+    },
+    LoraUnload {
+        name: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    LoraList {
+        reply: tokio::sync::oneshot::Sender<Vec<(String, i64, f64, i64, i64)>>,
     },
 }
 
@@ -3822,6 +3909,8 @@ impl<const N: usize> LatencyHist<N> {
 struct ServerState {
     meta: ModelMeta,
     engine_tx: std_mpsc::Sender<EngineCmd>,
+    max_queue: usize,
+    lora_adapters: std::sync::RwLock<Vec<String>>,
     queued_reqs: AtomicUsize,
     active_batch: AtomicUsize,
     cb_batches_run: AtomicU64,
@@ -3837,12 +3926,16 @@ struct ServerState {
     vision_cache_hits: AtomicU64,
     vision_cache_entries: AtomicUsize,
     lora_swaps: AtomicU64,
+    lora_hot_swaps: AtomicU64,
     hetero_lora_batches: AtomicU64,
     mm_kv_cow_hits: AtomicU64,
     pd_transfers: AtomicU64,
     pd_shm_transfers: AtomicU64,
+    pd_layer_streams: AtomicU64,
     pd_binary_bytes: AtomicU64,
     pd_shm_seq: AtomicU64,
+    stream_cancelled: AtomicU64,
+    backpressure_rejected: AtomicU64,
     ttft_hist: LatencyHist<8>,
     tpot_hist: LatencyHist<7>,
 }
@@ -3854,6 +3947,12 @@ fn finish_cb_seq(
     state: &ServerState,
 ) {
     let decode_ms = seq.t_dec.elapsed().as_secs_f64() * 1000.0;
+    if finish_reason == "cancelled" {
+        state.stream_cancelled.fetch_add(1, Ordering::Relaxed);
+        m.api.paged_seq_free(m.handle, seq.slot);
+        m.cb_radix.release(seq.slot, Vec::new());
+        return;
+    }
     state.ttft_hist.observe(seq.prefill_ms, &TTFT_BOUNDS_MS);
     if seq.completion_tokens > 0 && decode_ms > 0.0 {
         let tpot = decode_ms / (seq.completion_tokens.saturating_sub(1).max(1) as f64);
@@ -3865,7 +3964,11 @@ fn finish_cb_seq(
             .radix_saved_toks
             .fetch_add(seq.cached_prefix_tokens as u64, Ordering::Relaxed);
     }
-    m.cb_radix.release(seq.slot, seq.full_seq);
+    if seq.slot >= m.cb_radix.slots.len() {
+        m.api.paged_seq_free(m.handle, seq.slot);
+    } else {
+        m.cb_radix.release(seq.slot, seq.full_seq);
+    }
     let _ = seq.tx.send(StreamEvent::Done(GenResult {
         text: seq.out_text,
         prompt_tokens: seq.prompt_tokens,
@@ -3964,7 +4067,9 @@ fn finalize_prefilled_cb(
         seq.completion_tokens += 1;
         seq.full_seq.push(seq.next_tok);
         let alive = seq.tx.send(StreamEvent::Piece(piece)).is_ok();
-        if !alive || seq.grammar.as_ref().is_some_and(GrammarState::is_strictly_done) {
+        if !alive {
+            finish_cb_seq(m, seq, "cancelled", state);
+        } else if seq.grammar.as_ref().is_some_and(GrammarState::is_strictly_done) {
             finish_cb_seq(m, seq, "stop", state);
         } else if seq.completion_tokens >= seq.cfg.max_tokens
             || seq.full_seq.len() + 2 >= m.meta.max_ctx as usize
@@ -4583,6 +4688,21 @@ fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: 
             continue;
         }
 
+        // Tenon v11: Real-Time SSE Client-Disconnect Cancellation BEFORE launching GPU decode!
+        let mut live_active = Vec::with_capacity(active.len());
+        for seq in active.drain(..) {
+            if seq.tx.is_closed() {
+                finish_cb_seq(&mut m, seq, "cancelled", &state);
+            } else {
+                live_active.push(seq);
+            }
+        }
+        active = live_active;
+        if active.is_empty() {
+            state.active_batch.store(0, Ordering::Relaxed);
+            continue;
+        }
+
         // Tenon v8 Native Zero-Migration In-Slot Speculative Step:
         // When `active.len() == 1 && prefill_queue.is_empty()` and speculative mode is active,
         // verify K+1 tokens directly IN-PLACE inside `active[0].slot` using `paged_verify_batch`!
@@ -4687,7 +4807,9 @@ fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: 
             seq.completion_tokens += 1;
             seq.full_seq.push(chosen);
             let alive = seq.tx.send(StreamEvent::Piece(piece)).is_ok();
-            if !alive || seq.grammar.as_ref().is_some_and(GrammarState::is_strictly_done) {
+            if !alive {
+                finish_cb_seq(&mut m, seq, "cancelled", &state);
+            } else if seq.grammar.as_ref().is_some_and(GrammarState::is_strictly_done) {
                 finish_cb_seq(&mut m, seq, "stop", &state);
             } else if seq.completion_tokens >= seq.cfg.max_tokens
                 || seq.full_seq.len() + 2 >= m.meta.max_ctx as usize
@@ -4825,20 +4947,32 @@ fn handle_engine_cmd(
             let free = m.api.paged_kv_info(m.handle, 2);
             let forks = m.api.paged_kv_info(m.handle, 4);
             let copies = m.api.paged_kv_info(m.handle, 5);
-            let (graph_replays, graph_captured, moe_tc_amx_tiles) = if m.api.backend == "cuda" {
-                (
-                    m.api.info(m.handle, 46),
-                    m.api.info(m.handle, 47),
-                    m.api.info(m.handle, 45),
-                )
-            } else {
-                (
-                    m.api.info(m.handle, 40),
-                    m.api.info(m.handle, 41),
-                    m.api.info(m.handle, 39),
-                )
-            };
-            let _ = reply.send((total, free, forks, copies, graph_replays, graph_captured, moe_tc_amx_tiles));
+            let (graph_replays, graph_captured, moe_tc_amx_tiles, fd_launches, pipe_or_tp_rep, tp_cap, mega_v3_tiles) =
+                if m.api.backend == "cuda" {
+                    (
+                        m.api.info(m.handle, 46),
+                        m.api.info(m.handle, 47),
+                        m.api.info(m.handle, 45),
+                        m.api.info(m.handle, 55),
+                        m.api.info(m.handle, 52),
+                        m.api.info(m.handle, 53),
+                        m.api.info(m.handle, 54),
+                    )
+                } else {
+                    (
+                        m.api.info(m.handle, 40),
+                        m.api.info(m.handle, 41),
+                        m.api.info(m.handle, 39),
+                        m.api.info(m.handle, 43),
+                        m.api.info(m.handle, 44),
+                        0,
+                        m.api.info(m.handle, 45),
+                    )
+                };
+            let _ = reply.send((
+                total, free, forks, copies, graph_replays, graph_captured, moe_tc_amx_tiles,
+                fd_launches, pipe_or_tp_rep, tp_cap, mega_v3_tiles,
+            ));
             false
         }
         EngineCmd::PdPrefill { prompt, add_bos, reply } => {
@@ -5006,11 +5140,171 @@ fn handle_engine_cmd(
             seq.completion_tokens = 1;
             let alive = seq.tx.send(StreamEvent::Piece(piece)).is_ok();
             if !alive || seq.completion_tokens >= seq.cfg.max_tokens {
-                finish_cb_seq(m, seq, if !alive { "stop" } else { "length" }, state);
+                finish_cb_seq(m, seq, if !alive { "cancelled" } else { "length" }, state);
                 return false;
             }
             active.push(seq);
             true
+        }
+        EngineCmd::PdPrefillLayers { prompt, add_bos, layer_chunk, reply } => {
+            if !m.meta.supports_cb {
+                let _ = reply.send(Err("model does not support PagedKV Layer-Stream PD".into()));
+                return false;
+            }
+            let _ = m.apply_lora(None);
+            let max_prompt = (m.meta.max_ctx as usize).saturating_sub(16).max(16);
+            let mut ids = Vec::new();
+            if add_bos && m.bos_id >= 0 { ids.push(m.bos_id); }
+            ids.extend(m.api.tokenize(m.handle, &prompt, max_prompt));
+            if ids.is_empty() { ids.push(m.bos_id.max(1)); }
+            let pd_slot = 24usize;
+            m.api.paged_seq_free(m.handle, pd_slot);
+            let t0 = Instant::now();
+            let first_tok = m.api.paged_prefill(m.handle, pd_slot, &ids, 0);
+            let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let first_piece = m.api.token_str(m.handle, first_tok);
+            let n_layers = m.api.info(m.handle, 0).max(1) as usize;
+            let step_l = layer_chunk.max(1).min(n_layers);
+            let mut chunks = Vec::new();
+            let mut ls = 0usize;
+            let mut ok = true;
+            while ls < n_layers {
+                let lc = step_l.min(n_layers - ls);
+                if let Some(ch) = m.api.kv_export_layer(m.handle, pd_slot, ids.len(), ls, lc) {
+                    chunks.push(ch);
+                } else {
+                    ok = false;
+                    break;
+                }
+                ls += lc;
+            }
+            m.api.paged_seq_free(m.handle, pd_slot);
+            if ok && !chunks.is_empty() {
+                state.pd_transfers.fetch_add(1, Ordering::Relaxed);
+                state.pd_layer_streams.fetch_add(1, Ordering::Relaxed);
+                state.ttft_hist.observe(prefill_ms, &TTFT_BOUNDS_MS);
+                let _ = reply.send(Ok((first_tok, first_piece, ids.len(), n_layers, chunks, prefill_ms)));
+            } else {
+                let _ = reply.send(Err("failed to export TNKL layer chunks".into()));
+            }
+            false
+        }
+        EngineCmd::PdImportLayer { slot, layer_start, blob, reply } => {
+            if !m.meta.supports_cb {
+                let _ = reply.send(Err("model does not support PagedKV Layer-Stream PD".into()));
+                return false;
+            }
+            if layer_start == 0 {
+                m.api.paged_seq_free(m.handle, slot);
+            }
+            let imported = m.api.kv_import_layer(m.handle, slot, &blob);
+            if imported > 0 {
+                let _ = reply.send(Ok(imported));
+            } else {
+                let _ = reply.send(Err("invalid or corrupted TNKL layer chunk (checksum mismatch)".into()));
+            }
+            false
+        }
+        EngineCmd::PdDecodeSlot { slot, first_tok, prompt_tokens, cfg, tx, ack } => {
+            if !m.meta.supports_cb {
+                let _ = ack.send(Err("model does not support PagedKV PD decode".into()));
+                return false;
+            }
+            state.pd_transfers.fetch_add(1, Ordering::Relaxed);
+            state.pd_layer_streams.fetch_add(1, Ordering::Relaxed);
+            let _ = ack.send(Ok(()));
+            let plen = prompt_tokens.max(1);
+            let (lora_id, _) = m.resolve_lora(cfg.lora.as_deref());
+            let mut full_seq = vec![-1i64; plen];
+            let piece = m.api.token_str(m.handle, first_tok);
+            let mut seq = ActiveCbSeq {
+                slot,
+                cfg,
+                lora_id,
+                grammar: None,
+                prompt_tokens: plen,
+                cached_prefix_tokens: plen,
+                full_seq: Vec::new(),
+                next_tok: first_tok,
+                out_text: String::new(),
+                completion_tokens: 0,
+                spec_proposed: 0,
+                spec_accepted: 0,
+                prefill_ms: 0.0,
+                t_dec: Instant::now(),
+                tx,
+            };
+            if is_stop_token(first_tok, m.eos_id, &piece) || seq.cfg.max_tokens == 0 {
+                seq.full_seq = full_seq;
+                finish_cb_seq(m, seq, "stop", state);
+                return false;
+            }
+            full_seq.push(first_tok);
+            seq.full_seq = full_seq;
+            seq.out_text.push_str(&piece);
+            seq.completion_tokens = 1;
+            let alive = seq.tx.send(StreamEvent::Piece(piece)).is_ok();
+            if !alive || seq.completion_tokens >= seq.cfg.max_tokens {
+                finish_cb_seq(m, seq, if !alive { "cancelled" } else { "length" }, state);
+                return false;
+            }
+            active.push(seq);
+            true
+        }
+        EngineCmd::LoraLoad { name, path, scale, reply } => {
+            if let Some((old_id, _)) = m.lora_map.remove(&name) {
+                if m.active_lora_id == old_id {
+                    m.api.lora_set(m.handle, 0, 1.0);
+                    m.active_lora_id = 0;
+                }
+                m.api.lora_free(m.handle, old_id);
+            }
+            match m.api.lora_load(m.handle, &path, scale) {
+                Ok(lid) => {
+                    let rank = m.api.lora_info(m.handle, lid, 1);
+                    let nt = m.api.lora_info(m.handle, lid, 2);
+                    m.lora_map.insert(name.clone(), (lid, scale));
+                    if let Ok(mut guard) = state.lora_adapters.write() {
+                        if !guard.iter().any(|x| x == &name) {
+                            guard.push(name);
+                        }
+                    }
+                    state.lora_hot_swaps.fetch_add(1, Ordering::Relaxed);
+                    let _ = reply.send(Ok((lid, rank, nt)));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
+            false
+        }
+        EngineCmd::LoraUnload { name, reply } => {
+            if let Some((lid, _)) = m.lora_map.remove(&name) {
+                if m.active_lora_id == lid {
+                    m.api.lora_set(m.handle, 0, 1.0);
+                    m.active_lora_id = 0;
+                }
+                m.api.lora_free(m.handle, lid);
+                if let Ok(mut guard) = state.lora_adapters.write() {
+                    guard.retain(|x| x != &name);
+                }
+                state.lora_hot_swaps.fetch_add(1, Ordering::Relaxed);
+                let _ = reply.send(Ok(()));
+            } else {
+                let _ = reply.send(Err(format!("LoRA adapter `{}` is not loaded", name)));
+            }
+            false
+        }
+        EngineCmd::LoraList { reply } => {
+            let mut list = Vec::with_capacity(m.lora_map.len());
+            for (nm, &(lid, sc)) in &m.lora_map {
+                let rank = m.api.lora_info(m.handle, lid, 1);
+                let nt = m.api.lora_info(m.handle, lid, 2);
+                list.push((nm.clone(), lid, sc, rank, nt));
+            }
+            list.sort_by(|a, b| a.0.cmp(&b.0));
+            let _ = reply.send(list);
+            false
         }
     }
 }
@@ -5199,17 +5493,18 @@ async fn handle_http_client(
     }
 
     if method == "GET" && clean_path == "/health" {
-        let (pa_tot, pa_free, pa_forks, pa_copies, graph_replays, graph_captured, moe_tc_amx_tiles) = {
+        let (pa_tot, pa_free, pa_forks, pa_copies, graph_replays, graph_captured, moe_tc_amx_tiles, fd_launches, pipe_or_tp_rep, tp_cap, mega_v3_tiles) = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             if state.engine_tx.send(EngineCmd::PagedStats { reply: tx }).is_ok() {
-                rx.await.unwrap_or((0, 0, 0, 0, 0, 0, 0))
+                rx.await.unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
             } else {
-                (0, 0, 0, 0, 0, 0, 0)
+                (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
             }
         };
+        let live_loras: Vec<String> = state.lora_adapters.read().map(|g| g.clone()).unwrap_or_default();
         let mut info = json!({
             "status": "ok",
-            "version": "tenon-v10",
+            "version": "tenon-v11",
             "backend": state.meta.backend,
             "model": state.meta.model_id,
             "arch": state.meta.arch,
@@ -5243,16 +5538,29 @@ async fn handle_http_client(
             obj.insert("adaptive_spec_proposed".into(), json!(state.adaptive_spec_proposed.load(Ordering::Relaxed)));
             obj.insert("adaptive_spec_accepted".into(), json!(state.adaptive_spec_accepted.load(Ordering::Relaxed)));
             obj.insert("spec_zero_migrations".into(), json!(state.spec_zero_migrations.load(Ordering::Relaxed)));
-            obj.insert("lora_adapters".into(), json!(state.meta.lora_adapters));
+            obj.insert("lora_adapters".into(), json!(live_loras));
             obj.insert("lora_swaps".into(), json!(state.lora_swaps.load(Ordering::Relaxed)));
+            obj.insert("lora_hot_swaps".into(), json!(state.lora_hot_swaps.load(Ordering::Relaxed)));
             obj.insert("hetero_lora_batches".into(), json!(state.hetero_lora_batches.load(Ordering::Relaxed)));
             obj.insert("mm_kv_cow_hits".into(), json!(state.mm_kv_cow_hits.load(Ordering::Relaxed)));
             obj.insert("pd_transfers".into(), json!(state.pd_transfers.load(Ordering::Relaxed)));
             obj.insert("pd_shm_transfers".into(), json!(state.pd_shm_transfers.load(Ordering::Relaxed)));
+            obj.insert("pd_layer_streams".into(), json!(state.pd_layer_streams.load(Ordering::Relaxed)));
             obj.insert("pd_binary_bytes".into(), json!(state.pd_binary_bytes.load(Ordering::Relaxed)));
             obj.insert("graph_replays".into(), json!(graph_replays));
             obj.insert("graph_captured".into(), json!(graph_captured));
             obj.insert("moe_tc_amx_tiles".into(), json!(moe_tc_amx_tiles));
+            obj.insert("flash_decode_launches".into(), json!(fd_launches));
+            obj.insert("moe_mega_v3_tiles".into(), json!(mega_v3_tiles));
+            if state.meta.backend == "cuda" {
+                obj.insert("tp_graph_replays".into(), json!(pipe_or_tp_rep));
+                obj.insert("tp_graph_captured".into(), json!(tp_cap));
+            } else {
+                obj.insert("icb_pipe_overlaps".into(), json!(pipe_or_tp_rep));
+            }
+            obj.insert("stream_cancelled".into(), json!(state.stream_cancelled.load(Ordering::Relaxed)));
+            obj.insert("backpressure_rejected".into(), json!(state.backpressure_rejected.load(Ordering::Relaxed)));
+            obj.insert("max_queue".into(), json!(state.max_queue));
             obj.insert("active_batch_size".into(), json!(state.active_batch.load(Ordering::Relaxed)));
             obj.insert("cb_batches_run".into(), json!(state.cb_batches_run.load(Ordering::Relaxed)));
             obj.insert("cb_max_batch_seen".into(), json!(state.cb_max_batch.load(Ordering::Relaxed)));
@@ -5270,12 +5578,12 @@ async fn handle_http_client(
     }
 
     if method == "GET" && clean_path == "/metrics" {
-        let (pa_tot, pa_free, pa_forks, pa_copies, graph_replays, graph_captured, moe_tc_amx_tiles) = {
+        let (pa_tot, pa_free, pa_forks, pa_copies, graph_replays, graph_captured, moe_tc_amx_tiles, fd_launches, pipe_or_tp_rep, tp_cap, mega_v3_tiles) = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             if state.engine_tx.send(EngineCmd::PagedStats { reply: tx }).is_ok() {
-                rx.await.unwrap_or((0, 0, 0, 0, 0, 0, 0))
+                rx.await.unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
             } else {
-                (0, 0, 0, 0, 0, 0, 0)
+                (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
             }
         };
         let mut body = format!(
@@ -5312,6 +5620,9 @@ async fn handle_http_client(
              # HELP tenon_lora_swaps_total Zero-copy runtime LoRA adapter swaps\n\
              # TYPE tenon_lora_swaps_total counter\n\
              tenon_lora_swaps_total {}\n\
+             # HELP tenon_lora_hot_swaps_total Zero-downtime dynamic LoRA load/unload hot-swaps\n\
+             # TYPE tenon_lora_hot_swaps_total counter\n\
+             tenon_lora_hot_swaps_total {}\n\
              # HELP tenon_hetero_lora_batches_total Single-launch mixed-tenant BGMV LoRA batches\n\
              # TYPE tenon_hetero_lora_batches_total counter\n\
              tenon_hetero_lora_batches_total {}\n\
@@ -5324,6 +5635,9 @@ async fn handle_http_client(
              # HELP tenon_pd_shm_transfers_total Zero-copy POSIX SHM PD PagedKV transfers\n\
              # TYPE tenon_pd_shm_transfers_total counter\n\
              tenon_pd_shm_transfers_total {}\n\
+             # HELP tenon_pd_layer_streams_total Layer-wise streaming TNKL PD transfers\n\
+             # TYPE tenon_pd_layer_streams_total counter\n\
+             tenon_pd_layer_streams_total {}\n\
              # HELP tenon_pd_binary_bytes_total Raw binary HTTP PD PagedKV bytes transferred\n\
              # TYPE tenon_pd_binary_bytes_total counter\n\
              tenon_pd_binary_bytes_total {}\n\
@@ -5336,6 +5650,18 @@ async fn handle_http_client(
              # HELP tenon_moe_tc_amx_tiles_total Tensor Core / AMX hot-expert grouped MoE tiles executed\n\
              # TYPE tenon_moe_tc_amx_tiles_total counter\n\
              tenon_moe_tc_amx_tiles_total {}\n\
+             # HELP tenon_flash_decode_launches_total Hardware-native 2-phase FlashDecoding Split-KV launches\n\
+             # TYPE tenon_flash_decode_launches_total counter\n\
+             tenon_flash_decode_launches_total {}\n\
+             # HELP tenon_moe_mega_v3_tiles_total MoE Mega-Kernel v3 (FP8-TC / Reg-AMX) tiles executed\n\
+             # TYPE tenon_moe_mega_v3_tiles_total counter\n\
+             tenon_moe_mega_v3_tiles_total {}\n\
+             # HELP tenon_stream_cancelled_total Real-time SSE client-disconnect cancellations\n\
+             # TYPE tenon_stream_cancelled_total counter\n\
+             tenon_stream_cancelled_total {}\n\
+             # HELP tenon_backpressure_rejected_total Requests rejected with HTTP 503 due to queue backpressure\n\
+             # TYPE tenon_backpressure_rejected_total counter\n\
+             tenon_backpressure_rejected_total {}\n\
              # HELP tenon_kv_quant_mode Active PagedKV compression mode (0=FP16,1=Q8_0,2=FP8,3=Q4_0)\n\
              # TYPE tenon_kv_quant_mode gauge\n\
              tenon_kv_quant_mode {}\n",
@@ -5350,16 +5676,40 @@ async fn handle_http_client(
             state.spec_zero_migrations.load(Ordering::Relaxed),
             state.vision_cache_hits.load(Ordering::Relaxed),
             state.lora_swaps.load(Ordering::Relaxed),
+            state.lora_hot_swaps.load(Ordering::Relaxed),
             state.hetero_lora_batches.load(Ordering::Relaxed),
             state.mm_kv_cow_hits.load(Ordering::Relaxed),
             state.pd_transfers.load(Ordering::Relaxed),
             state.pd_shm_transfers.load(Ordering::Relaxed),
+            state.pd_layer_streams.load(Ordering::Relaxed),
             state.pd_binary_bytes.load(Ordering::Relaxed),
             graph_replays,
             graph_captured,
             moe_tc_amx_tiles,
+            fd_launches,
+            mega_v3_tiles,
+            state.stream_cancelled.load(Ordering::Relaxed),
+            state.backpressure_rejected.load(Ordering::Relaxed),
             state.meta.kv_quant_mode,
         );
+        if state.meta.backend == "cuda" {
+            body.push_str(&format!(
+                "# HELP tenon_tp_graph_replays_total Multi-GPU TP=2..8 CUDA Graph replays\n\
+                 # TYPE tenon_tp_graph_replays_total counter\n\
+                 tenon_tp_graph_replays_total {}\n\
+                 # HELP tenon_tp_graph_captured_total Multi-GPU TP=2..8 CUDA Graphs captured\n\
+                 # TYPE tenon_tp_graph_captured_total counter\n\
+                 tenon_tp_graph_captured_total {}\n",
+                pipe_or_tp_rep, tp_cap
+            ));
+        } else {
+            body.push_str(&format!(
+                "# HELP tenon_icb_pipe_overlaps_total Apple Metal unretained-ref async ICB overlaps\n\
+                 # TYPE tenon_icb_pipe_overlaps_total counter\n\
+                 tenon_icb_pipe_overlaps_total {}\n",
+                pipe_or_tp_rep
+            ));
+        }
         body.push_str(&state.ttft_hist.format_prom(
             "tenon_ttft_ms",
             "Time-to-first-token (prefill) latency in milliseconds",
@@ -5377,6 +5727,115 @@ async fn handle_http_client(
         );
         let _ = stream.write_all(resp.as_bytes()).await;
         let _ = stream.flush().await;
+        return;
+    }
+
+    // Tenon v11: Zero-Downtime Dynamic LoRA Hot-Swap Endpoints (`/v1/lora/load`, `/v1/lora/unload`, `/v1/lora/list`)
+    if method == "GET" && clean_path == "/v1/lora/list" {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state.engine_tx.send(EngineCmd::LoraList { reply: tx }).is_err() {
+            let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+            return;
+        }
+        let adapters: Vec<Value> = rx.await.unwrap_or_default().into_iter().map(|(name, lora_id, scale, rank, tensors)| {
+            json!({"name": name, "lora_id": lora_id, "scale": scale, "rank": rank, "tensors": tensors})
+        }).collect();
+        let _ = write_json_response(&mut stream, "200 OK", &json!({"object": "list", "adapters": adapters, "lora_hot_swaps": state.lora_hot_swaps.load(Ordering::Relaxed)})).await;
+        return;
+    }
+    if method == "POST" && clean_path == "/v1/lora/load" {
+        let Ok(req) = serde_json::from_str::<Value>(&body) else {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid JSON"}})).await;
+            return;
+        };
+        let name = req.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let lpath = req.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let scale = req.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
+        if name.is_empty() || lpath.is_empty() {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "missing `name` or `path`"}})).await;
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state.engine_tx.send(EngineCmd::LoraLoad { name: name.clone(), path: lpath, scale, reply: tx }).is_err() {
+            let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+            return;
+        }
+        match rx.await {
+            Ok(Ok((lora_id, rank, tensors))) => {
+                let _ = write_json_response(&mut stream, "200 OK", &json!({"status": "loaded", "name": name, "lora_id": lora_id, "rank": rank, "tensors": tensors, "scale": scale})).await;
+            }
+            Ok(Err(e)) => {
+                let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": e}})).await;
+            }
+            Err(_) => {
+                let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "lora load failed"}})).await;
+            }
+        }
+        return;
+    }
+    if method == "POST" && clean_path == "/v1/lora/unload" {
+        let Ok(req) = serde_json::from_str::<Value>(&body) else {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid JSON"}})).await;
+            return;
+        };
+        let name = req.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        if name.is_empty() {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "missing `name`"}})).await;
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state.engine_tx.send(EngineCmd::LoraUnload { name: name.clone(), reply: tx }).is_err() {
+            let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+            return;
+        }
+        match rx.await {
+            Ok(Ok(())) => {
+                let _ = write_json_response(&mut stream, "200 OK", &json!({"status": "unloaded", "name": name})).await;
+            }
+            Ok(Err(e)) => {
+                let _ = write_json_response(&mut stream, "404 Not Found", &json!({"error": {"message": e}})).await;
+            }
+            Err(_) => {
+                let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "lora unload failed"}})).await;
+            }
+        }
+        return;
+    }
+
+    // Tenon v11: Layer-Wise Streaming PD Chunk Ingest (`POST /v1/pd/layer`)
+    if method == "POST" && clean_path == "/v1/pd/layer" {
+        if body_bytes.len() < 48 {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "truncated TNKL layer payload"}})).await;
+            return;
+        }
+        let slot = headers
+            .get("x-tenon-pd-slot")
+            .and_then(|s| s.parse::<usize>().ok())
+            .or_else(|| query_param(&path, "slot").and_then(|s| s.parse::<usize>().ok()))
+            .unwrap_or(25);
+        let layer_start = headers
+            .get("x-tenon-pd-layer-start")
+            .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| query_param(&path, "layer_start").and_then(|s| s.parse::<i64>().ok()))
+            .unwrap_or(-1);
+        let nbytes = body_bytes.len();
+        state.pd_binary_bytes.fetch_add(nbytes as u64, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state.engine_tx.send(EngineCmd::PdImportLayer { slot, layer_start, blob: body_bytes, reply: tx }).is_err() {
+            let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+            return;
+        }
+        match rx.await {
+            Ok(Ok(imported)) => {
+                let _ = write_json_response(&mut stream, "200 OK", &json!({"status": "ok", "slot": slot, "imported_tokens": imported, "bytes": nbytes})).await;
+            }
+            Ok(Err(e)) => {
+                let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": e}})).await;
+            }
+            Err(_) => {
+                let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "layer import failed"}})).await;
+            }
+        }
         return;
     }
 
@@ -5429,13 +5888,89 @@ async fn handle_http_client(
             .and_then(Value::as_str)
             .or_else(|| query_param(&path, "transport"))
             .unwrap_or("");
-        let want_shm = transport.eq_ignore_ascii_case("shm");
-        let want_binary = !want_shm
+        let want_layer = transport.eq_ignore_ascii_case("layer");
+        let want_shm = !want_layer && transport.eq_ignore_ascii_case("shm");
+        let want_binary = !want_shm && !want_layer
             && (query_param(&path, "format").is_some_and(|f| f.eq_ignore_ascii_case("binary"))
                 || transport.eq_ignore_ascii_case("binary")
                 || headers
                     .get("accept")
                     .is_some_and(|a| a.to_ascii_lowercase().contains("application/octet-stream")));
+
+        if want_layer {
+            let layer_chunk = req
+                .get("layer_chunk")
+                .and_then(Value::as_u64)
+                .or_else(|| query_param(&path, "layer_chunk").and_then(|s| s.parse::<u64>().ok()))
+                .unwrap_or(4) as usize;
+            let decode_worker = req
+                .get("decode_worker")
+                .and_then(Value::as_str)
+                .or_else(|| query_param(&path, "decode_worker"))
+                .unwrap_or("")
+                .to_string();
+            let target_slot = req
+                .get("slot")
+                .and_then(Value::as_u64)
+                .unwrap_or(25) as usize;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if state
+                .engine_tx
+                .send(EngineCmd::PdPrefillLayers { prompt, add_bos: true, layer_chunk, reply: tx })
+                .is_err()
+            {
+                let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+                return;
+            }
+            match rx.await {
+                Ok(Ok((first_tok, first_piece, prompt_tokens, n_layers, chunks, prefill_ms))) => {
+                    let total_bytes: usize = chunks.iter().map(Vec::len).sum();
+                    let n_chunks = chunks.len();
+                    if !decode_worker.is_empty() {
+                        for (ci, ch) in chunks.iter().enumerate() {
+                            let ls_hdr = if ci == 0 { "0".to_string() } else { (ci * layer_chunk).to_string() };
+                            let dhdrs = [
+                                ("X-Tenon-PD-Slot", target_slot.to_string()),
+                                ("X-Tenon-PD-Layer-Start", ls_hdr),
+                            ];
+                            match pd_http_post(&decode_worker, "/v1/pd/layer", "application/octet-stream", &dhdrs, ch).await {
+                                Ok((200, _, _)) => {}
+                                Ok((st, _, eb)) => {
+                                    let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": format!("layer chunk {} rejected ({}): {}", ci, st, String::from_utf8_lossy(&eb))}})).await;
+                                    return;
+                                }
+                                Err(e) => {
+                                    let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": format!("layer chunk {} push failed: {}", ci, e)}})).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    state.pd_binary_bytes.fetch_add(total_bytes as u64, Ordering::Relaxed);
+                    let resp = json!({
+                        "object": "tenon.pd.prefill",
+                        "transport": "layer",
+                        "model": state.meta.model_id,
+                        "slot": target_slot,
+                        "layers_streamed": n_layers,
+                        "chunks": n_chunks,
+                        "first_tok": first_tok,
+                        "first_piece": first_piece,
+                        "prompt_tokens": prompt_tokens,
+                        "kv_bytes": total_bytes,
+                        "prefill_ms": prefill_ms,
+                    });
+                    let _ = write_json_response(&mut stream, "200 OK", &resp).await;
+                }
+                Ok(Err(e)) => {
+                    let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": e}})).await;
+                }
+                Err(_) => {
+                    let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "pd prefill layer stream failed"}})).await;
+                }
+            }
+            return;
+        }
 
         if want_shm {
             let seq_n = state.pd_shm_seq.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5580,7 +6115,26 @@ async fn handle_http_client(
             if let Some(t) = req.get("temperature").and_then(Value::as_f64) { cfg.temp = t; }
             if let Some(m) = req.get("max_tokens").and_then(Value::as_u64) { cfg.max_tokens = m as usize; }
             if let Some(l) = req.get("lora").and_then(Value::as_str) { cfg.lora = Some(l.to_string()); }
-            if let Some(shm_name) = req.get("shm_name").and_then(Value::as_str) {
+            if req.get("layer_ready").and_then(Value::as_bool).unwrap_or(false) {
+                let slot = req.get("slot").and_then(Value::as_u64).unwrap_or(25) as usize;
+                state.total_reqs.fetch_add(1, Ordering::Relaxed);
+                transport_used = "layer";
+                if state
+                    .engine_tx
+                    .send(EngineCmd::PdDecodeSlot {
+                        slot,
+                        first_tok,
+                        prompt_tokens,
+                        cfg,
+                        tx: stx,
+                        ack: atx,
+                    })
+                    .is_err()
+                {
+                    let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+                    return;
+                }
+            } else if let Some(shm_name) = req.get("shm_name").and_then(Value::as_str) {
                 state.total_reqs.fetch_add(1, Ordering::Relaxed);
                 transport_used = "shm";
                 if state
@@ -5778,15 +6332,27 @@ async fn handle_http_client(
         let want_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let cfg = parse_sampling_from_json(&req, &default_cfg);
         if let Some(ref lname) = cfg.lora {
-            if !state.meta.lora_adapters.iter().any(|a| a == lname) {
+            let live_loras: Vec<String> = state.lora_adapters.read().map(|g| g.clone()).unwrap_or_default();
+            if !live_loras.iter().any(|a| a == lname) {
                 let _ = write_json_response(
                     &mut stream,
                     "400 Bad Request",
-                    &json!({"error": {"message": format!("unknown LoRA adapter `{}` (loaded: {:?})", lname, state.meta.lora_adapters)}}),
+                    &json!({"error": {"message": format!("unknown LoRA adapter `{}` (loaded: {:?})", lname, live_loras)}}),
                 )
                 .await;
                 return;
             }
+        }
+        if state.max_queue > 0 && state.queued_reqs.load(Ordering::Relaxed) >= state.max_queue {
+            state.backpressure_rejected.fetch_add(1, Ordering::Relaxed);
+            let payload = json!({"error": {"message": "server busy (max queue depth reached)", "type": "overloaded"}}).to_string();
+            let resp = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 1\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(), payload
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
+            return;
         }
         if let Err(e) = compile_grammar_for_cfg(&cfg) {
             let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": format!("grammar/schema error: {}", e)}})).await;
@@ -5937,10 +6503,29 @@ async fn handle_http_client(
         if want_stream {
             let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
             if stream.write_all(hdr.as_bytes()).await.is_err() {
+                drop(ev_rx);
                 state.queued_reqs.fetch_sub(1, Ordering::Relaxed);
                 return;
             }
-            while let Some(ev) = ev_rx.recv().await {
+            let mut peek_buf = [0u8; 16];
+            loop {
+                let maybe_ev = tokio::select! {
+                    ev = ev_rx.recv() => ev,
+                    res = stream.readable() => {
+                        match res {
+                            Ok(()) => match stream.try_read(&mut peek_buf) {
+                                Ok(0) => None, // Client closed TCP socket (FIN) -> instant cancel!
+                                Ok(_) => continue,
+                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                                Err(_) => None,
+                            },
+                            Err(_) => None,
+                        }
+                    }
+                };
+                let Some(ev) = maybe_ev else {
+                    break;
+                };
                 match ev {
                     StreamEvent::Piece(piece) => {
                         let chunk = if is_chat {
@@ -5997,6 +6582,7 @@ async fn handle_http_client(
                     }
                 }
             }
+            drop(ev_rx);
             state.queued_reqs.fetch_sub(1, Ordering::Relaxed);
             return;
         }
@@ -6103,19 +6689,35 @@ async fn handle_http_client(
 }
 
 // ============================================================================
-// Tenon v10: Built-In Disaggregated Prefill-Decode (PD) Router / Gateway!
-// Prefix-Affinity Hashing (Prefill COW hits) + Raw Binary / POSIX SHM 2-Phase Orchestration
+// Tenon v11: Production HA Disaggregated Prefill-Decode (PD) Router / Gateway!
+// Prefix-Affinity Hashing + Raw Binary / POSIX SHM / Layer-Wise Streaming PD
+// + Health Probes + Circuit Breakers + Seamless Auto-Failover + 503 Backpressure!
 // ============================================================================
 struct PdRouterState {
     prefill_workers: Vec<String>,
     decode_workers: Vec<String>,
-    transport: String, // "binary" or "shm"
+    transport: String, // "binary", "shm", or "layer"
+    max_queue: usize,
+    active_reqs: AtomicUsize,
     decode_rr: AtomicUsize,
     total_reqs: AtomicU64,
     shm_transfers: AtomicU64,
+    layer_streams: AtomicU64,
     binary_bytes: AtomicU64,
+    router_failovers: AtomicU64,
+    router_backpressure: AtomicU64,
+    pf_unhealthy_until: Vec<AtomicU64>,
+    pf_failures: Vec<AtomicU64>,
+    dec_unhealthy_until: Vec<AtomicU64>,
+    dec_failures: Vec<AtomicU64>,
     ttft_hist: LatencyHist<8>,
     tpot_hist: LatencyHist<7>,
+}
+
+const CB_COOLDOWN_SECS: u64 = 15;
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn fnv1a_prefix_hash(bytes: &[u8]) -> u64 {
@@ -6125,6 +6727,20 @@ fn fnv1a_prefix_hash(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(1099511628211);
     }
     h
+}
+
+async fn pd_http_probe_health(addr: &str) -> bool {
+    let fut = async {
+        let mut s = TcpStream::connect(addr).await.ok()?;
+        let req = format!("GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", addr);
+        s.write_all(req.as_bytes()).await.ok()?;
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).await.ok()?;
+        if n == 0 { return None; }
+        let line = String::from_utf8_lossy(&buf[..n]);
+        Some(line.starts_with("HTTP/1.1 200") || line.starts_with("HTTP/1.0 200"))
+    };
+    matches!(tokio::time::timeout(std::time::Duration::from_millis(800), fut).await, Ok(Some(true)))
 }
 
 async fn pd_http_post(
@@ -6172,6 +6788,21 @@ async fn pd_http_post(
     Ok((status, hdrs, raw[pos + 4..].to_vec()))
 }
 
+fn candidate_order(n: usize, start: usize, unhealthy_until: &[AtomicU64], now: u64) -> Vec<usize> {
+    let mut healthy = Vec::with_capacity(n);
+    let mut tripped = Vec::new();
+    for k in 0..n {
+        let idx = (start + k) % n;
+        if unhealthy_until[idx].load(Ordering::Relaxed) <= now {
+            healthy.push(idx);
+        } else {
+            tripped.push(idx);
+        }
+    }
+    healthy.extend(tripped);
+    healthy
+}
+
 async fn handle_pd_router_client(mut stream: TcpStream, state: Arc<PdRouterState>) {
     let Ok((method, path, _headers, body_bytes)) = read_http_request(&mut stream).await else {
         return;
@@ -6184,16 +6815,32 @@ async fn handle_pd_router_client(mut stream: TcpStream, state: Arc<PdRouterState
         return;
     }
     if method == "GET" && clean_path == "/health" {
+        let now = now_epoch_secs();
+        let pf_health: Vec<Value> = state.prefill_workers.iter().enumerate().map(|(i, w)| {
+            let until = state.pf_unhealthy_until[i].load(Ordering::Relaxed);
+            json!({"addr": w, "healthy": until <= now, "failures": state.pf_failures[i].load(Ordering::Relaxed)})
+        }).collect();
+        let dec_health: Vec<Value> = state.decode_workers.iter().enumerate().map(|(i, w)| {
+            let until = state.dec_unhealthy_until[i].load(Ordering::Relaxed);
+            json!({"addr": w, "healthy": until <= now, "failures": state.dec_failures[i].load(Ordering::Relaxed)})
+        }).collect();
         let resp = json!({
             "status": "ok",
-            "version": "tenon-v10-pd-router",
+            "version": "tenon-v11-pd-router",
             "role": "pd-router",
             "transport": state.transport,
+            "max_queue": state.max_queue,
+            "active_requests": state.active_reqs.load(Ordering::Relaxed),
             "prefill_workers": state.prefill_workers,
             "decode_workers": state.decode_workers,
+            "prefill_health": pf_health,
+            "decode_health": dec_health,
             "pd_router_requests": state.total_reqs.load(Ordering::Relaxed),
             "pd_shm_transfers": state.shm_transfers.load(Ordering::Relaxed),
+            "pd_layer_streams": state.layer_streams.load(Ordering::Relaxed),
             "pd_binary_bytes": state.binary_bytes.load(Ordering::Relaxed),
+            "router_failovers": state.router_failovers.load(Ordering::Relaxed),
+            "router_backpressure": state.router_backpressure.load(Ordering::Relaxed),
         });
         let _ = write_json_response(&mut stream, "200 OK", &resp).await;
         return;
@@ -6206,12 +6853,24 @@ async fn handle_pd_router_client(mut stream: TcpStream, state: Arc<PdRouterState
              # HELP tenon_pd_shm_transfers_total Zero-copy POSIX SHM PD transfers routed\n\
              # TYPE tenon_pd_shm_transfers_total counter\n\
              tenon_pd_shm_transfers_total {}\n\
+             # HELP tenon_pd_layer_streams_total Layer-wise streaming TNKL PD transfers routed\n\
+             # TYPE tenon_pd_layer_streams_total counter\n\
+             tenon_pd_layer_streams_total {}\n\
              # HELP tenon_pd_binary_bytes_total Raw binary HTTP PD KV bytes routed\n\
              # TYPE tenon_pd_binary_bytes_total counter\n\
-             tenon_pd_binary_bytes_total {}\n",
+             tenon_pd_binary_bytes_total {}\n\
+             # HELP tenon_router_failovers_total Automatic circuit-breaker worker failovers\n\
+             # TYPE tenon_router_failovers_total counter\n\
+             tenon_router_failovers_total {}\n\
+             # HELP tenon_router_backpressure_total Requests shed with HTTP 503 due to queue backpressure\n\
+             # TYPE tenon_router_backpressure_total counter\n\
+             tenon_router_backpressure_total {}\n",
             state.total_reqs.load(Ordering::Relaxed),
             state.shm_transfers.load(Ordering::Relaxed),
+            state.layer_streams.load(Ordering::Relaxed),
             state.binary_bytes.load(Ordering::Relaxed),
+            state.router_failovers.load(Ordering::Relaxed),
+            state.router_backpressure.load(Ordering::Relaxed),
         );
         body.push_str(&state.ttft_hist.format_prom(
             "tenon_ttft_ms",
@@ -6246,117 +6905,269 @@ async fn handle_pd_router_client(mut stream: TcpStream, state: Arc<PdRouterState
             let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid JSON"}})).await;
             return;
         };
+        if state.max_queue > 0 && state.active_reqs.load(Ordering::Relaxed) >= state.max_queue {
+            state.router_backpressure.fetch_add(1, Ordering::Relaxed);
+            let payload = json!({"error": {"message": "PD router busy (max queue depth reached)", "type": "overloaded"}}).to_string();
+            let resp = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 1\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(), payload
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
+            return;
+        }
+        state.active_reqs.fetch_add(1, Ordering::Relaxed);
         let seq_no = state.total_reqs.fetch_add(1, Ordering::Relaxed) + 1;
-        // Prefix-affinity hash picks the same Prefill worker for identical prompt prefixes (maximizing COW hits!)
         let affinity_key = req
             .get("messages")
             .map(Value::to_string)
             .or_else(|| req.get("prompt").and_then(Value::as_str).map(String::from))
             .unwrap_or_default();
-        let pf_idx = (fnv1a_prefix_hash(affinity_key.as_bytes()) as usize) % state.prefill_workers.len();
-        let dec_idx = state.decode_rr.fetch_add(1, Ordering::Relaxed) % state.decode_workers.len();
-        let pf_worker = &state.prefill_workers[pf_idx];
-        let dec_worker = &state.decode_workers[dec_idx];
+        let pf_start = (fnv1a_prefix_hash(affinity_key.as_bytes()) as usize) % state.prefill_workers.len();
+        let dec_start = state.decode_rr.fetch_add(1, Ordering::Relaxed) % state.decode_workers.len();
+        let now = now_epoch_secs();
+        let pf_cands = candidate_order(state.prefill_workers.len(), pf_start, &state.pf_unhealthy_until, now);
+        let dec_cands = candidate_order(state.decode_workers.len(), dec_start, &state.dec_unhealthy_until, now);
 
         let max_tokens = req.get("max_tokens").and_then(Value::as_u64).unwrap_or(64);
         let temp = req.get("temperature").and_then(Value::as_f64).unwrap_or(0.0);
         let lora = req.get("lora").and_then(Value::as_str).unwrap_or("");
-        let use_shm = req
+        let tr_str = req
             .get("transport")
             .and_then(Value::as_str)
-            .unwrap_or(&state.transport)
-            .eq_ignore_ascii_case("shm");
+            .unwrap_or(&state.transport);
+        let use_layer = tr_str.eq_ignore_ascii_case("layer");
+        let use_shm = !use_layer && tr_str.eq_ignore_ascii_case("shm");
+        let layer_chunk = req.get("layer_chunk").and_then(Value::as_u64).unwrap_or(4);
 
         let t_total = Instant::now();
-        let mut pf_body = json!({});
-        if let Some(m) = req.get("messages") { pf_body["messages"] = m.clone(); }
-        if let Some(p) = req.get("prompt") { pf_body["prompt"] = p.clone(); }
-        if use_shm { pf_body["transport"] = json!("shm"); }
-        let pf_bytes = pf_body.to_string().into_bytes();
+        let mut pf_used = state.prefill_workers[pf_cands[0]].clone();
+        let mut dec_used = state.decode_workers[dec_cands[0]].clone();
 
-        let (dec_resp_bytes, kv_bytes, pf_ms, transport_label) = if use_shm {
-            let Ok((st, _hdrs, rbody)) = pd_http_post(pf_worker, "/v1/pd/prefill?transport=shm", "application/json", &[], &pf_bytes).await else {
-                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "prefill worker unreachable"}})).await;
-                return;
-            };
-            if st != 200 {
-                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": String::from_utf8_lossy(&rbody)}})).await;
-                return;
+        let result: Result<(Vec<u8>, u64, f64, &'static str), String> = if use_layer {
+            let mut chosen_dec: Option<String> = None;
+            for (di, &d_idx) in dec_cands.iter().enumerate() {
+                let cand = &state.decode_workers[d_idx];
+                if pd_http_probe_health(cand).await {
+                    state.dec_unhealthy_until[d_idx].store(0, Ordering::Relaxed);
+                    chosen_dec = Some(cand.clone());
+                    break;
+                } else {
+                    state.dec_unhealthy_until[d_idx].store(now_epoch_secs() + CB_COOLDOWN_SECS, Ordering::Relaxed);
+                    state.dec_failures[d_idx].fetch_add(1, Ordering::Relaxed);
+                    if di + 1 < dec_cands.len() {
+                        state.router_failovers.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
-            let Ok(pj) = serde_json::from_slice::<Value>(&rbody) else {
-                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "invalid prefill JSON"}})).await;
+            let Some(dec_addr) = chosen_dec else {
+                state.active_reqs.fetch_sub(1, Ordering::Relaxed);
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "all decode workers unhealthy"}})).await;
                 return;
             };
-            let shm_name = pj.get("shm_name").and_then(Value::as_str).unwrap_or("").to_string();
-            let first_tok = pj.get("first_tok").and_then(Value::as_i64).unwrap_or(0);
-            let prompt_tokens = pj.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-            let kv_b = pj.get("kv_bytes").and_then(Value::as_u64).unwrap_or(0);
-            let pms = pj.get("prefill_ms").and_then(Value::as_f64).unwrap_or(0.0);
-            state.shm_transfers.fetch_add(1, Ordering::Relaxed);
+            dec_used = dec_addr.clone();
+            let mut pf_body = json!({"transport": "layer", "layer_chunk": layer_chunk, "decode_worker": dec_addr, "slot": 25});
+            if let Some(m) = req.get("messages") { pf_body["messages"] = m.clone(); }
+            if let Some(p) = req.get("prompt") { pf_body["prompt"] = p.clone(); }
+            let pf_bytes = pf_body.to_string().into_bytes();
 
-            let mut dec_req = json!({
-                "shm_name": shm_name,
-                "first_tok": first_tok,
-                "prompt_tokens": prompt_tokens,
-                "max_tokens": max_tokens,
-                "temperature": temp,
-            });
-            if !lora.is_empty() { dec_req["lora"] = json!(lora); }
-            let dbytes = dec_req.to_string().into_bytes();
-            let Ok((dst, _dh, dbody)) = pd_http_post(dec_worker, "/v1/pd/decode", "application/json", &[], &dbytes).await else {
-                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "decode worker unreachable"}})).await;
-                return;
-            };
-            if dst != 200 {
-                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": String::from_utf8_lossy(&dbody)}})).await;
-                return;
+            let mut pj_opt: Option<Value> = None;
+            let mut last_err = "prefill worker unreachable".to_string();
+            for (pi, &p_idx) in pf_cands.iter().enumerate() {
+                let p_addr = &state.prefill_workers[p_idx];
+                match pd_http_post(p_addr, "/v1/pd/prefill?transport=layer", "application/json", &[], &pf_bytes).await {
+                    Ok((200, _, rbody)) => {
+                        if let Ok(pj) = serde_json::from_slice::<Value>(&rbody) {
+                            state.pf_unhealthy_until[p_idx].store(0, Ordering::Relaxed);
+                            pf_used = p_addr.clone();
+                            pj_opt = Some(pj);
+                            break;
+                        }
+                        last_err = "invalid prefill JSON".into();
+                    }
+                    Ok((_, _, rbody)) => { last_err = String::from_utf8_lossy(&rbody).into_owned(); }
+                    Err(e) => { last_err = e; }
+                }
+                state.pf_unhealthy_until[p_idx].store(now_epoch_secs() + CB_COOLDOWN_SECS, Ordering::Relaxed);
+                state.pf_failures[p_idx].fetch_add(1, Ordering::Relaxed);
+                if pi + 1 < pf_cands.len() {
+                    state.router_failovers.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            (dbody, kv_b, pms, "shm")
+            match pj_opt {
+                None => Err(last_err),
+                Some(pj) => {
+                    let first_tok = pj.get("first_tok").and_then(Value::as_i64).unwrap_or(0);
+                    let prompt_tokens = pj.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let kv_b = pj.get("kv_bytes").and_then(Value::as_u64).unwrap_or(0);
+                    let pms = pj.get("prefill_ms").and_then(Value::as_f64).unwrap_or(0.0);
+                    let slot = pj.get("slot").and_then(Value::as_u64).unwrap_or(25);
+                    state.layer_streams.fetch_add(1, Ordering::Relaxed);
+                    state.binary_bytes.fetch_add(kv_b, Ordering::Relaxed);
+                    let mut dec_req = json!({
+                        "layer_ready": true,
+                        "slot": slot,
+                        "first_tok": first_tok,
+                        "prompt_tokens": prompt_tokens,
+                        "max_tokens": max_tokens,
+                        "temperature": temp,
+                    });
+                    if !lora.is_empty() { dec_req["lora"] = json!(lora); }
+                    let dbytes = dec_req.to_string().into_bytes();
+                    match pd_http_post(&dec_addr, "/v1/pd/decode", "application/json", &[], &dbytes).await {
+                        Ok((200, _, dbody)) => Ok((dbody, kv_b, pms, "layer")),
+                        Ok((_, _, dbody)) => Err(String::from_utf8_lossy(&dbody).into_owned()),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        } else if use_shm {
+            let mut pf_body = json!({"transport": "shm"});
+            if let Some(m) = req.get("messages") { pf_body["messages"] = m.clone(); }
+            if let Some(p) = req.get("prompt") { pf_body["prompt"] = p.clone(); }
+            let pf_bytes = pf_body.to_string().into_bytes();
+            let mut pj_opt: Option<Value> = None;
+            let mut last_err = "prefill worker unreachable".to_string();
+            for (pi, &p_idx) in pf_cands.iter().enumerate() {
+                let p_addr = &state.prefill_workers[p_idx];
+                match pd_http_post(p_addr, "/v1/pd/prefill?transport=shm", "application/json", &[], &pf_bytes).await {
+                    Ok((200, _, rbody)) => {
+                        if let Ok(pj) = serde_json::from_slice::<Value>(&rbody) {
+                            state.pf_unhealthy_until[p_idx].store(0, Ordering::Relaxed);
+                            pf_used = p_addr.clone();
+                            pj_opt = Some(pj);
+                            break;
+                        }
+                        last_err = "invalid prefill JSON".into();
+                    }
+                    Ok((_, _, rbody)) => { last_err = String::from_utf8_lossy(&rbody).into_owned(); }
+                    Err(e) => { last_err = e; }
+                }
+                state.pf_unhealthy_until[p_idx].store(now_epoch_secs() + CB_COOLDOWN_SECS, Ordering::Relaxed);
+                state.pf_failures[p_idx].fetch_add(1, Ordering::Relaxed);
+                if pi + 1 < pf_cands.len() {
+                    state.router_failovers.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            match pj_opt {
+                None => Err(last_err),
+                Some(pj) => {
+                    let shm_name = pj.get("shm_name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let first_tok = pj.get("first_tok").and_then(Value::as_i64).unwrap_or(0);
+                    let prompt_tokens = pj.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let kv_b = pj.get("kv_bytes").and_then(Value::as_u64).unwrap_or(0);
+                    let pms = pj.get("prefill_ms").and_then(Value::as_f64).unwrap_or(0.0);
+                    state.shm_transfers.fetch_add(1, Ordering::Relaxed);
+                    let mut dec_req = json!({
+                        "shm_name": shm_name,
+                        "first_tok": first_tok,
+                        "prompt_tokens": prompt_tokens,
+                        "max_tokens": max_tokens,
+                        "temperature": temp,
+                    });
+                    if !lora.is_empty() { dec_req["lora"] = json!(lora); }
+                    let dbytes = dec_req.to_string().into_bytes();
+                    let mut out_res = Err("decode worker unreachable".to_string());
+                    for (di, &d_idx) in dec_cands.iter().enumerate() {
+                        let d_addr = &state.decode_workers[d_idx];
+                        match pd_http_post(d_addr, "/v1/pd/decode", "application/json", &[], &dbytes).await {
+                            Ok((200, _, dbody)) => {
+                                state.dec_unhealthy_until[d_idx].store(0, Ordering::Relaxed);
+                                dec_used = d_addr.clone();
+                                out_res = Ok((dbody, kv_b, pms, "shm"));
+                                break;
+                            }
+                            Ok((_, _, dbody)) => { out_res = Err(String::from_utf8_lossy(&dbody).into_owned()); }
+                            Err(e) => { out_res = Err(e); }
+                        }
+                        state.dec_unhealthy_until[d_idx].store(now_epoch_secs() + CB_COOLDOWN_SECS, Ordering::Relaxed);
+                        state.dec_failures[d_idx].fetch_add(1, Ordering::Relaxed);
+                        if di + 1 < dec_cands.len() {
+                            state.router_failovers.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    out_res
+                }
+            }
         } else {
-            let Ok((st, hdrs, kv_raw)) = pd_http_post(
-                pf_worker,
-                "/v1/pd/prefill?format=binary",
-                "application/json",
-                &[("Accept", "application/octet-stream".into())],
-                &pf_bytes,
-            ).await else {
-                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "prefill worker unreachable"}})).await;
-                return;
-            };
-            if st != 200 {
-                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": String::from_utf8_lossy(&kv_raw)}})).await;
-                return;
+            let mut pf_body = json!({});
+            if let Some(m) = req.get("messages") { pf_body["messages"] = m.clone(); }
+            if let Some(p) = req.get("prompt") { pf_body["prompt"] = p.clone(); }
+            let pf_bytes = pf_body.to_string().into_bytes();
+            let mut pf_ok: Option<(HashMap<String, String>, Vec<u8>)> = None;
+            let mut last_err = "prefill worker unreachable".to_string();
+            for (pi, &p_idx) in pf_cands.iter().enumerate() {
+                let p_addr = &state.prefill_workers[p_idx];
+                match pd_http_post(
+                    p_addr,
+                    "/v1/pd/prefill?format=binary",
+                    "application/json",
+                    &[("Accept", "application/octet-stream".into())],
+                    &pf_bytes,
+                ).await {
+                    Ok((200, hdrs, kv_raw)) if kv_raw.len() >= 48 => {
+                        state.pf_unhealthy_until[p_idx].store(0, Ordering::Relaxed);
+                        pf_used = p_addr.clone();
+                        pf_ok = Some((hdrs, kv_raw));
+                        break;
+                    }
+                    Ok((_, _, rbody)) => { last_err = String::from_utf8_lossy(&rbody).into_owned(); }
+                    Err(e) => { last_err = e; }
+                }
+                state.pf_unhealthy_until[p_idx].store(now_epoch_secs() + CB_COOLDOWN_SECS, Ordering::Relaxed);
+                state.pf_failures[p_idx].fetch_add(1, Ordering::Relaxed);
+                if pi + 1 < pf_cands.len() {
+                    state.router_failovers.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            let first_tok = hdrs.get("x-tenon-pd-first-tok").cloned().unwrap_or_else(|| "0".into());
-            let prompt_tokens = hdrs.get("x-tenon-pd-prompt-tokens").cloned().unwrap_or_else(|| "0".into());
-            let pms = hdrs.get("x-tenon-pd-prefill-ms").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let kv_b = kv_raw.len() as u64;
-            state.binary_bytes.fetch_add(kv_b, Ordering::Relaxed);
+            match pf_ok {
+                None => Err(last_err),
+                Some((hdrs, kv_raw)) => {
+                    let first_tok = hdrs.get("x-tenon-pd-first-tok").cloned().unwrap_or_else(|| "0".into());
+                    let prompt_tokens = hdrs.get("x-tenon-pd-prompt-tokens").cloned().unwrap_or_else(|| "0".into());
+                    let pms = hdrs.get("x-tenon-pd-prefill-ms").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let kv_b = kv_raw.len() as u64;
+                    state.binary_bytes.fetch_add(kv_b, Ordering::Relaxed);
+                    let mut dhdrs = vec![
+                        ("X-Tenon-PD-First-Tok", first_tok),
+                        ("X-Tenon-PD-Prompt-Tokens", prompt_tokens),
+                        ("X-Tenon-PD-Max-Tokens", max_tokens.to_string()),
+                        ("X-Tenon-PD-Temp", format!("{:.4}", temp)),
+                    ];
+                    if !lora.is_empty() {
+                        dhdrs.push(("X-Tenon-PD-Lora", lora.to_string()));
+                    }
+                    let mut out_res = Err("decode worker unreachable".to_string());
+                    for (di, &d_idx) in dec_cands.iter().enumerate() {
+                        let d_addr = &state.decode_workers[d_idx];
+                        match pd_http_post(d_addr, "/v1/pd/decode", "application/octet-stream", &dhdrs, &kv_raw).await {
+                            Ok((200, _, dbody)) => {
+                                state.dec_unhealthy_until[d_idx].store(0, Ordering::Relaxed);
+                                dec_used = d_addr.clone();
+                                out_res = Ok((dbody, kv_b, pms, "binary"));
+                                break;
+                            }
+                            Ok((_, _, dbody)) => { out_res = Err(String::from_utf8_lossy(&dbody).into_owned()); }
+                            Err(e) => { out_res = Err(e); }
+                        }
+                        state.dec_unhealthy_until[d_idx].store(now_epoch_secs() + CB_COOLDOWN_SECS, Ordering::Relaxed);
+                        state.dec_failures[d_idx].fetch_add(1, Ordering::Relaxed);
+                        if di + 1 < dec_cands.len() {
+                            state.router_failovers.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    out_res
+                }
+            }
+        };
 
-            let mut dhdrs = vec![
-                ("X-Tenon-PD-First-Tok", first_tok),
-                ("X-Tenon-PD-Prompt-Tokens", prompt_tokens),
-                ("X-Tenon-PD-Max-Tokens", max_tokens.to_string()),
-                ("X-Tenon-PD-Temp", format!("{:.4}", temp)),
-            ];
-            if !lora.is_empty() {
-                dhdrs.push(("X-Tenon-PD-Lora", lora.to_string()));
-            }
-            let Ok((dst, _dh, dbody)) = pd_http_post(
-                dec_worker,
-                "/v1/pd/decode",
-                "application/octet-stream",
-                &dhdrs,
-                &kv_raw,
-            ).await else {
-                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "decode worker unreachable"}})).await;
-                return;
-            };
-            if dst != 200 {
-                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": String::from_utf8_lossy(&dbody)}})).await;
+        state.active_reqs.fetch_sub(1, Ordering::Relaxed);
+        let (dec_resp_bytes, kv_bytes, pf_ms, transport_label) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": e}})).await;
                 return;
             }
-            (dbody, kv_b, pms, "binary")
         };
 
         let Ok(dj) = serde_json::from_slice::<Value>(&dec_resp_bytes) else {
@@ -6375,7 +7186,7 @@ async fn handle_pd_router_client(mut stream: TcpStream, state: Arc<PdRouterState
             state.tpot_hist.observe(dec_ms / (ctoks.saturating_sub(1).max(1) as f64), &TPOT_BOUNDS_MS);
         }
 
-        let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let created = now_epoch_secs();
         let resp = if is_chat {
             json!({
                 "id": format!("chatcmpl-tenon-pd-{}", seq_no),
@@ -6393,8 +7204,8 @@ async fn handle_pd_router_client(mut stream: TcpStream, state: Arc<PdRouterState
                     "total_tokens": ptoks + ctoks,
                 },
                 "timings": {
-                    "prefill_worker": pf_worker,
-                    "decode_worker": dec_worker,
+                    "prefill_worker": pf_used,
+                    "decode_worker": dec_used,
                     "transport": transport_label,
                     "kv_bytes": kv_bytes,
                     "prefill_ms": pf_ms,
@@ -6419,8 +7230,8 @@ async fn handle_pd_router_client(mut stream: TcpStream, state: Arc<PdRouterState
                     "total_tokens": ptoks + ctoks,
                 },
                 "timings": {
-                    "prefill_worker": pf_worker,
-                    "decode_worker": dec_worker,
+                    "prefill_worker": pf_used,
+                    "decode_worker": dec_used,
                     "transport": transport_label,
                     "kv_bytes": kv_bytes,
                     "prefill_ms": pf_ms,
@@ -6441,6 +7252,7 @@ async fn run_pd_router(
     prefill_workers: Vec<String>,
     decode_workers: Vec<String>,
     transport: String,
+    max_queue: usize,
 ) -> ExitCode {
     if prefill_workers.is_empty() || decode_workers.is_empty() {
         eprintln!("error: --pd-router requires non-empty --prefill-workers and --decode-workers");
@@ -6453,20 +7265,53 @@ async fn run_pd_router(
             return ExitCode::from(1);
         }
     };
+    let n_pf = prefill_workers.len();
+    let n_dec = decode_workers.len();
     let state = Arc::new(PdRouterState {
         prefill_workers: prefill_workers.clone(),
         decode_workers: decode_workers.clone(),
         transport: transport.clone(),
+        max_queue,
+        active_reqs: AtomicUsize::new(0),
         decode_rr: AtomicUsize::new(0),
         total_reqs: AtomicU64::new(0),
         shm_transfers: AtomicU64::new(0),
+        layer_streams: AtomicU64::new(0),
         binary_bytes: AtomicU64::new(0),
+        router_failovers: AtomicU64::new(0),
+        router_backpressure: AtomicU64::new(0),
+        pf_unhealthy_until: (0..n_pf).map(|_| AtomicU64::new(0)).collect(),
+        pf_failures: (0..n_pf).map(|_| AtomicU64::new(0)).collect(),
+        dec_unhealthy_until: (0..n_dec).map(|_| AtomicU64::new(0)).collect(),
+        dec_failures: (0..n_dec).map(|_| AtomicU64::new(0)).collect(),
         ttft_hist: LatencyHist::new(),
         tpot_hist: LatencyHist::new(),
     });
+    // Background HA health-check probe task (every 5s)
+    let st_hc = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            for (i, addr) in st_hc.prefill_workers.iter().enumerate() {
+                if pd_http_probe_health(addr).await {
+                    st_hc.pf_unhealthy_until[i].store(0, Ordering::Relaxed);
+                } else {
+                    st_hc.pf_unhealthy_until[i].store(now_epoch_secs() + CB_COOLDOWN_SECS, Ordering::Relaxed);
+                }
+            }
+            for (i, addr) in st_hc.decode_workers.iter().enumerate() {
+                if pd_http_probe_health(addr).await {
+                    st_hc.dec_unhealthy_until[i].store(0, Ordering::Relaxed);
+                } else {
+                    st_hc.dec_unhealthy_until[i].store(now_epoch_secs() + CB_COOLDOWN_SECS, Ordering::Relaxed);
+                }
+            }
+        }
+    });
     eprintln!(
-        "[tenon llm] Disaggregated PD Router v10 listening on http://{} (transport={}, prefill={:?}, decode={:?})",
-        addr, transport, prefill_workers, decode_workers
+        "[tenon llm] Production HA Disaggregated PD Router v11 listening on http://{} (transport={}, max_queue={}, prefill={:?}, decode={:?})",
+        addr, transport, max_queue, prefill_workers, decode_workers
     );
     loop {
         match listener.accept().await {
@@ -6507,7 +7352,7 @@ fn parse_lora_spec(spec: &str) -> (String, String, f64) {
 
 fn print_llm_usage() {
     println!(
-        r#"tenon llm — Native Out-of-Core Streaming LLM CLI, OpenAI Server & PD Router (v10)
+        r#"tenon llm — Native Out-of-Core Streaming LLM CLI, OpenAI Server & Production HA PD Router (v11)
 
 USAGE:
   tenon llm <model.gguf> [OPTIONS]
@@ -6523,12 +7368,13 @@ OPTIONS:
   --audio-mmproj <path|mel:D> Whisper 80-bin Log-Mel audio encoder GGUF or built-in `mel:<dim>`
   --audio <file.wav>        Local 16-bit PCM WAV audio file for multimodal speech/audio input
   --mrope-grid <T,H,W>      Explicit 2D/3D MRoPE spatial grid for Qwen2.5-VL/video embeddings
-  --lora <name=path[:sc]>   Load zero-copy runtime GGUF LoRA adapter (repeatable; HTTP `"lora":"name"`)
-  --serve <host:port>       Launch OpenAI-compatible v10 Universal CB + Graphs/ICB + PD + /metrics server
-  --pd-router               Run --serve as a Disaggregated PD Gateway routing Prefill -> Decode workers
+  --lora <name=path[:sc]>   Load zero-copy runtime GGUF LoRA adapter (repeatable; dynamic `/v1/lora/{{load,unload,list}}`!)
+  --serve <host:port>       Launch OpenAI-compatible v11 Universal CB + FlashDecoding + Graphs/ICB + PD + HA Server
+  --pd-router               Run --serve as a Production HA PD Gateway (Health Probes + Circuit Breaker + Auto-Failover)
   --prefill-workers <list>  Comma-separated Prefill worker addresses (`127.0.0.1:28091,...`)
   --decode-workers <list>   Comma-separated Decode worker addresses (`127.0.0.1:28092,...`)
-  --pd-transport <binary|shm> PD Router KV transfer transport (`binary` HTTP or `shm` zero-copy; default: binary)
+  --pd-transport <binary|shm|layer> PD Router KV transfer transport (`binary`, `shm`, or `layer` TNKL stream; default: binary)
+  --max-queue <N>           Queue backpressure limit returning HTTP 503 + Retry-After: 1 when exceeded (default: 64)
   --prefill-chunk <N>       Chunked prefill token budget per decode tick in --serve mode (default: 128)
   --plan-only               Inspect GGUF & print Auto VRAM/NUMA/KV/TP/EP plan without loading weights
   --max-vram-gb <F>         Hard VRAM/RAM budget cap in GiB (0 = auto-detect hardware)
@@ -6580,6 +7426,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
     let mut prefill_workers: Vec<String> = Vec::new();
     let mut decode_workers: Vec<String> = Vec::new();
     let mut pd_transport = "binary".to_string();
+    let mut max_queue = 64usize;
     let mut prefill_chunk_size = 128usize;
     let mut plan_only = false;
     let mut max_vram_gb = 0.0f64;
@@ -6626,6 +7473,10 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
                 i += 2;
             }
             "--pd-transport" if i + 1 < args.len() => { pd_transport = args[i + 1].clone(); i += 2; }
+            "--max-queue" if i + 1 < args.len() => {
+                max_queue = args[i + 1].parse::<usize>().unwrap_or(64);
+                i += 2;
+            }
             "--prefill-chunk" if i + 1 < args.len() => {
                 prefill_chunk_size = args[i + 1].parse::<usize>().unwrap_or(128).clamp(16, 4096);
                 i += 2;
@@ -6684,7 +7535,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
 
     if pd_router {
         let addr = serve_addr.unwrap_or_else(|| "127.0.0.1:28095".to_string());
-        return run_pd_router(addr, prefill_workers, decode_workers, pd_transport).await;
+        return run_pd_router(addr, prefill_workers, decode_workers, pd_transport, max_queue).await;
     }
 
     let Some(model_path) = model_path else {
@@ -7031,6 +7882,8 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         let state = Arc::new(ServerState {
             meta: meta.clone(),
             engine_tx,
+            max_queue,
+            lora_adapters: std::sync::RwLock::new(meta.lora_adapters.clone()),
             queued_reqs: AtomicUsize::new(0),
             active_batch: AtomicUsize::new(0),
             cb_batches_run: AtomicU64::new(0),
@@ -7046,12 +7899,16 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
             vision_cache_hits: AtomicU64::new(0),
             vision_cache_entries: AtomicUsize::new(0),
             lora_swaps: AtomicU64::new(0),
+            lora_hot_swaps: AtomicU64::new(0),
             hetero_lora_batches: AtomicU64::new(0),
             mm_kv_cow_hits: AtomicU64::new(0),
             pd_transfers: AtomicU64::new(0),
             pd_shm_transfers: AtomicU64::new(0),
+            pd_layer_streams: AtomicU64::new(0),
             pd_binary_bytes: AtomicU64::new(0),
             pd_shm_seq: AtomicU64::new(0),
+            stream_cancelled: AtomicU64::new(0),
+            backpressure_rejected: AtomicU64::new(0),
             ttft_hist: LatencyHist::new(),
             tpot_hist: LatencyHist::new(),
         });
@@ -7062,8 +7919,8 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
             .expect("spawn continuous batching engine thread");
 
         eprintln!(
-            "[tenon llm] OpenAI-compatible v10 Server listening on http://{} (kv={}, swa={}, sink={}, PagedKV {} blks, UniversalCB={}, Graphs/ICB=true, PD-Binary+SHM=true, MM-KV-COW=true, ChunkedPrefill={}, ZeroMigSpec={:?}, MultiLoRA={:?}, mmproj={}, audio={})",
-            addr, meta.kv_quant_name, meta.sliding_window, meta.attn_sink, pa_blocks, meta.supports_cb, meta.prefill_chunk_size, cfg.spec_mode, meta.lora_adapters, meta.has_mmproj, meta.has_audio
+            "[tenon llm] OpenAI-compatible v11 Server listening on http://{} (kv={}, swa={}, sink={}, PagedKV {} blks, UniversalCB={}, FlashDecode=true, Graphs/ICB=true, PD-Binary+SHM+Layer=true, MaxQueue={}, LoRA-HotSwap=true, SSE-Cancel=true, ChunkedPrefill={}, ZeroMigSpec={:?}, MultiLoRA={:?}, mmproj={}, audio={})",
+            addr, meta.kv_quant_name, meta.sliding_window, meta.attn_sink, pa_blocks, meta.supports_cb, max_queue, meta.prefill_chunk_size, cfg.spec_mode, meta.lora_adapters, meta.has_mmproj, meta.has_audio
         );
         loop {
             match listener.accept().await {

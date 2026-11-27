@@ -94,6 +94,9 @@ extern "C" {
     fn tn_moe_kv_import_slot(handle Int, slot_id Int, src_ptr Ptr[UInt8], src_len Int) Int
     fn tn_moe_kv_export_shm(handle Int, slot_id Int, n_tokens Int, shm_name_ptr Ptr[UInt8]) Int
     fn tn_moe_kv_import_shm(handle Int, slot_id Int, shm_name_ptr Ptr[UInt8], unlink_after Int) Int
+    fn tn_moe_kv_layer_bytes(handle Int, slot_id Int, n_tokens Int, layer_start Int, layer_count Int) Int
+    fn tn_moe_kv_export_layer(handle Int, slot_id Int, n_tokens Int, layer_start Int, layer_count Int, dst_ptr Ptr[UInt8], dst_cap Int) Int
+    fn tn_moe_kv_import_layer(handle Int, slot_id Int, src_ptr Ptr[UInt8], src_len Int) Int
 
     /// Decodes a token ID to a UTF-8 C string from the GGUF's embedded vocabulary.
     fn tn_moe_token_cstr(handle Int, tok_id Int) Ptr[UInt8]

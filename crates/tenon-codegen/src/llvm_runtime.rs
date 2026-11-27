@@ -1481,8 +1481,15 @@ int64_t tenon_net_write(int64_t fd, int64_t bytes_obj) {
     const uint8_t* p = (const uint8_t*)hdr->fields;
     size_t rem = (size_t)hdr->len;
     size_t total = 0;
+#ifdef SO_NOSIGPIPE
+    { int nosig = 1; setsockopt((int)fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig)); }
+#endif
+    int send_flags = 0;
+#ifdef MSG_NOSIGNAL
+    send_flags |= MSG_NOSIGNAL;
+#endif
     while (rem > 0) {
-        ssize_t n = send((int)fd, p + total, rem, 0);
+        ssize_t n = send((int)fd, p + total, rem, send_flags);
         if (n < 0) {
             if (errno == EINTR) continue;
             return total > 0 ? (int64_t)total : -1;

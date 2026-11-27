@@ -140,6 +140,16 @@ pub struct GpuOptConfig {
     pub paged_kv_fp8_q4_swa_longctx: bool,
     /// #46: Prefix-Affinity Disaggregated `PD Router / Gateway` + Real Open-Source Multimodal E2E + Prometheus TTFT/TPOT Histograms.
     pub pd_router_prefix_affinity_telemetry: bool,
+    /// #47: Multi-GPU `TP=2..8` & `2D TPxEP` Persistent Device Decode Graphs (`CUDA Graphs` + NCCL Capture) & Metal Multi-Queue Async ICB Pipeline.
+    pub multi_gpu_graph_and_async_icb: bool,
+    /// #48: Native `sm_89+` FP8 (`e4m3×e4m3`) `mma.sync.m16n8k32` Grouped MoE Mega-Kernel v3 & Apple Metal Register-Direct `half4` AMX Mega-Kernel v3.
+    pub moe_mega_v3_fp8_tc_and_reg_amx: bool,
+    /// #49: Multi-GPU `TP=2..8` GPU-Direct `CUDA IPC` Sharded PD + Layer-Wise Streaming Pipelined PD (`/v1/pd/layer`).
+    pub pd_multigpu_ipc_and_layer_stream: bool,
+    /// #50: Hardware-Native `FlashDecoding` Split-KV Parallel Long-Context Decode (`32K-128K`, 4-Mode GQA + SWA/Sink + Latent MLA).
+    pub flash_decoding_split_kv_lse: bool,
+    /// #51: Production HA `PD Router` (Health Checks / Circuit Breaker / Failover / Backpressure) + SSE Stream Cancel + Dynamic `/v1/lora/load` Hot-Swap.
+    pub production_ha_cancel_and_lora_hotswap: bool,
 
     /// Optional SPMD device count (`1` = single device, `>1` = auto-sharded multi-device SPMD).
     pub spmd_devices: usize,
@@ -208,6 +218,11 @@ impl GpuOptConfig {
             pd_zerocopy_binary_shm_ipc: false,
             paged_kv_fp8_q4_swa_longctx: false,
             pd_router_prefix_affinity_telemetry: false,
+            multi_gpu_graph_and_async_icb: false,
+            moe_mega_v3_fp8_tc_and_reg_amx: false,
+            pd_multigpu_ipc_and_layer_stream: false,
+            flash_decoding_split_kv_lse: false,
+            production_ha_cancel_and_lora_hotswap: false,
             spmd_devices: 1,
             force_tile: None,
         }
@@ -293,6 +308,11 @@ impl GpuOptConfig {
         c.pd_zerocopy_binary_shm_ipc = true;
         c.paged_kv_fp8_q4_swa_longctx = true;
         c.pd_router_prefix_affinity_telemetry = true;
+        c.multi_gpu_graph_and_async_icb = true;
+        c.moe_mega_v3_fp8_tc_and_reg_amx = true;
+        c.pd_multigpu_ipc_and_layer_stream = true;
+        c.flash_decoding_split_kv_lse = true;
+        c.production_ha_cancel_and_lora_hotswap = true;
         c
     }
 
@@ -411,6 +431,11 @@ impl GpuOptConfig {
                         "pd_zerocopy_binary_shm_ipc" | "pd_zc" | "pd_shm" => cfg.pd_zerocopy_binary_shm_ipc = enable,
                         "paged_kv_fp8_q4_swa_longctx" | "kv_fp8_q4_swa" | "swa" => cfg.paged_kv_fp8_q4_swa_longctx = enable,
                         "pd_router_prefix_affinity_telemetry" | "pd_router" => cfg.pd_router_prefix_affinity_telemetry = enable,
+                        "multi_gpu_graph_and_async_icb" | "tp_graph" | "async_icb" => cfg.multi_gpu_graph_and_async_icb = enable,
+                        "moe_mega_v3_fp8_tc_and_reg_amx" | "moe_mega_v3" => cfg.moe_mega_v3_fp8_tc_and_reg_amx = enable,
+                        "pd_multigpu_ipc_and_layer_stream" | "pd_tp_ipc" | "pd_layer_stream" => cfg.pd_multigpu_ipc_and_layer_stream = enable,
+                        "flash_decoding_split_kv_lse" | "flash_decode" | "split_kv" => cfg.flash_decoding_split_kv_lse = enable,
+                        "production_ha_cancel_and_lora_hotswap" | "router_ha" | "lora_hotswap" => cfg.production_ha_cancel_and_lora_hotswap = enable,
                         _ => {}
                     }
                 }

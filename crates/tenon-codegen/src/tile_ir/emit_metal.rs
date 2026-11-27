@@ -118,7 +118,7 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
     if cg.hetero_plan.active {
         let hp = &cg.hetero_plan;
         plan.push_str(&format!(
-            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|tp={}|ep={}|nccl={}|marlin={}|cb_slots={}|cow_kv={}|mla_latent={}|paged_blk={}|radix_prefix={}|spec_k={}|tree_w={}|mtp={}|mmproj={}|sb_shx={}|hybrid_2d={}|chunk_pf={}|lora_r={}|anyres={}|mrope={}|fp8_mxfp4={}|fp8_tc={}|q4k_marlin={}|paged_univ={}|moe_grp={}|audio_mel={}|vis_cache={}|moe_mega={}|fp8_k32={}|hetero_lora={}|mm_kv_cow={}|pd_kv={}|moe_mega_v2={}|dev_graph={}|pd_zc={}|kv_mode={}|swa={}|pd_router={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
+            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|tp={}|ep={}|nccl={}|marlin={}|cb_slots={}|cow_kv={}|mla_latent={}|paged_blk={}|radix_prefix={}|spec_k={}|tree_w={}|mtp={}|mmproj={}|sb_shx={}|hybrid_2d={}|chunk_pf={}|lora_r={}|anyres={}|mrope={}|fp8_mxfp4={}|fp8_tc={}|q4k_marlin={}|paged_univ={}|moe_grp={}|audio_mel={}|vis_cache={}|moe_mega={}|fp8_k32={}|hetero_lora={}|mm_kv_cow={}|pd_kv={}|moe_mega_v2={}|dev_graph={}|pd_zc={}|kv_mode={}|swa={}|pd_router={}|tp_graph={}|moe_mega_v3={}|pd_layer={}|fd_splits={}|ha_hotswap={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
             hp.dispatch_mode.tag(),
             hp.vram_cap_bytes,
             hp.core_vram_bytes,
@@ -169,11 +169,16 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             hp.kv_quant_mode,
             hp.swa_window,
             if hp.pd_router_affinity { 1 } else { 0 },
+            if hp.multi_gpu_graph_async_icb { 1 } else { 0 },
+            if hp.moe_mega_v3_fp8_amx { 1 } else { 0 },
+            if hp.pd_multigpu_ipc_layer_stream { 1 } else { 0 },
+            hp.flash_decode_splits,
+            if hp.router_ha_cancel_hotswap { 1 } else { 0 },
             hp.projected_decode_tok_s,
             hp.projected_prefill_tok_s,
         ));
         msl.push_str(&format!(
-            "// [Stage 6 Heterogeneous Streaming] mode={} | tp={} ep={} hybrid_2d={} cb_slots={} cow_kv={} chunk_pf={} mla_latent={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={} sb_shx={} spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} lora_r={} fp8_mxfp4={} fp8_tc={} q4k_marlin={} paged_univ={} moe_grp={} audio_mel={} vis_cache={} moe_mega={} fp8_k32={} hetero_lora={} mm_kv_cow={} pd_kv={} moe_mega_v2={} dev_graph={} pd_zc={} kv_mode={} swa={} pd_router={}\n",
+            "// [Stage 6 Heterogeneous Streaming] mode={} | tp={} ep={} hybrid_2d={} cb_slots={} cow_kv={} chunk_pf={} mla_latent={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={} sb_shx={} spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} lora_r={} fp8_mxfp4={} fp8_tc={} q4k_marlin={} paged_univ={} moe_grp={} audio_mel={} vis_cache={} moe_mega={} fp8_k32={} hetero_lora={} mm_kv_cow={} pd_kv={} moe_mega_v2={} dev_graph={} pd_zc={} kv_mode={} swa={} pd_router={} tp_graph={} moe_mega_v3={} pd_layer={} fd_splits={} ha_hotswap={}\n",
             hp.dispatch_mode.tag(),
             hp.tp_devices,
             hp.ep_devices,
@@ -215,6 +220,11 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             hp.kv_quant_mode,
             hp.swa_window,
             hp.pd_router_affinity,
+            hp.multi_gpu_graph_async_icb,
+            hp.moe_mega_v3_fp8_amx,
+            hp.pd_multigpu_ipc_layer_stream,
+            hp.flash_decode_splits,
+            hp.router_ha_cancel_hotswap,
         ));
     }
 

@@ -100,6 +100,11 @@ pub struct HeteroStreamPlan {
     pub kv_quant_mode: u8, // 0=FP16, 1=Q8_0, 2=FP8_E4M3, 3=Q4_0
     pub swa_window: usize,
     pub pd_router_affinity: bool,
+    pub multi_gpu_graph_async_icb: bool,
+    pub moe_mega_v3_fp8_amx: bool,
+    pub pd_multigpu_ipc_layer_stream: bool,
+    pub flash_decode_splits: usize,
+    pub router_ha_cancel_hotswap: bool,
     pub dispatch_mode: HeteroDispatchMode,
     pub numa_repack_weights: Vec<(String, LayoutTag)>,
     pub projected_decode_tok_s: f64,
@@ -167,6 +172,11 @@ impl Default for HeteroStreamPlan {
             kv_quant_mode: 0,
             swa_window: 0,
             pd_router_affinity: false,
+            multi_gpu_graph_async_icb: false,
+            moe_mega_v3_fp8_amx: false,
+            pd_multigpu_ipc_layer_stream: false,
+            flash_decode_splits: 0,
+            router_ha_cancel_hotswap: false,
             dispatch_mode: HeteroDispatchMode::ResidentGpu,
             numa_repack_weights: Vec::new(),
             projected_decode_tok_s: 0.0,
@@ -624,6 +634,15 @@ pub fn plan_hetero_stream(
         },
         swa_window: if cfg.paged_kv_fp8_q4_swa_longctx { swa_window } else { 0 },
         pd_router_affinity: cfg.pd_router_prefix_affinity_telemetry && (pd_router_req || cfg.disaggregated_pd_kv_transfer),
+        multi_gpu_graph_async_icb: cfg.multi_gpu_graph_and_async_icb && cfg.device_graph_capture,
+        moe_mega_v3_fp8_amx: cfg.moe_mega_v3_fp8_tc_and_reg_amx && n_experts > 0,
+        pd_multigpu_ipc_layer_stream: cfg.pd_multigpu_ipc_and_layer_stream && cfg.pd_zerocopy_binary_shm_ipc,
+        flash_decode_splits: if cfg.flash_decoding_split_kv_lse && max_ctx >= 512 {
+            if max_ctx >= 32768 { 16 } else if max_ctx >= 4096 { 8 } else { 4 }
+        } else {
+            0
+        },
+        router_ha_cancel_hotswap: cfg.production_ha_cancel_and_lora_hotswap,
         dispatch_mode,
         numa_repack_weights,
         projected_decode_tok_s,

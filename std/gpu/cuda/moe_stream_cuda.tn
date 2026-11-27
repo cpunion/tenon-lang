@@ -72,6 +72,9 @@ extern "C" {
     fn tn_cumoe_kv_export_ipc(handle Int, slot_id Int, seq_len Int, out_ptr Ptr[UInt8], cap_bytes Int) Int
     fn tn_cumoe_kv_import_ipc(handle Int, slot_id Int, in_ptr Ptr[UInt8], n_bytes Int) Int
     fn tn_cumoe_kv_release_ipc(handle Int) Int
+    fn tn_cumoe_kv_layer_bytes(handle Int, slot_id Int, seq_len Int, layer_start Int, layer_count Int) Int
+    fn tn_cumoe_kv_export_layer(handle Int, slot_id Int, seq_len Int, layer_start Int, layer_count Int, out_ptr Ptr[UInt8], cap_bytes Int) Int
+    fn tn_cumoe_kv_import_layer(handle Int, slot_id Int, in_ptr Ptr[UInt8], n_bytes Int) Int
     fn tn_cumoe_audio_load(path_cstr Ptr[UInt8]) Int
     fn tn_cumoe_audio_info(audio_h Int, field_id Int) Int
     fn tn_cumoe_audio_encode_pcm16(audio_h Int, pcm16_ptr Ptr[UInt8], n_samples Int, sample_rate Int, out_embd_ptr Ptr[UInt8], max_vecs Int) Int

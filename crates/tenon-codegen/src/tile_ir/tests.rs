@@ -666,3 +666,34 @@ fn dsv2_v10_full_stack(x Matrix[16, 2048, Float16], w_q Matrix[2048, 2048, FP8],
     let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
     assert!(plan.contains("moe_mega_v2=1|dev_graph=1|pd_zc=1|kv_mode=3|swa=4096|pd_router=1"));
 }
+
+#[test]
+fn test_stage6_v11_tp_graph_mega_v3_pd_layer_flash_decode_ha_hotswap() {
+    let def = GpuOptConfig::default();
+    assert!(
+        def.multi_gpu_graph_and_async_icb
+            && def.moe_mega_v3_fp8_tc_and_reg_amx
+            && def.pd_multigpu_ipc_and_layer_stream
+            && def.flash_decoding_split_kv_lse
+            && def.production_ha_cancel_and_lora_hotswap
+    );
+    let src = r#"
+@gpu_graph("stream:vram=48G,ram=128G,layers=27,experts=64,topk=6,ctx=131072,kv=fp8,swa=4096,tp=2,ep=2,mla=576,cb=16,lora=16,mmproj=64,audio=128,pd_router=1")
+fn dsv2_v11_full_stack(x Matrix[16, 2048, Float16], w_q Matrix[2048, 2048, FP8], w_down Matrix[2048, 1408, Q6_K]) Matrix[16, 1408, Float16] {
+    let h = tg_matmul(x, w_q)
+    tg_matmul(h, w_down)
+}
+"#;
+    let prog = tenon_syntax::parse(src).expect("parse v11 graph");
+    let on = compile_universal_graphs(&prog, GpuOptConfig::default());
+    assert_eq!(on.len(), 1);
+    let hp = &on[0].hetero_plan;
+    assert!(hp.multi_gpu_graph_async_icb && hp.moe_mega_v3_fp8_amx && hp.pd_multigpu_ipc_layer_stream && hp.router_ha_cancel_hotswap);
+    assert_eq!(hp.flash_decode_splits, 16);
+    let cuda = emit_cuda_tpu::emit_universal_cuda(&on[0]);
+    assert!(cuda.contains("tp_graph=true") && cuda.contains("moe_mega_v3=true") && cuda.contains("pd_layer=true") && cuda.contains("fd_splits=16") && cuda.contains("ha_hotswap=true"));
+    let tpu = emit_cuda_tpu::emit_universal_stablehlo(&on[0]);
+    assert!(tpu.contains("tp_graph=true") && tpu.contains("moe_mega_v3=true") && tpu.contains("pd_layer=true") && tpu.contains("fd_splits=16") && tpu.contains("ha_hotswap=true"));
+    let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
+    assert!(plan.contains("tp_graph=1|moe_mega_v3=1|pd_layer=1|fd_splits=16|ha_hotswap=1"));
+}
