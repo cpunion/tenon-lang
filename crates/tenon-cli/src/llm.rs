@@ -4413,6 +4413,23 @@ fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: 
                     if !handle_engine_cmd(&mut m, cmd, &mut pending_gen, &mut active, &state) {
                         continue;
                     }
+                    // Tenon v12: Micro-coalesce concurrent burst arrivals (<= 1.5ms window on idle->active)
+                    // so parallel HTTP clients hit 100% shared-prefix COW fork + 1 single ICB/CUDA Graph capture!
+                    if !pending_gen.is_empty() && m.meta.supports_cb {
+                        let deadline = Instant::now() + std::time::Duration::from_micros(1500);
+                        while pending_gen.len() < max_cb_batch {
+                            let rem = deadline.saturating_duration_since(Instant::now());
+                            if rem.is_zero() {
+                                break;
+                            }
+                            match rx.recv_timeout(rem) {
+                                Ok(cmd2) => {
+                                    handle_engine_cmd(&mut m, cmd2, &mut pending_gen, &mut active, &state);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
                 }
                 Err(_) => break,
             }
@@ -4632,6 +4649,30 @@ fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: 
             }
             let actual_lcp = if allow_cow { lcp } else { 0 };
             let remaining = ids.len().saturating_sub(actual_lcp);
+            // Tenon v12: Burst Shared-Prefix COW Deduplication!
+            // When a burst of >=2 requests arrives simultaneously while the prefix cache is cold (actual_lcp == 0),
+            // immediately prefill request #1 & register its active prefix in `cb_radix` BEFORE admitting requests #2..N
+            // so all remaining requests in the same tick hit ZERO-COPY `paged_seq_fork` instead of redundantly prefilling!
+            if !pending_gen.is_empty() && remaining > 0 && remaining <= chunk_sz && lora_id == 0 && actual_lcp == 0 {
+                let pf = PrefillingCbSeq {
+                    slot: dst_slot,
+                    cfg: req.cfg,
+                    lora_id,
+                    ids,
+                    actual_lcp,
+                    cursor: actual_lcp,
+                    is_chunked: false,
+                    t_pf: Instant::now(),
+                    tx: req.tx,
+                };
+                let (_, swapped) = m.apply_lora(pf.cfg.lora.as_deref());
+                if swapped {
+                    state.lora_swaps.fetch_add(1, Ordering::Relaxed);
+                }
+                let argmax = m.api.paged_prefill(m.handle, pf.slot, &pf.ids[pf.cursor..], pf.cursor as i64);
+                finalize_prefilled_cb(&mut m, pf, argmax, &mut active, &state);
+                continue;
+            }
             prefill_queue.push(PrefillingCbSeq {
                 slot: dst_slot,
                 cfg: req.cfg,
@@ -4647,6 +4688,62 @@ fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: 
 
         if spec_active.is_some() {
             continue;
+        }
+
+        // Tenon v12: Parallel Batched Suffix Ingestion via `step_batch`!
+        // When >=2 COW-forked requests in `prefill_queue` share the same LoRA and have short unique suffixes (<= 16 tok),
+        // advance ALL of them in parallel in 1 batched GPU step per suffix token instead of N serial `paged_prefill` calls!
+        while prefill_queue.len() >= 2 {
+            let lora0 = prefill_queue[0].lora_id;
+            let all_short_same_lora = prefill_queue.iter().all(|pf| {
+                pf.lora_id == lora0
+                    && pf.ids.len().saturating_sub(pf.cursor) <= 16
+                    && pf.cfg.temp <= 1e-5
+                    && pf.cfg.repeat_penalty <= 1.0001
+                    && pf.cfg.json_schema.is_none()
+                    && pf.cfg.gbnf_grammar.is_none()
+                    && !pf.cfg.json_constrained
+            });
+            if !all_short_same_lora {
+                break;
+            }
+            let (_, swapped) = m.apply_lora(prefill_queue[0].cfg.lora.as_deref());
+            if swapped {
+                state.lora_swaps.fetch_add(1, Ordering::Relaxed);
+            }
+            let nb = prefill_queue.len().min(max_cb_batch);
+            let mut toks = Vec::with_capacity(nb);
+            let mut poss = Vec::with_capacity(nb);
+            let mut slts = Vec::with_capacity(nb);
+            let mut outs = vec![0i64; nb];
+            for pf in prefill_queue.iter().take(nb) {
+                if pf.cursor < pf.ids.len() {
+                    toks.push(pf.ids[pf.cursor]);
+                    poss.push(pf.cursor as i64);
+                    slts.push(pf.slot as i64);
+                } else {
+                    toks.push(*pf.ids.last().unwrap_or(&m.bos_id));
+                    poss.push(pf.ids.len().saturating_sub(1) as i64);
+                    slts.push(pf.slot as i64);
+                }
+            }
+            m.api.step_batch(m.handle, &toks, &poss, &slts, &mut outs);
+            let mut remaining_pf = Vec::with_capacity(prefill_queue.len());
+            for (idx, mut pf) in prefill_queue.into_iter().enumerate() {
+                if idx < nb {
+                    if pf.cursor < pf.ids.len() {
+                        pf.cursor += 1;
+                    }
+                    if pf.cursor >= pf.ids.len() {
+                        finalize_prefilled_cb(&mut m, pf, outs[idx], &mut active, &state);
+                    } else {
+                        remaining_pf.push(pf);
+                    }
+                } else {
+                    remaining_pf.push(pf);
+                }
+            }
+            prefill_queue = remaining_pf;
         }
 
         // Chunked Prefill Interleaving: advance AT MOST `chunk_sz` tokens per tick when decoders are active

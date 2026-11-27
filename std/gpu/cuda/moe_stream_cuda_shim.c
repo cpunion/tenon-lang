@@ -45,7 +45,9 @@
 #define CM_MAX_TOPK     16
 #define CM_MAX_SEQ      131072
 #define CM_DEFAULT_SEQ  2048
-#define CM_PREFILL_MAX_B 64
+#define CM_PREFILL_MAX_B 512
+#define CM_FD_MAX_SPLITS 64
+#define CM_FD_MAX_B      32
 #define CM_STAGE_SLOTS  16
 #define CM_IO_WORKERS   8
 #define CM_MAX_CPU_THR  64
@@ -96,14 +98,33 @@ typedef uint64_t CUdeviceptr;
 
 typedef int nvrtcResult;
 typedef void* nvrtcProgram;
+typedef int cublasStatus_t;
+typedef void* cublasHandle_t;
 
 #define CUDA_SUCCESS 0
 #define NVRTC_SUCCESS 0
+#define CUBLAS_STATUS_SUCCESS 0
+#define CUBLAS_OP_N 0
+#define CUBLAS_OP_T 1
+#define CUDA_R_32F 0
+#define CUDA_R_16F 2
+#define CUBLAS_COMPUTE_32F 68
+#define CUBLAS_GEMM_DEFAULT_TENSOR_OP 99
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR 75
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR 76
 #define CU_STREAM_NON_BLOCKING 1
 #define CU_EVENT_DISABLE_TIMING 2
 #define CU_MEMHOSTALLOC_PORTABLE 1
+
+typedef cublasStatus_t (*fn_cublasCreate_v2)(cublasHandle_t*);
+typedef cublasStatus_t (*fn_cublasDestroy_v2)(cublasHandle_t);
+typedef cublasStatus_t (*fn_cublasSetStream_v2)(cublasHandle_t, CUstream);
+typedef cublasStatus_t (*fn_cublasGemmEx)(
+    cublasHandle_t, int, int, int, int, int,
+    const void*, const void*, int, int,
+    const void*, int, int,
+    const void*, void*, int, int,
+    int, int);
 
 typedef CUresult (*fn_cuInit)(unsigned int);
 typedef CUresult (*fn_cuDeviceGetCount)(int*);
@@ -211,8 +232,17 @@ typedef struct {
     CUfunction k_moe_mega_gu_fp8_tc, k_moe_mega_down_fp8_tc;
     CUfunction k_rope_kv_fp8_paged, k_flash_dec_fp8_paged, k_rope_kv_q4_paged, k_flash_dec_q4_paged;
     CUfunction k_flash_dec_split_paged, k_flash_mla_split_paged, k_flash_dec_reduce_paged;
+    CUfunction k_rmsnorm_strided, k_f32_to_f16;
+    CUfunction k_deq_q4_0_f16, k_deq_q4_1_f16, k_deq_q8_0_f16, k_deq_q4k_f16, k_deq_q6k_f16;
+    CUfunction k_flash_prefill_paged_fp16;
+    CUfunction k_quant_q8_1_b, k_gemv_q6k_dp4a, k_gemm_q4_dp4a_sb, k_gemm_q4_1_dp4a_sb, k_gemm_q6k_dp4a_sb;
+    CUfunction k_gemm_q4_mmq, k_gemm_q4_1_mmq;
     CUfunction k_argmax;
     CUdeviceptr d_xq8;
+    size_t xq8_cap;
+    cublasHandle_t cublas;
+    CUdeviceptr d_deq_f16, d_px_f16;
+    size_t deq_f16_cap, px_f16_cap;
 } CmDevCtx;
 
 typedef struct {
@@ -220,7 +250,13 @@ typedef struct {
     void* libcuda;
     void* libnvrtc;
     void* libnccl;
+    void* libcublas;
     int nccl_avail;
+    int cublas_avail;
+    fn_cublasCreate_v2 cublasCreate;
+    fn_cublasDestroy_v2 cublasDestroy;
+    fn_cublasSetStream_v2 cublasSetStream;
+    fn_cublasGemmEx cublasGemmEx;
     fn_ncclCommInitAll ncclCommInitAll;
     fn_ncclCommDestroy ncclCommDestroy;
     fn_ncclAllReduce ncclAllReduce;
@@ -322,9 +358,16 @@ typedef struct {
     CUfunction k_moe_mega_gu_fp8_tc, k_moe_mega_down_fp8_tc;
     CUfunction k_rope_kv_fp8_paged, k_flash_dec_fp8_paged, k_rope_kv_q4_paged, k_flash_dec_q4_paged;
     CUfunction k_flash_dec_split_paged, k_flash_mla_split_paged, k_flash_dec_reduce_paged;
+    CUfunction k_rmsnorm_strided, k_f32_to_f16;
+    CUfunction k_deq_q4_0_f16, k_deq_q4_1_f16, k_deq_q8_0_f16, k_deq_q4k_f16, k_deq_q6k_f16;
+    CUfunction k_flash_prefill_paged_fp16;
+    CUfunction k_quant_q8_1_b, k_gemv_q6k_dp4a, k_gemm_q4_dp4a_sb, k_gemm_q4_1_dp4a_sb, k_gemm_q6k_dp4a_sb;
+    CUfunction k_gemm_q4_mmq, k_gemm_q4_1_mmq;
     CUfunction k_argmax;
     CUdeviceptr d_xq8;
+    size_t xq8_cap;
     int fast_dp4a;
+    int in_graph_capture;
 } CmCuda;
 
 static CmCuda g_cu = {0};
@@ -861,6 +904,144 @@ static const char* kCuMoeSrc =
 "    float inv = rsqrtf(tot / (float)dim + eps);\n"
 "    uint32_t wbase = shared_w ? 0u : base;\n"
 "    for (uint32_t i = lid; i < dim; i += 256u) out[base + i] = x[base + i] * inv * w[wbase + i];\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_rmsnorm_strided(float* x, const float* w, uint32_t dim, uint32_t stride, uint32_t n_groups, float eps) {\n"
+"    uint32_t g = blockIdx.x; if (g >= n_groups) return;\n"
+"    __shared__ float s_sq[8];\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint64_t base = (uint64_t)g * stride;\n"
+"    float lsq = 0.0f;\n"
+"    for (uint32_t i = lid; i < dim; i += 256u) { float v = x[base + i]; lsq = fmaf(v, v, lsq); }\n"
+"    lsq = warp_sum(lsq);\n"
+"    if (lane == 0u) s_sq[wid] = lsq;\n"
+"    __syncthreads();\n"
+"    float tot = 0.0f;\n"
+"    for (uint32_t s = 0; s < 8u; s++) tot += s_sq[s];\n"
+"    float inv = rsqrtf(tot / (float)dim + eps);\n"
+"    for (uint32_t i = lid; i < dim; i += 256u) x[base + i] = x[base + i] * inv * w[i];\n"
+"}\n"
+"\n"
+"// Tenon v12: High-Bandwidth FP16 Activation Cast & Weight Dequant Kernels for cuBLAS Tensor Core Prefill!\n"
+"extern \"C\" __global__ void cm_f32_to_f16(const float* __restrict__ src, half* __restrict__ dst, uint32_t n) {\n"
+"    uint32_t i2 = (blockIdx.x * blockDim.x + threadIdx.x) << 1;\n"
+"    if (i2 + 1u < n) {\n"
+"        float2 v = *(const float2*)(src + i2);\n"
+"        *(half2*)(dst + i2) = __float22half2_rn(v);\n"
+"    } else if (i2 < n) {\n"
+"        dst[i2] = __float2half(src[i2]);\n"
+"    }\n"
+"}\n"
+"\n"
+"// Tenon v12 Round 2: Vectorized 64-bit half2/uint2 Coalesced Dequant-to-FP16 Kernels (saturates 960 GB/s GDDR6!)\n"
+"extern \"C\" __global__ void cm_deq_q4_0_f16(const uint8_t* __restrict__ w, half* __restrict__ dst, uint32_t row0, uint32_t n_rows, uint32_t in_dim) {\n"
+"    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    uint32_t blk_idx = tid >> 2, g = tid & 3u;\n"
+"    if (blk_idx >= n_rows * nb) return;\n"
+"    const uint8_t* blk = w + ((uint64_t)row0 * nb + blk_idx) * 18ull;\n"
+"    float d = load_f16_le(blk);\n"
+"    const uint16_t* p16 = (const uint16_t*)(blk + 2u + g * 4u);\n"
+"    uint32_t q4 = (uint32_t)__ldg(&p16[0]) | ((uint32_t)__ldg(&p16[1]) << 16);\n"
+"    uint32_t b0 = q4 & 0xFFu, b1 = (q4 >> 8) & 0xFFu, b2 = (q4 >> 16) & 0xFFu, b3 = q4 >> 24;\n"
+"    half2 lo0 = __floats2half2_rn(((float)(b0 & 0xFu) - 8.0f) * d, ((float)(b1 & 0xFu) - 8.0f) * d);\n"
+"    half2 lo1 = __floats2half2_rn(((float)(b2 & 0xFu) - 8.0f) * d, ((float)(b3 & 0xFu) - 8.0f) * d);\n"
+"    half2 hi0 = __floats2half2_rn(((float)(b0 >> 4)   - 8.0f) * d, ((float)(b1 >> 4)   - 8.0f) * d);\n"
+"    half2 hi1 = __floats2half2_rn(((float)(b2 >> 4)   - 8.0f) * d, ((float)(b3 >> 4)   - 8.0f) * d);\n"
+"    uint64_t ob = (uint64_t)blk_idx * 32ull + g * 4u;\n"
+"    *(uint2*)(dst + ob)       = make_uint2(*(uint32_t*)&lo0, *(uint32_t*)&lo1);\n"
+"    *(uint2*)(dst + ob + 16u) = make_uint2(*(uint32_t*)&hi0, *(uint32_t*)&hi1);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_deq_q4_1_f16(const uint8_t* __restrict__ w, half* __restrict__ dst, uint32_t row0, uint32_t n_rows, uint32_t in_dim) {\n"
+"    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    uint32_t blk_idx = tid >> 2, g = tid & 3u;\n"
+"    if (blk_idx >= n_rows * nb) return;\n"
+"    const uint8_t* blk = w + ((uint64_t)row0 * nb + blk_idx) * 20ull;\n"
+"    float d = load_f16_le(blk), m = load_f16_le(blk + 2u);\n"
+"    uint32_t q4 = __ldg((const uint32_t*)(blk + 4u + g * 4u));\n"
+"    uint32_t b0 = q4 & 0xFFu, b1 = (q4 >> 8) & 0xFFu, b2 = (q4 >> 16) & 0xFFu, b3 = q4 >> 24;\n"
+"    half2 lo0 = __floats2half2_rn(fmaf((float)(b0 & 0xFu), d, m), fmaf((float)(b1 & 0xFu), d, m));\n"
+"    half2 lo1 = __floats2half2_rn(fmaf((float)(b2 & 0xFu), d, m), fmaf((float)(b3 & 0xFu), d, m));\n"
+"    half2 hi0 = __floats2half2_rn(fmaf((float)(b0 >> 4),   d, m), fmaf((float)(b1 >> 4),   d, m));\n"
+"    half2 hi1 = __floats2half2_rn(fmaf((float)(b2 >> 4),   d, m), fmaf((float)(b3 >> 4),   d, m));\n"
+"    uint64_t ob = (uint64_t)blk_idx * 32ull + g * 4u;\n"
+"    *(uint2*)(dst + ob)       = make_uint2(*(uint32_t*)&lo0, *(uint32_t*)&lo1);\n"
+"    *(uint2*)(dst + ob + 16u) = make_uint2(*(uint32_t*)&hi0, *(uint32_t*)&hi1);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_deq_q8_0_f16(const uint8_t* __restrict__ w, half* __restrict__ dst, uint32_t row0, uint32_t n_rows, uint32_t in_dim) {\n"
+"    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    uint32_t blk_idx = tid >> 3, g = tid & 7u;\n"
+"    if (blk_idx >= n_rows * nb) return;\n"
+"    const uint8_t* blk = w + ((uint64_t)row0 * nb + blk_idx) * 34ull;\n"
+"    float d = load_f16_le(blk);\n"
+"    const uint16_t* p16 = (const uint16_t*)(blk + 2u + g * 4u);\n"
+"    uint32_t q4 = (uint32_t)__ldg(&p16[0]) | ((uint32_t)__ldg(&p16[1]) << 16);\n"
+"    half2 h0 = __floats2half2_rn((float)(int8_t)(q4 & 0xFFu) * d, (float)(int8_t)((q4 >> 8) & 0xFFu) * d);\n"
+"    half2 h1 = __floats2half2_rn((float)(int8_t)((q4 >> 16) & 0xFFu) * d, (float)(int8_t)(q4 >> 24) * d);\n"
+"    *(uint2*)(dst + (uint64_t)blk_idx * 32ull + g * 4u) = make_uint2(*(uint32_t*)&h0, *(uint32_t*)&h1);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_deq_q4k_f16(const uint8_t* __restrict__ w, half* __restrict__ dst, uint32_t row0, uint32_t n_rows, uint32_t in_dim) {\n"
+"    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    uint32_t nb = in_dim >> 8;\n"
+"    uint32_t sb_idx = tid >> 5, l = tid & 31u;\n"
+"    if (sb_idx >= n_rows * nb) return;\n"
+"    const uint8_t* blk = w + ((uint64_t)row0 * nb + sb_idx) * 144ull;\n"
+"    float d = load_f16_le(blk), dmin = load_f16_le(blk + 2u);\n"
+"    const uint8_t* sc = blk + 4u; const uint8_t* qs = blk + 16u;\n"
+"    uint32_t j64 = l >> 3, g = l & 7u, k = g * 4u, is = j64 * 2u;\n"
+"    uint8_t sc0, m0, sc1, m1;\n"
+"    if (is < 4u) {\n"
+"        sc0 = sc[is] & 63u; m0 = sc[is + 4u] & 63u;\n"
+"        sc1 = sc[is + 1u] & 63u; m1 = sc[is + 5u] & 63u;\n"
+"    } else {\n"
+"        sc0 = (sc[is + 4u] & 0xFu) | ((sc[is - 4u] >> 6) << 4); m0 = (sc[is + 4u] >> 4) | ((sc[is] >> 6) << 4);\n"
+"        sc1 = (sc[is + 5u] & 0xFu) | ((sc[is - 3u] >> 6) << 4); m1 = (sc[is + 5u] >> 4) | ((sc[is + 1u] >> 6) << 4);\n"
+"    }\n"
+"    float d0 = d * (float)sc0, mn0 = -dmin * (float)m0, d1 = d * (float)sc1, mn1 = -dmin * (float)m1;\n"
+"    uint32_t q4 = __ldg((const uint32_t*)(qs + j64 * 32u + k));\n"
+"    uint32_t b0 = q4 & 0xFFu, b1 = (q4 >> 8) & 0xFFu, b2 = (q4 >> 16) & 0xFFu, b3 = q4 >> 24;\n"
+"    half2 lo0 = __floats2half2_rn(fmaf(d0, (float)(b0 & 0xFu), mn0), fmaf(d0, (float)(b1 & 0xFu), mn0));\n"
+"    half2 lo1 = __floats2half2_rn(fmaf(d0, (float)(b2 & 0xFu), mn0), fmaf(d0, (float)(b3 & 0xFu), mn0));\n"
+"    half2 hi0 = __floats2half2_rn(fmaf(d1, (float)(b0 >> 4),   mn1), fmaf(d1, (float)(b1 >> 4),   mn1));\n"
+"    half2 hi1 = __floats2half2_rn(fmaf(d1, (float)(b2 >> 4),   mn1), fmaf(d1, (float)(b3 >> 4),   mn1));\n"
+"    uint64_t ob = (uint64_t)sb_idx * 256ull + (uint64_t)j64 * 64ull + k;\n"
+"    *(uint2*)(dst + ob)       = make_uint2(*(uint32_t*)&lo0, *(uint32_t*)&lo1);\n"
+"    *(uint2*)(dst + ob + 32u) = make_uint2(*(uint32_t*)&hi0, *(uint32_t*)&hi1);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_deq_q6k_f16(const uint8_t* __restrict__ w, half* __restrict__ dst, uint32_t row0, uint32_t n_rows, uint32_t in_dim) {\n"
+"    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    uint32_t nb = in_dim >> 8;\n"
+"    uint32_t sb_idx = tid >> 5, l = tid & 31u;\n"
+"    if (sb_idx >= n_rows * nb) return;\n"
+"    const uint8_t* blk = w + ((uint64_t)row0 * nb + sb_idx) * 210ull;\n"
+"    float d = load_f16_le(blk + 208u);\n"
+"    uint32_t half_id = l >> 4, r = l & 15u, qp = r >> 3, g = r & 7u, k = g * 4u;\n"
+"    uint32_t n128 = half_id * 128u;\n"
+"    const uint16_t* ql16 = (const uint16_t*)(blk + (n128 >> 1) + qp * 32u + k);\n"
+"    const uint16_t* qh16 = (const uint16_t*)(blk + 128u + (n128 >> 2) + k);\n"
+"    const int8_t*  sc = (const int8_t*)(blk + 192u) + (n128 >> 4);\n"
+"    uint32_t ql4 = (uint32_t)__ldg(&ql16[0]) | ((uint32_t)__ldg(&ql16[1]) << 16);\n"
+"    uint32_t qh4 = (uint32_t)__ldg(&qh16[0]) | ((uint32_t)__ldg(&qh16[1]) << 16);\n"
+"    uint32_t is = k >> 4, sh0 = qp * 2u, sh1 = qp * 2u + 4u;\n"
+"    float ds0 = d * (float)sc[is + qp * 2u], ds1 = d * (float)sc[is + qp * 2u + 4u];\n"
+"    float lo[4], hi[4];\n"
+"    #pragma unroll\n"
+"    for (uint32_t i = 0; i < 4u; i++) {\n"
+"        uint32_t lv = (ql4 >> (i * 8u)) & 0xFFu, hv = (qh4 >> (i * 8u)) & 0xFFu;\n"
+"        lo[i] = ds0 * (float)((int)((lv & 0x0Fu) | (((hv >> sh0) & 3u) << 4)) - 32);\n"
+"        hi[i] = ds1 * (float)((int)((lv >> 4)    | (((hv >> sh1) & 3u) << 4)) - 32);\n"
+"    }\n"
+"    half2 lo0 = __floats2half2_rn(lo[0], lo[1]), lo1 = __floats2half2_rn(lo[2], lo[3]);\n"
+"    half2 hi0 = __floats2half2_rn(hi[0], hi[1]), hi1 = __floats2half2_rn(hi[2], hi[3]);\n"
+"    uint64_t ob = (uint64_t)sb_idx * 256ull + n128 + qp * 32u + k;\n"
+"    *(uint2*)(dst + ob)       = make_uint2(*(uint32_t*)&lo0, *(uint32_t*)&lo1);\n"
+"    *(uint2*)(dst + ob + 64u) = make_uint2(*(uint32_t*)&hi0, *(uint32_t*)&hi1);\n"
 "}\n"
 "\n"
 "extern \"C\" __global__ void cm_add_bias(float* x, const float* bias, uint32_t n) {\n"
@@ -1498,6 +1679,530 @@ static const char* kCuMoeSrc =
 "        h_out[row0] = (ag0 / (1.0f + expf(-ag0))) * au0;\n"
 "        if (row1 < out_dim) h_out[row1] = (ag1 / (1.0f + expf(-ag1))) * au1;\n"
 "    }\n"
+"}\n"
+"\n"
+"// Tenon v12 Round 2: Batched Q8_1 Quant + DP4A Q6_K GEMV + DP4A Small-B (B=2..16) Q4_0/Q4_1/Q6_K GEMMs!\n"
+"extern \"C\" __global__ void cm_quantize_q8_1_b(const float* __restrict__ x, CmQ8_1* __restrict__ y, uint32_t in_dim, uint32_t batch_b) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t nb = in_dim >> 5, blk = blockIdx.x * 4u + wid, b = blockIdx.y;\n"
+"    if (blk >= nb || b >= batch_b) return;\n"
+"    float v = x[(uint64_t)b * in_dim + (blk << 5) + lane];\n"
+"    float am = fabsf(v);\n"
+"    #pragma unroll\n"
+"    for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, off));\n"
+"    float d = am / 127.0f; float id = (am > 0.0f) ? (127.0f / am) : 0.0f;\n"
+"    int32_t qi = __float2int_rn(v * id);\n"
+"    float xs = v;\n"
+"    #pragma unroll\n"
+"    for (int off = 16; off > 0; off >>= 1) xs += __shfl_xor_sync(0xFFFFFFFFu, xs, off);\n"
+"    uint32_t b0 = (uint32_t)(qi & 0xFF);\n"
+"    uint32_t b1 = __shfl_down_sync(0xFFFFFFFFu, b0, 1);\n"
+"    uint32_t b2 = __shfl_down_sync(0xFFFFFFFFu, b0, 2);\n"
+"    uint32_t b3 = __shfl_down_sync(0xFFFFFFFFu, b0, 3);\n"
+"    uint64_t ob = (uint64_t)b * nb + blk;\n"
+"    int32_t* qp = (int32_t*)&y[ob].q0;\n"
+"    if ((lane & 3u) == 0u) qp[lane >> 2] = (int32_t)(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));\n"
+"    if (lane == 0u) { y[ob].d = d; y[ob].s = xs; }\n"
+"}\n"
+"\n"
+"__device__ __forceinline__ int32_t cm_q6k_load_w4(const uint16_t* __restrict__ ql16, const uint16_t* __restrict__ qh16, uint32_t idx, uint32_t sh, bool hi) {\n"
+"    uint32_t lv = (uint32_t)__ldg(&ql16[idx * 2u]) | ((uint32_t)__ldg(&ql16[idx * 2u + 1u]) << 16);\n"
+"    uint32_t hv = (uint32_t)__ldg(&qh16[idx * 2u]) | ((uint32_t)__ldg(&qh16[idx * 2u + 1u]) << 16);\n"
+"    uint32_t lo = hi ? ((lv >> 4) & 0x0F0F0F0Fu) : (lv & 0x0F0F0F0Fu);\n"
+"    return (int32_t)(lo | (((hv >> sh) & 0x03030303u) << 4));\n"
+"}\n"
+"\n"
+"__device__ __forceinline__ float dot_q6_k_dp4a_1s8(const uint8_t* __restrict__ blk, uint32_t s8, int4 q0, int4 q1, float xd, int32_t sx0, int32_t sx1) {\n"
+"    float d = load_f16_le(blk + 208u);\n"
+"    uint32_t h128 = s8 >> 2, grp = s8 & 3u;\n"
+"    const uint16_t* ql16 = (const uint16_t*)(blk + h128 * 64u + (grp & 1u) * 32u);\n"
+"    const uint16_t* qh16 = (const uint16_t*)(blk + 128u + h128 * 32u);\n"
+"    const int8_t* sc = (const int8_t*)(blk + 192u) + h128 * 8u + grp * 2u;\n"
+"    uint32_t sh = grp * 2u; bool hi = (grp >= 2u);\n"
+"    int32_t dp0 = __dp4a(cm_q6k_load_w4(ql16, qh16, 0u, sh, hi), q0.x, 0);\n"
+"    dp0 = __dp4a(cm_q6k_load_w4(ql16, qh16, 1u, sh, hi), q0.y, dp0);\n"
+"    dp0 = __dp4a(cm_q6k_load_w4(ql16, qh16, 2u, sh, hi), q0.z, dp0);\n"
+"    dp0 = __dp4a(cm_q6k_load_w4(ql16, qh16, 3u, sh, hi), q0.w, dp0);\n"
+"    int32_t dp1 = __dp4a(cm_q6k_load_w4(ql16, qh16, 4u, sh, hi), q1.x, 0);\n"
+"    dp1 = __dp4a(cm_q6k_load_w4(ql16, qh16, 5u, sh, hi), q1.y, dp1);\n"
+"    dp1 = __dp4a(cm_q6k_load_w4(ql16, qh16, 6u, sh, hi), q1.z, dp1);\n"
+"    dp1 = __dp4a(cm_q6k_load_w4(ql16, qh16, 7u, sh, hi), q1.w, dp1);\n"
+"    float p0 = (float)(dp0 - 32 * sx0) * (float)__ldg(&sc[0]);\n"
+"    float p1 = (float)(dp1 - 32 * sx1) * (float)__ldg(&sc[1]);\n"
+"    return d * xd * (p0 + p1);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_q6k_dp4a(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row0 = (blockIdx.x * 4u + wid) * 4u;\n"
+"    if (row0 >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 8, s8 = lane & 7u;\n"
+"    uint64_t rb = (uint64_t)nb * 210ull;\n"
+"    const uint8_t* wp0 = w + (uint64_t)row0 * rb;\n"
+"    const uint8_t* wp1 = (row0 + 1u < out_dim) ? (wp0 + rb) : wp0;\n"
+"    const uint8_t* wp2 = (row0 + 2u < out_dim) ? (wp0 + rb * 2ull) : wp0;\n"
+"    const uint8_t* wp3 = (row0 + 3u < out_dim) ? (wp0 + rb * 3ull) : wp0;\n"
+"    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        int4 q0 = __ldg(&xq8[xb].q0), q1 = __ldg(&xq8[xb].q1); float xd = __ldg(&xq8[xb].d);\n"
+"        int32_t sx0 = __dp4a(0x01010101, q0.x, __dp4a(0x01010101, q0.y, __dp4a(0x01010101, q0.z, __dp4a(0x01010101, q0.w, 0))));\n"
+"        int32_t sx1 = __dp4a(0x01010101, q1.x, __dp4a(0x01010101, q1.y, __dp4a(0x01010101, q1.z, __dp4a(0x01010101, q1.w, 0))));\n"
+"        uint64_t boff = (uint64_t)b * 210ull;\n"
+"        a0 += dot_q6_k_dp4a_1s8(wp0 + boff, s8, q0, q1, xd, sx0, sx1);\n"
+"        if (row0 + 1u < out_dim) a1 += dot_q6_k_dp4a_1s8(wp1 + boff, s8, q0, q1, xd, sx0, sx1);\n"
+"        if (row0 + 2u < out_dim) a2 += dot_q6_k_dp4a_1s8(wp2 + boff, s8, q0, q1, xd, sx0, sx1);\n"
+"        if (row0 + 3u < out_dim) a3 += dot_q6_k_dp4a_1s8(wp3 + boff, s8, q0, q1, xd, sx0, sx1);\n"
+"    }\n"
+"    a0 = warp_sum(a0); a1 = warp_sum(a1); a2 = warp_sum(a2); a3 = warp_sum(a3);\n"
+"    if (lane == 0u) {\n"
+"        y[row0] = add_res ? (y[row0] + a0) : a0;\n"
+"        if (row0 + 1u < out_dim) y[row0 + 1u] = add_res ? (y[row0 + 1u] + a1) : a1;\n"
+"        if (row0 + 2u < out_dim) y[row0 + 2u] = add_res ? (y[row0 + 2u] + a2) : a2;\n"
+"        if (row0 + 3u < out_dim) y[row0 + 3u] = add_res ? (y[row0 + 3u] + a3) : a3;\n"
+"    }\n"
+"}\n"
+"\n"
+"// Tenon v12 Round 3: Shared-Memory xq8 (10 KB SMEM, 256 thr = 8 rows/CTA, 1 row/warp -> 8x less xq8 traffic, 2x occupancy!)\n"
+"extern \"C\" __global__ void cm_gemm_q4_dp4a_sb(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                              uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"    uint32_t rbase = blockIdx.x * 8u, b0 = blockIdx.y * 8u;\n"
+"    if (rbase >= out_dim || b0 >= batch_b) return;\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = rbase + wid;\n"
+"    uint32_t bt = (batch_b - b0 < 8u) ? (batch_b - b0) : 8u;\n"
+"    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 18ull;\n"
+"    const uint8_t* wp = w + (uint64_t)(row < out_dim ? row : (out_dim - 1u)) * rb;\n"
+"    __shared__ int4 s_q0[8][32];\n"
+"    __shared__ int4 s_q1[8][32];\n"
+"    __shared__ float2 s_ds[8][32];\n"
+"    float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;\n"
+"    for (uint32_t bk = 0; bk < nb; bk += 32u) {\n"
+"        uint32_t bi = bk + lane;\n"
+"        if (wid < bt && bi < nb) {\n"
+"            uint64_t xoff = (uint64_t)(b0 + wid) * nb + bi;\n"
+"            s_q0[wid][lane] = __ldg(&xq8[xoff].q0);\n"
+"            s_q1[wid][lane] = __ldg(&xq8[xoff].q1);\n"
+"            s_ds[wid][lane] = make_float2(__ldg(&xq8[xoff].d), -8.0f * __ldg(&xq8[xoff].s));\n"
+"        }\n"
+"        __syncthreads();\n"
+"        if (row < out_dim && bi < nb) {\n"
+"            const uint8_t* blk = wp + (uint64_t)bi * 18ull;\n"
+"            float d0 = load_f16_le(blk);\n"
+"            const uint16_t* p0 = (const uint16_t*)(blk + 2u);\n"
+"            uint32_t w0 = (uint32_t)__ldg(&p0[0]) | ((uint32_t)__ldg(&p0[1]) << 16);\n"
+"            uint32_t w1 = (uint32_t)__ldg(&p0[2]) | ((uint32_t)__ldg(&p0[3]) << 16);\n"
+"            uint32_t w2 = (uint32_t)__ldg(&p0[4]) | ((uint32_t)__ldg(&p0[5]) << 16);\n"
+"            uint32_t w3 = (uint32_t)__ldg(&p0[6]) | ((uint32_t)__ldg(&p0[7]) << 16);\n"
+"            int32_t l0 = (int32_t)(w0 & 0x0F0F0F0Fu), l1 = (int32_t)(w1 & 0x0F0F0F0Fu);\n"
+"            int32_t l2 = (int32_t)(w2 & 0x0F0F0F0Fu), l3 = (int32_t)(w3 & 0x0F0F0F0Fu);\n"
+"            int32_t h0 = (int32_t)((w0 >> 4) & 0x0F0F0F0Fu), h1 = (int32_t)((w1 >> 4) & 0x0F0F0F0Fu);\n"
+"            int32_t h2 = (int32_t)((w2 >> 4) & 0x0F0F0F0Fu), h3 = (int32_t)((w3 >> 4) & 0x0F0F0F0Fu);\n"
+"            #define Q4DSB_STEP(T, ACC) do { \\\n"
+"                int4 q0 = s_q0[(T)][lane], q1 = s_q1[(T)][lane]; float2 ds = s_ds[(T)][lane]; \\\n"
+"                int32_t dp = __dp4a(l0, q0.x, __dp4a(l1, q0.y, __dp4a(l2, q0.z, __dp4a(l3, q0.w, 0)))); \\\n"
+"                dp = __dp4a(h0, q1.x, __dp4a(h1, q1.y, __dp4a(h2, q1.z, __dp4a(h3, q1.w, dp)))); \\\n"
+"                (ACC) = fmaf(d0, fmaf((float)dp, ds.x, ds.y), (ACC)); \\\n"
+"            } while (0)\n"
+"            Q4DSB_STEP(0u, a0);\n"
+"            if (bt > 1u) Q4DSB_STEP(1u, a1);\n"
+"            if (bt > 2u) Q4DSB_STEP(2u, a2);\n"
+"            if (bt > 3u) Q4DSB_STEP(3u, a3);\n"
+"            if (bt > 4u) Q4DSB_STEP(4u, a4);\n"
+"            if (bt > 5u) Q4DSB_STEP(5u, a5);\n"
+"            if (bt > 6u) Q4DSB_STEP(6u, a6);\n"
+"            if (bt > 7u) Q4DSB_STEP(7u, a7);\n"
+"            #undef Q4DSB_STEP\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (row >= out_dim) return;\n"
+"    #define Q4DSB_ST(T, ACC) do { \\\n"
+"        float v = warp_sum((ACC)); \\\n"
+"        if (lane == 0u) { uint64_t idx = (uint64_t)(b0 + (T)) * out_dim + row; y[idx] = add_res ? (y[idx] + v) : v; } \\\n"
+"    } while (0)\n"
+"    Q4DSB_ST(0u, a0);\n"
+"    if (bt > 1u) Q4DSB_ST(1u, a1);\n"
+"    if (bt > 2u) Q4DSB_ST(2u, a2);\n"
+"    if (bt > 3u) Q4DSB_ST(3u, a3);\n"
+"    if (bt > 4u) Q4DSB_ST(4u, a4);\n"
+"    if (bt > 5u) Q4DSB_ST(5u, a5);\n"
+"    if (bt > 6u) Q4DSB_ST(6u, a6);\n"
+"    if (bt > 7u) Q4DSB_ST(7u, a7);\n"
+"    #undef Q4DSB_ST\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemm_q4_1_dp4a_sb(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                                uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"    uint32_t rbase = blockIdx.x * 8u, b0 = blockIdx.y * 8u;\n"
+"    if (rbase >= out_dim || b0 >= batch_b) return;\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = rbase + wid;\n"
+"    uint32_t bt = (batch_b - b0 < 8u) ? (batch_b - b0) : 8u;\n"
+"    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 20ull;\n"
+"    const uint8_t* wp = w + (uint64_t)(row < out_dim ? row : (out_dim - 1u)) * rb;\n"
+"    __shared__ int4 s_q0[8][32];\n"
+"    __shared__ int4 s_q1[8][32];\n"
+"    __shared__ float2 s_ds[8][32];\n"
+"    float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;\n"
+"    for (uint32_t bk = 0; bk < nb; bk += 32u) {\n"
+"        uint32_t bi = bk + lane;\n"
+"        if (wid < bt && bi < nb) {\n"
+"            uint64_t xoff = (uint64_t)(b0 + wid) * nb + bi;\n"
+"            s_q0[wid][lane] = __ldg(&xq8[xoff].q0);\n"
+"            s_q1[wid][lane] = __ldg(&xq8[xoff].q1);\n"
+"            s_ds[wid][lane] = make_float2(__ldg(&xq8[xoff].d), __ldg(&xq8[xoff].s));\n"
+"        }\n"
+"        __syncthreads();\n"
+"        if (row < out_dim && bi < nb) {\n"
+"            const uint32_t* p0 = (const uint32_t*)(wp + (uint64_t)bi * 20ull);\n"
+"            uint32_t dm0 = __ldg(&p0[0]);\n"
+"            float d0 = __half2float(__ushort_as_half((uint16_t)(dm0 & 0xFFFFu)));\n"
+"            float m0 = __half2float(__ushort_as_half((uint16_t)(dm0 >> 16)));\n"
+"            uint32_t w0 = __ldg(&p0[1]), w1 = __ldg(&p0[2]), w2 = __ldg(&p0[3]), w3 = __ldg(&p0[4]);\n"
+"            int32_t l0 = (int32_t)(w0 & 0x0F0F0F0Fu), l1 = (int32_t)(w1 & 0x0F0F0F0Fu);\n"
+"            int32_t l2 = (int32_t)(w2 & 0x0F0F0F0Fu), l3 = (int32_t)(w3 & 0x0F0F0F0Fu);\n"
+"            int32_t h0 = (int32_t)((w0 >> 4) & 0x0F0F0F0Fu), h1 = (int32_t)((w1 >> 4) & 0x0F0F0F0Fu);\n"
+"            int32_t h2 = (int32_t)((w2 >> 4) & 0x0F0F0F0Fu), h3 = (int32_t)((w3 >> 4) & 0x0F0F0F0Fu);\n"
+"            #define Q41DSB_STEP(T, ACC) do { \\\n"
+"                int4 q0 = s_q0[(T)][lane], q1 = s_q1[(T)][lane]; float2 ds = s_ds[(T)][lane]; \\\n"
+"                int32_t dp = __dp4a(l0, q0.x, __dp4a(l1, q0.y, __dp4a(l2, q0.z, __dp4a(l3, q0.w, 0)))); \\\n"
+"                dp = __dp4a(h0, q1.x, __dp4a(h1, q1.y, __dp4a(h2, q1.z, __dp4a(h3, q1.w, dp)))); \\\n"
+"                (ACC) += fmaf(d0, (float)dp * ds.x, m0 * ds.y); \\\n"
+"            } while (0)\n"
+"            Q41DSB_STEP(0u, a0);\n"
+"            if (bt > 1u) Q41DSB_STEP(1u, a1);\n"
+"            if (bt > 2u) Q41DSB_STEP(2u, a2);\n"
+"            if (bt > 3u) Q41DSB_STEP(3u, a3);\n"
+"            if (bt > 4u) Q41DSB_STEP(4u, a4);\n"
+"            if (bt > 5u) Q41DSB_STEP(5u, a5);\n"
+"            if (bt > 6u) Q41DSB_STEP(6u, a6);\n"
+"            if (bt > 7u) Q41DSB_STEP(7u, a7);\n"
+"            #undef Q41DSB_STEP\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (row >= out_dim) return;\n"
+"    #define Q41DSB_ST(T, ACC) do { \\\n"
+"        float v = warp_sum((ACC)); \\\n"
+"        if (lane == 0u) { uint64_t idx = (uint64_t)(b0 + (T)) * out_dim + row; y[idx] = add_res ? (y[idx] + v) : v; } \\\n"
+"    } while (0)\n"
+"    Q41DSB_ST(0u, a0);\n"
+"    if (bt > 1u) Q41DSB_ST(1u, a1);\n"
+"    if (bt > 2u) Q41DSB_ST(2u, a2);\n"
+"    if (bt > 3u) Q41DSB_ST(3u, a3);\n"
+"    if (bt > 4u) Q41DSB_ST(4u, a4);\n"
+"    if (bt > 5u) Q41DSB_ST(5u, a5);\n"
+"    if (bt > 6u) Q41DSB_ST(6u, a6);\n"
+"    if (bt > 7u) Q41DSB_ST(7u, a7);\n"
+"    #undef Q41DSB_ST\n"
+"}\n"
+"\n"
+"// Tenon v12 Round 3: True INT8 Tensor Core MMQ (`mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`, 364 TOPS on RTX 6000 Ada!)\n"
+"// 64M x 64N x 32K, 256 thr = 8 warps (32M x 16N/warp), 6.9 KB zero-bank-conflict stride-48 SMEM, ZERO FP16 dequant round-trip!\n"
+"extern \"C\" __global__ void cm_gemm_q4_mmq(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                          uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"#if __CUDA_ARCH__ >= 800\n"
+"    uint32_t r0 = blockIdx.x * 64u, b0 = blockIdx.y * 64u;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    if (r0 >= out_dim || b0 >= batch_b || nb == 0u) return;\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint32_t gid = lane >> 2, tid = lane & 3u;\n"
+"    uint32_t tx = lid >> 2, gx = lid & 3u;\n"
+"    uint32_t gb = b0 + tx, gr = r0 + tx;\n"
+"    uint64_t rb = (uint64_t)nb * 18ull;\n"
+"    const uint8_t* wrow = w + (uint64_t)(gr < out_dim ? gr : (out_dim - 1u)) * rb;\n"
+"    const CmQ8_1*  xrow = xq8 + (uint64_t)(gb < batch_b ? gb : (batch_b - 1u)) * nb;\n"
+"    __shared__ uint8_t sX[64][48];\n"
+"    __shared__ uint8_t sW[64][48];\n"
+"    __shared__ float   sXd[64];\n"
+"    __shared__ float   sXs[64];\n"
+"    __shared__ float   sWd[64];\n"
+"    uint32_t wm = (wid >> 2) * 32u, wn = (wid & 3u) * 16u;\n"
+"    int act0 = (b0 + wm < batch_b) && (r0 + wn < out_dim);\n"
+"    int act1 = (b0 + wm + 16u < batch_b) && (r0 + wn < out_dim);\n"
+"    float c00=0,c01=0,c02=0,c03=0, c04=0,c05=0,c06=0,c07=0;\n"
+"    float c10=0,c11=0,c12=0,c13=0, c14=0,c15=0,c16=0,c17=0;\n"
+"    uint32_t xlo = 0u, xhi = 0u, w32 = 0u;\n"
+"    float xd_r = 0.0f, xs_r = 0.0f, wd_r = 0.0f;\n"
+"    if (gb < batch_b) {\n"
+"        const uint32_t* qp = (const uint32_t*)&xrow[0].q0;\n"
+"        xlo = __ldg(&qp[gx]); xhi = __ldg(&qp[gx + 4u]);\n"
+"        if (gx == 0u) { xd_r = __ldg(&xrow[0].d); xs_r = -8.0f * __ldg(&xrow[0].s); }\n"
+"    }\n"
+"    if (gr < out_dim) {\n"
+"        const uint16_t* p16 = (const uint16_t*)(wrow + 2u + gx * 4u);\n"
+"        w32 = (uint32_t)__ldg(&p16[0]) | ((uint32_t)__ldg(&p16[1]) << 16);\n"
+"        if (gx == 0u) wd_r = load_f16_le(wrow);\n"
+"    }\n"
+"    for (uint32_t bk = 0; bk < nb; bk++) {\n"
+"        *(uint32_t*)&sX[tx][gx * 4u]       = xlo;\n"
+"        *(uint32_t*)&sX[tx][16u + gx * 4u] = xhi;\n"
+"        *(uint32_t*)&sW[tx][gx * 4u]       = w32 & 0x0F0F0F0Fu;\n"
+"        *(uint32_t*)&sW[tx][16u + gx * 4u] = (w32 >> 4) & 0x0F0F0F0Fu;\n"
+"        if (gx == 0u) { sXd[tx] = xd_r; sXs[tx] = xs_r; sWd[tx] = wd_r; }\n"
+"        __syncthreads();\n"
+"        if (bk + 1u < nb) {\n"
+"            uint32_t nbk = bk + 1u;\n"
+"            if (gb < batch_b) {\n"
+"                const uint32_t* qp = (const uint32_t*)&xrow[nbk].q0;\n"
+"                xlo = __ldg(&qp[gx]); xhi = __ldg(&qp[gx + 4u]);\n"
+"                if (gx == 0u) { xd_r = __ldg(&xrow[nbk].d); xs_r = -8.0f * __ldg(&xrow[nbk].s); }\n"
+"            }\n"
+"            if (gr < out_dim) {\n"
+"                const uint8_t* blk = wrow + (uint64_t)nbk * 18ull;\n"
+"                const uint16_t* p16 = (const uint16_t*)(blk + 2u + gx * 4u);\n"
+"                w32 = (uint32_t)__ldg(&p16[0]) | ((uint32_t)__ldg(&p16[1]) << 16);\n"
+"                if (gx == 0u) wd_r = load_f16_le(blk);\n"
+"            }\n"
+"        }\n"
+"        if (act0) {\n"
+"            uint32_t b00 = *(const uint32_t*)&sW[wn + gid][tid * 4u];\n"
+"            uint32_t b01 = *(const uint32_t*)&sW[wn + gid][16u + tid * 4u];\n"
+"            uint32_t b10 = *(const uint32_t*)&sW[wn + 8u + gid][tid * 4u];\n"
+"            uint32_t b11 = *(const uint32_t*)&sW[wn + 8u + gid][16u + tid * 4u];\n"
+"            float dw0 = sWd[wn + tid * 2u], dw1 = sWd[wn + tid * 2u + 1u];\n"
+"            float dw2 = sWd[wn + 8u + tid * 2u], dw3 = sWd[wn + 8u + tid * 2u + 1u];\n"
+"            uint32_t a00 = *(const uint32_t*)&sX[wm + gid][tid * 4u];\n"
+"            uint32_t a01 = *(const uint32_t*)&sX[wm + gid + 8u][tid * 4u];\n"
+"            uint32_t a02 = *(const uint32_t*)&sX[wm + gid][16u + tid * 4u];\n"
+"            uint32_t a03 = *(const uint32_t*)&sX[wm + gid + 8u][16u + tid * 4u];\n"
+"            int32_t t0, t1, t2, t3, t4, t5, t6, t7;\n"
+"            asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                         : \"=r\"(t0), \"=r\"(t1), \"=r\"(t2), \"=r\"(t3)\n"
+"                         : \"r\"(a00), \"r\"(a01), \"r\"(a02), \"r\"(a03), \"r\"(b00), \"r\"(b01), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"            asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                         : \"=r\"(t4), \"=r\"(t5), \"=r\"(t6), \"=r\"(t7)\n"
+"                         : \"r\"(a00), \"r\"(a01), \"r\"(a02), \"r\"(a03), \"r\"(b10), \"r\"(b11), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"            float xd0 = sXd[wm + gid], xs0 = sXs[wm + gid];\n"
+"            float xd1 = sXd[wm + gid + 8u], xs1 = sXs[wm + gid + 8u];\n"
+"            c00 = fmaf(fmaf((float)t0, xd0, xs0), dw0, c00); c01 = fmaf(fmaf((float)t1, xd0, xs0), dw1, c01);\n"
+"            c02 = fmaf(fmaf((float)t2, xd1, xs1), dw0, c02); c03 = fmaf(fmaf((float)t3, xd1, xs1), dw1, c03);\n"
+"            c04 = fmaf(fmaf((float)t4, xd0, xs0), dw2, c04); c05 = fmaf(fmaf((float)t5, xd0, xs0), dw3, c05);\n"
+"            c06 = fmaf(fmaf((float)t6, xd1, xs1), dw2, c06); c07 = fmaf(fmaf((float)t7, xd1, xs1), dw3, c07);\n"
+"            if (act1) {\n"
+"                uint32_t a10 = *(const uint32_t*)&sX[wm + 16u + gid][tid * 4u];\n"
+"                uint32_t a11 = *(const uint32_t*)&sX[wm + 24u + gid][tid * 4u];\n"
+"                uint32_t a12 = *(const uint32_t*)&sX[wm + 16u + gid][16u + tid * 4u];\n"
+"                uint32_t a13 = *(const uint32_t*)&sX[wm + 24u + gid][16u + tid * 4u];\n"
+"                int32_t u0, u1, u2, u3, u4, u5, u6, u7;\n"
+"                asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                             : \"=r\"(u0), \"=r\"(u1), \"=r\"(u2), \"=r\"(u3)\n"
+"                             : \"r\"(a10), \"r\"(a11), \"r\"(a12), \"r\"(a13), \"r\"(b00), \"r\"(b01), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"                asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                             : \"=r\"(u4), \"=r\"(u5), \"=r\"(u6), \"=r\"(u7)\n"
+"                             : \"r\"(a10), \"r\"(a11), \"r\"(a12), \"r\"(a13), \"r\"(b10), \"r\"(b11), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"                float xd2 = sXd[wm + 16u + gid], xs2 = sXs[wm + 16u + gid];\n"
+"                float xd3 = sXd[wm + 24u + gid], xs3 = sXs[wm + 24u + gid];\n"
+"                c10 = fmaf(fmaf((float)u0, xd2, xs2), dw0, c10); c11 = fmaf(fmaf((float)u1, xd2, xs2), dw1, c11);\n"
+"                c12 = fmaf(fmaf((float)u2, xd3, xs3), dw0, c12); c13 = fmaf(fmaf((float)u3, xd3, xs3), dw1, c13);\n"
+"                c14 = fmaf(fmaf((float)u4, xd2, xs2), dw2, c14); c15 = fmaf(fmaf((float)u5, xd2, xs2), dw3, c15);\n"
+"                c16 = fmaf(fmaf((float)u6, xd3, xs3), dw2, c16); c17 = fmaf(fmaf((float)u7, xd3, xs3), dw3, c17);\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (act0) {\n"
+"        uint32_t ob0 = b0 + wm + gid, ob1 = ob0 + 8u, or0 = r0 + wn + tid * 2u, or1 = or0 + 8u;\n"
+"        #define ST_MMQ(ob, orw, val) if ((ob) < batch_b && (orw) < out_dim) { uint64_t idx = (uint64_t)(ob) * out_dim + (orw); y[idx] = add_res ? (y[idx] + (val)) : (val); }\n"
+"        ST_MMQ(ob0, or0, c00); ST_MMQ(ob0, or0 + 1u, c01); ST_MMQ(ob1, or0, c02); ST_MMQ(ob1, or0 + 1u, c03);\n"
+"        ST_MMQ(ob0, or1, c04); ST_MMQ(ob0, or1 + 1u, c05); ST_MMQ(ob1, or1, c06); ST_MMQ(ob1, or1 + 1u, c07);\n"
+"        if (act1) {\n"
+"            uint32_t ob2 = ob0 + 16u, ob3 = ob0 + 24u;\n"
+"            ST_MMQ(ob2, or0, c10); ST_MMQ(ob2, or0 + 1u, c11); ST_MMQ(ob3, or0, c12); ST_MMQ(ob3, or0 + 1u, c13);\n"
+"            ST_MMQ(ob2, or1, c14); ST_MMQ(ob2, or1 + 1u, c15); ST_MMQ(ob3, or1, c16); ST_MMQ(ob3, or1 + 1u, c17);\n"
+"        }\n"
+"        #undef ST_MMQ\n"
+"    }\n"
+"#else\n"
+"    (void)w; (void)xq8; (void)y; (void)out_dim; (void)in_dim; (void)batch_b; (void)add_res;\n"
+"#endif\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemm_q4_1_mmq(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                            uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"#if __CUDA_ARCH__ >= 800\n"
+"    uint32_t r0 = blockIdx.x * 64u, b0 = blockIdx.y * 64u;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    if (r0 >= out_dim || b0 >= batch_b || nb == 0u) return;\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint32_t gid = lane >> 2, tid = lane & 3u;\n"
+"    uint32_t tx = lid >> 2, gx = lid & 3u;\n"
+"    uint32_t gb = b0 + tx, gr = r0 + tx;\n"
+"    uint64_t rb = (uint64_t)nb * 20ull;\n"
+"    const uint8_t* wrow = w + (uint64_t)(gr < out_dim ? gr : (out_dim - 1u)) * rb;\n"
+"    const CmQ8_1*  xrow = xq8 + (uint64_t)(gb < batch_b ? gb : (batch_b - 1u)) * nb;\n"
+"    __shared__ uint8_t sX[64][48];\n"
+"    __shared__ uint8_t sW[64][48];\n"
+"    __shared__ float   sXd[64];\n"
+"    __shared__ float   sXs[64];\n"
+"    __shared__ float   sWd[64];\n"
+"    __shared__ float   sWm[64];\n"
+"    uint32_t wm = (wid >> 2) * 32u, wn = (wid & 3u) * 16u;\n"
+"    int act0 = (b0 + wm < batch_b) && (r0 + wn < out_dim);\n"
+"    int act1 = (b0 + wm + 16u < batch_b) && (r0 + wn < out_dim);\n"
+"    float c00=0,c01=0,c02=0,c03=0, c04=0,c05=0,c06=0,c07=0;\n"
+"    float c10=0,c11=0,c12=0,c13=0, c14=0,c15=0,c16=0,c17=0;\n"
+"    uint32_t xlo = 0u, xhi = 0u, w32 = 0u;\n"
+"    float xd_r = 0.0f, xs_r = 0.0f, wd_r = 0.0f, wm_r = 0.0f;\n"
+"    if (gb < batch_b) {\n"
+"        const uint32_t* qp = (const uint32_t*)&xrow[0].q0;\n"
+"        xlo = __ldg(&qp[gx]); xhi = __ldg(&qp[gx + 4u]);\n"
+"        if (gx == 0u) { xd_r = __ldg(&xrow[0].d); xs_r = __ldg(&xrow[0].s); }\n"
+"    }\n"
+"    if (gr < out_dim) {\n"
+"        const uint32_t* p32 = (const uint32_t*)wrow;\n"
+"        w32 = __ldg(&p32[1u + gx]);\n"
+"        if (gx == 0u) {\n"
+"            uint32_t dm0 = __ldg(&p32[0]);\n"
+"            wd_r = __half2float(__ushort_as_half((uint16_t)(dm0 & 0xFFFFu)));\n"
+"            wm_r = __half2float(__ushort_as_half((uint16_t)(dm0 >> 16)));\n"
+"        }\n"
+"    }\n"
+"    for (uint32_t bk = 0; bk < nb; bk++) {\n"
+"        *(uint32_t*)&sX[tx][gx * 4u]       = xlo;\n"
+"        *(uint32_t*)&sX[tx][16u + gx * 4u] = xhi;\n"
+"        *(uint32_t*)&sW[tx][gx * 4u]       = w32 & 0x0F0F0F0Fu;\n"
+"        *(uint32_t*)&sW[tx][16u + gx * 4u] = (w32 >> 4) & 0x0F0F0F0Fu;\n"
+"        if (gx == 0u) { sXd[tx] = xd_r; sXs[tx] = xs_r; sWd[tx] = wd_r; sWm[tx] = wm_r; }\n"
+"        __syncthreads();\n"
+"        if (bk + 1u < nb) {\n"
+"            uint32_t nbk = bk + 1u;\n"
+"            if (gb < batch_b) {\n"
+"                const uint32_t* qp = (const uint32_t*)&xrow[nbk].q0;\n"
+"                xlo = __ldg(&qp[gx]); xhi = __ldg(&qp[gx + 4u]);\n"
+"                if (gx == 0u) { xd_r = __ldg(&xrow[nbk].d); xs_r = __ldg(&xrow[nbk].s); }\n"
+"            }\n"
+"            if (gr < out_dim) {\n"
+"                const uint32_t* p32 = (const uint32_t*)(wrow + (uint64_t)nbk * 20ull);\n"
+"                w32 = __ldg(&p32[1u + gx]);\n"
+"                if (gx == 0u) {\n"
+"                    uint32_t dm0 = __ldg(&p32[0]);\n"
+"                    wd_r = __half2float(__ushort_as_half((uint16_t)(dm0 & 0xFFFFu)));\n"
+"                    wm_r = __half2float(__ushort_as_half((uint16_t)(dm0 >> 16)));\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        if (act0) {\n"
+"            uint32_t b00 = *(const uint32_t*)&sW[wn + gid][tid * 4u];\n"
+"            uint32_t b01 = *(const uint32_t*)&sW[wn + gid][16u + tid * 4u];\n"
+"            uint32_t b10 = *(const uint32_t*)&sW[wn + 8u + gid][tid * 4u];\n"
+"            uint32_t b11 = *(const uint32_t*)&sW[wn + 8u + gid][16u + tid * 4u];\n"
+"            float dw0 = sWd[wn + tid * 2u], dw1 = sWd[wn + tid * 2u + 1u];\n"
+"            float dw2 = sWd[wn + 8u + tid * 2u], dw3 = sWd[wn + 8u + tid * 2u + 1u];\n"
+"            float mw0 = sWm[wn + tid * 2u], mw1 = sWm[wn + tid * 2u + 1u];\n"
+"            float mw2 = sWm[wn + 8u + tid * 2u], mw3 = sWm[wn + 8u + tid * 2u + 1u];\n"
+"            uint32_t a00 = *(const uint32_t*)&sX[wm + gid][tid * 4u];\n"
+"            uint32_t a01 = *(const uint32_t*)&sX[wm + gid + 8u][tid * 4u];\n"
+"            uint32_t a02 = *(const uint32_t*)&sX[wm + gid][16u + tid * 4u];\n"
+"            uint32_t a03 = *(const uint32_t*)&sX[wm + gid + 8u][16u + tid * 4u];\n"
+"            int32_t t0, t1, t2, t3, t4, t5, t6, t7;\n"
+"            asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                         : \"=r\"(t0), \"=r\"(t1), \"=r\"(t2), \"=r\"(t3)\n"
+"                         : \"r\"(a00), \"r\"(a01), \"r\"(a02), \"r\"(a03), \"r\"(b00), \"r\"(b01), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"            asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                         : \"=r\"(t4), \"=r\"(t5), \"=r\"(t6), \"=r\"(t7)\n"
+"                         : \"r\"(a00), \"r\"(a01), \"r\"(a02), \"r\"(a03), \"r\"(b10), \"r\"(b11), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"            float xd0 = sXd[wm + gid], xs0 = sXs[wm + gid];\n"
+"            float xd1 = sXd[wm + gid + 8u], xs1 = sXs[wm + gid + 8u];\n"
+"            c00 = fmaf((float)t0 * xd0, dw0, fmaf(xs0, mw0, c00)); c01 = fmaf((float)t1 * xd0, dw1, fmaf(xs0, mw1, c01));\n"
+"            c02 = fmaf((float)t2 * xd1, dw0, fmaf(xs1, mw0, c02)); c03 = fmaf((float)t3 * xd1, dw1, fmaf(xs1, mw1, c03));\n"
+"            c04 = fmaf((float)t4 * xd0, dw2, fmaf(xs0, mw2, c04)); c05 = fmaf((float)t5 * xd0, dw3, fmaf(xs0, mw3, c05));\n"
+"            c06 = fmaf((float)t6 * xd1, dw2, fmaf(xs1, mw2, c06)); c07 = fmaf((float)t7 * xd1, dw3, fmaf(xs1, mw3, c07));\n"
+"            if (act1) {\n"
+"                uint32_t a10 = *(const uint32_t*)&sX[wm + 16u + gid][tid * 4u];\n"
+"                uint32_t a11 = *(const uint32_t*)&sX[wm + 24u + gid][tid * 4u];\n"
+"                uint32_t a12 = *(const uint32_t*)&sX[wm + 16u + gid][16u + tid * 4u];\n"
+"                uint32_t a13 = *(const uint32_t*)&sX[wm + 24u + gid][16u + tid * 4u];\n"
+"                int32_t u0, u1, u2, u3, u4, u5, u6, u7;\n"
+"                asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                             : \"=r\"(u0), \"=r\"(u1), \"=r\"(u2), \"=r\"(u3)\n"
+"                             : \"r\"(a10), \"r\"(a11), \"r\"(a12), \"r\"(a13), \"r\"(b00), \"r\"(b01), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"                asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                             : \"=r\"(u4), \"=r\"(u5), \"=r\"(u6), \"=r\"(u7)\n"
+"                             : \"r\"(a10), \"r\"(a11), \"r\"(a12), \"r\"(a13), \"r\"(b10), \"r\"(b11), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"                float xd2 = sXd[wm + 16u + gid], xs2 = sXs[wm + 16u + gid];\n"
+"                float xd3 = sXd[wm + 24u + gid], xs3 = sXs[wm + 24u + gid];\n"
+"                c10 = fmaf((float)u0 * xd2, dw0, fmaf(xs2, mw0, c10)); c11 = fmaf((float)u1 * xd2, dw1, fmaf(xs2, mw1, c11));\n"
+"                c12 = fmaf((float)u2 * xd3, dw0, fmaf(xs3, mw0, c12)); c13 = fmaf((float)u3 * xd3, dw1, fmaf(xs3, mw1, c13));\n"
+"                c14 = fmaf((float)u4 * xd2, dw2, fmaf(xs2, mw2, c14)); c15 = fmaf((float)u5 * xd2, dw3, fmaf(xs2, mw3, c15));\n"
+"                c16 = fmaf((float)u6 * xd3, dw2, fmaf(xs3, mw2, c16)); c17 = fmaf((float)u7 * xd3, dw3, fmaf(xs3, mw3, c17));\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (act0) {\n"
+"        uint32_t ob0 = b0 + wm + gid, ob1 = ob0 + 8u, or0 = r0 + wn + tid * 2u, or1 = or0 + 8u;\n"
+"        #define ST_MMQ1(ob, orw, val) if ((ob) < batch_b && (orw) < out_dim) { uint64_t idx = (uint64_t)(ob) * out_dim + (orw); y[idx] = add_res ? (y[idx] + (val)) : (val); }\n"
+"        ST_MMQ1(ob0, or0, c00); ST_MMQ1(ob0, or0 + 1u, c01); ST_MMQ1(ob1, or0, c02); ST_MMQ1(ob1, or0 + 1u, c03);\n"
+"        ST_MMQ1(ob0, or1, c04); ST_MMQ1(ob0, or1 + 1u, c05); ST_MMQ1(ob1, or1, c06); ST_MMQ1(ob1, or1 + 1u, c07);\n"
+"        if (act1) {\n"
+"            uint32_t ob2 = ob0 + 16u, ob3 = ob0 + 24u;\n"
+"            ST_MMQ1(ob2, or0, c10); ST_MMQ1(ob2, or0 + 1u, c11); ST_MMQ1(ob3, or0, c12); ST_MMQ1(ob3, or0 + 1u, c13);\n"
+"            ST_MMQ1(ob2, or1, c14); ST_MMQ1(ob2, or1 + 1u, c15); ST_MMQ1(ob3, or1, c16); ST_MMQ1(ob3, or1 + 1u, c17);\n"
+"        }\n"
+"        #undef ST_MMQ1\n"
+"    }\n"
+"#else\n"
+"    (void)w; (void)xq8; (void)y; (void)out_dim; (void)in_dim; (void)batch_b; (void)add_res;\n"
+"#endif\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemm_q6k_dp4a_sb(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                               uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4u + wid, b0 = blockIdx.y * 8u;\n"
+"    if (row >= out_dim || b0 >= batch_b) return;\n"
+"    uint32_t bt = (batch_b - b0 < 8u) ? (batch_b - b0) : 8u;\n"
+"    uint32_t nb = in_dim >> 8, nb32 = in_dim >> 5, s8 = lane & 7u;\n"
+"    uint64_t rb = (uint64_t)nb * 210ull;\n"
+"    const uint8_t* wp = w + (uint64_t)row * rb;\n"
+"    float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;\n"
+"    uint32_t h128 = s8 >> 2, grp = s8 & 3u, sh = grp * 2u; bool hi = (grp >= 2u);\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        const uint8_t* blk = wp + (uint64_t)b * 210ull;\n"
+"        float d = load_f16_le(blk + 208u);\n"
+"        const uint16_t* ql16 = (const uint16_t*)(blk + h128 * 64u + (grp & 1u) * 32u);\n"
+"        const uint16_t* qh16 = (const uint16_t*)(blk + 128u + h128 * 32u);\n"
+"        const int8_t* sc = (const int8_t*)(blk + 192u) + h128 * 8u + grp * 2u;\n"
+"        float ds0 = d * (float)__ldg(&sc[0]), ds1 = d * (float)__ldg(&sc[1]);\n"
+"        int32_t w0 = cm_q6k_load_w4(ql16, qh16, 0u, sh, hi), w1 = cm_q6k_load_w4(ql16, qh16, 1u, sh, hi);\n"
+"        int32_t w2 = cm_q6k_load_w4(ql16, qh16, 2u, sh, hi), w3 = cm_q6k_load_w4(ql16, qh16, 3u, sh, hi);\n"
+"        int32_t w4 = cm_q6k_load_w4(ql16, qh16, 4u, sh, hi), w5 = cm_q6k_load_w4(ql16, qh16, 5u, sh, hi);\n"
+"        int32_t w6 = cm_q6k_load_w4(ql16, qh16, 6u, sh, hi), w7 = cm_q6k_load_w4(ql16, qh16, 7u, sh, hi);\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        #define Q6DSB_STEP(T, ACC) do { \\\n"
+"            uint64_t xoff = (uint64_t)(b0 + (T)) * nb32 + xb; \\\n"
+"            int4 q0 = __ldg(&xq8[xoff].q0), q1 = __ldg(&xq8[xoff].q1); float xd = __ldg(&xq8[xoff].d); \\\n"
+"            int32_t dp0 = __dp4a(w0, q0.x, __dp4a(w1, q0.y, __dp4a(w2, q0.z, __dp4a(w3, q0.w, 0)))); \\\n"
+"            int32_t sx0 = __dp4a(0x01010101, q0.x, __dp4a(0x01010101, q0.y, __dp4a(0x01010101, q0.z, __dp4a(0x01010101, q0.w, 0)))); \\\n"
+"            int32_t dp1 = __dp4a(w4, q1.x, __dp4a(w5, q1.y, __dp4a(w6, q1.z, __dp4a(w7, q1.w, 0)))); \\\n"
+"            int32_t sx1 = __dp4a(0x01010101, q1.x, __dp4a(0x01010101, q1.y, __dp4a(0x01010101, q1.z, __dp4a(0x01010101, q1.w, 0)))); \\\n"
+"            (ACC) += xd * (ds0 * (float)(dp0 - 32 * sx0) + ds1 * (float)(dp1 - 32 * sx1)); \\\n"
+"        } while (0)\n"
+"        Q6DSB_STEP(0u, a0);\n"
+"        if (bt > 1u) Q6DSB_STEP(1u, a1);\n"
+"        if (bt > 2u) Q6DSB_STEP(2u, a2);\n"
+"        if (bt > 3u) Q6DSB_STEP(3u, a3);\n"
+"        if (bt > 4u) Q6DSB_STEP(4u, a4);\n"
+"        if (bt > 5u) Q6DSB_STEP(5u, a5);\n"
+"        if (bt > 6u) Q6DSB_STEP(6u, a6);\n"
+"        if (bt > 7u) Q6DSB_STEP(7u, a7);\n"
+"        #undef Q6DSB_STEP\n"
+"    }\n"
+"    #define Q6DSB_ST(T, ACC) do { \\\n"
+"        float v = warp_sum((ACC)); \\\n"
+"        if (lane == 0u) { uint64_t idx = (uint64_t)(b0 + (T)) * out_dim + row; y[idx] = add_res ? (y[idx] + v) : v; } \\\n"
+"    } while (0)\n"
+"    Q6DSB_ST(0u, a0);\n"
+"    if (bt > 1u) Q6DSB_ST(1u, a1);\n"
+"    if (bt > 2u) Q6DSB_ST(2u, a2);\n"
+"    if (bt > 3u) Q6DSB_ST(3u, a3);\n"
+"    if (bt > 4u) Q6DSB_ST(4u, a4);\n"
+"    if (bt > 5u) Q6DSB_ST(5u, a5);\n"
+"    if (bt > 6u) Q6DSB_ST(6u, a6);\n"
+"    if (bt > 7u) Q6DSB_ST(7u, a7);\n"
+"    #undef Q6DSB_ST\n"
 "}\n"
 "\n"
 "// Q4_K MoE Slot Kernels (Qwen3-MoE / DeepSeek-R1 Q4_K_M!)\n"
@@ -3322,8 +4027,8 @@ static const char* kCuMoeSrc =
 "}\n"
 "\n"
 "// =========================================================================\n"
-"// Tenon v11: Hardware-Native FlashDecoding Split-KV Parallel Long-Context Decode\n"
-"//   (All 4 KV modes FP16/Q8/FP8/Q4 + SWA/Sink + Latent MLA, 1x GPU & TP=2..8 & CUDA Graphs!)\n"
+"// Tenon v12: Zero-Spill 1-Warp-per-Q-Head Cooperative GQA FlashDecoding Split-KV\n"
+"//   + 4-Head-Grouped half4 Latent MLA FlashDecoding + 16-Tok-Block Causal Paged FlashAttn-2 Prefill!\n"
 "// =========================================================================\n"
 "extern \"C\" __global__ void cm_flash_decode_split_paged(\n"
 "    const float* q, const uint8_t* k_cache, const uint8_t* v_cache,\n"
@@ -3331,13 +4036,22 @@ static const char* kCuMoeSrc =
 "    const uint32_t* pos_arr, const uint32_t* slot_arr, const int32_t* block_table,\n"
 "    uint32_t n_heads, uint32_t n_kv, uint32_t d_head, uint32_t batch_b,\n"
 "    float scale, uint32_t max_blks, uint32_t swa_window, uint32_t attn_sink,\n"
-"    uint32_t kv_mode, uint32_t n_splits\n"
+"    uint32_t kv_mode, uint32_t n_splits, uint32_t grp_step\n"
 ") {\n"
-"    uint32_t h = blockIdx.x, b = blockIdx.y, sp = blockIdx.z;\n"
-"    if (h >= n_heads || b >= batch_b || sp >= n_splits) return;\n"
+"    uint32_t grp = (n_heads / n_kv) > 0u ? (n_heads / n_kv) : 1u;\n"
+"    uint32_t gstep = (grp_step > 0u) ? grp_step : 1u;\n"
+"    uint32_t n_gchunks = (grp + gstep - 1u) / gstep;\n"
+"    uint32_t kvh = blockIdx.x / n_gchunks, gc = blockIdx.x % n_gchunks;\n"
+"    uint32_t b = blockIdx.y, sp = blockIdx.z;\n"
+"    if (kvh >= n_kv || b >= batch_b || sp >= n_splits) return;\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint32_t g_beg = gc * gstep;\n"
+"    uint32_t g_cnt = (grp - g_beg < gstep) ? (grp - g_beg) : gstep;\n"
+"    uint32_t h0 = kvh * grp + g_beg;\n"
+"    int w_valid = (wid < g_cnt) ? 1 : 0;\n"
+"    uint32_t h = h0 + (w_valid ? wid : 0u);\n"
 "    uint64_t bh = (uint64_t)b * n_heads + h;\n"
 "    uint64_t sp_slot = bh * n_splits + sp;\n"
-"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
 "    uint32_t kv_len = pos_arr[b] + 1u, slot = slot_arr[b];\n"
 "    uint32_t win_start = (swa_window > 0u && kv_len > swa_window) ? (kv_len - swa_window) : 0u;\n"
 "    uint32_t sink_end = (attn_sink < win_start) ? attn_sink : win_start;\n"
@@ -3346,91 +4060,156 @@ static const char* kCuMoeSrc =
 "    uint32_t i_beg = sp * chunk;\n"
 "    uint32_t i_end = (i_beg + chunk < total_vis) ? (i_beg + chunk) : total_vis;\n"
 "    if (i_beg >= i_end) {\n"
-"        if (lid == 0u) { part_m[sp_slot] = -1e30f; part_l[sp_slot] = 0.0f; }\n"
+"        if (w_valid && lane == 0u) { part_m[sp_slot] = -1e30f; part_l[sp_slot] = 0.0f; }\n"
 "        return;\n"
 "    }\n"
 "    const int32_t* bt = block_table + (uint64_t)slot * max_blks;\n"
-"    uint32_t grp = (n_heads / n_kv) > 0u ? (n_heads / n_kv) : 1u, kvh = h / grp;\n"
-"    __shared__ float s_q[256], s_m[4], s_l[4], s_o[4][256];\n"
-"    uint64_t qbase = bh * d_head;\n"
-"    for (uint32_t d = lid; d < d_head; d += 128u) s_q[d] = q[qbase + d];\n"
-"    __syncthreads();\n"
-"    float m_run = -1e30f, l_run = 0.0f, o_acc[8] = {0,0,0,0,0,0,0,0};\n"
-"    uint32_t nblk = d_head >> 5, dpl = (d_head + 31u) >> 5;\n"
-"    uint32_t lo_idx = lane & 15u, is_hi = lane >> 4;\n"
+"    uint32_t n_thr = gstep * 32u, nblk = d_head >> 5;\n"
 "    uint64_t bpb = (kv_mode == 3u) ? 18ull : 34ull;\n"
 "    uint64_t row_bytes = (kv_mode == 0u) ? ((uint64_t)n_kv * d_head * 2ull) : ((uint64_t)n_kv * nblk * bpb);\n"
 "    const half* kc_f16 = (const half*)k_cache;\n"
 "    const half* vc_f16 = (const half*)v_cache;\n"
 "    uint32_t kv_stride = n_kv * d_head;\n"
-"    for (uint32_t idx = i_beg + wid; idx < i_end; idx += 4u) {\n"
-"        uint32_t t = (idx < sink_end) ? idx : (win_start + (idx - sink_end));\n"
-"        uint32_t pt = ((uint32_t)bt[t >> 4] << 4) | (t & 15u);\n"
-"        float dot = 0.0f;\n"
-"        if (kv_mode == 0u) {\n"
-"            const half* kp = kc_f16 + (uint64_t)pt * kv_stride + kvh * d_head;\n"
-"            const half* vp = vc_f16 + (uint64_t)pt * kv_stride + kvh * d_head;\n"
-"            for (uint32_t k = 0; k < dpl; k++) { uint32_t d = lane + k * 32u; if (d < d_head) dot = fmaf(s_q[d], __half2float(kp[d]), dot); }\n"
-"            float sc = warp_sum(dot) * scale; sc = __shfl_sync(0xFFFFFFFFu, sc, 0);\n"
-"            float mn = fmaxf(m_run, sc), al = expf(m_run - mn), wt = expf(sc - mn);\n"
-"            l_run = fmaf(l_run, al, wt); m_run = mn;\n"
-"            for (uint32_t k = 0; k < dpl; k++) { uint32_t d = lane + k * 32u; if (d < d_head) o_acc[k] = fmaf(o_acc[k], al, wt * __half2float(vp[d])); }\n"
-"        } else {\n"
-"            uint64_t hoff = (uint64_t)pt * row_bytes + (uint64_t)kvh * nblk * bpb;\n"
-"            const uint8_t* kp = k_cache + hoff; const uint8_t* vp = v_cache + hoff;\n"
-"            if (kv_mode == 1u) {\n"
-"                for (uint32_t blk = 0; blk < nblk; blk++) {\n"
-"                    const uint8_t* kb = kp + (uint64_t)blk * 34ull;\n"
-"                    dot = fmaf(s_q[blk * 32u + lane], (float)((const int8_t*)(kb + 2u))[lane] * load_f16_le(kb), dot);\n"
-"                }\n"
-"                float sc = warp_sum(dot) * scale; sc = __shfl_sync(0xFFFFFFFFu, sc, 0);\n"
-"                float mn = fmaxf(m_run, sc), al = expf(m_run - mn), wt = expf(sc - mn);\n"
-"                l_run = fmaf(l_run, al, wt); m_run = mn;\n"
-"                for (uint32_t blk = 0; blk < nblk; blk++) {\n"
-"                    const uint8_t* vb = vp + (uint64_t)blk * 34ull;\n"
-"                    o_acc[blk] = fmaf(o_acc[blk], al, wt * (float)((const int8_t*)(vb + 2u))[lane] * load_f16_le(vb));\n"
-"                }\n"
-"            } else if (kv_mode == 2u) {\n"
-"                for (uint32_t blk = 0; blk < nblk; blk++) {\n"
-"                    const uint8_t* kb = kp + (uint64_t)blk * 34ull;\n"
-"                    dot = fmaf(s_q[blk * 32u + lane], cm_fp8_e4m3_dec(kb[2u + lane]) * load_f16_le(kb), dot);\n"
-"                }\n"
-"                float sc = warp_sum(dot) * scale; sc = __shfl_sync(0xFFFFFFFFu, sc, 0);\n"
-"                float mn = fmaxf(m_run, sc), al = expf(m_run - mn), wt = expf(sc - mn);\n"
-"                l_run = fmaf(l_run, al, wt); m_run = mn;\n"
-"                for (uint32_t blk = 0; blk < nblk; blk++) {\n"
-"                    const uint8_t* vb = vp + (uint64_t)blk * 34ull;\n"
-"                    o_acc[blk] = fmaf(o_acc[blk], al, wt * cm_fp8_e4m3_dec(vb[2u + lane]) * load_f16_le(vb));\n"
-"                }\n"
+"    if (d_head == 64u || d_head == 128u) {\n"
+"        __shared__ half sK[16][132];\n"
+"        __shared__ half sV[16][132];\n"
+"        float m_run = -1e30f, l_run = 0.0f;\n"
+"        float4 qr = make_float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+"        float4 oa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+"        uint64_t qbase = bh * d_head;\n"
+"        if (w_valid) {\n"
+"            if (d_head == 64u) {\n"
+"                float2 q2 = *(const float2*)(q + qbase + lane * 2u);\n"
+"                qr.x = q2.x; qr.y = q2.y;\n"
 "            } else {\n"
-"                for (uint32_t blk = 0; blk < nblk; blk++) {\n"
-"                    const uint8_t* kb = kp + (uint64_t)blk * 18ull;\n"
-"                    uint8_t qb = kb[2u + lo_idx];\n"
-"                    float kq = (float)(is_hi ? (qb >> 4) : (qb & 15u)) - 8.0f;\n"
-"                    dot = fmaf(s_q[blk * 32u + lane], kq * load_f16_le(kb), dot);\n"
-"                }\n"
-"                float sc = warp_sum(dot) * scale; sc = __shfl_sync(0xFFFFFFFFu, sc, 0);\n"
-"                float mn = fmaxf(m_run, sc), al = expf(m_run - mn), wt = expf(sc - mn);\n"
-"                l_run = fmaf(l_run, al, wt); m_run = mn;\n"
-"                for (uint32_t blk = 0; blk < nblk; blk++) {\n"
-"                    const uint8_t* vb = vp + (uint64_t)blk * 18ull;\n"
-"                    uint8_t qb = vb[2u + lo_idx];\n"
-"                    float vq = (float)(is_hi ? (qb >> 4) : (qb & 15u)) - 8.0f;\n"
-"                    o_acc[blk] = fmaf(o_acc[blk], al, wt * vq * load_f16_le(vb));\n"
-"                }\n"
+"                qr = *(const float4*)(q + qbase + lane * 4u);\n"
 "            }\n"
 "        }\n"
+"        uint32_t dh4 = d_head >> 2;\n"
+"        uint32_t dh4_sh = (d_head == 64u) ? 4u : 5u;\n"
+"        uint32_t dh4_mk = dh4 - 1u;\n"
+"        for (uint32_t idx_base = i_beg; idx_base < i_end; idx_base += 16u) {\n"
+"            uint32_t nt = (i_end - idx_base < 16u) ? (i_end - idx_base) : 16u;\n"
+"            uint32_t tot4 = nt * dh4;\n"
+"            if (kv_mode == 0u) {\n"
+"                for (uint32_t vi = lid; vi < tot4; vi += n_thr) {\n"
+"                    uint32_t ti = vi >> dh4_sh, c4 = (vi & dh4_mk) << 2;\n"
+"                    uint32_t idx = idx_base + ti;\n"
+"                    uint32_t t = (idx < sink_end) ? idx : (win_start + (idx - sink_end));\n"
+"                    uint32_t pt = ((uint32_t)bt[t >> 4] << 4) | (t & 15u);\n"
+"                    uint64_t off = (uint64_t)pt * kv_stride + kvh * d_head + c4;\n"
+"                    *(uint2*)(&sK[ti][c4]) = __ldg((const uint2*)(kc_f16 + off));\n"
+"                    *(uint2*)(&sV[ti][c4]) = __ldg((const uint2*)(vc_f16 + off));\n"
+"                }\n"
+"            } else {\n"
+"                for (uint32_t vi = lid; vi < tot4; vi += n_thr) {\n"
+"                    uint32_t ti = vi >> dh4_sh, c4 = (vi & dh4_mk) << 2;\n"
+"                    uint32_t blk = c4 >> 5, j = c4 & 31u;\n"
+"                    uint32_t idx = idx_base + ti;\n"
+"                    uint32_t t = (idx < sink_end) ? idx : (win_start + (idx - sink_end));\n"
+"                    uint32_t pt = ((uint32_t)bt[t >> 4] << 4) | (t & 15u);\n"
+"                    uint64_t off = (uint64_t)pt * row_bytes + (uint64_t)(kvh * nblk + blk) * bpb;\n"
+"                    const uint8_t* kb = k_cache + off; const uint8_t* vb = v_cache + off;\n"
+"                    float dk = load_f16_le(kb), dv = load_f16_le(vb);\n"
+"                    if (kv_mode == 1u) {\n"
+"                        const uint16_t* kp16 = (const uint16_t*)(kb + 2u + j);\n"
+"                        const uint16_t* vp16 = (const uint16_t*)(vb + 2u + j);\n"
+"                        uint32_t k4 = (uint32_t)__ldg(&kp16[0]) | ((uint32_t)__ldg(&kp16[1]) << 16);\n"
+"                        uint32_t v4 = (uint32_t)__ldg(&vp16[0]) | ((uint32_t)__ldg(&vp16[1]) << 16);\n"
+"                        *(half2*)(&sK[ti][c4])      = __floats2half2_rn((float)(int8_t)(k4 & 0xFFu) * dk, (float)(int8_t)((k4 >> 8) & 0xFFu) * dk);\n"
+"                        *(half2*)(&sK[ti][c4 + 2u]) = __floats2half2_rn((float)(int8_t)((k4 >> 16) & 0xFFu) * dk, (float)(int8_t)(k4 >> 24) * dk);\n"
+"                        *(half2*)(&sV[ti][c4])      = __floats2half2_rn((float)(int8_t)(v4 & 0xFFu) * dv, (float)(int8_t)((v4 >> 8) & 0xFFu) * dv);\n"
+"                        *(half2*)(&sV[ti][c4 + 2u]) = __floats2half2_rn((float)(int8_t)((v4 >> 16) & 0xFFu) * dv, (float)(int8_t)(v4 >> 24) * dv);\n"
+"                    } else if (kv_mode == 2u) {\n"
+"                        const uint8_t* kq = kb + 2u + j; const uint8_t* vq = vb + 2u + j;\n"
+"                        *(half2*)(&sK[ti][c4])      = __floats2half2_rn(cm_fp8_e4m3_dec(kq[0]) * dk, cm_fp8_e4m3_dec(kq[1]) * dk);\n"
+"                        *(half2*)(&sK[ti][c4 + 2u]) = __floats2half2_rn(cm_fp8_e4m3_dec(kq[2]) * dk, cm_fp8_e4m3_dec(kq[3]) * dk);\n"
+"                        *(half2*)(&sV[ti][c4])      = __floats2half2_rn(cm_fp8_e4m3_dec(vq[0]) * dv, cm_fp8_e4m3_dec(vq[1]) * dv);\n"
+"                        *(half2*)(&sV[ti][c4 + 2u]) = __floats2half2_rn(cm_fp8_e4m3_dec(vq[2]) * dv, cm_fp8_e4m3_dec(vq[3]) * dv);\n"
+"                    } else {\n"
+"                        uint32_t lo = j & 15u, hi = j >> 4;\n"
+"                        const uint16_t* kp16 = (const uint16_t*)(kb + 2u + lo);\n"
+"                        const uint16_t* vp16 = (const uint16_t*)(vb + 2u + lo);\n"
+"                        uint32_t k4 = (uint32_t)__ldg(&kp16[0]) | ((uint32_t)__ldg(&kp16[1]) << 16);\n"
+"                        uint32_t v4 = (uint32_t)__ldg(&vp16[0]) | ((uint32_t)__ldg(&vp16[1]) << 16);\n"
+"                        if (hi) { k4 >>= 4; v4 >>= 4; }\n"
+"                        *(half2*)(&sK[ti][c4])      = __floats2half2_rn(((float)(k4 & 15u) - 8.0f) * dk, ((float)((k4 >> 8) & 15u) - 8.0f) * dk);\n"
+"                        *(half2*)(&sK[ti][c4 + 2u]) = __floats2half2_rn(((float)((k4 >> 16) & 15u) - 8.0f) * dk, ((float)((k4 >> 24) & 15u) - 8.0f) * dk);\n"
+"                        *(half2*)(&sV[ti][c4])      = __floats2half2_rn(((float)(v4 & 15u) - 8.0f) * dv, ((float)((v4 >> 8) & 15u) - 8.0f) * dv);\n"
+"                        *(half2*)(&sV[ti][c4 + 2u]) = __floats2half2_rn(((float)((v4 >> 16) & 15u) - 8.0f) * dv, ((float)((v4 >> 24) & 15u) - 8.0f) * dv);\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"            __syncthreads();\n"
+"            if (w_valid) {\n"
+"                if (d_head == 64u) {\n"
+"                    for (uint32_t ti = 0; ti < nt; ti++) {\n"
+"                        float2 kf = __half22float2(*(const half2*)(&sK[ti][lane * 2u]));\n"
+"                        float2 vf = __half22float2(*(const half2*)(&sV[ti][lane * 2u]));\n"
+"                        float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(fmaf(qr.x, kf.x, qr.y * kf.y)) * scale, 0);\n"
+"                        float mn = fmaxf(m_run, sc), al = __expf(m_run - mn), wt = __expf(sc - mn);\n"
+"                        l_run = fmaf(l_run, al, wt); m_run = mn;\n"
+"                        oa.x = fmaf(oa.x, al, wt * vf.x); oa.y = fmaf(oa.y, al, wt * vf.y);\n"
+"                    }\n"
+"                } else {\n"
+"                    for (uint32_t ti = 0; ti < nt; ti++) {\n"
+"                        float2 k01 = __half22float2(*(const half2*)(&sK[ti][lane * 4u]));\n"
+"                        float2 k23 = __half22float2(*(const half2*)(&sK[ti][lane * 4u + 2u]));\n"
+"                        float2 v01 = __half22float2(*(const half2*)(&sV[ti][lane * 4u]));\n"
+"                        float2 v23 = __half22float2(*(const half2*)(&sV[ti][lane * 4u + 2u]));\n"
+"                        float dt = fmaf(qr.x, k01.x, fmaf(qr.y, k01.y, fmaf(qr.z, k23.x, qr.w * k23.y)));\n"
+"                        float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(dt) * scale, 0);\n"
+"                        float mn = fmaxf(m_run, sc), al = __expf(m_run - mn), wt = __expf(sc - mn);\n"
+"                        l_run = fmaf(l_run, al, wt); m_run = mn;\n"
+"                        oa.x = fmaf(oa.x, al, wt * v01.x); oa.y = fmaf(oa.y, al, wt * v01.y);\n"
+"                        oa.z = fmaf(oa.z, al, wt * v23.x); oa.w = fmaf(oa.w, al, wt * v23.y);\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"            __syncthreads();\n"
+"        }\n"
+"        if (w_valid) {\n"
+"            if (lane == 0u) { part_m[sp_slot] = m_run; part_l[sp_slot] = l_run; }\n"
+"            uint64_t obase = sp_slot * d_head;\n"
+"            if (d_head == 64u) { part_o[obase + lane * 2u] = oa.x; part_o[obase + lane * 2u + 1u] = oa.y; }\n"
+"            else { *(float4*)(part_o + obase + lane * 4u) = oa; }\n"
+"        }\n"
+"        return;\n"
 "    }\n"
-"    if (lane == 0u) { s_m[wid] = m_run; s_l[wid] = l_run; }\n"
-"    for (uint32_t k = 0; k < dpl; k++) { uint32_t d = lane + k * 32u; if (d < d_head) s_o[wid][d] = o_acc[k]; }\n"
-"    __syncthreads();\n"
-"    float gm = fmaxf(fmaxf(s_m[0], s_m[1]), fmaxf(s_m[2], s_m[3])), gl = 0.0f;\n"
-"    for (uint32_t s = 0; s < 4u; s++) if (s_l[s] > 0.0f) gl += s_l[s] * expf(s_m[s] - gm);\n"
-"    if (lid == 0u) { part_m[sp_slot] = gm; part_l[sp_slot] = gl; }\n"
-"    uint64_t obase = sp_slot * d_head;\n"
-"    for (uint32_t d = lid; d < d_head; d += 128u) {\n"
-"        float ov = 0.0f; for (uint32_t s = 0; s < 4u; s++) if (s_l[s] > 0.0f) ov = fmaf(s_o[s][d], expf(s_m[s] - gm), ov);\n"
-"        part_o[obase + d] = ov;\n"
+"    // Generic fallback for rare d_head != 64, 128\n"
+"    float m_run = -1e30f, l_run = 0.0f, qr[8], oa[8];\n"
+"    uint32_t dpl = (d_head + 31u) >> 5, lo_idx = lane & 15u, is_hi = lane >> 4;\n"
+"    uint64_t qbase = bh * d_head;\n"
+"    for (uint32_t k = 0; k < 8u; k++) { uint32_t d = lane + k * 32u; qr[k] = (w_valid && d < d_head) ? q[qbase + d] : 0.0f; oa[k] = 0.0f; }\n"
+"    if (w_valid) {\n"
+"        for (uint32_t idx = i_beg; idx < i_end; idx++) {\n"
+"            uint32_t t = (idx < sink_end) ? idx : (win_start + (idx - sink_end));\n"
+"            uint32_t pt = ((uint32_t)bt[t >> 4] << 4) | (t & 15u);\n"
+"            float dot = 0.0f, vv[8];\n"
+"            if (kv_mode == 0u) {\n"
+"                const half* kp = kc_f16 + (uint64_t)pt * kv_stride + kvh * d_head;\n"
+"                const half* vp = vc_f16 + (uint64_t)pt * kv_stride + kvh * d_head;\n"
+"                for (uint32_t k = 0; k < dpl && k < 8u; k++) { uint32_t d = lane + k * 32u; if (d < d_head) { dot = fmaf(qr[k], __half2float(kp[d]), dot); vv[k] = __half2float(vp[d]); } else vv[k] = 0.0f; }\n"
+"            } else {\n"
+"                uint64_t hoff = (uint64_t)pt * row_bytes + (uint64_t)kvh * nblk * bpb;\n"
+"                const uint8_t* kp = k_cache + hoff; const uint8_t* vp = v_cache + hoff;\n"
+"                for (uint32_t blk = 0; blk < nblk && blk < 8u; blk++) {\n"
+"                    const uint8_t* kb = kp + (uint64_t)blk * bpb; const uint8_t* vb = vp + (uint64_t)blk * bpb;\n"
+"                    float kf, vf;\n"
+"                    if (kv_mode == 1u) { kf = (float)((const int8_t*)(kb + 2u))[lane] * load_f16_le(kb); vf = (float)((const int8_t*)(vb + 2u))[lane] * load_f16_le(vb); }\n"
+"                    else if (kv_mode == 2u) { kf = cm_fp8_e4m3_dec(kb[2u + lane]) * load_f16_le(kb); vf = cm_fp8_e4m3_dec(vb[2u + lane]) * load_f16_le(vb); }\n"
+"                    else { uint8_t qk = kb[2u + lo_idx], qv = vb[2u + lo_idx]; kf = ((float)(is_hi ? (qk >> 4) : (qk & 15u)) - 8.0f) * load_f16_le(kb); vf = ((float)(is_hi ? (qv >> 4) : (qv & 15u)) - 8.0f) * load_f16_le(vb); }\n"
+"                    dot = fmaf(qr[blk], kf, dot); vv[blk] = vf;\n"
+"                }\n"
+"            }\n"
+"            float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(dot) * scale, 0);\n"
+"            float mn = fmaxf(m_run, sc), al = expf(m_run - mn), wt = expf(sc - mn);\n"
+"            l_run = fmaf(l_run, al, wt); m_run = mn;\n"
+"            for (uint32_t k = 0; k < dpl && k < 8u; k++) oa[k] = fmaf(oa[k], al, wt * vv[k]);\n"
+"        }\n"
+"        if (lane == 0u) { part_m[sp_slot] = m_run; part_l[sp_slot] = l_run; }\n"
+"        uint64_t obase = sp_slot * d_head;\n"
+"        for (uint32_t k = 0; k < dpl && k < 8u; k++) { uint32_t d = lane + k * 32u; if (d < d_head) part_o[obase + d] = oa[k]; }\n"
 "    }\n"
 "}\n"
 "\n"
@@ -3441,11 +4220,14 @@ static const char* kCuMoeSrc =
 "    uint32_t n_heads, uint32_t kv_r, uint32_t rope_d, float scale, uint32_t batch_b,\n"
 "    uint32_t max_blks, uint32_t swa_window, uint32_t attn_sink, uint32_t n_splits\n"
 ") {\n"
-"    uint32_t h = blockIdx.x, b = blockIdx.y, sp = blockIdx.z;\n"
-"    if (h >= n_heads || b >= batch_b || sp >= n_splits) return;\n"
-"    uint64_t bh = (uint64_t)b * n_heads + h;\n"
-"    uint64_t sp_slot = bh * n_splits + sp;\n"
+"    // Tenon v12: 4-Head-Grouped half4-Vectorized Zero-Spill Latent MLA FlashDecoding (4x less latent DRAM, ZERO cross-warp reduce!)\n"
+"    uint32_t h0 = blockIdx.x * 4u, b = blockIdx.y, sp = blockIdx.z;\n"
+"    if (h0 >= n_heads || b >= batch_b || sp >= n_splits) return;\n"
 "    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint32_t h = h0 + wid;\n"
+"    int h_valid = (h < n_heads) ? 1 : 0;\n"
+"    uint64_t bh = (uint64_t)b * n_heads + (h_valid ? h : (n_heads - 1u));\n"
+"    uint64_t sp_slot = bh * n_splits + sp;\n"
 "    uint32_t kv_len = pos_arr[b] + 1u, slot = slot_arr[b];\n"
 "    uint32_t win_start = (swa_window > 0u && kv_len > swa_window) ? (kv_len - swa_window) : 0u;\n"
 "    uint32_t sink_end = (attn_sink < win_start) ? attn_sink : win_start;\n"
@@ -3454,39 +4236,99 @@ static const char* kCuMoeSrc =
 "    uint32_t i_beg = sp * chunk;\n"
 "    uint32_t i_end = (i_beg + chunk < total_vis) ? (i_beg + chunk) : total_vis;\n"
 "    if (i_beg >= i_end) {\n"
-"        if (lid == 0u) { part_m[sp_slot] = -1e30f; part_l[sp_slot] = 0.0f; }\n"
+"        if (h_valid && lane == 0u) { part_m[sp_slot] = -1e30f; part_l[sp_slot] = 0.0f; }\n"
 "        return;\n"
 "    }\n"
 "    const int32_t* bt = block_table + (uint64_t)slot * max_blks;\n"
-"    uint32_t ldim = kv_r + rope_d;\n"
-"    __shared__ float s_q[768], s_m[4], s_l[4], s_o[4][576];\n"
-"    uint64_t qbase = bh * ldim;\n"
-"    for (uint32_t d = lid; d < ldim && d < 768u; d += 128u) s_q[d] = q_abs[qbase + d];\n"
-"    __syncthreads();\n"
-"    float m_run = -1e30f, l_run = 0.0f, o_acc[18];\n"
-"    uint32_t dpl = (kv_r + 31u) >> 5, lpl = (ldim + 31u) >> 5;\n"
-"    for (uint32_t k = 0; k < dpl && k < 18u; k++) o_acc[k] = 0.0f;\n"
-"    for (uint32_t idx = i_beg + wid; idx < i_end; idx += 4u) {\n"
-"        uint32_t t = (idx < sink_end) ? idx : (win_start + (idx - sink_end));\n"
-"        uint32_t pt = ((uint32_t)bt[t >> 4] << 4) | (t & 15u);\n"
-"        const half* lp = lat_cache + (uint64_t)pt * ldim;\n"
-"        float dot = 0.0f;\n"
-"        for (uint32_t k = 0; k < lpl; k++) { uint32_t d = lane + k * 32u; if (d < ldim) dot = fmaf(s_q[d], __half2float(lp[d]), dot); }\n"
-"        float sc = warp_sum(dot) * scale; sc = __shfl_sync(0xFFFFFFFFu, sc, 0);\n"
-"        float mn = fmaxf(m_run, sc), al = expf(m_run - mn), wt = expf(sc - mn);\n"
-"        l_run = fmaf(l_run, al, wt); m_run = mn;\n"
-"        for (uint32_t k = 0; k < dpl && k < 18u; k++) { uint32_t d = lane + k * 32u; if (d < kv_r) o_acc[k] = fmaf(o_acc[k], al, wt * __half2float(lp[d])); }\n"
+"    uint32_t ldim = kv_r + rope_d, lat4 = ldim >> 2;\n"
+"    __shared__ half s_lat[4][580];\n"
+"    float m_run = -1e30f, l_run = 0.0f;\n"
+"    if (kv_r == 512u && rope_d == 64u) {\n"
+"        uint32_t c4_l = lane * 4u, r2_l = lane * 2u;\n"
+"        const float* qp_base = q_abs + bh * 576ull;\n"
+"        float4 qa0 = h_valid ? *(const float4*)(qp_base + c4_l)        : make_float4(0,0,0,0);\n"
+"        float4 qa1 = h_valid ? *(const float4*)(qp_base + c4_l + 128u) : make_float4(0,0,0,0);\n"
+"        float4 qa2 = h_valid ? *(const float4*)(qp_base + c4_l + 256u) : make_float4(0,0,0,0);\n"
+"        float4 qa3 = h_valid ? *(const float4*)(qp_base + c4_l + 384u) : make_float4(0,0,0,0);\n"
+"        float2 qp  = h_valid ? *(const float2*)(qp_base + 512u + r2_l) : make_float2(0,0);\n"
+"        float4 oa0 = make_float4(0,0,0,0), oa1 = make_float4(0,0,0,0);\n"
+"        float4 oa2 = make_float4(0,0,0,0), oa3 = make_float4(0,0,0,0);\n"
+"        for (uint32_t idx_base = i_beg; idx_base < i_end; idx_base += 4u) {\n"
+"            uint32_t nt = (i_end - idx_base < 4u) ? (i_end - idx_base) : 4u;\n"
+"            uint32_t tot_v4 = nt * lat4;\n"
+"            for (uint32_t vi = lid; vi < tot_v4; vi += 128u) {\n"
+"                uint32_t ti = vi / lat4, c4 = (vi % lat4) * 4u;\n"
+"                uint32_t idx = idx_base + ti;\n"
+"                uint32_t t = (idx < sink_end) ? idx : (win_start + (idx - sink_end));\n"
+"                uint32_t pt = ((uint32_t)bt[t >> 4] << 4) | (t & 15u);\n"
+"                *(uint2*)(&s_lat[ti][c4]) = __ldg((const uint2*)(lat_cache + (uint64_t)pt * ldim + c4));\n"
+"            }\n"
+"            __syncthreads();\n"
+"            if (h_valid) {\n"
+"                for (uint32_t ti = 0; ti < nt; ti++) {\n"
+"                    float2 a0 = __half22float2(*(const half2*)(&s_lat[ti][c4_l]));\n"
+"                    float2 a1 = __half22float2(*(const half2*)(&s_lat[ti][c4_l + 2u]));\n"
+"                    float2 b0 = __half22float2(*(const half2*)(&s_lat[ti][c4_l + 128u]));\n"
+"                    float2 b1 = __half22float2(*(const half2*)(&s_lat[ti][c4_l + 130u]));\n"
+"                    float2 c0 = __half22float2(*(const half2*)(&s_lat[ti][c4_l + 256u]));\n"
+"                    float2 c1 = __half22float2(*(const half2*)(&s_lat[ti][c4_l + 258u]));\n"
+"                    float2 d0 = __half22float2(*(const half2*)(&s_lat[ti][c4_l + 384u]));\n"
+"                    float2 d1 = __half22float2(*(const half2*)(&s_lat[ti][c4_l + 386u]));\n"
+"                    float2 p0 = __half22float2(*(const half2*)(&s_lat[ti][512u + r2_l]));\n"
+"                    float dt = fmaf(qa0.x, a0.x, fmaf(qa0.y, a0.y, fmaf(qa0.z, a1.x, qa0.w * a1.y)))\n"
+"                             + fmaf(qa1.x, b0.x, fmaf(qa1.y, b0.y, fmaf(qa1.z, b1.x, qa1.w * b1.y)))\n"
+"                             + fmaf(qa2.x, c0.x, fmaf(qa2.y, c0.y, fmaf(qa2.z, c1.x, qa2.w * c1.y)))\n"
+"                             + fmaf(qa3.x, d0.x, fmaf(qa3.y, d0.y, fmaf(qa3.z, d1.x, qa3.w * d1.y)))\n"
+"                             + fmaf(qp.x, p0.x, qp.y * p0.y);\n"
+"                    float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(dt) * scale, 0);\n"
+"                    float mn = fmaxf(m_run, sc), al = expf(m_run - mn), wt = expf(sc - mn);\n"
+"                    l_run = fmaf(l_run, al, wt); m_run = mn;\n"
+"                    oa0.x = fmaf(oa0.x, al, wt * a0.x); oa0.y = fmaf(oa0.y, al, wt * a0.y); oa0.z = fmaf(oa0.z, al, wt * a1.x); oa0.w = fmaf(oa0.w, al, wt * a1.y);\n"
+"                    oa1.x = fmaf(oa1.x, al, wt * b0.x); oa1.y = fmaf(oa1.y, al, wt * b0.y); oa1.z = fmaf(oa1.z, al, wt * b1.x); oa1.w = fmaf(oa1.w, al, wt * b1.y);\n"
+"                    oa2.x = fmaf(oa2.x, al, wt * c0.x); oa2.y = fmaf(oa2.y, al, wt * c0.y); oa2.z = fmaf(oa2.z, al, wt * c1.x); oa2.w = fmaf(oa2.w, al, wt * c1.y);\n"
+"                    oa3.x = fmaf(oa3.x, al, wt * d0.x); oa3.y = fmaf(oa3.y, al, wt * d0.y); oa3.z = fmaf(oa3.z, al, wt * d1.x); oa3.w = fmaf(oa3.w, al, wt * d1.y);\n"
+"                }\n"
+"            }\n"
+"            __syncthreads();\n"
+"        }\n"
+"        if (h_valid) {\n"
+"            if (lane == 0u) { part_m[sp_slot] = m_run; part_l[sp_slot] = l_run; }\n"
+"            float* op = part_o + sp_slot * 512ull;\n"
+"            *(float4*)(op + c4_l)        = oa0; *(float4*)(op + c4_l + 128u) = oa1;\n"
+"            *(float4*)(op + c4_l + 256u) = oa2; *(float4*)(op + c4_l + 384u) = oa3;\n"
+"        }\n"
+"        return;\n"
 "    }\n"
-"    if (lane == 0u) { s_m[wid] = m_run; s_l[wid] = l_run; }\n"
-"    for (uint32_t k = 0; k < dpl && k < 18u; k++) { uint32_t d = lane + k * 32u; if (d < kv_r && d < 576u) s_o[wid][d] = o_acc[k]; }\n"
-"    __syncthreads();\n"
-"    float gm = fmaxf(fmaxf(s_m[0], s_m[1]), fmaxf(s_m[2], s_m[3])), gl = 0.0f;\n"
-"    for (uint32_t s = 0; s < 4u; s++) if (s_l[s] > 0.0f) gl += s_l[s] * expf(s_m[s] - gm);\n"
-"    if (lid == 0u) { part_m[sp_slot] = gm; part_l[sp_slot] = gl; }\n"
-"    uint64_t obase = sp_slot * kv_r;\n"
-"    for (uint32_t d = lid; d < kv_r && d < 576u; d += 128u) {\n"
-"        float ov = 0.0f; for (uint32_t s = 0; s < 4u; s++) if (s_l[s] > 0.0f) ov = fmaf(s_o[s][d], expf(s_m[s] - gm), ov);\n"
-"        part_o[obase + d] = ov;\n"
+"    float qa[18], oa[18];\n"
+"    uint32_t dpl = (kv_r + 31u) >> 5, lpl = (ldim + 31u) >> 5;\n"
+"    for (uint32_t k = 0; k < 18u; k++) { uint32_t d = lane + k * 32u; qa[k] = (h_valid && d < ldim) ? q_abs[bh * ldim + d] : 0.0f; oa[k] = 0.0f; }\n"
+"    for (uint32_t idx_base = i_beg; idx_base < i_end; idx_base += 4u) {\n"
+"        uint32_t nt = (i_end - idx_base < 4u) ? (i_end - idx_base) : 4u;\n"
+"        uint32_t tot_v4 = nt * lat4;\n"
+"        for (uint32_t vi = lid; vi < tot_v4; vi += 128u) {\n"
+"            uint32_t ti = vi / lat4, c4 = (vi % lat4) * 4u;\n"
+"            uint32_t idx = idx_base + ti;\n"
+"            uint32_t t = (idx < sink_end) ? idx : (win_start + (idx - sink_end));\n"
+"            uint32_t pt = ((uint32_t)bt[t >> 4] << 4) | (t & 15u);\n"
+"            *(uint2*)(&s_lat[ti][c4]) = __ldg((const uint2*)(lat_cache + (uint64_t)pt * ldim + c4));\n"
+"        }\n"
+"        __syncthreads();\n"
+"        if (h_valid) {\n"
+"            for (uint32_t ti = 0; ti < nt; ti++) {\n"
+"                float dot = 0.0f;\n"
+"                for (uint32_t k = 0; k < lpl && k < 18u; k++) { uint32_t d = lane + k * 32u; if (d < ldim) dot = fmaf(qa[k], __half2float(s_lat[ti][d]), dot); }\n"
+"                float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(dot) * scale, 0);\n"
+"                float mn = fmaxf(m_run, sc), al = expf(m_run - mn), wt = expf(sc - mn);\n"
+"                l_run = fmaf(l_run, al, wt); m_run = mn;\n"
+"                for (uint32_t k = 0; k < dpl && k < 18u; k++) { uint32_t d = lane + k * 32u; if (d < kv_r) oa[k] = fmaf(oa[k], al, wt * __half2float(s_lat[ti][d])); }\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (h_valid) {\n"
+"        if (lane == 0u) { part_m[sp_slot] = m_run; part_l[sp_slot] = l_run; }\n"
+"        uint64_t obase = sp_slot * kv_r;\n"
+"        for (uint32_t k = 0; k < dpl && k < 18u; k++) { uint32_t d = lane + k * 32u; if (d < kv_r) part_o[obase + d] = oa[k]; }\n"
 "    }\n"
 "}\n"
 "\n"
@@ -3498,21 +4340,210 @@ static const char* kCuMoeSrc =
 "    if (h >= n_heads || b >= batch_b) return;\n"
 "    uint64_t bh = (uint64_t)b * n_heads + h;\n"
 "    uint64_t sbase = bh * n_splits;\n"
-"    float gm = -1e30f;\n"
-"    for (uint32_t s = 0; s < n_splits; s++) if (part_l[sbase + s] > 0.0f) gm = fmaxf(gm, part_m[sbase + s]);\n"
-"    float gl = 0.0f, ws[16];\n"
-"    for (uint32_t s = 0; s < n_splits; s++) {\n"
-"        float ls = part_l[sbase + s];\n"
-"        float w = (ls > 0.0f) ? expf(part_m[sbase + s] - gm) : 0.0f;\n"
-"        ws[s] = w; gl += ls * w;\n"
+"    __shared__ float s_ws[64];\n"
+"    __shared__ float s_inv;\n"
+"    if (lid == 0u) {\n"
+"        float gm = -1e30f;\n"
+"        for (uint32_t s = 0; s < n_splits; s++) if (part_l[sbase + s] > 0.0f) gm = fmaxf(gm, part_m[sbase + s]);\n"
+"        float gl = 0.0f;\n"
+"        for (uint32_t s = 0; s < n_splits; s++) {\n"
+"            float ls = part_l[sbase + s];\n"
+"            float w = (ls > 0.0f) ? __expf(part_m[sbase + s] - gm) : 0.0f;\n"
+"            s_ws[s] = w; gl += ls * w;\n"
+"        }\n"
+"        s_inv = 1.0f / fmaxf(gl, 1e-12f);\n"
 "    }\n"
-"    float inv = 1.0f / fmaxf(gl, 1e-12f);\n"
+"    __syncthreads();\n"
+"    float inv = s_inv;\n"
 "    uint64_t obase = bh * v_dim;\n"
 "    for (uint32_t d = lid; d < v_dim; d += 128u) {\n"
 "        float acc = 0.0f;\n"
-"        for (uint32_t s = 0; s < n_splits; s++) if (ws[s] > 0.0f) acc = fmaf(part_o[(sbase + s) * v_dim + d], ws[s], acc);\n"
+"        for (uint32_t s = 0; s < n_splits; s++) if (s_ws[s] > 0.0f) acc = fmaf(part_o[(sbase + s) * v_dim + d], s_ws[s], acc);\n"
 "        dst[obase + d] = acc * inv;\n"
 "    }\n"
+"}\n"
+"\n"
+"// Tenon v12 Round 2: Zero-Spill BQ=8, BK=16 Causal Paged FlashAttention-2 Prefill (NO register spill!)\n"
+"extern \"C\" __global__ void cm_flash_prefill_paged_fp16(\n"
+"    const float* q, const half* k_cache, const half* v_cache, float* ctx,\n"
+"    const uint32_t* pos_arr, const uint32_t* slot_arr, const int32_t* block_table,\n"
+"    uint32_t n_heads, uint32_t n_kv, uint32_t d_head, uint32_t batch_b,\n"
+"    float scale, uint32_t max_blks, uint32_t swa_window, uint32_t attn_sink\n"
+") {\n"
+"    uint32_t h = blockIdx.x, qb0 = blockIdx.y * 8u;\n"
+"    if (h >= n_heads || qb0 >= batch_b) return;\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint32_t slot = slot_arr[qb0];\n"
+"    const int32_t* bt = block_table + (uint64_t)slot * max_blks;\n"
+"    uint32_t grp = (n_heads / n_kv) > 0u ? (n_heads / n_kv) : 1u, kvh = h / grp;\n"
+"    uint32_t kv_stride = n_kv * d_head;\n"
+"    uint32_t max_qb = (qb0 + 8u < batch_b) ? (qb0 + 8u) : batch_b;\n"
+"    uint32_t max_pos_tg = pos_arr[max_qb - 1u];\n"
+"    uint32_t b0 = qb0 + wid * 2u, b1 = b0 + 1u;\n"
+"    int v0 = (b0 < batch_b) ? 1 : 0, v1 = (b1 < batch_b) ? 1 : 0;\n"
+"    uint32_t p0 = v0 ? pos_arr[b0] : 0u, p1 = v1 ? pos_arr[b1] : 0u;\n"
+"    float m0 = -1e30f, l0 = 0.0f, m1 = -1e30f, l1 = 0.0f;\n"
+"    __shared__ half sK[16][132];\n"
+"    __shared__ half sV[16][132];\n"
+"    uint32_t max_lb = max_pos_tg >> 4, dh4 = d_head >> 2, kv_v4 = 16u * dh4;\n"
+"    if (d_head == 64u) {\n"
+"        uint64_t qb_0 = ((uint64_t)(v0 ? b0 : 0u) * n_heads + h) * 64ull;\n"
+"        uint64_t qb_1 = ((uint64_t)(v1 ? b1 : 0u) * n_heads + h) * 64ull;\n"
+"        float2 q0 = v0 ? __ldg((const float2*)(q + qb_0 + lane * 2u)) : make_float2(0.0f, 0.0f);\n"
+"        float2 q1 = v1 ? __ldg((const float2*)(q + qb_1 + lane * 2u)) : make_float2(0.0f, 0.0f);\n"
+"        float2 o0 = make_float2(0.0f, 0.0f), o1 = make_float2(0.0f, 0.0f);\n"
+"        for (uint32_t lb = 0; lb <= max_lb; lb++) {\n"
+"            uint32_t t_base = lb << 4;\n"
+"            if (swa_window > 0u) {\n"
+"                uint32_t min_p = pos_arr[qb0];\n"
+"                uint32_t ws = (min_p + 1u > swa_window) ? (min_p + 1u - swa_window) : 0u;\n"
+"                if (t_base + 16u <= ws && t_base >= attn_sink) continue;\n"
+"            }\n"
+"            uint32_t pt_base = (uint32_t)bt[lb] << 4;\n"
+"            for (uint32_t vi = lid; vi < 256u; vi += 128u) {\n"
+"                uint32_t tk = vi >> 4, c4 = (vi & 15u) << 2;\n"
+"                uint64_t off = (uint64_t)(pt_base + tk) * kv_stride + kvh * 64u + c4;\n"
+"                *(uint2*)(&sK[tk][c4]) = __ldg((const uint2*)(k_cache + off));\n"
+"                *(uint2*)(&sV[tk][c4]) = __ldg((const uint2*)(v_cache + off));\n"
+"            }\n"
+"            __syncthreads();\n"
+"            uint32_t tk_lim = (max_pos_tg - t_base + 1u < 16u) ? (max_pos_tg - t_base + 1u) : 16u;\n"
+"            for (uint32_t tk = 0; tk < tk_lim; tk++) {\n"
+"                uint32_t t = t_base + tk;\n"
+"                float2 kv = __half22float2(*(const half2*)(&sK[tk][lane * 2u]));\n"
+"                float2 vv = __half22float2(*(const half2*)(&sV[tk][lane * 2u]));\n"
+"                if (v0 && t <= p0) {\n"
+"                    int ok0 = 1;\n"
+"                    if (swa_window > 0u) { uint32_t ws = (p0 + 1u > swa_window) ? (p0 + 1u - swa_window) : 0u; ok0 = (t >= ws || t < attn_sink); }\n"
+"                    if (ok0) {\n"
+"                        float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(fmaf(q0.x, kv.x, q0.y * kv.y)) * scale, 0);\n"
+"                        float mn = fmaxf(m0, sc), al = __expf(m0 - mn), wt = __expf(sc - mn);\n"
+"                        l0 = fmaf(l0, al, wt); m0 = mn;\n"
+"                        o0.x = fmaf(o0.x, al, wt * vv.x); o0.y = fmaf(o0.y, al, wt * vv.y);\n"
+"                    }\n"
+"                }\n"
+"                if (v1 && t <= p1) {\n"
+"                    int ok1 = 1;\n"
+"                    if (swa_window > 0u) { uint32_t ws = (p1 + 1u > swa_window) ? (p1 + 1u - swa_window) : 0u; ok1 = (t >= ws || t < attn_sink); }\n"
+"                    if (ok1) {\n"
+"                        float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(fmaf(q1.x, kv.x, q1.y * kv.y)) * scale, 0);\n"
+"                        float mn = fmaxf(m1, sc), al = __expf(m1 - mn), wt = __expf(sc - mn);\n"
+"                        l1 = fmaf(l1, al, wt); m1 = mn;\n"
+"                        o1.x = fmaf(o1.x, al, wt * vv.x); o1.y = fmaf(o1.y, al, wt * vv.y);\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"            __syncthreads();\n"
+"        }\n"
+"        if (v0) { uint64_t cb = ((uint64_t)b0 * n_heads + h) * 64ull; float inv = 1.0f / fmaxf(l0, 1e-12f); *(float2*)(ctx + cb + lane * 2u) = make_float2(o0.x * inv, o0.y * inv); }\n"
+"        if (v1) { uint64_t cb = ((uint64_t)b1 * n_heads + h) * 64ull; float inv = 1.0f / fmaxf(l1, 1e-12f); *(float2*)(ctx + cb + lane * 2u) = make_float2(o1.x * inv, o1.y * inv); }\n"
+"        return;\n"
+"    }\n"
+"    if (d_head == 128u) {\n"
+"        uint64_t qb_0 = ((uint64_t)(v0 ? b0 : 0u) * n_heads + h) * 128ull;\n"
+"        uint64_t qb_1 = ((uint64_t)(v1 ? b1 : 0u) * n_heads + h) * 128ull;\n"
+"        float4 q0 = v0 ? __ldg((const float4*)(q + qb_0 + lane * 4u)) : make_float4(0,0,0,0);\n"
+"        float4 q1 = v1 ? __ldg((const float4*)(q + qb_1 + lane * 4u)) : make_float4(0,0,0,0);\n"
+"        float4 o0 = make_float4(0,0,0,0), o1 = make_float4(0,0,0,0);\n"
+"        for (uint32_t lb = 0; lb <= max_lb; lb++) {\n"
+"            uint32_t t_base = lb << 4;\n"
+"            if (swa_window > 0u) {\n"
+"                uint32_t min_p = pos_arr[qb0];\n"
+"                uint32_t ws = (min_p + 1u > swa_window) ? (min_p + 1u - swa_window) : 0u;\n"
+"                if (t_base + 16u <= ws && t_base >= attn_sink) continue;\n"
+"            }\n"
+"            uint32_t pt_base = (uint32_t)bt[lb] << 4;\n"
+"            for (uint32_t vi = lid; vi < 512u; vi += 128u) {\n"
+"                uint32_t tk = vi >> 5, c4 = (vi & 31u) << 2;\n"
+"                uint64_t off = (uint64_t)(pt_base + tk) * kv_stride + kvh * 128u + c4;\n"
+"                *(uint2*)(&sK[tk][c4]) = __ldg((const uint2*)(k_cache + off));\n"
+"                *(uint2*)(&sV[tk][c4]) = __ldg((const uint2*)(v_cache + off));\n"
+"            }\n"
+"            __syncthreads();\n"
+"            uint32_t tk_lim = (max_pos_tg - t_base + 1u < 16u) ? (max_pos_tg - t_base + 1u) : 16u;\n"
+"            for (uint32_t tk = 0; tk < tk_lim; tk++) {\n"
+"                uint32_t t = t_base + tk;\n"
+"                float2 k01 = __half22float2(*(const half2*)(&sK[tk][lane * 4u]));\n"
+"                float2 k23 = __half22float2(*(const half2*)(&sK[tk][lane * 4u + 2u]));\n"
+"                float2 v01 = __half22float2(*(const half2*)(&sV[tk][lane * 4u]));\n"
+"                float2 v23 = __half22float2(*(const half2*)(&sV[tk][lane * 4u + 2u]));\n"
+"                if (v0 && t <= p0) {\n"
+"                    int ok0 = 1;\n"
+"                    if (swa_window > 0u) { uint32_t ws = (p0 + 1u > swa_window) ? (p0 + 1u - swa_window) : 0u; ok0 = (t >= ws || t < attn_sink); }\n"
+"                    if (ok0) {\n"
+"                        float dt = fmaf(q0.x, k01.x, fmaf(q0.y, k01.y, fmaf(q0.z, k23.x, q0.w * k23.y)));\n"
+"                        float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(dt) * scale, 0);\n"
+"                        float mn = fmaxf(m0, sc), al = __expf(m0 - mn), wt = __expf(sc - mn);\n"
+"                        l0 = fmaf(l0, al, wt); m0 = mn;\n"
+"                        o0.x = fmaf(o0.x, al, wt * v01.x); o0.y = fmaf(o0.y, al, wt * v01.y);\n"
+"                        o0.z = fmaf(o0.z, al, wt * v23.x); o0.w = fmaf(o0.w, al, wt * v23.y);\n"
+"                    }\n"
+"                }\n"
+"                if (v1 && t <= p1) {\n"
+"                    int ok1 = 1;\n"
+"                    if (swa_window > 0u) { uint32_t ws = (p1 + 1u > swa_window) ? (p1 + 1u - swa_window) : 0u; ok1 = (t >= ws || t < attn_sink); }\n"
+"                    if (ok1) {\n"
+"                        float dt = fmaf(q1.x, k01.x, fmaf(q1.y, k01.y, fmaf(q1.z, k23.x, q1.w * k23.y)));\n"
+"                        float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(dt) * scale, 0);\n"
+"                        float mn = fmaxf(m1, sc), al = __expf(m1 - mn), wt = __expf(sc - mn);\n"
+"                        l1 = fmaf(l1, al, wt); m1 = mn;\n"
+"                        o1.x = fmaf(o1.x, al, wt * v01.x); o1.y = fmaf(o1.y, al, wt * v01.y);\n"
+"                        o1.z = fmaf(o1.z, al, wt * v23.x); o1.w = fmaf(o1.w, al, wt * v23.y);\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"            __syncthreads();\n"
+"        }\n"
+"        if (v0) { uint64_t cb = ((uint64_t)b0 * n_heads + h) * 128ull; float inv = 1.0f / fmaxf(l0, 1e-12f); *(float4*)(ctx + cb + lane * 4u) = make_float4(o0.x*inv, o0.y*inv, o0.z*inv, o0.w*inv); }\n"
+"        if (v1) { uint64_t cb = ((uint64_t)b1 * n_heads + h) * 128ull; float inv = 1.0f / fmaxf(l1, 1e-12f); *(float4*)(ctx + cb + lane * 4u) = make_float4(o1.x*inv, o1.y*inv, o1.z*inv, o1.w*inv); }\n"
+"        return;\n"
+"    }\n"
+"    uint32_t c0 = lane, c1 = lane + 32u, c2 = lane + 64u, c3 = lane + 96u;\n"
+"    uint64_t qb_0 = ((uint64_t)(v0 ? b0 : 0u) * n_heads + h) * d_head;\n"
+"    uint64_t qb_1 = ((uint64_t)(v1 ? b1 : 0u) * n_heads + h) * d_head;\n"
+"    float q00 = (v0 && c0 < d_head) ? q[qb_0 + c0] : 0.0f, q01 = (v0 && c1 < d_head) ? q[qb_0 + c1] : 0.0f;\n"
+"    float q02 = (v0 && c2 < d_head) ? q[qb_0 + c2] : 0.0f, q03 = (v0 && c3 < d_head) ? q[qb_0 + c3] : 0.0f;\n"
+"    float q10 = (v1 && c0 < d_head) ? q[qb_1 + c0] : 0.0f, q11 = (v1 && c1 < d_head) ? q[qb_1 + c1] : 0.0f;\n"
+"    float q12 = (v1 && c2 < d_head) ? q[qb_1 + c2] : 0.0f, q13 = (v1 && c3 < d_head) ? q[qb_1 + c3] : 0.0f;\n"
+"    float o00=0, o01=0, o02=0, o03=0, o10=0, o11=0, o12=0, o13=0;\n"
+"    for (uint32_t lb = 0; lb <= max_lb; lb++) {\n"
+"        uint32_t t_base = lb << 4;\n"
+"        uint32_t pt_base = (uint32_t)bt[lb] << 4;\n"
+"        for (uint32_t vi = lid; vi < kv_v4; vi += 128u) {\n"
+"            uint32_t tk = vi / dh4, c4 = (vi % dh4) * 4u;\n"
+"            uint64_t off = (uint64_t)(pt_base + tk) * kv_stride + kvh * d_head + c4;\n"
+"            *(uint2*)(&sK[tk][c4]) = __ldg((const uint2*)(k_cache + off));\n"
+"            *(uint2*)(&sV[tk][c4]) = __ldg((const uint2*)(v_cache + off));\n"
+"        }\n"
+"        __syncthreads();\n"
+"        uint32_t tk_lim = (max_pos_tg - t_base + 1u < 16u) ? (max_pos_tg - t_base + 1u) : 16u;\n"
+"        for (uint32_t tk = 0; tk < tk_lim; tk++) {\n"
+"            uint32_t t = t_base + tk;\n"
+"            float k0 = (c0 < d_head) ? __half2float(sK[tk][c0]) : 0.0f, k1 = (c1 < d_head) ? __half2float(sK[tk][c1]) : 0.0f;\n"
+"            float k2 = (c2 < d_head) ? __half2float(sK[tk][c2]) : 0.0f, k3 = (c3 < d_head) ? __half2float(sK[tk][c3]) : 0.0f;\n"
+"            float vv0 = (c0 < d_head) ? __half2float(sV[tk][c0]) : 0.0f, vv1 = (c1 < d_head) ? __half2float(sV[tk][c1]) : 0.0f;\n"
+"            float vv2 = (c2 < d_head) ? __half2float(sV[tk][c2]) : 0.0f, vv3 = (c3 < d_head) ? __half2float(sV[tk][c3]) : 0.0f;\n"
+"            if (v0 && t <= p0) {\n"
+"                float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(fmaf(q00,k0,fmaf(q01,k1,fmaf(q02,k2,q03*k3)))) * scale, 0);\n"
+"                float mn = fmaxf(m0, sc), al = __expf(m0 - mn), wt = __expf(sc - mn);\n"
+"                l0 = fmaf(l0, al, wt); m0 = mn;\n"
+"                o00 = fmaf(o00, al, wt * vv0); o01 = fmaf(o01, al, wt * vv1); o02 = fmaf(o02, al, wt * vv2); o03 = fmaf(o03, al, wt * vv3);\n"
+"            }\n"
+"            if (v1 && t <= p1) {\n"
+"                float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(fmaf(q10,k0,fmaf(q11,k1,fmaf(q12,k2,q13*k3)))) * scale, 0);\n"
+"                float mn = fmaxf(m1, sc), al = __expf(m1 - mn), wt = __expf(sc - mn);\n"
+"                l1 = fmaf(l1, al, wt); m1 = mn;\n"
+"                o10 = fmaf(o10, al, wt * vv0); o11 = fmaf(o11, al, wt * vv1); o12 = fmaf(o12, al, wt * vv2); o13 = fmaf(o13, al, wt * vv3);\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (v0) { uint64_t cb = ((uint64_t)b0 * n_heads + h) * d_head; float inv = 1.0f / fmaxf(l0, 1e-12f);\n"
+"        if (c0 < d_head) ctx[cb + c0] = o00 * inv; if (c1 < d_head) ctx[cb + c1] = o01 * inv;\n"
+"        if (c2 < d_head) ctx[cb + c2] = o02 * inv; if (c3 < d_head) ctx[cb + c3] = o03 * inv; }\n"
+"    if (v1) { uint64_t cb = ((uint64_t)b1 * n_heads + h) * d_head; float inv = 1.0f / fmaxf(l1, 1e-12f);\n"
+"        if (c0 < d_head) ctx[cb + c0] = o10 * inv; if (c1 < d_head) ctx[cb + c1] = o11 * inv;\n"
+"        if (c2 < d_head) ctx[cb + c2] = o12 * inv; if (c3 < d_head) ctx[cb + c3] = o13 * inv; }\n"
 "}\n"
 "\n"
 "extern \"C\" __global__ void cm_gemv_fp8_e4m3(const uint8_t* w, const float* x, float* y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
@@ -4335,11 +5366,11 @@ static const char* kCuMoeSrc =
 "    uint32_t norm_wt, uint32_t has_bias, uint32_t n_groups, uint32_t n_group_used,\n"
 "    float w_scale, uint32_t e_start, uint32_t e_end\n"
 ") {\n"
-"    __shared__ uint32_t te_all[64 * 16];\n"
-"    __shared__ float tw_all[64 * 16];\n"
+"    __shared__ uint8_t te_all[256 * 16];\n"
+"    __shared__ float tw_all[256 * 16];\n"
 "    uint32_t tid = threadIdx.x;\n"
-"    if (tid < batch_b && tid < 64u) {\n"
-"        uint32_t b = tid;\n"
+"    uint32_t b_lim = (batch_b < 256u) ? batch_b : 256u;\n"
+"    for (uint32_t b = tid; b < b_lim; b += 64u) {\n"
 "        float probs[256], scores[256];\n"
 "        const float* rl = rlogits + (uint64_t)b * n_exp;\n"
 "        if (gating_func == 2u) {\n"
@@ -4368,7 +5399,7 @@ static const char* kCuMoeSrc =
 "        for (uint32_t k = 0; k < top_k; k++) {\n"
 "            uint32_t be = 0; float bs = -1e30f;\n"
 "            for (uint32_t e = 0; e < n_exp; e++) if (scores[e] > bs) { bs = scores[e]; be = e; }\n"
-"            te_all[b * 16u + k] = be; tw_all[b * 16u + k] = probs[be]; wsum += probs[be]; scores[be] = -1e30f;\n"
+"            te_all[b * 16u + k] = (uint8_t)be; tw_all[b * 16u + k] = probs[be]; wsum += probs[be]; scores[be] = -1e30f;\n"
 "        }\n"
 "        float mult = w_scale; if (norm_wt && wsum > 1e-12f) mult /= wsum;\n"
 "        for (uint32_t k = 0; k < top_k; k++) tw_all[b * 16u + k] *= mult;\n"
@@ -4377,7 +5408,7 @@ static const char* kCuMoeSrc =
 "    if (tid != 0u) return;\n"
 "    uint32_t cnt[256];\n"
 "    for (uint32_t e = 0; e < n_exp && e < 256u; e++) cnt[e] = 0u;\n"
-"    for (uint32_t b = 0; b < batch_b && b < 64u; b++) for (uint32_t k = 0; k < top_k; k++) cnt[te_all[b * 16u + k]]++;\n"
+"    for (uint32_t b = 0; b < b_lim; b++) for (uint32_t k = 0; k < top_k; k++) cnt[te_all[b * 16u + k]]++;\n"
 "    uint32_t exp_cur[256], n_uniq_local = 0u, n_uniq_all = 0u, cur_off = 0u;\n"
 "    for (uint32_t e = 0; e < n_exp; e++) {\n"
 "        exp_cur[e] = 0u;\n"
@@ -4393,9 +5424,9 @@ static const char* kCuMoeSrc =
 "            }\n"
 "        }\n"
 "    }\n"
-"    for (uint32_t b = 0; b < batch_b && b < 64u; b++) {\n"
+"    for (uint32_t b = 0; b < b_lim; b++) {\n"
 "        for (uint32_t k = 0; k < top_k; k++) {\n"
-"            uint32_t e = te_all[b * 16u + k];\n"
+"            uint32_t e = (uint32_t)te_all[b * 16u + k];\n"
 "            if (e >= e_start && e < e_end) {\n"
 "                uint32_t sl = exp_cur[e]++;\n"
 "                tok_idx[sl] = b; tok_wt[sl] = tw_all[b * 16u + k];\n"
@@ -4735,16 +5766,16 @@ static const char* kCuMoeSrc =
 "    const uint8_t* gw = cache_base + (uint64_t)e * slot_stride;\n"
 "    const uint8_t* uw = gw + up_off;\n"
 "#if __CUDA_ARCH__ >= 800\n"
-"    if (cnt < 8u) {\n"
-"        uint32_t t_ids[8]; for (uint32_t t = 0; t < cnt; t++) t_ids[t] = tok_idx[off + t];\n"
+"    if (cnt < 4u) {\n"
+"        uint32_t t_ids[4]; for (uint32_t t = 0; t < cnt; t++) t_ids[t] = tok_idx[off + t];\n"
 "        for (uint32_t rr = wid; rr < 32u && (r0 + rr) < out_dim; rr += 4u) {\n"
 "            uint32_t row = r0 + rr;\n"
-"            float gacc[8] = {0,0,0,0,0,0,0,0}, uacc[8] = {0,0,0,0,0,0,0,0};\n"
+"            float gacc[4] = {0,0,0,0}, uacc[4] = {0,0,0,0};\n"
 "            cm_mega_dot8_fast(gw, row, in_dim, gtype,  x, t_ids, cnt, lane, gacc);\n"
 "            cm_mega_dot8_fast(uw, row, in_dim, gtype2, x, t_ids, cnt, lane, uacc);\n"
 "            for (uint32_t t = 0; t < cnt; t++) {\n"
 "                float gv = warp_sum(gacc[t]), uv = warp_sum(uacc[t]);\n"
-"                if (lane == 0u) h_grp[(uint64_t)(off + t) * out_dim + row] = (gv / (1.0f + expf(-gv))) * uv;\n"
+"                if (lane == 0u) h_grp[(uint64_t)(off + t) * out_dim + row] = (gv / (1.0f + __expf(-gv))) * uv;\n"
 "            }\n"
 "        }\n"
 "        return;\n"
@@ -4834,11 +5865,11 @@ static const char* kCuMoeSrc =
 "    uint32_t e = active_e[ei], off = grp_off[ei], cnt = grp_cnt[ei];\n"
 "    const uint8_t* dw = cache_base + (uint64_t)e * slot_stride + down_off;\n"
 "#if __CUDA_ARCH__ >= 800\n"
-"    if (cnt < 8u) {\n"
-"        uint32_t s_ids[8]; for (uint32_t t = 0; t < cnt; t++) s_ids[t] = off + t;\n"
+"    if (cnt < 4u) {\n"
+"        uint32_t s_ids[4]; for (uint32_t t = 0; t < cnt; t++) s_ids[t] = off + t;\n"
 "        for (uint32_t rr = wid; rr < 32u && (r0 + rr) < out_dim; rr += 4u) {\n"
 "            uint32_t row = r0 + rr;\n"
-"            float acc[8] = {0,0,0,0,0,0,0,0};\n"
+"            float acc[4] = {0,0,0,0};\n"
 "            cm_mega_dot8_fast(dw, row, in_dim, gtype, h_grp, s_ids, cnt, lane, acc);\n"
 "            for (uint32_t t = 0; t < cnt; t++) {\n"
 "                float val = warp_sum(acc[t]);\n"
@@ -5371,10 +6402,29 @@ static int cm_load_dev_kernels(CmDevCtx* dc, const void* bin) {
     LK(k_flash_dec_split_paged, "cm_flash_decode_split_paged");
     LK(k_flash_mla_split_paged, "cm_flash_mla_split_paged");
     LK(k_flash_dec_reduce_paged, "cm_flash_decode_reduce_paged");
+    LK(k_rmsnorm_strided, "cm_rmsnorm_strided");
+    LK(k_f32_to_f16, "cm_f32_to_f16");
+    LK(k_deq_q4_0_f16, "cm_deq_q4_0_f16");
+    LK(k_deq_q4_1_f16, "cm_deq_q4_1_f16");
+    LK(k_deq_q8_0_f16, "cm_deq_q8_0_f16");
+    LK(k_deq_q4k_f16, "cm_deq_q4k_f16");
+    LK(k_deq_q6k_f16, "cm_deq_q6k_f16");
+    LK(k_flash_prefill_paged_fp16, "cm_flash_prefill_paged_fp16");
+    LK(k_quant_q8_1_b, "cm_quantize_q8_1_b");
+    LK(k_gemv_q6k_dp4a, "cm_gemv_q6k_dp4a");
+    LK(k_gemm_q4_dp4a_sb, "cm_gemm_q4_dp4a_sb");
+    LK(k_gemm_q4_1_dp4a_sb, "cm_gemm_q4_1_dp4a_sb");
+    LK(k_gemm_q6k_dp4a_sb, "cm_gemm_q6k_dp4a_sb");
+    LK(k_gemm_q4_mmq, "cm_gemm_q4_mmq");
+    LK(k_gemm_q4_1_mmq, "cm_gemm_q4_1_mmq");
     LK(k_router, "cm_router_topk");
     LK(k_argmax, "cm_argmax_f32");
     #undef LK
-    g_cu.cuMemAlloc(&dc->d_xq8, 512u * 1024u);
+    dc->xq8_cap = 24u * 1024u * 1024u;
+    if (g_cu.cuMemAlloc(&dc->d_xq8, dc->xq8_cap) != CUDA_SUCCESS) {
+        dc->xq8_cap = 8u * 1024u * 1024u;
+        g_cu.cuMemAlloc(&dc->d_xq8, dc->xq8_cap);
+    }
     dc->ready = 1;
     return 1;
 }
@@ -5501,8 +6551,39 @@ int64_t tn_cumoe_init(void) {
     COPY_K(k_moe_mega_gu_fp8_tc); COPY_K(k_moe_mega_down_fp8_tc);
     COPY_K(k_rope_kv_fp8_paged); COPY_K(k_flash_dec_fp8_paged); COPY_K(k_rope_kv_q4_paged); COPY_K(k_flash_dec_q4_paged);
     COPY_K(k_flash_dec_split_paged); COPY_K(k_flash_mla_split_paged); COPY_K(k_flash_dec_reduce_paged);
+    COPY_K(k_rmsnorm_strided); COPY_K(k_f32_to_f16);
+    COPY_K(k_deq_q4_0_f16); COPY_K(k_deq_q4_1_f16); COPY_K(k_deq_q8_0_f16); COPY_K(k_deq_q4k_f16); COPY_K(k_deq_q6k_f16);
+    COPY_K(k_flash_prefill_paged_fp16);
+    COPY_K(k_quant_q8_1_b); COPY_K(k_gemv_q6k_dp4a); COPY_K(k_gemm_q4_dp4a_sb); COPY_K(k_gemm_q4_1_dp4a_sb); COPY_K(k_gemm_q6k_dp4a_sb);
+    COPY_K(k_gemm_q4_mmq); COPY_K(k_gemm_q4_1_mmq);
     COPY_K(k_argmax);
     #undef COPY_K
+
+    // Tenon v12: Zero-Link Dynamic cuBLAS Tensor Core Auto-Discovery (`dlopen("libcublas.so.12")`)!
+    const char* cub_env = getenv("TENON_CUDA_CUBLAS");
+    if (!(cub_env && atoi(cub_env) == 0)) {
+        const char* cub_paths[] = {
+            "libcublas.so.12", "libcublas.so.11", "libcublas.so",
+            "/usr/local/cuda/lib64/libcublas.so.12",
+            "/usr/local/cuda/lib64/libcublas.so",
+            "/usr/lib/x86_64-linux-gnu/libcublas.so.12",
+            "/usr/local/lib/python3.11/dist-packages/nvidia/cublas/lib/libcublas.so.12",
+            "/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib/libcublas.so.12",
+            "/usr/local/lib/python3.12/dist-packages/nvidia/cublas/lib/libcublas.so.12",
+            NULL
+        };
+        for (int i = 0; cub_paths[i] && !g_cu.libcublas; i++) g_cu.libcublas = dlopen(cub_paths[i], RTLD_LAZY);
+        if (g_cu.libcublas) {
+            g_cu.cublasCreate    = (fn_cublasCreate_v2)cm_sym(g_cu.libcublas, "cublasCreate_v2", NULL);
+            g_cu.cublasDestroy   = (fn_cublasDestroy_v2)cm_sym(g_cu.libcublas, "cublasDestroy_v2", NULL);
+            g_cu.cublasSetStream = (fn_cublasSetStream_v2)cm_sym(g_cu.libcublas, "cublasSetStream_v2", NULL);
+            g_cu.cublasGemmEx    = (fn_cublasGemmEx)cm_sym(g_cu.libcublas, "cublasGemmEx", NULL);
+            if (g_cu.cublasCreate && g_cu.cublasSetStream && g_cu.cublasGemmEx) {
+                g_cu.cublas_avail = 1;
+                if (g_cu.cublasCreate(&g_cu.gpus[0].cublas) != CUBLAS_STATUS_SUCCESS) g_cu.gpus[0].cublas = NULL;
+            }
+        }
+    }
 
     // Zero-Link Dynamic NCCL Auto-Discovery (`dlopen("libnccl.so.2")`) for Multi-GPU TP & EP!
     const char* nccl_env = getenv("TENON_NCCL");
@@ -5540,6 +6621,9 @@ int64_t tn_cumoe_init(void) {
                 g_cu.cuDeviceGetName(dc->dev_name, sizeof(dc->dev_name), dc->dev);
                 g_cu.cuDeviceTotalMem(&dc->vram_bytes, dc->dev);
                 cm_load_dev_kernels(dc, ptx);
+                if (g_cu.cublas_avail && g_cu.cublasCreate) {
+                    if (g_cu.cublasCreate(&dc->cublas) != CUBLAS_STATUS_SUCCESS) dc->cublas = NULL;
+                }
             }
         }
     }
@@ -5601,7 +6685,7 @@ int64_t tn_cumoe_init(void) {
     }
 
     const char* fdp = getenv("TENON_CUDA_FAST_DP4A");
-    g_cu.fast_dp4a = (fdp && atoi(fdp) > 0) ? 1 : 0;
+    g_cu.fast_dp4a = (fdp && atoi(fdp) == 0) ? 0 : 1;
     g_cu.ready = 1;
     return 1;
 }
@@ -5809,6 +6893,7 @@ typedef struct {
         uint32_t B;
         uint64_t lora_sig;
         int use_fd;
+        int fd_splits;
         int n_moe_layers;
         CUgraphExec exec;
     } cb_graph_cache[CM_CB_GRAPH_MAX];
@@ -5821,13 +6906,17 @@ typedef struct {
         int valid;
         uint32_t B;
         int use_fd;
+        int fd_splits;
         int n_moe_layers;
         CUgraphExec exec[CM_MAX_TP];
     } tp_graph_cache[CM_CB_GRAPH_MAX];
     int fd_enabled;
     int fd_min_len;
     int fd_splits;
+    int fd_splits_forced;
     int cur_use_fd;
+    int cur_fd_splits;
+    int cur_is_prefill;
     int64_t flash_decode_launches;
     CUdeviceptr d_fd_o, d_fd_m, d_fd_l;
     CUdeviceptr d_ipc_buf;
@@ -6168,7 +7257,11 @@ static void launch_gemv_raw(CUstream st, CUdeviceptr w, uint32_t gtype, CUdevice
         case CM_GGML_IQ4_XS: fn = g_cu.k_gemv_iq4xs; rptg = 8; break;
         case CM_GGML_Q4_K:   fn = g_cu.k_gemv_q4k;   rptg = 8; break;
         case CM_GGML_Q5_K:   fn = g_cu.k_gemv_q5k;   rptg = 8; break;
-        case CM_GGML_Q6_K:   fn = g_cu.k_gemv_q6k;   rptg = 8; break;
+        case CM_GGML_Q6_K:
+            if (g_cu.fast_dp4a && (in_dim & 255u) == 0u && g_cu.k_gemv_q6k_dp4a) {
+                launch_quant_q8_1(st, x, in_dim); xin = g_cu.d_xq8; fn = g_cu.k_gemv_q6k_dp4a; rptg = 16;
+            } else { fn = g_cu.k_gemv_q6k; rptg = 8; }
+            break;
         case CM_GGML_FP8_E4M3: fn = g_cu.k_gemv_fp8;   rptg = 4; break;
         case CM_GGML_MXFP4:    fn = g_cu.k_gemv_mxfp4; rptg = 4; break;
         case CM_GGML_F16:    fn = g_cu.k_gemv_f16;   rptg = 4; break;
@@ -8181,6 +9274,9 @@ static void cm_tp_ensure_bufs(CmModel* m, int B) {
     size_t kvd_l = (size_t)((m->n_kv / P) * m->d_head);
     size_t ff_l = (size_t)(m->d_ff_dense / P);
     if ((size_t)m->d_ff_exp > ff_l) ff_l = (size_t)m->d_ff_exp;
+    for (int L = 0; L < m->n_layers; L++) {
+        if (m->layers[L].has_shared_exp && (size_t)m->layers[L].sh_gate.ne1 > ff_l) ff_l = (size_t)m->layers[L].sh_gate.ne1;
+    }
     if (ff_l < 64u) ff_l = 64u;
     size_t kv_r = (size_t)(m->kv_lora_rank > 0 ? m->kv_lora_rank : 512);
     size_t ldim = kv_r + (size_t)m->rope_dim;
@@ -8236,10 +9332,11 @@ static void cm_tp_ensure_bufs(CmModel* m, int B) {
         if (tr->d_fd_m) g_cu.cuMemFree(tr->d_fd_m);
         if (tr->d_fd_l) g_cu.cuMemFree(tr->d_fd_l);
         {
-            size_t fd_sp = (size_t)(m->fd_splits > 0 ? m->fd_splits : 8);
+            size_t fd_cap = (size_t)(cap < CM_FD_MAX_B ? cap : CM_FD_MAX_B);
+            size_t fd_sp = (size_t)CM_FD_MAX_SPLITS;
             size_t fd_v = (size_t)m->d_head;
             if (m->hybrid_2d_mode && kv_r > fd_v) fd_v = kv_r;
-            size_t n_sp = (size_t)cap * nh_l * fd_sp;
+            size_t n_sp = fd_cap * nh_l * fd_sp;
             g_cu.cuMemAlloc(&tr->d_fd_o, n_sp * fd_v * 4u);
             g_cu.cuMemAlloc(&tr->d_fd_m, n_sp * 4u);
             g_cu.cuMemAlloc(&tr->d_fd_l, n_sp * 4u);
@@ -8279,6 +9376,10 @@ static void cm_tp_ensure_bufs(CmModel* m, int B) {
     }
     if (m->h_tp_sum) g_cu.cuMemFreeHost(m->h_tp_sum);
     g_cu.cuMemHostAlloc((void**)&m->h_tp_sum, (size_t)cap * dm * 4u, CU_MEMHOSTALLOC_PORTABLE);
+    if (m->n_experts > 0) {
+        if (m->h_prlogits) g_cu.cuMemFreeHost(m->h_prlogits);
+        g_cu.cuMemHostAlloc((void**)&m->h_prlogits, (size_t)cap * (size_t)m->n_experts * 4u, CU_MEMHOSTALLOC_PORTABLE);
+    }
     m->tp_host_cap = cap;
 }
 
@@ -8293,6 +9394,10 @@ static void cm_tp_launch_gemv_dc(CmDevCtx* dc, CUstream st, CUdeviceptr w, uint3
         uint32_t nb = in_dim >> 5; void* qa[] = { &x, &dc->d_xq8, &in_dim };
         g_cu.cuLaunchKernel(dc->k_quant_q8_1, (nb + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, qa, NULL);
         xin = dc->d_xq8; fn = dc->k_gemv_q4_1_dp4a; rptg = 8;
+    } else if (gtype == CM_GGML_Q6_K && g_cu.fast_dp4a && (in_dim & 255u) == 0u && dc->k_gemv_q6k_dp4a) {
+        uint32_t nb = in_dim >> 5; void* qa[] = { &x, &dc->d_xq8, &in_dim };
+        g_cu.cuLaunchKernel(dc->k_quant_q8_1, (nb + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, qa, NULL);
+        xin = dc->d_xq8; fn = dc->k_gemv_q6k_dp4a; rptg = 16;
     } else {
         switch (gtype) {
             case CM_GGML_Q4_0:   fn = dc->k_gemv_q4;    rptg = 8; break;
@@ -8316,10 +9421,123 @@ static void cm_tp_launch_gemv_dc(CmDevCtx* dc, CUstream st, CUdeviceptr w, uint3
     g_cu.cuLaunchKernel(fn, (out_dim + rptg - 1u) / rptg, 1, 1, 128, 1, 1, 0, st, args, NULL);
 }
 
+// Tenon v12: Row-Slabbed Zero-Link Dynamic cuBLAS FP16 Tensor Core GEMM (140-182 TFLOPS on RTX 6000 Ada!)
+static int cm_launch_cublas_qgemm_dc(CmDevCtx* dc, CUstream st, CUdeviceptr w, uint32_t gtype,
+                                     CUdeviceptr x, CUdeviceptr y, uint32_t out_dim, uint32_t in_dim,
+                                     uint32_t B, uint32_t add_res) {
+    if (B < 32u || !dc || !dc->cublas || !g_cu.cublasGemmEx || !g_cu.cublasSetStream || g_cu.in_graph_capture) return 0;
+    if (gtype != CM_GGML_Q4_0 && gtype != CM_GGML_Q4_1 && gtype != CM_GGML_Q8_0 &&
+        gtype != CM_GGML_Q4_K && gtype != CM_GGML_Q6_K && gtype != CM_GGML_F16) return 0;
+    if ((gtype == CM_GGML_Q4_K || gtype == CM_GGML_Q6_K) && (in_dim & 255u) != 0u) return 0;
+    if ((gtype == CM_GGML_Q4_0 || gtype == CM_GGML_Q4_1 || gtype == CM_GGML_Q8_0) && (in_dim & 31u) != 0u) return 0;
+
+    size_t px_need = (size_t)B * (size_t)in_dim * 2u;
+    if (dc->px_f16_cap < px_need) {
+        size_t ncap = px_need < (16u * 1024u * 1024u) ? (16u * 1024u * 1024u) : px_need;
+        if (dc->d_px_f16) g_cu.cuMemFree(dc->d_px_f16);
+        if (g_cu.cuMemAlloc(&dc->d_px_f16, ncap) != CUDA_SUCCESS) { dc->d_px_f16 = 0; dc->px_f16_cap = 0; return 0; }
+        dc->px_f16_cap = ncap;
+    }
+    size_t slab_bytes = 128u * 1024u * 1024u;
+    if (gtype != CM_GGML_F16 && dc->deq_f16_cap < slab_bytes) {
+        if (dc->d_deq_f16) g_cu.cuMemFree(dc->d_deq_f16);
+        if (g_cu.cuMemAlloc(&dc->d_deq_f16, slab_bytes) != CUDA_SUCCESS) {
+            slab_bytes = 64u * 1024u * 1024u;
+            if (g_cu.cuMemAlloc(&dc->d_deq_f16, slab_bytes) != CUDA_SUCCESS) { dc->d_deq_f16 = 0; dc->deq_f16_cap = 0; return 0; }
+        }
+        dc->deq_f16_cap = slab_bytes;
+    }
+
+    uint32_t xn = B * in_dim;
+    void* fa[] = { &x, &dc->d_px_f16, &xn };
+    g_cu.cuLaunchKernel(dc->k_f32_to_f16, ((xn + 1u) / 2u + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, fa, NULL);
+
+    if (g_cu.cublasSetStream(dc->cublas, st) != CUBLAS_STATUS_SUCCESS) return 0;
+    float alpha = 1.0f, beta = add_res ? 1.0f : 0.0f;
+
+    if (gtype == CM_GGML_F16) {
+        cublasStatus_t cst = g_cu.cublasGemmEx(
+            dc->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)out_dim, (int)B, (int)in_dim,
+            &alpha,
+            (const void*)(uintptr_t)w, CUDA_R_16F, (int)in_dim,
+            (const void*)(uintptr_t)dc->d_px_f16, CUDA_R_16F, (int)in_dim,
+            &beta,
+            (void*)(uintptr_t)y, CUDA_R_32F, (int)out_dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        );
+        return (cst == CUBLAS_STATUS_SUCCESS) ? 1 : 0;
+    }
+
+    uint32_t max_rows = (uint32_t)(dc->deq_f16_cap / ((size_t)in_dim * 2u));
+    if (max_rows == 0u) return 0;
+    for (uint32_t r0 = 0; r0 < out_dim; r0 += max_rows) {
+        uint32_t nr = (out_dim - r0 < max_rows) ? (out_dim - r0) : max_rows;
+        void* da[] = { &w, &dc->d_deq_f16, &r0, &nr, &in_dim };
+        if (gtype == CM_GGML_Q4_0) {
+            uint32_t nthr = nr * (in_dim >> 5) * 4u;
+            g_cu.cuLaunchKernel(dc->k_deq_q4_0_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
+        } else if (gtype == CM_GGML_Q4_1) {
+            uint32_t nthr = nr * (in_dim >> 5) * 4u;
+            g_cu.cuLaunchKernel(dc->k_deq_q4_1_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
+        } else if (gtype == CM_GGML_Q8_0) {
+            uint32_t nthr = nr * (in_dim >> 2);
+            g_cu.cuLaunchKernel(dc->k_deq_q8_0_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
+        } else if (gtype == CM_GGML_Q4_K) {
+            uint32_t nthr = nr * (in_dim >> 8) * 32u;
+            g_cu.cuLaunchKernel(dc->k_deq_q4k_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
+        } else {
+            uint32_t nthr = nr * (in_dim >> 8) * 32u;
+            g_cu.cuLaunchKernel(dc->k_deq_q6k_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
+        }
+        CUdeviceptr y_slab = y + (uint64_t)r0 * 4ull;
+        cublasStatus_t cst = g_cu.cublasGemmEx(
+            dc->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)nr, (int)B, (int)in_dim,
+            &alpha,
+            (const void*)(uintptr_t)dc->d_deq_f16, CUDA_R_16F, (int)in_dim,
+            (const void*)(uintptr_t)dc->d_px_f16, CUDA_R_16F, (int)in_dim,
+            &beta,
+            (void*)(uintptr_t)y_slab, CUDA_R_32F, (int)out_dim,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        );
+        if (cst != CUBLAS_STATUS_SUCCESS) return 0;
+    }
+    return 1;
+}
+
 static void cm_tp_launch_gemm_dc(CmDevCtx* dc, CUstream st, CUdeviceptr w, uint32_t gtype, CUdeviceptr x, CUdeviceptr y,
                                  uint32_t out_dim, uint32_t in_dim, uint32_t B, uint32_t add_res) {
     if (B == 1u) { cm_tp_launch_gemv_dc(dc, st, w, gtype, x, y, out_dim, in_dim, add_res); return; }
+    size_t xq8_need = (size_t)B * (size_t)(in_dim >> 5) * 48u;
+    if (B >= 16u && g_cu.cc_major >= 8 && g_cu.fast_dp4a && dc->k_quant_q8_1_b && (in_dim & 31u) == 0u && xq8_need <= dc->xq8_cap) {
+        if ((gtype == CM_GGML_Q4_0 && dc->k_gemm_q4_mmq) || (gtype == CM_GGML_Q4_1 && dc->k_gemm_q4_1_mmq)) {
+            uint32_t nb = in_dim >> 5;
+            void* qa[] = { &x, &dc->d_xq8, &in_dim, &B };
+            g_cu.cuLaunchKernel(dc->k_quant_q8_1_b, (nb + 3u) / 4u, B, 1, 128, 1, 1, 0, st, qa, NULL);
+            void* args[] = { &w, &dc->d_xq8, &y, &out_dim, &in_dim, &B, &add_res };
+            CUfunction fn_mmq = (gtype == CM_GGML_Q4_0) ? dc->k_gemm_q4_mmq : dc->k_gemm_q4_1_mmq;
+            g_cu.cuLaunchKernel(fn_mmq, (out_dim + 63u) / 64u, (B + 63u) / 64u, 1, 256, 1, 1, 0, st, args, NULL);
+            return;
+        }
+    }
+    if (cm_launch_cublas_qgemm_dc(dc, st, w, gtype, x, y, out_dim, in_dim, B, add_res)) return;
     CUfunction fn = dc->k_gemm_q4_b; uint32_t tn = 64u, tb = 32u, bdim = 128u;
+    if (B <= 16u && g_cu.fast_dp4a && dc->k_quant_q8_1_b && xq8_need <= dc->xq8_cap) {
+        if ((gtype == CM_GGML_Q4_0 && dc->k_gemm_q4_dp4a_sb) ||
+            (gtype == CM_GGML_Q4_1 && dc->k_gemm_q4_1_dp4a_sb) ||
+            (gtype == CM_GGML_Q6_K && (in_dim & 255u) == 0u && dc->k_gemm_q6k_dp4a_sb)) {
+            uint32_t nb = in_dim >> 5;
+            void* qa[] = { &x, &dc->d_xq8, &in_dim, &B };
+            g_cu.cuLaunchKernel(dc->k_quant_q8_1_b, (nb + 3u) / 4u, B, 1, 128, 1, 1, 0, st, qa, NULL);
+            void* args[] = { &w, &dc->d_xq8, &y, &out_dim, &in_dim, &B, &add_res };
+            uint32_t gy = (B + 7u) / 8u;
+            if (gtype == CM_GGML_Q4_0)      g_cu.cuLaunchKernel(dc->k_gemm_q4_dp4a_sb,   (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
+            else if (gtype == CM_GGML_Q4_1) g_cu.cuLaunchKernel(dc->k_gemm_q4_1_dp4a_sb, (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
+            else                            g_cu.cuLaunchKernel(dc->k_gemm_q6k_dp4a_sb,  (out_dim + 3u) / 4u, gy, 1, 128, 1, 1, 0, st, args, NULL);
+            return;
+        }
+    }
     if (B <= 8u) {
         if (gtype == CM_GGML_Q4_0) {
             void* args[] = { &w, &x, &y, &out_dim, &in_dim, &B, &add_res };
@@ -8942,7 +10160,7 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
     m->dense_model = (m->n_experts <= 0) ? 1 : 0;
     {
         const char* fdp = getenv("TENON_CUDA_FAST_DP4A");
-        g_cu.fast_dp4a = (fdp && atoi(fdp) > 0) ? 1 : 0;
+        g_cu.fast_dp4a = (fdp && atoi(fdp) == 0) ? 0 : 1;
         m->fast_dp4a = g_cu.fast_dp4a;
         const char* ctx_e = getenv("TENON_MAX_CTX");
         int ctx = (ctx_e && atoi(ctx_e) > 0) ? atoi(ctx_e) : CM_DEFAULT_SEQ;
@@ -8968,7 +10186,13 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
         const char* fdm_e = getenv("TENON_FLASH_DECODE_MIN_LEN");
         m->fd_min_len = (fdm_e && atoi(fdm_e) > 0) ? atoi(fdm_e) : 512;
         const char* fds_e = getenv("TENON_FLASH_DECODE_SPLITS");
-        m->fd_splits = (fds_e && atoi(fds_e) >= 2 && atoi(fds_e) <= 16) ? atoi(fds_e) : 8;
+        if (fds_e && atoi(fds_e) >= 2 && atoi(fds_e) <= CM_FD_MAX_SPLITS) {
+            m->fd_splits = atoi(fds_e);
+            m->fd_splits_forced = 1;
+        } else {
+            m->fd_splits = 8;
+            m->fd_splits_forced = 0;
+        }
         const char* mla_e = getenv("TENON_MLA_LATENT_KV");
         m->mla_latent_kv = (mla_e && atoi(mla_e) == 0) ? 0 : 1;
         const char* kvs_e = getenv("TENON_KV_SLOTS");
@@ -10477,12 +11701,13 @@ static void cm_ensure_prefill_bufs(CmModel* m, int B) {
     if (m->d_fd_m) g_cu.cuMemFree(m->d_fd_m);
     if (m->d_fd_l) g_cu.cuMemFree(m->d_fd_l);
     {
-        size_t fd_sp = (size_t)(m->fd_splits > 0 ? m->fd_splits : 8);
+        size_t fd_cap = (size_t)(cap < CM_FD_MAX_B ? cap : CM_FD_MAX_B);
+        size_t fd_sp = (size_t)CM_FD_MAX_SPLITS;
         size_t fd_v = (size_t)m->d_head;
         if (m->n_layers > 0 && m->layers[0].is_mla && (size_t)(m->kv_lora_rank > 0 ? m->kv_lora_rank : 512) > fd_v) {
             fd_v = (size_t)(m->kv_lora_rank > 0 ? m->kv_lora_rank : 512);
         }
-        size_t n_sp = (size_t)cap * (size_t)m->n_heads * fd_sp;
+        size_t n_sp = fd_cap * (size_t)m->n_heads * fd_sp;
         g_cu.cuMemAlloc(&m->d_fd_o, n_sp * fd_v * 4u);
         g_cu.cuMemAlloc(&m->d_fd_m, n_sp * 4u);
         g_cu.cuMemAlloc(&m->d_fd_l, n_sp * 4u);
@@ -10495,6 +11720,34 @@ static void launch_gemm_batch_raw(CUstream st, CUdeviceptr w, uint32_t gtype, CU
     if (B == 1u) {
         launch_gemv_raw(st, w, gtype, x, y, out_dim, in_dim, add_res);
         return;
+    }
+    size_t xq8_need = (size_t)B * (size_t)(in_dim >> 5) * 48u;
+    if (B >= 16u && g_cu.cc_major >= 8 && g_cu.fast_dp4a && g_cu.k_quant_q8_1_b && (in_dim & 31u) == 0u && xq8_need <= g_cu.gpus[0].xq8_cap) {
+        if ((gtype == CM_GGML_Q4_0 && g_cu.k_gemm_q4_mmq) || (gtype == CM_GGML_Q4_1 && g_cu.k_gemm_q4_1_mmq)) {
+            uint32_t nb = in_dim >> 5;
+            void* qa[] = { &x, &g_cu.d_xq8, &in_dim, &B };
+            g_cu.cuLaunchKernel(g_cu.k_quant_q8_1_b, (nb + 3u) / 4u, B, 1, 128, 1, 1, 0, st, qa, NULL);
+            void* args[] = { &w, &g_cu.d_xq8, &y, &out_dim, &in_dim, &B, &add_res };
+            CUfunction fn_mmq = (gtype == CM_GGML_Q4_0) ? g_cu.k_gemm_q4_mmq : g_cu.k_gemm_q4_1_mmq;
+            g_cu.cuLaunchKernel(fn_mmq, (out_dim + 63u) / 64u, (B + 63u) / 64u, 1, 256, 1, 1, 0, st, args, NULL);
+            return;
+        }
+    }
+    if (cm_launch_cublas_qgemm_dc(&g_cu.gpus[0], st, w, gtype, x, y, out_dim, in_dim, B, add_res)) return;
+    if (B <= 16u && g_cu.fast_dp4a && g_cu.k_quant_q8_1_b && xq8_need <= g_cu.gpus[0].xq8_cap) {
+        if ((gtype == CM_GGML_Q4_0 && g_cu.k_gemm_q4_dp4a_sb) ||
+            (gtype == CM_GGML_Q4_1 && g_cu.k_gemm_q4_1_dp4a_sb) ||
+            (gtype == CM_GGML_Q6_K && (in_dim & 255u) == 0u && g_cu.k_gemm_q6k_dp4a_sb)) {
+            uint32_t nb = in_dim >> 5;
+            void* qa[] = { &x, &g_cu.d_xq8, &in_dim, &B };
+            g_cu.cuLaunchKernel(g_cu.k_quant_q8_1_b, (nb + 3u) / 4u, B, 1, 128, 1, 1, 0, st, qa, NULL);
+            void* args[] = { &w, &g_cu.d_xq8, &y, &out_dim, &in_dim, &B, &add_res };
+            uint32_t gy = (B + 7u) / 8u;
+            if (gtype == CM_GGML_Q4_0)      g_cu.cuLaunchKernel(g_cu.k_gemm_q4_dp4a_sb,   (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
+            else if (gtype == CM_GGML_Q4_1) g_cu.cuLaunchKernel(g_cu.k_gemm_q4_1_dp4a_sb, (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
+            else                            g_cu.cuLaunchKernel(g_cu.k_gemm_q6k_dp4a_sb,  (out_dim + 3u) / 4u, gy, 1, 128, 1, 1, 0, st, args, NULL);
+            return;
+        }
     }
     if (B <= 8u) {
         if (gtype == CM_GGML_Q4_0) {
@@ -10652,13 +11905,25 @@ static void launch_dense_ffn_batch(CmModel* m, CUstream st,
     uint32_t dm = (uint32_t)m->d_model;
     int L = m->cur_exec_layer;
     int has_lora = (m->active_lora > 0 || m->use_batch_lora) && L >= 0;
-    launch_gemm_batch_raw(st, wg, gt, m->d_pxn, m->d_pg, d_ff, dm, B, 0);
-    if (has_lora) launch_lora_delta(m, st, L, 4, m->d_pxn, m->d_pg, d_ff, dm, B);
-    launch_gemm_batch_raw(st, wu, ut, m->d_pxn, m->d_pu, d_ff, dm, B, 0);
-    if (has_lora) launch_lora_delta(m, st, L, 5, m->d_pxn, m->d_pu, d_ff, dm, B);
-    uint32_t tot = B * d_ff;
-    void* sargs[] = { &m->d_pg, &m->d_pu, &tot };
-    g_cu.cuLaunchKernel(g_cu.k_swiglu_mul, (tot + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, sargs, NULL);
+    if (B == 1u && gt == CM_GGML_Q4_0 && ut == CM_GGML_Q4_0 && !has_lora) {
+        // Tenon v12: Single-launch fused Gate+Up+SwiGLU for B=1 Paged Decode (DP4A/FP32)!
+        if (g_cu.fast_dp4a) {
+            launch_quant_q8_1(st, m->d_pxn, dm);
+            void* args[] = { &wg, &wu, &g_cu.d_xq8, &m->d_pg, &d_ff, &dm };
+            g_cu.cuLaunchKernel(g_cu.k_dense_gu_q4_dp4a, (d_ff + 7u) / 8u, 1, 1, 128, 1, 1, 0, st, args, NULL);
+        } else {
+            void* args[] = { &wg, &wu, &m->d_pxn, &m->d_pg, &d_ff, &dm };
+            g_cu.cuLaunchKernel(g_cu.k_dense_gu_q4, (d_ff + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, args, NULL);
+        }
+    } else {
+        launch_gemm_batch_raw(st, wg, gt, m->d_pxn, m->d_pg, d_ff, dm, B, 0);
+        if (has_lora) launch_lora_delta(m, st, L, 4, m->d_pxn, m->d_pg, d_ff, dm, B);
+        launch_gemm_batch_raw(st, wu, ut, m->d_pxn, m->d_pu, d_ff, dm, B, 0);
+        if (has_lora) launch_lora_delta(m, st, L, 5, m->d_pxn, m->d_pu, d_ff, dm, B);
+        uint32_t tot = B * d_ff;
+        void* sargs[] = { &m->d_pg, &m->d_pu, &tot };
+        g_cu.cuLaunchKernel(g_cu.k_swiglu_mul, (tot + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, sargs, NULL);
+    }
     launch_gemm_batch_raw(st, wd, dt, m->d_pg, m->d_px, dm, d_ff, B, 1);
     if (has_lora) launch_lora_delta(m, st, L, 6, m->d_pg, m->d_px, dm, d_ff, B);
 }
@@ -11471,9 +12736,15 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
         }
         launch_gemm_batch_raw(st, ly->wkv_a.dptr, ly->wkv_a.ggml_type, m->d_pxn, m->d_mla_kv, ldim, dm, B, 0);
         if (ly->kv_a_norm.dptr) {
-            for (uint32_t bi = 0; bi < B; bi++) {
-                CUdeviceptr cptr = m->d_mla_kv + (uint64_t)bi * ldim * 4ull;
-                launch_rmsnorm(st, cptr, &ly->kv_a_norm, cptr, kv_r, 1, m->rms_eps, 0);
+            if (g_cu.k_rmsnorm_strided) {
+                CUdeviceptr knw = ly->kv_a_norm.dptr;
+                void* kna[] = { &m->d_mla_kv, &knw, &kv_r, &ldim, &B, &m->rms_eps };
+                g_cu.cuLaunchKernel(g_cu.k_rmsnorm_strided, B, 1, 1, 256, 1, 1, 0, st, kna, NULL);
+            } else {
+                for (uint32_t bi = 0; bi < B; bi++) {
+                    CUdeviceptr cptr = m->d_mla_kv + (uint64_t)bi * ldim * 4ull;
+                    launch_rmsnorm(st, cptr, &ly->kv_a_norm, cptr, kv_r, 1, m->rms_eps, 0);
+                }
             }
         }
         void* rpe_a[] = { &m->d_pq, &m->d_mla_kv, &ly->k_cache_base, &rf, &m->d_cb_pos, &m->d_cb_slot, &m->d_pa_bt,
@@ -11482,10 +12753,10 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
         void* qa[] = { &m->d_pq, &ly->mla_wuk_f16, &m->d_mla_qabs, &nh, &dh, &nope_d, &rd, &kv_r, &B };
         g_cu.cuLaunchKernel(g_cu.k_mla_absorb_q, (ldim + 3u) / 4u, nh, B, 128, 1, 1, 0, st, qa, NULL);
         if (m->cur_use_fd && g_cu.k_flash_mla_split_paged && g_cu.k_flash_dec_reduce_paged && m->d_fd_o) {
-            uint32_t ns = (uint32_t)(m->fd_splits > 0 ? m->fd_splits : 8);
+            uint32_t ns = (uint32_t)(m->cur_fd_splits > 0 ? m->cur_fd_splits : 8);
             void* fs[] = { &m->d_mla_qabs, &ly->k_cache_base, &m->d_fd_o, &m->d_fd_m, &m->d_fd_l,
                            &m->d_cb_pos, &m->d_cb_slot, &m->d_pa_bt, &nh, &kv_r, &rd, &mla_sc, &B, &mb, &swa, &sink, &ns };
-            g_cu.cuLaunchKernel(g_cu.k_flash_mla_split_paged, nh, B, ns, 128, 1, 1, 0, st, fs, NULL);
+            g_cu.cuLaunchKernel(g_cu.k_flash_mla_split_paged, (nh + 3u) / 4u, B, ns, 128, 1, 1, 0, st, fs, NULL);
             void* fr[] = { &m->d_fd_o, &m->d_fd_m, &m->d_fd_l, &m->d_mla_olat, &nh, &kv_r, &B, &ns };
             g_cu.cuLaunchKernel(g_cu.k_flash_dec_reduce_paged, nh, B, 1, 128, 1, 1, 0, st, fr, NULL);
             m->flash_decode_launches++;
@@ -11505,9 +12776,24 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
     CUdeviceptr pq = ring_base ? (ring_base + m->dense_off_wq) : ly->wq.dptr;
     CUdeviceptr pk = ring_base ? (ring_base + m->dense_off_wk) : ly->wk.dptr;
     CUdeviceptr pv = ring_base ? (ring_base + m->dense_off_wv) : ly->wv.dptr;
-    launch_gemm_batch_raw(st, pq, ly->wq.ggml_type, m->d_pxn, m->d_pq, qdim, dm, B, 0);
-    launch_gemm_batch_raw(st, pk, ly->wk.ggml_type, m->d_pxn, m->d_pk, kvdim, dm, B, 0);
-    launch_gemm_batch_raw(st, pv, ly->wv.ggml_type, m->d_pxn, m->d_pv, kvdim, dm, B, 0);
+    int has_qkv_lora = (m->active_lora > 0 || m->use_batch_lora);
+    if (B == 1u && !has_qkv_lora &&
+        ly->wq.ggml_type == CM_GGML_Q4_0 && ly->wk.ggml_type == CM_GGML_Q4_0 && ly->wv.ggml_type == CM_GGML_Q4_0) {
+        // Tenon v12: Single-launch fused Q||K||V for B=1 Paged Decode (DP4A/FP32)!
+        uint32_t tot = qdim + kvdim + kvdim;
+        if (g_cu.fast_dp4a) {
+            launch_quant_q8_1(st, m->d_pxn, dm);
+            void* qargs[] = { &pq, &pk, &pv, &g_cu.d_xq8, &m->d_pq, &m->d_pk, &m->d_pv, &qdim, &kvdim, &dm };
+            g_cu.cuLaunchKernel(g_cu.k_gemv_qkv_q4_dp4a, (tot + 15u) / 16u, 1, 1, 128, 1, 1, 0, st, qargs, NULL);
+        } else {
+            void* qargs[] = { &pq, &pk, &pv, &m->d_pxn, &m->d_pq, &m->d_pk, &m->d_pv, &qdim, &kvdim, &dm };
+            g_cu.cuLaunchKernel(g_cu.k_gemv_qkv_q4, (tot + 7u) / 8u, 1, 1, 128, 1, 1, 0, st, qargs, NULL);
+        }
+    } else {
+        launch_gemm_batch_raw(st, pq, ly->wq.ggml_type, m->d_pxn, m->d_pq, qdim, dm, B, 0);
+        launch_gemm_batch_raw(st, pk, ly->wk.ggml_type, m->d_pxn, m->d_pk, kvdim, dm, B, 0);
+        launch_gemm_batch_raw(st, pv, ly->wv.ggml_type, m->d_pxn, m->d_pv, kvdim, dm, B, 0);
+    }
     if (m->active_lora > 0 || m->use_batch_lora) {
         launch_lora_delta(m, st, L, 0, m->d_pxn, m->d_pq, qdim, dm, B);
         launch_lora_delta(m, st, L, 1, m->d_pxn, m->d_pk, kvdim, dm, B);
@@ -11550,13 +12836,20 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
         g_cu.cuLaunchKernel(g_cu.k_rope_kv_paged, (hd2 + 31u) / 32u, nh, B, 32, 1, 1, 0, st, ra, NULL);
     }
     if (m->cur_use_fd && g_cu.k_flash_dec_split_paged && g_cu.k_flash_dec_reduce_paged && m->d_fd_o) {
-        uint32_t kvm = (uint32_t)m->kv_quant_q8, ns = (uint32_t)(m->fd_splits > 0 ? m->fd_splits : 8);
+        uint32_t kvm = (uint32_t)m->kv_quant_q8, ns = (uint32_t)(m->cur_fd_splits > 0 ? m->cur_fd_splits : 8);
+        uint32_t grp = (nh / nkv) > 0u ? (nh / nkv) : 1u;
+        uint32_t gstep = (grp < 8u ? grp : 8u);
+        uint32_t n_gchunks = (grp + gstep - 1u) / gstep;
         void* fs[] = { &m->d_pq, &ly->k_cache_base, &ly->v_cache_base, &m->d_fd_o, &m->d_fd_m, &m->d_fd_l,
-                       &m->d_cb_pos, &m->d_cb_slot, &m->d_pa_bt, &nh, &nkv, &dh, &B, &sc, &mb, &swa, &sink, &kvm, &ns };
-        g_cu.cuLaunchKernel(g_cu.k_flash_dec_split_paged, nh, B, ns, 128, 1, 1, 0, st, fs, NULL);
+                       &m->d_cb_pos, &m->d_cb_slot, &m->d_pa_bt, &nh, &nkv, &dh, &B, &sc, &mb, &swa, &sink, &kvm, &ns, &gstep };
+        g_cu.cuLaunchKernel(g_cu.k_flash_dec_split_paged, nkv * n_gchunks, B, ns, gstep * 32u, 1, 1, 0, st, fs, NULL);
         void* fr[] = { &m->d_fd_o, &m->d_fd_m, &m->d_fd_l, &m->d_pctx, &nh, &dh, &B, &ns };
         g_cu.cuLaunchKernel(g_cu.k_flash_dec_reduce_paged, nh, B, 1, 128, 1, 1, 0, st, fr, NULL);
         m->flash_decode_launches++;
+    } else if (m->cur_is_prefill && B >= 16u && m->kv_quant_q8 == 0 && dh <= 128u && (dh & 3u) == 0u && g_cu.k_flash_prefill_paged_fp16) {
+        void* aa[] = { &m->d_pq, &ly->k_cache_base, &ly->v_cache_base, &m->d_pctx,
+                       &m->d_cb_pos, &m->d_cb_slot, &m->d_pa_bt, &nh, &nkv, &dh, &B, &sc, &mb, &swa, &sink };
+        g_cu.cuLaunchKernel(g_cu.k_flash_prefill_paged_fp16, nh, (B + 7u) / 8u, 1, 128, 1, 1, 0, st, aa, NULL);
     } else {
         CUfunction afn = (m->kv_quant_q8 == 3) ? g_cu.k_flash_dec_q4_paged
                        : (m->kv_quant_q8 == 2) ? g_cu.k_flash_dec_fp8_paged
@@ -11683,11 +12976,17 @@ static void cm_tp_paged_forward_body(CmModel* m, uint32_t B, int need_batch_argm
                 }
                 cm_tp_launch_gemm_dc(dc, st, tl->wkv_a.dptr, tl->wkv_a.ggml_type, tr->d_xn, tr->d_mla_kv, ldim, dm, B, 0);
                 if (tl->kv_a_norm.dptr) {
-                    uint32_t one = 1u, zero_u = 0u; CUdeviceptr knw = tl->kv_a_norm.dptr;
-                    for (uint32_t bi = 0; bi < B; bi++) {
-                        CUdeviceptr cptr = tr->d_mla_kv + (uint64_t)bi * ldim * 4ull;
-                        void* kna[] = { &cptr, &knw, &cptr, &kv_r, &one, &m->rms_eps, &zero_u };
-                        g_cu.cuLaunchKernel(dc->k_rmsnorm, 1, 1, 1, 256, 1, 1, 0, st, kna, NULL);
+                    CUdeviceptr knw = tl->kv_a_norm.dptr;
+                    if (dc->k_rmsnorm_strided) {
+                        void* kna[] = { &tr->d_mla_kv, &knw, &kv_r, &ldim, &B, &m->rms_eps };
+                        g_cu.cuLaunchKernel(dc->k_rmsnorm_strided, B, 1, 1, 256, 1, 1, 0, st, kna, NULL);
+                    } else {
+                        uint32_t one = 1u, zero_u = 0u;
+                        for (uint32_t bi = 0; bi < B; bi++) {
+                            CUdeviceptr cptr = tr->d_mla_kv + (uint64_t)bi * ldim * 4ull;
+                            void* kna[] = { &cptr, &knw, &cptr, &kv_r, &one, &m->rms_eps, &zero_u };
+                            g_cu.cuLaunchKernel(dc->k_rmsnorm, 1, 1, 1, 256, 1, 1, 0, st, kna, NULL);
+                        }
                     }
                 }
                 void* rpe_a[] = { &tr->d_q, &tr->d_mla_kv, &tl->k_cache_base, &rf, &tr->d_cb_pos, &tr->d_cb_slot, &tr->d_pa_bt,
@@ -11696,10 +12995,10 @@ static void cm_tp_paged_forward_body(CmModel* m, uint32_t B, int need_batch_argm
                 void* qa[] = { &tr->d_q, &tl->mla_wuk_f16, &tr->d_mla_qabs, &nh_l, &dh, &nope_d, &rd, &kv_r, &B };
                 g_cu.cuLaunchKernel(dc->k_mla_absorb_q, (ldim + 3u) / 4u, nh_l, B, 128, 1, 1, 0, st, qa, NULL);
                 if (m->cur_use_fd && dc->k_flash_mla_split_paged && dc->k_flash_dec_reduce_paged && tr->d_fd_o) {
-                    uint32_t ns = (uint32_t)(m->fd_splits > 0 ? m->fd_splits : 8);
+                    uint32_t ns = (uint32_t)(m->cur_fd_splits > 0 ? m->cur_fd_splits : 8);
                     void* fs[] = { &tr->d_mla_qabs, &tl->k_cache_base, &tr->d_fd_o, &tr->d_fd_m, &tr->d_fd_l,
                                    &tr->d_cb_pos, &tr->d_cb_slot, &tr->d_pa_bt, &nh_l, &kv_r, &rd, &mla_sc, &B, &mb, &swa, &sink, &ns };
-                    g_cu.cuLaunchKernel(dc->k_flash_mla_split_paged, nh_l, B, ns, 128, 1, 1, 0, st, fs, NULL);
+                    g_cu.cuLaunchKernel(dc->k_flash_mla_split_paged, (nh_l + 3u) / 4u, B, ns, 128, 1, 1, 0, st, fs, NULL);
                     void* fr[] = { &tr->d_fd_o, &tr->d_fd_m, &tr->d_fd_l, &tr->d_mla_olat, &nh_l, &kv_r, &B, &ns };
                     g_cu.cuLaunchKernel(dc->k_flash_dec_reduce_paged, nh_l, B, 1, 128, 1, 1, 0, st, fr, NULL);
                     if (r == 0) m->flash_decode_launches++;
@@ -11739,13 +13038,20 @@ static void cm_tp_paged_forward_body(CmModel* m, uint32_t B, int need_batch_argm
                     g_cu.cuLaunchKernel(dc->k_rope_kv_paged, (hd2 + 31u) / 32u, nh_l, B, 32, 1, 1, 0, st, ra, NULL);
                 }
                 if (m->cur_use_fd && dc->k_flash_dec_split_paged && dc->k_flash_dec_reduce_paged && tr->d_fd_o) {
-                    uint32_t kvm = (uint32_t)m->kv_quant_q8, ns = (uint32_t)(m->fd_splits > 0 ? m->fd_splits : 8);
+                    uint32_t kvm = (uint32_t)m->kv_quant_q8, ns = (uint32_t)(m->cur_fd_splits > 0 ? m->cur_fd_splits : 8);
+                    uint32_t grp = (nh_l / nkv_l) > 0u ? (nh_l / nkv_l) : 1u;
+                    uint32_t gstep = (grp < 8u ? grp : 8u);
+                    uint32_t n_gchunks = (grp + gstep - 1u) / gstep;
                     void* fs[] = { &tr->d_q, &tl->k_cache_base, &tl->v_cache_base, &tr->d_fd_o, &tr->d_fd_m, &tr->d_fd_l,
-                                   &tr->d_cb_pos, &tr->d_cb_slot, &tr->d_pa_bt, &nh_l, &nkv_l, &dh, &B, &sc, &mb, &swa, &sink, &kvm, &ns };
-                    g_cu.cuLaunchKernel(dc->k_flash_dec_split_paged, nh_l, B, ns, 128, 1, 1, 0, st, fs, NULL);
+                                   &tr->d_cb_pos, &tr->d_cb_slot, &tr->d_pa_bt, &nh_l, &nkv_l, &dh, &B, &sc, &mb, &swa, &sink, &kvm, &ns, &gstep };
+                    g_cu.cuLaunchKernel(dc->k_flash_dec_split_paged, nkv_l * n_gchunks, B, ns, gstep * 32u, 1, 1, 0, st, fs, NULL);
                     void* fr[] = { &tr->d_fd_o, &tr->d_fd_m, &tr->d_fd_l, &tr->d_ctx, &nh_l, &dh, &B, &ns };
                     g_cu.cuLaunchKernel(dc->k_flash_dec_reduce_paged, nh_l, B, 1, 128, 1, 1, 0, st, fr, NULL);
                     if (r == 0) m->flash_decode_launches++;
+                } else if (m->cur_is_prefill && B >= 16u && m->kv_quant_q8 == 0 && dh <= 128u && (dh & 3u) == 0u && dc->k_flash_prefill_paged_fp16) {
+                    void* aa[] = { &tr->d_q, &tl->k_cache_base, &tl->v_cache_base, &tr->d_ctx,
+                                   &tr->d_cb_pos, &tr->d_cb_slot, &tr->d_pa_bt, &nh_l, &nkv_l, &dh, &B, &sc, &mb, &swa, &sink };
+                    g_cu.cuLaunchKernel(dc->k_flash_prefill_paged_fp16, nh_l, (B + 7u) / 8u, 1, 128, 1, 1, 0, st, aa, NULL);
                 } else {
                     CUfunction afn = (m->kv_quant_q8 == 3) ? dc->k_flash_dec_q4_paged
                                    : (m->kv_quant_q8 == 2) ? dc->k_flash_dec_fp8_paged
@@ -11836,12 +13142,12 @@ static void cm_tp_paged_forward_body(CmModel* m, uint32_t B, int need_batch_argm
                 }
                 if (r == 0 && ly0->has_shared_exp) {
                     uint32_t sh_ff = (ly0->sh_gate.ne1 > 0) ? (uint32_t)ly0->sh_gate.ne1 : df;
-                    cm_tp_launch_gemm_dc(dc, st, ly0->sh_gate.dptr, ly0->sh_gate.ggml_type, tr->d_xn, m->d_pg, sh_ff, dm, B, 0);
-                    cm_tp_launch_gemm_dc(dc, st, ly0->sh_up.dptr,   ly0->sh_up.ggml_type,   tr->d_xn, m->d_pu, sh_ff, dm, B, 0);
+                    cm_tp_launch_gemm_dc(dc, st, ly0->sh_gate.dptr, ly0->sh_gate.ggml_type, tr->d_xn, tr->d_g, sh_ff, dm, B, 0);
+                    cm_tp_launch_gemm_dc(dc, st, ly0->sh_up.dptr,   ly0->sh_up.ggml_type,   tr->d_xn, tr->d_u, sh_ff, dm, B, 0);
                     uint32_t stot = B * sh_ff;
-                    void* swa_a[] = { &m->d_pg, &m->d_pu, &stot };
+                    void* swa_a[] = { &tr->d_g, &tr->d_u, &stot };
                     g_cu.cuLaunchKernel(dc->k_swiglu_mul, (stot + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, swa_a, NULL);
-                    cm_tp_launch_gemm_dc(dc, st, ly0->sh_down.dptr, ly0->sh_down.ggml_type, m->d_pg, tr->d_tp_part, dm, sh_ff, B, 0);
+                    cm_tp_launch_gemm_dc(dc, st, ly0->sh_down.dptr, ly0->sh_down.ggml_type, tr->d_g, tr->d_tp_part, dm, sh_ff, B, 0);
                 } else {
                     if (g_cu.cuMemsetD8Async) g_cu.cuMemsetD8Async(tr->d_tp_part, 0, (size_t)B * dm * 4u, st);
                     else g_cu.cuMemsetD8(tr->d_tp_part, 0, (size_t)B * dm * 4u);
@@ -11961,9 +13267,11 @@ static int64_t cm_tp_paged_forward_batch(CmModel* m, const int64_t* ids, const u
             for (uint32_t bi = 0; bi < B; bi++) { out_argmax_all[bi] = (int64_t)m->h_argmax_batch[bi]; last_tok = out_argmax_all[bi]; }
             return last_tok;
         }
+        int cur_sp = m->cur_fd_splits > 0 ? m->cur_fd_splits : 8;
         int hit = -1;
         for (int ci = 0; ci < CM_CB_GRAPH_MAX; ci++) {
-            if (m->tp_graph_cache[ci].valid && m->tp_graph_cache[ci].B == B && m->tp_graph_cache[ci].use_fd == use_fd) {
+            if (m->tp_graph_cache[ci].valid && m->tp_graph_cache[ci].B == B &&
+                m->tp_graph_cache[ci].use_fd == use_fd && (!use_fd || m->tp_graph_cache[ci].fd_splits == cur_sp)) {
                 hit = ci; break;
             }
         }
@@ -12005,7 +13313,9 @@ static int64_t cm_tp_paged_forward_batch(CmModel* m, const int64_t* ids, const u
         CUgraphExec execs[CM_MAX_TP] = {0};
         if (cap_ok) {
             m->tp_in_graph_capture = 1;
+            g_cu.in_graph_capture = 1;
             cm_tp_paged_forward_body(m, B, 1);
+            g_cu.in_graph_capture = 0;
             m->tp_in_graph_capture = 0;
         }
         m->flash_decode_launches = prev_fd;
@@ -12046,6 +13356,7 @@ static int64_t cm_tp_paged_forward_batch(CmModel* m, const int64_t* ids, const u
             m->tp_graph_cache[ev].valid = 1;
             m->tp_graph_cache[ev].B = B;
             m->tp_graph_cache[ev].use_fd = use_fd;
+            m->tp_graph_cache[ev].fd_splits = cur_sp;
             m->tp_graph_cache[ev].n_moe_layers = (int)(m->moe_mega_launches - prev_mega);
             for (int r = 0; r < P; r++) m->tp_graph_cache[ev].exec[r] = execs[r];
             m->tp_graph_captured++;
@@ -12212,7 +13523,17 @@ int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr
         if (p > max_pos) max_pos = p;
     }
     int use_fd = (m->fd_enabled && (max_pos + 1 >= m->fd_min_len) && B <= 8u) ? 1 : 0;
+    int cur_sp = m->fd_splits;
+    if (use_fd && !m->fd_splits_forced) {
+        int kv_l = max_pos + 1;
+        if (kv_l >= 4096 && B == 1u && (m->n_kv <= 8 || (m->n_layers > 0 && m->layers[0].is_mla))) cur_sp = 64;
+        else if (kv_l >= 1536) cur_sp = (B <= 2u && (m->n_kv <= 8 || (m->n_layers > 0 && m->layers[0].is_mla))) ? 32 : 16;
+        else if (kv_l >= 512) cur_sp = 16;
+        else cur_sp = 8;
+    }
     m->cur_use_fd = use_fd;
+    m->cur_fd_splits = cur_sp;
+    m->cur_is_prefill = 0;
     if (m->tp_size > 1 && m->tp) {
         cm_tp_ensure_bufs(m, (int)B);
         cm_pa_sync_bt(m);
@@ -12251,7 +13572,8 @@ int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr
         int hit = -1;
         for (int ci = 0; ci < CM_CB_GRAPH_MAX; ci++) {
             if (m->cb_graph_cache[ci].valid && m->cb_graph_cache[ci].B == B &&
-                m->cb_graph_cache[ci].lora_sig == lora_sig && m->cb_graph_cache[ci].use_fd == use_fd) {
+                m->cb_graph_cache[ci].lora_sig == lora_sig && m->cb_graph_cache[ci].use_fd == use_fd &&
+                (!use_fd || m->cb_graph_cache[ci].fd_splits == cur_sp)) {
                 hit = ci; break;
             }
         }
@@ -12273,6 +13595,7 @@ int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr
         int64_t prev_mega = m->moe_mega_launches;
         int64_t prev_fd = m->flash_decode_launches;
         if (g_cu.cuStreamBeginCapture(m->compute_stream, 2) == CUDA_SUCCESS) {
+            g_cu.in_graph_capture = 1;
             CUdeviceptr ep = m->tok_embd.dptr;
             void* eargs[] = { &ep, &m->d_cb_tok, &m->d_px, &dm, &gt, &B };
             g_cu.cuLaunchKernel(g_cu.k_embed_batch, (dm + 255u) / 256u, B, 1, 256, 1, 1, 0, m->compute_stream, eargs, NULL);
@@ -12286,6 +13609,7 @@ int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr
             if (m->d_last_hidden) {
                 g_cu.cuMemcpyDtoDAsync(m->d_last_hidden, m->d_px + (uint64_t)(B - 1u) * (uint64_t)dm * 4ull, (size_t)dm * 4u, m->compute_stream);
             }
+            g_cu.in_graph_capture = 0;
             m->flash_decode_launches = prev_fd;
             if (g_cu.cuStreamEndCapture(m->compute_stream, &gr) == CUDA_SUCCESS && gr) {
                 CUgraphExec gexec = NULL;
@@ -12304,6 +13628,7 @@ int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr
                     m->cb_graph_cache[ev].B = B;
                     m->cb_graph_cache[ev].lora_sig = lora_sig;
                     m->cb_graph_cache[ev].use_fd = use_fd;
+                    m->cb_graph_cache[ev].fd_splits = cur_sp;
                     m->cb_graph_cache[ev].n_moe_layers = (int)(m->moe_mega_launches - prev_mega);
                     m->cb_graph_cache[ev].exec = gexec;
                     m->cb_graph_captured++;
@@ -12393,8 +13718,11 @@ int64_t tn_cumoe_paged_prefill(int64_t handle, int64_t slot_id, int64_t tok_ids_
     double t0 = cm_now_ms();
     int64_t last_tok = 0;
     int s = (int)slot_id; if (s < 0 || s >= CM_PA_MAX_SEQS) s = 0;
-    int chunk_sz = 64;
+    int chunk_sz = (m->d_model <= 2560 && !(m->n_layers > 0 && m->layers[0].is_mla) && m->n_experts == 0) ? 512
+                 : (m->d_model <= 4096 ? 256 : 128);
+    if (chunk_sz > CM_PREFILL_MAX_B) chunk_sz = CM_PREFILL_MAX_B;
     m->cur_use_fd = 0;
+    m->cur_is_prefill = 1;
     if (m->tp_size > 1 && m->tp) {
         int64_t off = 0;
         while (off < n_toks) {
@@ -12402,7 +13730,7 @@ int64_t tn_cumoe_paged_prefill(int64_t handle, int64_t slot_id, int64_t tok_ids_
             uint32_t p_arr[CM_PREFILL_MAX_B], s_arr[CM_PREFILL_MAX_B];
             for (uint32_t b = 0; b < B; b++) {
                 int p = (int)(start_pos + off + b);
-                if (!cm_pa_ensure_slot_pos(m, s, p)) return 0;
+                if (!cm_pa_ensure_slot_pos(m, s, p)) { m->cur_is_prefill = 0; return 0; }
                 p_arr[b] = (uint32_t)p; s_arr[b] = (uint32_t)s;
             }
             cm_tp_ensure_bufs(m, (int)B);
@@ -12410,37 +13738,47 @@ int64_t tn_cumoe_paged_prefill(int64_t handle, int64_t slot_id, int64_t tok_ids_
             last_tok = cm_tp_paged_forward_batch(m, ids + off, p_arr, s_arr, B, NULL);
             off += B;
         }
+        m->cur_is_prefill = 0;
         m->last_total_ms = cm_now_ms() - t0;
         return last_tok;
     }
-    cm_ensure_prefill_bufs(m, chunk_sz);
+    int alloc_b = (int)(n_toks < chunk_sz ? n_toks : chunk_sz);
+    cm_ensure_prefill_bufs(m, alloc_b);
     uint32_t dm = (uint32_t)m->d_model, gt = m->tok_embd.ggml_type;
     int64_t off = 0;
     while (off < n_toks) {
         uint32_t B = (uint32_t)((n_toks - off > chunk_sz) ? chunk_sz : (n_toks - off));
-        uint32_t p_arr[CM_PREFILL_MAX_B], s_arr[CM_PREFILL_MAX_B];
+        uint32_t t_arr[CM_PREFILL_MAX_B], p_arr[CM_PREFILL_MAX_B], s_arr[CM_PREFILL_MAX_B];
         for (uint32_t b = 0; b < B; b++) {
             int p = (int)(start_pos + off + b);
-            if (!cm_pa_ensure_slot_pos(m, s, p)) return 0;
+            if (!cm_pa_ensure_slot_pos(m, s, p)) { m->cur_is_prefill = 0; return 0; }
+            t_arr[b] = (uint32_t)ids[off + b];
             p_arr[b] = (uint32_t)p; s_arr[b] = (uint32_t)s;
         }
         cm_pa_sync_bt(m);
         g_cu.cuMemcpyHtoDAsync(m->d_cb_pos,  p_arr, (size_t)B * 4u, m->compute_stream);
         g_cu.cuMemcpyHtoDAsync(m->d_cb_slot, s_arr, (size_t)B * 4u, m->compute_stream);
-        for (uint32_t bi = 0; bi < B; bi++) {
-            CUdeviceptr dst = m->d_px + (uint64_t)bi * (uint64_t)dm * 4ull;
-            uint32_t tid = (uint32_t)ids[off + bi];
-            if (m->resident_mode && m->tok_embd.dptr) {
-                CUdeviceptr ep = m->tok_embd.dptr;
-                void* args[] = { &ep, &dst, &tid, &dm, &gt };
-                g_cu.cuLaunchKernel(g_cu.k_embed, (dm + 255u) / 256u, 1, 1, 256, 1, 1, 0, m->compute_stream, args, NULL);
-            } else {
-                uint64_t rb = cm_ggml_type_bytes(gt, (uint64_t)dm);
-                cm_read_slice(m, m->tok_embd.shard_idx, m->h_emb_row, (size_t)rb, m->tok_embd.file_off + (uint64_t)tid * rb);
-                g_cu.cuMemcpyHtoD(m->d_emb_row, m->h_emb_row, (size_t)rb);
-                uint32_t z = 0; void* args[] = { &m->d_emb_row, &dst, &z, &dm, &gt };
-                g_cu.cuLaunchKernel(g_cu.k_embed, (dm + 255u) / 256u, 1, 1, 256, 1, 1, 0, m->compute_stream, args, NULL);
-                g_cu.cuStreamSynchronize(m->compute_stream);
+        if (m->resident_mode && m->tok_embd.dptr && g_cu.k_embed_batch && m->d_cb_tok) {
+            g_cu.cuMemcpyHtoDAsync(m->d_cb_tok, t_arr, (size_t)B * 4u, m->compute_stream);
+            CUdeviceptr ep = m->tok_embd.dptr;
+            void* eargs[] = { &ep, &m->d_cb_tok, &m->d_px, &dm, &gt, &B };
+            g_cu.cuLaunchKernel(g_cu.k_embed_batch, (dm + 255u) / 256u, B, 1, 256, 1, 1, 0, m->compute_stream, eargs, NULL);
+        } else {
+            for (uint32_t bi = 0; bi < B; bi++) {
+                CUdeviceptr dst = m->d_px + (uint64_t)bi * (uint64_t)dm * 4ull;
+                uint32_t tid = t_arr[bi];
+                if (m->resident_mode && m->tok_embd.dptr) {
+                    CUdeviceptr ep = m->tok_embd.dptr;
+                    void* args[] = { &ep, &dst, &tid, &dm, &gt };
+                    g_cu.cuLaunchKernel(g_cu.k_embed, (dm + 255u) / 256u, 1, 1, 256, 1, 1, 0, m->compute_stream, args, NULL);
+                } else {
+                    uint64_t rb = cm_ggml_type_bytes(gt, (uint64_t)dm);
+                    cm_read_slice(m, m->tok_embd.shard_idx, m->h_emb_row, (size_t)rb, m->tok_embd.file_off + (uint64_t)tid * rb);
+                    g_cu.cuMemcpyHtoD(m->d_emb_row, m->h_emb_row, (size_t)rb);
+                    uint32_t z = 0; void* args[] = { &m->d_emb_row, &dst, &z, &dm, &gt };
+                    g_cu.cuLaunchKernel(g_cu.k_embed, (dm + 255u) / 256u, 1, 1, 256, 1, 1, 0, m->compute_stream, args, NULL);
+                    g_cu.cuStreamSynchronize(m->compute_stream);
+                }
             }
         }
         cm_run_dense_paged_layers_batch(m, B);
@@ -12460,6 +13798,7 @@ int64_t tn_cumoe_paged_prefill(int64_t handle, int64_t slot_id, int64_t tok_ids_
         }
         off += B;
     }
+    m->cur_is_prefill = 0;
     m->last_total_ms = cm_now_ms() - t0;
     return last_tok;
 }
