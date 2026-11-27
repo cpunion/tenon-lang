@@ -53,7 +53,13 @@ extern "C" {
     fn tn_cumoe_mmproj_load(path_cstr Ptr[UInt8]) Int
     fn tn_cumoe_mmproj_info(mm_h Int, field_id Int) Int
     fn tn_cumoe_mmproj_encode_rgb(mm_h Int, rgb_u8_ptr Ptr[UInt8], width Int, height Int, out_embd_ptr Ptr[UInt8], max_vecs Int) Int
+    fn tn_cumoe_mmproj_encode_anyres(mm_h Int, rgb_u8_ptr Ptr[UInt8], width Int, height Int, max_tiles Int, out_embd_ptr Ptr[UInt8], max_vecs Int) Int
     fn tn_cumoe_mmproj_free(mm_h Int) Int
+    fn tn_cumoe_set_mrope_pos(handle Int, pos_t Int, pos_h Int, pos_w Int) Int
+    fn tn_cumoe_lora_load(handle Int, path_cstr Ptr[UInt8], scale Float) Int
+    fn tn_cumoe_lora_set(handle Int, lora_id Int, scale Float) Int
+    fn tn_cumoe_lora_free(handle Int, lora_id Int) Int
+    fn tn_cumoe_lora_info(handle Int, lora_id Int, field_id Int) Int
     fn tn_cumoe_auto_plan(path_cstr Ptr[UInt8], max_vram_gb Float, max_ctx Int, kv_mode Int, out_plan_ptr Ptr[UInt8]) Int
     fn tn_cumoe_sample_next(
         handle Int, tok_id Int, pos Int,

@@ -100,6 +100,16 @@ pub struct GpuOptConfig {
     pub moe_ep_nccl: bool,
     /// #25: Tree-Attention Speculative Masking (`verify_tree`) + Native MTP `nextn` Block + Vision `mmproj` Soft-Prompt Injection.
     pub tree_spec_mtp_mm: bool,
+    /// #27: Cross-Chip Small-Batch (`B=2..8`) Coalesced Shared-X `half4`/`half2` W4A16/Q4_1/Q4_K/Q6_K Dispatch (Metal + CUDA + TPU).
+    pub small_batch_shared_x: bool,
+    /// #28: 2D Hybrid Tensor × Expert Parallelism (`TP × EP`) Co-Located/Orthogonal Mesh + Resident MoE Direct Fast-Path.
+    pub hybrid_2d_tp_ep: bool,
+    /// #29: Chunked Prefill Interleaved Continuous Batching + Adaptive Low-Concurrency Speculative Fusion.
+    pub chunked_prefill_cb: bool,
+    /// #30: Zero-Copy Runtime GGUF Multi-Adapter LoRA Hot-Swapping (`y += (scale/r) * B(Ax)` sharing base weights & PagedKV).
+    pub multi_lora_zero_copy: bool,
+    /// #31: Multi-Image AnyRes Vision + 2D/3D MRoPE + Native `FP8_E4M3` & OCP `MXFP4` (`E2M1`+`E8M0`) Cross-Chip Kernels.
+    pub anyres_mrope_fp8_mxfp4: bool,
 
     /// Optional SPMD device count (`1` = single device, `>1` = auto-sharded multi-device SPMD).
     pub spmd_devices: usize,
@@ -148,6 +158,11 @@ impl GpuOptConfig {
             marlin_w4a16_mma: false,
             moe_ep_nccl: false,
             tree_spec_mtp_mm: false,
+            small_batch_shared_x: false,
+            hybrid_2d_tp_ep: false,
+            chunked_prefill_cb: false,
+            multi_lora_zero_copy: false,
+            anyres_mrope_fp8_mxfp4: false,
             spmd_devices: 1,
             force_tile: None,
         }
@@ -213,6 +228,11 @@ impl GpuOptConfig {
         c.marlin_w4a16_mma = true;
         c.moe_ep_nccl = true;
         c.tree_spec_mtp_mm = true;
+        c.small_batch_shared_x = true;
+        c.hybrid_2d_tp_ep = true;
+        c.chunked_prefill_cb = true;
+        c.multi_lora_zero_copy = true;
+        c.anyres_mrope_fp8_mxfp4 = true;
         c
     }
 
@@ -311,6 +331,11 @@ impl GpuOptConfig {
                         "marlin_w4a16_mma" | "marlin" => cfg.marlin_w4a16_mma = enable,
                         "moe_ep_nccl" | "ep" | "nccl" => cfg.moe_ep_nccl = enable,
                         "tree_spec_mtp_mm" | "tree_spec" | "mtp" | "mmproj" => cfg.tree_spec_mtp_mm = enable,
+                        "small_batch_shared_x" | "small_b" | "shared_x" => cfg.small_batch_shared_x = enable,
+                        "hybrid_2d_tp_ep" | "tp_ep" | "2d_mesh" => cfg.hybrid_2d_tp_ep = enable,
+                        "chunked_prefill_cb" | "chunked_prefill" => cfg.chunked_prefill_cb = enable,
+                        "multi_lora_zero_copy" | "lora" => cfg.multi_lora_zero_copy = enable,
+                        "anyres_mrope_fp8_mxfp4" | "mrope" | "fp8_mxfp4" => cfg.anyres_mrope_fp8_mxfp4 = enable,
                         _ => {}
                     }
                 }
@@ -360,6 +385,11 @@ impl GpuOptConfig {
         if self.marlin_w4a16_mma { on.push("marlin"); }
         if self.moe_ep_nccl { on.push("ep_nccl"); }
         if self.tree_spec_mtp_mm { on.push("tree_mtp_mm"); }
+        if self.small_batch_shared_x { on.push("sb_shx"); }
+        if self.hybrid_2d_tp_ep { on.push("2d_tpep"); }
+        if self.chunked_prefill_cb { on.push("chunk_pf"); }
+        if self.multi_lora_zero_copy { on.push("lora"); }
+        if self.anyres_mrope_fp8_mxfp4 { on.push("mrope_fp8_fp4"); }
         if self.spmd_devices > 1 {
             on.push("spmd_multi");
         }

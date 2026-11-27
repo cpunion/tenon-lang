@@ -76,6 +76,13 @@ pub struct HeteroStreamPlan {
     pub tree_spec_width: usize,
     pub mtp_nextn_layers: usize,
     pub vision_mmproj_tokens: usize,
+    pub small_batch_shared_x: bool,
+    pub hybrid_2d_tp_ep: bool,
+    pub chunked_prefill_size: usize,
+    pub lora_max_rank: usize,
+    pub vision_anyres_tiles: usize,
+    pub vision_mrope_2d: bool,
+    pub fp8_mxfp4_native: bool,
     pub dispatch_mode: HeteroDispatchMode,
     pub numa_repack_weights: Vec<(String, LayoutTag)>,
     pub projected_decode_tok_s: f64,
@@ -119,6 +126,13 @@ impl Default for HeteroStreamPlan {
             tree_spec_width: 0,
             mtp_nextn_layers: 0,
             vision_mmproj_tokens: 0,
+            small_batch_shared_x: false,
+            hybrid_2d_tp_ep: false,
+            chunked_prefill_size: 0,
+            lora_max_rank: 0,
+            vision_anyres_tiles: 0,
+            vision_mrope_2d: false,
+            fp8_mxfp4_native: false,
             dispatch_mode: HeteroDispatchMode::ResidentGpu,
             numa_repack_weights: Vec::new(),
             projected_decode_tok_s: 0.0,
@@ -172,6 +186,11 @@ pub fn plan_hetero_stream(
     let mut mtp_nextn_layers: usize = 0;
     let mut vision_mmproj_tokens: usize = 0;
     let mut radix_prefix_cache: bool = cfg.vram_budget_plan;
+    let mut chunked_prefill_size: usize = if cfg.chunked_prefill_cb { 128 } else { 0 };
+    let mut lora_max_rank: usize = 0;
+    let mut vision_anyres_tiles: usize = 1;
+    let mut vision_mrope_2d: bool = false;
+    let mut fp8_mxfp4_native: bool = cfg.anyres_mrope_fp8_mxfp4;
 
     if let Some(rest) = g.attr_mode.strip_prefix("stream:") {
         for part in rest.split(',') {
@@ -271,6 +290,23 @@ pub fn plan_hetero_stream(
                         vision_mmproj_tokens = n;
                     }
                 }
+                "chunk_pf" | "prefill_chunk" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        chunked_prefill_size = n;
+                    }
+                }
+                "lora" | "lora_rank" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        lora_max_rank = n;
+                    }
+                }
+                "anyres" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        vision_anyres_tiles = n.max(1);
+                    }
+                }
+                "mrope" => vision_mrope_2d = v != "0" && v != "false",
+                "fp8_mxfp4" => fp8_mxfp4_native = v != "0" && v != "false",
                 "prefix" => radix_prefix_cache = v != "0" && v != "false",
                 _ => {}
             }
@@ -508,6 +544,13 @@ pub fn plan_hetero_stream(
         tree_spec_width,
         mtp_nextn_layers,
         vision_mmproj_tokens,
+        small_batch_shared_x: cfg.small_batch_shared_x,
+        hybrid_2d_tp_ep: cfg.hybrid_2d_tp_ep && tp_devices > 1 && ep_devices > 1,
+        chunked_prefill_size: if cfg.chunked_prefill_cb { chunked_prefill_size } else { 0 },
+        lora_max_rank: if cfg.multi_lora_zero_copy { lora_max_rank } else { 0 },
+        vision_anyres_tiles: if vision_mmproj_tokens > 0 { vision_anyres_tiles } else { 0 },
+        vision_mrope_2d: cfg.anyres_mrope_fp8_mxfp4 && vision_mrope_2d,
+        fp8_mxfp4_native: cfg.anyres_mrope_fp8_mxfp4 && fp8_mxfp4_native,
         dispatch_mode,
         numa_repack_weights,
         projected_decode_tok_s,

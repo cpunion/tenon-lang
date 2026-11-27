@@ -555,3 +555,37 @@ fn deepseek_v2_lite_ep2_v6(
     let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
     assert!(plan.contains("ep=2|nccl=1|marlin=1|cb_slots=8|cow_kv=1") && plan.contains("tree_w=7|mtp=1|mmproj=256"));
 }
+
+#[test]
+fn stage6_v7_cross_chip_small_batch_2d_tpep_chunked_lora_mrope_fp8_mxfp4() {
+    let def = GpuOptConfig::default();
+    assert!(def.small_batch_shared_x && def.hybrid_2d_tp_ep && def.chunked_prefill_cb && def.multi_lora_zero_copy && def.anyres_mrope_fp8_mxfp4);
+    let src = r#"
+@gpu_graph("stream:vram=48G,ram=128G,layers=46,experts=128,topk=8,ctx=16384,kv_dim=1024,tp=2,ep=2,cb=8,chunk_pf=128,lora=16,mmproj=256,anyres=4,mrope=1,fp8_mxfp4=1")
+fn glm45_2d_hybrid_v7(
+    x        Matrix[1, 4096, Float16],
+    exp_gate Matrix[4096, 1408, MXFP4],
+    exp_up   Matrix[4096, 1408, MXFP4],
+    exp_down Matrix[1408, 4096, FP8],
+) Matrix[1, 4096, Float16] {
+    let g = tg_silu(tg_matmul(x, exp_gate))
+    let u = tg_matmul(x, exp_up)
+    let h = tg_mul(g, u)
+    tg_matmul(h, exp_down)
+}
+"#;
+    let prog = tenon_syntax::parse(src).expect("parse v7 stage6");
+    let on = compile_universal_graphs(&prog, GpuOptConfig::default());
+    assert_eq!(on.len(), 1);
+    let hp = &on[0].hetero_plan;
+    assert!(hp.small_batch_shared_x && hp.hybrid_2d_tp_ep && hp.vision_mrope_2d && hp.fp8_mxfp4_native);
+    assert_eq!(hp.chunked_prefill_size, 128);
+    assert_eq!(hp.lora_max_rank, 16);
+    assert_eq!(hp.vision_anyres_tiles, 4);
+    let cuda = emit_cuda_tpu::emit_universal_cuda(&on[0]);
+    assert!(cuda.contains("hybrid_2d=true") && cuda.contains("chunk_pf=128") && cuda.contains("sb_shx=true") && cuda.contains("lora_r=16") && cuda.contains("fp8_mxfp4=true"));
+    let tpu = emit_cuda_tpu::emit_universal_stablehlo(&on[0]);
+    assert!(tpu.contains("hybrid_2d=true") && tpu.contains("sb_shx=true") && tpu.contains("lora_r=16"));
+    let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
+    assert!(plan.contains("sb_shx=1|hybrid_2d=1|chunk_pf=128|lora_r=16|anyres=4|mrope=1|fp8_mxfp4=1"));
+}

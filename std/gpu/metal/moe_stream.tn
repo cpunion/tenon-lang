@@ -74,7 +74,13 @@ extern "C" {
     fn tn_moe_mmproj_load(path_cstr Ptr[UInt8]) Int
     fn tn_moe_mmproj_info(mm_h Int, field_id Int) Int
     fn tn_moe_mmproj_encode_rgb(mm_h Int, rgb_u8_ptr Ptr[UInt8], width Int, height Int, out_embd_ptr Ptr[UInt8], max_vecs Int) Int
+    fn tn_moe_mmproj_encode_anyres(mm_h Int, rgb_u8_ptr Ptr[UInt8], width Int, height Int, max_tiles Int, out_embd_ptr Ptr[UInt8], max_vecs Int) Int
     fn tn_moe_mmproj_free(mm_h Int) Int
+    fn tn_moe_set_mrope_pos(handle Int, pos_t Int, pos_h Int, pos_w Int) Int
+    fn tn_moe_lora_load(handle Int, path_cstr Ptr[UInt8], scale Float) Int
+    fn tn_moe_lora_set(handle Int, lora_id Int, scale Float) Int
+    fn tn_moe_lora_free(handle Int, lora_id Int) Int
+    fn tn_moe_lora_info(handle Int, lora_id Int, field_id Int) Int
 
     /// Decodes a token ID to a UTF-8 C string from the GGUF's embedded vocabulary.
     fn tn_moe_token_cstr(handle Int, tok_id Int) Ptr[UInt8]

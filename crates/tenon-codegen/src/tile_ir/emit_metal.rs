@@ -118,7 +118,7 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
     if cg.hetero_plan.active {
         let hp = &cg.hetero_plan;
         plan.push_str(&format!(
-            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|tp={}|ep={}|nccl={}|marlin={}|cb_slots={}|cow_kv={}|mla_latent={}|paged_blk={}|radix_prefix={}|spec_k={}|tree_w={}|mtp={}|mmproj={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
+            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|tp={}|ep={}|nccl={}|marlin={}|cb_slots={}|cow_kv={}|mla_latent={}|paged_blk={}|radix_prefix={}|spec_k={}|tree_w={}|mtp={}|mmproj={}|sb_shx={}|hybrid_2d={}|chunk_pf={}|lora_r={}|anyres={}|mrope={}|fp8_mxfp4={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
             hp.dispatch_mode.tag(),
             hp.vram_cap_bytes,
             hp.core_vram_bytes,
@@ -145,16 +145,25 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             hp.tree_spec_width,
             hp.mtp_nextn_layers,
             hp.vision_mmproj_tokens,
+            if hp.small_batch_shared_x { 1 } else { 0 },
+            if hp.hybrid_2d_tp_ep { 1 } else { 0 },
+            hp.chunked_prefill_size,
+            hp.lora_max_rank,
+            hp.vision_anyres_tiles,
+            if hp.vision_mrope_2d { 1 } else { 0 },
+            if hp.fp8_mxfp4_native { 1 } else { 0 },
             hp.projected_decode_tok_s,
             hp.projected_prefill_tok_s,
         ));
         msl.push_str(&format!(
-            "// [Stage 6 Heterogeneous Streaming] mode={} | tp={} ep={} cb_slots={} cow_kv={} mla_latent={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={} spec_k={} tree_w={} mtp={} mmproj={}\n",
+            "// [Stage 6 Heterogeneous Streaming] mode={} | tp={} ep={} hybrid_2d={} cb_slots={} cow_kv={} chunk_pf={} mla_latent={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={} sb_shx={} spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} lora_r={} fp8_mxfp4={}\n",
             hp.dispatch_mode.tag(),
             hp.tp_devices,
             hp.ep_devices,
+            hp.hybrid_2d_tp_ep,
             hp.cont_batch_slots,
             hp.cow_prefix_blocks,
+            hp.chunked_prefill_size,
             hp.mla_latent_dim,
             hp.pinned_gpu_ffn_layers,
             hp.lru_slots_per_layer,
@@ -163,10 +172,15 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             hp.dma_ring_slots,
             hp.purgeable_reclaim,
             hp.prefill_chunk_tokens,
+            hp.small_batch_shared_x,
             hp.speculative_k,
             hp.tree_spec_width,
             hp.mtp_nextn_layers,
             hp.vision_mmproj_tokens,
+            hp.vision_anyres_tiles,
+            hp.vision_mrope_2d,
+            hp.lora_max_rank,
+            hp.fp8_mxfp4_native,
         ));
     }
 

@@ -56,6 +56,14 @@ type FnMmprojInfo = unsafe extern "C" fn(i64, i64) -> i64;
 type FnMmprojEncodeRgb = unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64;
 type FnMmprojFree = unsafe extern "C" fn(i64) -> i64;
 
+// Tenon v7 FFI function signatures (identical across Metal & CUDA!)
+type FnMmprojEncodeAnyres = unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64;
+type FnSetMropePos = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
+type FnLoraLoad = unsafe extern "C" fn(i64, i64, f64) -> i64;
+type FnLoraSet = unsafe extern "C" fn(i64, i64, f64) -> i64;
+type FnLoraFree = unsafe extern "C" fn(i64, i64) -> i64;
+type FnLoraInfo = unsafe extern "C" fn(i64, i64, i64) -> i64;
+
 struct LlmApi {
     backend: &'static str,
     _dl_handle: *mut c_void,
@@ -91,6 +99,13 @@ struct LlmApi {
     mmproj_info: FnMmprojInfo,
     mmproj_encode_rgb: FnMmprojEncodeRgb,
     mmproj_free: FnMmprojFree,
+    // v7 APIs
+    mmproj_encode_anyres: FnMmprojEncodeAnyres,
+    set_mrope_pos: FnSetMropePos,
+    lora_load: FnLoraLoad,
+    lora_set: FnLoraSet,
+    lora_free: FnLoraFree,
+    lora_info: FnLoraInfo,
 }
 
 unsafe impl Send for LlmApi {}
@@ -101,6 +116,7 @@ struct AutoPlan {
     slots: i64,
     nocache: bool,
     kv_q8: bool,
+    #[allow(dead_code)]
     prefill_chunk: i64,
     est_vram_bytes: i64,
     disk_bytes: i64,
@@ -132,6 +148,8 @@ struct SamplingCfg {
     gbnf_grammar: Option<String>,
     spec_mode: SpecMode,
     spec_k: usize,
+    lora: Option<String>,
+    anyres: bool,
 }
 
 impl Default for SamplingCfg {
@@ -149,6 +167,8 @@ impl Default for SamplingCfg {
             gbnf_grammar: None,
             spec_mode: SpecMode::Off,
             spec_k: 5,
+            lora: None,
+            anyres: false,
         }
     }
 }
@@ -209,11 +229,11 @@ fn load_llm_api() -> Result<LlmApi, String> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let lib_path = PathBuf::from(format!("/tmp/tenon_llm_{}_v6_{}.{}", backend, mtime, ext));
+    let lib_path = PathBuf::from(format!("/tmp/tenon_llm_{}_v7_{}.{}", backend, mtime, ext));
 
     if !lib_path.exists() {
         eprintln!(
-            "[tenon llm] compiling {} v6 runtime shim ({}) -> {}",
+            "[tenon llm] compiling {} v7 runtime shim ({}) -> {}",
             backend,
             src.display(),
             lib_path.display()
@@ -311,6 +331,12 @@ fn load_llm_api() -> Result<LlmApi, String> {
         mmproj_info: load_symbol(dl_handle, &sym("mmproj_info"))?,
         mmproj_encode_rgb: load_symbol(dl_handle, &sym("mmproj_encode_rgb"))?,
         mmproj_free: load_symbol(dl_handle, &sym("mmproj_free"))?,
+        mmproj_encode_anyres: load_symbol(dl_handle, &sym("mmproj_encode_anyres"))?,
+        set_mrope_pos: load_symbol(dl_handle, &sym("set_mrope_pos"))?,
+        lora_load: load_symbol(dl_handle, &sym("lora_load"))?,
+        lora_set: load_symbol(dl_handle, &sym("lora_set"))?,
+        lora_free: load_symbol(dl_handle, &sym("lora_free"))?,
+        lora_info: load_symbol(dl_handle, &sym("lora_info"))?,
     };
     if let Some(init) = api.init_fn {
         if unsafe { init() } == 0 {
@@ -552,6 +578,56 @@ impl LlmApi {
         unsafe {
             (self.mmproj_free)(mm_h);
         }
+    }
+
+    fn mmproj_encode_anyres(
+        &self,
+        mm_h: i64,
+        rgb: &[u8],
+        w: usize,
+        h: usize,
+        max_tiles: usize,
+        out: &mut [f32],
+        max_vecs: usize,
+    ) -> usize {
+        let n = unsafe {
+            (self.mmproj_encode_anyres)(
+                mm_h,
+                rgb.as_ptr() as i64,
+                w as i64,
+                h as i64,
+                max_tiles as i64,
+                out.as_mut_ptr() as i64,
+                max_vecs as i64,
+            )
+        };
+        n.max(0) as usize
+    }
+
+    #[allow(dead_code)]
+    fn set_mrope_pos(&self, h: i64, pos_t: i64, pos_h: i64, pos_w: i64) -> i64 {
+        unsafe { (self.set_mrope_pos)(h, pos_t, pos_h, pos_w) }
+    }
+
+    fn lora_load(&self, h: i64, path: &str, scale: f64) -> Result<i64, String> {
+        let cp = CString::new(path).map_err(|_| "invalid lora path")?;
+        let id = unsafe { (self.lora_load)(h, cp.as_ptr() as i64, scale) };
+        if id <= 0 {
+            return Err(format!("failed to load GGUF LoRA adapter `{}`", path));
+        }
+        Ok(id)
+    }
+
+    fn lora_set(&self, h: i64, lora_id: i64, scale: f64) -> i64 {
+        unsafe { (self.lora_set)(h, lora_id, scale) }
+    }
+
+    fn lora_free(&self, h: i64, lora_id: i64) -> i64 {
+        unsafe { (self.lora_free)(h, lora_id) }
+    }
+
+    fn lora_info(&self, h: i64, lora_id: i64, field: i64) -> i64 {
+        unsafe { (self.lora_info)(h, lora_id, field) }
     }
 
     fn sample_next(
@@ -2150,12 +2226,15 @@ struct ModelMeta {
     n_bpe_merges: i64,
     tp_size: i64,
     ep_size: i64,
+    hybrid_2d: bool,
     nccl_active: bool,
     has_draft: bool,
     has_mtp: i64,
     has_mmproj: bool,
     mmproj_n_tokens: usize,
     supports_cb: bool,
+    prefill_chunk_size: usize,
+    lora_adapters: Vec<String>,
 }
 
 struct LoadedModel {
@@ -2171,9 +2250,32 @@ struct LoadedModel {
     cb_radix: RadixKvCache,
     vocab_pieces: Vec<String>,
     logits_scratch: Vec<f32>,
+    lora_map: HashMap<String, (i64, f64)>,
+    active_lora_id: i64,
+    prefill_chunk_size: usize,
 }
 
 impl LoadedModel {
+    fn resolve_lora(&self, name: Option<&str>) -> (i64, f64) {
+        if let Some(n) = name {
+            if let Some(&(id, sc)) = self.lora_map.get(n) {
+                return (id, sc);
+            }
+        }
+        (0, 1.0)
+    }
+
+    /// Zero-copy runtime LoRA hot-swap (~1 us GPU pointer switch); returns `(lora_id, swapped)`.
+    fn apply_lora(&mut self, name: Option<&str>) -> (i64, bool) {
+        let (target_id, scale) = self.resolve_lora(name);
+        if target_id != self.active_lora_id {
+            self.api.lora_set(self.handle, target_id, scale);
+            self.active_lora_id = target_id;
+            return (target_id, true);
+        }
+        (target_id, false)
+    }
+
     fn ensure_vocab_pieces(&mut self) {
         if !self.vocab_pieces.is_empty() {
             return;
@@ -2375,6 +2477,17 @@ fn nucleus_sample(cands: &[(usize, f32)], cfg: &SamplingCfg, seed: i64) -> usize
 
 impl Drop for LoadedModel {
     fn drop(&mut self) {
+        if self.handle > 0 {
+            if self.active_lora_id > 0 {
+                self.api.lora_set(self.handle, 0, 1.0);
+                self.active_lora_id = 0;
+            }
+            for &(lid, _) in self.lora_map.values() {
+                if lid > 0 {
+                    self.api.lora_free(self.handle, lid);
+                }
+            }
+        }
         if self.mmproj_handle > 0 {
             self.api.mmproj_free(self.mmproj_handle);
             self.mmproj_handle = 0;
@@ -2522,60 +2635,93 @@ struct GenResult {
     finish_reason: &'static str,
 }
 
+#[derive(Debug, Clone)]
+enum MmPart {
+    Text(String),
+    Image(RgbImage),
+}
+
 fn run_multimodal_generation<F>(
     m: &mut LoadedModel,
-    user_text: &str,
-    img: &RgbImage,
+    parts: &[MmPart],
     cfg: &SamplingCfg,
     mut on_piece: F,
 ) -> GenResult
 where
     F: FnMut(&str) -> bool,
 {
+    let _ = m.apply_lora(cfg.lora.as_deref());
     let t_pf = Instant::now();
-    let n_vis = m.meta.mmproj_n_tokens.max(1);
+    let img_size = m.api.mmproj_info(m.mmproj_handle, 0).max(1) as usize;
+    let n_vis_base = m.meta.mmproj_n_tokens.max(1);
     let pdim = m.api.mmproj_info(m.mmproj_handle, 5).max(m.meta.d_model as i64) as usize;
-    let mut vis_emb = vec![0.0f32; n_vis * pdim];
-    let n_encoded = m.api.mmproj_encode_rgb(
-        m.mmproj_handle,
-        &img.rgb,
-        img.width,
-        img.height,
-        &mut vis_emb,
-        n_vis,
-    );
 
-    // SmolVLM / Idefics3 chat template vs generic LLaVA template
+    // SmolVLM / Idefics3 multi-image chat template vs generic LLaVA template
     let is_smolvlm = m.api.tokenize(m.handle, "<fake_token_around_image>", 8).len() == 1;
-    let (prefix_str, suffix_str) = if is_smolvlm {
-        (
-            "<|im_start|>User:<fake_token_around_image><global-img>".to_string(),
-            format!("<fake_token_around_image>{}<end_of_utterance>\nAssistant:", user_text),
-        )
-    } else {
-        (
-            "USER: ".to_string(),
-            format!("\n{}\nASSISTANT:", user_text),
-        )
-    };
-    let pre_ids = m.api.tokenize(m.handle, &prefix_str, 256);
-    let suf_ids = m.api.tokenize(m.handle, &suffix_str, 512);
     let mut pos = 0i64;
-    if !pre_ids.is_empty() {
-        m.api.prefill(m.handle, &pre_ids, pos);
-        pos += pre_ids.len() as i64;
+    let mut next_tok = m.bos_id;
+    let mut seg_buf = String::from(if is_smolvlm { "<|im_start|>User:" } else { "USER:" });
+
+    for part in parts {
+        match part {
+            MmPart::Text(txt) => {
+                if !txt.is_empty() {
+                    if !seg_buf.ends_with(' ') && !txt.starts_with(' ') {
+                        seg_buf.push(' ');
+                    }
+                    seg_buf.push_str(txt);
+                }
+            }
+            MmPart::Image(img) => {
+                if is_smolvlm {
+                    seg_buf.push_str("<fake_token_around_image><global-img>");
+                }
+                let tids = m.api.tokenize(m.handle, &seg_buf, 512);
+                seg_buf.clear();
+                if !tids.is_empty() {
+                    next_tok = m.api.prefill(m.handle, &tids, pos);
+                    pos += tids.len() as i64;
+                }
+                let use_anyres = cfg.anyres || img.width > img_size || img.height > img_size;
+                let max_vecs = if use_anyres { n_vis_base * 5 } else { n_vis_base };
+                let mut vis_emb = vec![0.0f32; max_vecs * pdim];
+                let n_encoded = if use_anyres {
+                    m.api.mmproj_encode_anyres(
+                        m.mmproj_handle,
+                        &img.rgb,
+                        img.width,
+                        img.height,
+                        5,
+                        &mut vis_emb,
+                        max_vecs,
+                    )
+                } else {
+                    m.api.mmproj_encode_rgb(
+                        m.mmproj_handle,
+                        &img.rgb,
+                        img.width,
+                        img.height,
+                        &mut vis_emb,
+                        n_vis_base,
+                    )
+                };
+                if n_encoded > 0 {
+                    next_tok = m.api.step_embd(m.handle, &vis_emb, n_encoded, pos);
+                    pos += n_encoded as i64;
+                }
+                if is_smolvlm {
+                    seg_buf.push_str("<fake_token_around_image>");
+                }
+            }
+        }
     }
-    if n_encoded > 0 {
-        m.api.step_embd(m.handle, &vis_emb, n_encoded, pos);
-        pos += n_encoded as i64;
+
+    seg_buf.push_str(if is_smolvlm { "<end_of_utterance>\nAssistant:" } else { "\nASSISTANT:" });
+    let close_ids = m.api.tokenize(m.handle, &seg_buf, 512);
+    if !close_ids.is_empty() {
+        next_tok = m.api.prefill(m.handle, &close_ids, pos);
+        pos += close_ids.len() as i64;
     }
-    let mut next_tok = if !suf_ids.is_empty() {
-        let t = m.api.prefill(m.handle, &suf_ids, pos);
-        pos += suf_ids.len() as i64;
-        t
-    } else {
-        m.bos_id
-    };
     let prefill_ms = t_pf.elapsed().as_secs_f64() * 1000.0;
     let prompt_tokens = pos as usize;
 
@@ -2654,6 +2800,7 @@ fn run_generation<F>(
 where
     F: FnMut(&str) -> bool,
 {
+    let _ = m.apply_lora(cfg.lora.as_deref());
     let slot_ctx = m.meta.slot_ctx as usize;
     let max_prompt = slot_ctx.saturating_sub(cfg.max_tokens.min(512) + 8).max(16);
     let mut ids = Vec::new();
@@ -2929,7 +3076,7 @@ where
 }
 
 // ============================================================================
-// Tenon v6: Iteration-Level Continuous Batching Engine + OpenAI HTTP/SSE Server
+// Tenon v7: Chunked Prefill + Continuous Batching + Adaptive Speculative Fusion + Multi-LoRA
 // ============================================================================
 enum StreamEvent {
     Piece(String),
@@ -2941,7 +3088,7 @@ enum EngineCmd {
         prompt: String,
         add_bos: bool,
         cfg: SamplingCfg,
-        image: Option<RgbImage>,
+        mm_parts: Vec<MmPart>,
         tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     },
     Embed {
@@ -2959,9 +3106,30 @@ enum EngineCmd {
     },
 }
 
+struct PendingGenReq {
+    prompt: String,
+    add_bos: bool,
+    cfg: SamplingCfg,
+    mm_parts: Vec<MmPart>,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+}
+
+struct PrefillingCbSeq {
+    slot: usize,
+    cfg: SamplingCfg,
+    lora_id: i64,
+    ids: Vec<i64>,
+    actual_lcp: usize,
+    cursor: usize,
+    is_chunked: bool,
+    t_pf: Instant,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+}
+
 struct ActiveCbSeq {
     slot: usize,
     cfg: SamplingCfg,
+    lora_id: i64,
     grammar: Option<GrammarState>,
     full_seq: Vec<i64>,
     next_tok: i64,
@@ -2969,6 +3137,26 @@ struct ActiveCbSeq {
     prompt_tokens: usize,
     cached_prefix_tokens: usize,
     completion_tokens: usize,
+    spec_proposed: usize,
+    spec_accepted: usize,
+    prefill_ms: f64,
+    t_dec: Instant,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+}
+
+/// Single-client Adaptive Speculative Decoding sequence running in linear KV slot 0;
+/// seamlessly migrates to PagedKV Continuous Batching the instant a 2nd request arrives!
+struct ActiveSpecSeq {
+    kv_slot: usize,
+    cfg: SamplingCfg,
+    full_seq: Vec<i64>,
+    next_tok: i64,
+    out_text: String,
+    prompt_tokens: usize,
+    cached_prefix_tokens: usize,
+    completion_tokens: usize,
+    spec_proposed: usize,
+    spec_accepted: usize,
     prefill_ms: f64,
     t_dec: Instant,
     tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
@@ -2984,6 +3172,11 @@ struct ServerState {
     total_reqs: AtomicU64,
     radix_hits: AtomicU64,
     radix_saved_toks: AtomicU64,
+    chunked_prefill_chunks: AtomicU64,
+    adaptive_spec_steps: AtomicU64,
+    adaptive_spec_proposed: AtomicU64,
+    adaptive_spec_accepted: AtomicU64,
+    lora_swaps: AtomicU64,
 }
 
 fn finish_cb_seq(
@@ -3006,22 +3199,317 @@ fn finish_cb_seq(
         cached_prefix_tokens: seq.cached_prefix_tokens,
         kv_slot: seq.slot,
         completion_tokens: seq.completion_tokens,
-        spec_proposed: 0,
-        spec_accepted: 0,
+        spec_proposed: seq.spec_proposed,
+        spec_accepted: seq.spec_accepted,
         prefill_ms: seq.prefill_ms,
         decode_ms,
         finish_reason,
     }));
 }
 
+fn finish_spec_seq(
+    m: &mut LoadedModel,
+    seq: ActiveSpecSeq,
+    finish_reason: &'static str,
+    state: &ServerState,
+) {
+    let decode_ms = seq.t_dec.elapsed().as_secs_f64() * 1000.0;
+    if seq.cached_prefix_tokens > 0 {
+        state.radix_hits.fetch_add(1, Ordering::Relaxed);
+        state
+            .radix_saved_toks
+            .fetch_add(seq.cached_prefix_tokens as u64, Ordering::Relaxed);
+    }
+    m.radix_cache.commit(seq.kv_slot, seq.full_seq);
+    let _ = seq.tx.send(StreamEvent::Done(GenResult {
+        text: seq.out_text,
+        prompt_tokens: seq.prompt_tokens,
+        cached_prefix_tokens: seq.cached_prefix_tokens,
+        kv_slot: seq.kv_slot,
+        completion_tokens: seq.completion_tokens,
+        spec_proposed: seq.spec_proposed,
+        spec_accepted: seq.spec_accepted,
+        prefill_ms: seq.prefill_ms,
+        decode_ms,
+        finish_reason,
+    }));
+}
+
+fn finalize_prefilled_cb(
+    m: &mut LoadedModel,
+    pf: PrefillingCbSeq,
+    argmax0: i64,
+    active: &mut Vec<ActiveCbSeq>,
+    state: &ServerState,
+) {
+    m.cb_radix.set_active_prefix(pf.slot, &pf.ids);
+    let prefill_ms = pf.t_pf.elapsed().as_secs_f64() * 1000.0;
+
+    let mut grammar = compile_grammar_for_cfg(&pf.cfg).ok().flatten();
+    let first_tok = if let Some(ref gs) = grammar {
+        let (tok, ns) = m.sample_constrained(gs, &pf.cfg, &pf.ids[pf.ids.len().saturating_sub(64)..], pf.cfg.seed);
+        grammar = ns;
+        tok
+    } else if pf.cfg.temp <= 1e-5 && pf.cfg.repeat_penalty <= 1.0001 {
+        argmax0
+    } else {
+        if m.logits_scratch.len() < m.vocab_size {
+            m.logits_scratch.resize(m.vocab_size, 0.0);
+        }
+        m.api.copy_logits(m.handle, &mut m.logits_scratch);
+        m.sample_from_scratch_logits(None, &pf.cfg, &pf.ids[pf.ids.len().saturating_sub(64)..], pf.cfg.seed).0
+    };
+
+    let mut seq = ActiveCbSeq {
+        slot: pf.slot,
+        cfg: pf.cfg,
+        lora_id: pf.lora_id,
+        grammar,
+        prompt_tokens: pf.ids.len(),
+        cached_prefix_tokens: pf.actual_lcp,
+        full_seq: pf.ids,
+        next_tok: first_tok,
+        out_text: String::new(),
+        completion_tokens: 0,
+        spec_proposed: 0,
+        spec_accepted: 0,
+        prefill_ms,
+        t_dec: Instant::now(),
+        tx: pf.tx,
+    };
+
+    let piece = m.api.token_str(m.handle, seq.next_tok);
+    if is_stop_token(seq.next_tok, m.eos_id, &piece) || seq.cfg.max_tokens == 0 {
+        finish_cb_seq(m, seq, "stop", state);
+    } else {
+        seq.out_text.push_str(&piece);
+        seq.completion_tokens += 1;
+        seq.full_seq.push(seq.next_tok);
+        let alive = seq.tx.send(StreamEvent::Piece(piece)).is_ok();
+        if !alive || seq.grammar.as_ref().is_some_and(GrammarState::is_strictly_done) {
+            finish_cb_seq(m, seq, "stop", state);
+        } else if seq.completion_tokens >= seq.cfg.max_tokens
+            || seq.full_seq.len() + 2 >= m.meta.max_ctx as usize
+        {
+            finish_cb_seq(m, seq, "length", state);
+        } else {
+            active.push(seq);
+        }
+    }
+}
+
+/// Runs ONE lossless speculative decode iteration (`tree`, `draft`, `mtp`, or `ngram`) for `spec_active`.
+/// Returns `Some(seq)` if continuing, or `None` if finished.
+fn step_adaptive_spec(
+    m: &mut LoadedModel,
+    mut seq: ActiveSpecSeq,
+    state: &ServerState,
+) -> Option<ActiveSpecSeq> {
+    let (_, swapped) = m.apply_lora(seq.cfg.lora.as_deref());
+    if swapped {
+        state.lora_swaps.fetch_add(1, Ordering::Relaxed);
+    }
+    m.api.kv_slot_set(m.handle, seq.kv_slot);
+    let slot_ctx = m.meta.slot_ctx as usize;
+    let pos = seq.full_seq.len() - 1;
+    if pos + 2 >= slot_ctx || seq.completion_tokens >= seq.cfg.max_tokens {
+        finish_spec_seq(m, seq, "length", state);
+        return None;
+    }
+
+    let use_tree = seq.cfg.spec_mode == SpecMode::Tree && m.draft_handle > 0 && seq.cfg.spec_k >= 2;
+    let use_draft = seq.cfg.spec_mode == SpecMode::Draft && m.draft_handle > 0;
+    let use_mtp = seq.cfg.spec_mode == SpecMode::Mtp && m.meta.has_mtp > 0;
+    let use_ngram = seq.cfg.spec_mode == SpecMode::Ngram;
+
+    if use_tree {
+        let max_d = seq.cfg.spec_k.min(4).min(seq.cfg.max_tokens - seq.completion_tokens).min(slot_ctx - pos - 2);
+        let mut tree_ids = vec![seq.next_tok];
+        let mut parents = vec![-1i64];
+        let d1_top = m.api.step(m.draft_handle, seq.next_tok, pos as i64);
+        let mut dlogits = vec![0.0f32; m.vocab_size];
+        let dn = m.api.copy_logits(m.draft_handle, &mut dlogits);
+        let mut second_tok = d1_top;
+        if dn > 2 {
+            let mut best2 = f32::NEG_INFINITY;
+            for v in 0..dn {
+                if v as i64 != d1_top && dlogits[v] > best2 {
+                    best2 = dlogits[v];
+                    second_tok = v as i64;
+                }
+            }
+        }
+        tree_ids.push(d1_top);
+        parents.push(0);
+        let mut cur = d1_top;
+        let mut dpos = (pos + 1) as i64;
+        for step_i in 1..max_d {
+            let nxt = m.api.step(m.draft_handle, cur, dpos);
+            tree_ids.push(nxt);
+            parents.push(step_i as i64);
+            cur = nxt;
+            dpos += 1;
+        }
+        if second_tok != d1_top {
+            tree_ids.push(second_tok);
+            parents.push(0);
+        }
+        let prop = tree_ids.len() - 1;
+        seq.spec_proposed += prop;
+        state.adaptive_spec_steps.fetch_add(1, Ordering::Relaxed);
+        state.adaptive_spec_proposed.fetch_add(prop as u64, Ordering::Relaxed);
+
+        let mut tree_out = vec![0i64; tree_ids.len()];
+        m.api.verify_tree(m.handle, &tree_ids, &parents, pos as i64, &mut tree_out);
+        let mut acc_path: Vec<i64> = vec![0];
+        let mut cur_node = 0usize;
+        let mut bonus_tok = tree_out[0];
+        let mut done_reason: Option<&'static str> = None;
+        loop {
+            let want = tree_out[cur_node];
+            let mut matched_child = None;
+            for c in (cur_node + 1)..tree_ids.len() {
+                if parents[c] == cur_node as i64 && tree_ids[c] == want {
+                    matched_child = Some(c);
+                    break;
+                }
+            }
+            if let Some(ch) = matched_child {
+                acc_path.push(ch as i64);
+                seq.spec_accepted += 1;
+                state.adaptive_spec_accepted.fetch_add(1, Ordering::Relaxed);
+                let dp = m.api.token_str(m.handle, want);
+                if is_stop_token(want, m.eos_id, &dp) {
+                    done_reason = Some("stop");
+                    break;
+                }
+                seq.out_text.push_str(&dp);
+                seq.completion_tokens += 1;
+                seq.full_seq.push(want);
+                if seq.tx.send(StreamEvent::Piece(dp)).is_err() {
+                    done_reason = Some("stop");
+                    break;
+                }
+                if seq.completion_tokens >= seq.cfg.max_tokens {
+                    done_reason = Some("length");
+                    break;
+                }
+                cur_node = ch;
+                bonus_tok = tree_out[ch];
+            } else {
+                break;
+            }
+        }
+        m.api.commit_tree_path(m.handle, &acc_path, pos as i64);
+        if let Some(reason) = done_reason {
+            finish_spec_seq(m, seq, reason, state);
+            return None;
+        }
+        if acc_path.len() > 1 {
+            let acc_toks: Vec<i64> = acc_path[1..].iter().map(|&ni| tree_ids[ni as usize]).collect();
+            m.api.prefill(m.draft_handle, &acc_toks, (pos + 1) as i64);
+        }
+        seq.next_tok = bonus_tok;
+    } else {
+        let max_k = seq.cfg.spec_k.min(seq.cfg.max_tokens - seq.completion_tokens).min(slot_ctx - pos - 2);
+        let mut draft_toks = Vec::new();
+        if use_draft && max_k > 0 {
+            let mut dcur = seq.next_tok;
+            let mut dpos = pos as i64;
+            for _ in 0..max_k {
+                dcur = m.api.step(m.draft_handle, dcur, dpos);
+                let dp = m.api.token_str(m.draft_handle, dcur);
+                draft_toks.push(dcur);
+                dpos += 1;
+                if is_stop_token(dcur, m.eos_id, &dp) {
+                    break;
+                }
+            }
+        } else if use_mtp && max_k > 0 {
+            let p_tok = m.api.mtp_predict(m.handle, seq.next_tok, pos as i64);
+            if p_tok >= 0 && (p_tok as usize) < m.vocab_size {
+                draft_toks.push(p_tok);
+            }
+        } else if use_ngram && max_k > 0 {
+            draft_toks = propose_ngram_draft(&seq.full_seq, max_k);
+        }
+
+        if !draft_toks.is_empty() {
+            seq.spec_proposed += draft_toks.len();
+            state.adaptive_spec_steps.fetch_add(1, Ordering::Relaxed);
+            state.adaptive_spec_proposed.fetch_add(draft_toks.len() as u64, Ordering::Relaxed);
+            let mut verify_in = Vec::with_capacity(1 + draft_toks.len());
+            verify_in.push(seq.next_tok);
+            verify_in.extend_from_slice(&draft_toks);
+            let mut target_out = vec![0i64; verify_in.len()];
+            m.api.verify_batch(m.handle, &verify_in, pos as i64, &mut target_out);
+
+            let mut n_acc = 0usize;
+            for &dt in &draft_toks {
+                if target_out[n_acc] == dt {
+                    n_acc += 1;
+                    seq.spec_accepted += 1;
+                    state.adaptive_spec_accepted.fetch_add(1, Ordering::Relaxed);
+                    let dp = m.api.token_str(m.handle, dt);
+                    if is_stop_token(dt, m.eos_id, &dp) {
+                        finish_spec_seq(m, seq, "stop", state);
+                        return None;
+                    }
+                    seq.out_text.push_str(&dp);
+                    seq.completion_tokens += 1;
+                    seq.full_seq.push(dt);
+                    if seq.tx.send(StreamEvent::Piece(dp)).is_err() {
+                        finish_spec_seq(m, seq, "stop", state);
+                        return None;
+                    }
+                    if seq.completion_tokens >= seq.cfg.max_tokens {
+                        finish_spec_seq(m, seq, "length", state);
+                        return None;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if use_draft && n_acc == draft_toks.len() {
+                let last_dt = draft_toks[n_acc - 1];
+                let _ = m.api.step(m.draft_handle, last_dt, (pos + n_acc) as i64);
+            }
+            seq.next_tok = target_out[n_acc];
+        } else {
+            seq.next_tok = m.api.step(m.handle, seq.next_tok, pos as i64);
+        }
+    }
+
+    // Emit the newly verified bonus/step token
+    let piece = m.api.token_str(m.handle, seq.next_tok);
+    if is_stop_token(seq.next_tok, m.eos_id, &piece) {
+        finish_spec_seq(m, seq, "stop", state);
+        return None;
+    }
+    seq.out_text.push_str(&piece);
+    seq.completion_tokens += 1;
+    seq.full_seq.push(seq.next_tok);
+    if seq.tx.send(StreamEvent::Piece(piece)).is_err() {
+        finish_spec_seq(m, seq, "stop", state);
+        return None;
+    }
+    if seq.completion_tokens >= seq.cfg.max_tokens || seq.full_seq.len() + 2 >= slot_ctx {
+        finish_spec_seq(m, seq, "length", state);
+        return None;
+    }
+    Some(seq)
+}
+
 fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: Arc<ServerState>) {
     let mut active: Vec<ActiveCbSeq> = Vec::new();
-    let mut pending_gen: Vec<(String, bool, SamplingCfg, Option<RgbImage>, tokio::sync::mpsc::UnboundedSender<StreamEvent>)> = Vec::new();
+    let mut prefill_queue: Vec<PrefillingCbSeq> = Vec::new();
+    let mut spec_active: Option<ActiveSpecSeq> = None;
+    let mut pending_gen: Vec<PendingGenReq> = Vec::new();
     let max_cb_batch = 16usize;
+    let chunk_sz = m.prefill_chunk_size.max(16);
 
     loop {
-        // Wait for work when idle; otherwise non-blocking drain newly arrived commands every single decode iteration!
-        if active.is_empty() && pending_gen.is_empty() {
+        if active.is_empty() && prefill_queue.is_empty() && spec_active.is_none() && pending_gen.is_empty() {
             match rx.recv() {
                 Ok(cmd) => {
                     if !handle_engine_cmd(&mut m, cmd, &mut pending_gen, &state) {
@@ -3035,30 +3523,151 @@ fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: 
             handle_engine_cmd(&mut m, cmd, &mut pending_gen, &state);
         }
 
-        // Admit waiting requests into the PagedAttention Continuous Batching pool!
-        while !pending_gen.is_empty() {
-            let need_legacy = !m.meta.supports_cb
-                || pending_gen[0].3.is_some()
-                || (pending_gen[0].2.spec_mode != SpecMode::Off && active.is_empty());
-
-            if need_legacy {
-                if !active.is_empty() {
-                    break; // Wait until current CB batch completes before running multimodal/legacy path
+        // Adaptive CB / Speculative Fusion: if a single-client speculative stream is active AND a 2nd request
+        // arrives mid-generation, seamlessly migrate the speculative stream into PagedAttention CB so BOTH run concurrently!
+        if spec_active.is_some() && !pending_gen.is_empty() && m.meta.supports_cb {
+            if let Some(sseq) = spec_active.take() {
+                let (lora_id, swapped) = m.apply_lora(sseq.cfg.lora.as_deref());
+                if swapped {
+                    state.lora_swaps.fetch_add(1, Ordering::Relaxed);
                 }
-                let (prompt, add_bos, cfg, image, tx) = pending_gen.remove(0);
-                let res = if let Some(img) = image {
-                    if m.mmproj_handle > 0 {
-                        run_multimodal_generation(&mut m, &prompt, &img, &cfg, |p| {
-                            tx.send(StreamEvent::Piece(p.to_string())).is_ok()
-                        })
+                m.radix_cache.commit(sseq.kv_slot, sseq.full_seq.clone());
+                if let Some((dst_slot, src_slot, lcp)) = m.cb_radix.match_for_cow_fork(&sseq.full_seq) {
+                    if lcp > 0 && src_slot != dst_slot {
+                        m.api.paged_seq_fork(m.handle, src_slot, dst_slot, lcp);
                     } else {
-                        run_generation(&mut m, &prompt, add_bos, &cfg, |p| {
-                            tx.send(StreamEvent::Piece(p.to_string())).is_ok()
-                        })
+                        m.api.paged_seq_free(m.handle, dst_slot);
                     }
+                    let actual_lcp = if lcp > 0 && src_slot != dst_slot { lcp } else { 0 };
+                    let prefill_end = sseq.full_seq.len().saturating_sub(1);
+                    if prefill_end > actual_lcp {
+                        let _ = m.api.paged_prefill(
+                            m.handle,
+                            dst_slot,
+                            &sseq.full_seq[actual_lcp..prefill_end],
+                            actual_lcp as i64,
+                        );
+                    }
+                    m.cb_radix.set_active_prefix(dst_slot, &sseq.full_seq);
+                    active.push(ActiveCbSeq {
+                        slot: dst_slot,
+                        cfg: sseq.cfg,
+                        lora_id,
+                        grammar: None,
+                        full_seq: sseq.full_seq,
+                        next_tok: sseq.next_tok,
+                        out_text: sseq.out_text,
+                        prompt_tokens: sseq.prompt_tokens,
+                        cached_prefix_tokens: sseq.cached_prefix_tokens,
+                        completion_tokens: sseq.completion_tokens,
+                        spec_proposed: sseq.spec_proposed,
+                        spec_accepted: sseq.spec_accepted,
+                        prefill_ms: sseq.prefill_ms,
+                        t_dec: sseq.t_dec,
+                        tx: sseq.tx,
+                    });
                 } else {
-                    run_generation(&mut m, &prompt, add_bos, &cfg, |p| {
-                        tx.send(StreamEvent::Piece(p.to_string())).is_ok()
+                    spec_active = Some(sseq);
+                }
+            }
+        }
+
+        // If `spec_active` is still running alone (no 2nd client), execute ONE speculative step and loop!
+        if let Some(sseq) = spec_active.take() {
+            state.active_batch.store(1, Ordering::Relaxed);
+            spec_active = step_adaptive_spec(&mut m, sseq, &state);
+            continue;
+        }
+
+        // Admit waiting requests into Adaptive Speculative OR Chunked-Prefill PagedAttention CB pool!
+        while !pending_gen.is_empty() {
+            let front = &pending_gen[0];
+            let has_mm = !front.mm_parts.is_empty();
+            let want_adaptive_spec = !has_mm
+                && front.cfg.spec_mode != SpecMode::Off
+                && front.cfg.temp <= 1e-5
+                && !front.cfg.json_constrained
+                && front.cfg.json_schema.is_none()
+                && front.cfg.gbnf_grammar.is_none()
+                && active.is_empty()
+                && prefill_queue.is_empty()
+                && pending_gen.len() == 1;
+
+            if want_adaptive_spec {
+                let req = pending_gen.remove(0);
+                let (_, swapped) = m.apply_lora(req.cfg.lora.as_deref());
+                if swapped {
+                    state.lora_swaps.fetch_add(1, Ordering::Relaxed);
+                }
+                let slot_ctx = m.meta.slot_ctx as usize;
+                let max_prompt = slot_ctx.saturating_sub(req.cfg.max_tokens.min(512) + 8).max(16);
+                let mut ids = Vec::new();
+                if req.add_bos && m.bos_id >= 0 {
+                    ids.push(m.bos_id);
+                }
+                ids.extend(m.api.tokenize(m.handle, &req.prompt, max_prompt));
+                if ids.is_empty() {
+                    ids.push(m.bos_id.max(1));
+                }
+                let prompt_tokens = ids.len();
+                let (kv_slot, lcp) = m.radix_cache.match_and_acquire(&ids);
+                m.api.kv_slot_set(m.handle, kv_slot);
+                let t_pf = Instant::now();
+                let first_tok = m.api.prefill(m.handle, &ids[lcp..], lcp as i64);
+                let prefill_ms = t_pf.elapsed().as_secs_f64() * 1000.0;
+                m.api.reset(m.handle);
+                if (req.cfg.spec_mode == SpecMode::Draft || req.cfg.spec_mode == SpecMode::Tree)
+                    && m.draft_handle > 0
+                {
+                    m.api.prefill(m.draft_handle, &ids, 0);
+                    m.api.reset(m.draft_handle);
+                }
+                let mut sseq = ActiveSpecSeq {
+                    kv_slot,
+                    cfg: req.cfg,
+                    full_seq: ids,
+                    next_tok: first_tok,
+                    out_text: String::new(),
+                    prompt_tokens,
+                    cached_prefix_tokens: lcp,
+                    completion_tokens: 0,
+                    spec_proposed: 0,
+                    spec_accepted: 0,
+                    prefill_ms,
+                    t_dec: Instant::now(),
+                    tx: req.tx,
+                };
+                let piece0 = m.api.token_str(m.handle, first_tok);
+                if is_stop_token(first_tok, m.eos_id, &piece0) || sseq.cfg.max_tokens == 0 {
+                    finish_spec_seq(&mut m, sseq, "stop", &state);
+                } else {
+                    sseq.out_text.push_str(&piece0);
+                    sseq.completion_tokens += 1;
+                    sseq.full_seq.push(first_tok);
+                    if sseq.tx.send(StreamEvent::Piece(piece0)).is_err() {
+                        finish_spec_seq(&mut m, sseq, "stop", &state);
+                    } else if sseq.completion_tokens >= sseq.cfg.max_tokens {
+                        finish_spec_seq(&mut m, sseq, "length", &state);
+                    } else {
+                        spec_active = Some(sseq);
+                    }
+                }
+                break;
+            }
+
+            let need_legacy = !m.meta.supports_cb || has_mm;
+            if need_legacy {
+                if !active.is_empty() || !prefill_queue.is_empty() {
+                    break;
+                }
+                let req = pending_gen.remove(0);
+                let res = if !req.mm_parts.is_empty() && m.mmproj_handle > 0 {
+                    run_multimodal_generation(&mut m, &req.mm_parts, &req.cfg, |p| {
+                        req.tx.send(StreamEvent::Piece(p.to_string())).is_ok()
+                    })
+                } else {
+                    run_generation(&mut m, &req.prompt, req.add_bos, &req.cfg, |p| {
+                        req.tx.send(StreamEvent::Piece(p.to_string())).is_ok()
                     })
                 };
                 if res.cached_prefix_tokens > 0 {
@@ -3067,87 +3676,85 @@ fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: 
                         .radix_saved_toks
                         .fetch_add(res.cached_prefix_tokens as u64, Ordering::Relaxed);
                 }
-                let _ = tx.send(StreamEvent::Done(res));
+                let _ = req.tx.send(StreamEvent::Done(res));
                 continue;
             }
 
-            if active.len() >= max_cb_batch {
+            if active.len() + prefill_queue.len() >= max_cb_batch {
                 break;
             }
-            let (prompt, add_bos, cfg, _img, tx) = pending_gen.remove(0);
-            let max_prompt = (m.meta.max_ctx as usize).saturating_sub(cfg.max_tokens.min(512) + 8).max(16);
+            let req = pending_gen.remove(0);
+            let max_prompt = (m.meta.max_ctx as usize).saturating_sub(req.cfg.max_tokens.min(512) + 8).max(16);
             let mut ids = Vec::new();
-            if add_bos && m.bos_id >= 0 {
+            if req.add_bos && m.bos_id >= 0 {
                 ids.push(m.bos_id);
             }
-            ids.extend(m.api.tokenize(m.handle, &prompt, max_prompt));
+            ids.extend(m.api.tokenize(m.handle, &req.prompt, max_prompt));
             if ids.is_empty() {
                 ids.push(m.bos_id.max(1));
             }
             let Some((dst_slot, src_slot, lcp)) = m.cb_radix.match_for_cow_fork(&ids) else {
-                pending_gen.insert(0, (prompt, add_bos, cfg, None, tx));
+                pending_gen.insert(0, req);
                 break;
             };
-            let t_pf = Instant::now();
-            if lcp > 0 && src_slot != dst_slot {
-                // 100% Zero-Copy PagedAttention COW Prefix Fork!
+            let (lora_id, _) = m.resolve_lora(req.cfg.lora.as_deref());
+            // Do not COW-fork KV across incompatible LoRA adapters!
+            let allow_cow = lcp > 0 && src_slot != dst_slot && lora_id == 0;
+            if allow_cow {
                 m.api.paged_seq_fork(m.handle, src_slot, dst_slot, lcp);
             } else {
                 m.api.paged_seq_free(m.handle, dst_slot);
             }
-            let actual_lcp = if lcp > 0 && src_slot != dst_slot { lcp } else { 0 };
-            let argmax0 = m.api.paged_prefill(m.handle, dst_slot, &ids[actual_lcp..], actual_lcp as i64);
-            m.cb_radix.set_active_prefix(dst_slot, &ids);
-            let prefill_ms = t_pf.elapsed().as_secs_f64() * 1000.0;
-
-            let mut grammar = compile_grammar_for_cfg(&cfg).ok().flatten();
-            let first_tok = if let Some(ref gs) = grammar {
-                let (tok, ns) = m.sample_constrained(gs, &cfg, &ids[ids.len().saturating_sub(64)..], cfg.seed);
-                grammar = ns;
-                tok
-            } else if cfg.temp <= 1e-5 && cfg.repeat_penalty <= 1.0001 {
-                argmax0
-            } else {
-                if m.logits_scratch.len() < m.vocab_size {
-                    m.logits_scratch.resize(m.vocab_size, 0.0);
-                }
-                m.api.copy_logits(m.handle, &mut m.logits_scratch);
-                m.sample_from_scratch_logits(None, &cfg, &ids[ids.len().saturating_sub(64)..], cfg.seed).0
-            };
-
-            let mut seq = ActiveCbSeq {
+            let actual_lcp = if allow_cow { lcp } else { 0 };
+            let remaining = ids.len().saturating_sub(actual_lcp);
+            prefill_queue.push(PrefillingCbSeq {
                 slot: dst_slot,
-                cfg,
-                grammar,
-                prompt_tokens: ids.len(),
-                cached_prefix_tokens: actual_lcp,
-                full_seq: ids,
-                next_tok: first_tok,
-                out_text: String::new(),
-                completion_tokens: 0,
-                prefill_ms,
-                t_dec: Instant::now(),
-                tx,
-            };
+                cfg: req.cfg,
+                lora_id,
+                ids,
+                actual_lcp,
+                cursor: actual_lcp,
+                is_chunked: remaining > chunk_sz,
+                t_pf: Instant::now(),
+                tx: req.tx,
+            });
+        }
 
-            // Emit the first token immediately (TTFT!)
-            let piece = m.api.token_str(m.handle, seq.next_tok);
-            if is_stop_token(seq.next_tok, m.eos_id, &piece) || seq.cfg.max_tokens == 0 {
-                finish_cb_seq(&mut m, seq, "stop", &state);
+        if spec_active.is_some() {
+            continue;
+        }
+
+        // Chunked Prefill Interleaving: advance AT MOST `chunk_sz` tokens per tick when decoders are active
+        // (or finish short <= chunk_sz prompts immediately when idle so bursts batch together on tick 1!).
+        let mut chunk_budget = chunk_sz;
+        let pfi = 0usize;
+        while pfi < prefill_queue.len() && chunk_budget > 0 {
+            let rem = prefill_queue[pfi].ids.len().saturating_sub(prefill_queue[pfi].cursor);
+            let take = rem.min(chunk_budget);
+            let mut pf = prefill_queue.remove(pfi);
+            let (_, swapped) = m.apply_lora(pf.cfg.lora.as_deref());
+            if swapped {
+                state.lora_swaps.fetch_add(1, Ordering::Relaxed);
+            }
+            let end = (pf.cursor + take).min(pf.ids.len());
+            let argmax = if end > pf.cursor {
+                m.api.paged_prefill(m.handle, pf.slot, &pf.ids[pf.cursor..end], pf.cursor as i64)
             } else {
-                seq.out_text.push_str(&piece);
-                seq.completion_tokens += 1;
-                seq.full_seq.push(seq.next_tok);
-                let alive = seq.tx.send(StreamEvent::Piece(piece)).is_ok();
-                if !alive || seq.grammar.as_ref().is_some_and(GrammarState::is_strictly_done) {
-                    finish_cb_seq(&mut m, seq, "stop", &state);
-                } else if seq.completion_tokens >= seq.cfg.max_tokens
-                    || seq.full_seq.len() + 2 >= m.meta.max_ctx as usize
-                {
-                    finish_cb_seq(&mut m, seq, "length", &state);
-                } else {
-                    active.push(seq);
-                }
+                m.bos_id
+            };
+            pf.cursor = end;
+            if pf.is_chunked {
+                state.chunked_prefill_chunks.fetch_add(1, Ordering::Relaxed);
+            }
+            chunk_budget = chunk_budget.saturating_sub(take);
+            if pf.cursor >= pf.ids.len() {
+                finalize_prefilled_cb(&mut m, pf, argmax, &mut active, &state);
+            } else {
+                prefill_queue.insert(pfi, pf);
+                break; // Yield remaining prompt chunks to next tick so active decoders stream smoothly!
+            }
+            if !active.is_empty() && chunk_budget == 0 {
+                break;
             }
         }
 
@@ -3156,7 +3763,8 @@ fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: 
             continue;
         }
 
-        // ONE Iteration-Level Continuous Batching Decode Step across ALL `B = active.len()` clients simultaneously!
+        // ONE Iteration-Level Continuous Batching Decode Step across ALL `B = active.len()` clients!
+        // Partition seamlessly by `lora_id` if concurrent clients use different LoRAs (zero cross-client interference!).
         let b_sz = active.len();
         state.active_batch.store(b_sz, Ordering::Relaxed);
         state.cb_batches_run.fetch_add(1, Ordering::Relaxed);
@@ -3165,41 +3773,70 @@ fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: 
             state.cb_max_batch.store(b_sz, Ordering::Relaxed);
         }
 
-        let tok_ids: Vec<i64> = active.iter().map(|s| s.next_tok).collect();
-        let pos_arr: Vec<i64> = active.iter().map(|s| (s.full_seq.len() - 1) as i64).collect();
-        let slot_arr: Vec<i64> = active.iter().map(|s| s.slot as i64).collect();
-        let mut argmax_out = vec![0i64; b_sz];
-        m.api.step_batch(m.handle, &tok_ids, &pos_arr, &slot_arr, &mut argmax_out);
-
         if m.logits_scratch.len() < m.vocab_size {
             m.logits_scratch.resize(m.vocab_size, 0.0);
         }
 
+        let mut unique_loras: Vec<i64> = Vec::new();
+        for s in &active {
+            if !unique_loras.contains(&s.lora_id) {
+                unique_loras.push(s.lora_id);
+            }
+        }
+
+        let mut chosen_toks = vec![0i64; b_sz];
+        let mut next_grammars: Vec<Option<GrammarState>> = (0..b_sz).map(|_| None).collect();
+
+        for lid in unique_loras {
+            let group_idx: Vec<usize> = active
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| if s.lora_id == lid { Some(i) } else { None })
+                .collect();
+            let lora_name = active[group_idx[0]].cfg.lora.as_deref();
+            let (_, swapped) = m.apply_lora(lora_name);
+            if swapped {
+                state.lora_swaps.fetch_add(1, Ordering::Relaxed);
+            }
+            let gb = group_idx.len();
+            let tok_ids: Vec<i64> = group_idx.iter().map(|&i| active[i].next_tok).collect();
+            let pos_arr: Vec<i64> = group_idx.iter().map(|&i| (active[i].full_seq.len() - 1) as i64).collect();
+            let slot_arr: Vec<i64> = group_idx.iter().map(|&i| active[i].slot as i64).collect();
+            let mut argmax_out = vec![0i64; gb];
+            m.api.step_batch(m.handle, &tok_ids, &pos_arr, &slot_arr, &mut argmax_out);
+
+            for (gbi, &orig_i) in group_idx.iter().enumerate() {
+                let seq = &active[orig_i];
+                let need_logits = seq.grammar.is_some()
+                    || seq.cfg.temp > 1e-5
+                    || seq.cfg.repeat_penalty > 1.0001;
+                if need_logits {
+                    m.api.copy_logits_batch(m.handle, gbi, &mut m.logits_scratch);
+                    let rstart = seq.full_seq.len().saturating_sub(64);
+                    let step_seed = seq
+                        .cfg
+                        .seed
+                        .wrapping_add((seq.completion_tokens as i64).wrapping_mul(1000003));
+                    let (tok, ns) = m.sample_from_scratch_logits(
+                        seq.grammar.as_ref(),
+                        &seq.cfg,
+                        &seq.full_seq[rstart..],
+                        step_seed,
+                    );
+                    chosen_toks[orig_i] = tok;
+                    next_grammars[orig_i] = ns;
+                } else {
+                    chosen_toks[orig_i] = argmax_out[gbi];
+                }
+            }
+        }
+
         let mut next_active = Vec::with_capacity(b_sz);
         for (bi, mut seq) in active.drain(..).enumerate() {
-            let need_logits = seq.grammar.is_some()
-                || seq.cfg.temp > 1e-5
-                || seq.cfg.repeat_penalty > 1.0001;
-            let chosen = if need_logits {
-                m.api.copy_logits_batch(m.handle, bi, &mut m.logits_scratch);
-                let rstart = seq.full_seq.len().saturating_sub(64);
-                let step_seed = seq
-                    .cfg
-                    .seed
-                    .wrapping_add((seq.completion_tokens as i64).wrapping_mul(1000003));
-                let (tok, ns) = m.sample_from_scratch_logits(
-                    seq.grammar.as_ref(),
-                    &seq.cfg,
-                    &seq.full_seq[rstart..],
-                    step_seed,
-                );
-                if seq.grammar.is_some() {
-                    seq.grammar = ns;
-                }
-                tok
-            } else {
-                argmax_out[bi]
-            };
+            let chosen = chosen_toks[bi];
+            if seq.grammar.is_some() {
+                seq.grammar = next_grammars[bi].take();
+            }
 
             let piece = m.api.token_str(m.handle, chosen);
             if is_stop_token(chosen, m.eos_id, &piece) {
@@ -3228,12 +3865,12 @@ fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: 
 fn handle_engine_cmd(
     m: &mut LoadedModel,
     cmd: EngineCmd,
-    pending_gen: &mut Vec<(String, bool, SamplingCfg, Option<RgbImage>, tokio::sync::mpsc::UnboundedSender<StreamEvent>)>,
+    pending_gen: &mut Vec<PendingGenReq>,
     _state: &ServerState,
 ) -> bool {
     match cmd {
-        EngineCmd::Generate { prompt, add_bos, cfg, image, tx } => {
-            pending_gen.push((prompt, add_bos, cfg, image, tx));
+        EngineCmd::Generate { prompt, add_bos, cfg, mm_parts, tx } => {
+            pending_gen.push(PendingGenReq { prompt, add_bos, cfg, mm_parts, tx });
             true
         }
         EngineCmd::Embed { inputs, reply } => {
@@ -3462,6 +4099,13 @@ fn parse_sampling_from_json(v: &Value, default_cfg: &SamplingCfg) -> SamplingCfg
         gbnf_grammar,
         spec_mode: default_cfg.spec_mode,
         spec_k: default_cfg.spec_k,
+        lora: v
+            .get("lora")
+            .or_else(|| v.get("adapter"))
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| default_cfg.lora.clone()),
+        anyres: v.get("anyres").and_then(Value::as_bool).unwrap_or(default_cfg.anyres),
     }
 }
 
@@ -3511,7 +4155,7 @@ async fn handle_http_client(
         };
         let info = json!({
             "status": "ok",
-            "version": "tenon-v6",
+            "version": "tenon-v7",
             "backend": state.meta.backend,
             "model": state.meta.model_id,
             "arch": state.meta.arch,
@@ -3524,11 +4168,19 @@ async fn handle_http_client(
             "bpe_merges": state.meta.n_bpe_merges,
             "tp_size": state.meta.tp_size,
             "ep_size": state.meta.ep_size,
+            "hybrid_2d_tp_ep": state.meta.hybrid_2d,
             "nccl_active": state.meta.nccl_active,
             "has_mtp": state.meta.has_mtp,
             "has_mmproj": state.meta.has_mmproj,
             "speculative_draft": state.meta.has_draft,
             "continuous_batching": state.meta.supports_cb,
+            "prefill_chunk_size": state.meta.prefill_chunk_size,
+            "chunked_prefill_chunks": state.chunked_prefill_chunks.load(Ordering::Relaxed),
+            "adaptive_spec_steps": state.adaptive_spec_steps.load(Ordering::Relaxed),
+            "adaptive_spec_proposed": state.adaptive_spec_proposed.load(Ordering::Relaxed),
+            "adaptive_spec_accepted": state.adaptive_spec_accepted.load(Ordering::Relaxed),
+            "lora_adapters": state.meta.lora_adapters,
+            "lora_swaps": state.lora_swaps.load(Ordering::Relaxed),
             "active_batch_size": state.active_batch.load(Ordering::Relaxed),
             "cb_batches_run": state.cb_batches_run.load(Ordering::Relaxed),
             "cb_max_batch_seen": state.cb_max_batch.load(Ordering::Relaxed),
@@ -3677,6 +4329,17 @@ async fn handle_http_client(
         let is_chat = clean_path == "/v1/chat/completions";
         let want_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let cfg = parse_sampling_from_json(&req, &default_cfg);
+        if let Some(ref lname) = cfg.lora {
+            if !state.meta.lora_adapters.iter().any(|a| a == lname) {
+                let _ = write_json_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    &json!({"error": {"message": format!("unknown LoRA adapter `{}` (loaded: {:?})", lname, state.meta.lora_adapters)}}),
+                )
+                .await;
+                return;
+            }
+        }
         if let Err(e) = compile_grammar_for_cfg(&cfg) {
             let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": format!("grammar/schema error: {}", e)}})).await;
             return;
@@ -3691,8 +4354,8 @@ async fn handle_http_client(
         let seq_no = state.total_reqs.fetch_add(1, Ordering::Relaxed) + 1;
         let req_id = format!("chatcmpl-tenon-{}-{}", created, seq_no);
 
-        let mut parsed_image: Option<RgbImage> = None;
-        let mut mm_user_text = String::new();
+        let mut mm_parts: Vec<MmPart> = Vec::new();
+        let mut has_any_image = false;
         let prompt = if is_chat {
             let mut msgs: Vec<(String, String)> = Vec::new();
             if let Some(arr) = req.get("messages").and_then(Value::as_array) {
@@ -3703,9 +4366,12 @@ async fn handle_http_client(
                         .unwrap_or("user")
                         .to_string();
                     let content = if let Some(s) = item.get("content").and_then(Value::as_str) {
+                        if !s.is_empty() && role != "assistant" {
+                            mm_parts.push(MmPart::Text(s.to_string()));
+                        }
                         s.to_string()
                     } else if let Some(parts) = item.get("content").and_then(Value::as_array) {
-                        // OpenAI Multimodal Content Array: `[{"type":"text","text":"..."}, {"type":"image_url","image_url":{"url":"data:image/..."}}]`
+                        // OpenAI Multi-Image Multimodal Content Array: interleaves arbitrary `text` & `image_url` parts!
                         let mut text_acc = String::new();
                         for part in parts {
                             match part.get("type").and_then(Value::as_str) {
@@ -3715,6 +4381,7 @@ async fn handle_http_client(
                                             text_acc.push(' ');
                                         }
                                         text_acc.push_str(t);
+                                        mm_parts.push(MmPart::Text(t.to_string()));
                                     }
                                 }
                                 Some("image_url") => {
@@ -3723,7 +4390,10 @@ async fn handle_http_client(
                                         .and_then(|u| u.as_str().or_else(|| u.get("url").and_then(Value::as_str)));
                                     if let Some(u) = url {
                                         match decode_image_url_to_rgb(u) {
-                                            Ok(img) => parsed_image = Some(img),
+                                            Ok(img) => {
+                                                has_any_image = true;
+                                                mm_parts.push(MmPart::Image(img));
+                                            }
                                             Err(e) => {
                                                 let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": format!("image_url decode failed: {}", e)}})).await;
                                                 return;
@@ -3734,7 +4404,6 @@ async fn handle_http_client(
                                 _ => {}
                             }
                         }
-                        mm_user_text = text_acc.clone();
                         text_acc
                     } else {
                         String::new()
@@ -3770,11 +4439,10 @@ async fn handle_http_client(
                     msgs.push(("system".to_string(), schema_note));
                 }
             }
-            if parsed_image.is_some() && state.meta.has_mmproj {
-                mm_user_text
-            } else {
-                format_chat_template(&state.meta.arch, &msgs)
+            if !has_any_image || !state.meta.has_mmproj {
+                mm_parts.clear();
             }
+            format_chat_template(&state.meta.arch, &msgs)
         } else {
             req.get("prompt")
                 .and_then(Value::as_str)
@@ -3791,7 +4459,7 @@ async fn handle_http_client(
                 prompt,
                 add_bos: true,
                 cfg,
-                image: parsed_image,
+                mm_parts,
                 tx: ev_tx,
             })
             .is_err()
@@ -3968,9 +4636,33 @@ async fn handle_http_client(
     .await;
 }
 
+fn parse_lora_spec(spec: &str) -> (String, String, f64) {
+    let (name_opt, rest) = match spec.split_once('=') {
+        Some((n, r)) if !n.is_empty() => (Some(n.to_string()), r),
+        _ => (None, spec),
+    };
+    let (path, scale) = if let Some((p, sc_s)) = rest.rsplit_once(':') {
+        if let Ok(sc) = sc_s.parse::<f64>() {
+            (p.to_string(), sc)
+        } else {
+            (rest.to_string(), 1.0)
+        }
+    } else {
+        (rest.to_string(), 1.0)
+    };
+    let name = name_opt.unwrap_or_else(|| {
+        Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("lora")
+            .to_string()
+    });
+    (name, path, scale)
+}
+
 fn print_llm_usage() {
     println!(
-        r#"tenon llm — Native Out-of-Core Streaming LLM CLI & Continuous-Batching OpenAI Server (v6)
+        r#"tenon llm — Native Out-of-Core Streaming LLM CLI & Continuous-Batching OpenAI Server (v7)
 
 USAGE:
   tenon llm <model.gguf> [OPTIONS]
@@ -3979,9 +4671,12 @@ OPTIONS:
   --prompt <text>           Raw completion prompt (runs batched prefill + streaming stdout)
   --chat <text>             Chat user message (auto-applies model architecture chat template)
   --system <text>           Optional system prompt (used with --chat)
-  --image <path>            Local PNG/BMP/PPM image for multimodal VLM generation (with --mmproj)
+  --image <path>            Local PNG/BMP/PPM image for multimodal VLM (repeatable for multi-image!)
+  --anyres                  Force AnyRes high-res 5-tile encoding on VLM images (auto for hi-res!)
   --mmproj <mmproj.gguf>    CLIP/SigLIP/SmolVLM multimodal GPU vision encoder GGUF
-  --serve <host:port>       Launch OpenAI-compatible v6 Continuous-Batching + SSE + Embeddings + Rerank server
+  --lora <name=path[:sc]>   Load zero-copy runtime GGUF LoRA adapter (repeatable; HTTP `"lora":"name"`)
+  --serve <host:port>       Launch OpenAI-compatible v7 Chunked-Prefill CB + Adaptive Spec + Multi-LoRA server
+  --prefill-chunk <N>       Chunked prefill token budget per decode tick in --serve mode (default: 128)
   --plan-only               Inspect GGUF & print Auto VRAM/NUMA/KV/TP/EP plan without loading weights
   --max-vram-gb <F>         Hard VRAM/RAM budget cap in GiB (0 = auto-detect hardware)
   --ctx <N>                 Total KV context capacity across all slots (default: 4096, up to 16384)
@@ -3989,12 +4684,12 @@ OPTIONS:
   --kv-quant <auto|q8|fp16> KV-cache precision (`q8` saves -47% VRAM; default: auto)
   --mla-latent <0|1>        Matrix-absorbed compressed latent MLA KV cache (default: 1)
   --tp <N>                  Multi-GPU Tensor Parallelism degree on CUDA (`TP=2..8`, default: 1)
-  --ep <N>                  Multi-GPU MoE Expert Parallelism degree on CUDA (`EP=2..8`, default: 1)
+  --ep <N>                  Multi-GPU MoE Expert Parallelism degree on CUDA (`EP=2..8`, 2D `TPxEP` supported!)
   --slots <N>               Override auto-planned VRAM slots / pinned layers
   --nocache                 Force uncached direct NVMe I/O (`F_NOCACHE` / `POSIX_FADV_DONTNEED`)
   --fast-dp4a               Enable opt-in CUDA 128-bit `int4` Q8_1 `__dp4a` fast path
   --draft <small.gguf>      Small draft GGUF for lossless speculative decoding (`verify_batch` / `verify_tree`)
-  --speculative <off|ngram|draft|mtp|tree> Speculative decoding mode (default: off, or draft when --draft set)
+  --speculative <off|ngram|draft|mtp|tree> Speculative decoding mode (adaptive fusion with CB in --serve!)
   --spec-k <N>              Speculative lookahead window K (default: 5)
   --json                    Enforce RFC 8259 JSON-object grammar-constrained sampling
   --json-schema <json>      Enforce full recursive JSON Schema grammar-constrained sampling
@@ -4018,11 +4713,13 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
     let mut model_path: Option<String> = None;
     let mut draft_path: Option<String> = None;
     let mut mmproj_path: Option<String> = None;
-    let mut image_path: Option<String> = None;
+    let mut image_paths: Vec<String> = Vec::new();
+    let mut lora_specs: Vec<(String, String, f64)> = Vec::new();
     let mut prompt: Option<String> = None;
     let mut chat_msg: Option<String> = None;
     let mut system_msg: Option<String> = None;
     let mut serve_addr: Option<String> = None;
+    let mut prefill_chunk_size = 128usize;
     let mut plan_only = false;
     let mut max_vram_gb = 0.0f64;
     let mut max_ctx = 4096i64;
@@ -4042,9 +4739,15 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
             "--prompt" if i + 1 < args.len() => { prompt = Some(args[i + 1].clone()); i += 2; }
             "--chat" if i + 1 < args.len() => { chat_msg = Some(args[i + 1].clone()); i += 2; }
             "--system" if i + 1 < args.len() => { system_msg = Some(args[i + 1].clone()); i += 2; }
-            "--image" if i + 1 < args.len() => { image_path = Some(args[i + 1].clone()); i += 2; }
+            "--image" if i + 1 < args.len() => { image_paths.push(args[i + 1].clone()); i += 2; }
+            "--anyres" => { cfg.anyres = true; i += 1; }
             "--mmproj" if i + 1 < args.len() => { mmproj_path = Some(args[i + 1].clone()); i += 2; }
+            "--lora" if i + 1 < args.len() => { lora_specs.push(parse_lora_spec(&args[i + 1])); i += 2; }
             "--serve" if i + 1 < args.len() => { serve_addr = Some(args[i + 1].clone()); i += 2; }
+            "--prefill-chunk" if i + 1 < args.len() => {
+                prefill_chunk_size = args[i + 1].parse::<usize>().unwrap_or(128).clamp(16, 4096);
+                i += 2;
+            }
             "--plan-only" => { plan_only = true; i += 1; }
             "--max-vram-gb" if i + 1 < args.len() => { max_vram_gb = args[i + 1].parse().unwrap_or(0.0); i += 2; }
             "--ctx" if i + 1 < args.len() => { max_ctx = args[i + 1].parse().unwrap_or(4096); i += 2; }
@@ -4137,7 +4840,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
     let chosen_nocache = force_nocache || plan.nocache;
     let gib = 1024.0 * 1024.0 * 1024.0;
     eprintln!(
-        "[tenon llm] backend={} | disk={:.2} GiB | layers={} experts={} d={} | plan: slots={} nocache={} kv={} kv_slots={} tp={} ep={} prefill_B={} est_vram={:.2} GiB",
+        "[tenon llm] backend={} | disk={:.2} GiB | layers={} experts={} d={} | plan: slots={} nocache={} kv={} kv_slots={} tp={} ep={} prefill_chunk={} est_vram={:.2} GiB",
         api.backend,
         plan.disk_bytes as f64 / gib,
         plan.n_layers,
@@ -4149,7 +4852,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         kv_slots,
         tp_size,
         ep_size,
-        plan.prefill_chunk,
+        prefill_chunk_size,
         plan.est_vram_bytes as f64 / gib
     );
     if plan_only {
@@ -4195,7 +4898,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         match api.mmproj_load(mp) {
             Ok(mh) => {
                 eprintln!(
-                    "[tenon llm] loaded mmproj vision encoder `{}` ({}x{} patch={} -> {} vision tokens x {}d)",
+                    "[tenon llm] loaded mmproj vision encoder `{}` ({}x{} patch={} -> {} vision tokens x {}d, AnyRes ready)",
                     mp,
                     api.mmproj_info(mh, 0),
                     api.mmproj_info(mh, 0),
@@ -4215,6 +4918,31 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         0
     };
 
+    let mut lora_map: HashMap<String, (i64, f64)> = HashMap::new();
+    let mut lora_adapters: Vec<String> = Vec::new();
+    for (lname, lpath, lscale) in &lora_specs {
+        match api.lora_load(handle, lpath, *lscale) {
+            Ok(lid) => {
+                let rank = api.lora_info(handle, lid, 1);
+                let nt = api.lora_info(handle, lid, 2);
+                eprintln!(
+                    "[tenon llm] loaded zero-copy GGUF LoRA `{}` (id={}, rank={}, tensors={}, scale={:.2}) from `{}`",
+                    lname, lid, rank, nt, lscale, lpath
+                );
+                lora_map.insert(lname.clone(), (lid, *lscale));
+                lora_adapters.push(lname.clone());
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                api.free(handle);
+                return ExitCode::from(1);
+            }
+        }
+    }
+    if serve_addr.is_none() && !lora_adapters.is_empty() && cfg.lora.is_none() {
+        cfg.lora = Some(lora_adapters[0].clone());
+    }
+
     let arch = api.arch(handle);
     let d_model = api.info(handle, 1).max(1) as usize;
     let n_experts = api.info(handle, 5);
@@ -4223,7 +4951,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
     let vocab_size = api.info(handle, 7).max(1) as usize;
     let core_vram = api.info(handle, 8) as f64 / gib;
     let cache_vram = api.info(handle, 9) as f64 / gib;
-    let (actual_mla_lat, actual_slots, actual_slot_ctx, actual_bpe_merges, actual_tp, actual_ep, nccl_active, has_mtp, is_mla) =
+    let (actual_mla_lat, actual_slots, actual_slot_ctx, actual_bpe_merges, actual_tp, actual_ep, hybrid_2d, nccl_active, has_mtp, is_mla) =
         if api.backend == "cuda" {
             let sctx = api.info(handle, 28);
             (
@@ -4233,6 +4961,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
                 api.info(handle, 29),
                 api.info(handle, 31).max(1),
                 api.info(handle, 34).max(1),
+                api.info(handle, 38) != 0,
                 api.info(handle, 33) != 0,
                 api.info(handle, 30),
                 api.info(handle, 24) != 0,
@@ -4247,6 +4976,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
                 1,
                 1,
                 false,
+                false,
                 api.info(handle, 27),
                 api.info(handle, 23) != 0,
             )
@@ -4260,7 +4990,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         .unwrap_or("tenon-gguf")
         .to_string();
     eprintln!(
-        "[tenon llm] loaded `{}` (arch={}, ctx={} [{}x{}], kv={}, mla_latent={}, bpe_merges={}, tp={}, ep={}, nccl={}, mtp={}, pa_blks={}, cb={}, core_vram={:.2} GiB, cache_vram={:.2} GiB) in {:.2}s",
+        "[tenon llm] loaded `{}` (arch={}, ctx={} [{}x{}], kv={}, mla_latent={}, bpe_merges={}, tp={}, ep={}, hybrid_2d={}, nccl={}, mtp={}, pa_blks={}, cb={}, loras={}, core_vram={:.2} GiB, cache_vram={:.2} GiB) in {:.2}s",
         model_id,
         arch,
         max_ctx,
@@ -4271,10 +5001,12 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         actual_bpe_merges,
         actual_tp,
         actual_ep,
+        hybrid_2d,
         nccl_active,
         has_mtp,
         pa_blocks,
         supports_cb,
+        lora_adapters.len(),
         core_vram,
         cache_vram,
         t_load.elapsed().as_secs_f64()
@@ -4293,12 +5025,15 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         n_bpe_merges: actual_bpe_merges,
         tp_size: actual_tp,
         ep_size: actual_ep,
+        hybrid_2d,
         nccl_active,
         has_draft: draft_handle > 0,
         has_mtp,
         has_mmproj: mmproj_handle > 0,
         mmproj_n_tokens: if mmproj_handle > 0 { api.mmproj_info(mmproj_handle, 6).max(0) as usize } else { 0 },
         supports_cb,
+        prefill_chunk_size,
+        lora_adapters,
     };
 
     let mut loaded = LoadedModel {
@@ -4314,6 +5049,9 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         cb_radix: RadixKvCache::new(16),
         vocab_pieces: Vec::new(),
         logits_scratch: Vec::new(),
+        lora_map,
+        active_lora_id: 0,
+        prefill_chunk_size,
     };
 
     if let Some(addr) = serve_addr {
@@ -4335,6 +5073,11 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
             total_reqs: AtomicU64::new(0),
             radix_hits: AtomicU64::new(0),
             radix_saved_toks: AtomicU64::new(0),
+            chunked_prefill_chunks: AtomicU64::new(0),
+            adaptive_spec_steps: AtomicU64::new(0),
+            adaptive_spec_proposed: AtomicU64::new(0),
+            adaptive_spec_accepted: AtomicU64::new(0),
+            lora_swaps: AtomicU64::new(0),
         });
         let st_eng = Arc::clone(&state);
         std::thread::Builder::new()
@@ -4343,8 +5086,8 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
             .expect("spawn continuous batching engine thread");
 
         eprintln!(
-            "[tenon llm] OpenAI-compatible v6 Continuous-Batching Server listening on http://{} (PagedKV {} blks, COW Fork, json_schema+GBNF, /v1/embeddings, /v1/rerank, mmproj={})",
-            addr, pa_blocks, meta.has_mmproj
+            "[tenon llm] OpenAI-compatible v7 Server listening on http://{} (PagedKV {} blks, ChunkedPrefill={}, AdaptiveSpec={:?}, MultiLoRA={:?}, mmproj={})",
+            addr, pa_blocks, meta.prefill_chunk_size, cfg.spec_mode, meta.lora_adapters, meta.has_mmproj
         );
         loop {
             match listener.accept().await {
@@ -4362,27 +5105,36 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         }
     }
 
-    if let Some(ref img_p) = image_path {
+    if !image_paths.is_empty() {
         if loaded.mmproj_handle <= 0 {
             eprintln!("error: --image requires --mmproj <mmproj.gguf>");
             return ExitCode::from(2);
         }
-        let img = match decode_image_url_to_rgb(img_p) {
-            Ok(im) => im,
-            Err(e) => {
-                eprintln!("error decoding image `{}`: {}", img_p, e);
-                return ExitCode::from(1);
+        let mut parts: Vec<MmPart> = Vec::new();
+        for (idx, img_p) in image_paths.iter().enumerate() {
+            let img = match decode_image_url_to_rgb(img_p) {
+                Ok(im) => im,
+                Err(e) => {
+                    eprintln!("error decoding image `{}`: {}", img_p, e);
+                    return ExitCode::from(1);
+                }
+            };
+            if image_paths.len() > 1 {
+                parts.push(MmPart::Text(format!("Image {}:", idx + 1)));
             }
-        };
-        let q = chat_msg.or(prompt).unwrap_or_else(|| "Describe this image in one sentence.".to_string());
-        let res = run_multimodal_generation(&mut loaded, &q, &img, &cfg, |piece| {
+            parts.push(MmPart::Image(img));
+        }
+        let q = chat_msg.or(prompt).unwrap_or_else(|| "Describe these images.".to_string());
+        parts.push(MmPart::Text(q));
+        let res = run_multimodal_generation(&mut loaded, &parts, &cfg, |piece| {
             print!("{}", piece);
             let _ = io::stdout().flush();
             true
         });
         println!();
         eprintln!(
-            "[tenon llm] vision prefill: {} toks in {:.1} ms | decode: {} toks in {:.1} ms ({:.2} tok/s)",
+            "[tenon llm] vision prefill ({} images): {} toks in {:.1} ms | decode: {} toks in {:.1} ms ({:.2} tok/s)",
+            image_paths.len(),
             res.prompt_tokens,
             res.prefill_ms,
             res.completion_tokens,
@@ -4507,5 +5259,27 @@ mod tests {
         let img = decode_image_url_to_rgb(&format!("data:image/x-portable-pixmap;base64,{}", b64)).unwrap();
         assert_eq!((img.width, img.height), (2, 1));
         assert_eq!(img.rgb, vec![255, 0, 0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn test_v7_lora_spec_and_sampling_json() {
+        assert_eq!(
+            parse_lora_spec("coder=/tmp/code_lora.gguf:1.5"),
+            ("coder".to_string(), "/tmp/code_lora.gguf".to_string(), 1.5)
+        );
+        assert_eq!(
+            parse_lora_spec("/tmp/my_adapter.gguf"),
+            ("my_adapter".to_string(), "/tmp/my_adapter.gguf".to_string(), 1.0)
+        );
+        let req = json!({
+            "temperature": 0.0,
+            "max_tokens": 32,
+            "lora": "coder",
+            "anyres": true
+        });
+        let cfg = parse_sampling_from_json(&req, &SamplingCfg::default());
+        assert_eq!(cfg.lora.as_deref(), Some("coder"));
+        assert!(cfg.anyres);
+        assert_eq!(cfg.max_tokens, 32);
     }
 }
