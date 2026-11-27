@@ -1,19 +1,23 @@
 // examples/showcase/tenon_llm_server_cuda.tn
-// Pure-Tenon Zero-Rust Single-Binary Production LLM Server v9 (< 750 KiB, NVIDIA CUDA)!
+// Pure-Tenon Zero-Rust Single-Binary Production LLM Server & PD Router v10 (< 750 KiB, NVIDIA CUDA)!
 //
-// Tenon v9 Features:
+// Tenon v10 Features:
 //   - Zero Rust, Zero Tokio, Zero Python, Zero Docker — compiles via `tenon build` to a < 750 KiB native binary!
 //   - Single-threaded OS `epoll`/`kqueue` Reactor (`std/net/reactor.tn`) multiplexing up to 8 concurrent LLM clients!
-//   - Universal PagedAttention Continuous Batching (`tn_cumoe_step_batch`) + Zero-Copy COW Prefix Fork (`tn_cumoe_paged_seq_fork`)!
-//   - Single-Launch Mixed-Batch Heterogeneous Multi-Tenant LoRA BGMV (`tn_cumoe_lora_set_batch`) — zero tenant splitting!
-//   - Disaggregated Prefill-Decode (PD) PagedKV Transfer (`POST /v1/pd/prefill` & `POST /v1/pd/decode`, TNKV + FNV-1a checksum)!
-//   - OpenAI `tools` + `response_format` JSON mode + Chunked Prefill Interleaving (`TENON_PREFILL_CHUNK`)!
-//   - Prometheus `GET /metrics` (OpenMetrics text/plain) + `GET /health` + `POST /shutdown` Graceful Drain!
+//   - Universal PagedAttention Continuous Batching + Hardware CUDA Graphs Persistent Decode (`TENON_CUDA_GRAPH=1`)!
+//   - Adaptive Tensor Core `mma.sync.m16n8k16` MoE Mega-Kernel v2 + 4-Mode PagedKV (`FP16`/`Q8_0`/`FP8_E4M3`/`Q4_0`) + SWA/Sink!
+//   - Zero-Copy Disaggregated PD Transport:
+//       * POSIX SHM Zero-Copy (`transport="shm"` / `?transport=shm`, `tn_cumoe_kv_{export,import}_shm`)
+//       * Raw Binary HTTP (`?format=binary` / `application/octet-stream`, 0% Base64/Hex overhead!)
+//       * Built-in `TENON_PD_ROUTER=1` Gateway Mode (`TENON_PREFILL_WORKERS`, `TENON_DECODE_WORKERS`, Prefix-Affinity Routing!)
+//   - Prometheus `GET /metrics` TTFT/TPOT Latency Histograms (`tenon_ttft_ms_bucket`, `tenon_tpot_ms_bucket`) + v10 HW Counters!
 //   - Cross-platform macOS/Apple Metal counterpart: `examples/showcase/tenon_llm_server.tn`!
 //
 // Build & Run:
 //   tenon build examples/showcase/tenon_llm_server_cuda.tn -o /tmp/tenon_llm_server
 //   TENON_MODEL=/tmp/models/v6/Llama-3.2-1B-Instruct-Q4_0.gguf TENON_ADDR=127.0.0.1:28091 /tmp/tenon_llm_server
+//   # Or 3-node Zero-Rust Disaggregated PD Cluster:
+//   TENON_PD_ROUTER=1 TENON_ADDR=127.0.0.1:28095 TENON_PREFILL_WORKERS=127.0.0.1:28091 TENON_DECODE_WORKERS=127.0.0.1:28092 TENON_PD_TRANSPORT=shm /tmp/tenon_llm_server
 
 import "std/core/types.tn"
 import "std/os/io.tn"
@@ -40,43 +44,88 @@ pure fn find_hdr_end(s Text) Int {
     -1
 }
 
-pure fn parse_cl(hdr Text) Int {
-    let n = len(hdr)
+pure fn to_lower_ascii(c Int) Int {
+    if c >= 65 && c <= 90 { c + 32 } else { c }
+}
+
+pure fn str_contains_ci(hay Text, needle Text) Bool {
+    let hn = len(hay)
+    let nn = len(needle)
+    if nn == 0 { return true }
+    if nn > hn { return false }
     var i = 0
-    while i + 15 < n {
-        let b0 = byte_at(hdr, i)
-        let b1 = byte_at(hdr, i + 1)
-        let b7 = byte_at(hdr, i + 7)
-        let b8 = byte_at(hdr, i + 8)
-        if (b0 == 67 || b0 == 99) && (b1 == 79 || b1 == 111) && b7 == 45 && (b8 == 76 || b8 == 108) {
-            var p = i + 15
-            while p < n && (byte_at(hdr, p) == 58 || byte_at(hdr, p) == 32 || byte_at(hdr, p) == 9) {
-                p += 1
+    while i + nn <= hn {
+        var j = 0
+        var ok = true
+        while j < nn {
+            if to_lower_ascii(byte_at(hay, i + j)) != to_lower_ascii(byte_at(needle, j)) {
+                ok = false
+                j = nn
+            } else {
+                j += 1
             }
-            var acc = 0
-            while p < n && byte_at(hdr, p) >= 48 && byte_at(hdr, p) <= 57 {
-                acc = acc * 10 + (byte_at(hdr, p) - 48)
-                p += 1
+        }
+        if ok { return true }
+        i += 1
+    }
+    false
+}
+
+pure fn hdr_get_val(hdr Text, key_colon Text) Text {
+    let hn = len(hdr)
+    let kn = len(key_colon)
+    var i = 0
+    while i + kn <= hn {
+        let at_line_start = i == 0 || byte_at(hdr, i - 1) == 10
+        if at_line_start {
+            var j = 0
+            var ok = true
+            while j < kn {
+                if to_lower_ascii(byte_at(hdr, i + j)) != to_lower_ascii(byte_at(key_colon, j)) {
+                    ok = false
+                    j = kn
+                } else {
+                    j += 1
+                }
             }
-            return acc
+            if ok {
+                var p = i + kn
+                while p < hn && (byte_at(hdr, p) == 32 || byte_at(hdr, p) == 9) { p += 1 }
+                var e = p
+                while e < hn && byte_at(hdr, e) != 13 && byte_at(hdr, e) != 10 { e += 1 }
+                return str_slice(hdr, p, e)
+            }
         }
         i += 1
     }
-    0
+    ""
 }
 
-pure fn parse_pos_int(s Text, fallback Int) Int {
+pure fn parse_cl(hdr Text) Int {
+    let v = hdr_get_val(hdr, "content-length:")
+    parse_int_val(v, 0)
+}
+
+pure fn parse_int_val(s Text, fallback Int) Int {
     let n = len(s)
     if n == 0 { return fallback }
-    var acc = 0
     var i = 0
+    var neg = false
+    if byte_at(s, 0) == 45 { neg = true; i = 1 }
+    if i >= n { return fallback }
+    var acc = 0
     while i < n {
         let c = byte_at(s, i)
         if c < 48 || c > 57 { return fallback }
         acc = acc * 10 + (c - 48)
         i += 1
     }
-    if acc > 0 { acc } else { fallback }
+    if neg { 0 - acc } else { acc }
+}
+
+pure fn parse_pos_int(s Text, fallback Int) Int {
+    let v = parse_int_val(s, 0)
+    if v > 0 { v } else { fallback }
 }
 
 pure fn find_byte_from(s Text, ch Int, start Int) Int {
@@ -87,6 +136,38 @@ pure fn find_byte_from(s Text, ch Int, start Int) Int {
         i += 1
     }
     -1
+}
+
+pure fn path_clean(full_path Text) Text {
+    let q = find_byte_from(full_path, 63, 0)
+    if q >= 0 { str_slice(full_path, 0, q) } else { full_path }
+}
+
+pure fn split_csv(s Text) List[Text] {
+    var out List[Text] = []
+    let n = len(s)
+    var p = 0
+    while p < n {
+        let c = find_byte_from(s, 44, p)
+        let e = if c >= 0 { c } else { n }
+        if e > p {
+            out = push(out, str_slice(s, p, e))
+        }
+        p = if c >= 0 { c + 1 } else { n }
+    }
+    out
+}
+
+pure fn fnv1a_prefix(s Text) Int {
+    var h = 2166136261
+    let n = if len(s) < 256 { len(s) } else { 256 }
+    var i = 0
+    while i < n {
+        h = (h ^ byte_at(s, i)) * 16777619
+        h = h & 2147483647
+        i += 1
+    }
+    h
 }
 
 fn write_json_http(cfd Int, status Int, reason Text, body Text) {
@@ -129,6 +210,19 @@ fn words_to_hex(words List[Int], n_bytes Int) Text {
     tb.finish()
 }
 
+fn words_to_raw_bytes(words List[Int], n_bytes Int) Text {
+    let h = buf_new()
+    var i = 0
+    while i < n_bytes {
+        let w = words[i / 8]
+        let sh = (i & 7) * 8
+        let b = (w >> sh) & 255
+        let _ = buf_push_byte(h, b)
+        i += 1
+    }
+    buf_finish(h)
+}
+
 fn hex_to_words(hex Text) List[Int] {
     let n_bytes = len(hex) / 2
     var words List[Int] = list_filled((n_bytes + 7) / 8, 0)
@@ -144,6 +238,87 @@ fn hex_to_words(hex Text) List[Int] {
         i += 1
     }
     words
+}
+
+// Tenon v10: Prometheus TTFT/TPOT Latency Histogram Helper
+record LatencyHist {
+    bounds List[Int],
+    buckets List[Int],
+    count Int,
+    sum_us Int,
+}
+
+impl LatencyHist {
+    pub fn new(bounds List[Int]) LatencyHist {
+        LatencyHist {
+            bounds = bounds,
+            buckets = list_filled(len(bounds), 0),
+            count = 0,
+            sum_us = 0,
+        }
+    }
+
+    pub fn observe(inout self, ms Float) {
+        if ms < 0.0 { return }
+        self.count = self.count + 1
+        self.sum_us = self.sum_us + float_to_int(ms * 1000.0)
+        let n = len(self.bounds)
+        var i = 0
+        while i < n {
+            if ms <= int_to_float(self.bounds[i]) {
+                self.buckets[i] = self.buckets[i] + 1
+            }
+            i += 1
+        }
+    }
+
+    pub fn format_prom(self, metric Text, help Text) Text {
+        var tb = TextBuilder.new()
+        tb.push_str("# HELP " ++ metric ++ " " ++ help ++ "\n# TYPE " ++ metric ++ " histogram\n")
+        let n = len(self.bounds)
+        var i = 0
+        while i < n {
+            tb.push_str(metric ++ "_bucket{le=\"" ++ int_to_text(self.bounds[i]) ++ "\"} " ++ int_to_text(self.buckets[i]) ++ "\n")
+            i += 1
+        }
+        tb.push_str(metric ++ "_bucket{le=\"+Inf\"} " ++ int_to_text(self.count) ++ "\n")
+        tb.push_str(metric ++ "_sum " ++ float_to_text(int_to_float(self.sum_us) / 1000.0) ++ "\n")
+        tb.push_str(metric ++ "_count " ++ int_to_text(self.count) ++ "\n")
+        tb.finish()
+    }
+}
+
+fn http_post_raw(addr Text, path Text, ctype Text, extra_hdr Text, body Text) Text {
+    let fd = net_tcp_connect(addr)
+    if fd < 0 { return "" }
+    let hdr = "POST " ++ path ++ " HTTP/1.1\r\nHost: " ++ addr
+        ++ "\r\nContent-Type: " ++ ctype
+        ++ "\r\nContent-Length: " ++ int_to_text(len(body))
+        ++ "\r\n" ++ extra_hdr ++ "Connection: close\r\n\r\n"
+    let wn1 = net_write_text(fd, hdr)
+    if wn1 < 0 {
+        let _ = net_close(fd)
+        return ""
+    }
+    if len(body) > 0 {
+        let wn2 = net_write_text(fd, body)
+        if wn2 < 0 {
+            let _ = net_close(fd)
+            return ""
+        }
+    }
+    var tb = TextBuilder.new()
+    var reading = true
+    while reading {
+        let chunk = net_read_text(fd, 65536)
+        if len(chunk) > 0 {
+            tb.push_str(chunk)
+        } else {
+            reading = false
+        }
+    }
+    let _ = net_close(fd)
+    tb.finish()
 }
 
 fn format_chat(arch Text, msgs JsonValue, extra_sys Text) Text {
@@ -312,7 +487,7 @@ fn send_final_cb_response(
     timings = json_obj_set(timings, "decode_ms", JFloat(dec_ms))
 
     var resp = json_obj_new()
-    resp = json_obj_set(resp, "id", JStr("chatcmpl-tenon-native-v9"))
+    resp = json_obj_set(resp, "id", JStr("chatcmpl-tenon-native-v10"))
     resp = json_obj_set(resp, "object", JStr(if is_chat { "chat.completion" } else { "text_completion" }))
     resp = json_obj_set(resp, "model", JStr(model_name))
     resp = json_obj_set(resp, "choices", choices)
@@ -366,7 +541,20 @@ fn handle_embeddings(cfd Int, handle Int, model_name Text, body Text) {
     let _ = net_close(cfd)
 }
 
-fn handle_pd_prefill(cfd Int, handle Int, arch Text, model_name Text, body Text) Int {
+// Tenon v10: Zero-Copy POSIX SHM + Raw Binary HTTP + Hex Fallback Disaggregated Prefill!
+// Returns: >0 = bytes sent (positive), -1 = SHM success, 0 = error
+fn handle_pd_prefill(
+    cfd Int,
+    handle Int,
+    arch Text,
+    model_name Text,
+    full_path Text,
+    hdr Text,
+    body Text,
+    port Int,
+    shm_seq Int,
+    inout ttft_hist LatencyHist
+) Int {
     match JsonValue.parse(body) {
         Err(_) => {
             write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid json\"}")
@@ -383,6 +571,10 @@ fn handle_pd_prefill(cfd Int, handle Int, arch Text, model_name Text, body Text)
                 let _ = net_close(cfd)
                 return 0
             }
+            let req_tr = match json_get_str(jv, "transport") { Some(s) => s, None => "" }
+            let want_shm = req_tr == "shm" || str_contains_ci(full_path, "transport=shm")
+            let want_bin = !want_shm && (req_tr == "binary" || str_contains_ci(full_path, "format=binary") || str_contains_ci(hdr_get_val(hdr, "accept:"), "application/octet-stream"))
+
             let bos = unsafe { tn_cumoe_info(handle, 11) }
             var tok_buf List[Int] = list_filled(HIST_STRIDE, 0)
             let nt = unsafe { tn_cumoe_tokenize(handle, text_cstr_ptr(prompt), list_data_ptr(tok_buf), HIST_STRIDE - 2) }
@@ -396,6 +588,33 @@ fn handle_pd_prefill(cfd Int, handle Int, arch Text, model_name Text, body Text)
             let t0 = cumoe_now_ms()
             let first_tok = unsafe { tn_cumoe_paged_prefill(handle, pd_slot, list_data_ptr(ids), n_prompt, 0) }
             let pf_ms = cumoe_now_ms() - t0
+            ttft_hist.observe(pf_ms)
+            let piece0 = unsafe { cstr_to_text(tn_cumoe_token_cstr(handle, first_tok)) }
+
+            if want_shm {
+                let shm_name = "/tnpd_" ++ int_to_text(port) ++ "_" ++ int_to_text(shm_seq)
+                let wrote = unsafe { tn_cumoe_kv_export_shm(handle, pd_slot, n_prompt, text_cstr_ptr(shm_name)) }
+                let _ = unsafe { tn_cumoe_paged_seq_free(handle, pd_slot) }
+                if wrote <= 0 {
+                    write_json_http(cfd, 500, "Internal Server Error", "{\"error\":\"kv shm export failed\"}")
+                    let _ = net_close(cfd)
+                    return 0
+                }
+                var out = json_obj_new()
+                out = json_obj_set(out, "object", JStr("tenon.pd.prefill"))
+                out = json_obj_set(out, "transport", JStr("shm"))
+                out = json_obj_set(out, "model", JStr(model_name))
+                out = json_obj_set(out, "shm_name", JStr(shm_name))
+                out = json_obj_set(out, "first_tok", JInt(first_tok))
+                out = json_obj_set(out, "first_piece", JStr(piece0))
+                out = json_obj_set(out, "prompt_tokens", JInt(n_prompt))
+                out = json_obj_set(out, "kv_bytes", JInt(wrote))
+                out = json_obj_set(out, "prefill_ms", JFloat(pf_ms))
+                write_json_http(cfd, 200, "OK", out.stringify())
+                let _ = net_close(cfd)
+                return -1
+            }
+
             let kv_sz = unsafe { tn_cumoe_kv_slot_bytes(handle, pd_slot, n_prompt) }
             var blob List[Int] = list_filled((kv_sz + 7) / 8, 0)
             let wrote = unsafe { tn_cumoe_kv_export_slot(handle, pd_slot, n_prompt, list_data_ptr(blob), kv_sz) }
@@ -405,10 +624,24 @@ fn handle_pd_prefill(cfd Int, handle Int, arch Text, model_name Text, body Text)
                 let _ = net_close(cfd)
                 return 0
             }
+            if want_bin {
+                let raw = words_to_raw_bytes(blob, wrote)
+                let resp_hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *"
+                    ++ "\r\nX-Tenon-PD-Transport: binary\r\nX-Tenon-PD-Model: " ++ model_name
+                    ++ "\r\nX-Tenon-PD-First-Tok: " ++ int_to_text(first_tok)
+                    ++ "\r\nX-Tenon-PD-Prompt-Tokens: " ++ int_to_text(n_prompt)
+                    ++ "\r\nX-Tenon-PD-KV-Bytes: " ++ int_to_text(wrote)
+                    ++ "\r\nX-Tenon-PD-Prefill-Ms: " ++ float_to_text(pf_ms)
+                    ++ "\r\nContent-Length: " ++ int_to_text(len(raw)) ++ "\r\nConnection: close\r\n\r\n"
+                let _ = net_write_text(cfd, resp_hdr)
+                let _ = net_write_text(cfd, raw)
+                let _ = net_close(cfd)
+                return wrote
+            }
             let hex = words_to_hex(blob, wrote)
-            let piece0 = unsafe { cstr_to_text(tn_cumoe_token_cstr(handle, first_tok)) }
             var out = json_obj_new()
             out = json_obj_set(out, "object", JStr("tenon.pd.prefill"))
+            out = json_obj_set(out, "transport", JStr("hex"))
             out = json_obj_set(out, "model", JStr(model_name))
             out = json_obj_set(out, "first_tok", JInt(first_tok))
             out = json_obj_set(out, "first_piece", JStr(piece0))
@@ -423,78 +656,457 @@ fn handle_pd_prefill(cfd Int, handle Int, arch Text, model_name Text, body Text)
     }
 }
 
-fn handle_pd_decode(cfd Int, handle Int, eos Int, model_name Text, body Text) Int {
-    match JsonValue.parse(body) {
-        Err(_) => {
-            write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid json\"}")
+// Returns: >0 = raw binary bytes imported, -1 = SHM imported, -2 = hex imported, 0 = error
+fn handle_pd_decode(
+    cfd Int,
+    handle Int,
+    eos Int,
+    model_name Text,
+    hdr Text,
+    body Text,
+    inout tpot_hist LatencyHist
+) Int {
+    let pd_slot = 25
+    let is_bin = str_contains_ci(hdr_get_val(hdr, "content-type:"), "application/octet-stream")
+    var first_tok = 0
+    var max_toks = 16
+    var imported = 0
+    var ret_code = 0
+
+    if is_bin {
+        first_tok = parse_int_val(hdr_get_val(hdr, "x-tenon-pd-first-tok:"), 0)
+        max_toks = parse_pos_int(hdr_get_val(hdr, "x-tenon-pd-max-tokens:"), 16)
+        imported = unsafe { tn_cumoe_kv_import_slot(handle, pd_slot, text_cstr_ptr(body), len(body)) }
+        if imported <= 0 {
+            write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid binary TNKV blob\"}")
             let _ = net_close(cfd)
-            0
+            return 0
         }
-        Ok(jv) => {
-            let hex = match json_get_str(jv, "kv_blob_hex") { Some(s) => s, None => "" }
-            let first_tok = match json_get_int(jv, "first_tok") { Some(n) => n, None => 0 }
-            let max_toks = match json_get_int(jv, "max_tokens") { Some(n) => n, None => 16 }
-            if len(hex) < 128 || (len(hex) & 1) != 0 {
-                write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid kv_blob_hex\"}")
+        ret_code = len(body)
+    } else {
+        match JsonValue.parse(body) {
+            Err(_) => {
+                write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid json\"}")
                 let _ = net_close(cfd)
                 return 0
             }
-            let n_bytes = len(hex) / 2
-            let blob = hex_to_words(hex)
-            if len(blob) == 0 {
-                write_json_http(cfd, 400, "Bad Request", "{\"error\":\"malformed hex\"}")
-                let _ = net_close(cfd)
-                return 0
-            }
-            let pd_slot = 25
-            let imported = unsafe { tn_cumoe_kv_import_slot(handle, pd_slot, list_data_ptr(blob), n_bytes) }
-            if imported <= 0 {
-                write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid or corrupted TNKV blob\"}")
-                let _ = net_close(cfd)
-                return 0
-            }
-            let t0 = cumoe_now_ms()
-            var tb = TextBuilder.new()
-            var gen = 0
-            var cur = first_tok
-            var pos = imported
-            var ta List[Int] = list_filled(1, 0)
-            var pa List[Int] = list_filled(1, 0)
-            var sa List[Int] = list_filled(1, pd_slot)
-            var oa List[Int] = list_filled(1, 0)
-            var finish_reason = "length"
-            while gen < max_toks {
-                let piece = unsafe { cstr_to_text(tn_cumoe_token_cstr(handle, cur)) }
-                if is_stop_piece(cur, eos, piece) {
-                    finish_reason = "stop"
-                    break
+            Ok(jv) => {
+                first_tok = match json_get_int(jv, "first_tok") { Some(n) => n, None => 0 }
+                max_toks = match json_get_int(jv, "max_tokens") { Some(n) => n, None => 16 }
+                let shm_name = match json_get_str(jv, "shm_name") { Some(s) => s, None => "" }
+                if len(shm_name) > 0 {
+                    imported = unsafe { tn_cumoe_kv_import_shm(handle, pd_slot, text_cstr_ptr(shm_name), 1) }
+                    if imported <= 0 {
+                        write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid or missing POSIX SHM segment\"}")
+                        let _ = net_close(cfd)
+                        return 0
+                    }
+                    ret_code = -1
+                } else {
+                    let hex = match json_get_str(jv, "kv_blob_hex") { Some(s) => s, None => "" }
+                    if len(hex) < 128 || (len(hex) & 1) != 0 {
+                        write_json_http(cfd, 400, "Bad Request", "{\"error\":\"missing shm_name, binary body, or kv_blob_hex\"}")
+                        let _ = net_close(cfd)
+                        return 0
+                    }
+                    let n_bytes = len(hex) / 2
+                    let blob = hex_to_words(hex)
+                    if len(blob) == 0 {
+                        write_json_http(cfd, 400, "Bad Request", "{\"error\":\"malformed hex\"}")
+                        let _ = net_close(cfd)
+                        return 0
+                    }
+                    imported = unsafe { tn_cumoe_kv_import_slot(handle, pd_slot, list_data_ptr(blob), n_bytes) }
+                    if imported <= 0 {
+                        write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid or corrupted TNKV blob\"}")
+                        let _ = net_close(cfd)
+                        return 0
+                    }
+                    ret_code = -2
                 }
-                tb.push_str(piece)
-                gen += 1
-                if gen >= max_toks { break }
-                ta[0] = cur
-                pa[0] = pos
-                let _ = unsafe { tn_cumoe_step_batch(handle, list_data_ptr(ta), list_data_ptr(pa), list_data_ptr(sa), 1, list_data_ptr(oa)) }
-                cur = oa[0]
-                pos += 1
             }
-            let dec_ms = cumoe_now_ms() - t0
-            let _ = unsafe { tn_cumoe_paged_seq_free(handle, pd_slot) }
-            send_final_cb_response(cfd, model_name, false, false, tb.finish(), imported, imported, gen, pd_slot, 0.0, dec_ms, finish_reason)
-            1
         }
     }
+
+    let t0 = cumoe_now_ms()
+    var tb = TextBuilder.new()
+    var gen = 0
+    var cur = first_tok
+    var pos = imported
+    var ta List[Int] = list_filled(1, 0)
+    var pa List[Int] = list_filled(1, 0)
+    var sa List[Int] = list_filled(1, pd_slot)
+    var oa List[Int] = list_filled(1, 0)
+    var finish_reason = "length"
+    while gen < max_toks {
+        let piece = unsafe { cstr_to_text(tn_cumoe_token_cstr(handle, cur)) }
+        if is_stop_piece(cur, eos, piece) {
+            finish_reason = "stop"
+            break
+        }
+        tb.push_str(piece)
+        gen += 1
+        if gen >= max_toks { break }
+        ta[0] = cur
+        pa[0] = pos
+        let _ = unsafe { tn_cumoe_step_batch(handle, list_data_ptr(ta), list_data_ptr(pa), list_data_ptr(sa), 1, list_data_ptr(oa)) }
+        cur = oa[0]
+        pos += 1
+    }
+    let dec_ms = cumoe_now_ms() - t0
+    if gen > 0 && dec_ms > 0.0 {
+        let denom = if gen > 1 { gen - 1 } else { 1 }
+        tpot_hist.observe(dec_ms / int_to_float(denom))
+    }
+    let _ = unsafe { tn_cumoe_paged_seq_free(handle, pd_slot) }
+    send_final_cb_response(cfd, model_name, false, false, tb.finish(), imported, imported, gen, pd_slot, 0.0, dec_ms, finish_reason)
+    ret_code
+}
+
+// =========================================================================
+// Tenon v10: Built-In Pure-Tenon Zero-Rust Disaggregated PD Router / Gateway!
+// Prefix-Affinity Hashing + Zero-Copy POSIX SHM / Raw Binary HTTP Orchestration!
+// =========================================================================
+fn run_pd_router_mode(addr Text) Int {
+    let pf_workers = split_csv(sys_env("TENON_PREFILL_WORKERS"))
+    let dec_workers = split_csv(sys_env("TENON_DECODE_WORKERS"))
+    if len(pf_workers) == 0 || len(dec_workers) == 0 {
+        println("[tenon-pd-router-v10] error: TENON_PREFILL_WORKERS and TENON_DECODE_WORKERS must be set")
+        return 1
+    }
+    let tr_env = sys_env("TENON_PD_TRANSPORT")
+    let def_transport = if len(tr_env) > 0 { tr_env } else { "binary" }
+
+    let lfd = net_tcp_listen(addr)
+    if lfd < 0 {
+        println("[tenon-pd-router-v10] listen failed on [" ++ addr ++ "]")
+        return 1
+    }
+    let port = net_tcp_local_port(lfd)
+    let _ = net_set_nonblocking(lfd, true)
+    let rfd = reactor_new()
+    let _ = reactor_add(rfd, lfd, EVENT_READ, 0)
+
+    println("[tenon-pd-router-v10] Pure-Tenon Zero-Rust PD Router v10 (CUDA) listening on http://" ++ addr
+        ++ " (port=" ++ int_to_text(port) ++ ", transport=" ++ def_transport
+        ++ ", prefill_workers=" ++ int_to_text(len(pf_workers))
+        ++ ", decode_workers=" ++ int_to_text(len(dec_workers)) ++ ")")
+
+    var rd_fds List[Int] = list_filled(MAX_RD, -1)
+    var rd_bufs List[Text] = list_filled(MAX_RD, "")
+    var router_reqs = 0
+    var shm_transfers = 0
+    var binary_bytes = 0
+    var dec_rr = 0
+    var ttft_hist = LatencyHist.new([10, 25, 50, 100, 250, 500, 1000, 2500])
+    var tpot_hist = LatencyHist.new([2, 5, 10, 20, 50, 100, 250])
+    var running = true
+
+    while running {
+        let evs = reactor_wait(rfd, 25, 64)
+        var ei = 0
+        while ei < len(evs) {
+            let tok = event_token(evs[ei])
+            if tok == 0 {
+                var accepting = true
+                while accepting {
+                    let cfd = net_tcp_accept(lfd)
+                    if cfd >= 0 {
+                        var free_rd = -1
+                        var ri = 0
+                        while ri < MAX_RD {
+                            if rd_fds[ri] < 0 { free_rd = ri; ri = MAX_RD } else { ri += 1 }
+                        }
+                        if free_rd >= 0 {
+                            let _ = net_set_nonblocking(cfd, true)
+                            let _ = net_set_nodelay(cfd, true)
+                            let _ = reactor_add(rfd, cfd, EVENT_READ, cfd)
+                            rd_fds[free_rd] = cfd
+                            rd_bufs[free_rd] = ""
+                        } else {
+                            let _ = net_close(cfd)
+                        }
+                    } else {
+                        accepting = false
+                    }
+                }
+            } else {
+                var rslot = -1
+                var ri = 0
+                while ri < MAX_RD {
+                    if rd_fds[ri] == tok { rslot = ri; ri = MAX_RD } else { ri += 1 }
+                }
+                if rslot >= 0 {
+                    var closed = false
+                    var reading = true
+                    while reading {
+                        let chunk = net_read_text(tok, 16384)
+                        if len(chunk) > 0 {
+                            rd_bufs[rslot] = rd_bufs[rslot] ++ chunk
+                        } else {
+                            if !net_last_would_block() { closed = true }
+                            reading = false
+                        }
+                    }
+                    let buf = rd_bufs[rslot]
+                    let hend = find_hdr_end(buf)
+                    if hend >= 0 {
+                        let hdr = str_slice(buf, 0, hend)
+                        let clen = parse_cl(hdr)
+                        if len(buf) >= hend + 4 + clen {
+                            let _ = reactor_del(rfd, tok)
+                            let _ = net_set_nonblocking(tok, false)
+                            rd_fds[rslot] = -1
+                            rd_bufs[rslot] = ""
+
+                            var sp1 = 0
+                            while sp1 < hend && byte_at(buf, sp1) != 32 { sp1 += 1 }
+                            var sp2 = sp1 + 1
+                            while sp2 < hend && byte_at(buf, sp2) != 32 { sp2 += 1 }
+                            let method = str_slice(buf, 0, sp1)
+                            let full_path = str_slice(buf, sp1 + 1, sp2)
+                            let path = path_clean(full_path)
+                            let body = if clen > 0 && hend + 4 + clen <= len(buf) {
+                                str_slice(buf, hend + 4, hend + 4 + clen)
+                            } else {
+                                ""
+                            }
+
+                            if method == "OPTIONS" {
+                                let _ = net_write_text(tok, "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n")
+                                let _ = net_close(tok)
+                            } else if method == "POST" && path == "/shutdown" {
+                                running = false
+                                write_json_http(tok, 200, "OK", "{\"status\":\"shutting_down\"}")
+                                let _ = net_close(tok)
+                            } else if method == "GET" && path == "/health" {
+                                var pwa = json_arr_new()
+                                var wi = 0
+                                while wi < len(pf_workers) { pwa = json_arr_push(pwa, JStr(pf_workers[wi])); wi += 1 }
+                                var dwa = json_arr_new()
+                                wi = 0
+                                while wi < len(dec_workers) { dwa = json_arr_push(dwa, JStr(dec_workers[wi])); wi += 1 }
+                                var obj = json_obj_new()
+                                obj = json_obj_set(obj, "status", JStr("ok"))
+                                obj = json_obj_set(obj, "engine", JStr("tenon-native-zero-rust-v10-pd-router"))
+                                obj = json_obj_set(obj, "role", JStr("pd-router"))
+                                obj = json_obj_set(obj, "transport", JStr(def_transport))
+                                obj = json_obj_set(obj, "prefill_workers", pwa)
+                                obj = json_obj_set(obj, "decode_workers", dwa)
+                                obj = json_obj_set(obj, "pd_router_requests", JInt(router_reqs))
+                                obj = json_obj_set(obj, "pd_shm_transfers", JInt(shm_transfers))
+                                obj = json_obj_set(obj, "pd_binary_bytes", JInt(binary_bytes))
+                                write_json_http(tok, 200, "OK", obj.stringify())
+                                let _ = net_close(tok)
+                            } else if method == "GET" && path == "/metrics" {
+                                var mt = TextBuilder.new()
+                                mt.push_str("# HELP tenon_pd_router_requests_total Total OpenAI requests routed across PD cluster\n# TYPE tenon_pd_router_requests_total counter\ntenon_pd_router_requests_total ")
+                                mt.push_str(int_to_text(router_reqs))
+                                mt.push_str("\n# HELP tenon_pd_shm_transfers_total Zero-copy POSIX SHM PD transfers\n# TYPE tenon_pd_shm_transfers_total counter\ntenon_pd_shm_transfers_total ")
+                                mt.push_str(int_to_text(shm_transfers))
+                                mt.push_str("\n# HELP tenon_pd_binary_bytes_total Raw binary HTTP PD KV bytes\n# TYPE tenon_pd_binary_bytes_total counter\ntenon_pd_binary_bytes_total ")
+                                mt.push_str(int_to_text(binary_bytes))
+                                mt.push_str("\n")
+                                mt.push_str(ttft_hist.format_prom("tenon_ttft_ms", "Time-to-first-token (prefill) latency in ms"))
+                                mt.push_str(tpot_hist.format_prom("tenon_tpot_ms", "Time-per-output-token (decode) latency in ms"))
+                                write_text_http(tok, 200, "OK", "text/plain; version=0.0.4", mt.finish())
+                                let _ = net_close(tok)
+                            } else if method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions") {
+                                let is_chat = path == "/v1/chat/completions"
+                                match JsonValue.parse(body) {
+                                    Err(_) => {
+                                        write_json_http(tok, 400, "Bad Request", "{\"error\":\"invalid json\"}")
+                                        let _ = net_close(tok)
+                                    }
+                                    Ok(jv) => {
+                                        router_reqs += 1
+                                        let max_toks = match json_get_int(jv, "max_tokens") { Some(n) => n, None => 32 }
+                                        let tr_req = match json_get_str(jv, "transport") { Some(s) => s, None => def_transport }
+                                        let use_shm = tr_req == "shm"
+
+                                        let pf_idx = fnv1a_prefix(body) % len(pf_workers)
+                                        let dec_idx = dec_rr % len(dec_workers)
+                                        dec_rr += 1
+                                        let pf_addr = pf_workers[pf_idx]
+                                        let dec_addr = dec_workers[dec_idx]
+
+                                        let t_all = cumoe_now_ms()
+                                        var pf_ms = 0.0
+                                        var kv_bytes = 0
+                                        var dec_raw = ""
+                                        var ok_pf = false
+
+                                        if use_shm {
+                                            let pf_raw = http_post_raw(pf_addr, "/v1/pd/prefill?transport=shm", "application/json", "", body)
+                                            let phe = find_hdr_end(pf_raw)
+                                            if phe >= 0 {
+                                                let pb = str_slice(pf_raw, phe + 4, len(pf_raw))
+                                                match JsonValue.parse(pb) {
+                                                    Ok(pj) => {
+                                                        let shm_n = match json_get_str(pj, "shm_name") { Some(s) => s, None => "" }
+                                                        let ftok = match json_get_int(pj, "first_tok") { Some(n) => n, None => 0 }
+                                                        let ptoks = match json_get_int(pj, "prompt_tokens") { Some(n) => n, None => 0 }
+                                                        kv_bytes = match json_get_int(pj, "kv_bytes") { Some(n) => n, None => 0 }
+                                                        pf_ms = cumoe_now_ms() - t_all
+                                                        if len(shm_n) > 0 {
+                                                            shm_transfers += 1
+                                                            ok_pf = true
+                                                            var dreq = json_obj_new()
+                                                            dreq = json_obj_set(dreq, "shm_name", JStr(shm_n))
+                                                            dreq = json_obj_set(dreq, "first_tok", JInt(ftok))
+                                                            dreq = json_obj_set(dreq, "prompt_tokens", JInt(ptoks))
+                                                            dreq = json_obj_set(dreq, "max_tokens", JInt(max_toks))
+                                                            dec_raw = http_post_raw(dec_addr, "/v1/pd/decode", "application/json", "", dreq.stringify())
+                                                        }
+                                                    }
+                                                    Err(_) => {}
+                                                }
+                                            }
+                                        } else {
+                                            let pf_raw = http_post_raw(pf_addr, "/v1/pd/prefill?format=binary", "application/json", "Accept: application/octet-stream\r\n", body)
+                                            let phe = find_hdr_end(pf_raw)
+                                            if phe >= 0 {
+                                                let phdr = str_slice(pf_raw, 0, phe)
+                                                let kv_bin = str_slice(pf_raw, phe + 4, len(pf_raw))
+                                                let ftok_s = hdr_get_val(phdr, "x-tenon-pd-first-tok:")
+                                                let ptok_s = hdr_get_val(phdr, "x-tenon-pd-prompt-tokens:")
+                                                kv_bytes = len(kv_bin)
+                                                pf_ms = cumoe_now_ms() - t_all
+                                                if kv_bytes >= 48 {
+                                                    binary_bytes += kv_bytes
+                                                    ok_pf = true
+                                                    let dhdr = "X-Tenon-PD-First-Tok: " ++ ftok_s
+                                                        ++ "\r\nX-Tenon-PD-Prompt-Tokens: " ++ ptok_s
+                                                        ++ "\r\nX-Tenon-PD-Max-Tokens: " ++ int_to_text(max_toks) ++ "\r\n"
+                                                    dec_raw = http_post_raw(dec_addr, "/v1/pd/decode", "application/octet-stream", dhdr, kv_bin)
+                                                }
+                                            }
+                                        }
+
+                                        let dhe = find_hdr_end(dec_raw)
+                                        if !ok_pf || dhe < 0 {
+                                            write_json_http(tok, 502, "Bad Gateway", "{\"error\":\"PD worker handoff failed\"}")
+                                            let _ = net_close(tok)
+                                        } else {
+                                            let dbody = str_slice(dec_raw, dhe + 4, len(dec_raw))
+                                            match JsonValue.parse(dbody) {
+                                                Err(_) => {
+                                                    write_json_http(tok, 502, "Bad Gateway", "{\"error\":\"malformed decode worker json\"}")
+                                                    let _ = net_close(tok)
+                                                }
+                                                Ok(dj) => {
+                                                    let total_ms = cumoe_now_ms() - t_all
+                                                    let dec_ms = if total_ms > pf_ms { total_ms - pf_ms } else { 0.1 }
+                                                    ttft_hist.observe(pf_ms)
+                                                    var gen_text = ""
+                                                    var fin_r = "length"
+                                                    match json_get(dj, "choices") {
+                                                        Some(chs) => {
+                                                            match json_at(chs, 0) {
+                                                                Some(c0) => {
+                                                                    gen_text = match json_get_str(c0, "text") { Some(s) => s, None => "" }
+                                                                    fin_r = match json_get_str(c0, "finish_reason") { Some(s) => s, None => "length" }
+                                                                }
+                                                                None => {}
+                                                            }
+                                                        }
+                                                        None => {}
+                                                    }
+                                                    var ptoks = 0
+                                                    var ctoks = 0
+                                                    match json_get(dj, "usage") {
+                                                        Some(u) => {
+                                                            ptoks = match json_get_int(u, "prompt_tokens") { Some(n) => n, None => 0 }
+                                                            ctoks = match json_get_int(u, "completion_tokens") { Some(n) => n, None => 0 }
+                                                        }
+                                                        None => {}
+                                                    }
+                                                    if ctoks > 0 && dec_ms > 0.0 {
+                                                        let denom = if ctoks > 1 { ctoks - 1 } else { 1 }
+                                                        tpot_hist.observe(dec_ms / int_to_float(denom))
+                                                    }
+                                                    var choice = json_obj_new()
+                                                    choice = json_obj_set(choice, "index", JInt(0))
+                                                    if is_chat {
+                                                        var msg = json_obj_new()
+                                                        msg = json_obj_set(msg, "role", JStr("assistant"))
+                                                        msg = json_obj_set(msg, "content", JStr(gen_text))
+                                                        choice = json_obj_set(choice, "message", msg)
+                                                    } else {
+                                                        choice = json_obj_set(choice, "text", JStr(gen_text))
+                                                    }
+                                                    choice = json_obj_set(choice, "finish_reason", JStr(fin_r))
+                                                    var choices = json_arr_new()
+                                                    choices = json_arr_push(choices, choice)
+                                                    var usage = json_obj_new()
+                                                    usage = json_obj_set(usage, "prompt_tokens", JInt(ptoks))
+                                                    usage = json_obj_set(usage, "completion_tokens", JInt(ctoks))
+                                                    usage = json_obj_set(usage, "total_tokens", JInt(ptoks + ctoks))
+                                                    var timings = json_obj_new()
+                                                    timings = json_obj_set(timings, "prefill_worker", JStr(pf_addr))
+                                                    timings = json_obj_set(timings, "decode_worker", JStr(dec_addr))
+                                                    timings = json_obj_set(timings, "transport", JStr(if use_shm { "shm" } else { "binary" }))
+                                                    timings = json_obj_set(timings, "kv_bytes", JInt(kv_bytes))
+                                                    timings = json_obj_set(timings, "prefill_ms", JFloat(pf_ms))
+                                                    timings = json_obj_set(timings, "decode_ms", JFloat(dec_ms))
+                                                    timings = json_obj_set(timings, "total_ms", JFloat(total_ms))
+                                                    var resp = json_obj_new()
+                                                    resp = json_obj_set(resp, "id", JStr("chatcmpl-tenon-pd-router-" ++ int_to_text(router_reqs)))
+                                                    resp = json_obj_set(resp, "object", JStr(if is_chat { "chat.completion" } else { "text_completion" }))
+                                                    resp = json_obj_set(resp, "model", JStr("tenon-pd-cluster"))
+                                                    resp = json_obj_set(resp, "choices", choices)
+                                                    resp = json_obj_set(resp, "usage", usage)
+                                                    resp = json_obj_set(resp, "timings", timings)
+                                                    write_json_http(tok, 200, "OK", resp.stringify())
+                                                    let _ = net_close(tok)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                write_json_http(tok, 404, "Not Found", "{\"error\":\"unknown router endpoint\"}")
+                                let _ = net_close(tok)
+                            }
+                        } else if closed {
+                            let _ = reactor_del(rfd, tok)
+                            let _ = net_close(tok)
+                            rd_fds[rslot] = -1
+                            rd_bufs[rslot] = ""
+                        }
+                    } else if closed {
+                        let _ = reactor_del(rfd, tok)
+                        let _ = net_close(tok)
+                        rd_fds[rslot] = -1
+                        rd_bufs[rslot] = ""
+                    }
+                }
+            }
+            ei += 1
+        }
+    }
+
+    let _ = reactor_del(rfd, lfd)
+    let _ = reactor_close(rfd)
+    let _ = net_close(lfd)
+    println("[tenon-pd-router-v10] graceful shutdown complete.")
+    0
 }
 
 fn main() Int {
+    let addr_env = sys_env("TENON_ADDR")
+    let addr = if len(addr_env) > 0 { addr_env } else { "127.0.0.1:28091" }
+    let router_env = sys_env("TENON_PD_ROUTER")
+    if router_env == "1" || router_env == "true" {
+        return run_pd_router_mode(addr)
+    }
+
     let model_env = sys_env("TENON_MODEL")
     let model_path = if len(model_env) > 0 {
         model_env
     } else {
         "/tmp/models/v6/Llama-3.2-1B-Instruct-Q4_0.gguf"
     }
-    let addr_env = sys_env("TENON_ADDR")
-    let addr = if len(addr_env) > 0 { addr_env } else { "127.0.0.1:28091" }
     let chunk_env = sys_env("TENON_PREFILL_CHUNK")
     let prefill_chunk = parse_pos_int(chunk_env, 64)
     let model_name = "tenon-native-gguf"
@@ -532,7 +1144,7 @@ fn main() Int {
                 if lid > 0 {
                     lora_names = push(lora_names, lname)
                     lora_ids = push(lora_ids, lid)
-                    println("[tenon-native-v8] loaded zero-copy LoRA `" ++ lname ++ "` (id=" ++ int_to_text(lid) ++ ")")
+                    println("[tenon-native-v10] loaded zero-copy LoRA `" ++ lname ++ "` (id=" ++ int_to_text(lid) ++ ")")
                 }
             }
             pos_l = if comma >= 0 { comma + 1 } else { n_le }
@@ -541,7 +1153,7 @@ fn main() Int {
 
     let lfd = net_tcp_listen(addr)
     if lfd < 0 {
-        println("[tenon-native-v8] listen failed on [" ++ addr ++ "]")
+        println("[tenon-native-v10] listen failed on [" ++ addr ++ "]")
         model.destroy()
         return 1
     }
@@ -550,9 +1162,12 @@ fn main() Int {
     let rfd = reactor_new()
     let _ = reactor_add(rfd, lfd, EVENT_READ, 0)
 
-    println("[tenon-native-v9] Pure-Tenon Zero-Rust Unified Server v9 (CUDA) listening on http://" ++ addr
-        ++ " (port=" ++ int_to_text(port) ++ ", arch=" ++ arch ++ ", pa_blks=" ++ int_to_text(pa_init_blks)
-        ++ ", chunk=" ++ int_to_text(prefill_chunk) ++ ", loras=" ++ int_to_text(len(lora_names)) ++ ", hetero_bgmv=true, pd=true, max_cb=" ++ int_to_text(MAX_CB) ++ ")")
+    let kv_qmode = unsafe { tn_cumoe_info(handle, 48) }
+    let swa_win = unsafe { tn_cumoe_info(handle, 49) }
+    println("[tenon-native-v10] Pure-Tenon Zero-Rust Unified Server v10 (CUDA) listening on http://" ++ addr
+        ++ " (port=" ++ int_to_text(port) ++ ", arch=" ++ arch ++ ", kv_mode=" ++ int_to_text(kv_qmode)
+        ++ ", swa=" ++ int_to_text(swa_win) ++ ", pa_blks=" ++ int_to_text(pa_init_blks)
+        ++ ", chunk=" ++ int_to_text(prefill_chunk) ++ ", loras=" ++ int_to_text(len(lora_names)) ++ ", cuda_graph=true, pd_bin_shm=true, max_cb=" ++ int_to_text(MAX_CB) ++ ")")
 
     // Non-blocking HTTP connection read slots (`rd_fds[i] == -1` => free)
     var rd_fds List[Int] = list_filled(MAX_RD, -1)
@@ -597,7 +1212,7 @@ fn main() Int {
     var tok_scratch List[Int] = list_filled(HIST_STRIDE, 0)
     var chunk_buf List[Int] = list_filled(HIST_STRIDE, 0)
 
-    // Server telemetry
+    // Server telemetry + TTFT/TPOT histograms
     var clock_tick = 0
     var total_reqs = 0
     var cb_batches_run = 0
@@ -609,6 +1224,11 @@ fn main() Int {
     var lora_swaps = 0
     var hetero_lora_batches = 0
     var pd_transfers = 0
+    var pd_shm_transfers = 0
+    var pd_binary_bytes = 0
+    var pd_shm_seq = 0
+    var ttft_hist = LatencyHist.new([10, 25, 50, 100, 250, 500, 1000, 2500])
+    var tpot_hist = LatencyHist.new([2, 5, 10, 20, 50, 100, 250])
     var draining = false
 
     var running = true
@@ -674,7 +1294,7 @@ fn main() Int {
                     var closed = false
                     var reading = true
                     while reading {
-                        let chunk = net_read_text(tok, 16384)
+                        let chunk = net_read_text(tok, 32768)
                         if len(chunk) > 0 {
                             rd_bufs[rslot] = rd_bufs[rslot] ++ chunk
                         } else {
@@ -687,7 +1307,8 @@ fn main() Int {
                     let buf = rd_bufs[rslot]
                     let hend = find_hdr_end(buf)
                     if hend >= 0 {
-                        let clen = parse_cl(str_slice(buf, 0, hend))
+                        let hdr = str_slice(buf, 0, hend)
+                        let clen = parse_cl(hdr)
                         if len(buf) >= hend + 4 + clen {
                             let _ = reactor_del(rfd, tok)
                             let _ = net_set_nonblocking(tok, false)
@@ -699,7 +1320,8 @@ fn main() Int {
                             var sp2 = sp1 + 1
                             while sp2 < hend && byte_at(buf, sp2) != 32 { sp2 += 1 }
                             let method = str_slice(buf, 0, sp1)
-                            let path = str_slice(buf, sp1 + 1, sp2)
+                            let full_path = str_slice(buf, sp1 + 1, sp2)
+                            let path = path_clean(full_path)
                             let body = if clen > 0 && hend + 4 + clen <= len(buf) {
                                 str_slice(buf, hend + 4, hend + 4 + clen)
                             } else {
@@ -707,7 +1329,7 @@ fn main() Int {
                             }
 
                             if method == "OPTIONS" {
-                                let _ = net_write_text(tok, "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n")
+                                let _ = net_write_text(tok, "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Tenon-PD-First-Tok, X-Tenon-PD-Prompt-Tokens, X-Tenon-PD-Max-Tokens\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n")
                                 let _ = net_close(tok)
                             } else if method == "GET" && path == "/health" {
                                 let d_model = unsafe { tn_cumoe_info(handle, 1) }
@@ -716,6 +1338,12 @@ fn main() Int {
                                 let pa_free = unsafe { tn_cumoe_paged_kv_info(handle, 2) }
                                 let pa_forks = unsafe { tn_cumoe_paged_kv_info(handle, 4) }
                                 let vram = unsafe { tn_cumoe_info(handle, 8) }
+                                let g_rep = unsafe { tn_cumoe_info(handle, 46) }
+                                let g_cap = unsafe { tn_cumoe_info(handle, 47) }
+                                let tc_tiles = unsafe { tn_cumoe_info(handle, 45) }
+                                let kv_m = unsafe { tn_cumoe_info(handle, 48) }
+                                let swa_m = unsafe { tn_cumoe_info(handle, 49) }
+                                let sink_m = unsafe { tn_cumoe_info(handle, 50) }
                                 var cur_act = 0
                                 var ci = 0
                                 while ci < MAX_CB {
@@ -730,17 +1358,25 @@ fn main() Int {
                                 }
                                 var obj = json_obj_new()
                                 obj = json_obj_set(obj, "status", JStr(if draining { "draining" } else { "ok" }))
-                                obj = json_obj_set(obj, "engine", JStr("tenon-native-zero-rust-v9-cuda"))
+                                obj = json_obj_set(obj, "engine", JStr("tenon-native-zero-rust-v10-cuda"))
                                 obj = json_obj_set(obj, "arch", JStr(arch))
                                 obj = json_obj_set(obj, "model", JStr(model_name))
                                 obj = json_obj_set(obj, "n_layers", JInt(n_layers))
                                 obj = json_obj_set(obj, "d_model", JInt(d_model))
+                                obj = json_obj_set(obj, "kv_quant_mode", JInt(kv_m))
+                                obj = json_obj_set(obj, "sliding_window", JInt(swa_m))
+                                obj = json_obj_set(obj, "attn_sink", JInt(sink_m))
+                                obj = json_obj_set(obj, "graph_replays", JInt(g_rep))
+                                obj = json_obj_set(obj, "graph_captured", JInt(g_cap))
+                                obj = json_obj_set(obj, "moe_tc_amx_tiles", JInt(tc_tiles))
                                 obj = json_obj_set(obj, "prefill_chunk_size", JInt(prefill_chunk))
                                 obj = json_obj_set(obj, "chunked_prefill_chunks", JInt(chunked_prefill_chunks))
                                 obj = json_obj_set(obj, "lora_adapters", la)
                                 obj = json_obj_set(obj, "lora_swaps", JInt(lora_swaps))
                                 obj = json_obj_set(obj, "hetero_lora_batches", JInt(hetero_lora_batches))
                                 obj = json_obj_set(obj, "pd_transfers", JInt(pd_transfers))
+                                obj = json_obj_set(obj, "pd_shm_transfers", JInt(pd_shm_transfers))
+                                obj = json_obj_set(obj, "pd_binary_bytes", JInt(pd_binary_bytes))
                                 obj = json_obj_set(obj, "paged_kv_blocks", JInt(pa_tot))
                                 obj = json_obj_set(obj, "paged_kv_free_blocks", JInt(pa_free))
                                 obj = json_obj_set(obj, "paged_cow_forks", JInt(pa_forks))
@@ -757,6 +1393,10 @@ fn main() Int {
                                 let pa_tot = unsafe { tn_cumoe_paged_kv_info(handle, 1) }
                                 let pa_free = unsafe { tn_cumoe_paged_kv_info(handle, 2) }
                                 let pa_forks = unsafe { tn_cumoe_paged_kv_info(handle, 4) }
+                                let g_rep = unsafe { tn_cumoe_info(handle, 46) }
+                                let g_cap = unsafe { tn_cumoe_info(handle, 47) }
+                                let tc_tiles = unsafe { tn_cumoe_info(handle, 45) }
+                                let kv_m = unsafe { tn_cumoe_info(handle, 48) }
                                 var cur_act = 0
                                 var ci = 0
                                 while ci < MAX_CB {
@@ -784,9 +1424,23 @@ fn main() Int {
                                 mt.push_str(int_to_text(hetero_lora_batches))
                                 mt.push_str("\n# HELP tenon_pd_transfers_total Disaggregated PD PagedKV transfers\n# TYPE tenon_pd_transfers_total counter\ntenon_pd_transfers_total ")
                                 mt.push_str(int_to_text(pd_transfers))
+                                mt.push_str("\n# HELP tenon_pd_shm_transfers_total Zero-copy POSIX SHM PD transfers\n# TYPE tenon_pd_shm_transfers_total counter\ntenon_pd_shm_transfers_total ")
+                                mt.push_str(int_to_text(pd_shm_transfers))
+                                mt.push_str("\n# HELP tenon_pd_binary_bytes_total Raw binary HTTP PD bytes\n# TYPE tenon_pd_binary_bytes_total counter\ntenon_pd_binary_bytes_total ")
+                                mt.push_str(int_to_text(pd_binary_bytes))
+                                mt.push_str("\n# HELP tenon_graph_replays_total CUDA Graph persistent decode replays\n# TYPE tenon_graph_replays_total counter\ntenon_graph_replays_total ")
+                                mt.push_str(int_to_text(g_rep))
+                                mt.push_str("\n# HELP tenon_graph_captured_total CUDA Graph decode graphs captured\n# TYPE tenon_graph_captured_total counter\ntenon_graph_captured_total ")
+                                mt.push_str(int_to_text(g_cap))
+                                mt.push_str("\n# HELP tenon_moe_tc_amx_tiles_total Tensor Core hot-expert grouped MoE tiles\n# TYPE tenon_moe_tc_amx_tiles_total counter\ntenon_moe_tc_amx_tiles_total ")
+                                mt.push_str(int_to_text(tc_tiles))
+                                mt.push_str("\n# HELP tenon_kv_quant_mode PagedKV precision mode (0=FP16,1=Q8,2=FP8,3=Q4)\n# TYPE tenon_kv_quant_mode gauge\ntenon_kv_quant_mode ")
+                                mt.push_str(int_to_text(kv_m))
                                 mt.push_str("\n# HELP tenon_draining Graceful shutdown drain state\n# TYPE tenon_draining gauge\ntenon_draining ")
                                 mt.push_str(if draining { "1" } else { "0" })
                                 mt.push_str("\n")
+                                mt.push_str(ttft_hist.format_prom("tenon_ttft_ms", "Time-to-first-token (prefill) latency in ms"))
+                                mt.push_str(tpot_hist.format_prom("tenon_tpot_ms", "Time-per-output-token (decode) latency in ms"))
                                 write_text_http(tok, 200, "OK", "text/plain; version=0.0.4", mt.finish())
                                 let _ = net_close(tok)
                             } else if method == "POST" && path == "/shutdown" {
@@ -810,14 +1464,25 @@ fn main() Int {
                                     write_json_http(tok, 503, "Service Unavailable", "{\"error\":\"server draining\"}")
                                     let _ = net_close(tok)
                                 } else {
-                                    pd_transfers += handle_pd_prefill(tok, handle, arch, model_name, body)
+                                    pd_shm_seq += 1
+                                    let r = handle_pd_prefill(tok, handle, arch, model_name, full_path, hdr, body, port, pd_shm_seq, ttft_hist)
+                                    if r != 0 {
+                                        pd_transfers += 1
+                                        if r == -1 { pd_shm_transfers += 1 }
+                                        else if r > 1 { pd_binary_bytes += r }
+                                    }
                                 }
                             } else if method == "POST" && path == "/v1/pd/decode" {
                                 if draining {
                                     write_json_http(tok, 503, "Service Unavailable", "{\"error\":\"server draining\"}")
                                     let _ = net_close(tok)
                                 } else {
-                                    pd_transfers += handle_pd_decode(tok, handle, eos, model_name, body)
+                                    let r = handle_pd_decode(tok, handle, eos, model_name, hdr, body, tpot_hist)
+                                    if r != 0 {
+                                        pd_transfers += 1
+                                        if r == -1 { pd_shm_transfers += 1 }
+                                        else if r > 0 { pd_binary_bytes += r }
+                                    }
                                 }
                             } else if method == "POST" && path == "/v1/embeddings" {
                                 if draining {
@@ -1050,6 +1715,7 @@ fn main() Int {
                 if cb_pf_cur[pfs] >= end_p {
                     let pf_ms = cumoe_now_ms() - cb_tpf0[pfs]
                     cb_pf_ms[pfs] = pf_ms
+                    ttft_hist.observe(pf_ms)
                     let n_prompt = cb_ptoks[pfs]
                     let actual_lcp = cb_cached[pfs]
                     let cfd = cb_cfd[pfs]
@@ -1099,7 +1765,7 @@ fn main() Int {
             pfs += 1
         }
 
-        // Tenon v9: ONE Single-Launch Mixed-Batch Heterogeneous Multi-Tenant LoRA BGMV `step_batch`!
+        // Tenon v10: ONE Single-Launch Mixed-Batch Heterogeneous Multi-Tenant LoRA BGMV + CUDA Graphs `step_batch`!
         var b_sz = 0
         var first_lid = -1
         var has_hetero = false
@@ -1151,6 +1817,10 @@ fn main() Int {
                 let want_stream = cb_stream[s] != 0
                 if is_stop_piece(chosen, eos, piece) {
                     let dec_ms = cumoe_now_ms() - cb_tdec[s]
+                    if cb_gen[s] > 0 && dec_ms > 0.0 {
+                        let denom = if cb_gen[s] > 1 { cb_gen[s] - 1 } else { 1 }
+                        tpot_hist.observe(dec_ms / int_to_float(denom))
+                    }
                     send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, "stop")
                     cb_state[s] = 0
                     cb_cfd[s] = -1
@@ -1169,6 +1839,10 @@ fn main() Int {
                     if want_stream { alive = write_sse_piece(cb_cfd[s], model_name, is_chat, piece) }
                     if !alive || cb_gen[s] >= cb_max[s] || cb_pos[s] + 2 >= 4096 {
                         let dec_ms = cumoe_now_ms() - cb_tdec[s]
+                        if cb_gen[s] > 0 && dec_ms > 0.0 {
+                            let denom = if cb_gen[s] > 1 { cb_gen[s] - 1 } else { 1 }
+                            tpot_hist.observe(dec_ms / int_to_float(denom))
+                        }
                         let reason = if !alive { "stop" } else { "length" }
                         send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, reason)
                         cb_state[s] = 0
@@ -1185,6 +1859,6 @@ fn main() Int {
     let _ = reactor_close(rfd)
     let _ = net_close(lfd)
     model.destroy()
-    println("[tenon-native-v9] graceful shutdown complete.")
+    println("[tenon-native-v10] graceful shutdown complete.")
     0
 }

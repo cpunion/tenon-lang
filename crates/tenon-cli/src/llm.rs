@@ -79,6 +79,10 @@ type FnKvSlotBytes = unsafe extern "C" fn(i64, i64, i64) -> i64;
 type FnKvExportSlot = unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64;
 type FnKvImportSlot = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
 
+// Tenon v10 FFI function signatures (Zero-Copy POSIX SHM Disaggregated PD across Metal & CUDA!)
+type FnKvExportShm = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
+type FnKvImportShm = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
+
 struct LlmApi {
     backend: &'static str,
     _dl_handle: *mut c_void,
@@ -134,6 +138,9 @@ struct LlmApi {
     kv_slot_bytes: FnKvSlotBytes,
     kv_export_slot: FnKvExportSlot,
     kv_import_slot: FnKvImportSlot,
+    // v10 APIs
+    kv_export_shm: FnKvExportShm,
+    kv_import_shm: FnKvImportShm,
 }
 
 unsafe impl Send for LlmApi {}
@@ -259,11 +266,11 @@ fn load_llm_api() -> Result<LlmApi, String> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let lib_path = PathBuf::from(format!("/tmp/tenon_llm_{}_v9_{}.{}", backend, mtime, ext));
+    let lib_path = PathBuf::from(format!("/tmp/tenon_llm_{}_v10_{}.{}", backend, mtime, ext));
 
     if !lib_path.exists() {
         eprintln!(
-            "[tenon llm] compiling {} v9 runtime shim ({}) -> {}",
+            "[tenon llm] compiling {} v10 runtime shim ({}) -> {}",
             backend,
             src.display(),
             lib_path.display()
@@ -290,7 +297,7 @@ fn load_llm_api() -> Result<LlmApi, String> {
                 cmd.args(["-mavx2", "-mfma", "-mf16c"]);
             }
             cmd.arg(&src)
-                .args(["-ldl", "-lpthread", "-lm", "-o"])
+                .args(["-ldl", "-lpthread", "-lm", "-lrt", "-o"])
                 .arg(&lib_path)
                 .status()
         }
@@ -378,6 +385,8 @@ fn load_llm_api() -> Result<LlmApi, String> {
         kv_slot_bytes: load_symbol(dl_handle, &sym("kv_slot_bytes"))?,
         kv_export_slot: load_symbol(dl_handle, &sym("kv_export_slot"))?,
         kv_import_slot: load_symbol(dl_handle, &sym("kv_import_slot"))?,
+        kv_export_shm: load_symbol(dl_handle, &sym("kv_export_shm"))?,
+        kv_import_shm: load_symbol(dl_handle, &sym("kv_import_shm"))?,
     };
     if let Some(init) = api.init_fn {
         if unsafe { init() } == 0 {
@@ -711,6 +720,25 @@ impl LlmApi {
     fn kv_import_slot(&self, h: i64, slot: usize, blob: &[u8]) -> usize {
         let n = unsafe {
             (self.kv_import_slot)(h, slot as i64, blob.as_ptr() as i64, blob.len() as i64)
+        };
+        n.max(0) as usize
+    }
+
+    fn kv_export_shm(&self, h: i64, slot: usize, seq_len: usize, shm_name: &str) -> usize {
+        let Ok(cname) = CString::new(shm_name) else { return 0; };
+        let n = unsafe { (self.kv_export_shm)(h, slot as i64, seq_len as i64, cname.as_ptr() as i64) };
+        n.max(0) as usize
+    }
+
+    fn kv_import_shm(&self, h: i64, slot: usize, shm_name: &str, unlink_after: bool) -> usize {
+        let Ok(cname) = CString::new(shm_name) else { return 0; };
+        let n = unsafe {
+            (self.kv_import_shm)(
+                h,
+                slot as i64,
+                cname.as_ptr() as i64,
+                if unlink_after { 1 } else { 0 },
+            )
         };
         n.max(0) as usize
     }
@@ -2416,7 +2444,12 @@ struct ModelMeta {
     max_ctx: i64,
     slot_ctx: i64,
     n_kv_slots: usize,
+    #[allow(dead_code)]
     kv_q8: bool,
+    kv_quant_mode: i64,
+    kv_quant_name: String,
+    sliding_window: i64,
+    attn_sink: i64,
     mla_latent: bool,
     n_bpe_merges: i64,
     tp_size: i64,
@@ -3649,15 +3682,29 @@ enum EngineCmd {
         reply: tokio::sync::oneshot::Sender<Result<Vec<(usize, f32)>, String>>,
     },
     PagedStats {
-        reply: tokio::sync::oneshot::Sender<(i64, i64, i64, i64)>,
+        reply: tokio::sync::oneshot::Sender<(i64, i64, i64, i64, i64, i64, i64)>,
     },
     PdPrefill {
         prompt: String,
         add_bos: bool,
         reply: tokio::sync::oneshot::Sender<Result<(i64, String, usize, Vec<u8>, f64), String>>,
     },
+    PdPrefillShm {
+        prompt: String,
+        add_bos: bool,
+        shm_name: String,
+        reply: tokio::sync::oneshot::Sender<Result<(i64, String, usize, usize, f64), String>>,
+    },
     PdDecode {
         kv_blob: Vec<u8>,
+        first_tok: i64,
+        prompt_tokens: usize,
+        cfg: SamplingCfg,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    PdDecodeShm {
+        shm_name: String,
         first_tok: i64,
         prompt_tokens: usize,
         cfg: SamplingCfg,
@@ -3722,6 +3769,56 @@ struct ActiveSpecSeq {
     tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
 }
 
+const TTFT_BOUNDS_MS: [f64; 8] = [10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0];
+const TPOT_BOUNDS_MS: [f64; 7] = [2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 250.0];
+
+struct LatencyHist<const N: usize> {
+    buckets: [AtomicU64; N],
+    count: AtomicU64,
+    sum_us: AtomicU64,
+}
+
+impl<const N: usize> LatencyHist<N> {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(&self, ms: f64, bounds: &[f64; N]) {
+        if !ms.is_finite() || ms < 0.0 {
+            return;
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add((ms * 1000.0).round() as u64, Ordering::Relaxed);
+        for (idx, &b) in bounds.iter().enumerate() {
+            if ms <= b {
+                self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn format_prom(&self, metric: &str, help: &str, bounds: &[f64; N]) -> String {
+        let mut s = format!("# HELP {} {}\n# TYPE {} histogram\n", metric, help, metric);
+        for (idx, &b) in bounds.iter().enumerate() {
+            s.push_str(&format!(
+                "{}_bucket{{le=\"{}\"}} {}\n",
+                metric,
+                b,
+                self.buckets[idx].load(Ordering::Relaxed)
+            ));
+        }
+        let cnt = self.count.load(Ordering::Relaxed);
+        let sum_ms = self.sum_us.load(Ordering::Relaxed) as f64 / 1000.0;
+        s.push_str(&format!("{}_bucket{{le=\"+Inf\"}} {}\n", metric, cnt));
+        s.push_str(&format!("{}_sum {:.3}\n", metric, sum_ms));
+        s.push_str(&format!("{}_count {}\n", metric, cnt));
+        s
+    }
+}
+
 struct ServerState {
     meta: ModelMeta,
     engine_tx: std_mpsc::Sender<EngineCmd>,
@@ -3743,6 +3840,11 @@ struct ServerState {
     hetero_lora_batches: AtomicU64,
     mm_kv_cow_hits: AtomicU64,
     pd_transfers: AtomicU64,
+    pd_shm_transfers: AtomicU64,
+    pd_binary_bytes: AtomicU64,
+    pd_shm_seq: AtomicU64,
+    ttft_hist: LatencyHist<8>,
+    tpot_hist: LatencyHist<7>,
 }
 
 fn finish_cb_seq(
@@ -3752,6 +3854,11 @@ fn finish_cb_seq(
     state: &ServerState,
 ) {
     let decode_ms = seq.t_dec.elapsed().as_secs_f64() * 1000.0;
+    state.ttft_hist.observe(seq.prefill_ms, &TTFT_BOUNDS_MS);
+    if seq.completion_tokens > 0 && decode_ms > 0.0 {
+        let tpot = decode_ms / (seq.completion_tokens.saturating_sub(1).max(1) as f64);
+        state.tpot_hist.observe(tpot, &TPOT_BOUNDS_MS);
+    }
     if seq.cached_prefix_tokens > 0 {
         state.radix_hits.fetch_add(1, Ordering::Relaxed);
         state
@@ -3780,6 +3887,11 @@ fn finish_spec_seq(
     state: &ServerState,
 ) {
     let decode_ms = seq.t_dec.elapsed().as_secs_f64() * 1000.0;
+    state.ttft_hist.observe(seq.prefill_ms, &TTFT_BOUNDS_MS);
+    if seq.completion_tokens > 0 && decode_ms > 0.0 {
+        let tpot = decode_ms / (seq.completion_tokens.saturating_sub(1).max(1) as f64);
+        state.tpot_hist.observe(tpot, &TPOT_BOUNDS_MS);
+    }
     if seq.cached_prefix_tokens > 0 {
         state.radix_hits.fetch_add(1, Ordering::Relaxed);
         state
@@ -4713,7 +4825,20 @@ fn handle_engine_cmd(
             let free = m.api.paged_kv_info(m.handle, 2);
             let forks = m.api.paged_kv_info(m.handle, 4);
             let copies = m.api.paged_kv_info(m.handle, 5);
-            let _ = reply.send((total, free, forks, copies));
+            let (graph_replays, graph_captured, moe_tc_amx_tiles) = if m.api.backend == "cuda" {
+                (
+                    m.api.info(m.handle, 46),
+                    m.api.info(m.handle, 47),
+                    m.api.info(m.handle, 45),
+                )
+            } else {
+                (
+                    m.api.info(m.handle, 40),
+                    m.api.info(m.handle, 41),
+                    m.api.info(m.handle, 39),
+                )
+            };
+            let _ = reply.send((total, free, forks, copies, graph_replays, graph_captured, moe_tc_amx_tiles));
             false
         }
         EngineCmd::PdPrefill { prompt, add_bos, reply } => {
@@ -4738,11 +4863,41 @@ fn handle_engine_cmd(
             match blob {
                 Some(b) => {
                     state.pd_transfers.fetch_add(1, Ordering::Relaxed);
+                    state.ttft_hist.observe(prefill_ms, &TTFT_BOUNDS_MS);
                     let _ = reply.send(Ok((first_tok, first_piece, ids.len(), b, prefill_ms)));
                 }
                 None => {
                     let _ = reply.send(Err("failed to serialize PagedKV slot".into()));
                 }
+            }
+            false
+        }
+        EngineCmd::PdPrefillShm { prompt, add_bos, shm_name, reply } => {
+            if !m.meta.supports_cb {
+                let _ = reply.send(Err("model does not support PagedKV PD transfer".into()));
+                return false;
+            }
+            let _ = m.apply_lora(None);
+            let max_prompt = (m.meta.max_ctx as usize).saturating_sub(16).max(16);
+            let mut ids = Vec::new();
+            if add_bos && m.bos_id >= 0 { ids.push(m.bos_id); }
+            ids.extend(m.api.tokenize(m.handle, &prompt, max_prompt));
+            if ids.is_empty() { ids.push(m.bos_id.max(1)); }
+            let pd_slot = 24usize;
+            m.api.paged_seq_free(m.handle, pd_slot);
+            let t0 = Instant::now();
+            let first_tok = m.api.paged_prefill(m.handle, pd_slot, &ids, 0);
+            let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let first_piece = m.api.token_str(m.handle, first_tok);
+            let written = m.api.kv_export_shm(m.handle, pd_slot, ids.len(), &shm_name);
+            m.api.paged_seq_free(m.handle, pd_slot);
+            if written > 0 {
+                state.pd_transfers.fetch_add(1, Ordering::Relaxed);
+                state.pd_shm_transfers.fetch_add(1, Ordering::Relaxed);
+                state.ttft_hist.observe(prefill_ms, &TTFT_BOUNDS_MS);
+                let _ = reply.send(Ok((first_tok, first_piece, ids.len(), written, prefill_ms)));
+            } else {
+                let _ = reply.send(Err("failed to export PagedKV to POSIX shared memory".into()));
             }
             false
         }
@@ -4801,14 +4956,73 @@ fn handle_engine_cmd(
             active.push(seq);
             true
         }
+        EngineCmd::PdDecodeShm { shm_name, first_tok, prompt_tokens, cfg, tx, ack } => {
+            if !m.meta.supports_cb {
+                let _ = ack.send(Err("model does not support PagedKV PD decode".into()));
+                return false;
+            }
+            let Some((dst_slot, _, _)) = m.cb_radix.match_for_cow_fork(&[]) else {
+                let _ = ack.send(Err("no free CB slots for PD decode".into()));
+                return false;
+            };
+            let imported = m.api.kv_import_shm(m.handle, dst_slot, &shm_name, true);
+            if imported == 0 {
+                m.cb_radix.release(dst_slot, Vec::new());
+                let _ = ack.send(Err("invalid or missing POSIX SHM PagedKV segment".into()));
+                return false;
+            }
+            state.pd_transfers.fetch_add(1, Ordering::Relaxed);
+            state.pd_shm_transfers.fetch_add(1, Ordering::Relaxed);
+            let _ = ack.send(Ok(()));
+            let plen = if prompt_tokens > 0 { prompt_tokens } else { imported };
+            let (lora_id, _) = m.resolve_lora(cfg.lora.as_deref());
+            let mut full_seq = vec![-1i64; plen];
+            let piece = m.api.token_str(m.handle, first_tok);
+            let mut seq = ActiveCbSeq {
+                slot: dst_slot,
+                cfg,
+                lora_id,
+                grammar: None,
+                prompt_tokens: plen,
+                cached_prefix_tokens: plen,
+                full_seq: Vec::new(),
+                next_tok: first_tok,
+                out_text: String::new(),
+                completion_tokens: 0,
+                spec_proposed: 0,
+                spec_accepted: 0,
+                prefill_ms: 0.0,
+                t_dec: Instant::now(),
+                tx,
+            };
+            if is_stop_token(first_tok, m.eos_id, &piece) || seq.cfg.max_tokens == 0 {
+                seq.full_seq = full_seq;
+                finish_cb_seq(m, seq, "stop", state);
+                return false;
+            }
+            full_seq.push(first_tok);
+            seq.full_seq = full_seq;
+            seq.out_text.push_str(&piece);
+            seq.completion_tokens = 1;
+            let alive = seq.tx.send(StreamEvent::Piece(piece)).is_ok();
+            if !alive || seq.completion_tokens >= seq.cfg.max_tokens {
+                finish_cb_seq(m, seq, if !alive { "stop" } else { "length" }, state);
+                return false;
+            }
+            active.push(seq);
+            true
+        }
     }
 }
 
-async fn read_http_request(stream: &mut TcpStream) -> io::Result<(String, String, String)> {
+async fn read_http_request(
+    stream: &mut TcpStream,
+) -> io::Result<(String, String, HashMap<String, String>, Vec<u8>)> {
     let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 8192];
+    let mut tmp = [0u8; 16384];
     let mut header_end = None;
     let mut content_length = 0usize;
+    let mut headers = HashMap::new();
 
     loop {
         let n = stream.read(&mut tmp).await?;
@@ -4822,9 +5036,12 @@ async fn read_http_request(stream: &mut TcpStream) -> io::Result<(String, String
                 let hdr_str = String::from_utf8_lossy(&buf[..pos]);
                 for line in hdr_str.lines().skip(1) {
                     if let Some((k, v)) = line.split_once(':') {
-                        if k.trim().eq_ignore_ascii_case("content-length") {
-                            content_length = v.trim().parse().unwrap_or(0);
+                        let kl = k.trim().to_ascii_lowercase();
+                        let val = v.trim().to_string();
+                        if kl == "content-length" {
+                            content_length = val.parse().unwrap_or(0);
                         }
+                        headers.insert(kl, val);
                     }
                 }
             }
@@ -4834,7 +5051,7 @@ async fn read_http_request(stream: &mut TcpStream) -> io::Result<(String, String
                 break;
             }
         }
-        if buf.len() > 24 * 1024 * 1024 {
+        if buf.len() > 128 * 1024 * 1024 {
             break;
         }
     }
@@ -4845,12 +5062,24 @@ async fn read_http_request(stream: &mut TcpStream) -> io::Result<(String, String
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").to_string();
-    let body = if buf.len() > he {
-        String::from_utf8_lossy(&buf[he..(he + content_length).min(buf.len())]).into_owned()
+    let body_bytes = if buf.len() > he {
+        buf[he..(he + content_length).min(buf.len())].to_vec()
     } else {
-        String::new()
+        Vec::new()
     };
-    Ok((method, path, body))
+    Ok((method, path, headers, body_bytes))
+}
+
+fn query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
+    let q = path.split_once('?')?.1;
+    for pair in q.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 async fn write_json_response(stream: &mut TcpStream, status: &str, body: &Value) -> io::Result<()> {
@@ -4957,29 +5186,30 @@ async fn handle_http_client(
     state: Arc<ServerState>,
     default_cfg: SamplingCfg,
 ) {
-    let Ok((method, path, body)) = read_http_request(&mut stream).await else {
+    let Ok((method, path, headers, body_bytes)) = read_http_request(&mut stream).await else {
         return;
     };
     let clean_path = path.split('?').next().unwrap_or("/");
+    let body = String::from_utf8_lossy(&body_bytes);
     if method == "OPTIONS" {
         let _ = stream
-            .write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n")
+            .write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Tenon-PD-First-Tok, X-Tenon-PD-Prompt-Tokens, X-Tenon-PD-Max-Tokens, X-Tenon-PD-Temp\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n")
             .await;
         return;
     }
 
     if method == "GET" && clean_path == "/health" {
-        let (pa_tot, pa_free, pa_forks, pa_copies) = {
+        let (pa_tot, pa_free, pa_forks, pa_copies, graph_replays, graph_captured, moe_tc_amx_tiles) = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             if state.engine_tx.send(EngineCmd::PagedStats { reply: tx }).is_ok() {
-                rx.await.unwrap_or((0, 0, 0, 0))
+                rx.await.unwrap_or((0, 0, 0, 0, 0, 0, 0))
             } else {
-                (0, 0, 0, 0)
+                (0, 0, 0, 0, 0, 0, 0)
             }
         };
         let mut info = json!({
             "status": "ok",
-            "version": "tenon-v9",
+            "version": "tenon-v10",
             "backend": state.meta.backend,
             "model": state.meta.model_id,
             "arch": state.meta.arch,
@@ -4987,7 +5217,10 @@ async fn handle_http_client(
             "max_ctx": state.meta.max_ctx,
             "slot_ctx": state.meta.slot_ctx,
             "kv_slots": state.meta.n_kv_slots,
-            "kv_quant": if state.meta.kv_q8 { "q8_0" } else { "fp16" },
+            "kv_quant": state.meta.kv_quant_name,
+            "kv_quant_mode": state.meta.kv_quant_mode,
+            "sliding_window": state.meta.sliding_window,
+            "attn_sink": state.meta.attn_sink,
             "mla_latent_kv": state.meta.mla_latent,
             "bpe_merges": state.meta.n_bpe_merges,
             "tp_size": state.meta.tp_size,
@@ -5015,6 +5248,11 @@ async fn handle_http_client(
             obj.insert("hetero_lora_batches".into(), json!(state.hetero_lora_batches.load(Ordering::Relaxed)));
             obj.insert("mm_kv_cow_hits".into(), json!(state.mm_kv_cow_hits.load(Ordering::Relaxed)));
             obj.insert("pd_transfers".into(), json!(state.pd_transfers.load(Ordering::Relaxed)));
+            obj.insert("pd_shm_transfers".into(), json!(state.pd_shm_transfers.load(Ordering::Relaxed)));
+            obj.insert("pd_binary_bytes".into(), json!(state.pd_binary_bytes.load(Ordering::Relaxed)));
+            obj.insert("graph_replays".into(), json!(graph_replays));
+            obj.insert("graph_captured".into(), json!(graph_captured));
+            obj.insert("moe_tc_amx_tiles".into(), json!(moe_tc_amx_tiles));
             obj.insert("active_batch_size".into(), json!(state.active_batch.load(Ordering::Relaxed)));
             obj.insert("cb_batches_run".into(), json!(state.cb_batches_run.load(Ordering::Relaxed)));
             obj.insert("cb_max_batch_seen".into(), json!(state.cb_max_batch.load(Ordering::Relaxed)));
@@ -5032,15 +5270,15 @@ async fn handle_http_client(
     }
 
     if method == "GET" && clean_path == "/metrics" {
-        let (pa_tot, pa_free, pa_forks, pa_copies) = {
+        let (pa_tot, pa_free, pa_forks, pa_copies, graph_replays, graph_captured, moe_tc_amx_tiles) = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             if state.engine_tx.send(EngineCmd::PagedStats { reply: tx }).is_ok() {
-                rx.await.unwrap_or((0, 0, 0, 0))
+                rx.await.unwrap_or((0, 0, 0, 0, 0, 0, 0))
             } else {
-                (0, 0, 0, 0)
+                (0, 0, 0, 0, 0, 0, 0)
             }
         };
-        let body = format!(
+        let mut body = format!(
             "# HELP tenon_requests_total Total HTTP generation requests\n\
              # TYPE tenon_requests_total counter\n\
              tenon_requests_total {}\n\
@@ -5082,7 +5320,25 @@ async fn handle_http_client(
              tenon_mm_kv_cow_hits_total {}\n\
              # HELP tenon_pd_transfers_total Disaggregated PD PagedKV export/import transfers\n\
              # TYPE tenon_pd_transfers_total counter\n\
-             tenon_pd_transfers_total {}\n",
+             tenon_pd_transfers_total {}\n\
+             # HELP tenon_pd_shm_transfers_total Zero-copy POSIX SHM PD PagedKV transfers\n\
+             # TYPE tenon_pd_shm_transfers_total counter\n\
+             tenon_pd_shm_transfers_total {}\n\
+             # HELP tenon_pd_binary_bytes_total Raw binary HTTP PD PagedKV bytes transferred\n\
+             # TYPE tenon_pd_binary_bytes_total counter\n\
+             tenon_pd_binary_bytes_total {}\n\
+             # HELP tenon_graph_replays_total Hardware CUDA Graph / Metal ICB persistent decode replays\n\
+             # TYPE tenon_graph_replays_total counter\n\
+             tenon_graph_replays_total {}\n\
+             # HELP tenon_graph_captured_total Hardware CUDA Graph / Metal ICB decode graphs captured\n\
+             # TYPE tenon_graph_captured_total counter\n\
+             tenon_graph_captured_total {}\n\
+             # HELP tenon_moe_tc_amx_tiles_total Tensor Core / AMX hot-expert grouped MoE tiles executed\n\
+             # TYPE tenon_moe_tc_amx_tiles_total counter\n\
+             tenon_moe_tc_amx_tiles_total {}\n\
+             # HELP tenon_kv_quant_mode Active PagedKV compression mode (0=FP16,1=Q8_0,2=FP8,3=Q4_0)\n\
+             # TYPE tenon_kv_quant_mode gauge\n\
+             tenon_kv_quant_mode {}\n",
             state.total_reqs.load(Ordering::Relaxed),
             state.active_batch.load(Ordering::Relaxed),
             state.cb_batches_run.load(Ordering::Relaxed),
@@ -5097,7 +5353,23 @@ async fn handle_http_client(
             state.hetero_lora_batches.load(Ordering::Relaxed),
             state.mm_kv_cow_hits.load(Ordering::Relaxed),
             state.pd_transfers.load(Ordering::Relaxed),
+            state.pd_shm_transfers.load(Ordering::Relaxed),
+            state.pd_binary_bytes.load(Ordering::Relaxed),
+            graph_replays,
+            graph_captured,
+            moe_tc_amx_tiles,
+            state.meta.kv_quant_mode,
         );
+        body.push_str(&state.ttft_hist.format_prom(
+            "tenon_ttft_ms",
+            "Time-to-first-token (prefill) latency in milliseconds",
+            &TTFT_BOUNDS_MS,
+        ));
+        body.push_str(&state.tpot_hist.format_prom(
+            "tenon_tpot_ms",
+            "Time-per-output-token (decode) latency in milliseconds",
+            &TPOT_BOUNDS_MS,
+        ));
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
@@ -5126,7 +5398,10 @@ async fn handle_http_client(
         return;
     }
 
-    // Tenon v9: Disaggregated Prefill-Decode (PD) PagedKV Transfer Endpoints (`POST /v1/pd/prefill` & `POST /v1/pd/decode`)!
+    // Tenon v10: Zero-Copy Disaggregated Prefill-Decode (PD) Endpoints:
+    //   1. POSIX SHM zero-copy (`transport="shm"` or `?transport=shm`)
+    //   2. Raw Binary HTTP (`?format=binary` or `Accept/Content-Type: application/octet-stream`, 0% Base64 overhead!)
+    //   3. JSON Base64 fallback (`kv_blob_b64`)
     if method == "POST" && clean_path == "/v1/pd/prefill" {
         let Ok(req) = serde_json::from_str::<Value>(&body) else {
             let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid JSON"}})).await;
@@ -5149,6 +5424,56 @@ async fn handle_http_client(
             let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "missing `prompt` or `messages`"}})).await;
             return;
         }
+        let transport = req
+            .get("transport")
+            .and_then(Value::as_str)
+            .or_else(|| query_param(&path, "transport"))
+            .unwrap_or("");
+        let want_shm = transport.eq_ignore_ascii_case("shm");
+        let want_binary = !want_shm
+            && (query_param(&path, "format").is_some_and(|f| f.eq_ignore_ascii_case("binary"))
+                || transport.eq_ignore_ascii_case("binary")
+                || headers
+                    .get("accept")
+                    .is_some_and(|a| a.to_ascii_lowercase().contains("application/octet-stream")));
+
+        if want_shm {
+            let seq_n = state.pd_shm_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let shm_name = format!("/tnpd_{}_{}", std::process::id() % 100000, seq_n % 1000000);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if state
+                .engine_tx
+                .send(EngineCmd::PdPrefillShm { prompt, add_bos: true, shm_name: shm_name.clone(), reply: tx })
+                .is_err()
+            {
+                let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+                return;
+            }
+            match rx.await {
+                Ok(Ok((first_tok, first_piece, prompt_tokens, kv_bytes, prefill_ms))) => {
+                    let resp = json!({
+                        "object": "tenon.pd.prefill",
+                        "transport": "shm",
+                        "model": state.meta.model_id,
+                        "shm_name": shm_name,
+                        "first_tok": first_tok,
+                        "first_piece": first_piece,
+                        "prompt_tokens": prompt_tokens,
+                        "kv_bytes": kv_bytes,
+                        "prefill_ms": prefill_ms,
+                    });
+                    let _ = write_json_response(&mut stream, "200 OK", &resp).await;
+                }
+                Ok(Err(e)) => {
+                    let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": e}})).await;
+                }
+                Err(_) => {
+                    let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "pd prefill shm failed"}})).await;
+                }
+            }
+            return;
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         if state.engine_tx.send(EngineCmd::PdPrefill { prompt, add_bos: true, reply: tx }).is_err() {
             let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
@@ -5157,17 +5482,29 @@ async fn handle_http_client(
         match rx.await {
             Ok(Ok((first_tok, first_piece, prompt_tokens, blob, prefill_ms))) => {
                 let kv_bytes = blob.len();
-                let resp = json!({
-                    "object": "tenon.pd.prefill",
-                    "model": state.meta.model_id,
-                    "first_tok": first_tok,
-                    "first_piece": first_piece,
-                    "prompt_tokens": prompt_tokens,
-                    "kv_bytes": kv_bytes,
-                    "prefill_ms": prefill_ms,
-                    "kv_blob_b64": base64_encode(&blob),
-                });
-                let _ = write_json_response(&mut stream, "200 OK", &resp).await;
+                if want_binary {
+                    state.pd_binary_bytes.fetch_add(kv_bytes as u64, Ordering::Relaxed);
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\nX-Tenon-PD-Transport: binary\r\nX-Tenon-PD-Model: {}\r\nX-Tenon-PD-First-Tok: {}\r\nX-Tenon-PD-Prompt-Tokens: {}\r\nX-Tenon-PD-KV-Bytes: {}\r\nX-Tenon-PD-Prefill-Ms: {:.3}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        state.meta.model_id, first_tok, prompt_tokens, kv_bytes, prefill_ms, kv_bytes
+                    );
+                    let _ = stream.write_all(hdr.as_bytes()).await;
+                    let _ = stream.write_all(&blob).await;
+                    let _ = stream.flush().await;
+                } else {
+                    let resp = json!({
+                        "object": "tenon.pd.prefill",
+                        "transport": "b64",
+                        "model": state.meta.model_id,
+                        "first_tok": first_tok,
+                        "first_piece": first_piece,
+                        "prompt_tokens": prompt_tokens,
+                        "kv_bytes": kv_bytes,
+                        "prefill_ms": prefill_ms,
+                        "kv_blob_b64": base64_encode(&blob),
+                    });
+                    let _ = write_json_response(&mut stream, "200 OK", &resp).await;
+                }
             }
             Ok(Err(e)) => {
                 let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": e}})).await;
@@ -5180,30 +5517,107 @@ async fn handle_http_client(
     }
 
     if method == "POST" && clean_path == "/v1/pd/decode" {
-        let Ok(req) = serde_json::from_str::<Value>(&body) else {
-            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid JSON"}})).await;
-            return;
-        };
-        let Some(b64) = req.get("kv_blob_b64").and_then(Value::as_str) else {
-            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "missing `kv_blob_b64`"}})).await;
-            return;
-        };
-        let Ok(kv_blob) = base64_decode(b64) else {
-            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid base64 in `kv_blob_b64`"}})).await;
-            return;
-        };
-        let first_tok = req.get("first_tok").and_then(Value::as_i64).unwrap_or(0);
-        let prompt_tokens = req.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let is_binary_in = headers
+            .get("content-type")
+            .is_some_and(|ct| ct.to_ascii_lowercase().contains("application/octet-stream"));
         let mut cfg = default_cfg.clone();
-        if let Some(t) = req.get("temperature").and_then(Value::as_f64) { cfg.temp = t; }
-        if let Some(m) = req.get("max_tokens").and_then(Value::as_u64) { cfg.max_tokens = m as usize; }
-        if let Some(l) = req.get("lora").and_then(Value::as_str) { cfg.lora = Some(l.to_string()); }
         let (stx, mut srx) = tokio::sync::mpsc::unbounded_channel();
         let (atx, arx) = tokio::sync::oneshot::channel();
-        state.total_reqs.fetch_add(1, Ordering::Relaxed);
-        if state.engine_tx.send(EngineCmd::PdDecode { kv_blob, first_tok, prompt_tokens, cfg, tx: stx, ack: atx }).is_err() {
-            let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
-            return;
+        let transport_used: &'static str;
+
+        if is_binary_in {
+            if body_bytes.len() < 48 {
+                let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "truncated binary TNKV payload"}})).await;
+                return;
+            }
+            let first_tok = headers
+                .get("x-tenon-pd-first-tok")
+                .and_then(|s| s.parse::<i64>().ok())
+                .or_else(|| query_param(&path, "first_tok").and_then(|s| s.parse::<i64>().ok()))
+                .unwrap_or(0);
+            let prompt_tokens = headers
+                .get("x-tenon-pd-prompt-tokens")
+                .and_then(|s| s.parse::<usize>().ok())
+                .or_else(|| query_param(&path, "prompt_tokens").and_then(|s| s.parse::<usize>().ok()))
+                .unwrap_or(0);
+            if let Some(m) = headers
+                .get("x-tenon-pd-max-tokens")
+                .and_then(|s| s.parse::<usize>().ok())
+                .or_else(|| query_param(&path, "max_tokens").and_then(|s| s.parse::<usize>().ok()))
+            {
+                cfg.max_tokens = m;
+            }
+            if let Some(t) = headers
+                .get("x-tenon-pd-temp")
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| query_param(&path, "temperature").and_then(|s| s.parse::<f64>().ok()))
+            {
+                cfg.temp = t;
+            }
+            if let Some(l) = headers.get("x-tenon-pd-lora").map(String::as_str).or_else(|| query_param(&path, "lora")) {
+                if !l.is_empty() {
+                    cfg.lora = Some(l.to_string());
+                }
+            }
+            state.pd_binary_bytes.fetch_add(body_bytes.len() as u64, Ordering::Relaxed);
+            state.total_reqs.fetch_add(1, Ordering::Relaxed);
+            transport_used = "binary";
+            if state
+                .engine_tx
+                .send(EngineCmd::PdDecode { kv_blob: body_bytes, first_tok, prompt_tokens, cfg, tx: stx, ack: atx })
+                .is_err()
+            {
+                let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+                return;
+            }
+        } else {
+            let Ok(req) = serde_json::from_str::<Value>(&body) else {
+                let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid JSON"}})).await;
+                return;
+            };
+            let first_tok = req.get("first_tok").and_then(Value::as_i64).unwrap_or(0);
+            let prompt_tokens = req.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if let Some(t) = req.get("temperature").and_then(Value::as_f64) { cfg.temp = t; }
+            if let Some(m) = req.get("max_tokens").and_then(Value::as_u64) { cfg.max_tokens = m as usize; }
+            if let Some(l) = req.get("lora").and_then(Value::as_str) { cfg.lora = Some(l.to_string()); }
+            if let Some(shm_name) = req.get("shm_name").and_then(Value::as_str) {
+                state.total_reqs.fetch_add(1, Ordering::Relaxed);
+                transport_used = "shm";
+                if state
+                    .engine_tx
+                    .send(EngineCmd::PdDecodeShm {
+                        shm_name: shm_name.to_string(),
+                        first_tok,
+                        prompt_tokens,
+                        cfg,
+                        tx: stx,
+                        ack: atx,
+                    })
+                    .is_err()
+                {
+                    let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+                    return;
+                }
+            } else {
+                let Some(b64) = req.get("kv_blob_b64").and_then(Value::as_str) else {
+                    let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "missing `shm_name`, `kv_blob_b64`, or binary body"}})).await;
+                    return;
+                };
+                let Ok(kv_blob) = base64_decode(b64) else {
+                    let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid base64 in `kv_blob_b64`"}})).await;
+                    return;
+                };
+                state.total_reqs.fetch_add(1, Ordering::Relaxed);
+                transport_used = "b64";
+                if state
+                    .engine_tx
+                    .send(EngineCmd::PdDecode { kv_blob, first_tok, prompt_tokens, cfg, tx: stx, ack: atx })
+                    .is_err()
+                {
+                    let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+                    return;
+                }
+            }
         }
         match arx.await {
             Ok(Ok(())) => {}
@@ -5222,7 +5636,7 @@ async fn handle_http_client(
         }
         if let Some(res) = final_res {
             let resp = json!({
-                "id": "pdcmpl-tenon-v9",
+                "id": "pdcmpl-tenon-v10",
                 "object": "text_completion",
                 "model": state.meta.model_id,
                 "choices": [{
@@ -5238,6 +5652,7 @@ async fn handle_http_client(
                 },
                 "timings": {
                     "kv_slot": res.kv_slot,
+                    "transport": transport_used,
                     "decode_ms": res.decode_ms,
                 }
             });
@@ -5687,6 +6102,385 @@ async fn handle_http_client(
     .await;
 }
 
+// ============================================================================
+// Tenon v10: Built-In Disaggregated Prefill-Decode (PD) Router / Gateway!
+// Prefix-Affinity Hashing (Prefill COW hits) + Raw Binary / POSIX SHM 2-Phase Orchestration
+// ============================================================================
+struct PdRouterState {
+    prefill_workers: Vec<String>,
+    decode_workers: Vec<String>,
+    transport: String, // "binary" or "shm"
+    decode_rr: AtomicUsize,
+    total_reqs: AtomicU64,
+    shm_transfers: AtomicU64,
+    binary_bytes: AtomicU64,
+    ttft_hist: LatencyHist<8>,
+    tpot_hist: LatencyHist<7>,
+}
+
+fn fnv1a_prefix_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    for &b in bytes.iter().take(256) {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
+}
+
+async fn pd_http_post(
+    addr: &str,
+    path: &str,
+    content_type: &str,
+    extra_headers: &[(&str, String)],
+    body: &[u8],
+) -> Result<(u16, HashMap<String, String>, Vec<u8>), String> {
+    let mut s = TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connect {} failed: {}", addr, e))?;
+    let mut req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        path, addr, content_type, body.len()
+    );
+    for (k, v) in extra_headers {
+        req.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+    if !body.is_empty() {
+        s.write_all(body).await.map_err(|e| e.to_string())?;
+    }
+    s.flush().await.map_err(|e| e.to_string())?;
+
+    let mut raw = Vec::with_capacity(4096);
+    s.read_to_end(&mut raw).await.map_err(|e| e.to_string())?;
+    let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Err("malformed HTTP response from worker".into());
+    };
+    let head = String::from_utf8_lossy(&raw[..pos]);
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(500);
+    let mut hdrs = HashMap::new();
+    for line in head.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            hdrs.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+    Ok((status, hdrs, raw[pos + 4..].to_vec()))
+}
+
+async fn handle_pd_router_client(mut stream: TcpStream, state: Arc<PdRouterState>) {
+    let Ok((method, path, _headers, body_bytes)) = read_http_request(&mut stream).await else {
+        return;
+    };
+    let clean_path = path.split('?').next().unwrap_or("/");
+    if method == "OPTIONS" {
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n")
+            .await;
+        return;
+    }
+    if method == "GET" && clean_path == "/health" {
+        let resp = json!({
+            "status": "ok",
+            "version": "tenon-v10-pd-router",
+            "role": "pd-router",
+            "transport": state.transport,
+            "prefill_workers": state.prefill_workers,
+            "decode_workers": state.decode_workers,
+            "pd_router_requests": state.total_reqs.load(Ordering::Relaxed),
+            "pd_shm_transfers": state.shm_transfers.load(Ordering::Relaxed),
+            "pd_binary_bytes": state.binary_bytes.load(Ordering::Relaxed),
+        });
+        let _ = write_json_response(&mut stream, "200 OK", &resp).await;
+        return;
+    }
+    if method == "GET" && clean_path == "/metrics" {
+        let mut body = format!(
+            "# HELP tenon_pd_router_requests_total Total OpenAI requests orchestrated by PD Router\n\
+             # TYPE tenon_pd_router_requests_total counter\n\
+             tenon_pd_router_requests_total {}\n\
+             # HELP tenon_pd_shm_transfers_total Zero-copy POSIX SHM PD transfers routed\n\
+             # TYPE tenon_pd_shm_transfers_total counter\n\
+             tenon_pd_shm_transfers_total {}\n\
+             # HELP tenon_pd_binary_bytes_total Raw binary HTTP PD KV bytes routed\n\
+             # TYPE tenon_pd_binary_bytes_total counter\n\
+             tenon_pd_binary_bytes_total {}\n",
+            state.total_reqs.load(Ordering::Relaxed),
+            state.shm_transfers.load(Ordering::Relaxed),
+            state.binary_bytes.load(Ordering::Relaxed),
+        );
+        body.push_str(&state.ttft_hist.format_prom(
+            "tenon_ttft_ms",
+            "Time-to-first-token (prefill + KV handoff) latency in milliseconds",
+            &TTFT_BOUNDS_MS,
+        ));
+        body.push_str(&state.tpot_hist.format_prom(
+            "tenon_tpot_ms",
+            "Time-per-output-token (decode) latency in milliseconds",
+            &TPOT_BOUNDS_MS,
+        ));
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+    if method == "GET" && clean_path == "/v1/models" {
+        let resp = json!({
+            "object": "list",
+            "data": [{"id": "tenon-pd-cluster", "object": "model", "owned_by": "tenon-lang"}]
+        });
+        let _ = write_json_response(&mut stream, "200 OK", &resp).await;
+        return;
+    }
+    if method == "POST" && (clean_path == "/v1/chat/completions" || clean_path == "/v1/completions") {
+        let is_chat = clean_path == "/v1/chat/completions";
+        let Ok(req) = serde_json::from_slice::<Value>(&body_bytes) else {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid JSON"}})).await;
+            return;
+        };
+        let seq_no = state.total_reqs.fetch_add(1, Ordering::Relaxed) + 1;
+        // Prefix-affinity hash picks the same Prefill worker for identical prompt prefixes (maximizing COW hits!)
+        let affinity_key = req
+            .get("messages")
+            .map(Value::to_string)
+            .or_else(|| req.get("prompt").and_then(Value::as_str).map(String::from))
+            .unwrap_or_default();
+        let pf_idx = (fnv1a_prefix_hash(affinity_key.as_bytes()) as usize) % state.prefill_workers.len();
+        let dec_idx = state.decode_rr.fetch_add(1, Ordering::Relaxed) % state.decode_workers.len();
+        let pf_worker = &state.prefill_workers[pf_idx];
+        let dec_worker = &state.decode_workers[dec_idx];
+
+        let max_tokens = req.get("max_tokens").and_then(Value::as_u64).unwrap_or(64);
+        let temp = req.get("temperature").and_then(Value::as_f64).unwrap_or(0.0);
+        let lora = req.get("lora").and_then(Value::as_str).unwrap_or("");
+        let use_shm = req
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or(&state.transport)
+            .eq_ignore_ascii_case("shm");
+
+        let t_total = Instant::now();
+        let mut pf_body = json!({});
+        if let Some(m) = req.get("messages") { pf_body["messages"] = m.clone(); }
+        if let Some(p) = req.get("prompt") { pf_body["prompt"] = p.clone(); }
+        if use_shm { pf_body["transport"] = json!("shm"); }
+        let pf_bytes = pf_body.to_string().into_bytes();
+
+        let (dec_resp_bytes, kv_bytes, pf_ms, transport_label) = if use_shm {
+            let Ok((st, _hdrs, rbody)) = pd_http_post(pf_worker, "/v1/pd/prefill?transport=shm", "application/json", &[], &pf_bytes).await else {
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "prefill worker unreachable"}})).await;
+                return;
+            };
+            if st != 200 {
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": String::from_utf8_lossy(&rbody)}})).await;
+                return;
+            }
+            let Ok(pj) = serde_json::from_slice::<Value>(&rbody) else {
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "invalid prefill JSON"}})).await;
+                return;
+            };
+            let shm_name = pj.get("shm_name").and_then(Value::as_str).unwrap_or("").to_string();
+            let first_tok = pj.get("first_tok").and_then(Value::as_i64).unwrap_or(0);
+            let prompt_tokens = pj.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+            let kv_b = pj.get("kv_bytes").and_then(Value::as_u64).unwrap_or(0);
+            let pms = pj.get("prefill_ms").and_then(Value::as_f64).unwrap_or(0.0);
+            state.shm_transfers.fetch_add(1, Ordering::Relaxed);
+
+            let mut dec_req = json!({
+                "shm_name": shm_name,
+                "first_tok": first_tok,
+                "prompt_tokens": prompt_tokens,
+                "max_tokens": max_tokens,
+                "temperature": temp,
+            });
+            if !lora.is_empty() { dec_req["lora"] = json!(lora); }
+            let dbytes = dec_req.to_string().into_bytes();
+            let Ok((dst, _dh, dbody)) = pd_http_post(dec_worker, "/v1/pd/decode", "application/json", &[], &dbytes).await else {
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "decode worker unreachable"}})).await;
+                return;
+            };
+            if dst != 200 {
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": String::from_utf8_lossy(&dbody)}})).await;
+                return;
+            }
+            (dbody, kv_b, pms, "shm")
+        } else {
+            let Ok((st, hdrs, kv_raw)) = pd_http_post(
+                pf_worker,
+                "/v1/pd/prefill?format=binary",
+                "application/json",
+                &[("Accept", "application/octet-stream".into())],
+                &pf_bytes,
+            ).await else {
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "prefill worker unreachable"}})).await;
+                return;
+            };
+            if st != 200 {
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": String::from_utf8_lossy(&kv_raw)}})).await;
+                return;
+            }
+            let first_tok = hdrs.get("x-tenon-pd-first-tok").cloned().unwrap_or_else(|| "0".into());
+            let prompt_tokens = hdrs.get("x-tenon-pd-prompt-tokens").cloned().unwrap_or_else(|| "0".into());
+            let pms = hdrs.get("x-tenon-pd-prefill-ms").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let kv_b = kv_raw.len() as u64;
+            state.binary_bytes.fetch_add(kv_b, Ordering::Relaxed);
+
+            let mut dhdrs = vec![
+                ("X-Tenon-PD-First-Tok", first_tok),
+                ("X-Tenon-PD-Prompt-Tokens", prompt_tokens),
+                ("X-Tenon-PD-Max-Tokens", max_tokens.to_string()),
+                ("X-Tenon-PD-Temp", format!("{:.4}", temp)),
+            ];
+            if !lora.is_empty() {
+                dhdrs.push(("X-Tenon-PD-Lora", lora.to_string()));
+            }
+            let Ok((dst, _dh, dbody)) = pd_http_post(
+                dec_worker,
+                "/v1/pd/decode",
+                "application/octet-stream",
+                &dhdrs,
+                &kv_raw,
+            ).await else {
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "decode worker unreachable"}})).await;
+                return;
+            };
+            if dst != 200 {
+                let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": String::from_utf8_lossy(&dbody)}})).await;
+                return;
+            }
+            (dbody, kv_b, pms, "binary")
+        };
+
+        let Ok(dj) = serde_json::from_slice::<Value>(&dec_resp_bytes) else {
+            let _ = write_json_response(&mut stream, "502 Bad Gateway", &json!({"error": {"message": "invalid decode JSON"}})).await;
+            return;
+        };
+        let gen_text = dj["choices"][0]["text"].as_str().unwrap_or("").to_string();
+        let finish_reason = dj["choices"][0]["finish_reason"].as_str().unwrap_or("length").to_string();
+        let model_id = dj["model"].as_str().unwrap_or("tenon-pd-cluster").to_string();
+        let ptoks = dj["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+        let ctoks = dj["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+        let dec_ms = dj["timings"]["decode_ms"].as_f64().unwrap_or(0.0);
+        let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+        state.ttft_hist.observe(pf_ms.max(0.01), &TTFT_BOUNDS_MS);
+        if ctoks > 0 && dec_ms > 0.0 {
+            state.tpot_hist.observe(dec_ms / (ctoks.saturating_sub(1).max(1) as f64), &TPOT_BOUNDS_MS);
+        }
+
+        let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let resp = if is_chat {
+            json!({
+                "id": format!("chatcmpl-tenon-pd-{}", seq_no),
+                "object": "chat.completion",
+                "created": created,
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": gen_text},
+                    "finish_reason": finish_reason,
+                }],
+                "usage": {
+                    "prompt_tokens": ptoks,
+                    "completion_tokens": ctoks,
+                    "total_tokens": ptoks + ctoks,
+                },
+                "timings": {
+                    "prefill_worker": pf_worker,
+                    "decode_worker": dec_worker,
+                    "transport": transport_label,
+                    "kv_bytes": kv_bytes,
+                    "prefill_ms": pf_ms,
+                    "decode_ms": dec_ms,
+                    "total_ms": total_ms,
+                }
+            })
+        } else {
+            json!({
+                "id": format!("cmpl-tenon-pd-{}", seq_no),
+                "object": "text_completion",
+                "created": created,
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "text": gen_text,
+                    "finish_reason": finish_reason,
+                }],
+                "usage": {
+                    "prompt_tokens": ptoks,
+                    "completion_tokens": ctoks,
+                    "total_tokens": ptoks + ctoks,
+                },
+                "timings": {
+                    "prefill_worker": pf_worker,
+                    "decode_worker": dec_worker,
+                    "transport": transport_label,
+                    "kv_bytes": kv_bytes,
+                    "prefill_ms": pf_ms,
+                    "decode_ms": dec_ms,
+                    "total_ms": total_ms,
+                }
+            })
+        };
+        let _ = write_json_response(&mut stream, "200 OK", &resp).await;
+        return;
+    }
+
+    let _ = write_json_response(&mut stream, "404 Not Found", &json!({"error": {"message": "unknown router endpoint"}})).await;
+}
+
+async fn run_pd_router(
+    addr: String,
+    prefill_workers: Vec<String>,
+    decode_workers: Vec<String>,
+    transport: String,
+) -> ExitCode {
+    if prefill_workers.is_empty() || decode_workers.is_empty() {
+        eprintln!("error: --pd-router requires non-empty --prefill-workers and --decode-workers");
+        return ExitCode::from(2);
+    }
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error binding PD router {}: {}", addr, e);
+            return ExitCode::from(1);
+        }
+    };
+    let state = Arc::new(PdRouterState {
+        prefill_workers: prefill_workers.clone(),
+        decode_workers: decode_workers.clone(),
+        transport: transport.clone(),
+        decode_rr: AtomicUsize::new(0),
+        total_reqs: AtomicU64::new(0),
+        shm_transfers: AtomicU64::new(0),
+        binary_bytes: AtomicU64::new(0),
+        ttft_hist: LatencyHist::new(),
+        tpot_hist: LatencyHist::new(),
+    });
+    eprintln!(
+        "[tenon llm] Disaggregated PD Router v10 listening on http://{} (transport={}, prefill={:?}, decode={:?})",
+        addr, transport, prefill_workers, decode_workers
+    );
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let st = Arc::clone(&state);
+                tokio::spawn(async move {
+                    handle_pd_router_client(stream, st).await;
+                });
+            }
+            Err(e) => eprintln!("[tenon pd-router] accept error: {}", e),
+        }
+    }
+}
+
 fn parse_lora_spec(spec: &str) -> (String, String, f64) {
     let (name_opt, rest) = match spec.split_once('=') {
         Some((n, r)) if !n.is_empty() => (Some(n.to_string()), r),
@@ -5713,10 +6507,11 @@ fn parse_lora_spec(spec: &str) -> (String, String, f64) {
 
 fn print_llm_usage() {
     println!(
-        r#"tenon llm — Native Out-of-Core Streaming LLM CLI & Continuous-Batching OpenAI Server (v7)
+        r#"tenon llm — Native Out-of-Core Streaming LLM CLI, OpenAI Server & PD Router (v10)
 
 USAGE:
   tenon llm <model.gguf> [OPTIONS]
+  tenon llm --serve <host:port> --pd-router --prefill-workers <h1:p1,...> --decode-workers <h2:p2,...>
 
 OPTIONS:
   --prompt <text>           Raw completion prompt (runs batched prefill + streaming stdout)
@@ -5729,13 +6524,19 @@ OPTIONS:
   --audio <file.wav>        Local 16-bit PCM WAV audio file for multimodal speech/audio input
   --mrope-grid <T,H,W>      Explicit 2D/3D MRoPE spatial grid for Qwen2.5-VL/video embeddings
   --lora <name=path[:sc]>   Load zero-copy runtime GGUF LoRA adapter (repeatable; HTTP `"lora":"name"`)
-  --serve <host:port>       Launch OpenAI-compatible v8 Universal CB + Zero-Migration Spec + Multi-LoRA + /metrics server
+  --serve <host:port>       Launch OpenAI-compatible v10 Universal CB + Graphs/ICB + PD + /metrics server
+  --pd-router               Run --serve as a Disaggregated PD Gateway routing Prefill -> Decode workers
+  --prefill-workers <list>  Comma-separated Prefill worker addresses (`127.0.0.1:28091,...`)
+  --decode-workers <list>   Comma-separated Decode worker addresses (`127.0.0.1:28092,...`)
+  --pd-transport <binary|shm> PD Router KV transfer transport (`binary` HTTP or `shm` zero-copy; default: binary)
   --prefill-chunk <N>       Chunked prefill token budget per decode tick in --serve mode (default: 128)
   --plan-only               Inspect GGUF & print Auto VRAM/NUMA/KV/TP/EP plan without loading weights
   --max-vram-gb <F>         Hard VRAM/RAM budget cap in GiB (0 = auto-detect hardware)
-  --ctx <N>                 Total KV context capacity across all slots (default: 4096, up to 16384)
+  --ctx <N>                 Total KV context capacity across all slots (default: 4096, up to 131072)
   --kv-slots <N>            Number of partitioned Radix Prefix KV slots (default: 2 for --serve, 1 CLI)
-  --kv-quant <auto|q8|fp16> KV-cache precision (`q8` saves -47% VRAM; default: auto)
+  --kv-quant <auto|fp16|q8|fp8|q4> 4-mode PagedKV precision (`q8`/`fp8` 1.88x, `q4` 3.56x smaller!)
+  --sliding-window <N>      Enable O(W) Sliding Window Attention window size (`0` = full attention)
+  --attn-sink <S>           Number of pinned Attention Sink tokens preserved with SWA (default: 0)
   --mla-latent <0|1>        Matrix-absorbed compressed latent MLA KV cache (default: 1)
   --tp <N>                  Multi-GPU Tensor Parallelism degree on CUDA (`TP=2..8`, default: 1)
   --ep <N>                  Multi-GPU MoE Expert Parallelism degree on CUDA (`EP=2..8`, 2D `TPxEP` supported!)
@@ -5775,12 +6576,18 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
     let mut chat_msg: Option<String> = None;
     let mut system_msg: Option<String> = None;
     let mut serve_addr: Option<String> = None;
+    let mut pd_router = false;
+    let mut prefill_workers: Vec<String> = Vec::new();
+    let mut decode_workers: Vec<String> = Vec::new();
+    let mut pd_transport = "binary".to_string();
     let mut prefill_chunk_size = 128usize;
     let mut plan_only = false;
     let mut max_vram_gb = 0.0f64;
     let mut max_ctx = 4096i64;
     let mut kv_slots_opt: Option<usize> = None;
     let mut kv_quant = "auto".to_string();
+    let mut sliding_window = 0i64;
+    let mut attn_sink = 0i64;
     let mut mla_latent = 1i64;
     let mut tp_size = 1i64;
     let mut ep_size = 1i64;
@@ -5809,6 +6616,16 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
             }
             "--lora" if i + 1 < args.len() => { lora_specs.push(parse_lora_spec(&args[i + 1])); i += 2; }
             "--serve" if i + 1 < args.len() => { serve_addr = Some(args[i + 1].clone()); i += 2; }
+            "--pd-router" => { pd_router = true; i += 1; }
+            "--prefill-workers" if i + 1 < args.len() => {
+                prefill_workers.extend(args[i + 1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                i += 2;
+            }
+            "--decode-workers" if i + 1 < args.len() => {
+                decode_workers.extend(args[i + 1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                i += 2;
+            }
+            "--pd-transport" if i + 1 < args.len() => { pd_transport = args[i + 1].clone(); i += 2; }
             "--prefill-chunk" if i + 1 < args.len() => {
                 prefill_chunk_size = args[i + 1].parse::<usize>().unwrap_or(128).clamp(16, 4096);
                 i += 2;
@@ -5818,6 +6635,8 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
             "--ctx" if i + 1 < args.len() => { max_ctx = args[i + 1].parse().unwrap_or(4096); i += 2; }
             "--kv-slots" if i + 1 < args.len() => { kv_slots_opt = args[i + 1].parse().ok(); i += 2; }
             "--kv-quant" if i + 1 < args.len() => { kv_quant = args[i + 1].clone(); i += 2; }
+            "--sliding-window" if i + 1 < args.len() => { sliding_window = args[i + 1].parse().unwrap_or(0); i += 2; }
+            "--attn-sink" if i + 1 < args.len() => { attn_sink = args[i + 1].parse().unwrap_or(0); i += 2; }
             "--mla-latent" if i + 1 < args.len() => { mla_latent = args[i + 1].parse().unwrap_or(1); i += 2; }
             "--tp" if i + 1 < args.len() => { tp_size = args[i + 1].parse().unwrap_or(1); i += 2; }
             "--ep" if i + 1 < args.len() => { ep_size = args[i + 1].parse().unwrap_or(1); i += 2; }
@@ -5863,6 +6682,11 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         }
     }
 
+    if pd_router {
+        let addr = serve_addr.unwrap_or_else(|| "127.0.0.1:28095".to_string());
+        return run_pd_router(addr, prefill_workers, decode_workers, pd_transport).await;
+    }
+
     let Some(model_path) = model_path else {
         print_llm_usage();
         return ExitCode::from(2);
@@ -5872,6 +6696,12 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
     unsafe {
         env::set_var("TENON_MLA_LATENT_KV", mla_latent.to_string());
         env::set_var("TENON_KV_SLOTS", kv_slots.to_string());
+        if sliding_window > 0 {
+            env::set_var("TENON_SLIDING_WINDOW", sliding_window.to_string());
+        }
+        if attn_sink > 0 {
+            env::set_var("TENON_ATTN_SINK", attn_sink.to_string());
+        }
         if tp_size > 1 {
             env::set_var("TENON_TP_SIZE", tp_size.to_string());
         }
@@ -5888,12 +6718,19 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         }
     };
 
-    let kv_mode = match kv_quant.as_str() {
-        "q8" | "q8_0" | "1" => 1,
-        "fp16" | "0" => 0,
-        _ => -1,
+    let kv_mode_explicit: Option<(&'static str, i64)> = match kv_quant.to_ascii_lowercase().as_str() {
+        "fp16" | "0" => Some(("fp16", 0)),
+        "q8" | "q8_0" | "1" => Some(("q8", 1)),
+        "fp8" | "fp8_e4m3" | "2" => Some(("fp8", 2)),
+        "q4" | "q4_0" | "3" => Some(("q4", 3)),
+        _ => None,
     };
-    let plan = match api.plan(&model_path, max_vram_gb, max_ctx, kv_mode) {
+    let plan_kv_arg = match kv_mode_explicit {
+        Some((_, 0)) => 0,
+        Some((_, _)) => 1,
+        None => -1,
+    };
+    let plan = match api.plan(&model_path, max_vram_gb, max_ctx, plan_kv_arg) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -5901,11 +6738,26 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         }
     };
 
+    let (kv_env_val, kv_mode_id, kv_pretty) = match kv_mode_explicit {
+        Some((ev, id)) => {
+            let pr = match id {
+                0 => "fp16",
+                1 => "q8_0",
+                2 => "fp8_e4m3",
+                _ => "q4_0",
+            };
+            (ev, id, pr)
+        }
+        None => {
+            if plan.kv_q8 { ("q8", 1, "q8_0") } else { ("fp16", 0, "fp16") }
+        }
+    };
+
     let chosen_slots = slots_override.unwrap_or(plan.slots);
     let chosen_nocache = force_nocache || plan.nocache;
     let gib = 1024.0 * 1024.0 * 1024.0;
     eprintln!(
-        "[tenon llm] backend={} | disk={:.2} GiB | layers={} experts={} d={} | plan: slots={} nocache={} kv={} kv_slots={} tp={} ep={} prefill_chunk={} est_vram={:.2} GiB",
+        "[tenon llm] backend={} | disk={:.2} GiB | layers={} experts={} d={} | plan: slots={} nocache={} kv={} swa={} sink={} kv_slots={} tp={} ep={} prefill_chunk={} est_vram={:.2} GiB",
         api.backend,
         plan.disk_bytes as f64 / gib,
         plan.n_layers,
@@ -5913,7 +6765,9 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         plan.d_model,
         chosen_slots,
         if chosen_nocache { 1 } else { 0 },
-        if plan.kv_q8 { "Q8_0" } else { "FP16" },
+        kv_pretty,
+        sliding_window,
+        attn_sink,
         kv_slots,
         tp_size,
         ep_size,
@@ -5926,7 +6780,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
 
     unsafe {
         env::set_var("TENON_MAX_CTX", max_ctx.to_string());
-        env::set_var("TENON_KV_QUANT", if plan.kv_q8 { "q8" } else { "fp16" });
+        env::set_var("TENON_KV_QUANT", kv_env_val);
         if fast_dp4a {
             env::set_var("TENON_CUDA_FAST_DP4A", "1");
         }
@@ -6104,6 +6958,12 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         t_load.elapsed().as_secs_f64()
     );
 
+    let (actual_swa, actual_sink) = if api.backend == "cuda" {
+        (api.info(handle, 49), api.info(handle, 50))
+    } else {
+        (api.info(handle, 38), api.info(handle, 42))
+    };
+
     let meta = ModelMeta {
         backend: api.backend,
         model_id,
@@ -6112,7 +6972,11 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         max_ctx,
         slot_ctx: actual_slot_ctx,
         n_kv_slots: actual_slots,
-        kv_q8: plan.kv_q8,
+        kv_q8: kv_mode_id > 0,
+        kv_quant_mode: kv_mode_id,
+        kv_quant_name: kv_pretty.to_string(),
+        sliding_window: actual_swa,
+        attn_sink: actual_sink,
         mla_latent: actual_mla_lat,
         n_bpe_merges: actual_bpe_merges,
         tp_size: actual_tp,
@@ -6185,6 +7049,11 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
             hetero_lora_batches: AtomicU64::new(0),
             mm_kv_cow_hits: AtomicU64::new(0),
             pd_transfers: AtomicU64::new(0),
+            pd_shm_transfers: AtomicU64::new(0),
+            pd_binary_bytes: AtomicU64::new(0),
+            pd_shm_seq: AtomicU64::new(0),
+            ttft_hist: LatencyHist::new(),
+            tpot_hist: LatencyHist::new(),
         });
         let st_eng = Arc::clone(&state);
         std::thread::Builder::new()
@@ -6193,8 +7062,8 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
             .expect("spawn continuous batching engine thread");
 
         eprintln!(
-            "[tenon llm] OpenAI-compatible v9 Server listening on http://{} (PagedKV {} blks, UniversalCB={}, HeteroLoRA-BGMV=true, PD-Transfer=true, MM-KV-COW=true, ChunkedPrefill={}, ZeroMigSpec={:?}, MultiLoRA={:?}, mmproj={}, audio={})",
-            addr, pa_blocks, meta.supports_cb, meta.prefill_chunk_size, cfg.spec_mode, meta.lora_adapters, meta.has_mmproj, meta.has_audio
+            "[tenon llm] OpenAI-compatible v10 Server listening on http://{} (kv={}, swa={}, sink={}, PagedKV {} blks, UniversalCB={}, Graphs/ICB=true, PD-Binary+SHM=true, MM-KV-COW=true, ChunkedPrefill={}, ZeroMigSpec={:?}, MultiLoRA={:?}, mmproj={}, audio={})",
+            addr, meta.kv_quant_name, meta.sliding_window, meta.attn_sink, pa_blocks, meta.supports_cb, meta.prefill_chunk_size, cfg.spec_mode, meta.lora_adapters, meta.has_mmproj, meta.has_audio
         );
         loop {
             match listener.accept().await {

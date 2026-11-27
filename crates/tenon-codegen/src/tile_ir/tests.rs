@@ -634,3 +634,35 @@ fn dsv2_v9_full_stack(x Matrix[8, 2048, Float16], w_q Matrix[2048, 2048, FP8], w
     let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
     assert!(plan.contains("moe_mega=1|fp8_k32=1|hetero_lora=1|mm_kv_cow=1|pd_kv=1"));
 }
+
+#[test]
+fn test_stage6_v10_moe_mega_v2_dev_graph_pd_zc_kv_q4_swa_router() {
+    let def = GpuOptConfig::default();
+    assert!(
+        def.moe_mega_tc_amx_ragged
+            && def.device_graph_capture
+            && def.pd_zerocopy_binary_shm_ipc
+            && def.paged_kv_fp8_q4_swa_longctx
+            && def.pd_router_prefix_affinity_telemetry
+    );
+    let src = r#"
+@gpu_graph("stream:vram=48G,ram=128G,layers=27,experts=64,topk=6,ctx=131072,kv=q4,swa=4096,tp=2,ep=2,mla=576,cb=16,lora=16,mmproj=64,audio=128,pd_router=1")
+fn dsv2_v10_full_stack(x Matrix[16, 2048, Float16], w_q Matrix[2048, 2048, FP8], w_down Matrix[2048, 1408, Q6_K]) Matrix[16, 1408, Float16] {
+    let h = tg_matmul(x, w_q)
+    tg_matmul(h, w_down)
+}
+"#;
+    let prog = tenon_syntax::parse(src).expect("parse v10 graph");
+    let on = compile_universal_graphs(&prog, GpuOptConfig::default());
+    assert_eq!(on.len(), 1);
+    let hp = &on[0].hetero_plan;
+    assert!(hp.moe_mega_tc_amx_ragged && hp.device_graph_capture && hp.pd_zerocopy_binary_shm_ipc && hp.pd_router_affinity);
+    assert_eq!(hp.kv_quant_mode, 3);
+    assert_eq!(hp.swa_window, 4096);
+    let cuda = emit_cuda_tpu::emit_universal_cuda(&on[0]);
+    assert!(cuda.contains("moe_mega_v2=true") && cuda.contains("dev_graph=true") && cuda.contains("pd_zc=true") && cuda.contains("kv_mode=3") && cuda.contains("swa=4096") && cuda.contains("pd_router=true"));
+    let tpu = emit_cuda_tpu::emit_universal_stablehlo(&on[0]);
+    assert!(tpu.contains("moe_mega_v2=true") && tpu.contains("dev_graph=true") && tpu.contains("pd_zc=true") && tpu.contains("kv_mode=3") && tpu.contains("swa=4096") && tpu.contains("pd_router=true"));
+    let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
+    assert!(plan.contains("moe_mega_v2=1|dev_graph=1|pd_zc=1|kv_mode=3|swa=4096|pd_router=1"));
+}

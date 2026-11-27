@@ -94,6 +94,12 @@ pub struct HeteroStreamPlan {
     pub hetero_lora_bgmv: bool,
     pub multimodal_kv_cow_cache: bool,
     pub disaggregated_pd_kv: bool,
+    pub moe_mega_tc_amx_ragged: bool,
+    pub device_graph_capture: bool,
+    pub pd_zerocopy_binary_shm_ipc: bool,
+    pub kv_quant_mode: u8, // 0=FP16, 1=Q8_0, 2=FP8_E4M3, 3=Q4_0
+    pub swa_window: usize,
+    pub pd_router_affinity: bool,
     pub dispatch_mode: HeteroDispatchMode,
     pub numa_repack_weights: Vec<(String, LayoutTag)>,
     pub projected_decode_tok_s: f64,
@@ -155,6 +161,12 @@ impl Default for HeteroStreamPlan {
             hetero_lora_bgmv: false,
             multimodal_kv_cow_cache: false,
             disaggregated_pd_kv: false,
+            moe_mega_tc_amx_ragged: false,
+            device_graph_capture: false,
+            pd_zerocopy_binary_shm_ipc: false,
+            kv_quant_mode: 0,
+            swa_window: 0,
+            pd_router_affinity: false,
             dispatch_mode: HeteroDispatchMode::ResidentGpu,
             numa_repack_weights: Vec::new(),
             projected_decode_tok_s: 0.0,
@@ -215,6 +227,8 @@ pub fn plan_hetero_stream(
     let mut fp8_mxfp4_native: bool = cfg.anyres_mrope_fp8_mxfp4;
     let mut audio_mel_tokens: usize = 0;
     let mut vision_prefix_cache: bool = cfg.vlm_mrope_audio_prefix_cache;
+    let mut swa_window: usize = 0;
+    let mut pd_router_req: bool = false;
 
     if let Some(rest) = g.attr_mode.strip_prefix("stream:") {
         for part in rest.split(',') {
@@ -338,6 +352,12 @@ pub fn plan_hetero_stream(
                 }
                 "vis_cache" => vision_prefix_cache = v != "0" && v != "false",
                 "prefix" => radix_prefix_cache = v != "0" && v != "false",
+                "swa" | "sliding_window" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        swa_window = n;
+                    }
+                }
+                "pd_router" => pd_router_req = v != "0" && v != "false",
                 _ => {}
             }
         }
@@ -592,6 +612,18 @@ pub fn plan_hetero_stream(
         hetero_lora_bgmv: cfg.hetero_lora_bgmv_batch && lora_max_rank > 0,
         multimodal_kv_cow_cache: cfg.multimodal_real_vit_whisper_kv_cache && (vision_mmproj_tokens > 0 || audio_mel_tokens > 0),
         disaggregated_pd_kv: cfg.disaggregated_pd_kv_transfer && cfg.paged_cont_batch,
+        moe_mega_tc_amx_ragged: cfg.moe_mega_tc_amx_ragged && n_experts > 0,
+        device_graph_capture: cfg.device_graph_capture && cfg.paged_cont_batch,
+        pd_zerocopy_binary_shm_ipc: cfg.pd_zerocopy_binary_shm_ipc && cfg.disaggregated_pd_kv_transfer,
+        kv_quant_mode: match kv_mode {
+            "q4" | "q4_0" if cfg.paged_kv_fp8_q4_swa_longctx => 3,
+            "fp8" | "fp8_e4m3" if cfg.paged_kv_fp8_q4_swa_longctx => 2,
+            "q8" | "q8_0" => 1,
+            _ if kv_quant_q8 => 1,
+            _ => 0,
+        },
+        swa_window: if cfg.paged_kv_fp8_q4_swa_longctx { swa_window } else { 0 },
+        pd_router_affinity: cfg.pd_router_prefix_affinity_telemetry && (pd_router_req || cfg.disaggregated_pd_kv_transfer),
         dispatch_mode,
         numa_repack_weights,
         projected_decode_tok_s,

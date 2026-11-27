@@ -130,6 +130,16 @@ pub struct GpuOptConfig {
     pub multimodal_real_vit_whisper_kv_cache: bool,
     /// #41: Disaggregated Prefill-Decode (PD) PagedKV Block Serialization & Zero-Copy Cross-Node KV Transfer.
     pub disaggregated_pd_kv_transfer: bool,
+    /// #42: Native Tensor Core (`mma.sync`) / Apple FP16-AMX / TPU `ragged_dot` Adaptive Grouped MoE Mega-Kernel v2.
+    pub moe_mega_tc_amx_ragged: bool,
+    /// #43: Device-Side Persistent Decode Graphs (`CUDA Graphs` `cuGraphLaunch` + Metal `MTLIndirectCommandBuffer` + TPU `while_loop`).
+    pub device_graph_capture: bool,
+    /// #44: Zero-Copy High-Speed Disaggregated PD Transport (Raw Binary Stream + POSIX `shm_open` + CUDA `cuIpc`).
+    pub pd_zerocopy_binary_shm_ipc: bool,
+    /// #45: `FP8_E4M3`/`Q4_0` PagedKV Compression (`2x-3.56x`) + Sliding Window Attention (SWA) & Attention Sink + `128K+` Context.
+    pub paged_kv_fp8_q4_swa_longctx: bool,
+    /// #46: Prefix-Affinity Disaggregated `PD Router / Gateway` + Real Open-Source Multimodal E2E + Prometheus TTFT/TPOT Histograms.
+    pub pd_router_prefix_affinity_telemetry: bool,
 
     /// Optional SPMD device count (`1` = single device, `>1` = auto-sharded multi-device SPMD).
     pub spmd_devices: usize,
@@ -193,6 +203,11 @@ impl GpuOptConfig {
             hetero_lora_bgmv_batch: false,
             multimodal_real_vit_whisper_kv_cache: false,
             disaggregated_pd_kv_transfer: false,
+            moe_mega_tc_amx_ragged: false,
+            device_graph_capture: false,
+            pd_zerocopy_binary_shm_ipc: false,
+            paged_kv_fp8_q4_swa_longctx: false,
+            pd_router_prefix_affinity_telemetry: false,
             spmd_devices: 1,
             force_tile: None,
         }
@@ -273,6 +288,11 @@ impl GpuOptConfig {
         c.hetero_lora_bgmv_batch = true;
         c.multimodal_real_vit_whisper_kv_cache = true;
         c.disaggregated_pd_kv_transfer = true;
+        c.moe_mega_tc_amx_ragged = true;
+        c.device_graph_capture = true;
+        c.pd_zerocopy_binary_shm_ipc = true;
+        c.paged_kv_fp8_q4_swa_longctx = true;
+        c.pd_router_prefix_affinity_telemetry = true;
         c
     }
 
@@ -386,6 +406,11 @@ impl GpuOptConfig {
                         "hetero_lora_bgmv_batch" | "hetero_lora" | "bgmv" => cfg.hetero_lora_bgmv_batch = enable,
                         "multimodal_real_vit_whisper_kv_cache" | "mm_kv_cow" => cfg.multimodal_real_vit_whisper_kv_cache = enable,
                         "disaggregated_pd_kv_transfer" | "pd_kv" => cfg.disaggregated_pd_kv_transfer = enable,
+                        "moe_mega_tc_amx_ragged" | "moe_mega_v2" => cfg.moe_mega_tc_amx_ragged = enable,
+                        "device_graph_capture" | "dev_graph" | "cuda_graph" | "metal_icb" => cfg.device_graph_capture = enable,
+                        "pd_zerocopy_binary_shm_ipc" | "pd_zc" | "pd_shm" => cfg.pd_zerocopy_binary_shm_ipc = enable,
+                        "paged_kv_fp8_q4_swa_longctx" | "kv_fp8_q4_swa" | "swa" => cfg.paged_kv_fp8_q4_swa_longctx = enable,
+                        "pd_router_prefix_affinity_telemetry" | "pd_router" => cfg.pd_router_prefix_affinity_telemetry = enable,
                         _ => {}
                     }
                 }
@@ -450,6 +475,11 @@ impl GpuOptConfig {
         if self.hetero_lora_bgmv_batch { on.push("hetero_lora_bgmv"); }
         if self.multimodal_real_vit_whisper_kv_cache { on.push("mm_kv_cow"); }
         if self.disaggregated_pd_kv_transfer { on.push("pd_kv"); }
+        if self.moe_mega_tc_amx_ragged { on.push("moe_mega_v2"); }
+        if self.device_graph_capture { on.push("dev_graph"); }
+        if self.pd_zerocopy_binary_shm_ipc { on.push("pd_zc"); }
+        if self.paged_kv_fp8_q4_swa_longctx { on.push("kv_fp8_q4_swa"); }
+        if self.pd_router_prefix_affinity_telemetry { on.push("pd_router"); }
         if self.spmd_devices > 1 {
             on.push("spmd_multi");
         }
