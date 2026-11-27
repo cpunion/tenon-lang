@@ -64,10 +64,18 @@ pub struct HeteroStreamPlan {
     pub purgeable_reclaim: bool,
     pub cgroup_main_tid0: bool,
     pub tp_devices: usize,
+    pub ep_devices: usize,
+    pub nccl_collectives: bool,
+    pub marlin_cp_async: bool,
+    pub cont_batch_slots: usize,
+    pub cow_prefix_blocks: bool,
     pub mla_latent_dim: usize,
     pub paged_kv_block_size: usize,
     pub radix_prefix_cache: bool,
     pub speculative_k: usize,
+    pub tree_spec_width: usize,
+    pub mtp_nextn_layers: usize,
+    pub vision_mmproj_tokens: usize,
     pub dispatch_mode: HeteroDispatchMode,
     pub numa_repack_weights: Vec<(String, LayoutTag)>,
     pub projected_decode_tok_s: f64,
@@ -99,10 +107,18 @@ impl Default for HeteroStreamPlan {
             purgeable_reclaim: false,
             cgroup_main_tid0: false,
             tp_devices: 1,
+            ep_devices: 1,
+            nccl_collectives: false,
+            marlin_cp_async: false,
+            cont_batch_slots: 1,
+            cow_prefix_blocks: false,
             mla_latent_dim: 0,
             paged_kv_block_size: 16,
             radix_prefix_cache: false,
             speculative_k: 0,
+            tree_spec_width: 0,
+            mtp_nextn_layers: 0,
+            vision_mmproj_tokens: 0,
             dispatch_mode: HeteroDispatchMode::ResidentGpu,
             numa_repack_weights: Vec::new(),
             projected_decode_tok_s: 0.0,
@@ -148,8 +164,13 @@ pub fn plan_hetero_stream(
     let mut gpu_bw_gbs: f64 = 854.0;
     let mut explicit_kv_dim: Option<usize> = None;
     let mut tp_devices: usize = cfg.spmd_devices.max(1);
+    let mut ep_devices: usize = 1;
+    let mut cont_batch_slots: usize = if cfg.paged_cont_batch { 4 } else { 1 };
     let mut mla_latent_dim: usize = 0;
     let mut speculative_k: usize = 0;
+    let mut tree_spec_width: usize = 0;
+    let mut mtp_nextn_layers: usize = 0;
+    let mut vision_mmproj_tokens: usize = 0;
     let mut radix_prefix_cache: bool = cfg.vram_budget_plan;
 
     if let Some(rest) = g.attr_mode.strip_prefix("stream:") {
@@ -214,14 +235,40 @@ pub fn plan_hetero_stream(
                         tp_devices = n.max(1);
                     }
                 }
+                "ep" | "ep_devices" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        ep_devices = n.max(1);
+                    }
+                }
+                "cb" | "cont_batch" | "slots" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        cont_batch_slots = n.max(1);
+                    }
+                }
                 "mla" | "mla_latent" => {
                     if let Ok(n) = v.parse::<usize>() {
                         mla_latent_dim = n;
                     }
                 }
-                "spec" | "mtp" => {
+                "spec" => {
                     if let Ok(n) = v.parse::<usize>() {
                         speculative_k = n;
+                    }
+                }
+                "mtp" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        mtp_nextn_layers = n;
+                        if speculative_k == 0 { speculative_k = n; }
+                    }
+                }
+                "tree" | "tree_spec" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        tree_spec_width = n;
+                    }
+                }
+                "mmproj" | "vision" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        vision_mmproj_tokens = n;
                     }
                 }
                 "prefix" => radix_prefix_cache = v != "0" && v != "false",
@@ -256,7 +303,7 @@ pub fn plan_hetero_stream(
             if cfg.numa_repack_layout {
                 let tag = match pdesc.dtype {
                     IrDType::Q2_K | IrDType::Q3_K | IrDType::IQ4_XS | IrDType::Q4_K | IrDType::Q5_K | IrDType::Q6_K => Some(LayoutTag::NumaRepackQ4K_4R),
-                    IrDType::Q4_0 | IrDType::I4 | IrDType::MXFP4 => Some(LayoutTag::NumaRepackQ4_4R),
+                    IrDType::Q4_0 | IrDType::Q5_0 | IrDType::Q5_1 | IrDType::I4 | IrDType::MXFP4 => Some(LayoutTag::NumaRepackQ4_4R),
                     _ => None,
                 };
                 if let Some(t) = tag {
@@ -310,8 +357,12 @@ pub fn plan_hetero_stream(
     };
     let kv_bytes_saved = kv_fp16_bytes.saturating_sub(kv_cache_bytes);
 
-    // Multi-GPU Tensor Parallelism (`tp_devices > 1`): aggregate VRAM scales linearly across TP ranks!
-    let total_vram_cap = vram_cap_bytes.saturating_mul(tp_devices as u64);
+    // Multi-GPU Tensor + Expert Parallelism (`tp_devices * ep_devices`): aggregate VRAM scales linearly across GPUs!
+    let world_gpus = tp_devices.saturating_mul(ep_devices).max(1);
+    let total_vram_cap = vram_cap_bytes.saturating_mul(world_gpus as u64);
+    let nccl_collectives = cfg.moe_ep_nccl && world_gpus > 1;
+    let marlin_cp_async = cfg.marlin_w4a16_mma && cfg.vram_budget_plan;
+    let cow_prefix_blocks = cfg.paged_cont_batch && radix_prefix_cache;
     let usable_vram = (total_vram_cap as f64 * 0.94) as u64;
     let base_core = total_attn_bytes + kv_cache_bytes + head_overhead_bytes + (64 * 1024 * 1024);
 
@@ -405,7 +456,7 @@ pub fn plan_hetero_stream(
     } else {
         (cpu_offload_layers as f64) * (single_layer_ffn_bytes as f64)
     };
-    let t_gpu_s = gpu_bytes_per_tok / (gpu_bw_gbs * (tp_devices as f64) * 1e9);
+    let t_gpu_s = gpu_bytes_per_tok / (gpu_bw_gbs * (world_gpus as f64) * 1e9);
     let offload_bw = match dispatch_mode {
         HeteroDispatchMode::ResidentGpu => gpu_bw_gbs,
         HeteroDispatchMode::HybridCpuInt16 => ddr_bw_gbs,
@@ -445,10 +496,18 @@ pub fn plan_hetero_stream(
         purgeable_reclaim,
         cgroup_main_tid0: cfg.hetero_dispatch,
         tp_devices,
+        ep_devices,
+        nccl_collectives,
+        marlin_cp_async,
+        cont_batch_slots,
+        cow_prefix_blocks,
         mla_latent_dim,
         paged_kv_block_size: 16,
         radix_prefix_cache,
         speculative_k,
+        tree_spec_width,
+        mtp_nextn_layers,
+        vision_mmproj_tokens,
         dispatch_mode,
         numa_repack_weights,
         projected_decode_tok_s,

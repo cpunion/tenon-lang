@@ -118,7 +118,7 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
     if cg.hetero_plan.active {
         let hp = &cg.hetero_plan;
         plan.push_str(&format!(
-            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|tp={}|mla_latent={}|paged_blk={}|radix_prefix={}|spec_k={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
+            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|tp={}|ep={}|nccl={}|marlin={}|cb_slots={}|cow_kv={}|mla_latent={}|paged_blk={}|radix_prefix={}|spec_k={}|tree_w={}|mtp={}|mmproj={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
             hp.dispatch_mode.tag(),
             hp.vram_cap_bytes,
             hp.core_vram_bytes,
@@ -133,17 +133,28 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             if hp.purgeable_reclaim { 1 } else { 0 },
             if hp.async_promoter { 1 } else { 0 },
             hp.tp_devices,
+            hp.ep_devices,
+            if hp.nccl_collectives { 1 } else { 0 },
+            if hp.marlin_cp_async { 1 } else { 0 },
+            hp.cont_batch_slots,
+            if hp.cow_prefix_blocks { 1 } else { 0 },
             hp.mla_latent_dim,
             hp.paged_kv_block_size,
             if hp.radix_prefix_cache { 1 } else { 0 },
             hp.speculative_k,
+            hp.tree_spec_width,
+            hp.mtp_nextn_layers,
+            hp.vision_mmproj_tokens,
             hp.projected_decode_tok_s,
             hp.projected_prefill_tok_s,
         ));
         msl.push_str(&format!(
-            "// [Stage 6 Heterogeneous Streaming] mode={} | tp={} mla_latent={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={} spec_k={}\n",
+            "// [Stage 6 Heterogeneous Streaming] mode={} | tp={} ep={} cb_slots={} cow_kv={} mla_latent={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={} spec_k={} tree_w={} mtp={} mmproj={}\n",
             hp.dispatch_mode.tag(),
             hp.tp_devices,
+            hp.ep_devices,
+            hp.cont_batch_slots,
+            hp.cow_prefix_blocks,
             hp.mla_latent_dim,
             hp.pinned_gpu_ffn_layers,
             hp.lru_slots_per_layer,
@@ -153,6 +164,9 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             hp.purgeable_reclaim,
             hp.prefill_chunk_tokens,
             hp.speculative_k,
+            hp.tree_spec_width,
+            hp.mtp_nextn_layers,
+            hp.vision_mmproj_tokens,
         ));
     }
 

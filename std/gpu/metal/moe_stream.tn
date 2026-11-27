@@ -60,6 +60,21 @@ extern "C" {
     fn tn_moe_kv_slot_set(handle Int, slot_id Int) Int
     fn tn_moe_copy_logits(handle Int, dst_f32_ptr Ptr[UInt8]) Int
     fn tn_moe_verify_batch(handle Int, draft_ids_ptr Ptr[UInt8], n_draft Int, start_pos Int, out_argmax_ptr Ptr[UInt8]) Int
+    fn tn_moe_paged_kv_info(handle Int, field_id Int) Int
+    fn tn_moe_paged_seq_free(handle Int, slot_id Int) Int
+    fn tn_moe_paged_seq_fork(handle Int, src_slot Int, dst_slot Int, prefix_len Int) Int
+    fn tn_moe_paged_prefill(handle Int, slot_id Int, tok_ids_ptr Ptr[UInt8], n_toks Int, start_pos Int) Int
+    fn tn_moe_step_batch(handle Int, tok_ids_ptr Ptr[UInt8], pos_ptr Ptr[UInt8], slot_ids_ptr Ptr[UInt8], n_active Int, out_toks_ptr Ptr[UInt8]) Int
+    fn tn_moe_copy_logits_batch(handle Int, batch_idx Int, dst_f32_ptr Ptr[UInt8]) Int
+    fn tn_moe_verify_tree(handle Int, tok_ids_ptr Ptr[UInt8], parents_ptr Ptr[UInt8], n_nodes Int, start_pos Int, out_toks_ptr Ptr[UInt8]) Int
+    fn tn_moe_commit_tree_path(handle Int, path_nodes_ptr Ptr[UInt8], path_len Int, start_pos Int) Int
+    fn tn_moe_mtp_predict(handle Int, tok_id Int, pos Int) Int
+    fn tn_moe_embed_text(handle Int, tok_ids_ptr Ptr[UInt8], n_toks Int, out_f32_ptr Ptr[UInt8], max_dim Int) Int
+    fn tn_moe_step_embd(handle Int, embd_f32_ptr Ptr[UInt8], n_vecs Int, start_pos Int) Int
+    fn tn_moe_mmproj_load(path_cstr Ptr[UInt8]) Int
+    fn tn_moe_mmproj_info(mm_h Int, field_id Int) Int
+    fn tn_moe_mmproj_encode_rgb(mm_h Int, rgb_u8_ptr Ptr[UInt8], width Int, height Int, out_embd_ptr Ptr[UInt8], max_vecs Int) Int
+    fn tn_moe_mmproj_free(mm_h Int) Int
 
     /// Decodes a token ID to a UTF-8 C string from the GGUF's embedded vocabulary.
     fn tn_moe_token_cstr(handle Int, tok_id Int) Ptr[UInt8]

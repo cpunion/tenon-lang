@@ -1,0 +1,438 @@
+// examples/showcase/tenon_llm_server.tn
+// Pure-Tenon Zero-Rust Single-Binary OpenAI-Compatible HTTP + SSE + Embeddings Server (< 350 KB)!
+//
+// Features:
+//   - Zero Rust, Zero Tokio, Zero Python, Zero Docker — compiles via `tenon build` to a < 350 KB native binary!
+//   - Built natively on Tenon OS TCP sockets (`net_tcp_listen`/`net_tcp_accept`) + `std/encoding/json.tn` + `std/gpu/metal/moe_stream.tn`
+//   - Serves:
+//       * `GET  /health`                (backend, arch, PagedKV blocks, VRAM footprint)
+//       * `GET  /v1/models`             (OpenAI models list)
+//       * `POST /v1/chat/completions`   (OpenAI JSON + live token-by-token `text/event-stream` SSE!)
+//       * `POST /v1/embeddings`         (L2-normalized hidden-state embeddings via `tn_moe_embed_text`)
+//
+// Build & Run:
+//   tenon build examples/showcase/tenon_llm_server.tn -o /tmp/tenon_llm_server
+//   TENON_MODEL=/tmp/models/v6/Llama-3.2-1B-Instruct-Q4_0.gguf TENON_ADDR=127.0.0.1:8091 /tmp/tenon_llm_server
+
+import "std/core/types.tn"
+import "std/os/io.tn"
+import "std/text/text.tn"
+import "std/text/builder.tn"
+import "std/encoding/json.tn"
+import "std/gpu/metal/moe_stream.tn"
+
+pure fn find_hdr_end(s Text) Int {
+    let n = len(s)
+    var i = 0
+    while i + 3 < n {
+        if byte_at(s, i) == 13 && byte_at(s, i + 1) == 10 && byte_at(s, i + 2) == 13 && byte_at(s, i + 3) == 10 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+pure fn parse_cl(hdr Text) Int {
+    let n = len(hdr)
+    var i = 0
+    while i + 15 < n {
+        let b0 = byte_at(hdr, i)
+        let b1 = byte_at(hdr, i + 1)
+        let b7 = byte_at(hdr, i + 7)
+        let b8 = byte_at(hdr, i + 8)
+        if (b0 == 67 || b0 == 99) && (b1 == 79 || b1 == 111) && b7 == 45 && (b8 == 76 || b8 == 108) {
+            var p = i + 15
+            while p < n && (byte_at(hdr, p) == 58 || byte_at(hdr, p) == 32 || byte_at(hdr, p) == 9) {
+                p += 1
+            }
+            var acc = 0
+            while p < n && byte_at(hdr, p) >= 48 && byte_at(hdr, p) <= 57 {
+                acc = acc * 10 + (byte_at(hdr, p) - 48)
+                p += 1
+            }
+            return acc
+        }
+        i += 1
+    }
+    0
+}
+
+fn write_json_http(cfd Int, status Int, reason Text, body Text) {
+    let resp = "HTTP/1.1 " ++ int_to_text(status) ++ " " ++ reason
+        ++ "\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
+        ++ int_to_text(len(body)) ++ "\r\nConnection: close\r\n\r\n" ++ body
+    let _ = net_write_text(cfd, resp)
+}
+
+fn format_chat(arch Text, msgs JsonValue) Text {
+    var tb = TextBuilder.new()
+    let n = json_len(msgs)
+    var i = 0
+    if arch == "llama" {
+        while i < n {
+            match json_at(msgs, i) {
+                Some(m) => {
+                    let role = match json_get_str(m, "role") { Some(r) => r, None => "user" }
+                    let content = match json_get_str(m, "content") { Some(c) => c, None => "" }
+                    tb.push_str("<|start_header_id|>")
+                    tb.push_str(role)
+                    tb.push_str("<|end_header_id|>\n\n")
+                    tb.push_str(content)
+                    tb.push_str("<|eot_id|>")
+                }
+                None => {}
+            }
+            i += 1
+        }
+        tb.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n")
+    } else if arch == "qwen3moe" || arch == "qwen2" {
+        while i < n {
+            match json_at(msgs, i) {
+                Some(m) => {
+                    let role = match json_get_str(m, "role") { Some(r) => r, None => "user" }
+                    let content = match json_get_str(m, "content") { Some(c) => c, None => "" }
+                    tb.push_str("<|im_start|>")
+                    tb.push_str(role)
+                    tb.push_str("\n")
+                    tb.push_str(content)
+                    tb.push_str("<|im_end|>\n")
+                }
+                None => {}
+            }
+            i += 1
+        }
+        tb.push_str("<|im_start|>assistant\n")
+    } else {
+        while i < n {
+            match json_at(msgs, i) {
+                Some(m) => {
+                    let role = match json_get_str(m, "role") { Some(r) => r, None => "user" }
+                    let content = match json_get_str(m, "content") { Some(c) => c, None => "" }
+                    tb.push_str(role)
+                    tb.push_str(": ")
+                    tb.push_str(content)
+                    tb.push_str("\n")
+                }
+                None => {}
+            }
+            i += 1
+        }
+        tb.push_str("assistant: ")
+    }
+    tb.finish()
+}
+
+fn is_stop_piece(tok Int, eos Int, piece Text) Bool {
+    tok == eos || piece == "<|eot_id|>" || piece == "<|eom_id|>" || piece == "<|eoft_id|>" || piece == "<|im_end|>" || piece == "</s>"
+}
+
+fn f32_bits_to_float(bits Int) Float {
+    let sign = (bits >> 31) & 1
+    let exp = (bits >> 23) & 255
+    let frac = bits & 8388607
+    if exp == 0 {
+        return 0.0
+    }
+    var m = 1.0 + int_to_float(frac) / 8388608.0
+    var e = exp - 127
+    while e > 0 {
+        m = m * 2.0
+        e -= 1
+    }
+    while e < 0 {
+        m = m * 0.5
+        e += 1
+    }
+    if sign != 0 { 0.0 - m } else { m }
+}
+
+fn handle_client(cfd Int, handle Int, arch Text, model_name Text) {
+    let _ = net_set_nodelay(cfd, true)
+    var buf = ""
+    var hend = -1
+    var clen = 0
+    var reads = 0
+    while reads < 16 {
+        let chunk = net_read_text(cfd, 16384)
+        if len(chunk) == 0 {
+            reads = 16
+        } else {
+            buf = buf ++ chunk
+            if hend < 0 {
+                hend = find_hdr_end(buf)
+                if hend >= 0 {
+                    clen = parse_cl(str_slice(buf, 0, hend))
+                }
+            }
+            if hend >= 0 && len(buf) >= hend + 4 + clen {
+                reads = 16
+            } else {
+                reads += 1
+            }
+        }
+    }
+    if hend < 0 {
+        let _ = net_close(cfd)
+        return
+    }
+    var sp1 = 0
+    while sp1 < hend && byte_at(buf, sp1) != 32 {
+        sp1 += 1
+    }
+    var sp2 = sp1 + 1
+    while sp2 < hend && byte_at(buf, sp2) != 32 {
+        sp2 += 1
+    }
+    let method = str_slice(buf, 0, sp1)
+    let path = str_slice(buf, sp1 + 1, sp2)
+    let body = if clen > 0 && hend + 4 + clen <= len(buf) {
+        str_slice(buf, hend + 4, hend + 4 + clen)
+    } else {
+        ""
+    }
+
+    if method == "GET" && path == "/health" {
+        let d_model = unsafe { tn_moe_info(handle, 1) }
+        let n_layers = unsafe { tn_moe_info(handle, 0) }
+        let pa_blks = unsafe { tn_moe_paged_kv_info(handle, 1) }
+        let vram = unsafe { tn_moe_info(handle, 8) }
+        var obj = json_obj_new()
+        obj = json_obj_set(obj, "status", JStr("ok"))
+        obj = json_obj_set(obj, "engine", JStr("tenon-native-zero-rust-v6"))
+        obj = json_obj_set(obj, "arch", JStr(arch))
+        obj = json_obj_set(obj, "model", JStr(model_name))
+        obj = json_obj_set(obj, "n_layers", JInt(n_layers))
+        obj = json_obj_set(obj, "d_model", JInt(d_model))
+        obj = json_obj_set(obj, "paged_kv_blocks", JInt(pa_blks))
+        obj = json_obj_set(obj, "core_vram_bytes", JInt(vram))
+        write_json_http(cfd, 200, "OK", obj.stringify())
+        let _ = net_close(cfd)
+        return
+    }
+
+    if method == "GET" && path == "/v1/models" {
+        var item = json_obj_new()
+        item = json_obj_set(item, "id", JStr(model_name))
+        item = json_obj_set(item, "object", JStr("model"))
+        item = json_obj_set(item, "owned_by", JStr("tenon-native"))
+        var data = json_arr_new()
+        data = json_arr_push(data, item)
+        var obj = json_obj_new()
+        obj = json_obj_set(obj, "object", JStr("list"))
+        obj = json_obj_set(obj, "data", data)
+        write_json_http(cfd, 200, "OK", obj.stringify())
+        let _ = net_close(cfd)
+        return
+    }
+
+    if method == "POST" && path == "/v1/embeddings" {
+        match JsonValue.parse(body) {
+            Err(_) => {
+                write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid json\"}")
+                let _ = net_close(cfd)
+                return
+            }
+            Ok(jv) => {
+                let txt = match json_get_str(jv, "input") { Some(s) => s, None => "hello" }
+                let dm = unsafe { tn_moe_info(handle, 1) }
+                let bos = unsafe { tn_moe_info(handle, 11) }
+                var tok_buf List[Int] = list_filled(256, 0)
+                let nt = unsafe { tn_moe_tokenize(handle, text_cstr_ptr(txt), list_data_ptr(tok_buf), 255) }
+                var ids List[Int] = list_filled(nt + 1, 0)
+                ids[0] = bos
+                var ti = 0
+                while ti < nt {
+                    ids[ti + 1] = tok_buf[ti]
+                    ti += 1
+                }
+                var raw_f32 List[Int] = list_filled((dm + 1) / 2, 0)
+                let got = unsafe { tn_moe_embed_text(handle, list_data_ptr(ids), nt + 1, list_data_ptr(raw_f32), dm) }
+                var emb_arr = json_arr_new()
+                var di = 0
+                while di < got {
+                    let word = raw_f32[di / 2]
+                    let bits = if (di & 1) == 0 { word & 4294967295 } else { (word >> 32) & 4294967295 }
+                    emb_arr = json_arr_push(emb_arr, JFloat(f32_bits_to_float(bits)))
+                    di += 1
+                }
+                var item = json_obj_new()
+                item = json_obj_set(item, "object", JStr("embedding"))
+                item = json_obj_set(item, "index", JInt(0))
+                item = json_obj_set(item, "embedding", emb_arr)
+                var data = json_arr_new()
+                data = json_arr_push(data, item)
+                var out = json_obj_new()
+                out = json_obj_set(out, "object", JStr("list"))
+                out = json_obj_set(out, "model", JStr(model_name))
+                out = json_obj_set(out, "data", data)
+                write_json_http(cfd, 200, "OK", out.stringify())
+                let _ = net_close(cfd)
+                return
+            }
+        }
+    }
+
+    if method == "POST" && path == "/v1/chat/completions" {
+        match JsonValue.parse(body) {
+            Err(_) => {
+                write_json_http(cfd, 400, "Bad Request", "{\"error\":\"invalid json\"}")
+                let _ = net_close(cfd)
+                return
+            }
+            Ok(jv) => {
+                let want_stream = match json_get_bool(jv, "stream") { Some(b) => b, None => false }
+                let max_toks = match json_get_int(jv, "max_tokens") { Some(n) => n, None => 48 }
+                let temp = match json_get_float(jv, "temperature") { Some(f) => f, None => 0.0 }
+                let prompt = match json_get(jv, "messages") {
+                    Some(msgs) => format_chat(arch, msgs)
+                    None => match json_get_str(jv, "prompt") { Some(p) => p, None => "Hello" }
+                }
+                let bos = unsafe { tn_moe_info(handle, 11) }
+                let eos = unsafe { tn_moe_info(handle, 12) }
+                var tok_buf List[Int] = list_filled(512, 0)
+                let nt = unsafe { tn_moe_tokenize(handle, text_cstr_ptr(prompt), list_data_ptr(tok_buf), 511) }
+                var ids List[Int] = list_filled(nt + 1, 0)
+                ids[0] = bos
+                var ti = 0
+                while ti < nt {
+                    ids[ti + 1] = tok_buf[ti]
+                    ti += 1
+                }
+
+                let t0 = moe_now_ms()
+                let _ = unsafe { tn_moe_prefill(handle, list_data_ptr(ids), nt + 1, 0) }
+                let pf_ms = moe_now_ms() - t0
+                let _ = unsafe { tn_moe_reset(handle) }
+
+                var recent List[Int] = list_filled(64, 0)
+                var rlen = 0
+                var tok = unsafe { tn_moe_sample_next(handle, -1, nt, temp, 40, 0.9, 0.05, 1.0, list_data_ptr(recent), 0, 42) }
+                var pos = nt + 1
+
+                if want_stream {
+                    let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+                    let _ = net_write_text(cfd, hdr)
+                }
+
+                var out_tb = TextBuilder.new()
+                let t1 = moe_now_ms()
+                var step = 0
+                var gen_toks = 0
+                while step < max_toks {
+                    let piece = unsafe { cstr_to_text(tn_moe_token_cstr(handle, tok)) }
+                    if is_stop_piece(tok, eos, piece) {
+                        step = max_toks
+                    } else {
+                        out_tb.push_str(piece)
+                        gen_toks += 1
+                        if want_stream {
+                            var delta = json_obj_new()
+                            delta = json_obj_set(delta, "content", JStr(piece))
+                            var ch = json_obj_new()
+                            ch = json_obj_set(ch, "index", JInt(0))
+                            ch = json_obj_set(ch, "delta", delta)
+                            var chs = json_arr_new()
+                            chs = json_arr_push(chs, ch)
+                            var chunk = json_obj_new()
+                            chunk = json_obj_set(chunk, "object", JStr("chat.completion.chunk"))
+                            chunk = json_obj_set(chunk, "model", JStr(model_name))
+                            chunk = json_obj_set(chunk, "choices", chs)
+                            let _ = net_write_text(cfd, "data: " ++ chunk.stringify() ++ "\n\n")
+                        }
+                        if rlen < 64 {
+                            recent[rlen] = tok
+                            rlen += 1
+                        }
+                        if step + 1 < max_toks {
+                            tok = unsafe { tn_moe_sample_next(handle, tok, pos, temp, 40, 0.9, 0.05, 1.0, list_data_ptr(recent), rlen, 42 + step) }
+                            pos += 1
+                        }
+                        step += 1
+                    }
+                }
+                let dec_ms = moe_now_ms() - t1
+                let gen_text = out_tb.finish()
+
+                if want_stream {
+                    let _ = net_write_text(cfd, "data: [DONE]\n\n")
+                    let _ = net_close(cfd)
+                    return
+                }
+
+                var msg = json_obj_new()
+                msg = json_obj_set(msg, "role", JStr("assistant"))
+                msg = json_obj_set(msg, "content", JStr(gen_text))
+                var choice = json_obj_new()
+                choice = json_obj_set(choice, "index", JInt(0))
+                choice = json_obj_set(choice, "message", msg)
+                choice = json_obj_set(choice, "finish_reason", JStr("stop"))
+                var choices = json_arr_new()
+                choices = json_arr_push(choices, choice)
+                var usage = json_obj_new()
+                usage = json_obj_set(usage, "prompt_tokens", JInt(nt + 1))
+                usage = json_obj_set(usage, "completion_tokens", JInt(gen_toks))
+                var timings = json_obj_new()
+                timings = json_obj_set(timings, "prefill_ms", JFloat(pf_ms))
+                timings = json_obj_set(timings, "decode_ms", JFloat(dec_ms))
+                var resp = json_obj_new()
+                resp = json_obj_set(resp, "id", JStr("chatcmpl-tenon-native"))
+                resp = json_obj_set(resp, "object", JStr("chat.completion"))
+                resp = json_obj_set(resp, "model", JStr(model_name))
+                resp = json_obj_set(resp, "choices", choices)
+                resp = json_obj_set(resp, "usage", usage)
+                resp = json_obj_set(resp, "timings", timings)
+                write_json_http(cfd, 200, "OK", resp.stringify())
+                let _ = net_close(cfd)
+                return
+            }
+        }
+    }
+
+    write_json_http(cfd, 404, "Not Found", "{\"error\":\"unknown endpoint\"}")
+    let _ = net_close(cfd)
+}
+
+fn main() Int {
+    let model_env = sys_env("TENON_MODEL")
+    let model_path = if len(model_env) > 0 {
+        model_env
+    } else {
+        "/tmp/models/v6/Llama-3.2-1B-Instruct-Q4_0.gguf"
+    }
+    let addr_env = sys_env("TENON_ADDR")
+    let addr = if len(addr_env) > 0 { addr_env } else { "127.0.0.1:8091" }
+
+    var plan List[Int] = list_filled(9, 0)
+    let ok = unsafe { tn_moe_auto_plan(text_cstr_ptr(model_path), 0.0, 4096, -1, list_data_ptr(plan)) }
+    assert(ok != 0)
+    let slots = plan[0]
+    let nocache = plan[1] != 0
+
+    var model = StreamingMoeModel.open_gguf(model_path, slots, nocache, true)
+    assert(model.is_valid())
+    let arch = model.arch_name()
+    let handle = model.handle
+
+    let lfd = net_tcp_listen(addr)
+    if lfd < 0 {
+        println("[tenon-native-server] listen failed on [" ++ addr ++ "]")
+        model.destroy()
+        return 1
+    }
+    let port = net_tcp_local_port(lfd)
+    println("[tenon-native-server] Pure-Tenon Zero-Rust LLM Server listening on http://" ++ addr ++ " (port=" ++ int_to_text(port) ++ ", arch=" ++ arch ++ ")")
+
+    var running = true
+    while running {
+        let cfd = net_tcp_accept(lfd)
+        if cfd >= 0 {
+            handle_client(cfd, handle, arch, "tenon-native-gguf")
+        } else {
+            running = false
+        }
+    }
+    let _ = net_close(lfd)
+    model.destroy()
+    0
+}

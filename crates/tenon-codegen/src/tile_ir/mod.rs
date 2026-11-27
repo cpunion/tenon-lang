@@ -92,6 +92,14 @@ pub struct GpuOptConfig {
     pub dual_stream_dma: bool,
     /// #17: Roofline-Driven GPU+CPU Hybrid Dispatch (AVX2/NEON INT16 `Main=tid0` container-cgroup-aware worker pool when `BW_DDR > 1.2 * BW_PCIe`).
     pub hetero_dispatch: bool,
+    /// #22: Iteration-Level Continuous Batching (`step_batch`) + PagedAttention 16-Token Block-Table KV + Zero-Copy COW Prefix Fork.
+    pub paged_cont_batch: bool,
+    /// #23: Marlin-Style 2-Stage `cp.async` + FP16x2 Magic-Bit `lop3` W4A16 Tensor Core Prefill.
+    pub marlin_w4a16_mma: bool,
+    /// #24: Multi-GPU MoE Expert Parallelism (`EP=2..8`) + Zero-Link `dlopen("libnccl.so.2")` Collective Auto-Dispatch.
+    pub moe_ep_nccl: bool,
+    /// #25: Tree-Attention Speculative Masking (`verify_tree`) + Native MTP `nextn` Block + Vision `mmproj` Soft-Prompt Injection.
+    pub tree_spec_mtp_mm: bool,
 
     /// Optional SPMD device count (`1` = single device, `>1` = auto-sharded multi-device SPMD).
     pub spmd_devices: usize,
@@ -136,6 +144,10 @@ impl GpuOptConfig {
             numa_repack_layout: false,
             dual_stream_dma: false,
             hetero_dispatch: false,
+            paged_cont_batch: false,
+            marlin_w4a16_mma: false,
+            moe_ep_nccl: false,
+            tree_spec_mtp_mm: false,
             spmd_devices: 1,
             force_tile: None,
         }
@@ -197,6 +209,10 @@ impl GpuOptConfig {
         c.numa_repack_layout = true;
         c.dual_stream_dma = true;
         c.hetero_dispatch = true;
+        c.paged_cont_batch = true;
+        c.marlin_w4a16_mma = true;
+        c.moe_ep_nccl = true;
+        c.tree_spec_mtp_mm = true;
         c
     }
 
@@ -291,6 +307,10 @@ impl GpuOptConfig {
                         "numa_repack_layout" | "numa_repack" | "repack_4r" => cfg.numa_repack_layout = enable,
                         "dual_stream_dma" | "dma_ring" | "dual_stream" => cfg.dual_stream_dma = enable,
                         "hetero_dispatch" | "hetero" | "hybrid_cpu" => cfg.hetero_dispatch = enable,
+                        "paged_cont_batch" | "paged_kv" | "cont_batch" => cfg.paged_cont_batch = enable,
+                        "marlin_w4a16_mma" | "marlin" => cfg.marlin_w4a16_mma = enable,
+                        "moe_ep_nccl" | "ep" | "nccl" => cfg.moe_ep_nccl = enable,
+                        "tree_spec_mtp_mm" | "tree_spec" | "mtp" | "mmproj" => cfg.tree_spec_mtp_mm = enable,
                         _ => {}
                     }
                 }
@@ -336,6 +356,10 @@ impl GpuOptConfig {
         if self.numa_repack_layout { on.push("numa4r"); }
         if self.dual_stream_dma { on.push("dma_ring"); }
         if self.hetero_dispatch { on.push("hetero"); }
+        if self.paged_cont_batch { on.push("paged_cb"); }
+        if self.marlin_w4a16_mma { on.push("marlin"); }
+        if self.moe_ep_nccl { on.push("ep_nccl"); }
+        if self.tree_spec_mtp_mm { on.push("tree_mtp_mm"); }
         if self.spmd_devices > 1 {
             on.push("spmd_multi");
         }
@@ -439,6 +463,8 @@ pub enum IrDType {
     I4,
     Q8_0,
     Q4_0,
+    Q5_0,
+    Q5_1,
     /// GGML K-Quant & I-Quant super-blocks (256 weights: Q2_K=84B, Q3_K=110B, IQ4_XS=136B, Q4_K=144B, Q5_K=176B, Q6_K=210B).
     Q2_K,
     Q3_K,
@@ -459,6 +485,8 @@ impl IrDType {
             Self::I4 => 0.5,
             Self::Q8_0 => 34.0 / 32.0,
             Self::Q4_0 => 18.0 / 32.0,
+            Self::Q5_0 => 22.0 / 32.0,
+            Self::Q5_1 => 24.0 / 32.0,
             Self::Q2_K => 84.0 / 256.0,
             Self::Q3_K => 110.0 / 256.0,
             Self::IQ4_XS => 136.0 / 256.0,
@@ -470,7 +498,7 @@ impl IrDType {
     }
 
     pub fn is_sub_byte(self) -> bool {
-        matches!(self, Self::I4 | Self::Q4_0 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4)
+        matches!(self, Self::I4 | Self::Q4_0 | Self::Q5_0 | Self::Q5_1 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4)
     }
 
     pub fn msl_ty(self) -> &'static str {
@@ -478,7 +506,7 @@ impl IrDType {
             Self::F32 => "float",
             Self::F16 => "half",
             Self::BF16 => "bfloat",
-            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4 => "uchar",
+            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::Q5_0 | Self::Q5_1 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4 => "uchar",
             Self::I8 => "char",
         }
     }
@@ -489,7 +517,7 @@ impl IrDType {
             Self::F16 => "__half",
             Self::BF16 => "__nv_bfloat16",
             Self::I8 => "int8_t",
-            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4 => "uint8_t",
+            Self::FP8 | Self::I4 | Self::Q8_0 | Self::Q4_0 | Self::Q5_0 | Self::Q5_1 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::MXFP4 => "uint8_t",
         }
     }
 
@@ -499,7 +527,7 @@ impl IrDType {
             Self::F16 => "f16",
             Self::BF16 => "bf16",
             Self::FP8 => "f8E4M3FN",
-            Self::I8 | Self::Q8_0 | Self::Q5_K | Self::Q6_K => "i8",
+            Self::I8 | Self::Q8_0 | Self::Q5_0 | Self::Q5_1 | Self::Q5_K | Self::Q6_K => "i8",
             Self::I4 | Self::Q4_0 | Self::Q2_K | Self::Q3_K | Self::IQ4_XS | Self::Q4_K | Self::MXFP4 => "i4",
         }
     }
@@ -902,7 +930,7 @@ fn parse_dim_expr(ty: &TypeExpr) -> Option<DimExpr> {
                     name.as_str(),
                     "Float32" | "F32" | "Float16" | "F16" | "BFloat16" | "BF16"
                         | "FP8" | "Float8" | "Int8" | "I8" | "Int4" | "I4"
-                        | "Q8_0" | "Q4_0" | "Q2_K" | "Q3_K" | "IQ4_XS" | "Q4_K" | "Q5_K" | "Q6_K" | "MXFP4" | "FP4"
+                        | "Q8_0" | "Q4_0" | "Q5_0" | "Q5_1" | "Q2_K" | "Q3_K" | "IQ4_XS" | "Q4_K" | "Q5_K" | "Q6_K" | "MXFP4" | "FP4"
                 )
             {
                 return Some(DimExpr::Sym { name: name.clone(), max_bound: 1024 });
@@ -923,6 +951,8 @@ fn parse_ir_dtype(ty: &TypeExpr) -> Option<IrDType> {
             "Int4" | "I4" => Some(IrDType::I4),
             "Q8_0" => Some(IrDType::Q8_0),
             "Q4_0" => Some(IrDType::Q4_0),
+            "Q5_0" => Some(IrDType::Q5_0),
+            "Q5_1" => Some(IrDType::Q5_1),
             "Q2_K" => Some(IrDType::Q2_K),
             "Q3_K" | "Q3_K_M" => Some(IrDType::Q3_K),
             "IQ4_XS" => Some(IrDType::IQ4_XS),
@@ -1330,7 +1360,7 @@ pub fn run_optimization_pipeline(mut g: TensorIrGraph, mut cfg: GpuOptConfig) ->
         let t_cmp = (opt_flops / (peak_t * 1e12)) * 1e3;
         t_mem.max(t_cmp)
     };
-    let uses_low_bit = g.tensors.values().any(|t| matches!(t.dtype, IrDType::FP8 | IrDType::I8 | IrDType::I4 | IrDType::Q4_0 | IrDType::Q2_K | IrDType::Q3_K | IrDType::IQ4_XS | IrDType::Q4_K | IrDType::Q5_K | IrDType::Q6_K | IrDType::MXFP4));
+    let uses_low_bit = g.tensors.values().any(|t| matches!(t.dtype, IrDType::FP8 | IrDType::I8 | IrDType::I4 | IrDType::Q4_0 | IrDType::Q5_0 | IrDType::Q5_1 | IrDType::Q2_K | IrDType::Q3_K | IrDType::IQ4_XS | IrDType::Q4_K | IrDType::Q5_K | IrDType::Q6_K | IrDType::MXFP4));
 
     let roofline = UniversalRoofline {
         raw_flops,

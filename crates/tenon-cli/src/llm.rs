@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs;
@@ -6,13 +6,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
 
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
@@ -26,7 +25,8 @@ type FnLoadGguf = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
 type FnInfo = unsafe extern "C" fn(i64, i64) -> i64;
 type FnReset = unsafe extern "C" fn(i64) -> i64;
 type FnKvSlotSet = unsafe extern "C" fn(i64, i64) -> i64;
-type FnCopyLogits = unsafe extern "C" fn(i64, i64, i64) -> i64;
+type FnCopyLogits2 = unsafe extern "C" fn(i64, i64) -> i64;
+type FnCopyLogits3 = unsafe extern "C" fn(i64, i64, i64) -> i64;
 type FnPrefill = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
 type FnVerifyBatch = unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64;
 type FnAutoPlan = unsafe extern "C" fn(i64, f64, i64, i64, i64) -> i64;
@@ -37,6 +37,24 @@ type FnTokenize = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
 type FnTokenCstr = unsafe extern "C" fn(i64, i64) -> i64;
 type FnFree = unsafe extern "C" fn(i64) -> i64;
 type FnInit = unsafe extern "C" fn() -> i64;
+type FnStep = unsafe extern "C" fn(i64, i64, i64) -> i64;
+
+// Tenon v6 FFI function signatures (identical across Metal & CUDA!)
+type FnPagedKvInfo = unsafe extern "C" fn(i64, i64) -> i64;
+type FnPagedSeqFree = unsafe extern "C" fn(i64, i64) -> i64;
+type FnPagedSeqFork = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
+type FnPagedPrefill = unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64;
+type FnStepBatch = unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64;
+type FnCopyLogitsBatch = unsafe extern "C" fn(i64, i64, i64) -> i64;
+type FnVerifyTree = unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64;
+type FnCommitTreePath = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
+type FnMtpPredict = unsafe extern "C" fn(i64, i64, i64) -> i64;
+type FnEmbedText = unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64;
+type FnStepEmbd = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
+type FnMmprojLoad = unsafe extern "C" fn(i64) -> i64;
+type FnMmprojInfo = unsafe extern "C" fn(i64, i64) -> i64;
+type FnMmprojEncodeRgb = unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64;
+type FnMmprojFree = unsafe extern "C" fn(i64) -> i64;
 
 struct LlmApi {
     backend: &'static str,
@@ -46,7 +64,9 @@ struct LlmApi {
     info: FnInfo,
     reset: FnReset,
     kv_slot_set: FnKvSlotSet,
-    copy_logits: FnCopyLogits,
+    copy_logits_2: Option<FnCopyLogits2>,
+    copy_logits_3: Option<FnCopyLogits3>,
+    step_fn: FnStep,
     prefill: FnPrefill,
     verify_batch: FnVerifyBatch,
     auto_plan: FnAutoPlan,
@@ -55,6 +75,22 @@ struct LlmApi {
     tokenize: FnTokenize,
     token_cstr: FnTokenCstr,
     free: FnFree,
+    // v6 APIs
+    paged_kv_info: FnPagedKvInfo,
+    paged_seq_free: FnPagedSeqFree,
+    paged_seq_fork: FnPagedSeqFork,
+    paged_prefill: FnPagedPrefill,
+    step_batch: FnStepBatch,
+    copy_logits_batch: FnCopyLogitsBatch,
+    verify_tree: FnVerifyTree,
+    commit_tree_path: FnCommitTreePath,
+    mtp_predict: FnMtpPredict,
+    embed_text: FnEmbedText,
+    step_embd: FnStepEmbd,
+    mmproj_load: FnMmprojLoad,
+    mmproj_info: FnMmprojInfo,
+    mmproj_encode_rgb: FnMmprojEncodeRgb,
+    mmproj_free: FnMmprojFree,
 }
 
 unsafe impl Send for LlmApi {}
@@ -78,6 +114,8 @@ enum SpecMode {
     Off,
     Ngram,
     Draft,
+    Mtp,
+    Tree,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +128,8 @@ struct SamplingCfg {
     max_tokens: usize,
     seed: i64,
     json_constrained: bool,
+    json_schema: Option<Value>,
+    gbnf_grammar: Option<String>,
     spec_mode: SpecMode,
     spec_k: usize,
 }
@@ -105,6 +145,8 @@ impl Default for SamplingCfg {
             max_tokens: 256,
             seed: 42,
             json_constrained: false,
+            json_schema: None,
+            gbnf_grammar: None,
             spec_mode: SpecMode::Off,
             spec_k: 5,
         }
@@ -167,11 +209,11 @@ fn load_llm_api() -> Result<LlmApi, String> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let lib_path = PathBuf::from(format!("/tmp/tenon_llm_{}_v5_{}.{}", backend, mtime, ext));
+    let lib_path = PathBuf::from(format!("/tmp/tenon_llm_{}_v6_{}.{}", backend, mtime, ext));
 
     if !lib_path.exists() {
         eprintln!(
-            "[tenon llm] compiling {} v5 runtime shim ({}) -> {}",
+            "[tenon llm] compiling {} v6 runtime shim ({}) -> {}",
             backend,
             src.display(),
             lib_path.display()
@@ -229,6 +271,11 @@ fn load_llm_api() -> Result<LlmApi, String> {
     } else {
         None
     };
+    let (copy_logits_2, copy_logits_3) = if backend == "cuda" {
+        (None, Some(load_symbol::<FnCopyLogits3>(dl_handle, &sym("copy_logits"))?))
+    } else {
+        (Some(load_symbol::<FnCopyLogits2>(dl_handle, &sym("copy_logits"))?), None)
+    };
 
     let api = LlmApi {
         backend,
@@ -238,7 +285,9 @@ fn load_llm_api() -> Result<LlmApi, String> {
         info: load_symbol(dl_handle, &sym("info"))?,
         reset: load_symbol(dl_handle, &sym("reset"))?,
         kv_slot_set: load_symbol(dl_handle, &sym("kv_slot_set"))?,
-        copy_logits: load_symbol(dl_handle, &sym("copy_logits"))?,
+        copy_logits_2,
+        copy_logits_3,
+        step_fn: load_symbol(dl_handle, &sym("step"))?,
         prefill: load_symbol(dl_handle, &sym("prefill"))?,
         verify_batch: load_symbol(dl_handle, &sym("verify_batch"))?,
         auto_plan: load_symbol(dl_handle, &sym("auto_plan"))?,
@@ -247,6 +296,21 @@ fn load_llm_api() -> Result<LlmApi, String> {
         tokenize: load_symbol(dl_handle, &sym("tokenize"))?,
         token_cstr: load_symbol(dl_handle, &sym("token_cstr"))?,
         free: load_symbol(dl_handle, &sym("free"))?,
+        paged_kv_info: load_symbol(dl_handle, &sym("paged_kv_info"))?,
+        paged_seq_free: load_symbol(dl_handle, &sym("paged_seq_free"))?,
+        paged_seq_fork: load_symbol(dl_handle, &sym("paged_seq_fork"))?,
+        paged_prefill: load_symbol(dl_handle, &sym("paged_prefill"))?,
+        step_batch: load_symbol(dl_handle, &sym("step_batch"))?,
+        copy_logits_batch: load_symbol(dl_handle, &sym("copy_logits_batch"))?,
+        verify_tree: load_symbol(dl_handle, &sym("verify_tree"))?,
+        commit_tree_path: load_symbol(dl_handle, &sym("commit_tree_path"))?,
+        mtp_predict: load_symbol(dl_handle, &sym("mtp_predict"))?,
+        embed_text: load_symbol(dl_handle, &sym("embed_text"))?,
+        step_embd: load_symbol(dl_handle, &sym("step_embd"))?,
+        mmproj_load: load_symbol(dl_handle, &sym("mmproj_load"))?,
+        mmproj_info: load_symbol(dl_handle, &sym("mmproj_info"))?,
+        mmproj_encode_rgb: load_symbol(dl_handle, &sym("mmproj_encode_rgb"))?,
+        mmproj_free: load_symbol(dl_handle, &sym("mmproj_free"))?,
     };
     if let Some(init) = api.init_fn {
         if unsafe { init() } == 0 {
@@ -338,8 +402,18 @@ impl LlmApi {
     }
 
     fn copy_logits(&self, h: i64, out: &mut [f32]) -> usize {
-        let n = unsafe { (self.copy_logits)(h, out.as_mut_ptr() as i64, out.len() as i64) };
+        let n = if let Some(f3) = self.copy_logits_3 {
+            unsafe { f3(h, out.as_mut_ptr() as i64, out.len() as i64) }
+        } else if let Some(f2) = self.copy_logits_2 {
+            unsafe { f2(h, out.as_mut_ptr() as i64) }
+        } else {
+            0
+        };
         n.max(0) as usize
+    }
+
+    fn step(&self, h: i64, tok_id: i64, pos: i64) -> i64 {
+        unsafe { (self.step_fn)(h, tok_id, pos) }
     }
 
     fn prefill(&self, h: i64, ids: &[i64], start_pos: i64) -> i64 {
@@ -357,6 +431,127 @@ impl LlmApi {
             )
         };
         n.max(0) as usize
+    }
+
+    fn paged_kv_info(&self, h: i64, field: i64) -> i64 {
+        unsafe { (self.paged_kv_info)(h, field) }
+    }
+
+    fn paged_seq_free(&self, h: i64, slot: usize) -> i64 {
+        unsafe { (self.paged_seq_free)(h, slot as i64) }
+    }
+
+    fn paged_seq_fork(&self, h: i64, src_slot: usize, dst_slot: usize, prefix_len: usize) -> i64 {
+        unsafe { (self.paged_seq_fork)(h, src_slot as i64, dst_slot as i64, prefix_len as i64) }
+    }
+
+    fn paged_prefill(&self, h: i64, slot: usize, ids: &[i64], start_pos: i64) -> i64 {
+        unsafe { (self.paged_prefill)(h, slot as i64, ids.as_ptr() as i64, ids.len() as i64, start_pos) }
+    }
+
+    fn step_batch(
+        &self,
+        h: i64,
+        ids: &[i64],
+        pos: &[i64],
+        slots: &[i64],
+        out_toks: &mut [i64],
+    ) -> usize {
+        let n = unsafe {
+            (self.step_batch)(
+                h,
+                ids.as_ptr() as i64,
+                pos.as_ptr() as i64,
+                slots.as_ptr() as i64,
+                ids.len() as i64,
+                out_toks.as_mut_ptr() as i64,
+            )
+        };
+        n.max(0) as usize
+    }
+
+    fn copy_logits_batch(&self, h: i64, batch_idx: usize, dst: &mut [f32]) -> usize {
+        let n = unsafe { (self.copy_logits_batch)(h, batch_idx as i64, dst.as_mut_ptr() as i64) };
+        n.max(0) as usize
+    }
+
+    fn verify_tree(
+        &self,
+        h: i64,
+        ids: &[i64],
+        parents: &[i64],
+        start_pos: i64,
+        out_toks: &mut [i64],
+    ) -> usize {
+        let n = unsafe {
+            (self.verify_tree)(
+                h,
+                ids.as_ptr() as i64,
+                parents.as_ptr() as i64,
+                ids.len() as i64,
+                start_pos,
+                out_toks.as_mut_ptr() as i64,
+            )
+        };
+        n.max(0) as usize
+    }
+
+    fn commit_tree_path(&self, h: i64, nodes: &[i64], start_pos: i64) -> i64 {
+        unsafe { (self.commit_tree_path)(h, nodes.as_ptr() as i64, nodes.len() as i64, start_pos) }
+    }
+
+    fn mtp_predict(&self, h: i64, tok_id: i64, pos: i64) -> i64 {
+        unsafe { (self.mtp_predict)(h, tok_id, pos) }
+    }
+
+    fn embed_text(&self, h: i64, ids: &[i64], out: &mut [f32]) -> usize {
+        let n = unsafe {
+            (self.embed_text)(
+                h,
+                ids.as_ptr() as i64,
+                ids.len() as i64,
+                out.as_mut_ptr() as i64,
+                out.len() as i64,
+            )
+        };
+        n.max(0) as usize
+    }
+
+    fn step_embd(&self, h: i64, vecs: &[f32], n_vecs: usize, start_pos: i64) -> i64 {
+        unsafe { (self.step_embd)(h, vecs.as_ptr() as i64, n_vecs as i64, start_pos) }
+    }
+
+    fn mmproj_load(&self, path: &str) -> Result<i64, String> {
+        let cp = CString::new(path).map_err(|_| "invalid mmproj path")?;
+        let h = unsafe { (self.mmproj_load)(cp.as_ptr() as i64) };
+        if h <= 0 {
+            return Err(format!("failed to load mmproj GGUF `{}`", path));
+        }
+        Ok(h)
+    }
+
+    fn mmproj_info(&self, mm_h: i64, field: i64) -> i64 {
+        unsafe { (self.mmproj_info)(mm_h, field) }
+    }
+
+    fn mmproj_encode_rgb(&self, mm_h: i64, rgb: &[u8], w: usize, h: usize, out: &mut [f32], max_vecs: usize) -> usize {
+        let n = unsafe {
+            (self.mmproj_encode_rgb)(
+                mm_h,
+                rgb.as_ptr() as i64,
+                w as i64,
+                h as i64,
+                out.as_mut_ptr() as i64,
+                max_vecs as i64,
+            )
+        };
+        n.max(0) as usize
+    }
+
+    fn mmproj_free(&self, mm_h: i64) {
+        unsafe {
+            (self.mmproj_free)(mm_h);
+        }
     }
 
     fn sample_next(
@@ -399,12 +594,1426 @@ impl LlmApi {
 }
 
 // ============================================================================
+// Tenon v6: Full Recursive JSON Schema + GBNF Pushdown Automaton Grammar Compiler
+// ============================================================================
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CharClass {
+    ranges: Vec<(u8, u8)>,
+    negated: bool,
+}
+
+impl CharClass {
+    fn matches(&self, b: u8) -> bool {
+        let hit = self.ranges.iter().any(|&(lo, hi)| b >= lo && b <= hi);
+        if self.negated { !hit } else { hit }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GbnfAtom {
+    Byte(u8),
+    Class(usize),
+    Rule(usize),
+}
+
+#[derive(Debug, Clone)]
+struct GbnfGrammar {
+    rules: Vec<Vec<Vec<GbnfAtom>>>,
+    classes: Vec<CharClass>,
+    root: usize,
+}
+
+impl GbnfGrammar {
+    fn new() -> Self {
+        Self {
+            rules: Vec::new(),
+            classes: Vec::new(),
+            root: 0,
+        }
+    }
+
+    fn add_rule(&mut self, alts: Vec<Vec<GbnfAtom>>) -> usize {
+        let id = self.rules.len();
+        self.rules.push(alts);
+        id
+    }
+
+    fn reserve_rule(&mut self) -> usize {
+        let id = self.rules.len();
+        self.rules.push(Vec::new());
+        id
+    }
+
+    fn add_class(&mut self, ranges: Vec<(u8, u8)>, negated: bool) -> usize {
+        let cc = CharClass { ranges, negated };
+        if let Some(pos) = self.classes.iter().position(|c| c == &cc) {
+            return pos;
+        }
+        let id = self.classes.len();
+        self.classes.push(cc);
+        id
+    }
+
+    fn lit_atoms(s: &str) -> Vec<GbnfAtom> {
+        s.bytes().map(GbnfAtom::Byte).collect()
+    }
+
+    fn make_opt(&mut self, seq: Vec<GbnfAtom>) -> usize {
+        self.add_rule(vec![vec![], seq])
+    }
+
+    fn make_star(&mut self, seq: Vec<GbnfAtom>) -> usize {
+        let id = self.reserve_rule();
+        let mut rec = seq;
+        rec.push(GbnfAtom::Rule(id));
+        self.rules[id] = vec![vec![], rec];
+        id
+    }
+
+    fn make_plus(&mut self, seq: Vec<GbnfAtom>) -> usize {
+        let star = self.make_star(seq.clone());
+        let mut alt = seq;
+        alt.push(GbnfAtom::Rule(star));
+        self.add_rule(vec![alt])
+    }
+
+    /// Parse standard llama.cpp GBNF grammar (`root ::= ...`) into a runnable PDA grammar!
+    fn parse_gbnf(src: &str) -> Result<Self, String> {
+        let mut g = GbnfGrammar::new();
+        let mut name_to_id: HashMap<String, usize> = HashMap::new();
+
+        // Pre-scan rule names (`name ::=`) so forward & mutually recursive references resolve cleanly.
+        let mut raw_rules: Vec<(String, String)> = Vec::new();
+        let mut cur_name: Option<String> = None;
+        let mut cur_rhs = String::new();
+        for raw_line in src.lines() {
+            // Strip comments outside quotes/brackets
+            let mut line = String::new();
+            let mut in_q = false;
+            let mut in_br = false;
+            let mut esc = false;
+            for ch in raw_line.chars() {
+                if esc {
+                    line.push(ch);
+                    esc = false;
+                    continue;
+                }
+                if ch == '\\' && (in_q || in_br) {
+                    line.push(ch);
+                    esc = true;
+                    continue;
+                }
+                if ch == '"' && !in_br {
+                    in_q = !in_q;
+                } else if ch == '[' && !in_q {
+                    in_br = true;
+                } else if ch == ']' && !in_q {
+                    in_br = false;
+                } else if ch == '#' && !in_q && !in_br {
+                    break;
+                }
+                line.push(ch);
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(pos) = trimmed.find("::=") {
+                if let Some(n) = cur_name.take() {
+                    raw_rules.push((n, cur_rhs.clone()));
+                    cur_rhs.clear();
+                }
+                let nm = trimmed[..pos].trim().to_string();
+                let rhs = trimmed[pos + 3..].trim().to_string();
+                cur_name = Some(nm);
+                cur_rhs = rhs;
+            } else if cur_name.is_some() {
+                cur_rhs.push(' ');
+                cur_rhs.push_str(trimmed);
+            }
+        }
+        if let Some(n) = cur_name.take() {
+            raw_rules.push((n, cur_rhs));
+        }
+        if raw_rules.is_empty() {
+            return Err("empty GBNF grammar".into());
+        }
+        for (nm, _) in &raw_rules {
+            if !name_to_id.contains_key(nm) {
+                let id = g.reserve_rule();
+                name_to_id.insert(nm.clone(), id);
+            }
+        }
+        g.root = *name_to_id.get("root").unwrap_or(&0);
+
+        for (nm, rhs) in raw_rules {
+            let rid = name_to_id[&nm];
+            let mut p = GbnfParser {
+                b: rhs.as_bytes(),
+                pos: 0,
+                g: &mut g,
+                names: &mut name_to_id,
+            };
+            let alts = p.parse_alts()?;
+            g.rules[rid] = alts;
+        }
+        Ok(g)
+    }
+
+    /// Full Recursive JSON Schema -> GBNF Grammar Compiler!
+    /// Supports nested `object`/`properties`/`required`/`additionalProperties`, `array`/`items`/`minItems`/`maxItems`,
+    /// `string`/`enum`/`const`/`pattern` (regex!), `integer`, `number`, `boolean`, `null`, `$ref`/`$defs`, `anyOf`/`oneOf`!
+    fn from_json_schema(schema: &Value) -> Result<Self, String> {
+        let mut b = JsonSchemaBuilder::new(schema);
+        let root_id = b.compile(schema)?;
+        let ws = b.ws;
+        b.g.root = b.g.add_rule(vec![vec![GbnfAtom::Rule(ws), GbnfAtom::Rule(root_id), GbnfAtom::Rule(ws)]]);
+        Ok(b.g)
+    }
+
+    /// Generic RFC 8259 JSON Object grammar (for `response_format: {type: "json_object"}` or `--json`).
+    fn json_object() -> Self {
+        Self::from_json_schema(&json!({"type": "object"})).expect("json_object schema")
+    }
+}
+
+struct GbnfParser<'a> {
+    b: &'a [u8],
+    pos: usize,
+    g: &'a mut GbnfGrammar,
+    names: &'a mut HashMap<String, usize>,
+}
+
+impl<'a> GbnfParser<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.b.len() && self.b[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn parse_escape(&mut self) -> Result<u8, String> {
+        if self.pos >= self.b.len() {
+            return Err("unterminated escape".into());
+        }
+        let c = self.b[self.pos];
+        self.pos += 1;
+        match c {
+            b'n' => Ok(b'\n'),
+            b'r' => Ok(b'\r'),
+            b't' => Ok(b'\t'),
+            b'"' => Ok(b'"'),
+            b'\\' => Ok(b'\\'),
+            b'x' if self.pos + 2 <= self.b.len() => {
+                let hex = std::str::from_utf8(&self.b[self.pos..self.pos + 2]).unwrap_or("00");
+                self.pos += 2;
+                u8::from_str_radix(hex, 16).map_err(|_| "invalid hex escape".into())
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn parse_alts(&mut self) -> Result<Vec<Vec<GbnfAtom>>, String> {
+        let mut alts = Vec::new();
+        loop {
+            alts.push(self.parse_seq()?);
+            self.skip_ws();
+            if self.pos < self.b.len() && self.b[self.pos] == b'|' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(alts)
+    }
+
+    fn parse_seq(&mut self) -> Result<Vec<GbnfAtom>, String> {
+        let mut seq = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.pos >= self.b.len() || self.b[self.pos] == b'|' || self.b[self.pos] == b')' {
+                break;
+            }
+            let atom_seq = self.parse_primary()?;
+            self.skip_ws();
+            if self.pos < self.b.len() {
+                match self.b[self.pos] {
+                    b'?' => {
+                        self.pos += 1;
+                        let r = self.g.make_opt(atom_seq);
+                        seq.push(GbnfAtom::Rule(r));
+                        continue;
+                    }
+                    b'*' => {
+                        self.pos += 1;
+                        let r = self.g.make_star(atom_seq);
+                        seq.push(GbnfAtom::Rule(r));
+                        continue;
+                    }
+                    b'+' => {
+                        self.pos += 1;
+                        let r = self.g.make_plus(atom_seq);
+                        seq.push(GbnfAtom::Rule(r));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            seq.extend(atom_seq);
+        }
+        Ok(seq)
+    }
+
+    fn parse_primary(&mut self) -> Result<Vec<GbnfAtom>, String> {
+        self.skip_ws();
+        if self.pos >= self.b.len() {
+            return Err("unexpected end of GBNF expression".into());
+        }
+        match self.b[self.pos] {
+            b'"' => {
+                self.pos += 1;
+                let mut out = Vec::new();
+                while self.pos < self.b.len() && self.b[self.pos] != b'"' {
+                    if self.b[self.pos] == b'\\' {
+                        self.pos += 1;
+                        out.push(GbnfAtom::Byte(self.parse_escape()?));
+                    } else {
+                        out.push(GbnfAtom::Byte(self.b[self.pos]));
+                        self.pos += 1;
+                    }
+                }
+                if self.pos >= self.b.len() {
+                    return Err("unterminated GBNF string literal".into());
+                }
+                self.pos += 1;
+                Ok(out)
+            }
+            b'[' => {
+                self.pos += 1;
+                let mut neg = false;
+                if self.pos < self.b.len() && self.b[self.pos] == b'^' {
+                    neg = true;
+                    self.pos += 1;
+                }
+                let mut ranges = Vec::new();
+                while self.pos < self.b.len() && self.b[self.pos] != b']' {
+                    let lo = if self.b[self.pos] == b'\\' {
+                        self.pos += 1;
+                        self.parse_escape()?
+                    } else {
+                        let c = self.b[self.pos];
+                        self.pos += 1;
+                        c
+                    };
+                    if self.pos + 1 < self.b.len() && self.b[self.pos] == b'-' && self.b[self.pos + 1] != b']' {
+                        self.pos += 1;
+                        let hi = if self.b[self.pos] == b'\\' {
+                            self.pos += 1;
+                            self.parse_escape()?
+                        } else {
+                            let c = self.b[self.pos];
+                            self.pos += 1;
+                            c
+                        };
+                        ranges.push((lo.min(hi), lo.max(hi)));
+                    } else {
+                        ranges.push((lo, lo));
+                    }
+                }
+                if self.pos >= self.b.len() {
+                    return Err("unterminated GBNF character class".into());
+                }
+                self.pos += 1;
+                let cid = self.g.add_class(ranges, neg);
+                Ok(vec![GbnfAtom::Class(cid)])
+            }
+            b'(' => {
+                self.pos += 1;
+                let alts = self.parse_alts()?;
+                self.skip_ws();
+                if self.pos >= self.b.len() || self.b[self.pos] != b')' {
+                    return Err("missing closing `)` in GBNF".into());
+                }
+                self.pos += 1;
+                let r = self.g.add_rule(alts);
+                Ok(vec![GbnfAtom::Rule(r)])
+            }
+            _ => {
+                let start = self.pos;
+                while self.pos < self.b.len()
+                    && (self.b[self.pos].is_ascii_alphanumeric()
+                        || self.b[self.pos] == b'-'
+                        || self.b[self.pos] == b'_')
+                {
+                    self.pos += 1;
+                }
+                if self.pos == start {
+                    return Err(format!("unexpected byte `{}` in GBNF", self.b[self.pos] as char));
+                }
+                let name = String::from_utf8_lossy(&self.b[start..self.pos]).into_owned();
+                let rid = if let Some(&id) = self.names.get(&name) {
+                    id
+                } else {
+                    let id = self.g.reserve_rule();
+                    self.names.insert(name, id);
+                    id
+                };
+                Ok(vec![GbnfAtom::Rule(rid)])
+            }
+        }
+    }
+}
+
+struct JsonSchemaBuilder<'a> {
+    root_doc: &'a Value,
+    g: GbnfGrammar,
+    ws: usize,
+    j_str: usize,
+    j_int: usize,
+    j_num: usize,
+    j_bool: usize,
+    j_null: usize,
+    j_val: usize,
+    j_obj: usize,
+    ref_cache: HashMap<String, usize>,
+}
+
+impl<'a> JsonSchemaBuilder<'a> {
+    fn new(root_doc: &'a Value) -> Self {
+        let mut g = GbnfGrammar::new();
+        let ws_cls = g.add_class(vec![(b' ', b' '), (b'\t', b'\t'), (b'\n', b'\n'), (b'\r', b'\r')], false);
+        let ws = g.make_star(vec![GbnfAtom::Class(ws_cls)]);
+
+        // JSON string: `"` (plain_char | `\` escape_char)* `"`
+        let plain_cls = g.add_class(vec![(0x00, 0x1F), (b'"', b'"'), (b'\\', b'\\')], true);
+        let esc_cls = g.add_class(
+            vec![
+                (b'"', b'"'), (b'\\', b'\\'), (b'/', b'/'), (b'b', b'b'),
+                (b'f', b'f'), (b'n', b'n'), (b'r', b'r'), (b't', b't'),
+            ],
+            false,
+        );
+        let hex_cls = g.add_class(vec![(b'0', b'9'), (b'a', b'f'), (b'A', b'F')], false);
+        let str_char = g.add_rule(vec![
+            vec![GbnfAtom::Class(plain_cls)],
+            vec![GbnfAtom::Byte(b'\\'), GbnfAtom::Class(esc_cls)],
+            vec![
+                GbnfAtom::Byte(b'\\'), GbnfAtom::Byte(b'u'),
+                GbnfAtom::Class(hex_cls), GbnfAtom::Class(hex_cls),
+                GbnfAtom::Class(hex_cls), GbnfAtom::Class(hex_cls),
+            ],
+        ]);
+        let str_chars = g.make_star(vec![GbnfAtom::Rule(str_char)]);
+        let j_str = g.add_rule(vec![vec![GbnfAtom::Byte(b'"'), GbnfAtom::Rule(str_chars), GbnfAtom::Byte(b'"')]]);
+
+        // JSON integer: `-?` (`0` | `[1-9][0-9]*`)
+        let dig_cls = g.add_class(vec![(b'0', b'9')], false);
+        let nz_cls = g.add_class(vec![(b'1', b'9')], false);
+        let digs_star = g.make_star(vec![GbnfAtom::Class(dig_cls)]);
+        let digs_plus = g.make_plus(vec![GbnfAtom::Class(dig_cls)]);
+        let opt_minus = g.make_opt(vec![GbnfAtom::Byte(b'-')]);
+        let int_body = g.add_rule(vec![
+            vec![GbnfAtom::Byte(b'0')],
+            vec![GbnfAtom::Class(nz_cls), GbnfAtom::Rule(digs_star)],
+        ]);
+        let j_int = g.add_rule(vec![vec![GbnfAtom::Rule(opt_minus), GbnfAtom::Rule(int_body)]]);
+
+        // JSON number: int (`.` `[0-9]+`)? (`[eE]` `[+-]?` `[0-9]+`)?
+        let frac = g.make_opt(vec![GbnfAtom::Byte(b'.'), GbnfAtom::Rule(digs_plus)]);
+        let exp_ch = g.add_class(vec![(b'e', b'e'), (b'E', b'E')], false);
+        let sign_ch = g.add_class(vec![(b'+', b'+'), (b'-', b'-')], false);
+        let opt_sign = g.make_opt(vec![GbnfAtom::Class(sign_ch)]);
+        let exp_part = g.make_opt(vec![GbnfAtom::Class(exp_ch), GbnfAtom::Rule(opt_sign), GbnfAtom::Rule(digs_plus)]);
+        let j_num = g.add_rule(vec![vec![GbnfAtom::Rule(j_int), GbnfAtom::Rule(frac), GbnfAtom::Rule(exp_part)]]);
+
+        let j_bool = g.add_rule(vec![GbnfGrammar::lit_atoms("true"), GbnfGrammar::lit_atoms("false")]);
+        let j_null = g.add_rule(vec![GbnfGrammar::lit_atoms("null")]);
+
+        let j_val = g.reserve_rule();
+        let j_obj = g.reserve_rule();
+        let j_arr = g.reserve_rule();
+
+        let kv_pair = g.add_rule(vec![vec![
+            GbnfAtom::Rule(j_str), GbnfAtom::Rule(ws), GbnfAtom::Byte(b':'), GbnfAtom::Rule(ws), GbnfAtom::Rule(j_val),
+        ]]);
+        let more_kvs = g.make_star(vec![GbnfAtom::Rule(ws), GbnfAtom::Byte(b','), GbnfAtom::Rule(ws), GbnfAtom::Rule(kv_pair)]);
+        let obj_body = g.make_opt(vec![GbnfAtom::Rule(kv_pair), GbnfAtom::Rule(more_kvs)]);
+        g.rules[j_obj] = vec![vec![
+            GbnfAtom::Byte(b'{'), GbnfAtom::Rule(ws), GbnfAtom::Rule(obj_body), GbnfAtom::Rule(ws), GbnfAtom::Byte(b'}'),
+        ]];
+
+        let more_vals = g.make_star(vec![GbnfAtom::Rule(ws), GbnfAtom::Byte(b','), GbnfAtom::Rule(ws), GbnfAtom::Rule(j_val)]);
+        let arr_body = g.make_opt(vec![GbnfAtom::Rule(j_val), GbnfAtom::Rule(more_vals)]);
+        g.rules[j_arr] = vec![vec![
+            GbnfAtom::Byte(b'['), GbnfAtom::Rule(ws), GbnfAtom::Rule(arr_body), GbnfAtom::Rule(ws), GbnfAtom::Byte(b']'),
+        ]];
+
+        g.rules[j_val] = vec![
+            vec![GbnfAtom::Rule(j_obj)],
+            vec![GbnfAtom::Rule(j_arr)],
+            vec![GbnfAtom::Rule(j_str)],
+            vec![GbnfAtom::Rule(j_num)],
+            vec![GbnfAtom::Rule(j_bool)],
+            vec![GbnfAtom::Rule(j_null)],
+        ];
+
+        Self {
+            root_doc,
+            g,
+            ws,
+            j_str,
+            j_int,
+            j_num,
+            j_bool,
+            j_null,
+            j_val,
+            j_obj,
+            ref_cache: HashMap::new(),
+        }
+    }
+
+    fn resolve_ref(&self, ref_str: &str) -> Option<&'a Value> {
+        let ptr = ref_str.strip_prefix("#/")?;
+        let mut cur = self.root_doc;
+        for part in ptr.split('/') {
+            cur = cur.get(part)?;
+        }
+        Some(cur)
+    }
+
+    fn compile_regex_inner(&mut self, pat: &str) -> Result<usize, String> {
+        let mut s = pat;
+        if let Some(rest) = s.strip_prefix('^') {
+            s = rest;
+        }
+        if let Some(rest) = s.strip_suffix('$') {
+            s = rest;
+        }
+        let mut rp = RegexCompiler { b: s.as_bytes(), pos: 0, g: &mut self.g };
+        let alts = rp.parse_alts()?;
+        Ok(self.g.add_rule(alts))
+    }
+
+    fn compile(&mut self, s: &Value) -> Result<usize, String> {
+        // 1. `$ref` resolution with recursion memoization
+        if let Some(r) = s.get("$ref").and_then(Value::as_str) {
+            if let Some(&id) = self.ref_cache.get(r) {
+                return Ok(id);
+            }
+            let target = self
+                .resolve_ref(r)
+                .ok_or_else(|| format!("unresolved JSON Schema $ref `{}`", r))?;
+            let id = self.g.reserve_rule();
+            self.ref_cache.insert(r.to_string(), id);
+            let inner = self.compile(target)?;
+            self.g.rules[id] = vec![vec![GbnfAtom::Rule(inner)]];
+            return Ok(id);
+        }
+
+        // 2. `const`
+        if let Some(cv) = s.get("const") {
+            let lit = serde_json::to_string(cv).unwrap_or_else(|_| "null".into());
+            return Ok(self.g.add_rule(vec![GbnfGrammar::lit_atoms(&lit)]));
+        }
+
+        // 3. `enum`
+        if let Some(arr) = s.get("enum").and_then(Value::as_array) {
+            if !arr.is_empty() {
+                let alts: Vec<Vec<GbnfAtom>> = arr
+                    .iter()
+                    .map(|v| {
+                        let lit = serde_json::to_string(v).unwrap_or_else(|_| "null".into());
+                        GbnfGrammar::lit_atoms(&lit)
+                    })
+                    .collect();
+                return Ok(self.g.add_rule(alts));
+            }
+        }
+
+        // 4. `anyOf` / `oneOf`
+        if let Some(arr) = s.get("anyOf").or_else(|| s.get("oneOf")).and_then(Value::as_array) {
+            if !arr.is_empty() {
+                let mut alts = Vec::with_capacity(arr.len());
+                for sub in arr {
+                    let sub_r = self.compile(sub)?;
+                    alts.push(vec![GbnfAtom::Rule(sub_r)]);
+                }
+                return Ok(self.g.add_rule(alts));
+            }
+        }
+
+        // 5. Type dispatch (supports string type OR array of types like `["string", "null"]`)
+        if let Some(tarr) = s.get("type").and_then(Value::as_array) {
+            let mut alts = Vec::new();
+            for tv in tarr {
+                if let Some(ts) = tv.as_str() {
+                    let mut clone = s.clone();
+                    clone["type"] = Value::String(ts.to_string());
+                    let r = self.compile(&clone)?;
+                    alts.push(vec![GbnfAtom::Rule(r)]);
+                }
+            }
+            if !alts.is_empty() {
+                return Ok(self.g.add_rule(alts));
+            }
+        }
+
+        let ty = s.get("type").and_then(Value::as_str).unwrap_or_else(|| {
+            if s.get("properties").is_some() {
+                "object"
+            } else if s.get("items").is_some() {
+                "array"
+            } else {
+                "any"
+            }
+        });
+
+        match ty {
+            "null" => Ok(self.j_null),
+            "boolean" => Ok(self.j_bool),
+            "integer" => Ok(self.j_int),
+            "number" => Ok(self.j_num),
+            "string" => {
+                if let Some(pat) = s.get("pattern").and_then(Value::as_str) {
+                    let body = self.compile_regex_inner(pat)?;
+                    Ok(self.g.add_rule(vec![vec![
+                        GbnfAtom::Byte(b'"'), GbnfAtom::Rule(body), GbnfAtom::Byte(b'"'),
+                    ]]))
+                } else {
+                    Ok(self.j_str)
+                }
+            }
+            "array" => {
+                let item_r = if let Some(it) = s.get("items") {
+                    self.compile(it)?
+                } else {
+                    self.j_val
+                };
+                let min_items = s.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let max_items = s.get("maxItems").and_then(Value::as_u64).map(|x| x as usize);
+                let ws = self.ws;
+                let mut seq = vec![GbnfAtom::Byte(b'['), GbnfAtom::Rule(ws)];
+                if min_items == 0 && max_items.is_none() {
+                    let more = self.g.make_star(vec![
+                        GbnfAtom::Rule(ws), GbnfAtom::Byte(b','), GbnfAtom::Rule(ws), GbnfAtom::Rule(item_r),
+                    ]);
+                    let body = self.g.make_opt(vec![GbnfAtom::Rule(item_r), GbnfAtom::Rule(more)]);
+                    seq.push(GbnfAtom::Rule(body));
+                } else {
+                    for idx in 0..min_items {
+                        if idx > 0 {
+                            seq.extend([GbnfAtom::Rule(ws), GbnfAtom::Byte(b','), GbnfAtom::Rule(ws)]);
+                        }
+                        seq.push(GbnfAtom::Rule(item_r));
+                    }
+                    if let Some(mx) = max_items {
+                        let extra = mx.saturating_sub(min_items);
+                        if min_items == 0 && extra > 0 {
+                            let mut opt_chain = self.g.add_rule(vec![vec![]]);
+                            for _ in 1..extra {
+                                let prev = opt_chain;
+                                opt_chain = self.g.make_opt(vec![
+                                    GbnfAtom::Rule(ws), GbnfAtom::Byte(b','), GbnfAtom::Rule(ws),
+                                    GbnfAtom::Rule(item_r), GbnfAtom::Rule(prev),
+                                ]);
+                            }
+                            let top = self.g.make_opt(vec![GbnfAtom::Rule(item_r), GbnfAtom::Rule(opt_chain)]);
+                            seq.push(GbnfAtom::Rule(top));
+                        } else {
+                            let mut opt_chain = self.g.add_rule(vec![vec![]]);
+                            for _ in 0..extra {
+                                let prev = opt_chain;
+                                opt_chain = self.g.make_opt(vec![
+                                    GbnfAtom::Rule(ws), GbnfAtom::Byte(b','), GbnfAtom::Rule(ws),
+                                    GbnfAtom::Rule(item_r), GbnfAtom::Rule(prev),
+                                ]);
+                            }
+                            seq.push(GbnfAtom::Rule(opt_chain));
+                        }
+                    } else {
+                        let more = self.g.make_star(vec![
+                            GbnfAtom::Rule(ws), GbnfAtom::Byte(b','), GbnfAtom::Rule(ws), GbnfAtom::Rule(item_r),
+                        ]);
+                        seq.push(GbnfAtom::Rule(more));
+                    }
+                }
+                seq.extend([GbnfAtom::Rule(ws), GbnfAtom::Byte(b']')]);
+                Ok(self.g.add_rule(vec![seq]))
+            }
+            "object" => {
+                let Some(props) = s.get("properties").and_then(Value::as_object) else {
+                    return Ok(self.j_obj);
+                };
+                if props.is_empty() {
+                    return Ok(self.j_obj);
+                }
+                let req_list: Vec<&str> = s
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let req_set: HashSet<&str> = req_list.iter().copied().collect();
+
+                // Required properties in declared `required` order first, then optional properties!
+                let mut ordered: Vec<(&str, &Value, bool)> = Vec::new();
+                for rk in &req_list {
+                    if let Some(v) = props.get(*rk) {
+                        ordered.push((*rk, v, true));
+                    }
+                }
+                for (k, v) in props {
+                    if !req_set.contains(k.as_str()) {
+                        ordered.push((k.as_str(), v, false));
+                    }
+                }
+                let mut prop_rules: Vec<(usize, bool)> = Vec::with_capacity(ordered.len());
+                let ws = self.ws;
+                for (k, v, is_req) in ordered {
+                    let vr = self.compile(v)?;
+                    let klit = serde_json::to_string(k).unwrap_or_else(|_| format!("\"{}\"", k));
+                    let mut pseq = GbnfGrammar::lit_atoms(&klit);
+                    pseq.extend([GbnfAtom::Rule(ws), GbnfAtom::Byte(b':'), GbnfAtom::Rule(ws), GbnfAtom::Rule(vr)]);
+                    let pr = self.g.add_rule(vec![pseq]);
+                    prop_rules.push((pr, is_req));
+                }
+
+                // Build exact comma-handling chain over required & optional properties!
+                // State `(idx, emitted_any)` -> rule ID!
+                let n = prop_rules.len();
+                let mut tail_no = self.g.add_rule(vec![vec![]]);
+                let mut tail_yes = self.g.add_rule(vec![vec![]]);
+                if s.get("additionalProperties").and_then(Value::as_bool) == Some(true) {
+                    let kv = self.g.add_rule(vec![vec![
+                        GbnfAtom::Rule(self.j_str), GbnfAtom::Rule(ws), GbnfAtom::Byte(b':'), GbnfAtom::Rule(ws), GbnfAtom::Rule(self.j_val),
+                    ]]);
+                    let more = self.g.make_star(vec![GbnfAtom::Rule(ws), GbnfAtom::Byte(b','), GbnfAtom::Rule(ws), GbnfAtom::Rule(kv)]);
+                    tail_no = self.g.make_opt(vec![GbnfAtom::Rule(kv), GbnfAtom::Rule(more)]);
+                    tail_yes = more;
+                }
+                for idx in (0..n).rev() {
+                    let (pr, is_req) = prop_rules[idx];
+                    let with_no = vec![GbnfAtom::Rule(pr), GbnfAtom::Rule(tail_yes)];
+                    let with_yes = vec![GbnfAtom::Rule(ws), GbnfAtom::Byte(b','), GbnfAtom::Rule(ws), GbnfAtom::Rule(pr), GbnfAtom::Rule(tail_yes)];
+                    if is_req {
+                        tail_no = self.g.add_rule(vec![with_no]);
+                        tail_yes = self.g.add_rule(vec![with_yes]);
+                    } else {
+                        tail_no = self.g.add_rule(vec![with_no, vec![GbnfAtom::Rule(tail_no)]]);
+                        tail_yes = self.g.add_rule(vec![with_yes, vec![GbnfAtom::Rule(tail_yes)]]);
+                    }
+                }
+                Ok(self.g.add_rule(vec![vec![
+                    GbnfAtom::Byte(b'{'), GbnfAtom::Rule(ws), GbnfAtom::Rule(tail_no), GbnfAtom::Rule(ws), GbnfAtom::Byte(b'}'),
+                ]]))
+            }
+            _ => Ok(self.j_val),
+        }
+    }
+}
+
+struct RegexCompiler<'a> {
+    b: &'a [u8],
+    pos: usize,
+    g: &'a mut GbnfGrammar,
+}
+
+impl<'a> RegexCompiler<'a> {
+    fn parse_alts(&mut self) -> Result<Vec<Vec<GbnfAtom>>, String> {
+        let mut alts = Vec::new();
+        loop {
+            alts.push(self.parse_seq()?);
+            if self.pos < self.b.len() && self.b[self.pos] == b'|' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(alts)
+    }
+
+    fn parse_seq(&mut self) -> Result<Vec<GbnfAtom>, String> {
+        let mut seq = Vec::new();
+        while self.pos < self.b.len() && self.b[self.pos] != b'|' && self.b[self.pos] != b')' {
+            let atom = self.parse_atom()?;
+            if self.pos < self.b.len() {
+                match self.b[self.pos] {
+                    b'?' => {
+                        self.pos += 1;
+                        let r = self.g.make_opt(atom);
+                        seq.push(GbnfAtom::Rule(r));
+                        continue;
+                    }
+                    b'*' => {
+                        self.pos += 1;
+                        let r = self.g.make_star(atom);
+                        seq.push(GbnfAtom::Rule(r));
+                        continue;
+                    }
+                    b'+' => {
+                        self.pos += 1;
+                        let r = self.g.make_plus(atom);
+                        seq.push(GbnfAtom::Rule(r));
+                        continue;
+                    }
+                    b'{' => {
+                        if let Some((mn, mx)) = self.try_parse_brace() {
+                            for _ in 0..mn {
+                                seq.extend(atom.iter().copied());
+                            }
+                            if let Some(m) = mx {
+                                for _ in mn..m {
+                                    let r = self.g.make_opt(atom.clone());
+                                    seq.push(GbnfAtom::Rule(r));
+                                }
+                            } else {
+                                let r = self.g.make_star(atom);
+                                seq.push(GbnfAtom::Rule(r));
+                            }
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            seq.extend(atom);
+        }
+        Ok(seq)
+    }
+
+    fn try_parse_brace(&mut self) -> Option<(usize, Option<usize>)> {
+        let save = self.pos;
+        self.pos += 1;
+        let s1 = self.pos;
+        while self.pos < self.b.len() && self.b[self.pos].is_ascii_digit() {
+            self.pos += 1;
+        }
+        let mn: usize = std::str::from_utf8(&self.b[s1..self.pos]).ok()?.parse().ok()?;
+        if self.pos < self.b.len() && self.b[self.pos] == b'}' {
+            self.pos += 1;
+            return Some((mn, Some(mn)));
+        }
+        if self.pos < self.b.len() && self.b[self.pos] == b',' {
+            self.pos += 1;
+            let s2 = self.pos;
+            while self.pos < self.b.len() && self.b[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+            if self.pos < self.b.len() && self.b[self.pos] == b'}' {
+                let mx = if self.pos > s2 {
+                    std::str::from_utf8(&self.b[s2..self.pos]).ok()?.parse().ok()
+                } else {
+                    None
+                };
+                self.pos += 1;
+                return Some((mn, mx));
+            }
+        }
+        self.pos = save;
+        None
+    }
+
+    fn parse_atom(&mut self) -> Result<Vec<GbnfAtom>, String> {
+        match self.b[self.pos] {
+            b'(' => {
+                self.pos += 1;
+                let alts = self.parse_alts()?;
+                if self.pos < self.b.len() && self.b[self.pos] == b')' {
+                    self.pos += 1;
+                }
+                let r = self.g.add_rule(alts);
+                Ok(vec![GbnfAtom::Rule(r)])
+            }
+            b'[' => {
+                self.pos += 1;
+                let mut neg = false;
+                if self.pos < self.b.len() && self.b[self.pos] == b'^' {
+                    neg = true;
+                    self.pos += 1;
+                }
+                let mut ranges = Vec::new();
+                while self.pos < self.b.len() && self.b[self.pos] != b']' {
+                    let lo = self.b[self.pos];
+                    self.pos += 1;
+                    if self.pos + 1 < self.b.len() && self.b[self.pos] == b'-' && self.b[self.pos + 1] != b']' {
+                        self.pos += 1;
+                        let hi = self.b[self.pos];
+                        self.pos += 1;
+                        ranges.push((lo.min(hi), lo.max(hi)));
+                    } else {
+                        ranges.push((lo, lo));
+                    }
+                }
+                if self.pos < self.b.len() {
+                    self.pos += 1;
+                }
+                let cid = self.g.add_class(ranges, neg);
+                Ok(vec![GbnfAtom::Class(cid)])
+            }
+            b'.' => {
+                self.pos += 1;
+                let cid = self.g.add_class(vec![(0x00, 0x1F), (b'"', b'"'), (b'\\', b'\\')], true);
+                Ok(vec![GbnfAtom::Class(cid)])
+            }
+            b'\\' if self.pos + 1 < self.b.len() => {
+                self.pos += 1;
+                let c = self.b[self.pos];
+                self.pos += 1;
+                let cid = match c {
+                    b'd' => self.g.add_class(vec![(b'0', b'9')], false),
+                    b'w' => self.g.add_class(vec![(b'0', b'9'), (b'a', b'z'), (b'A', b'Z'), (b'_', b'_')], false),
+                    b's' => self.g.add_class(vec![(b' ', b' '), (b'\t', b'\t')], false),
+                    _ => return Ok(vec![GbnfAtom::Byte(c)]),
+                };
+                Ok(vec![GbnfAtom::Class(cid)])
+            }
+            c => {
+                self.pos += 1;
+                Ok(vec![GbnfAtom::Byte(c)])
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GrammarState {
+    grammar: Arc<GbnfGrammar>,
+    /// Active PDA stacks (top of stack is `.last()`). Empty stack => accepting!
+    stacks: Vec<Vec<GbnfAtom>>,
+}
+
+impl GrammarState {
+    fn new(grammar: Arc<GbnfGrammar>) -> Self {
+        let mut st = Self {
+            stacks: vec![vec![GbnfAtom::Rule(grammar.root)]],
+            grammar,
+        };
+        st.epsilon_close();
+        st
+    }
+
+    fn epsilon_close(&mut self) {
+        let mut out: Vec<Vec<GbnfAtom>> = Vec::new();
+        let mut seen: HashSet<Vec<GbnfAtom>> = HashSet::new();
+        let mut work: Vec<(Vec<GbnfAtom>, Vec<usize>)> = self
+            .stacks
+            .drain(..)
+            .map(|st| (st, Vec::new()))
+            .collect();
+
+        while let Some((mut st, expanded)) = work.pop() {
+            if out.len() >= 96 {
+                break;
+            }
+            match st.last().copied() {
+                Some(GbnfAtom::Rule(rid)) => {
+                    if expanded.contains(&rid) || st.len() > 96 {
+                        continue;
+                    }
+                    st.pop();
+                    let mut next_exp = expanded;
+                    next_exp.push(rid);
+                    if let Some(alts) = self.grammar.rules.get(rid) {
+                        for alt in alts {
+                            let mut nst = st.clone();
+                            for &atom in alt.iter().rev() {
+                                nst.push(atom);
+                            }
+                            work.push((nst, next_exp.clone()));
+                        }
+                    }
+                }
+                _ => {
+                    if seen.insert(st.clone()) {
+                        out.push(st);
+                    }
+                }
+            }
+        }
+        self.stacks = out;
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.stacks.iter().any(|s| s.is_empty())
+    }
+
+    fn is_strictly_done(&self) -> bool {
+        !self.stacks.is_empty() && self.stacks.iter().all(|s| s.is_empty())
+    }
+
+    fn step_byte(&mut self, b: u8) -> bool {
+        let mut next = Vec::new();
+        for st in &self.stacks {
+            match st.last().copied() {
+                Some(GbnfAtom::Byte(x)) if x == b => {
+                    let mut nst = st.clone();
+                    nst.pop();
+                    next.push(nst);
+                }
+                Some(GbnfAtom::Class(cid)) if self.grammar.classes[cid].matches(b) => {
+                    let mut nst = st.clone();
+                    nst.pop();
+                    next.push(nst);
+                }
+                _ => {}
+            }
+        }
+        if next.is_empty() {
+            self.stacks.clear();
+            return false;
+        }
+        self.stacks = next;
+        self.epsilon_close();
+        !self.stacks.is_empty()
+    }
+
+    fn try_advance(&self, piece: &str) -> Option<Self> {
+        if piece.is_empty() {
+            return None;
+        }
+        let mut next = self.clone();
+        for &b in piece.as_bytes() {
+            if !next.step_byte(b) {
+                return None;
+            }
+        }
+        Some(next)
+    }
+}
+
+fn compile_grammar_for_cfg(cfg: &SamplingCfg) -> Result<Option<GrammarState>, String> {
+    if let Some(ref gbnf) = cfg.gbnf_grammar {
+        let g = GbnfGrammar::parse_gbnf(gbnf)?;
+        return Ok(Some(GrammarState::new(Arc::new(g))));
+    }
+    if let Some(ref schema) = cfg.json_schema {
+        let g = GbnfGrammar::from_json_schema(schema)?;
+        return Ok(Some(GrammarState::new(Arc::new(g))));
+    }
+    if cfg.json_constrained {
+        let g = GbnfGrammar::json_object();
+        return Ok(Some(GrammarState::new(Arc::new(g))));
+    }
+    Ok(None)
+}
+
+// ============================================================================
+// Tenon v6: Zero-Dependency Base64 + PNG (RFC 1951 Inflate) + BMP + PPM Decoder
+// ============================================================================
+#[derive(Debug, Clone)]
+struct RgbImage {
+    width: usize,
+    height: usize,
+    rgb: Vec<u8>,
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => return Err(format!("invalid base64 byte {}", b)),
+        };
+        acc = (acc << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+// Minimal RFC 1951 Inflate for PNG zlib IDAT streams (stored, fixed Huffman, dynamic Huffman)
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    bit_buf: u32,
+    bit_cnt: u32,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0, bit_buf: 0, bit_cnt: 0 }
+    }
+    fn read_bits(&mut self, n: u32) -> Result<u32, String> {
+        while self.bit_cnt < n {
+            if self.pos >= self.data.len() {
+                return Err("unexpected EOF in deflate stream".into());
+            }
+            self.bit_buf |= (self.data[self.pos] as u32) << self.bit_cnt;
+            self.pos += 1;
+            self.bit_cnt += 8;
+        }
+        let v = self.bit_buf & ((1u32 << n) - 1);
+        self.bit_buf >>= n;
+        self.bit_cnt -= n;
+        Ok(v)
+    }
+    fn align_byte(&mut self) {
+        let rem = self.bit_cnt & 7;
+        self.bit_buf >>= rem;
+        self.bit_cnt -= rem;
+    }
+}
+
+struct HuffTable {
+    counts: [u16; 16],
+    syms: Vec<u16>,
+}
+
+impl HuffTable {
+    fn build(lengths: &[u8]) -> Result<Self, String> {
+        let mut counts = [0u16; 16];
+        for &l in lengths {
+            if l > 15 {
+                return Err("huffman length > 15".into());
+            }
+            if l > 0 {
+                counts[l as usize] += 1;
+            }
+        }
+        let mut offs = [0usize; 16];
+        let mut total = 0usize;
+        for bits in 1..16 {
+            offs[bits] = total;
+            total += counts[bits] as usize;
+        }
+        let mut syms = vec![0u16; total];
+        for (sym, &l) in lengths.iter().enumerate() {
+            if l > 0 {
+                syms[offs[l as usize]] = sym as u16;
+                offs[l as usize] += 1;
+            }
+        }
+        Ok(Self { counts, syms })
+    }
+
+    fn decode(&self, br: &mut BitReader<'_>) -> Result<u16, String> {
+        let mut code = 0i32;
+        let mut first = 0i32;
+        let mut index = 0usize;
+        for len in 1..16 {
+            code |= br.read_bits(1)? as i32;
+            let count = self.counts[len] as i32;
+            if code - count < first {
+                return Ok(self.syms[index + (code - first) as usize]);
+            }
+            index += count as usize;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        Err("invalid huffman code".into())
+    }
+}
+
+fn zlib_inflate(zdata: &[u8]) -> Result<Vec<u8>, String> {
+    if zdata.len() < 6 {
+        return Err("zlib stream too short".into());
+    }
+    let cmf = zdata[0];
+    let flg = zdata[1];
+    if (cmf & 0x0F) != 8 || (((cmf as u16) * 256 + (flg as u16)) % 31) != 0 {
+        return Err("invalid zlib header".into());
+    }
+    let start = if (flg & 0x20) != 0 { 6 } else { 2 };
+    let mut br = BitReader::new(&zdata[start..]);
+    let mut out = Vec::new();
+
+    const LEN_BASE: [u16; 29] = [
+        3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258,
+    ];
+    const LEN_EXT: [u8; 29] = [
+        0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0,
+    ];
+    const DIST_BASE: [u16; 30] = [
+        1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577,
+    ];
+    const DIST_EXT: [u8; 30] = [
+        0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,
+    ];
+    const CL_ORDER: [usize; 19] = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+
+    loop {
+        let bfinal = br.read_bits(1)?;
+        let btype = br.read_bits(2)?;
+        if btype == 0 {
+            br.align_byte();
+            let len = br.read_bits(16)? as usize;
+            let _nlen = br.read_bits(16)?;
+            for _ in 0..len {
+                out.push(br.read_bits(8)? as u8);
+            }
+        } else if btype == 1 || btype == 2 {
+            let (lit_tbl, dist_tbl) = if btype == 1 {
+                let mut ll = [0u8; 288];
+                for i in 0..144 { ll[i] = 8; }
+                for i in 144..256 { ll[i] = 9; }
+                for i in 256..280 { ll[i] = 7; }
+                for i in 280..288 { ll[i] = 8; }
+                let dl = [5u8; 32];
+                (HuffTable::build(&ll)?, HuffTable::build(&dl)?)
+            } else {
+                let hlit = br.read_bits(5)? as usize + 257;
+                let hdist = br.read_bits(5)? as usize + 1;
+                let hclen = br.read_bits(4)? as usize + 4;
+                let mut cl_lens = [0u8; 19];
+                for i in 0..hclen {
+                    cl_lens[CL_ORDER[i]] = br.read_bits(3)? as u8;
+                }
+                let cl_tbl = HuffTable::build(&cl_lens)?;
+                let mut lens = Vec::with_capacity(hlit + hdist);
+                while lens.len() < hlit + hdist {
+                    let sym = cl_tbl.decode(&mut br)?;
+                    if sym < 16 {
+                        lens.push(sym as u8);
+                    } else if sym == 16 {
+                        let rep = br.read_bits(2)? as usize + 3;
+                        let prev = *lens.last().ok_or("invalid rle 16")?;
+                        for _ in 0..rep { lens.push(prev); }
+                    } else if sym == 17 {
+                        let rep = br.read_bits(3)? as usize + 3;
+                        for _ in 0..rep { lens.push(0); }
+                    } else if sym == 18 {
+                        let rep = br.read_bits(7)? as usize + 11;
+                        for _ in 0..rep { lens.push(0); }
+                    }
+                }
+                (HuffTable::build(&lens[..hlit])?, HuffTable::build(&lens[hlit..hlit + hdist])?)
+            };
+            loop {
+                let sym = lit_tbl.decode(&mut br)?;
+                if sym < 256 {
+                    out.push(sym as u8);
+                } else if sym == 256 {
+                    break;
+                } else {
+                    let li = (sym - 257) as usize;
+                    if li >= LEN_BASE.len() {
+                        return Err("invalid deflate length symbol".into());
+                    }
+                    let length = LEN_BASE[li] as usize + br.read_bits(LEN_EXT[li] as u32)? as usize;
+                    let di = dist_tbl.decode(&mut br)? as usize;
+                    if di >= DIST_BASE.len() {
+                        return Err("invalid deflate dist symbol".into());
+                    }
+                    let dist = DIST_BASE[di] as usize + br.read_bits(DIST_EXT[di] as u32)? as usize;
+                    if dist == 0 || dist > out.len() {
+                        return Err("invalid deflate back-reference".into());
+                    }
+                    for _ in 0..length {
+                        let b = out[out.len() - dist];
+                        out.push(b);
+                    }
+                }
+            }
+        } else {
+            return Err("invalid deflate block type".into());
+        }
+        if bfinal != 0 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+    let (ia, ib, ic) = (a as i32, b as i32, c as i32);
+    let p = ia + ib - ic;
+    let pa = (p - ia).abs();
+    let pb = (p - ib).abs();
+    let pc = (p - ic).abs();
+    if pa <= pb && pa <= pc { a } else if pb <= pc { b } else { c }
+}
+
+fn decode_png(data: &[u8]) -> Result<RgbImage, String> {
+    if data.len() < 33 || &data[..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err("not a PNG image".into());
+    }
+    let mut pos = 8usize;
+    let mut width = 0usize;
+    let mut height = 0usize;
+    let mut color_type = 2u8;
+    let mut idat = Vec::new();
+    while pos + 12 <= data.len() {
+        let len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let ctype = &data[pos + 4..pos + 8];
+        let body_start = pos + 8;
+        let body_end = body_start + len;
+        if body_end + 4 > data.len() {
+            break;
+        }
+        let body = &data[body_start..body_end];
+        if ctype == b"IHDR" && len >= 13 {
+            width = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+            height = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+            let bit_depth = body[8];
+            color_type = body[9];
+            if bit_depth != 8 {
+                return Err(format!("unsupported PNG bit_depth {}", bit_depth));
+            }
+        } else if ctype == b"IDAT" {
+            idat.extend_from_slice(body);
+        } else if ctype == b"IEND" {
+            break;
+        }
+        pos = body_end + 4;
+    }
+    if width == 0 || height == 0 {
+        return Err("invalid PNG dimensions".into());
+    }
+    let bpp: usize = match color_type {
+        0 => 1,
+        2 => 3,
+        6 => 4,
+        _ => return Err(format!("unsupported PNG color_type {}", color_type)),
+    };
+    let raw = zlib_inflate(&idat)?;
+    let stride = width * bpp;
+    if raw.len() < height * (stride + 1) {
+        return Err("truncated PNG IDAT payload".into());
+    }
+    let mut recon = vec![0u8; height * stride];
+    for y in 0..height {
+        let flt = raw[y * (stride + 1)];
+        let src = &raw[y * (stride + 1) + 1..y * (stride + 1) + 1 + stride];
+        for x in 0..stride {
+            let left = if x >= bpp { recon[y * stride + x - bpp] } else { 0 };
+            let up = if y > 0 { recon[(y - 1) * stride + x] } else { 0 };
+            let ul = if y > 0 && x >= bpp { recon[(y - 1) * stride + x - bpp] } else { 0 };
+            let v = match flt {
+                0 => src[x],
+                1 => src[x].wrapping_add(left),
+                2 => src[x].wrapping_add(up),
+                3 => src[x].wrapping_add(((left as u16 + up as u16) >> 1) as u8),
+                4 => src[x].wrapping_add(paeth(left, up, ul)),
+                _ => src[x],
+            };
+            recon[y * stride + x] = v;
+        }
+    }
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            let p = y * stride + x * bpp;
+            match bpp {
+                1 => { let g = recon[p]; rgb.extend_from_slice(&[g, g, g]); }
+                3 | 4 => rgb.extend_from_slice(&[recon[p], recon[p + 1], recon[p + 2]]),
+                _ => {}
+            }
+        }
+    }
+    Ok(RgbImage { width, height, rgb })
+}
+
+fn decode_bmp(data: &[u8]) -> Result<RgbImage, String> {
+    if data.len() < 54 || &data[..2] != b"BM" {
+        return Err("not a BMP image".into());
+    }
+    let pix_off = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+    let w = i32::from_le_bytes([data[18], data[19], data[20], data[21]]).unsigned_abs() as usize;
+    let h_raw = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+    let top_down = h_raw < 0;
+    let h = h_raw.unsigned_abs() as usize;
+    let bpp = u16::from_le_bytes([data[28], data[29]]) as usize / 8;
+    if w == 0 || h == 0 || (bpp != 3 && bpp != 4) {
+        return Err("unsupported BMP format".into());
+    }
+    let row_stride = (w * bpp + 3) & !3;
+    let mut rgb = vec![0u8; w * h * 3];
+    for y in 0..h {
+        let src_y = if top_down { y } else { h - 1 - y };
+        let row = pix_off + src_y * row_stride;
+        if row + w * bpp > data.len() {
+            return Err("truncated BMP data".into());
+        }
+        for x in 0..w {
+            let b = data[row + x * bpp];
+            let g = data[row + x * bpp + 1];
+            let r = data[row + x * bpp + 2];
+            let dst = (y * w + x) * 3;
+            rgb[dst] = r;
+            rgb[dst + 1] = g;
+            rgb[dst + 2] = b;
+        }
+    }
+    Ok(RgbImage { width: w, height: h, rgb })
+}
+
+fn decode_ppm(data: &[u8]) -> Result<RgbImage, String> {
+    if data.len() < 11 || &data[..2] != b"P6" {
+        return Err("not a P6 PPM image".into());
+    }
+    let mut i = 2usize;
+    let mut nums = Vec::new();
+    while nums.len() < 3 && i < data.len() {
+        while i < data.len() && data[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < data.len() && data[i] == b'#' {
+            while i < data.len() && data[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        let s = i;
+        while i < data.len() && data[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i > s {
+            nums.push(std::str::from_utf8(&data[s..i]).unwrap_or("0").parse::<usize>().unwrap_or(0));
+        } else {
+            break;
+        }
+    }
+    if nums.len() < 3 || i >= data.len() {
+        return Err("invalid PPM header".into());
+    }
+    i += 1; // single whitespace byte after maxval
+    let (w, h) = (nums[0], nums[1]);
+    if i + w * h * 3 > data.len() {
+        return Err("truncated PPM pixel payload".into());
+    }
+    Ok(RgbImage { width: w, height: h, rgb: data[i..i + w * h * 3].to_vec() })
+}
+
+fn decode_image_bytes(data: &[u8]) -> Result<RgbImage, String> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        decode_png(data)
+    } else if data.starts_with(b"BM") {
+        decode_bmp(data)
+    } else if data.starts_with(b"P6") {
+        decode_ppm(data)
+    } else {
+        Err("unsupported image format (supported: PNG, BMP, P6 PPM)".into())
+    }
+}
+
+fn decode_image_url_to_rgb(url: &str) -> Result<RgbImage, String> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (_, payload) = rest.split_once(',').ok_or("malformed data: URL")?;
+        let bytes = base64_decode(payload)?;
+        decode_image_bytes(&bytes)
+    } else {
+        let path = url.strip_prefix("file://").unwrap_or(url);
+        let bytes = fs::read(path).map_err(|e| format!("failed to read image `{}`: {}", path, e))?;
+        decode_image_bytes(&bytes)
+    }
+}
+
+// ============================================================================
 // Radix Prefix Tree KV Cache (Multi-Slot Longest-Prefix Reuse -> 5-15x TTFT!)
 // ============================================================================
 #[derive(Debug, Clone)]
 struct KvSlotState {
     tokens: Vec<i64>,
     last_used: u64,
+    in_use: bool,
 }
 
 struct RadixKvCache {
@@ -422,6 +2031,7 @@ impl RadixKvCache {
                 .map(|_| KvSlotState {
                     tokens: Vec::new(),
                     last_used: 0,
+                    in_use: false,
                 })
                 .collect(),
             clock: 0,
@@ -437,6 +2047,9 @@ impl RadixKvCache {
         let mut best_lru = u64::MAX;
 
         for (idx, st) in self.slots.iter().enumerate() {
+            if st.in_use {
+                continue;
+            }
             let mut lcp = 0usize;
             let lim = st.tokens.len().min(max_reuse);
             while lcp < lim && st.tokens[lcp] == prompt[lcp] {
@@ -457,304 +2070,78 @@ impl RadixKvCache {
         (best_slot, best_lcp)
     }
 
-    fn commit(&mut self, slot: usize, full_tokens: Vec<i64>) {
+    /// PagedAttention Zero-Copy COW Fork Matcher: finds the longest prefix across ALL slots (even active ones!)
+    /// and acquires a free slot to fork into! Returns `(dst_slot, src_slot, lcp)`.
+    fn match_for_cow_fork(&mut self, prompt: &[i64]) -> Option<(usize, usize, usize)> {
+        let max_reuse = prompt.len().saturating_sub(1);
+        let mut best_src = 0usize;
+        let mut best_lcp = 0usize;
+        for (idx, st) in self.slots.iter().enumerate() {
+            let mut lcp = 0usize;
+            let lim = st.tokens.len().min(max_reuse);
+            while lcp < lim && st.tokens[lcp] == prompt[lcp] {
+                lcp += 1;
+            }
+            if lcp > best_lcp {
+                best_lcp = lcp;
+                best_src = idx;
+            }
+        }
+        // Pick an unused slot (preferring empty, then LRU inactive; never overwriting `best_src` if another free slot exists!)
+        let mut dst_slot: Option<usize> = None;
+        let mut best_lru = u64::MAX;
+        for (idx, st) in self.slots.iter().enumerate() {
+            if st.in_use {
+                continue;
+            }
+            if best_lcp > 0 && idx == best_src && self.slots.iter().filter(|s| !s.in_use).count() > 1 {
+                continue;
+            }
+            if st.last_used < best_lru {
+                best_lru = st.last_used;
+                dst_slot = Some(idx);
+            }
+        }
+        let dst = dst_slot?;
+        self.clock += 1;
+        self.slots[dst].in_use = true;
+        self.slots[dst].last_used = self.clock;
+        if best_lcp > 0 {
+            self.total_hits += 1;
+            self.total_cached_tokens += best_lcp as u64;
+        }
+        Some((dst, best_src, best_lcp))
+    }
+
+    fn set_active_prefix(&mut self, slot: usize, tokens: &[i64]) {
+        if let Some(st) = self.slots.get_mut(slot) {
+            st.tokens = tokens.to_vec();
+        }
+    }
+
+    fn release(&mut self, slot: usize, full_tokens: Vec<i64>) {
         if let Some(st) = self.slots.get_mut(slot) {
             self.clock += 1;
             st.tokens = full_tokens;
             st.last_used = self.clock;
+            st.in_use = false;
         }
+    }
+
+    fn commit(&mut self, slot: usize, full_tokens: Vec<i64>) {
+        self.release(slot, full_tokens);
     }
 }
 
 // ============================================================================
-// Incremental RFC 8259 JSON Grammar FSM (100% Valid JSON & OpenAI tool_calls!)
-// ============================================================================
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Container {
-    Object,
-    Array,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JsonPhase {
-    ExpectRootObject,
-    ExpectValue,
-    ExpectKeyOrObjEnd,
-    ExpectKey,
-    ExpectColon,
-    ExpectCommaOrEnd,
-    InString { for_key: bool, escaped: bool },
-    InNumber { has_dot: bool, has_exp: bool, need_digit: bool },
-    InLit { lit: &'static [u8], pos: usize },
-    Done,
-}
-
-#[derive(Debug, Clone)]
-struct JsonFsm {
-    stack: Vec<Container>,
-    phase: JsonPhase,
-}
-
-impl JsonFsm {
-    fn new_object() -> Self {
-        Self {
-            stack: Vec::with_capacity(8),
-            phase: JsonPhase::ExpectRootObject,
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        self.phase == JsonPhase::Done
-    }
-
-    fn after_value(&mut self) {
-        if self.stack.is_empty() {
-            self.phase = JsonPhase::Done;
-        } else {
-            self.phase = JsonPhase::ExpectCommaOrEnd;
-        }
-    }
-
-    fn step_byte(&mut self, b: u8) -> bool {
-        let ws = matches!(b, b' ' | b'\t' | b'\n' | b'\r');
-        match self.phase {
-            JsonPhase::Done => ws,
-            JsonPhase::ExpectRootObject => {
-                if ws {
-                    true
-                } else if b == b'{' {
-                    self.stack.push(Container::Object);
-                    self.phase = JsonPhase::ExpectKeyOrObjEnd;
-                    true
-                } else {
-                    false
-                }
-            }
-            JsonPhase::ExpectKeyOrObjEnd => {
-                if ws {
-                    true
-                } else if b == b'}' {
-                    if self.stack.pop() == Some(Container::Object) {
-                        self.after_value();
-                        true
-                    } else {
-                        false
-                    }
-                } else if b == b'"' {
-                    self.phase = JsonPhase::InString {
-                        for_key: true,
-                        escaped: false,
-                    };
-                    true
-                } else {
-                    false
-                }
-            }
-            JsonPhase::ExpectKey => {
-                if ws {
-                    true
-                } else if b == b'"' {
-                    self.phase = JsonPhase::InString {
-                        for_key: true,
-                        escaped: false,
-                    };
-                    true
-                } else {
-                    false
-                }
-            }
-            JsonPhase::ExpectColon => {
-                if ws {
-                    true
-                } else if b == b':' {
-                    self.phase = JsonPhase::ExpectValue;
-                    true
-                } else {
-                    false
-                }
-            }
-            JsonPhase::ExpectValue => {
-                if ws {
-                    true
-                } else if b == b'{' {
-                    if self.stack.len() >= 16 {
-                        return false;
-                    }
-                    self.stack.push(Container::Object);
-                    self.phase = JsonPhase::ExpectKeyOrObjEnd;
-                    true
-                } else if b == b'[' {
-                    if self.stack.len() >= 16 {
-                        return false;
-                    }
-                    self.stack.push(Container::Array);
-                    self.phase = JsonPhase::ExpectValue;
-                    true
-                } else if b == b']' && self.stack.last() == Some(&Container::Array) {
-                    self.stack.pop();
-                    self.after_value();
-                    true
-                } else if b == b'"' {
-                    self.phase = JsonPhase::InString {
-                        for_key: false,
-                        escaped: false,
-                    };
-                    true
-                } else if b == b'-' {
-                    self.phase = JsonPhase::InNumber {
-                        has_dot: false,
-                        has_exp: false,
-                        need_digit: true,
-                    };
-                    true
-                } else if b.is_ascii_digit() {
-                    self.phase = JsonPhase::InNumber {
-                        has_dot: false,
-                        has_exp: false,
-                        need_digit: false,
-                    };
-                    true
-                } else if b == b't' {
-                    self.phase = JsonPhase::InLit { lit: b"true", pos: 1 };
-                    true
-                } else if b == b'f' {
-                    self.phase = JsonPhase::InLit { lit: b"false", pos: 1 };
-                    true
-                } else if b == b'n' {
-                    self.phase = JsonPhase::InLit { lit: b"null", pos: 1 };
-                    true
-                } else {
-                    false
-                }
-            }
-            JsonPhase::ExpectCommaOrEnd => {
-                if ws {
-                    true
-                } else if b == b',' {
-                    match self.stack.last() {
-                        Some(Container::Object) => {
-                            self.phase = JsonPhase::ExpectKey;
-                            true
-                        }
-                        Some(Container::Array) => {
-                            self.phase = JsonPhase::ExpectValue;
-                            true
-                        }
-                        None => false,
-                    }
-                } else if b == b'}' && self.stack.last() == Some(&Container::Object) {
-                    self.stack.pop();
-                    self.after_value();
-                    true
-                } else if b == b']' && self.stack.last() == Some(&Container::Array) {
-                    self.stack.pop();
-                    self.after_value();
-                    true
-                } else {
-                    false
-                }
-            }
-            JsonPhase::InString { for_key, escaped } => {
-                if b < 0x20 {
-                    return false;
-                }
-                if escaped {
-                    if matches!(b, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u') {
-                        self.phase = JsonPhase::InString {
-                            for_key,
-                            escaped: false,
-                        };
-                        true
-                    } else {
-                        false
-                    }
-                } else if b == b'\\' {
-                    self.phase = JsonPhase::InString {
-                        for_key,
-                        escaped: true,
-                    };
-                    true
-                } else if b == b'"' {
-                    if for_key {
-                        self.phase = JsonPhase::ExpectColon;
-                    } else {
-                        self.after_value();
-                    }
-                    true
-                } else {
-                    true
-                }
-            }
-            JsonPhase::InNumber {
-                has_dot,
-                has_exp,
-                need_digit,
-            } => {
-                if b.is_ascii_digit() {
-                    self.phase = JsonPhase::InNumber {
-                        has_dot,
-                        has_exp,
-                        need_digit: false,
-                    };
-                    true
-                } else if !need_digit && b == b'.' && !has_dot && !has_exp {
-                    self.phase = JsonPhase::InNumber {
-                        has_dot: true,
-                        has_exp,
-                        need_digit: true,
-                    };
-                    true
-                } else if !need_digit && (b == b'e' || b == b'E') && !has_exp {
-                    self.phase = JsonPhase::InNumber {
-                        has_dot,
-                        has_exp: true,
-                        need_digit: true,
-                    };
-                    true
-                } else if !need_digit {
-                    self.after_value();
-                    self.step_byte(b)
-                } else {
-                    false
-                }
-            }
-            JsonPhase::InLit { lit, pos } => {
-                if pos < lit.len() && b == lit[pos] {
-                    if pos + 1 == lit.len() {
-                        self.after_value();
-                    } else {
-                        self.phase = JsonPhase::InLit { lit, pos: pos + 1 };
-                    }
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
-
-    fn try_advance(&self, piece: &str) -> Option<Self> {
-        if piece.is_empty() {
-            return None;
-        }
-        let mut next = self.clone();
-        for &b in piece.as_bytes() {
-            if !next.step_byte(b) {
-                return None;
-            }
-        }
-        Some(next)
-    }
-}
-
-// ============================================================================
-// Loaded Engine State + Constrained Sampler + Speculative Decoding
+// Loaded Engine State + Unified Grammar Sampler + Speculative Decoding
 // ============================================================================
 #[derive(Clone)]
 struct ModelMeta {
     backend: &'static str,
     model_id: String,
     arch: String,
+    d_model: usize,
     max_ctx: i64,
     slot_ctx: i64,
     n_kv_slots: usize,
@@ -762,18 +2149,26 @@ struct ModelMeta {
     mla_latent: bool,
     n_bpe_merges: i64,
     tp_size: i64,
+    ep_size: i64,
+    nccl_active: bool,
     has_draft: bool,
+    has_mtp: i64,
+    has_mmproj: bool,
+    mmproj_n_tokens: usize,
+    supports_cb: bool,
 }
 
 struct LoadedModel {
     api: LlmApi,
     handle: i64,
     draft_handle: i64,
+    mmproj_handle: i64,
     meta: ModelMeta,
     bos_id: i64,
     eos_id: i64,
     vocab_size: usize,
     radix_cache: RadixKvCache,
+    cb_radix: RadixKvCache,
     vocab_pieces: Vec<String>,
     logits_scratch: Vec<f32>,
 }
@@ -790,23 +2185,23 @@ impl LoadedModel {
         self.vocab_pieces = pieces;
     }
 
-    fn sample_constrained_json(
+    /// Sample a token directly from `self.logits_scratch` with optional GrammarState (JSON Schema / GBNF),
+    /// repetition penalty, temperature, top-k, top-p, and min-p!
+    fn sample_from_scratch_logits(
         &mut self,
-        fsm: &JsonFsm,
+        grammar: Option<&GrammarState>,
         cfg: &SamplingCfg,
         recent: &[i64],
         seed: i64,
-    ) -> (i64, Option<JsonFsm>) {
-        if fsm.is_done() {
-            return (self.eos_id, None);
-        }
-        self.ensure_vocab_pieces();
-        if self.logits_scratch.len() < self.vocab_size {
-            self.logits_scratch.resize(self.vocab_size, 0.0);
-        }
-        let n = self.api.copy_logits(self.handle, &mut self.logits_scratch);
+    ) -> (i64, Option<GrammarState>) {
+        let n = self.vocab_size.min(self.logits_scratch.len());
         if n == 0 {
             return (self.eos_id, None);
+        }
+        if let Some(g) = grammar {
+            if g.is_strictly_done() {
+                return (self.eos_id, None);
+            }
         }
         if cfg.repeat_penalty > 1.0001 && !recent.is_empty() {
             let rp = cfg.repeat_penalty as f32;
@@ -818,9 +2213,41 @@ impl LoadedModel {
                 }
             }
         }
-        // Fast path: inspect top-512 highest logits first (< 0.3 ms!), fallback to full scan if needed
+
+        // Fast unconstrained sampling path (no grammar)
+        let Some(gs) = grammar else {
+            if cfg.temp <= 1e-5 {
+                let mut best = 0usize;
+                let mut bv = self.logits_scratch[0];
+                for i in 1..n {
+                    if self.logits_scratch[i] > bv {
+                        bv = self.logits_scratch[i];
+                        best = i;
+                    }
+                }
+                return (best as i64, None);
+            }
+            let k = (cfg.top_k.max(1) as usize).min(n).min(128);
+            let mut idx: Vec<usize> = (0..n).collect();
+            idx.select_nth_unstable_by(k - 1, |&a, &b| {
+                self.logits_scratch[b]
+                    .partial_cmp(&self.logits_scratch[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            idx[..k].sort_unstable_by(|&a, &b| {
+                self.logits_scratch[b]
+                    .partial_cmp(&self.logits_scratch[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let cands: Vec<(usize, f32)> = idx[..k].iter().map(|&id| (id, self.logits_scratch[id])).collect();
+            return (nucleus_sample(&cands, cfg, seed) as i64, None);
+        };
+
+        // Grammar-constrained sampling path (Full Recursive JSON Schema / GBNF PDA!)
+        self.ensure_vocab_pieces();
+        let allow_stop = gs.is_accepting();
         let mut idx: Vec<usize> = (0..n).collect();
-        let probe_k = 512.min(n);
+        let probe_k = 1024.min(n);
         idx.select_nth_unstable_by(probe_k - 1, |&a, &b| {
             self.logits_scratch[b]
                 .partial_cmp(&self.logits_scratch[a])
@@ -832,22 +2259,29 @@ impl LoadedModel {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let mut valid: Vec<(usize, f32, JsonFsm)> = Vec::with_capacity(64);
+        let mut valid: Vec<(usize, f32, Option<GrammarState>)> = Vec::with_capacity(64);
         let limit_k = (cfg.top_k.max(1) as usize).min(64);
         for &id in &idx[..probe_k] {
-            if id as i64 == self.eos_id || is_stop_token(id as i64, self.eos_id, &self.vocab_pieces[id]) {
+            let is_stp = id as i64 == self.eos_id || is_stop_token(id as i64, self.eos_id, &self.vocab_pieces[id]);
+            if is_stp {
+                if allow_stop {
+                    valid.push((id, self.logits_scratch[id], None));
+                    if valid.len() >= limit_k {
+                        break;
+                    }
+                }
                 continue;
             }
-            if let Some(ns) = fsm.try_advance(&self.vocab_pieces[id]) {
-                valid.push((id, self.logits_scratch[id], ns));
+            if let Some(ns) = gs.try_advance(&self.vocab_pieces[id]) {
+                valid.push((id, self.logits_scratch[id], Some(ns)));
                 if valid.len() >= limit_k {
                     break;
                 }
             }
         }
         if valid.is_empty() {
-            // Guaranteed fallback over entire vocabulary so output is ALWAYS valid JSON!
-            let mut best: Option<(usize, f32, JsonFsm)> = None;
+            // Guaranteed full-vocab fallback so output ALWAYS obeys schema/grammar!
+            let mut best: Option<(usize, f32, GrammarState)> = None;
             for id in 0..n {
                 if id as i64 == self.eos_id || is_stop_token(id as i64, self.eos_id, &self.vocab_pieces[id]) {
                     continue;
@@ -858,7 +2292,7 @@ impl LoadedModel {
                         continue;
                     }
                 }
-                if let Some(ns) = fsm.try_advance(&self.vocab_pieces[id]) {
+                if let Some(ns) = gs.try_advance(&self.vocab_pieces[id]) {
                     best = Some((id, val, ns));
                 }
             }
@@ -869,54 +2303,82 @@ impl LoadedModel {
         }
         if cfg.temp <= 1e-5 || valid.len() == 1 {
             let (id, _, ns) = valid.remove(0);
-            return (id as i64, Some(ns));
+            return (id as i64, ns);
         }
-        let inv_t = 1.0f32 / (cfg.temp as f32);
-        let mx = valid[0].1 * inv_t;
-        let mut probs: Vec<f32> = valid.iter().map(|(_, v, _)| (v * inv_t - mx).exp()).collect();
-        let sum: f32 = probs.iter().sum::<f32>().max(1e-12);
-        for p in &mut probs {
-            *p /= sum;
-        }
-        let p_thresh = if cfg.min_p > 0.0 {
-            probs[0] * (cfg.min_p as f32)
-        } else {
-            0.0
-        };
-        let mut cum = 0.0f32;
-        let mut keep = 0usize;
-        for (i, &p) in probs.iter().enumerate() {
-            if i > 0 && p < p_thresh {
-                break;
-            }
-            cum += p;
-            keep += 1;
-            if cfg.top_p > 0.0 && cfg.top_p < 1.0 && cum >= cfg.top_p as f32 {
-                break;
-            }
-        }
-        let mut x = (seed as u64) ^ 0x9E3779B97F4A7C15u64;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        let u = (((x.wrapping_mul(2685821657736338717u64)) >> 11) as f64) * (1.0 / 9007199254740992.0);
-        let target = (u as f32) * cum;
-        let mut acc = 0.0f32;
-        let mut chosen = 0usize;
-        for i in 0..keep {
-            acc += probs[i];
-            if acc >= target {
-                chosen = i;
-                break;
-            }
-        }
+        let pairs: Vec<(usize, f32)> = valid.iter().enumerate().map(|(i, (_, v, _))| (i, *v)).collect();
+        let chosen = nucleus_sample(&pairs, cfg, seed);
         let (id, _, ns) = valid.swap_remove(chosen);
-        (id as i64, Some(ns))
+        (id as i64, ns)
     }
+
+    fn sample_constrained(
+        &mut self,
+        grammar: &GrammarState,
+        cfg: &SamplingCfg,
+        recent: &[i64],
+        seed: i64,
+    ) -> (i64, Option<GrammarState>) {
+        if self.logits_scratch.len() < self.vocab_size {
+            self.logits_scratch.resize(self.vocab_size, 0.0);
+        }
+        let n = self.api.copy_logits(self.handle, &mut self.logits_scratch);
+        if n == 0 {
+            return (self.eos_id, None);
+        }
+        self.sample_from_scratch_logits(Some(grammar), cfg, recent, seed)
+    }
+}
+
+fn nucleus_sample(cands: &[(usize, f32)], cfg: &SamplingCfg, seed: i64) -> usize {
+    if cands.len() <= 1 || cfg.temp <= 1e-5 {
+        return cands[0].0;
+    }
+    let inv_t = 1.0f32 / (cfg.temp as f32);
+    let mx = cands[0].1 * inv_t;
+    let mut probs: Vec<f32> = cands.iter().map(|(_, v)| (v * inv_t - mx).exp()).collect();
+    let sum: f32 = probs.iter().sum::<f32>().max(1e-12);
+    for p in &mut probs {
+        *p /= sum;
+    }
+    let p_thresh = if cfg.min_p > 0.0 {
+        probs[0] * (cfg.min_p as f32)
+    } else {
+        0.0
+    };
+    let mut cum = 0.0f32;
+    let mut keep = 0usize;
+    for (i, &p) in probs.iter().enumerate() {
+        if i > 0 && p < p_thresh {
+            break;
+        }
+        cum += p;
+        keep += 1;
+        if cfg.top_p > 0.0 && cfg.top_p < 1.0 && cum >= cfg.top_p as f32 {
+            break;
+        }
+    }
+    let mut x = (seed as u64) ^ 0x9E3779B97F4A7C15u64;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    let u = (((x.wrapping_mul(2685821657736338717u64)) >> 11) as f64) * (1.0 / 9007199254740992.0);
+    let target = (u as f32) * cum;
+    let mut acc = 0.0f32;
+    for i in 0..keep {
+        acc += probs[i];
+        if acc >= target {
+            return cands[i].0;
+        }
+    }
+    cands[0].0
 }
 
 impl Drop for LoadedModel {
     fn drop(&mut self) {
+        if self.mmproj_handle > 0 {
+            self.api.mmproj_free(self.mmproj_handle);
+            self.mmproj_handle = 0;
+        }
         if self.draft_handle > 0 {
             self.api.free(self.draft_handle);
             self.draft_handle = 0;
@@ -1019,6 +2481,7 @@ fn is_stop_token(tok_id: i64, eos_id: i64, piece: &str) -> bool {
             | "<|im_end|>"
             | "<|endoftext|>"
             | "<|user|>"
+            | "<end_of_utterance>"
             | "</s>"
     )
 }
@@ -1059,6 +2522,128 @@ struct GenResult {
     finish_reason: &'static str,
 }
 
+fn run_multimodal_generation<F>(
+    m: &mut LoadedModel,
+    user_text: &str,
+    img: &RgbImage,
+    cfg: &SamplingCfg,
+    mut on_piece: F,
+) -> GenResult
+where
+    F: FnMut(&str) -> bool,
+{
+    let t_pf = Instant::now();
+    let n_vis = m.meta.mmproj_n_tokens.max(1);
+    let pdim = m.api.mmproj_info(m.mmproj_handle, 5).max(m.meta.d_model as i64) as usize;
+    let mut vis_emb = vec![0.0f32; n_vis * pdim];
+    let n_encoded = m.api.mmproj_encode_rgb(
+        m.mmproj_handle,
+        &img.rgb,
+        img.width,
+        img.height,
+        &mut vis_emb,
+        n_vis,
+    );
+
+    // SmolVLM / Idefics3 chat template vs generic LLaVA template
+    let is_smolvlm = m.api.tokenize(m.handle, "<fake_token_around_image>", 8).len() == 1;
+    let (prefix_str, suffix_str) = if is_smolvlm {
+        (
+            "<|im_start|>User:<fake_token_around_image><global-img>".to_string(),
+            format!("<fake_token_around_image>{}<end_of_utterance>\nAssistant:", user_text),
+        )
+    } else {
+        (
+            "USER: ".to_string(),
+            format!("\n{}\nASSISTANT:", user_text),
+        )
+    };
+    let pre_ids = m.api.tokenize(m.handle, &prefix_str, 256);
+    let suf_ids = m.api.tokenize(m.handle, &suffix_str, 512);
+    let mut pos = 0i64;
+    if !pre_ids.is_empty() {
+        m.api.prefill(m.handle, &pre_ids, pos);
+        pos += pre_ids.len() as i64;
+    }
+    if n_encoded > 0 {
+        m.api.step_embd(m.handle, &vis_emb, n_encoded, pos);
+        pos += n_encoded as i64;
+    }
+    let mut next_tok = if !suf_ids.is_empty() {
+        let t = m.api.prefill(m.handle, &suf_ids, pos);
+        pos += suf_ids.len() as i64;
+        t
+    } else {
+        m.bos_id
+    };
+    let prefill_ms = t_pf.elapsed().as_secs_f64() * 1000.0;
+    let prompt_tokens = pos as usize;
+
+    let mut grammar = compile_grammar_for_cfg(cfg).ok().flatten();
+    if let Some(ref gs) = grammar {
+        let (tok, ns) = m.sample_constrained(gs, cfg, &[], cfg.seed);
+        grammar = ns;
+        next_tok = tok;
+    } else if cfg.temp > 1e-5 {
+        next_tok = m.api.sample_next(m.handle, -1, pos - 1, cfg, &[], cfg.seed);
+    }
+
+    let mut out_text = String::new();
+    let mut completion_tokens = 0usize;
+    let mut finish_reason = "length";
+    let mut recent: Vec<i64> = Vec::new();
+    let t_dec = Instant::now();
+    let slot_ctx = m.meta.slot_ctx as usize;
+
+    while completion_tokens < cfg.max_tokens {
+        let piece = m.api.token_str(m.handle, next_tok);
+        if is_stop_token(next_tok, m.eos_id, &piece) {
+            finish_reason = "stop";
+            break;
+        }
+        out_text.push_str(&piece);
+        completion_tokens += 1;
+        recent.push(next_tok);
+        if !on_piece(&piece) {
+            finish_reason = "stop";
+            break;
+        }
+        if grammar.as_ref().is_some_and(GrammarState::is_strictly_done) {
+            finish_reason = "stop";
+            break;
+        }
+        if (pos as usize) + 2 >= slot_ctx || completion_tokens >= cfg.max_tokens {
+            finish_reason = "length";
+            break;
+        }
+        let rstart = recent.len().saturating_sub(64);
+        let step_seed = cfg.seed.wrapping_add((completion_tokens as i64).wrapping_mul(1000003));
+        if let Some(ref gs) = grammar {
+            let _ = m.api.step(m.handle, next_tok, pos);
+            pos += 1;
+            let (tok, ns) = m.sample_constrained(gs, cfg, &recent[rstart..], step_seed);
+            grammar = ns;
+            next_tok = tok;
+        } else {
+            next_tok = m.api.sample_next(m.handle, next_tok, pos, cfg, &recent[rstart..], step_seed);
+            pos += 1;
+        }
+    }
+    let decode_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
+    GenResult {
+        text: out_text,
+        prompt_tokens,
+        cached_prefix_tokens: 0,
+        kv_slot: 0,
+        completion_tokens,
+        spec_proposed: 0,
+        spec_accepted: 0,
+        prefill_ms,
+        decode_ms,
+        finish_reason,
+    }
+}
+
 fn run_generation<F>(
     m: &mut LoadedModel,
     prompt: &str,
@@ -1091,22 +2676,16 @@ where
     m.api.reset(m.handle);
 
     let mut full_seq: Vec<i64> = ids.clone();
-    let mut json_fsm = if cfg.json_constrained {
-        Some(JsonFsm::new_object())
-    } else {
-        None
-    };
+    let mut grammar = compile_grammar_for_cfg(cfg).ok().flatten();
 
-    let mut next_tok = if let Some(ref fsm) = json_fsm {
-        let (tok, ns) = m.sample_constrained_json(
-            fsm,
+    let mut next_tok = if let Some(ref gs) = grammar {
+        let (tok, ns) = m.sample_constrained(
+            gs,
             cfg,
             &full_seq[full_seq.len().saturating_sub(64)..],
             cfg.seed,
         );
-        if let Some(n) = ns {
-            json_fsm = Some(n);
-        }
+        grammar = ns;
         tok
     } else {
         m.api.sample_next(
@@ -1119,9 +2698,12 @@ where
         )
     };
 
-    let use_draft = cfg.spec_mode == SpecMode::Draft && m.draft_handle > 0 && !cfg.json_constrained;
-    let use_ngram = cfg.spec_mode == SpecMode::Ngram && !cfg.json_constrained && cfg.temp <= 1e-5;
-    if use_draft {
+    let unconstrained = grammar.is_none();
+    let use_draft = cfg.spec_mode == SpecMode::Draft && m.draft_handle > 0 && unconstrained && cfg.temp <= 1e-5;
+    let use_tree = cfg.spec_mode == SpecMode::Tree && m.draft_handle > 0 && unconstrained && cfg.temp <= 1e-5;
+    let use_mtp = cfg.spec_mode == SpecMode::Mtp && m.meta.has_mtp > 0 && unconstrained && cfg.temp <= 1e-5;
+    let use_ngram = cfg.spec_mode == SpecMode::Ngram && unconstrained && cfg.temp <= 1e-5;
+    if use_draft || use_tree {
         m.api.prefill(m.draft_handle, &ids, 0);
         m.api.reset(m.draft_handle);
     }
@@ -1146,7 +2728,7 @@ where
             finish_reason = "stop";
             break;
         }
-        if json_fsm.as_ref().is_some_and(JsonFsm::is_done) {
+        if grammar.as_ref().is_some_and(GrammarState::is_strictly_done) {
             finish_reason = "stop";
             break;
         }
@@ -1156,26 +2738,113 @@ where
             break;
         }
 
-        // Lossless Batched Speculative Decoding (`--draft <small.gguf>` OR `--speculative ngram`)!
-        if (use_draft || use_ngram) && cfg.spec_k > 0 {
+        // Lossless Tree-Attention Speculative Decoding (`--speculative tree --draft ...`)!
+        if use_tree && cfg.spec_k >= 2 {
+            let max_d = cfg.spec_k.min(4).min(cfg.max_tokens - completion_tokens).min(slot_ctx - pos - 2);
+            // Build a 2-branch speculative tree from draft model's top-2 at depth 1 + greedy chain along both branches
+            let mut tree_ids = vec![next_tok];
+            let mut parents = vec![-1i64];
+            let d1_top = m.api.step(m.draft_handle, next_tok, pos as i64);
+            let mut dlogits = vec![0.0f32; m.vocab_size];
+            let dn = m.api.copy_logits(m.draft_handle, &mut dlogits);
+            let mut second_tok = d1_top;
+            if dn > 2 {
+                let mut best2 = f32::NEG_INFINITY;
+                for v in 0..dn {
+                    if v as i64 != d1_top && dlogits[v] > best2 {
+                        best2 = dlogits[v];
+                        second_tok = v as i64;
+                    }
+                }
+            }
+            // Branch 1 (primary greedy chain of length `max_d`): nodes 1..=max_d
+            tree_ids.push(d1_top);
+            parents.push(0);
+            let mut cur = d1_top;
+            let mut dpos = (pos + 1) as i64;
+            for step_i in 1..max_d {
+                let nxt = m.api.step(m.draft_handle, cur, dpos);
+                tree_ids.push(nxt);
+                parents.push(step_i as i64);
+                cur = nxt;
+                dpos += 1;
+            }
+            // Branch 2 (alt token at depth 1): node max_d + 1
+            if second_tok != d1_top {
+                tree_ids.push(second_tok);
+                parents.push(0);
+            }
+            spec_proposed += tree_ids.len() - 1;
+            let mut tree_out = vec![0i64; tree_ids.len()];
+            m.api.verify_tree(m.handle, &tree_ids, &parents, pos as i64, &mut tree_out);
+
+            // Walk longest accepted path from root 0!
+            let mut acc_path: Vec<i64> = vec![0];
+            let mut cur_node = 0usize;
+            let mut bonus_tok = tree_out[0];
+            loop {
+                let want = tree_out[cur_node];
+                let mut matched_child = None;
+                for c in (cur_node + 1)..tree_ids.len() {
+                    if parents[c] == cur_node as i64 && tree_ids[c] == want {
+                        matched_child = Some(c);
+                        break;
+                    }
+                }
+                if let Some(ch) = matched_child {
+                    acc_path.push(ch as i64);
+                    spec_accepted += 1;
+                    let dp = m.api.token_str(m.handle, want);
+                    if is_stop_token(want, m.eos_id, &dp) {
+                        finish_reason = "stop";
+                        break;
+                    }
+                    out_text.push_str(&dp);
+                    completion_tokens += 1;
+                    full_seq.push(want);
+                    if !on_piece(&dp) || completion_tokens >= cfg.max_tokens {
+                        finish_reason = "stop";
+                        break;
+                    }
+                    cur_node = ch;
+                    bonus_tok = tree_out[ch];
+                } else {
+                    break;
+                }
+            }
+            m.api.commit_tree_path(m.handle, &acc_path, pos as i64);
+            if finish_reason == "stop" {
+                break;
+            }
+            // Resync draft KV strictly for the accepted branch tokens
+            if acc_path.len() > 1 {
+                let acc_toks: Vec<i64> = acc_path[1..].iter().map(|&ni| tree_ids[ni as usize]).collect();
+                m.api.prefill(m.draft_handle, &acc_toks, (pos + 1) as i64);
+            }
+            next_tok = bonus_tok;
+            continue;
+        }
+
+        // Lossless Batched Speculative Decoding (`--draft`, `--speculative mtp`, OR `--speculative ngram`)!
+        if (use_draft || use_mtp || use_ngram) && cfg.spec_k > 0 {
             let max_k = cfg.spec_k.min(cfg.max_tokens - completion_tokens).min(slot_ctx - pos - 2);
             let mut draft_toks = Vec::with_capacity(max_k);
             if use_draft {
                 let mut dcur = next_tok;
                 let mut dpos = pos as i64;
-                let greedy_cfg = SamplingCfg {
-                    temp: 0.0,
-                    repeat_penalty: 1.0,
-                    ..cfg.clone()
-                };
                 for _ in 0..max_k {
-                    dcur = m.api.sample_next(m.draft_handle, dcur, dpos, &greedy_cfg, &[], cfg.seed);
+                    dcur = m.api.step(m.draft_handle, dcur, dpos);
                     let dp = m.api.token_str(m.draft_handle, dcur);
                     draft_toks.push(dcur);
                     dpos += 1;
                     if is_stop_token(dcur, m.eos_id, &dp) {
                         break;
                     }
+                }
+            } else if use_mtp {
+                let p_tok = m.api.mtp_predict(m.handle, next_tok, pos as i64);
+                if p_tok >= 0 && (p_tok as usize) < m.vocab_size {
+                    draft_toks.push(p_tok);
                 }
             } else {
                 draft_toks = propose_ngram_draft(&full_seq, max_k);
@@ -1213,6 +2882,12 @@ where
                 if finish_reason == "stop" {
                     break;
                 }
+                // CRITICAL: if ALL K draft tokens were accepted, feed the last accepted draft token
+                // into `draft_handle` at `pos + n_acc` so draft KV has ZERO gap before bonus token!
+                if use_draft && n_acc == draft_toks.len() {
+                    let last_dt = draft_toks[n_acc - 1];
+                    let _ = m.api.step(m.draft_handle, last_dt, (pos + n_acc) as i64);
+                }
                 next_tok = target_out[n_acc];
                 continue;
             }
@@ -1220,13 +2895,10 @@ where
 
         let rstart = full_seq.len().saturating_sub(64);
         let step_seed = cfg.seed.wrapping_add((completion_tokens as i64).wrapping_mul(1000003));
-        if let Some(ref fsm) = json_fsm {
-            // Feed `next_tok` into target model to update KV & compute logits, then apply JSON FSM mask!
-            let _ = m.api.prefill(m.handle, &[next_tok], pos as i64);
-            let (tok, ns) = m.sample_constrained_json(fsm, cfg, &full_seq[rstart..], step_seed);
-            if let Some(n) = ns {
-                json_fsm = Some(n);
-            }
+        if let Some(ref gs) = grammar {
+            let _ = m.api.step(m.handle, next_tok, pos as i64);
+            let (tok, ns) = m.sample_constrained(gs, cfg, &full_seq[rstart..], step_seed);
+            grammar = ns;
             next_tok = tok;
         } else {
             next_tok = m.api.sample_next(
@@ -1257,21 +2929,434 @@ where
 }
 
 // ============================================================================
-// Concurrent Request Scheduler & OpenAI-Compatible HTTP + SSE Server
+// Tenon v6: Iteration-Level Continuous Batching Engine + OpenAI HTTP/SSE Server
 // ============================================================================
+enum StreamEvent {
+    Piece(String),
+    Done(GenResult),
+}
+
+enum EngineCmd {
+    Generate {
+        prompt: String,
+        add_bos: bool,
+        cfg: SamplingCfg,
+        image: Option<RgbImage>,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    },
+    Embed {
+        inputs: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<(Vec<Vec<f32>>, usize), String>>,
+    },
+    Rerank {
+        query: String,
+        documents: Vec<String>,
+        top_n: usize,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<(usize, f32)>, String>>,
+    },
+    PagedStats {
+        reply: tokio::sync::oneshot::Sender<(i64, i64, i64, i64)>,
+    },
+}
+
+struct ActiveCbSeq {
+    slot: usize,
+    cfg: SamplingCfg,
+    grammar: Option<GrammarState>,
+    full_seq: Vec<i64>,
+    next_tok: i64,
+    out_text: String,
+    prompt_tokens: usize,
+    cached_prefix_tokens: usize,
+    completion_tokens: usize,
+    prefill_ms: f64,
+    t_dec: Instant,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+}
+
 struct ServerState {
     meta: ModelMeta,
-    model: Mutex<LoadedModel>,
-    queue_sem: Semaphore,
+    engine_tx: std_mpsc::Sender<EngineCmd>,
     queued_reqs: AtomicUsize,
+    active_batch: AtomicUsize,
+    cb_batches_run: AtomicU64,
+    cb_max_batch: AtomicUsize,
     total_reqs: AtomicU64,
     radix_hits: AtomicU64,
     radix_saved_toks: AtomicU64,
 }
 
+fn finish_cb_seq(
+    m: &mut LoadedModel,
+    seq: ActiveCbSeq,
+    finish_reason: &'static str,
+    state: &ServerState,
+) {
+    let decode_ms = seq.t_dec.elapsed().as_secs_f64() * 1000.0;
+    if seq.cached_prefix_tokens > 0 {
+        state.radix_hits.fetch_add(1, Ordering::Relaxed);
+        state
+            .radix_saved_toks
+            .fetch_add(seq.cached_prefix_tokens as u64, Ordering::Relaxed);
+    }
+    m.cb_radix.release(seq.slot, seq.full_seq);
+    let _ = seq.tx.send(StreamEvent::Done(GenResult {
+        text: seq.out_text,
+        prompt_tokens: seq.prompt_tokens,
+        cached_prefix_tokens: seq.cached_prefix_tokens,
+        kv_slot: seq.slot,
+        completion_tokens: seq.completion_tokens,
+        spec_proposed: 0,
+        spec_accepted: 0,
+        prefill_ms: seq.prefill_ms,
+        decode_ms,
+        finish_reason,
+    }));
+}
+
+fn cb_engine_loop(mut m: LoadedModel, rx: std_mpsc::Receiver<EngineCmd>, state: Arc<ServerState>) {
+    let mut active: Vec<ActiveCbSeq> = Vec::new();
+    let mut pending_gen: Vec<(String, bool, SamplingCfg, Option<RgbImage>, tokio::sync::mpsc::UnboundedSender<StreamEvent>)> = Vec::new();
+    let max_cb_batch = 16usize;
+
+    loop {
+        // Wait for work when idle; otherwise non-blocking drain newly arrived commands every single decode iteration!
+        if active.is_empty() && pending_gen.is_empty() {
+            match rx.recv() {
+                Ok(cmd) => {
+                    if !handle_engine_cmd(&mut m, cmd, &mut pending_gen, &state) {
+                        continue;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        while let Ok(cmd) = rx.try_recv() {
+            handle_engine_cmd(&mut m, cmd, &mut pending_gen, &state);
+        }
+
+        // Admit waiting requests into the PagedAttention Continuous Batching pool!
+        while !pending_gen.is_empty() {
+            let need_legacy = !m.meta.supports_cb
+                || pending_gen[0].3.is_some()
+                || (pending_gen[0].2.spec_mode != SpecMode::Off && active.is_empty());
+
+            if need_legacy {
+                if !active.is_empty() {
+                    break; // Wait until current CB batch completes before running multimodal/legacy path
+                }
+                let (prompt, add_bos, cfg, image, tx) = pending_gen.remove(0);
+                let res = if let Some(img) = image {
+                    if m.mmproj_handle > 0 {
+                        run_multimodal_generation(&mut m, &prompt, &img, &cfg, |p| {
+                            tx.send(StreamEvent::Piece(p.to_string())).is_ok()
+                        })
+                    } else {
+                        run_generation(&mut m, &prompt, add_bos, &cfg, |p| {
+                            tx.send(StreamEvent::Piece(p.to_string())).is_ok()
+                        })
+                    }
+                } else {
+                    run_generation(&mut m, &prompt, add_bos, &cfg, |p| {
+                        tx.send(StreamEvent::Piece(p.to_string())).is_ok()
+                    })
+                };
+                if res.cached_prefix_tokens > 0 {
+                    state.radix_hits.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .radix_saved_toks
+                        .fetch_add(res.cached_prefix_tokens as u64, Ordering::Relaxed);
+                }
+                let _ = tx.send(StreamEvent::Done(res));
+                continue;
+            }
+
+            if active.len() >= max_cb_batch {
+                break;
+            }
+            let (prompt, add_bos, cfg, _img, tx) = pending_gen.remove(0);
+            let max_prompt = (m.meta.max_ctx as usize).saturating_sub(cfg.max_tokens.min(512) + 8).max(16);
+            let mut ids = Vec::new();
+            if add_bos && m.bos_id >= 0 {
+                ids.push(m.bos_id);
+            }
+            ids.extend(m.api.tokenize(m.handle, &prompt, max_prompt));
+            if ids.is_empty() {
+                ids.push(m.bos_id.max(1));
+            }
+            let Some((dst_slot, src_slot, lcp)) = m.cb_radix.match_for_cow_fork(&ids) else {
+                pending_gen.insert(0, (prompt, add_bos, cfg, None, tx));
+                break;
+            };
+            let t_pf = Instant::now();
+            if lcp > 0 && src_slot != dst_slot {
+                // 100% Zero-Copy PagedAttention COW Prefix Fork!
+                m.api.paged_seq_fork(m.handle, src_slot, dst_slot, lcp);
+            } else {
+                m.api.paged_seq_free(m.handle, dst_slot);
+            }
+            let actual_lcp = if lcp > 0 && src_slot != dst_slot { lcp } else { 0 };
+            let argmax0 = m.api.paged_prefill(m.handle, dst_slot, &ids[actual_lcp..], actual_lcp as i64);
+            m.cb_radix.set_active_prefix(dst_slot, &ids);
+            let prefill_ms = t_pf.elapsed().as_secs_f64() * 1000.0;
+
+            let mut grammar = compile_grammar_for_cfg(&cfg).ok().flatten();
+            let first_tok = if let Some(ref gs) = grammar {
+                let (tok, ns) = m.sample_constrained(gs, &cfg, &ids[ids.len().saturating_sub(64)..], cfg.seed);
+                grammar = ns;
+                tok
+            } else if cfg.temp <= 1e-5 && cfg.repeat_penalty <= 1.0001 {
+                argmax0
+            } else {
+                if m.logits_scratch.len() < m.vocab_size {
+                    m.logits_scratch.resize(m.vocab_size, 0.0);
+                }
+                m.api.copy_logits(m.handle, &mut m.logits_scratch);
+                m.sample_from_scratch_logits(None, &cfg, &ids[ids.len().saturating_sub(64)..], cfg.seed).0
+            };
+
+            let mut seq = ActiveCbSeq {
+                slot: dst_slot,
+                cfg,
+                grammar,
+                prompt_tokens: ids.len(),
+                cached_prefix_tokens: actual_lcp,
+                full_seq: ids,
+                next_tok: first_tok,
+                out_text: String::new(),
+                completion_tokens: 0,
+                prefill_ms,
+                t_dec: Instant::now(),
+                tx,
+            };
+
+            // Emit the first token immediately (TTFT!)
+            let piece = m.api.token_str(m.handle, seq.next_tok);
+            if is_stop_token(seq.next_tok, m.eos_id, &piece) || seq.cfg.max_tokens == 0 {
+                finish_cb_seq(&mut m, seq, "stop", &state);
+            } else {
+                seq.out_text.push_str(&piece);
+                seq.completion_tokens += 1;
+                seq.full_seq.push(seq.next_tok);
+                let alive = seq.tx.send(StreamEvent::Piece(piece)).is_ok();
+                if !alive || seq.grammar.as_ref().is_some_and(GrammarState::is_strictly_done) {
+                    finish_cb_seq(&mut m, seq, "stop", &state);
+                } else if seq.completion_tokens >= seq.cfg.max_tokens
+                    || seq.full_seq.len() + 2 >= m.meta.max_ctx as usize
+                {
+                    finish_cb_seq(&mut m, seq, "length", &state);
+                } else {
+                    active.push(seq);
+                }
+            }
+        }
+
+        if active.is_empty() {
+            state.active_batch.store(0, Ordering::Relaxed);
+            continue;
+        }
+
+        // ONE Iteration-Level Continuous Batching Decode Step across ALL `B = active.len()` clients simultaneously!
+        let b_sz = active.len();
+        state.active_batch.store(b_sz, Ordering::Relaxed);
+        state.cb_batches_run.fetch_add(1, Ordering::Relaxed);
+        let prev_max = state.cb_max_batch.load(Ordering::Relaxed);
+        if b_sz > prev_max {
+            state.cb_max_batch.store(b_sz, Ordering::Relaxed);
+        }
+
+        let tok_ids: Vec<i64> = active.iter().map(|s| s.next_tok).collect();
+        let pos_arr: Vec<i64> = active.iter().map(|s| (s.full_seq.len() - 1) as i64).collect();
+        let slot_arr: Vec<i64> = active.iter().map(|s| s.slot as i64).collect();
+        let mut argmax_out = vec![0i64; b_sz];
+        m.api.step_batch(m.handle, &tok_ids, &pos_arr, &slot_arr, &mut argmax_out);
+
+        if m.logits_scratch.len() < m.vocab_size {
+            m.logits_scratch.resize(m.vocab_size, 0.0);
+        }
+
+        let mut next_active = Vec::with_capacity(b_sz);
+        for (bi, mut seq) in active.drain(..).enumerate() {
+            let need_logits = seq.grammar.is_some()
+                || seq.cfg.temp > 1e-5
+                || seq.cfg.repeat_penalty > 1.0001;
+            let chosen = if need_logits {
+                m.api.copy_logits_batch(m.handle, bi, &mut m.logits_scratch);
+                let rstart = seq.full_seq.len().saturating_sub(64);
+                let step_seed = seq
+                    .cfg
+                    .seed
+                    .wrapping_add((seq.completion_tokens as i64).wrapping_mul(1000003));
+                let (tok, ns) = m.sample_from_scratch_logits(
+                    seq.grammar.as_ref(),
+                    &seq.cfg,
+                    &seq.full_seq[rstart..],
+                    step_seed,
+                );
+                if seq.grammar.is_some() {
+                    seq.grammar = ns;
+                }
+                tok
+            } else {
+                argmax_out[bi]
+            };
+
+            let piece = m.api.token_str(m.handle, chosen);
+            if is_stop_token(chosen, m.eos_id, &piece) {
+                finish_cb_seq(&mut m, seq, "stop", &state);
+                continue;
+            }
+            seq.next_tok = chosen;
+            seq.out_text.push_str(&piece);
+            seq.completion_tokens += 1;
+            seq.full_seq.push(chosen);
+            let alive = seq.tx.send(StreamEvent::Piece(piece)).is_ok();
+            if !alive || seq.grammar.as_ref().is_some_and(GrammarState::is_strictly_done) {
+                finish_cb_seq(&mut m, seq, "stop", &state);
+            } else if seq.completion_tokens >= seq.cfg.max_tokens
+                || seq.full_seq.len() + 2 >= m.meta.max_ctx as usize
+            {
+                finish_cb_seq(&mut m, seq, "length", &state);
+            } else {
+                next_active.push(seq);
+            }
+        }
+        active = next_active;
+    }
+}
+
+fn handle_engine_cmd(
+    m: &mut LoadedModel,
+    cmd: EngineCmd,
+    pending_gen: &mut Vec<(String, bool, SamplingCfg, Option<RgbImage>, tokio::sync::mpsc::UnboundedSender<StreamEvent>)>,
+    _state: &ServerState,
+) -> bool {
+    match cmd {
+        EngineCmd::Generate { prompt, add_bos, cfg, image, tx } => {
+            pending_gen.push((prompt, add_bos, cfg, image, tx));
+            true
+        }
+        EngineCmd::Embed { inputs, reply } => {
+            let dm = m.meta.d_model;
+            let mut vecs = Vec::with_capacity(inputs.len());
+            let mut total_toks = 0usize;
+            for txt in &inputs {
+                let mut ids = Vec::new();
+                if m.bos_id >= 0 {
+                    ids.push(m.bos_id);
+                }
+                ids.extend(m.api.tokenize(m.handle, txt, 512));
+                if ids.is_empty() {
+                    ids.push(m.bos_id.max(1));
+                }
+                total_toks += ids.len();
+                let mut emb = vec![0.0f32; dm];
+                let got = m.api.embed_text(m.handle, &ids, &mut emb);
+                emb.truncate(got);
+                vecs.push(emb);
+            }
+            let _ = reply.send(Ok((vecs, total_toks)));
+            false
+        }
+        EngineCmd::Rerank { query, documents, top_n, reply } => {
+            // Cross-encoder LLM reranking via P("Yes") / (P("Yes") + P("No")) logit calibration
+            // (matches BGE-Reranker-v2-Gemma / Qwen3-Reranker / vLLM score semantics on causal LLMs),
+            // with automatic fallback to L2-normalized hidden-state cosine similarity if Yes/No tokens are absent.
+            let mut yes_ids: Vec<usize> = Vec::new();
+            let mut no_ids: Vec<usize> = Vec::new();
+            for s in ["Yes", " Yes", "yes", " yes"] {
+                let toks = m.api.tokenize(m.handle, s, 4);
+                if toks.len() == 1 && (toks[0] as usize) < m.vocab_size {
+                    let id = toks[0] as usize;
+                    if !yes_ids.contains(&id) {
+                        yes_ids.push(id);
+                    }
+                }
+            }
+            for s in ["No", " No", "no", " no"] {
+                let toks = m.api.tokenize(m.handle, s, 4);
+                if toks.len() == 1 && (toks[0] as usize) < m.vocab_size {
+                    let id = toks[0] as usize;
+                    if !no_ids.contains(&id) {
+                        no_ids.push(id);
+                    }
+                }
+            }
+            let mut scored: Vec<(usize, f32)> = Vec::with_capacity(documents.len());
+            if !yes_ids.is_empty() && !no_ids.is_empty() {
+                if m.logits_scratch.len() < m.vocab_size {
+                    m.logits_scratch.resize(m.vocab_size, 0.0);
+                }
+                for (idx, doc) in documents.iter().enumerate() {
+                    let prompt = format!(
+                        "Determine whether the Document is relevant to the Query. Respond with Yes or No.\nQuery: {}\nDocument: {}\nRelevant:",
+                        query, doc
+                    );
+                    let mut ids = Vec::new();
+                    if m.bos_id >= 0 {
+                        ids.push(m.bos_id);
+                    }
+                    ids.extend(m.api.tokenize(m.handle, &prompt, 512));
+                    if ids.is_empty() {
+                        ids.push(m.bos_id.max(1));
+                    }
+                    let _ = m.api.prefill(m.handle, &ids, 0);
+                    m.api.copy_logits(m.handle, &mut m.logits_scratch);
+                    let mut y_max = f32::NEG_INFINITY;
+                    for &id in &yes_ids {
+                        y_max = y_max.max(m.logits_scratch[id]);
+                    }
+                    let mut n_max = f32::NEG_INFINITY;
+                    for &id in &no_ids {
+                        n_max = n_max.max(m.logits_scratch[id]);
+                    }
+                    let prob = 1.0 / (1.0 + (n_max - y_max).exp());
+                    scored.push((idx, prob));
+                }
+            } else {
+                let dm = m.meta.d_model;
+                let embed_one = |m: &LoadedModel, txt: &str| -> Vec<f32> {
+                    let mut ids = Vec::new();
+                    if m.bos_id >= 0 {
+                        ids.push(m.bos_id);
+                    }
+                    ids.extend(m.api.tokenize(m.handle, txt, 512));
+                    if ids.is_empty() {
+                        ids.push(m.bos_id.max(1));
+                    }
+                    let mut emb = vec![0.0f32; dm];
+                    let got = m.api.embed_text(m.handle, &ids, &mut emb);
+                    emb.truncate(got);
+                    emb
+                };
+                let qv = embed_one(m, &query);
+                for (idx, doc) in documents.iter().enumerate() {
+                    let dv = embed_one(m, doc);
+                    let dot: f32 = qv.iter().zip(dv.iter()).map(|(a, b)| a * b).sum();
+                    scored.push((idx, dot));
+                }
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            if top_n > 0 && scored.len() > top_n {
+                scored.truncate(top_n);
+            }
+            let _ = reply.send(Ok(scored));
+            false
+        }
+        EngineCmd::PagedStats { reply } => {
+            let total = m.api.paged_kv_info(m.handle, 1);
+            let free = m.api.paged_kv_info(m.handle, 2);
+            let forks = m.api.paged_kv_info(m.handle, 4);
+            let copies = m.api.paged_kv_info(m.handle, 5);
+            let _ = reply.send((total, free, forks, copies));
+            false
+        }
+    }
+}
+
 async fn read_http_request(stream: &mut TcpStream) -> io::Result<(String, String, String)> {
     let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
+    let mut tmp = [0u8; 8192];
     let mut header_end = None;
     let mut content_length = 0usize;
 
@@ -1299,7 +3384,7 @@ async fn read_http_request(stream: &mut TcpStream) -> io::Result<(String, String
                 break;
             }
         }
-        if buf.len() > 8 * 1024 * 1024 {
+        if buf.len() > 24 * 1024 * 1024 {
             break;
         }
     }
@@ -1336,6 +3421,17 @@ fn parse_sampling_from_json(v: &Value, default_cfg: &SamplingCfg) -> SamplingCfg
         .and_then(|rf| rf.get("type"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let rf_schema = v
+        .get("response_format")
+        .and_then(|rf| rf.get("json_schema"))
+        .and_then(|js| js.get("schema").or(Some(js)))
+        .cloned()
+        .filter(|s| s.is_object());
+    let gbnf_grammar = v
+        .get("grammar")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| default_cfg.gbnf_grammar.clone());
     let has_tools = v
         .get("tools")
         .and_then(Value::as_array)
@@ -1362,6 +3458,8 @@ fn parse_sampling_from_json(v: &Value, default_cfg: &SamplingCfg) -> SamplingCfg
             .unwrap_or(default_cfg.max_tokens),
         seed: v.get("seed").and_then(Value::as_i64).unwrap_or(default_cfg.seed),
         json_constrained,
+        json_schema: rf_schema.or_else(|| default_cfg.json_schema.clone()),
+        gbnf_grammar,
         spec_mode: default_cfg.spec_mode,
         spec_k: default_cfg.spec_k,
     }
@@ -1403,11 +3501,21 @@ async fn handle_http_client(
     }
 
     if method == "GET" && clean_path == "/health" {
+        let (pa_tot, pa_free, pa_forks, pa_copies) = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if state.engine_tx.send(EngineCmd::PagedStats { reply: tx }).is_ok() {
+                rx.await.unwrap_or((0, 0, 0, 0))
+            } else {
+                (0, 0, 0, 0)
+            }
+        };
         let info = json!({
             "status": "ok",
+            "version": "tenon-v6",
             "backend": state.meta.backend,
             "model": state.meta.model_id,
             "arch": state.meta.arch,
+            "d_model": state.meta.d_model,
             "max_ctx": state.meta.max_ctx,
             "slot_ctx": state.meta.slot_ctx,
             "kv_slots": state.meta.n_kv_slots,
@@ -1415,7 +3523,19 @@ async fn handle_http_client(
             "mla_latent_kv": state.meta.mla_latent,
             "bpe_merges": state.meta.n_bpe_merges,
             "tp_size": state.meta.tp_size,
+            "ep_size": state.meta.ep_size,
+            "nccl_active": state.meta.nccl_active,
+            "has_mtp": state.meta.has_mtp,
+            "has_mmproj": state.meta.has_mmproj,
             "speculative_draft": state.meta.has_draft,
+            "continuous_batching": state.meta.supports_cb,
+            "active_batch_size": state.active_batch.load(Ordering::Relaxed),
+            "cb_batches_run": state.cb_batches_run.load(Ordering::Relaxed),
+            "cb_max_batch_seen": state.cb_max_batch.load(Ordering::Relaxed),
+            "paged_kv_blocks": pa_tot,
+            "paged_kv_free_blocks": pa_free,
+            "paged_cow_forks": pa_forks,
+            "paged_cow_copies": pa_copies,
             "queued_requests": state.queued_reqs.load(Ordering::Relaxed),
             "total_requests": state.total_reqs.load(Ordering::Relaxed),
             "radix_prefix_hits": state.radix_hits.load(Ordering::Relaxed),
@@ -1443,6 +3563,105 @@ async fn handle_http_client(
         return;
     }
 
+    // Tenon v6: OpenAI-compatible `POST /v1/embeddings`
+    if method == "POST" && clean_path == "/v1/embeddings" {
+        let Ok(req) = serde_json::from_str::<Value>(&body) else {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid JSON"}})).await;
+            return;
+        };
+        let mut inputs = Vec::new();
+        match req.get("input") {
+            Some(Value::String(s)) => inputs.push(s.clone()),
+            Some(Value::Array(arr)) => {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        inputs.push(s.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        if inputs.is_empty() {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "missing `input`"}})).await;
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state.engine_tx.send(EngineCmd::Embed { inputs, reply: tx }).is_err() {
+            let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+            return;
+        }
+        match rx.await {
+            Ok(Ok((vecs, total_toks))) => {
+                let data: Vec<Value> = vecs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, emb)| json!({"object": "embedding", "index": idx, "embedding": emb}))
+                    .collect();
+                let resp = json!({
+                    "object": "list",
+                    "model": state.meta.model_id,
+                    "data": data,
+                    "usage": {"prompt_tokens": total_toks, "total_tokens": total_toks}
+                });
+                let _ = write_json_response(&mut stream, "200 OK", &resp).await;
+            }
+            _ => {
+                let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "embedding failed"}})).await;
+            }
+        }
+        return;
+    }
+
+    // Tenon v6: Cohere/vLLM-compatible `POST /v1/rerank`
+    if method == "POST" && clean_path == "/v1/rerank" {
+        let Ok(req) = serde_json::from_str::<Value>(&body) else {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "invalid JSON"}})).await;
+            return;
+        };
+        let query = req.get("query").and_then(Value::as_str).unwrap_or("").to_string();
+        let docs: Vec<String> = req
+            .get("documents")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|d| d.as_str().or_else(|| d.get("text").and_then(Value::as_str)).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let top_n = req.get("top_n").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if query.is_empty() || docs.is_empty() {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": "missing `query` or `documents`"}})).await;
+            return;
+        }
+        let docs_copy = docs.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state.engine_tx.send(EngineCmd::Rerank { query, documents: docs, top_n, reply: tx }).is_err() {
+            let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "engine stopped"}})).await;
+            return;
+        }
+        match rx.await {
+            Ok(Ok(scored)) => {
+                let results: Vec<Value> = scored
+                    .into_iter()
+                    .map(|(idx, score)| json!({
+                        "index": idx,
+                        "relevance_score": score,
+                        "document": {"text": docs_copy[idx]}
+                    }))
+                    .collect();
+                let resp = json!({
+                    "model": state.meta.model_id,
+                    "results": results
+                });
+                let _ = write_json_response(&mut stream, "200 OK", &resp).await;
+            }
+            _ => {
+                let _ = write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": "rerank failed"}})).await;
+            }
+        }
+        return;
+    }
+
     if method == "POST"
         && (clean_path == "/v1/chat/completions" || clean_path == "/v1/completions")
     {
@@ -1458,13 +3677,12 @@ async fn handle_http_client(
         let is_chat = clean_path == "/v1/chat/completions";
         let want_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let cfg = parse_sampling_from_json(&req, &default_cfg);
+        if let Err(e) = compile_grammar_for_cfg(&cfg) {
+            let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": format!("grammar/schema error: {}", e)}})).await;
+            return;
+        }
         let tools_arr = req.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
         let has_tools = !tools_arr.is_empty();
-        let rf_schema = req
-            .get("response_format")
-            .and_then(|rf| rf.get("json_schema"))
-            .and_then(|js| js.get("schema"))
-            .cloned();
 
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1473,6 +3691,8 @@ async fn handle_http_client(
         let seq_no = state.total_reqs.fetch_add(1, Ordering::Relaxed) + 1;
         let req_id = format!("chatcmpl-tenon-{}-{}", created, seq_no);
 
+        let mut parsed_image: Option<RgbImage> = None;
+        let mut mm_user_text = String::new();
         let prompt = if is_chat {
             let mut msgs: Vec<(String, String)> = Vec::new();
             if let Some(arr) = req.get("messages").and_then(Value::as_array) {
@@ -1482,11 +3702,43 @@ async fn handle_http_client(
                         .and_then(Value::as_str)
                         .unwrap_or("user")
                         .to_string();
-                    let content = item
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                    let content = if let Some(s) = item.get("content").and_then(Value::as_str) {
+                        s.to_string()
+                    } else if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        // OpenAI Multimodal Content Array: `[{"type":"text","text":"..."}, {"type":"image_url","image_url":{"url":"data:image/..."}}]`
+                        let mut text_acc = String::new();
+                        for part in parts {
+                            match part.get("type").and_then(Value::as_str) {
+                                Some("text") => {
+                                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                        if !text_acc.is_empty() {
+                                            text_acc.push(' ');
+                                        }
+                                        text_acc.push_str(t);
+                                    }
+                                }
+                                Some("image_url") => {
+                                    let url = part
+                                        .get("image_url")
+                                        .and_then(|u| u.as_str().or_else(|| u.get("url").and_then(Value::as_str)));
+                                    if let Some(u) = url {
+                                        match decode_image_url_to_rgb(u) {
+                                            Ok(img) => parsed_image = Some(img),
+                                            Err(e) => {
+                                                let _ = write_json_response(&mut stream, "400 Bad Request", &json!({"error": {"message": format!("image_url decode failed: {}", e)}})).await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        mm_user_text = text_acc.clone();
+                        text_acc
+                    } else {
+                        String::new()
+                    };
                     msgs.push((role, content));
                 }
             }
@@ -1502,9 +3754,9 @@ async fn handle_http_client(
                 } else {
                     msgs.push(("system".to_string(), tool_sys));
                 }
-            } else if let Some(schema) = rf_schema {
+            } else if let Some(ref schema) = cfg.json_schema {
                 let schema_note = format!(
-                    "Respond ONLY with a valid JSON object adhering to this JSON Schema: {}",
+                    "Respond ONLY with valid JSON adhering strictly to this JSON Schema: {}",
                     schema
                 );
                 if let Some((r, c)) = msgs.first_mut() {
@@ -1518,7 +3770,11 @@ async fn handle_http_client(
                     msgs.push(("system".to_string(), schema_note));
                 }
             }
-            format_chat_template(&state.meta.arch, &msgs)
+            if parsed_image.is_some() && state.meta.has_mmproj {
+                mm_user_text
+            } else {
+                format_chat_template(&state.meta.arch, &msgs)
+            }
         } else {
             req.get("prompt")
                 .and_then(Value::as_str)
@@ -1527,12 +3783,22 @@ async fn handle_http_client(
         };
         let model_id = state.meta.model_id.clone();
 
-        // Fair async queue slot acquisition (allows concurrent HTTP connections + keeps /health instant!)
         state.queued_reqs.fetch_add(1, Ordering::Relaxed);
-        let Ok(_permit) = state.queue_sem.acquire().await else {
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+        if state
+            .engine_tx
+            .send(EngineCmd::Generate {
+                prompt,
+                add_bos: true,
+                cfg,
+                image: parsed_image,
+                tx: ev_tx,
+            })
+            .is_err()
+        {
             state.queued_reqs.fetch_sub(1, Ordering::Relaxed);
             return;
-        };
+        }
 
         if want_stream {
             let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
@@ -1540,93 +3806,78 @@ async fn handle_http_client(
                 state.queued_reqs.fetch_sub(1, Ordering::Relaxed);
                 return;
             }
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let st_bg = Arc::clone(&state);
-            let req_id_bg = req_id.clone();
-            let model_id_bg = model_id.clone();
-            let jh = tokio::task::spawn_blocking(move || {
-                let mut m = st_bg.model.lock().unwrap();
-                let res = run_generation(&mut m, &prompt, true, &cfg, |piece| {
-                    let chunk = if is_chat {
-                        json!({
-                            "id": req_id_bg,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_id_bg,
-                            "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": null}]
-                        })
-                    } else {
-                        json!({
-                            "id": req_id_bg,
-                            "object": "text_completion",
-                            "created": created,
-                            "model": model_id_bg,
-                            "choices": [{"index": 0, "text": piece, "finish_reason": null}]
-                        })
-                    };
-                    tx.send(format!("data: {}\n\n", chunk)).is_ok()
-                });
-                if res.cached_prefix_tokens > 0 {
-                    st_bg.radix_hits.fetch_add(1, Ordering::Relaxed);
-                    st_bg
-                        .radix_saved_toks
-                        .fetch_add(res.cached_prefix_tokens as u64, Ordering::Relaxed);
-                }
-                let done_chunk = if is_chat {
-                    json!({
-                        "id": req_id_bg,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_id_bg,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": res.finish_reason}],
-                        "usage": {
-                            "prompt_tokens": res.prompt_tokens,
-                            "completion_tokens": res.completion_tokens,
-                            "total_tokens": res.prompt_tokens + res.completion_tokens,
-                            "prompt_tokens_details": {"cached_tokens": res.cached_prefix_tokens}
+            while let Some(ev) = ev_rx.recv().await {
+                match ev {
+                    StreamEvent::Piece(piece) => {
+                        let chunk = if is_chat {
+                            json!({
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": null}]
+                            })
+                        } else {
+                            json!({
+                                "id": req_id,
+                                "object": "text_completion",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{"index": 0, "text": piece, "finish_reason": null}]
+                            })
+                        };
+                        let line = format!("data: {}\n\n", chunk);
+                        if stream.write_all(line.as_bytes()).await.is_err() {
+                            break;
                         }
-                    })
-                } else {
-                    json!({
-                        "id": req_id_bg,
-                        "object": "text_completion",
-                        "created": created,
-                        "model": model_id_bg,
-                        "choices": [{"index": 0, "text": "", "finish_reason": res.finish_reason}]
-                    })
-                };
-                let _ = tx.send(format!("data: {}\n\ndata: [DONE]\n\n", done_chunk));
-            });
-
-            while let Some(evt) = rx.recv().await {
-                if stream.write_all(evt.as_bytes()).await.is_err() {
-                    break;
+                        let _ = stream.flush().await;
+                    }
+                    StreamEvent::Done(res) => {
+                        let done_chunk = if is_chat {
+                            json!({
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": res.finish_reason}],
+                                "usage": {
+                                    "prompt_tokens": res.prompt_tokens,
+                                    "completion_tokens": res.completion_tokens,
+                                    "total_tokens": res.prompt_tokens + res.completion_tokens,
+                                    "prompt_tokens_details": {"cached_tokens": res.cached_prefix_tokens}
+                                }
+                            })
+                        } else {
+                            json!({
+                                "id": req_id,
+                                "object": "text_completion",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{"index": 0, "text": "", "finish_reason": res.finish_reason}]
+                            })
+                        };
+                        let tail = format!("data: {}\n\ndata: [DONE]\n\n", done_chunk);
+                        let _ = stream.write_all(tail.as_bytes()).await;
+                        let _ = stream.flush().await;
+                        break;
+                    }
                 }
-                let _ = stream.flush().await;
             }
-            let _ = jh.await;
             state.queued_reqs.fetch_sub(1, Ordering::Relaxed);
             return;
         }
 
-        let st_bg = Arc::clone(&state);
-        let Ok(res) = tokio::task::spawn_blocking(move || {
-            let mut m = st_bg.model.lock().unwrap();
-            let r = run_generation(&mut m, &prompt, true, &cfg, |_| true);
-            if r.cached_prefix_tokens > 0 {
-                st_bg.radix_hits.fetch_add(1, Ordering::Relaxed);
-                st_bg
-                    .radix_saved_toks
-                    .fetch_add(r.cached_prefix_tokens as u64, Ordering::Relaxed);
+        let mut final_res: Option<GenResult> = None;
+        while let Some(ev) = ev_rx.recv().await {
+            if let StreamEvent::Done(r) = ev {
+                final_res = Some(r);
+                break;
             }
-            r
-        })
-        .await
-        else {
-            state.queued_reqs.fetch_sub(1, Ordering::Relaxed);
+        }
+        state.queued_reqs.fetch_sub(1, Ordering::Relaxed);
+        let Some(res) = final_res else {
             return;
         };
-        state.queued_reqs.fetch_sub(1, Ordering::Relaxed);
 
         let pf_new = res.prompt_tokens.saturating_sub(res.cached_prefix_tokens);
         let pf_tps = if res.prefill_ms > 0.0 {
@@ -1719,7 +3970,7 @@ async fn handle_http_client(
 
 fn print_llm_usage() {
     println!(
-        r#"tenon llm — Native Out-of-Core Streaming LLM CLI & OpenAI-Compatible SSE Server (v5)
+        r#"tenon llm — Native Out-of-Core Streaming LLM CLI & Continuous-Batching OpenAI Server (v6)
 
 USAGE:
   tenon llm <model.gguf> [OPTIONS]
@@ -1728,21 +3979,26 @@ OPTIONS:
   --prompt <text>           Raw completion prompt (runs batched prefill + streaming stdout)
   --chat <text>             Chat user message (auto-applies model architecture chat template)
   --system <text>           Optional system prompt (used with --chat)
-  --serve <host:port>       Launch OpenAI-compatible HTTP + SSE server (Radix KV, tools, json_schema)
-  --plan-only               Inspect GGUF & print Auto VRAM/NUMA/KV/TP plan without loading weights
+  --image <path>            Local PNG/BMP/PPM image for multimodal VLM generation (with --mmproj)
+  --mmproj <mmproj.gguf>    CLIP/SigLIP/SmolVLM multimodal GPU vision encoder GGUF
+  --serve <host:port>       Launch OpenAI-compatible v6 Continuous-Batching + SSE + Embeddings + Rerank server
+  --plan-only               Inspect GGUF & print Auto VRAM/NUMA/KV/TP/EP plan without loading weights
   --max-vram-gb <F>         Hard VRAM/RAM budget cap in GiB (0 = auto-detect hardware)
   --ctx <N>                 Total KV context capacity across all slots (default: 4096, up to 16384)
   --kv-slots <N>            Number of partitioned Radix Prefix KV slots (default: 2 for --serve, 1 CLI)
   --kv-quant <auto|q8|fp16> KV-cache precision (`q8` saves -47% VRAM; default: auto)
   --mla-latent <0|1>        Matrix-absorbed compressed latent MLA KV cache (default: 1)
   --tp <N>                  Multi-GPU Tensor Parallelism degree on CUDA (`TP=2..8`, default: 1)
+  --ep <N>                  Multi-GPU MoE Expert Parallelism degree on CUDA (`EP=2..8`, default: 1)
   --slots <N>               Override auto-planned VRAM slots / pinned layers
   --nocache                 Force uncached direct NVMe I/O (`F_NOCACHE` / `POSIX_FADV_DONTNEED`)
   --fast-dp4a               Enable opt-in CUDA 128-bit `int4` Q8_1 `__dp4a` fast path
-  --draft <small.gguf>      Small draft GGUF for lossless speculative decoding (`verify_batch`)
-  --speculative <off|ngram|draft> Speculative decoding mode (default: off, or draft when --draft set)
+  --draft <small.gguf>      Small draft GGUF for lossless speculative decoding (`verify_batch` / `verify_tree`)
+  --speculative <off|ngram|draft|mtp|tree> Speculative decoding mode (default: off, or draft when --draft set)
   --spec-k <N>              Speculative lookahead window K (default: 5)
   --json                    Enforce RFC 8259 JSON-object grammar-constrained sampling
+  --json-schema <json>      Enforce full recursive JSON Schema grammar-constrained sampling
+  --grammar <gbnf>          Enforce custom GBNF grammar rules (`root ::= ...`)
   --temp <F>                Sampling temperature (0 = greedy argmax; default: 0.7)
   --top-k <N>               Top-K sampling cutoff (default: 40)
   --top-p <F>               Top-P nucleus cutoff (default: 0.9)
@@ -1761,6 +4017,8 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
 
     let mut model_path: Option<String> = None;
     let mut draft_path: Option<String> = None;
+    let mut mmproj_path: Option<String> = None;
+    let mut image_path: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut chat_msg: Option<String> = None;
     let mut system_msg: Option<String> = None;
@@ -1772,6 +4030,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
     let mut kv_quant = "auto".to_string();
     let mut mla_latent = 1i64;
     let mut tp_size = 1i64;
+    let mut ep_size = 1i64;
     let mut slots_override: Option<i64> = None;
     let mut force_nocache = false;
     let mut fast_dp4a = false;
@@ -1780,119 +4039,59 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--prompt" if i + 1 < args.len() => {
-                prompt = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--chat" if i + 1 < args.len() => {
-                chat_msg = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--system" if i + 1 < args.len() => {
-                system_msg = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--serve" if i + 1 < args.len() => {
-                serve_addr = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--plan-only" => {
-                plan_only = true;
-                i += 1;
-            }
-            "--max-vram-gb" if i + 1 < args.len() => {
-                max_vram_gb = args[i + 1].parse().unwrap_or(0.0);
-                i += 2;
-            }
-            "--ctx" if i + 1 < args.len() => {
-                max_ctx = args[i + 1].parse().unwrap_or(4096);
-                i += 2;
-            }
-            "--kv-slots" if i + 1 < args.len() => {
-                kv_slots_opt = args[i + 1].parse().ok();
-                i += 2;
-            }
-            "--kv-quant" if i + 1 < args.len() => {
-                kv_quant = args[i + 1].clone();
-                i += 2;
-            }
-            "--mla-latent" if i + 1 < args.len() => {
-                mla_latent = args[i + 1].parse().unwrap_or(1);
-                i += 2;
-            }
-            "--tp" if i + 1 < args.len() => {
-                tp_size = args[i + 1].parse().unwrap_or(1);
-                i += 2;
-            }
-            "--slots" if i + 1 < args.len() => {
-                slots_override = args[i + 1].parse().ok();
-                i += 2;
-            }
-            "--nocache" => {
-                force_nocache = true;
-                i += 1;
-            }
-            "--fast-dp4a" => {
-                fast_dp4a = true;
-                i += 1;
-            }
+            "--prompt" if i + 1 < args.len() => { prompt = Some(args[i + 1].clone()); i += 2; }
+            "--chat" if i + 1 < args.len() => { chat_msg = Some(args[i + 1].clone()); i += 2; }
+            "--system" if i + 1 < args.len() => { system_msg = Some(args[i + 1].clone()); i += 2; }
+            "--image" if i + 1 < args.len() => { image_path = Some(args[i + 1].clone()); i += 2; }
+            "--mmproj" if i + 1 < args.len() => { mmproj_path = Some(args[i + 1].clone()); i += 2; }
+            "--serve" if i + 1 < args.len() => { serve_addr = Some(args[i + 1].clone()); i += 2; }
+            "--plan-only" => { plan_only = true; i += 1; }
+            "--max-vram-gb" if i + 1 < args.len() => { max_vram_gb = args[i + 1].parse().unwrap_or(0.0); i += 2; }
+            "--ctx" if i + 1 < args.len() => { max_ctx = args[i + 1].parse().unwrap_or(4096); i += 2; }
+            "--kv-slots" if i + 1 < args.len() => { kv_slots_opt = args[i + 1].parse().ok(); i += 2; }
+            "--kv-quant" if i + 1 < args.len() => { kv_quant = args[i + 1].clone(); i += 2; }
+            "--mla-latent" if i + 1 < args.len() => { mla_latent = args[i + 1].parse().unwrap_or(1); i += 2; }
+            "--tp" if i + 1 < args.len() => { tp_size = args[i + 1].parse().unwrap_or(1); i += 2; }
+            "--ep" if i + 1 < args.len() => { ep_size = args[i + 1].parse().unwrap_or(1); i += 2; }
+            "--slots" if i + 1 < args.len() => { slots_override = args[i + 1].parse().ok(); i += 2; }
+            "--nocache" => { force_nocache = true; i += 1; }
+            "--fast-dp4a" => { fast_dp4a = true; i += 1; }
             "--draft" if i + 1 < args.len() => {
                 draft_path = Some(args[i + 1].clone());
-                cfg.spec_mode = SpecMode::Draft;
+                if cfg.spec_mode == SpecMode::Off {
+                    cfg.spec_mode = SpecMode::Draft;
+                }
                 i += 2;
             }
             "--speculative" if i + 1 < args.len() => {
                 cfg.spec_mode = match args[i + 1].as_str() {
                     "ngram" | "lookup" => SpecMode::Ngram,
                     "draft" => SpecMode::Draft,
+                    "mtp" => SpecMode::Mtp,
+                    "tree" => SpecMode::Tree,
                     _ => SpecMode::Off,
                 };
                 i += 2;
             }
-            "--spec-k" if i + 1 < args.len() => {
-                cfg.spec_k = args[i + 1].parse().unwrap_or(5);
+            "--spec-k" if i + 1 < args.len() => { cfg.spec_k = args[i + 1].parse().unwrap_or(5); i += 2; }
+            "--json" => { cfg.json_constrained = true; i += 1; }
+            "--json-schema" if i + 1 < args.len() => {
+                match serde_json::from_str::<Value>(&args[i + 1]) {
+                    Ok(v) => { cfg.json_schema = Some(v); cfg.json_constrained = true; }
+                    Err(e) => { eprintln!("invalid --json-schema: {}", e); return ExitCode::from(2); }
+                }
                 i += 2;
             }
-            "--json" => {
-                cfg.json_constrained = true;
-                i += 1;
-            }
-            "--temp" if i + 1 < args.len() => {
-                cfg.temp = args[i + 1].parse().unwrap_or(0.7);
-                i += 2;
-            }
-            "--top-k" if i + 1 < args.len() => {
-                cfg.top_k = args[i + 1].parse().unwrap_or(40);
-                i += 2;
-            }
-            "--top-p" if i + 1 < args.len() => {
-                cfg.top_p = args[i + 1].parse().unwrap_or(0.9);
-                i += 2;
-            }
-            "--min-p" if i + 1 < args.len() => {
-                cfg.min_p = args[i + 1].parse().unwrap_or(0.05);
-                i += 2;
-            }
-            "--repeat-penalty" if i + 1 < args.len() => {
-                cfg.repeat_penalty = args[i + 1].parse().unwrap_or(1.1);
-                i += 2;
-            }
-            "--max-tokens" if i + 1 < args.len() => {
-                cfg.max_tokens = args[i + 1].parse().unwrap_or(256);
-                i += 2;
-            }
-            "--seed" if i + 1 < args.len() => {
-                cfg.seed = args[i + 1].parse().unwrap_or(42);
-                i += 2;
-            }
-            s if !s.starts_with('-') && model_path.is_none() => {
-                model_path = Some(s.to_string());
-                i += 1;
-            }
-            other => {
-                eprintln!("unknown option `{}`", other);
-                return ExitCode::from(2);
-            }
+            "--grammar" if i + 1 < args.len() => { cfg.gbnf_grammar = Some(args[i + 1].clone()); i += 2; }
+            "--temp" if i + 1 < args.len() => { cfg.temp = args[i + 1].parse().unwrap_or(0.7); i += 2; }
+            "--top-k" if i + 1 < args.len() => { cfg.top_k = args[i + 1].parse().unwrap_or(40); i += 2; }
+            "--top-p" if i + 1 < args.len() => { cfg.top_p = args[i + 1].parse().unwrap_or(0.9); i += 2; }
+            "--min-p" if i + 1 < args.len() => { cfg.min_p = args[i + 1].parse().unwrap_or(0.05); i += 2; }
+            "--repeat-penalty" if i + 1 < args.len() => { cfg.repeat_penalty = args[i + 1].parse().unwrap_or(1.1); i += 2; }
+            "--max-tokens" if i + 1 < args.len() => { cfg.max_tokens = args[i + 1].parse().unwrap_or(256); i += 2; }
+            "--seed" if i + 1 < args.len() => { cfg.seed = args[i + 1].parse().unwrap_or(42); i += 2; }
+            s if !s.starts_with('-') && model_path.is_none() => { model_path = Some(s.to_string()); i += 1; }
+            other => { eprintln!("unknown option `{}`", other); return ExitCode::from(2); }
         }
     }
 
@@ -1907,6 +4106,9 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         env::set_var("TENON_KV_SLOTS", kv_slots.to_string());
         if tp_size > 1 {
             env::set_var("TENON_TP_SIZE", tp_size.to_string());
+        }
+        if ep_size > 1 {
+            env::set_var("TENON_EP_SIZE", ep_size.to_string());
         }
     }
 
@@ -1935,7 +4137,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
     let chosen_nocache = force_nocache || plan.nocache;
     let gib = 1024.0 * 1024.0 * 1024.0;
     eprintln!(
-        "[tenon llm] backend={} | disk={:.2} GiB | layers={} experts={} d={} | plan: slots={} nocache={} kv={} kv_slots={} tp={} prefill_B={} est_vram={:.2} GiB",
+        "[tenon llm] backend={} | disk={:.2} GiB | layers={} experts={} d={} | plan: slots={} nocache={} kv={} kv_slots={} tp={} ep={} prefill_B={} est_vram={:.2} GiB",
         api.backend,
         plan.disk_bytes as f64 / gib,
         plan.n_layers,
@@ -1946,6 +4148,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         if plan.kv_q8 { "Q8_0" } else { "FP16" },
         kv_slots,
         tp_size,
+        ep_size,
         plan.prefill_chunk,
         plan.est_vram_bytes as f64 / gib
     );
@@ -1973,10 +4176,11 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         unsafe {
             env::set_var("TENON_KV_SLOTS", "1");
             env::set_var("TENON_TP_SIZE", "1");
+            env::set_var("TENON_EP_SIZE", "1");
         }
         match api.load(dp, -1, false, true) {
             Ok(dh) => {
-                eprintln!("[tenon llm] loaded speculative draft model `{}` (K={})", dp, cfg.spec_k);
+                eprintln!("[tenon llm] loaded speculative draft model `{}` (mode={:?}, K={})", dp, cfg.spec_mode, cfg.spec_k);
                 dh
             }
             Err(e) => {
@@ -1987,15 +4191,39 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
     } else {
         0
     };
+    let mmproj_handle = if let Some(ref mp) = mmproj_path {
+        match api.mmproj_load(mp) {
+            Ok(mh) => {
+                eprintln!(
+                    "[tenon llm] loaded mmproj vision encoder `{}` ({}x{} patch={} -> {} vision tokens x {}d)",
+                    mp,
+                    api.mmproj_info(mh, 0),
+                    api.mmproj_info(mh, 0),
+                    api.mmproj_info(mh, 1),
+                    api.mmproj_info(mh, 6),
+                    api.mmproj_info(mh, 5),
+                );
+                mh
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                api.free(handle);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        0
+    };
 
     let arch = api.arch(handle);
+    let d_model = api.info(handle, 1).max(1) as usize;
+    let n_experts = api.info(handle, 5);
     let bos_id = api.info(handle, 11);
     let eos_id = api.info(handle, 12);
     let vocab_size = api.info(handle, 7).max(1) as usize;
     let core_vram = api.info(handle, 8) as f64 / gib;
     let cache_vram = api.info(handle, 9) as f64 / gib;
-    let actual_kv_slots = api.info(handle, 25).max(api.info(handle, 27)).max(1) as usize;
-    let (actual_mla_lat, actual_slots, actual_slot_ctx, actual_bpe_merges, actual_tp) =
+    let (actual_mla_lat, actual_slots, actual_slot_ctx, actual_bpe_merges, actual_tp, actual_ep, nccl_active, has_mtp, is_mla) =
         if api.backend == "cuda" {
             let sctx = api.info(handle, 28);
             (
@@ -2004,6 +4232,10 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
                 if sctx > 0 { sctx } else { max_ctx },
                 api.info(handle, 29),
                 api.info(handle, 31).max(1),
+                api.info(handle, 34).max(1),
+                api.info(handle, 33) != 0,
+                api.info(handle, 30),
+                api.info(handle, 24) != 0,
             )
         } else {
             let sctx = api.info(handle, 26);
@@ -2013,9 +4245,14 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
                 if sctx > 0 { sctx } else { max_ctx },
                 api.info(handle, 28),
                 1,
+                1,
+                false,
+                api.info(handle, 27),
+                api.info(handle, 23) != 0,
             )
         };
-    let _ = actual_kv_slots;
+    let pa_blocks = api.paged_kv_info(handle, 1);
+    let supports_cb = n_experts == 0 && !is_mla && actual_tp == 1 && pa_blocks >= 4;
 
     let model_id = Path::new(&model_path)
         .file_stem()
@@ -2023,7 +4260,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         .unwrap_or("tenon-gguf")
         .to_string();
     eprintln!(
-        "[tenon llm] loaded `{}` (arch={}, ctx={} [{}x{}], kv={}, mla_latent={}, bpe_merges={}, tp={}, core_vram={:.2} GiB, cache_vram={:.2} GiB) in {:.2}s",
+        "[tenon llm] loaded `{}` (arch={}, ctx={} [{}x{}], kv={}, mla_latent={}, bpe_merges={}, tp={}, ep={}, nccl={}, mtp={}, pa_blks={}, cb={}, core_vram={:.2} GiB, cache_vram={:.2} GiB) in {:.2}s",
         model_id,
         arch,
         max_ctx,
@@ -2033,6 +4270,11 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         actual_mla_lat,
         actual_bpe_merges,
         actual_tp,
+        actual_ep,
+        nccl_active,
+        has_mtp,
+        pa_blocks,
+        supports_cb,
         core_vram,
         cache_vram,
         t_load.elapsed().as_secs_f64()
@@ -2042,6 +4284,7 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         backend: api.backend,
         model_id,
         arch,
+        d_model,
         max_ctx,
         slot_ctx: actual_slot_ctx,
         n_kv_slots: actual_slots,
@@ -2049,18 +4292,26 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         mla_latent: actual_mla_lat,
         n_bpe_merges: actual_bpe_merges,
         tp_size: actual_tp,
+        ep_size: actual_ep,
+        nccl_active,
         has_draft: draft_handle > 0,
+        has_mtp,
+        has_mmproj: mmproj_handle > 0,
+        mmproj_n_tokens: if mmproj_handle > 0 { api.mmproj_info(mmproj_handle, 6).max(0) as usize } else { 0 },
+        supports_cb,
     };
 
     let mut loaded = LoadedModel {
         api,
         handle,
         draft_handle,
+        mmproj_handle,
         meta: meta.clone(),
         bos_id,
         eos_id,
         vocab_size,
         radix_cache: RadixKvCache::new(actual_slots),
+        cb_radix: RadixKvCache::new(16),
         vocab_pieces: Vec::new(),
         logits_scratch: Vec::new(),
     };
@@ -2073,19 +4324,28 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        eprintln!(
-            "[tenon llm] OpenAI-compatible v5 SSE server listening on http://{} (Radix KV {} slots, tools/json_schema, speculative={:?})",
-            addr, actual_slots, cfg.spec_mode
-        );
+        let (engine_tx, engine_rx) = std_mpsc::channel::<EngineCmd>();
         let state = Arc::new(ServerState {
-            meta,
-            model: Mutex::new(loaded),
-            queue_sem: Semaphore::new(1),
+            meta: meta.clone(),
+            engine_tx,
             queued_reqs: AtomicUsize::new(0),
+            active_batch: AtomicUsize::new(0),
+            cb_batches_run: AtomicU64::new(0),
+            cb_max_batch: AtomicUsize::new(0),
             total_reqs: AtomicU64::new(0),
             radix_hits: AtomicU64::new(0),
             radix_saved_toks: AtomicU64::new(0),
         });
+        let st_eng = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name("tenon-cb-engine".into())
+            .spawn(move || cb_engine_loop(loaded, engine_rx, st_eng))
+            .expect("spawn continuous batching engine thread");
+
+        eprintln!(
+            "[tenon llm] OpenAI-compatible v6 Continuous-Batching Server listening on http://{} (PagedKV {} blks, COW Fork, json_schema+GBNF, /v1/embeddings, /v1/rerank, mmproj={})",
+            addr, pa_blocks, meta.has_mmproj
+        );
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -2100,6 +4360,36 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
                 }
             }
         }
+    }
+
+    if let Some(ref img_p) = image_path {
+        if loaded.mmproj_handle <= 0 {
+            eprintln!("error: --image requires --mmproj <mmproj.gguf>");
+            return ExitCode::from(2);
+        }
+        let img = match decode_image_url_to_rgb(img_p) {
+            Ok(im) => im,
+            Err(e) => {
+                eprintln!("error decoding image `{}`: {}", img_p, e);
+                return ExitCode::from(1);
+            }
+        };
+        let q = chat_msg.or(prompt).unwrap_or_else(|| "Describe this image in one sentence.".to_string());
+        let res = run_multimodal_generation(&mut loaded, &q, &img, &cfg, |piece| {
+            print!("{}", piece);
+            let _ = io::stdout().flush();
+            true
+        });
+        println!();
+        eprintln!(
+            "[tenon llm] vision prefill: {} toks in {:.1} ms | decode: {} toks in {:.1} ms ({:.2} tok/s)",
+            res.prompt_tokens,
+            res.prefill_ms,
+            res.completion_tokens,
+            res.decode_ms,
+            if res.decode_ms > 0.0 { res.completion_tokens as f64 * 1000.0 / res.decode_ms } else { 0.0 }
+        );
+        return ExitCode::SUCCESS;
     }
 
     let final_prompt = if let Some(user_text) = chat_msg {
@@ -2142,4 +4432,80 @@ pub async fn cmd_llm(args: &[String]) -> ExitCode {
         res.spec_proposed
     );
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn accepts(g: &Arc<GbnfGrammar>, s: &str) -> bool {
+        let mut st = GrammarState::new(Arc::clone(g));
+        for &b in s.as_bytes() {
+            if !st.step_byte(b) {
+                return false;
+            }
+        }
+        st.is_accepting()
+    }
+
+    #[test]
+    fn test_recursive_json_schema_compiler() {
+        let schema = json!({
+            "$defs": {
+                "Tag": { "type": "string", "enum": ["gpu", "metal", "cuda"] }
+            },
+            "type": "object",
+            "required": ["name", "version", "tags", "meta"],
+            "properties": {
+                "name": { "type": "string", "pattern": "^[A-Z][a-z]+-[0-9]+$" },
+                "version": { "type": "integer" },
+                "tags": { "type": "array", "items": { "$ref": "#/$defs/Tag" }, "minItems": 1, "maxItems": 3 },
+                "meta": {
+                    "type": "object",
+                    "required": ["ok"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "note": { "anyOf": [{"type": "string"}, {"type": "null"}] }
+                    }
+                }
+            }
+        });
+        let g = Arc::new(GbnfGrammar::from_json_schema(&schema).expect("compile schema"));
+        assert!(accepts(&g, r#"{"name":"Tenon-6","version":6,"tags":["metal","cuda"],"meta":{"ok":true,"note":null}}"#));
+        assert!(accepts(&g, r#"{"name":"Tenon-6","version":6,"tags":["gpu"],"meta":{"ok":false}}"#));
+        // Invalid regex pattern (lowercase first char)
+        assert!(!accepts(&g, r#"{"name":"tenon-6","version":6,"tags":["gpu"],"meta":{"ok":true}}"#));
+        // Invalid float for integer field
+        assert!(!accepts(&g, r#"{"name":"Tenon-6","version":6.5,"tags":["gpu"],"meta":{"ok":true}}"#));
+        // Invalid enum value
+        assert!(!accepts(&g, r#"{"name":"Tenon-6","version":6,"tags":["rocm"],"meta":{"ok":true}}"#));
+        // Violates minItems=1
+        assert!(!accepts(&g, r#"{"name":"Tenon-6","version":6,"tags":[],"meta":{"ok":true}}"#));
+    }
+
+    #[test]
+    fn test_custom_gbnf_grammar_parser() {
+        let gbnf = r#"
+            # Simple SQL-like select grammar
+            root ::= "SELECT " cols " FROM " ident ";"
+            cols ::= ident (", " ident)*
+            ident ::= [a-z_][a-z0-9_]*
+        "#;
+        let g = Arc::new(GbnfGrammar::parse_gbnf(gbnf).expect("parse gbnf"));
+        assert!(accepts(&g, "SELECT id, name_2 FROM users;"));
+        assert!(accepts(&g, "SELECT col FROM t;"));
+        assert!(!accepts(&g, "DROP TABLE users;"));
+        assert!(!accepts(&g, "SELECT 123 FROM t;"));
+    }
+
+    #[test]
+    fn test_ppm_and_bmp_and_base64_image_decoders() {
+        // 2x1 red+blue PPM P6 via base64 data URL (`\xFF\x00\x00\x00\x00\xFF` -> 17 bytes)
+        let ppm = b"P6\n2 1\n255\n\xFF\x00\x00\x00\x00\xFF";
+        let b64 = "UDYKMiAxCjI1NQr/AAAAAP8=";
+        assert_eq!(base64_decode(b64).unwrap(), ppm);
+        let img = decode_image_url_to_rgb(&format!("data:image/x-portable-pixmap;base64,{}", b64)).unwrap();
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(img.rgb, vec![255, 0, 0, 0, 0, 255]);
+    }
 }

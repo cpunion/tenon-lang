@@ -26,6 +26,8 @@ import "std/core/types.tn"
 pub type Int4  = Int8
 pub type FP8   = UInt8
 pub type Q4_0  = UInt8
+pub type Q5_0  = UInt8
+pub type Q5_1  = UInt8
 pub type Q8_0  = UInt8
 pub type Q4_K  = UInt8
 pub type Q5_K  = UInt8

@@ -519,3 +519,39 @@ fn deepseek_v3_mla_latent(
     let (_, plan_mla) = emit_metal::emit_metal_graph_and_plan(&on[1]);
     assert!(plan_mla.contains("mla_latent=576") && plan_mla.contains("spec_k=4"));
 }
+
+#[test]
+fn stage6_v6_paged_cont_batch_marlin_ep_nccl_tree_mtp_mmproj() {
+    let def = GpuOptConfig::default();
+    assert!(def.paged_cont_batch && def.marlin_w4a16_mma && def.moe_ep_nccl && def.tree_spec_mtp_mm);
+    let src = r#"
+@gpu_graph("stream:vram=48G,ram=128G,layers=27,experts=64,topk=6,ctx=16384,kv_dim=2048,mla=576,ep=2,cb=8,tree=7,mtp=1,mmproj=256")
+fn deepseek_v2_lite_ep2_v6(
+    x        Matrix[1, 2048, Float16],
+    w_kv_a   Matrix[2048, 576, Q4_K],
+    exp_gate Matrix[2048, 1408, Q4_K],
+    exp_up   Matrix[2048, 1408, Q4_K],
+    exp_down Matrix[1408, 2048, Q5_0],
+) Matrix[1, 2048, Float16] {
+    let g = tg_silu(tg_matmul(x, exp_gate))
+    let u = tg_matmul(x, exp_up)
+    let h = tg_mul(g, u)
+    tg_matmul(h, exp_down)
+}
+"#;
+    let prog = tenon_syntax::parse(src).expect("parse v6 stage6");
+    let on = compile_universal_graphs(&prog, GpuOptConfig::default());
+    assert_eq!(on.len(), 1);
+    let hp = &on[0].hetero_plan;
+    assert_eq!(hp.ep_devices, 2);
+    assert!(hp.nccl_collectives && hp.marlin_cp_async && hp.cow_prefix_blocks);
+    assert_eq!(hp.cont_batch_slots, 8);
+    assert_eq!(hp.tree_spec_width, 7);
+    assert_eq!(hp.mtp_nextn_layers, 1);
+    assert_eq!(hp.vision_mmproj_tokens, 256);
+    assert_eq!(hp.dispatch_mode, hetero_stream::HeteroDispatchMode::ResidentGpu);
+    let cuda = emit_cuda_tpu::emit_universal_cuda(&on[0]);
+    assert!(cuda.contains("ep=2 (MoE EP + NCCL=true)") && cuda.contains("Marlin cp.async+lop3=true") && cuda.contains("tree_w=7 mtp=1 mmproj=256"));
+    let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
+    assert!(plan.contains("ep=2|nccl=1|marlin=1|cb_slots=8|cow_kv=1") && plan.contains("tree_w=7|mtp=1|mmproj=256"));
+}
