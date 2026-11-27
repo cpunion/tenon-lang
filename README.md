@@ -1,5 +1,7 @@
 # Tenon 语言设计与技术方案（已拍板定稿）
 
+> **跨框架综合实测报告**: 详见 [`benchmarks/TENON_V11_BENCHMARK_REPORT.md`](benchmarks/TENON_V11_BENCHMARK_REPORT.md)（Tenon v11 对比上游 `llama.cpp`、`ik_llama.cpp`、`BigMoeOnEdge`、`mistral.rs`、`KTransformers`、`t8/hypura`、`PyTorch 2.8`/`cublasLt`、`JAX 0.11.2`、`Apple MPS`，覆盖 6 大开源模型与 Metal / CUDA / TPU 三大芯片平台）。
+
 > **Working Codename**: `Tenon`（榫卯）—— 寓意**强约束精化类型、分层形式化验证、无别名污染的内存模型、系统级版本演化与可验证分布式协议**严丝合缝。  
 > **状态**: 核心架构已定稿（[ADR-0001](docs/adr/0001-architecture-decisions.md)、[ADR-0002](docs/adr/0002-interfaces-comptime-and-stdlib.md) & [ADR-0003](docs/adr/0003-declarative-gpu-and-unified-ui.md)），**极简正交语言核心（零新增硬关键字）→ 完整系统编程能力（S1/S2/S3）→ 声明式 CPU/GPU 融合（`@gpu_struct` / `@kernel` / `@gpu_graph` 真正 AST 级 MSL+WGSL 算子融合、`gpu_shared_f32` + `gpu_barrier()` 与 `E0842`/`E0843` 静态并发安全证明、`--emit-webgpu` 浏览器 WebGPU ESM 桥、零 Rust Metal/Vulkan HAL、Const-Generic 依赖维度 `Matrix[R, C]`）→ OpenUI Lang + 统一 React 风格 VDOM（真增量 Surgical VDOM Patcher + OpenAI/Ollama SSE 流式生成 + 双缓冲信号安全 TUI + 原生 Metal GPU `tenon-gpui` 动态 R8 中英文 Glyph Atlas / 缩放 / 滚轮 / 悬停 / 量化 K 线桌面工作台）→ 自动循环累积不变量推导 + `.tenon-cache` 持久化验证缓存 → Stage-3 纯 Tenon 零 Rust 自举固定点编译器（`sha256(stage3.ll) == sha256(stage4.ll)` & `sha256(stage3.o) == sha256(stage4.o)`）→ LSP 1.5 实时证明/GPU 融合 CodeLens 与反例一键转测试**（Rust 1.100.0 + Z3 + Cranelift Dev JIT + **LLVM 22 `-O3` AOT 独立原生二进制**）。
 > **上游沉淀**: 综合 [`loom-lang`](../loom-lang)（984 PR 自举实践）、[`lang-research`](../lang-research)（2026-11 多语言可复现实验）与 [`dast-os-kernel`](../../dast.ai/dast-os-kernel/README.md)（227 轮分布式调和内核审计），并结合 2025–2026 全球最新编程语言与形式化验证进展形成的全新通用编程语言设计。
