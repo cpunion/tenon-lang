@@ -45,7 +45,7 @@ pub fn emit_universal_cuda(cg: &CompiledUniversalGraph) -> String {
             "// [Stage 6 Heterogeneous Streaming Plan]\n\
              //   mode={} | tp={} (P2P AllReduce) | ep={} (MoE EP + NCCL={}) | hybrid_2d={} | cb_slots={} (PagedKV-16 COW={}, chunk_pf={}) | mla_latent={} | vram_cap={:.2}GiB | core_vram={:.2}GiB | pinned_ffn={}/{} | lru_slots={}/{} | kv_q8={} (saved {:.1}MB)\n\
              //   dma_ring={} (cuStreamWaitEvent compute_stream || dma_stream, indirect d_step_args CUDA Graph, async_promoter={})\n\
-             //   cpu_hybrid: NUMA_first_touch_4R={} | cgroup_main_tid0={} | AVX2 _mm256_madd_epi16 INT16 (B=8 shared-weight) | prefill_B={} (Marlin cp.async+lop3={} mma.sync m16n8k16, sb_shx={}) | spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} lora_r={} fp8_mxfp4={}\n\
+             //   cpu_hybrid: NUMA_first_touch_4R={} | cgroup_main_tid0={} | AVX2 _mm256_madd_epi16 INT16 (B=8 shared-weight) | prefill_B={} (Marlin cp.async+lop3={} mma.sync m16n8k16, sb_shx={}, fp8_tc={}, q4k_marlin={}) | paged_univ={} moe_grp={} spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} audio_mel={} vis_cache={} lora_r={} fp8_mxfp4={}\n\
              //   roofline_proj: decode={:.2} tok/s | batched_prefill={:.1} tok/s\n",
             hp.dispatch_mode.tag(),
             hp.tp_devices,
@@ -71,12 +71,18 @@ pub fn emit_universal_cuda(cg: &CompiledUniversalGraph) -> String {
             hp.prefill_chunk_tokens,
             hp.marlin_cp_async,
             hp.small_batch_shared_x,
+            hp.fp8_mxfp4_tc_amx,
+            hp.q4k_q6k_marlin,
+            hp.paged_cb_tp_mla_spec,
+            hp.moe_grouped_gemm,
             hp.speculative_k,
             hp.tree_spec_width,
             hp.mtp_nextn_layers,
             hp.vision_mmproj_tokens,
             hp.vision_anyres_tiles,
             hp.vision_mrope_2d,
+            hp.audio_mel_tokens,
+            hp.vision_prefix_cache,
             hp.lora_max_rank,
             hp.fp8_mxfp4_native,
             hp.projected_decode_tok_s,
@@ -560,7 +566,7 @@ pub fn emit_universal_stablehlo(cg: &CompiledUniversalGraph) -> String {
             "// [Stage 6 Heterogeneous Streaming Plan]\n\
              //   mode={} | tp={} (P2P AllReduce) | ep={} (MoE EP + NCCL={}) | hybrid_2d={} | cb_slots={} (PagedKV-16 COW={}, chunk_pf={}) | mla_latent={} | vram_cap={:.2}GiB | core_vram={:.2}GiB | pinned_ffn={}/{} | lru_slots={}/{} | kv_q8={} (saved {:.1}MB)\n\
              //   dma_ring={} (cuStreamWaitEvent compute_stream || dma_stream, indirect d_step_args CUDA Graph, async_promoter={})\n\
-             //   cpu_hybrid: NUMA_first_touch_4R={} | cgroup_main_tid0={} | AVX2 _mm256_madd_epi16 INT16 (B=8 shared-weight) | prefill_B={} (Marlin cp.async+lop3={} mma.sync m16n8k16, sb_shx={}) | spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} lora_r={} fp8_mxfp4={}\n\
+             //   cpu_hybrid: NUMA_first_touch_4R={} | cgroup_main_tid0={} | AVX2 _mm256_madd_epi16 INT16 (B=8 shared-weight) | prefill_B={} (Marlin cp.async+lop3={} mma.sync m16n8k16, sb_shx={}, fp8_tc={}, q4k_marlin={}) | paged_univ={} moe_grp={} spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} audio_mel={} vis_cache={} lora_r={} fp8_mxfp4={}\n\
              //   roofline_proj: decode={:.2} tok/s | batched_prefill={:.1} tok/s\n",
             hp.dispatch_mode.tag(),
             hp.tp_devices,
@@ -586,12 +592,18 @@ pub fn emit_universal_stablehlo(cg: &CompiledUniversalGraph) -> String {
             hp.prefill_chunk_tokens,
             hp.marlin_cp_async,
             hp.small_batch_shared_x,
+            hp.fp8_mxfp4_tc_amx,
+            hp.q4k_q6k_marlin,
+            hp.paged_cb_tp_mla_spec,
+            hp.moe_grouped_gemm,
             hp.speculative_k,
             hp.tree_spec_width,
             hp.mtp_nextn_layers,
             hp.vision_mmproj_tokens,
             hp.vision_anyres_tiles,
             hp.vision_mrope_2d,
+            hp.audio_mel_tokens,
+            hp.vision_prefix_cache,
             hp.lora_max_rank,
             hp.fp8_mxfp4_native,
             hp.projected_decode_tok_s,

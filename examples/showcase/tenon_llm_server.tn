@@ -1,16 +1,14 @@
 // examples/showcase/tenon_llm_server.tn
-// Pure-Tenon Zero-Rust Single-Binary Continuous-Batching OpenAI HTTP + SSE + Embeddings Server (< 450 KiB)!
+// Pure-Tenon Zero-Rust Single-Binary Production LLM Server v8 (< 500 KiB, Apple Metal)!
 //
-// Tenon v7 Features:
-//   - Zero Rust, Zero Tokio, Zero Python, Zero Docker — compiles via `tenon build` to a < 450 KiB native binary!
-//   - Single-threaded OS `kqueue`/`epoll` Reactor (`std/net/reactor.tn`) multiplexing up to 8 concurrent LLM clients!
-//   - Iteration-level Continuous Batching (`tn_moe_step_batch`) + Zero-Copy PagedAttention COW Prefix Sharing (`tn_moe_paged_seq_fork` + `tn_moe_paged_prefill`)!
-//   - Serves:
-//       * `GET  /health`                (engine, arch, PagedKV blocks, COW forks, max_batch_seen, cb_batches_run)
-//       * `GET  /v1/models`             (OpenAI models list)
-//       * `POST /v1/chat/completions`   (Continuous-Batched OpenAI JSON + live token-by-token `text/event-stream` SSE!)
-//       * `POST /v1/completions`        (Continuous-Batched raw completion JSON + SSE!)
-//       * `POST /v1/embeddings`         (L2-normalized hidden-state embeddings via `tn_moe_embed_text`)
+// Tenon v8 Features:
+//   - Zero Rust, Zero Tokio, Zero Python, Zero Docker — compiles via `tenon build` to a < 500 KiB native binary!
+//   - Single-threaded OS `kqueue` Reactor (`std/net/reactor.tn`) multiplexing up to 8 concurrent LLM clients!
+//   - Universal PagedAttention Continuous Batching (`tn_moe_step_batch`) + Zero-Copy COW Prefix Fork (`tn_moe_paged_seq_fork`)!
+//   - Chunked Prefill Interleaving (`TENON_PREFILL_CHUNK`, default 64 tokens/tick) so long prompts never stall active decoders!
+//   - Multi-Tenant Zero-Copy Runtime LoRA Hot-Swapping (`TENON_LORA=name=path,name2=path2`, JSON `"lora":"name"`)!
+//   - Prometheus `GET /metrics` (OpenMetrics text/plain) + `GET /health` + `POST /shutdown` Graceful Drain!
+//   - Cross-platform Linux/NVIDIA CUDA counterpart: `examples/showcase/tenon_llm_server_cuda.tn`!
 //
 // Build & Run:
 //   tenon build examples/showcase/tenon_llm_server.tn -o /tmp/tenon_llm_server
@@ -27,6 +25,7 @@ import "std/gpu/metal/moe_stream.tn"
 const MAX_CB Int = 8
 const MAX_RD Int = 32
 const HIST_STRIDE Int = 512
+const MAX_LORAS Int = 8
 
 pure fn find_hdr_end(s Text) Int {
     let n = len(s)
@@ -65,9 +64,40 @@ pure fn parse_cl(hdr Text) Int {
     0
 }
 
+pure fn parse_pos_int(s Text, fallback Int) Int {
+    let n = len(s)
+    if n == 0 { return fallback }
+    var acc = 0
+    var i = 0
+    while i < n {
+        let c = byte_at(s, i)
+        if c < 48 || c > 57 { return fallback }
+        acc = acc * 10 + (c - 48)
+        i += 1
+    }
+    if acc > 0 { acc } else { fallback }
+}
+
+pure fn find_byte_from(s Text, ch Int, start Int) Int {
+    let n = len(s)
+    var i = start
+    while i < n {
+        if byte_at(s, i) == ch { return i }
+        i += 1
+    }
+    -1
+}
+
 fn write_json_http(cfd Int, status Int, reason Text, body Text) {
     let resp = "HTTP/1.1 " ++ int_to_text(status) ++ " " ++ reason
         ++ "\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
+        ++ int_to_text(len(body)) ++ "\r\nConnection: close\r\n\r\n" ++ body
+    let _ = net_write_text(cfd, resp)
+}
+
+fn write_text_http(cfd Int, status Int, reason Text, ctype Text, body Text) {
+    let resp = "HTTP/1.1 " ++ int_to_text(status) ++ " " ++ reason
+        ++ "\r\nContent-Type: " ++ ctype ++ "\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
         ++ int_to_text(len(body)) ++ "\r\nConnection: close\r\n\r\n" ++ body
     let _ = net_write_text(cfd, resp)
 }
@@ -223,7 +253,7 @@ fn send_final_cb_response(
     timings = json_obj_set(timings, "decode_ms", JFloat(dec_ms))
 
     var resp = json_obj_new()
-    resp = json_obj_set(resp, "id", JStr("chatcmpl-tenon-native-cb"))
+    resp = json_obj_set(resp, "id", JStr("chatcmpl-tenon-native-v8"))
     resp = json_obj_set(resp, "object", JStr(if is_chat { "chat.completion" } else { "text_completion" }))
     resp = json_obj_set(resp, "model", JStr(model_name))
     resp = json_obj_set(resp, "choices", choices)
@@ -286,6 +316,8 @@ fn main() Int {
     }
     let addr_env = sys_env("TENON_ADDR")
     let addr = if len(addr_env) > 0 { addr_env } else { "127.0.0.1:28091" }
+    let chunk_env = sys_env("TENON_PREFILL_CHUNK")
+    let prefill_chunk = parse_pos_int(chunk_env, 64)
     let model_name = "tenon-native-gguf"
 
     var plan List[Int] = list_filled(9, 0)
@@ -302,9 +334,35 @@ fn main() Int {
     let eos = unsafe { tn_moe_info(handle, 12) }
     let pa_init_blks = unsafe { tn_moe_paged_kv_info(handle, 1) }
 
+    // Load optional Multi-Tenant Zero-Copy LoRAs from `TENON_LORA=name=path,name2=path2`
+    var lora_names List[Text] = []
+    var lora_ids List[Int] = []
+    let lora_env = sys_env("TENON_LORA")
+    if len(lora_env) > 0 {
+        var pos_l = 0
+        let n_le = len(lora_env)
+        while pos_l < n_le && len(lora_names) < MAX_LORAS {
+            let comma = find_byte_from(lora_env, 44, pos_l)
+            let end_l = if comma >= 0 { comma } else { n_le }
+            let spec = str_slice(lora_env, pos_l, end_l)
+            let eq = find_byte_from(spec, 61, 0)
+            if eq > 0 && eq + 1 < len(spec) {
+                let lname = str_slice(spec, 0, eq)
+                let lpath = str_slice(spec, eq + 1, len(spec))
+                let lid = unsafe { tn_moe_lora_load(handle, text_cstr_ptr(lpath), 1.0) }
+                if lid > 0 {
+                    lora_names = push(lora_names, lname)
+                    lora_ids = push(lora_ids, lid)
+                    println("[tenon-native-v8] loaded zero-copy LoRA `" ++ lname ++ "` (id=" ++ int_to_text(lid) ++ ")")
+                }
+            }
+            pos_l = if comma >= 0 { comma + 1 } else { n_le }
+        }
+    }
+
     let lfd = net_tcp_listen(addr)
     if lfd < 0 {
-        println("[tenon-native-cb] listen failed on [" ++ addr ++ "]")
+        println("[tenon-native-v8] listen failed on [" ++ addr ++ "]")
         model.destroy()
         return 1
     }
@@ -313,8 +371,9 @@ fn main() Int {
     let rfd = reactor_new()
     let _ = reactor_add(rfd, lfd, EVENT_READ, 0)
 
-    println("[tenon-native-cb] Pure-Tenon Zero-Rust CB Server v7 listening on http://" ++ addr
-        ++ " (port=" ++ int_to_text(port) ++ ", arch=" ++ arch ++ ", pa_blks=" ++ int_to_text(pa_init_blks) ++ ", max_cb=" ++ int_to_text(MAX_CB) ++ ")")
+    println("[tenon-native-v8] Pure-Tenon Zero-Rust Unified Server v8 (Metal) listening on http://" ++ addr
+        ++ " (port=" ++ int_to_text(port) ++ ", arch=" ++ arch ++ ", pa_blks=" ++ int_to_text(pa_init_blks)
+        ++ ", chunk=" ++ int_to_text(prefill_chunk) ++ ", loras=" ++ int_to_text(len(lora_names)) ++ ", max_cb=" ++ int_to_text(MAX_CB) ++ ")")
 
     // Non-blocking HTTP connection read slots (`rd_fds[i] == -1` => free)
     var rd_fds List[Int] = list_filled(MAX_RD, -1)
@@ -325,8 +384,8 @@ fn main() Int {
     var q_chat List[Int] = []
     var q_body List[Text] = []
 
-    // Continuous Batching active sequence slots (`0..MAX_CB-1`) + COW prefix history
-    var cb_active List[Int] = list_filled(MAX_CB, 0)
+    // Continuous Batching slot state: 0=free, 1=chunked-prefilling, 2=active-decoding
+    var cb_state List[Int] = list_filled(MAX_CB, 0)
     var cb_cfd List[Int] = list_filled(MAX_CB, -1)
     var cb_chat List[Int] = list_filled(MAX_CB, 1)
     var cb_stream List[Int] = list_filled(MAX_CB, 0)
@@ -336,6 +395,11 @@ fn main() Int {
     var cb_tok List[Int] = list_filled(MAX_CB, 0)
     var cb_ptoks List[Int] = list_filled(MAX_CB, 0)
     var cb_cached List[Int] = list_filled(MAX_CB, 0)
+    var cb_lora List[Int] = list_filled(MAX_CB, 0)
+    var cb_pf_cur List[Int] = list_filled(MAX_CB, 0)
+    var cb_pf_end List[Int] = list_filled(MAX_CB, 0)
+    var cb_pf_chunked List[Int] = list_filled(MAX_CB, 0)
+    var cb_tpf0 List[Float] = list_filled(MAX_CB, 0.0)
     var cb_lru List[Int] = list_filled(MAX_CB, 0)
     var cb_pf_ms List[Float] = list_filled(MAX_CB, 0.0)
     var cb_tdec List[Float] = list_filled(MAX_CB, 0.0)
@@ -343,13 +407,15 @@ fn main() Int {
 
     var hist_ids List[Int] = list_filled(MAX_CB * HIST_STRIDE, 0)
     var hist_len List[Int] = list_filled(MAX_CB, 0)
+    var pf_ids List[Int] = list_filled(MAX_CB * HIST_STRIDE, 0)
 
-    // Reusable step_batch buffers
+    // Reusable step_batch & chunked prefill scratch buffers
     var b_toks List[Int] = list_filled(MAX_CB, 0)
     var b_pos List[Int] = list_filled(MAX_CB, 0)
     var b_slots List[Int] = list_filled(MAX_CB, 0)
     var b_out List[Int] = list_filled(MAX_CB, 0)
     var tok_scratch List[Int] = list_filled(HIST_STRIDE, 0)
+    var chunk_buf List[Int] = list_filled(HIST_STRIDE, 0)
 
     // Server telemetry
     var clock_tick = 0
@@ -358,20 +424,27 @@ fn main() Int {
     var max_batch_seen = 0
     var cow_forks = 0
     var cow_saved_toks = 0
+    var chunked_prefill_chunks = 0
+    var active_lora_id = 0
+    var lora_swaps = 0
+    var draining = false
 
     var running = true
     while running {
-        var n_active = 0
+        var n_dec = 0
+        var n_pf = 0
         var ai = 0
         while ai < MAX_CB {
-            if cb_active[ai] != 0 {
-                n_active += 1
-            }
+            if cb_state[ai] == 2 { n_dec += 1 }
+            if cb_state[ai] == 1 { n_pf += 1 }
             ai += 1
         }
+        if draining && n_dec == 0 && n_pf == 0 && len(q_cfd) == 0 {
+            running = false
+            break
+        }
 
-        // Wait on OS kqueue/epoll reactor (0ms non-blocking poll when actively decoding a batch, 15ms idle sleep!)
-        let wait_ms = if n_active > 0 || len(q_cfd) > 0 { 0 } else { 15 }
+        let wait_ms = if n_dec > 0 || n_pf > 0 || len(q_cfd) > 0 { 0 } else { 15 }
         let evs = reactor_wait(rfd, wait_ms, 64)
         var ei = 0
         while ei < len(evs) {
@@ -434,20 +507,15 @@ fn main() Int {
                     if hend >= 0 {
                         let clen = parse_cl(str_slice(buf, 0, hend))
                         if len(buf) >= hend + 4 + clen {
-                            // Full HTTP request received! Unregister & restore blocking mode for clean writes
                             let _ = reactor_del(rfd, tok)
                             let _ = net_set_nonblocking(tok, false)
                             rd_fds[rslot] = -1
                             rd_bufs[rslot] = ""
 
                             var sp1 = 0
-                            while sp1 < hend && byte_at(buf, sp1) != 32 {
-                                sp1 += 1
-                            }
+                            while sp1 < hend && byte_at(buf, sp1) != 32 { sp1 += 1 }
                             var sp2 = sp1 + 1
-                            while sp2 < hend && byte_at(buf, sp2) != 32 {
-                                sp2 += 1
-                            }
+                            while sp2 < hend && byte_at(buf, sp2) != 32 { sp2 += 1 }
                             let method = str_slice(buf, 0, sp1)
                             let path = str_slice(buf, sp1 + 1, sp2)
                             let body = if clen > 0 && hend + 4 + clen <= len(buf) {
@@ -469,16 +537,26 @@ fn main() Int {
                                 var cur_act = 0
                                 var ci = 0
                                 while ci < MAX_CB {
-                                    if cb_active[ci] != 0 { cur_act += 1 }
+                                    if cb_state[ci] != 0 { cur_act += 1 }
                                     ci += 1
                                 }
+                                var la = json_arr_new()
+                                var li = 0
+                                while li < len(lora_names) {
+                                    la = json_arr_push(la, JStr(lora_names[li]))
+                                    li += 1
+                                }
                                 var obj = json_obj_new()
-                                obj = json_obj_set(obj, "status", JStr("ok"))
-                                obj = json_obj_set(obj, "engine", JStr("tenon-native-zero-rust-cb-v7"))
+                                obj = json_obj_set(obj, "status", JStr(if draining { "draining" } else { "ok" }))
+                                obj = json_obj_set(obj, "engine", JStr("tenon-native-zero-rust-v8-metal"))
                                 obj = json_obj_set(obj, "arch", JStr(arch))
                                 obj = json_obj_set(obj, "model", JStr(model_name))
                                 obj = json_obj_set(obj, "n_layers", JInt(n_layers))
                                 obj = json_obj_set(obj, "d_model", JInt(d_model))
+                                obj = json_obj_set(obj, "prefill_chunk_size", JInt(prefill_chunk))
+                                obj = json_obj_set(obj, "chunked_prefill_chunks", JInt(chunked_prefill_chunks))
+                                obj = json_obj_set(obj, "lora_adapters", la)
+                                obj = json_obj_set(obj, "lora_swaps", JInt(lora_swaps))
                                 obj = json_obj_set(obj, "paged_kv_blocks", JInt(pa_tot))
                                 obj = json_obj_set(obj, "paged_kv_free_blocks", JInt(pa_free))
                                 obj = json_obj_set(obj, "paged_cow_forks", JInt(pa_forks))
@@ -490,6 +568,42 @@ fn main() Int {
                                 obj = json_obj_set(obj, "total_requests", JInt(total_reqs))
                                 obj = json_obj_set(obj, "core_vram_bytes", JInt(vram))
                                 write_json_http(tok, 200, "OK", obj.stringify())
+                                let _ = net_close(tok)
+                            } else if method == "GET" && path == "/metrics" {
+                                let pa_tot = unsafe { tn_moe_paged_kv_info(handle, 1) }
+                                let pa_free = unsafe { tn_moe_paged_kv_info(handle, 2) }
+                                let pa_forks = unsafe { tn_moe_paged_kv_info(handle, 4) }
+                                var cur_act = 0
+                                var ci = 0
+                                while ci < MAX_CB {
+                                    if cb_state[ci] != 0 { cur_act += 1 }
+                                    ci += 1
+                                }
+                                var mt = TextBuilder.new()
+                                mt.push_str("# HELP tenon_requests_total Total HTTP requests\n# TYPE tenon_requests_total counter\ntenon_requests_total ")
+                                mt.push_str(int_to_text(total_reqs))
+                                mt.push_str("\n# HELP tenon_active_batch_size Current active CB sequences\n# TYPE tenon_active_batch_size gauge\ntenon_active_batch_size ")
+                                mt.push_str(int_to_text(cur_act))
+                                mt.push_str("\n# HELP tenon_cb_batches_total Total CB iterations\n# TYPE tenon_cb_batches_total counter\ntenon_cb_batches_total ")
+                                mt.push_str(int_to_text(cb_batches_run))
+                                mt.push_str("\n# HELP tenon_paged_kv_blocks_total Total PagedKV blocks\n# TYPE tenon_paged_kv_blocks_total gauge\ntenon_paged_kv_blocks_total ")
+                                mt.push_str(int_to_text(pa_tot))
+                                mt.push_str("\n# HELP tenon_paged_kv_blocks_free Free PagedKV blocks\n# TYPE tenon_paged_kv_blocks_free gauge\ntenon_paged_kv_blocks_free ")
+                                mt.push_str(int_to_text(pa_free))
+                                mt.push_str("\n# HELP tenon_paged_cow_forks_total COW prefix forks\n# TYPE tenon_paged_cow_forks_total counter\ntenon_paged_cow_forks_total ")
+                                mt.push_str(int_to_text(pa_forks))
+                                mt.push_str("\n# HELP tenon_chunked_prefill_chunks_total Chunked prefill ticks\n# TYPE tenon_chunked_prefill_chunks_total counter\ntenon_chunked_prefill_chunks_total ")
+                                mt.push_str(int_to_text(chunked_prefill_chunks))
+                                mt.push_str("\n# HELP tenon_lora_swaps_total Runtime LoRA swaps\n# TYPE tenon_lora_swaps_total counter\ntenon_lora_swaps_total ")
+                                mt.push_str(int_to_text(lora_swaps))
+                                mt.push_str("\n# HELP tenon_draining Graceful shutdown drain state\n# TYPE tenon_draining gauge\ntenon_draining ")
+                                mt.push_str(if draining { "1" } else { "0" })
+                                mt.push_str("\n")
+                                write_text_http(tok, 200, "OK", "text/plain; version=0.0.4", mt.finish())
+                                let _ = net_close(tok)
+                            } else if method == "POST" && path == "/shutdown" {
+                                draining = true
+                                write_json_http(tok, 200, "OK", "{\"status\":\"draining\"}")
                                 let _ = net_close(tok)
                             } else if method == "GET" && path == "/v1/models" {
                                 var item = json_obj_new()
@@ -504,12 +618,22 @@ fn main() Int {
                                 write_json_http(tok, 200, "OK", obj.stringify())
                                 let _ = net_close(tok)
                             } else if method == "POST" && path == "/v1/embeddings" {
-                                handle_embeddings(tok, handle, model_name, body)
+                                if draining {
+                                    write_json_http(tok, 503, "Service Unavailable", "{\"error\":\"server draining\"}")
+                                    let _ = net_close(tok)
+                                } else {
+                                    handle_embeddings(tok, handle, model_name, body)
+                                }
                             } else if method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions") {
-                                total_reqs += 1
-                                q_cfd = push(q_cfd, tok)
-                                q_chat = push(q_chat, if path == "/v1/chat/completions" { 1 } else { 0 })
-                                q_body = push(q_body, body)
+                                if draining {
+                                    write_json_http(tok, 503, "Service Unavailable", "{\"error\":\"server draining\"}")
+                                    let _ = net_close(tok)
+                                } else {
+                                    total_reqs += 1
+                                    q_cfd = push(q_cfd, tok)
+                                    q_chat = push(q_chat, if path == "/v1/chat/completions" { 1 } else { 0 })
+                                    q_body = push(q_body, body)
+                                }
                             } else {
                                 write_json_http(tok, 404, "Not Found", "{\"error\":\"unknown endpoint\"}")
                                 let _ = net_close(tok)
@@ -531,19 +655,16 @@ fn main() Int {
             ei += 1
         }
 
-        // Admit pending generation requests into free PagedAttention CB slots (with Zero-Copy COW Fork!)
+        // Admit pending generation requests into free PagedAttention CB slots (Chunked Prefill + COW Fork + Multi-LoRA!)
         var q_head = 0
         while q_head < len(q_cfd) {
-            // Count free slots
             var free_cnt = 0
             var fi = 0
             while fi < MAX_CB {
-                if cb_active[fi] == 0 { free_cnt += 1 }
+                if cb_state[fi] == 0 { free_cnt += 1 }
                 fi += 1
             }
-            if free_cnt == 0 {
-                break
-            }
+            if free_cnt == 0 { break }
             let cfd = q_cfd[q_head]
             let is_chat = q_chat[q_head] != 0
             let body = q_body[q_head]
@@ -557,6 +678,19 @@ fn main() Int {
                 Ok(jv) => {
                     let want_stream = match json_get_bool(jv, "stream") { Some(b) => b, None => false }
                     let max_toks = match json_get_int(jv, "max_tokens") { Some(n) => n, None => 48 }
+                    let req_lora = match json_get_str(jv, "lora") { Some(s) => s, None => "" }
+                    var lid_sel = 0
+                    if len(req_lora) > 0 {
+                        var li = 0
+                        while li < len(lora_names) {
+                            if lora_names[li] == req_lora {
+                                lid_sel = lora_ids[li]
+                                li = len(lora_names)
+                            } else {
+                                li += 1
+                            }
+                        }
+                    }
                     let prompt = if is_chat {
                         match json_get(jv, "messages") {
                             Some(msgs) => format_chat(arch, msgs)
@@ -575,10 +709,10 @@ fn main() Int {
                         ti += 1
                     }
 
-                    // Find longest common prefix across ALL slots (active OR cached!) for Zero-Copy COW Fork!
+                    // Find longest common prefix across ALL slots for Zero-Copy COW Fork (base model only!)
                     var best_src = -1
                     var best_lcp = 0
-                    let max_reuse = if n_prompt > 1 { n_prompt - 1 } else { 0 }
+                    let max_reuse = if lid_sel == 0 && n_prompt > 1 { n_prompt - 1 } else { 0 }
                     var si = 0
                     while si < MAX_CB {
                         let slen = hist_len[si]
@@ -597,12 +731,11 @@ fn main() Int {
                         si += 1
                     }
 
-                    // Pick LRU free dst slot (avoiding best_src if another free slot exists!)
                     var dst = -1
                     var best_lru = 9223372036854775800
                     var di = 0
                     while di < MAX_CB {
-                        if cb_active[di] == 0 {
+                        if cb_state[di] == 0 {
                             if !(best_lcp > 0 && di == best_src && free_cnt > 1) {
                                 if cb_lru[di] < best_lru {
                                     best_lru = cb_lru[di]
@@ -615,84 +748,47 @@ fn main() Int {
                     if dst < 0 {
                         di = 0
                         while di < MAX_CB {
-                            if cb_active[di] == 0 { dst = di; di = MAX_CB } else { di += 1 }
+                            if cb_state[di] == 0 { dst = di; di = MAX_CB } else { di += 1 }
                         }
                     }
 
                     clock_tick += 1
                     cb_lru[dst] = clock_tick
 
-                    let t0 = moe_now_ms()
                     var actual_lcp = 0
-                    var first_tok = eos
                     if best_lcp > 0 && best_src >= 0 && best_src != dst {
                         let _ = unsafe { tn_moe_paged_seq_fork(handle, best_src, dst, best_lcp) }
                         cow_forks += 1
                         cow_saved_toks += best_lcp
                         actual_lcp = best_lcp
-                        let suf_n = n_prompt - actual_lcp
-                        var suf List[Int] = list_filled(suf_n, 0)
-                        var k = 0
-                        while k < suf_n {
-                            suf[k] = ids[actual_lcp + k]
-                            k += 1
-                        }
-                        first_tok = unsafe { tn_moe_paged_prefill(handle, dst, list_data_ptr(suf), suf_n, actual_lcp) }
                     } else {
                         let _ = unsafe { tn_moe_paged_seq_free(handle, dst) }
-                        first_tok = unsafe { tn_moe_paged_prefill(handle, dst, list_data_ptr(ids), n_prompt, 0) }
-                    }
-                    let pf_ms = moe_now_ms() - t0
-
-                    // Record prompt history for subsequent zero-copy COW forks
-                    let hbase = dst * HIST_STRIDE
-                    let copy_n = if n_prompt < HIST_STRIDE { n_prompt } else { HIST_STRIDE }
-                    var hi = 0
-                    while hi < copy_n {
-                        hist_ids[hbase + hi] = ids[hi]
-                        hi += 1
-                    }
-                    hist_len[dst] = copy_n
-
-                    if want_stream {
-                        let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
-                        let _ = net_write_text(cfd, hdr)
                     }
 
-                    let piece0 = unsafe { cstr_to_text(tn_moe_token_cstr(handle, first_tok)) }
-                    if is_stop_piece(first_tok, eos, piece0) || max_toks <= 0 {
-                        send_final_cb_response(cfd, model_name, is_chat, want_stream, "", n_prompt, actual_lcp, 0, dst, pf_ms, 0.0, "stop")
-                    } else {
-                        var alive = true
-                        if want_stream {
-                            alive = write_sse_piece(cfd, model_name, is_chat, piece0)
-                        }
-                        if copy_n < HIST_STRIDE {
-                            hist_ids[hbase + copy_n] = first_tok
-                            hist_len[dst] = copy_n + 1
-                        }
-                        if !alive || max_toks <= 1 {
-                            send_final_cb_response(cfd, model_name, is_chat, want_stream, piece0, n_prompt, actual_lcp, 1, dst, pf_ms, 0.0, if !alive { "stop" } else { "length" })
-                        } else {
-                            cb_active[dst] = 1
-                            cb_cfd[dst] = cfd
-                            cb_chat[dst] = if is_chat { 1 } else { 0 }
-                            cb_stream[dst] = if want_stream { 1 } else { 0 }
-                            cb_max[dst] = max_toks
-                            cb_gen[dst] = 1
-                            cb_pos[dst] = n_prompt
-                            cb_tok[dst] = first_tok
-                            cb_ptoks[dst] = n_prompt
-                            cb_cached[dst] = actual_lcp
-                            cb_pf_ms[dst] = pf_ms
-                            cb_tdec[dst] = moe_now_ms()
-                            cb_text[dst] = piece0
-                        }
+                    // Copy prompt tokens into slot's chunked prefill buffer
+                    let pbase = dst * HIST_STRIDE
+                    var pi = 0
+                    while pi < n_prompt {
+                        pf_ids[pbase + pi] = ids[pi]
+                        pi += 1
                     }
+                    cb_state[dst] = 1
+                    cb_cfd[dst] = cfd
+                    cb_chat[dst] = if is_chat { 1 } else { 0 }
+                    cb_stream[dst] = if want_stream { 1 } else { 0 }
+                    cb_max[dst] = max_toks
+                    cb_gen[dst] = 0
+                    cb_ptoks[dst] = n_prompt
+                    cb_cached[dst] = actual_lcp
+                    cb_lora[dst] = lid_sel
+                    cb_pf_cur[dst] = actual_lcp
+                    cb_pf_end[dst] = n_prompt
+                    cb_pf_chunked[dst] = if (n_prompt - actual_lcp) > prefill_chunk { 1 } else { 0 }
+                    cb_tpf0[dst] = moe_now_ms()
+                    cb_text[dst] = ""
                 }
             }
         }
-        // Compact pending queue if any items were admitted
         if q_head > 0 {
             var n_cfd List[Int] = []
             var n_chat List[Int] = []
@@ -709,70 +805,162 @@ fn main() Int {
             q_body = n_body
         }
 
-        // Gather all active CB sequences and run ONE lockstep GPU `tn_moe_step_batch`!
-        var b_sz = 0
+        // Chunked Prefill Interleaving: advance up to `prefill_chunk` tokens per tick so active decoders never stall!
+        var budget = prefill_chunk
+        var pfs = 0
+        while pfs < MAX_CB && budget > 0 {
+            if cb_state[pfs] == 1 {
+                let cur = cb_pf_cur[pfs]
+                let end_p = cb_pf_end[pfs]
+                let rem = end_p - cur
+                let take = if rem < budget { rem } else { budget }
+                let lid = cb_lora[pfs]
+                if lid != active_lora_id {
+                    let _ = unsafe { tn_moe_lora_set(handle, lid, 1.0) }
+                    active_lora_id = lid
+                    lora_swaps += 1
+                }
+                let pbase = pfs * HIST_STRIDE
+                var ci = 0
+                while ci < take {
+                    chunk_buf[ci] = pf_ids[pbase + cur + ci]
+                    ci += 1
+                }
+                let first_tok = unsafe { tn_moe_paged_prefill(handle, pfs, list_data_ptr(chunk_buf), take, cur) }
+                cb_pf_cur[pfs] = cur + take
+                budget -= take
+                if cb_pf_chunked[pfs] != 0 {
+                    chunked_prefill_chunks += 1
+                }
+                if cb_pf_cur[pfs] >= end_p {
+                    let pf_ms = moe_now_ms() - cb_tpf0[pfs]
+                    cb_pf_ms[pfs] = pf_ms
+                    let n_prompt = cb_ptoks[pfs]
+                    let actual_lcp = cb_cached[pfs]
+                    let cfd = cb_cfd[pfs]
+                    let is_chat = cb_chat[pfs] != 0
+                    let want_stream = cb_stream[pfs] != 0
+                    let max_toks = cb_max[pfs]
+                    let copy_n = if n_prompt < HIST_STRIDE { n_prompt } else { HIST_STRIDE }
+                    var hi = 0
+                    while hi < copy_n {
+                        hist_ids[pbase + hi] = pf_ids[pbase + hi]
+                        hi += 1
+                    }
+                    hist_len[pfs] = copy_n
+                    if want_stream {
+                        let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                        let _ = net_write_text(cfd, hdr)
+                    }
+                    let piece0 = unsafe { cstr_to_text(tn_moe_token_cstr(handle, first_tok)) }
+                    if is_stop_piece(first_tok, eos, piece0) || max_toks <= 0 {
+                        send_final_cb_response(cfd, model_name, is_chat, want_stream, "", n_prompt, actual_lcp, 0, pfs, pf_ms, 0.0, "stop")
+                        cb_state[pfs] = 0
+                        cb_cfd[pfs] = -1
+                    } else {
+                        var alive = true
+                        if want_stream { alive = write_sse_piece(cfd, model_name, is_chat, piece0) }
+                        if copy_n < HIST_STRIDE {
+                            hist_ids[pbase + copy_n] = first_tok
+                            hist_len[pfs] = copy_n + 1
+                        }
+                        if !alive || max_toks <= 1 {
+                            send_final_cb_response(cfd, model_name, is_chat, want_stream, piece0, n_prompt, actual_lcp, 1, pfs, pf_ms, 0.0, if !alive { "stop" } else { "length" })
+                            cb_state[pfs] = 0
+                            cb_cfd[pfs] = -1
+                        } else {
+                            cb_state[pfs] = 2
+                            cb_gen[pfs] = 1
+                            cb_pos[pfs] = n_prompt
+                            cb_tok[pfs] = first_tok
+                            cb_tdec[pfs] = moe_now_ms()
+                            cb_text[pfs] = piece0
+                        }
+                    }
+                } else {
+                    break
+                }
+            }
+            pfs += 1
+        }
+
+        // Gather active decoding slots, partitioned cleanly by `cb_lora[s]` (zero cross-tenant interference!)
+        var total_dec = 0
         var si = 0
         while si < MAX_CB {
-            if cb_active[si] != 0 {
-                b_toks[b_sz] = cb_tok[si]
-                b_pos[b_sz] = cb_pos[si]
-                b_slots[b_sz] = si
-                b_sz += 1
-            }
+            if cb_state[si] == 2 { total_dec += 1 }
             si += 1
         }
-        if b_sz > 0 {
-            cb_batches_run += 1
-            if b_sz > max_batch_seen {
-                max_batch_seen = b_sz
-            }
-            let _ = unsafe {
-                tn_moe_step_batch(
-                    handle,
-                    list_data_ptr(b_toks),
-                    list_data_ptr(b_pos),
-                    list_data_ptr(b_slots),
-                    b_sz,
-                    list_data_ptr(b_out)
-                )
-            }
-            var bi = 0
-            while bi < b_sz {
-                let s = b_slots[bi]
-                let chosen = b_out[bi]
-                let piece = unsafe { cstr_to_text(tn_moe_token_cstr(handle, chosen)) }
-                let is_chat = cb_chat[s] != 0
-                let want_stream = cb_stream[s] != 0
-                if is_stop_piece(chosen, eos, piece) {
-                    let dec_ms = moe_now_ms() - cb_tdec[s]
-                    send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, "stop")
-                    cb_active[s] = 0
-                    cb_cfd[s] = -1
-                    cb_text[s] = ""
-                } else {
-                    cb_tok[s] = chosen
-                    cb_pos[s] = cb_pos[s] + 1
-                    cb_gen[s] = cb_gen[s] + 1
-                    cb_text[s] = cb_text[s] ++ piece
-                    let hl = hist_len[s]
-                    if hl < HIST_STRIDE {
-                        hist_ids[s * HIST_STRIDE + hl] = chosen
-                        hist_len[s] = hl + 1
+        if total_dec > 0 {
+            if total_dec > max_batch_seen { max_batch_seen = total_dec }
+            var lid_try = 0
+            while lid_try <= MAX_LORAS {
+                var b_sz = 0
+                si = 0
+                while si < MAX_CB {
+                    if cb_state[si] == 2 && cb_lora[si] == lid_try {
+                        b_toks[b_sz] = cb_tok[si]
+                        b_pos[b_sz] = cb_pos[si]
+                        b_slots[b_sz] = si
+                        b_sz += 1
                     }
-                    var alive = true
-                    if want_stream {
-                        alive = write_sse_piece(cb_cfd[s], model_name, is_chat, piece)
+                    si += 1
+                }
+                if b_sz > 0 {
+                    if lid_try != active_lora_id {
+                        let _ = unsafe { tn_moe_lora_set(handle, lid_try, 1.0) }
+                        active_lora_id = lid_try
+                        lora_swaps += 1
                     }
-                    if !alive || cb_gen[s] >= cb_max[s] || cb_pos[s] + 2 >= 4096 {
-                        let dec_ms = moe_now_ms() - cb_tdec[s]
-                        let reason = if !alive { "stop" } else { "length" }
-                        send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, reason)
-                        cb_active[s] = 0
-                        cb_cfd[s] = -1
-                        cb_text[s] = ""
+                    cb_batches_run += 1
+                    let _ = unsafe {
+                        tn_moe_step_batch(
+                            handle,
+                            list_data_ptr(b_toks),
+                            list_data_ptr(b_pos),
+                            list_data_ptr(b_slots),
+                            b_sz,
+                            list_data_ptr(b_out)
+                        )
+                    }
+                    var bi = 0
+                    while bi < b_sz {
+                        let s = b_slots[bi]
+                        let chosen = b_out[bi]
+                        let piece = unsafe { cstr_to_text(tn_moe_token_cstr(handle, chosen)) }
+                        let is_chat = cb_chat[s] != 0
+                        let want_stream = cb_stream[s] != 0
+                        if is_stop_piece(chosen, eos, piece) {
+                            let dec_ms = moe_now_ms() - cb_tdec[s]
+                            send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, "stop")
+                            cb_state[s] = 0
+                            cb_cfd[s] = -1
+                            cb_text[s] = ""
+                        } else {
+                            cb_tok[s] = chosen
+                            cb_pos[s] = cb_pos[s] + 1
+                            cb_gen[s] = cb_gen[s] + 1
+                            cb_text[s] = cb_text[s] ++ piece
+                            let hl = hist_len[s]
+                            if hl < HIST_STRIDE {
+                                hist_ids[s * HIST_STRIDE + hl] = chosen
+                                hist_len[s] = hl + 1
+                            }
+                            var alive = true
+                            if want_stream { alive = write_sse_piece(cb_cfd[s], model_name, is_chat, piece) }
+                            if !alive || cb_gen[s] >= cb_max[s] || cb_pos[s] + 2 >= 4096 {
+                                let dec_ms = moe_now_ms() - cb_tdec[s]
+                                let reason = if !alive { "stop" } else { "length" }
+                                send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, reason)
+                                cb_state[s] = 0
+                                cb_cfd[s] = -1
+                                cb_text[s] = ""
+                            }
+                        }
+                        bi += 1
                     }
                 }
-                bi += 1
+                lid_try += 1
             }
         }
     }
@@ -781,5 +969,6 @@ fn main() Int {
     let _ = reactor_close(rfd)
     let _ = net_close(lfd)
     model.destroy()
+    println("[tenon-native-v8] graceful shutdown complete.")
     0
 }

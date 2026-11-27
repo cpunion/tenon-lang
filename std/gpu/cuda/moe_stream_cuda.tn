@@ -60,6 +60,12 @@ extern "C" {
     fn tn_cumoe_lora_set(handle Int, lora_id Int, scale Float) Int
     fn tn_cumoe_lora_free(handle Int, lora_id Int) Int
     fn tn_cumoe_lora_info(handle Int, lora_id Int, field_id Int) Int
+    fn tn_cumoe_paged_verify_batch(handle Int, slot_id Int, tok_ids_ptr Ptr[UInt8], n_toks Int, start_pos Int, out_argmax_ptr Ptr[UInt8]) Int
+    fn tn_cumoe_step_embd_mrope(handle Int, embd_f32_ptr Ptr[UInt8], n_vecs Int, start_pos Int, grid_t Int, grid_h Int, grid_w Int) Int
+    fn tn_cumoe_audio_load(path_cstr Ptr[UInt8]) Int
+    fn tn_cumoe_audio_info(audio_h Int, field_id Int) Int
+    fn tn_cumoe_audio_encode_pcm16(audio_h Int, pcm16_ptr Ptr[UInt8], n_samples Int, sample_rate Int, out_embd_ptr Ptr[UInt8], max_vecs Int) Int
+    fn tn_cumoe_audio_free(audio_h Int) Int
     fn tn_cumoe_auto_plan(path_cstr Ptr[UInt8], max_vram_gb Float, max_ctx Int, kv_mode Int, out_plan_ptr Ptr[UInt8]) Int
     fn tn_cumoe_sample_next(
         handle Int, tok_id Int, pos Int,

@@ -589,3 +589,26 @@ fn glm45_2d_hybrid_v7(
     let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
     assert!(plan.contains("sb_shx=1|hybrid_2d=1|chunk_pf=128|lora_r=16|anyres=4|mrope=1|fp8_mxfp4=1"));
 }
+
+#[test]
+fn test_stage6_v8_tc_amx_q4k_marlin_universal_cb_moe_grouped_audio() {
+    let src = r#"
+@gpu_graph("stream:vram=48G,ram=128G,layers=27,experts=64,topk=6,ctx=8192,tp=2,ep=2,mla=576,cb=8,mmproj=64,audio=128,mrope=1,fp8_mxfp4=1")
+fn dsv2_v8_multimodal_block(x Matrix[8, 2048, Float16], w_q Matrix[2048, 2048, Q4_K], w_down Matrix[2048, 1408, Q6_K]) Matrix[8, 1408, Float16] {
+    let h = tg_matmul(x, w_q)
+    tg_matmul(h, w_down)
+}
+"#;
+    let prog = tenon_syntax::parse(src).expect("parse v8 graph");
+    let on = compile_universal_graphs(&prog, GpuOptConfig::default());
+    assert_eq!(on.len(), 1);
+    let hp = &on[0].hetero_plan;
+    assert!(hp.fp8_mxfp4_tc_amx && hp.q4k_q6k_marlin && hp.paged_cb_tp_mla_spec && hp.moe_grouped_gemm && hp.vision_prefix_cache);
+    assert_eq!(hp.audio_mel_tokens, 128);
+    let cuda = emit_cuda_tpu::emit_universal_cuda(&on[0]);
+    assert!(cuda.contains("fp8_tc=true") && cuda.contains("q4k_marlin=true") && cuda.contains("paged_univ=true") && cuda.contains("moe_grp=true") && cuda.contains("audio_mel=128") && cuda.contains("vis_cache=true"));
+    let tpu = emit_cuda_tpu::emit_universal_stablehlo(&on[0]);
+    assert!(tpu.contains("fp8_tc=true") && tpu.contains("q4k_marlin=true") && tpu.contains("moe_grp=true") && tpu.contains("audio_mel=128"));
+    let (_, plan) = emit_metal::emit_metal_graph_and_plan(&on[0]);
+    assert!(plan.contains("fp8_tc=1|q4k_marlin=1|paged_univ=1|moe_grp=1|audio_mel=128|vis_cache=1"));
+}

@@ -118,7 +118,7 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
     if cg.hetero_plan.active {
         let hp = &cg.hetero_plan;
         plan.push_str(&format!(
-            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|tp={}|ep={}|nccl={}|marlin={}|cb_slots={}|cow_kv={}|mla_latent={}|paged_blk={}|radix_prefix={}|spec_k={}|tree_w={}|mtp={}|mmproj={}|sb_shx={}|hybrid_2d={}|chunk_pf={}|lora_r={}|anyres={}|mrope={}|fp8_mxfp4={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
+            "HETERO_PLAN|mode={}|vram_cap={}|core_vram={}|pinned_ffn={}|lru_slots={}|cpu_offload={}|kv_q8={}|kv_saved={}|nocache={}|prefill_b={}|dma_ring={}|purgeable={}|promoter={}|tp={}|ep={}|nccl={}|marlin={}|cb_slots={}|cow_kv={}|mla_latent={}|paged_blk={}|radix_prefix={}|spec_k={}|tree_w={}|mtp={}|mmproj={}|sb_shx={}|hybrid_2d={}|chunk_pf={}|lora_r={}|anyres={}|mrope={}|fp8_mxfp4={}|fp8_tc={}|q4k_marlin={}|paged_univ={}|moe_grp={}|audio_mel={}|vis_cache={}|dec_tok_s={:.2}|pref_tok_s={:.2}\n",
             hp.dispatch_mode.tag(),
             hp.vram_cap_bytes,
             hp.core_vram_bytes,
@@ -152,11 +152,17 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             hp.vision_anyres_tiles,
             if hp.vision_mrope_2d { 1 } else { 0 },
             if hp.fp8_mxfp4_native { 1 } else { 0 },
+            if hp.fp8_mxfp4_tc_amx { 1 } else { 0 },
+            if hp.q4k_q6k_marlin { 1 } else { 0 },
+            if hp.paged_cb_tp_mla_spec { 1 } else { 0 },
+            if hp.moe_grouped_gemm { 1 } else { 0 },
+            hp.audio_mel_tokens,
+            if hp.vision_prefix_cache { 1 } else { 0 },
             hp.projected_decode_tok_s,
             hp.projected_prefill_tok_s,
         ));
         msl.push_str(&format!(
-            "// [Stage 6 Heterogeneous Streaming] mode={} | tp={} ep={} hybrid_2d={} cb_slots={} cow_kv={} chunk_pf={} mla_latent={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={} sb_shx={} spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} lora_r={} fp8_mxfp4={}\n",
+            "// [Stage 6 Heterogeneous Streaming] mode={} | tp={} ep={} hybrid_2d={} cb_slots={} cow_kv={} chunk_pf={} mla_latent={} | pinned_ffn={} lru_slots={} | kv_q8={} (saved {:.1}MB) | dma_ring={} (MTLEvent + MTLPurgeableStateEmpty={}) | prefill_chunk={} sb_shx={} spec_k={} tree_w={} mtp={} mmproj={} anyres={} mrope={} lora_r={} fp8_mxfp4={} fp8_tc={} q4k_marlin={} paged_univ={} moe_grp={} audio_mel={} vis_cache={}\n",
             hp.dispatch_mode.tag(),
             hp.tp_devices,
             hp.ep_devices,
@@ -181,6 +187,12 @@ pub fn emit_metal_graph_and_plan(cg: &CompiledUniversalGraph) -> (String, String
             hp.vision_mrope_2d,
             hp.lora_max_rank,
             hp.fp8_mxfp4_native,
+            hp.fp8_mxfp4_tc_amx,
+            hp.q4k_q6k_marlin,
+            hp.paged_cb_tp_mla_spec,
+            hp.moe_grouped_gemm,
+            hp.audio_mel_tokens,
+            hp.vision_prefix_cache,
         ));
     }
 

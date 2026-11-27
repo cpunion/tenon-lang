@@ -110,6 +110,16 @@ pub struct GpuOptConfig {
     pub multi_lora_zero_copy: bool,
     /// #31: Multi-Image AnyRes Vision + 2D/3D MRoPE + Native `FP8_E4M3` & OCP `MXFP4` (`E2M1`+`E8M0`) Cross-Chip Kernels.
     pub anyres_mrope_fp8_mxfp4: bool,
+    /// #32: Hardware Tensor Core (`mma.sync`) & Apple AMX (`simdgroup_half8x8`) FP8_E4M3 + MXFP4 Kernels (Metal + CUDA + TPU).
+    pub fp8_mxfp4_tc_amx: bool,
+    /// #33: `Q4_K`/`Q6_K` 2-Stage `cp.async` Marlin Tensor Core & Metal AMX `simdgroup_float8x8` Pipeline.
+    pub q4k_q6k_marlin_pipeline: bool,
+    /// #34: Universal PagedAttention Continuous Batching (`TP=2..8`, Latent MLA, `2D TPxEP`) + Native Zero-Migration `paged_verify_batch`.
+    pub paged_cb_tp_mla_spec: bool,
+    /// #35: MoE `B=2..16` Batched Routing + Counting-Sort Grouped MoE GEMM Fusion (Single Weight Read per Active Expert).
+    pub moe_grouped_gemm_batch: bool,
+    /// #36: Auto `Qwen2.5-VL` 2D/3D MRoPE Grid + Native Audio/Whisper Mel-Spectrogram Encoder + Vision Content-Hash Prefix Cache + Prometheus Metrics.
+    pub vlm_mrope_audio_prefix_cache: bool,
 
     /// Optional SPMD device count (`1` = single device, `>1` = auto-sharded multi-device SPMD).
     pub spmd_devices: usize,
@@ -163,6 +173,11 @@ impl GpuOptConfig {
             chunked_prefill_cb: false,
             multi_lora_zero_copy: false,
             anyres_mrope_fp8_mxfp4: false,
+            fp8_mxfp4_tc_amx: false,
+            q4k_q6k_marlin_pipeline: false,
+            paged_cb_tp_mla_spec: false,
+            moe_grouped_gemm_batch: false,
+            vlm_mrope_audio_prefix_cache: false,
             spmd_devices: 1,
             force_tile: None,
         }
@@ -233,6 +248,11 @@ impl GpuOptConfig {
         c.chunked_prefill_cb = true;
         c.multi_lora_zero_copy = true;
         c.anyres_mrope_fp8_mxfp4 = true;
+        c.fp8_mxfp4_tc_amx = true;
+        c.q4k_q6k_marlin_pipeline = true;
+        c.paged_cb_tp_mla_spec = true;
+        c.moe_grouped_gemm_batch = true;
+        c.vlm_mrope_audio_prefix_cache = true;
         c
     }
 
@@ -336,6 +356,11 @@ impl GpuOptConfig {
                         "chunked_prefill_cb" | "chunked_prefill" => cfg.chunked_prefill_cb = enable,
                         "multi_lora_zero_copy" | "lora" => cfg.multi_lora_zero_copy = enable,
                         "anyres_mrope_fp8_mxfp4" | "mrope" | "fp8_mxfp4" => cfg.anyres_mrope_fp8_mxfp4 = enable,
+                        "fp8_mxfp4_tc_amx" | "fp8_tc" | "mxfp4_amx" => cfg.fp8_mxfp4_tc_amx = enable,
+                        "q4k_q6k_marlin_pipeline" | "q4k_marlin" | "q6k_amx" => cfg.q4k_q6k_marlin_pipeline = enable,
+                        "paged_cb_tp_mla_spec" | "paged_verify" | "mla_cb" => cfg.paged_cb_tp_mla_spec = enable,
+                        "moe_grouped_gemm_batch" | "moe_grouped" => cfg.moe_grouped_gemm_batch = enable,
+                        "vlm_mrope_audio_prefix_cache" | "audio_vlm" | "vision_cache" => cfg.vlm_mrope_audio_prefix_cache = enable,
                         _ => {}
                     }
                 }
@@ -390,6 +415,11 @@ impl GpuOptConfig {
         if self.chunked_prefill_cb { on.push("chunk_pf"); }
         if self.multi_lora_zero_copy { on.push("lora"); }
         if self.anyres_mrope_fp8_mxfp4 { on.push("mrope_fp8_fp4"); }
+        if self.fp8_mxfp4_tc_amx { on.push("fp8_tc_amx"); }
+        if self.q4k_q6k_marlin_pipeline { on.push("q4k_marlin"); }
+        if self.paged_cb_tp_mla_spec { on.push("paged_tp_mla_spec"); }
+        if self.moe_grouped_gemm_batch { on.push("moe_grouped"); }
+        if self.vlm_mrope_audio_prefix_cache { on.push("vlm_audio_cache"); }
         if self.spmd_devices > 1 {
             on.push("spmd_multi");
         }

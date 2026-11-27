@@ -83,6 +83,12 @@ pub struct HeteroStreamPlan {
     pub vision_anyres_tiles: usize,
     pub vision_mrope_2d: bool,
     pub fp8_mxfp4_native: bool,
+    pub fp8_mxfp4_tc_amx: bool,
+    pub q4k_q6k_marlin: bool,
+    pub paged_cb_tp_mla_spec: bool,
+    pub moe_grouped_gemm: bool,
+    pub audio_mel_tokens: usize,
+    pub vision_prefix_cache: bool,
     pub dispatch_mode: HeteroDispatchMode,
     pub numa_repack_weights: Vec<(String, LayoutTag)>,
     pub projected_decode_tok_s: f64,
@@ -133,6 +139,12 @@ impl Default for HeteroStreamPlan {
             vision_anyres_tiles: 0,
             vision_mrope_2d: false,
             fp8_mxfp4_native: false,
+            fp8_mxfp4_tc_amx: false,
+            q4k_q6k_marlin: false,
+            paged_cb_tp_mla_spec: false,
+            moe_grouped_gemm: false,
+            audio_mel_tokens: 0,
+            vision_prefix_cache: false,
             dispatch_mode: HeteroDispatchMode::ResidentGpu,
             numa_repack_weights: Vec::new(),
             projected_decode_tok_s: 0.0,
@@ -191,6 +203,8 @@ pub fn plan_hetero_stream(
     let mut vision_anyres_tiles: usize = 1;
     let mut vision_mrope_2d: bool = false;
     let mut fp8_mxfp4_native: bool = cfg.anyres_mrope_fp8_mxfp4;
+    let mut audio_mel_tokens: usize = 0;
+    let mut vision_prefix_cache: bool = cfg.vlm_mrope_audio_prefix_cache;
 
     if let Some(rest) = g.attr_mode.strip_prefix("stream:") {
         for part in rest.split(',') {
@@ -307,6 +321,12 @@ pub fn plan_hetero_stream(
                 }
                 "mrope" => vision_mrope_2d = v != "0" && v != "false",
                 "fp8_mxfp4" => fp8_mxfp4_native = v != "0" && v != "false",
+                "audio" | "audio_mel" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        audio_mel_tokens = n;
+                    }
+                }
+                "vis_cache" => vision_prefix_cache = v != "0" && v != "false",
                 "prefix" => radix_prefix_cache = v != "0" && v != "false",
                 _ => {}
             }
@@ -551,6 +571,12 @@ pub fn plan_hetero_stream(
         vision_anyres_tiles: if vision_mmproj_tokens > 0 { vision_anyres_tiles } else { 0 },
         vision_mrope_2d: cfg.anyres_mrope_fp8_mxfp4 && vision_mrope_2d,
         fp8_mxfp4_native: cfg.anyres_mrope_fp8_mxfp4 && fp8_mxfp4_native,
+        fp8_mxfp4_tc_amx: cfg.fp8_mxfp4_tc_amx && fp8_mxfp4_native,
+        q4k_q6k_marlin: cfg.q4k_q6k_marlin_pipeline,
+        paged_cb_tp_mla_spec: cfg.paged_cb_tp_mla_spec && cfg.paged_cont_batch,
+        moe_grouped_gemm: cfg.moe_grouped_gemm_batch && n_experts > 0,
+        audio_mel_tokens: if cfg.vlm_mrope_audio_prefix_cache { audio_mel_tokens } else { 0 },
+        vision_prefix_cache: cfg.vlm_mrope_audio_prefix_cache && vision_prefix_cache && vision_mmproj_tokens > 0,
         dispatch_mode,
         numa_repack_weights,
         projected_decode_tok_s,
