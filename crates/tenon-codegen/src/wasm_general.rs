@@ -171,31 +171,74 @@ struct WasmFnEmitter<'a> {
 }
 
 impl<'a> WasmFnEmitter<'a> {
-    fn alloc_local(&mut self, name: &str, ty: WasmTy) -> u32 {
+    fn alloc_temp(&mut self, ty: WasmTy) -> u32 {
         let idx = self.next_local;
         self.next_local += 1;
         self.extra_locals.push(ty);
+        idx
+    }
+
+    fn alloc_local(&mut self, name: &str, ty: WasmTy) -> u32 {
+        let idx = self.alloc_temp(ty);
         self.locals.insert(name.to_string(), (idx, ty));
         idx
     }
 
     fn emit_block(&mut self, blk: &Block, want_val: bool) -> Result<WasmTy, String> {
-        for s in &blk.stmts {
-            self.emit_stmt(s)?;
-        }
-        if let Some(t) = &blk.tail {
-            let ty = self.emit_expr(t)?;
-            if !want_val {
-                self.code.push(0x1A); // drop
+        let saved_locals = self.locals.clone();
+        let res = (|| -> Result<WasmTy, String> {
+            for s in &blk.stmts {
+                self.emit_stmt(s)?;
             }
-            Ok(ty)
-        } else {
-            if want_val {
-                self.code.push(0x42); // i64.const 0
-                push_sleb64(&mut self.code, 0);
+            if let Some(t) = &blk.tail {
+                let ty = self.emit_expr(t)?;
+                if !want_val {
+                    self.code.push(0x1A); // drop
+                }
+                Ok(ty)
+            } else {
+                if want_val {
+                    self.code.push(0x42); // i64.const 0
+                    push_sleb64(&mut self.code, 0);
+                }
+                Ok(WasmTy::I64)
             }
-            Ok(WasmTy::I64)
-        }
+        })();
+        self.locals = saved_locals;
+        res
+    }
+
+    fn emit_block_branch(&mut self, blk: &Block, want_val: bool) -> Result<Option<WasmTy>, String> {
+        let saved_locals = self.locals.clone();
+        let res = (|| -> Result<Option<WasmTy>, String> {
+            for s in &blk.stmts {
+                self.emit_stmt(s)?;
+            }
+            if let Some(t) = &blk.tail {
+                let ty = self.emit_expr(t)?;
+                if !want_val {
+                    self.code.push(0x1A); // drop
+                }
+                Ok(Some(ty))
+            } else {
+                let diverges = matches!(
+                    blk.stmts.last(),
+                    Some(Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. })
+                );
+                if diverges {
+                    // Stack is already polymorphic after unconditional control transfer
+                    Ok(None)
+                } else {
+                    if want_val {
+                        self.code.push(0x42); // i64.const 0
+                        push_sleb64(&mut self.code, 0);
+                    }
+                    Ok(Some(WasmTy::I64))
+                }
+            }
+        })();
+        self.locals = saved_locals;
+        res
     }
 
     fn emit_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
@@ -339,7 +382,7 @@ impl<'a> WasmFnEmitter<'a> {
                 let ty = self.emit_expr(inner)?;
                 match (ty, op) {
                     (WasmTy::I64, UnOp::Neg) => {
-                        let tmp = self.alloc_local("__neg_tmp", WasmTy::I64);
+                        let tmp = self.alloc_temp(WasmTy::I64);
                         self.code.push(0x21);
                         push_uleb(&mut self.code, tmp);
                         self.code.push(0x42);
@@ -368,6 +411,36 @@ impl<'a> WasmFnEmitter<'a> {
                 }
             }
             ExprKind::Binary { op, left, right } => {
+                // True short-circuit boolean control flow for `&&` and `||`: RHS is NOT evaluated when LHS decides result!
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let lt = self.emit_expr(left)?;
+                    if lt != WasmTy::I64 {
+                        return Err(format!("logical {:?} requires Bool/I64 operand in wasm32", op));
+                    }
+                    self.code.extend_from_slice(&[0x42, 0x00, 0x52]); // i64.const 0; i64.ne -> i32
+                    self.code.extend_from_slice(&[0x04, WasmTy::I64.byte()]); // if (result i64)
+                    self.nesting += 1;
+                    if *op == BinOp::And {
+                        let rt = self.emit_expr(right)?;
+                        if rt != WasmTy::I64 {
+                            return Err("logical && RHS must be Bool/I64 in wasm32".into());
+                        }
+                        self.code.extend_from_slice(&[0x42, 0x00, 0x52, 0xAD]); // normalize to 0/1
+                        self.code.push(0x05); // else
+                        self.code.extend_from_slice(&[0x42, 0x00]); // i64.const 0
+                    } else {
+                        self.code.extend_from_slice(&[0x42, 0x01]); // i64.const 1
+                        self.code.push(0x05); // else
+                        let rt = self.emit_expr(right)?;
+                        if rt != WasmTy::I64 {
+                            return Err("logical || RHS must be Bool/I64 in wasm32".into());
+                        }
+                        self.code.extend_from_slice(&[0x42, 0x00, 0x52, 0xAD]); // normalize to 0/1
+                    }
+                    self.nesting -= 1;
+                    self.code.push(0x0B); // end
+                    return Ok(WasmTy::I64);
+                }
                 let lt = self.emit_expr(left)?;
                 let _rt = self.emit_expr(right)?;
                 match (lt, op) {
@@ -376,8 +449,8 @@ impl<'a> WasmFnEmitter<'a> {
                     (WasmTy::I64, BinOp::Mul) => { self.code.push(0x7E); Ok(WasmTy::I64) }
                     (WasmTy::I64, BinOp::Div) => { self.code.push(0x7F); Ok(WasmTy::I64) }
                     (WasmTy::I64, BinOp::Mod) => { self.code.push(0x81); Ok(WasmTy::I64) }
-                    (WasmTy::I64, BinOp::BitAnd) | (WasmTy::I64, BinOp::And) => { self.code.push(0x83); Ok(WasmTy::I64) }
-                    (WasmTy::I64, BinOp::BitOr) | (WasmTy::I64, BinOp::Or) => { self.code.push(0x84); Ok(WasmTy::I64) }
+                    (WasmTy::I64, BinOp::BitAnd) => { self.code.push(0x83); Ok(WasmTy::I64) }
+                    (WasmTy::I64, BinOp::BitOr) => { self.code.push(0x84); Ok(WasmTy::I64) }
                     (WasmTy::I64, BinOp::BitXor) => { self.code.push(0x85); Ok(WasmTy::I64) }
                     (WasmTy::I64, BinOp::Shl) => { self.code.push(0x86); Ok(WasmTy::I64) }
                     (WasmTy::I64, BinOp::Shr) => { self.code.push(0x88); Ok(WasmTy::I64) }
@@ -418,25 +491,44 @@ impl<'a> WasmFnEmitter<'a> {
                 let _ = self.emit_expr(cond)?;
                 self.code.extend_from_slice(&[0x42, 0x00, 0x52]); // i64.const 0; i64.ne -> i32
                 let has_else = else_branch.is_some();
-                let res_ty = if has_else { WasmTy::I64 } else { WasmTy::I64 };
+                let if_ty_pos = self.code.len() + 1;
                 if has_else {
-                    self.code.extend_from_slice(&[0x04, res_ty.byte()]); // if (result i64)
+                    self.code.extend_from_slice(&[0x04, WasmTy::I64.byte()]); // placeholder, patched after branches!
                 } else {
                     self.code.extend_from_slice(&[0x04, 0x40]); // if (void)
                 }
                 self.nesting += 1;
-                let t_ty = self.emit_block(then_block, has_else)?;
-                if let Some(eb) = else_branch {
+                let t_ty = self.emit_block_branch(then_block, has_else)?;
+                let final_ty = if let Some(eb) = else_branch {
                     self.code.push(0x05); // else
-                    let _ = self.emit_expr(eb)?;
-                }
+                    let e_ty = match &eb.kind {
+                        ExprKind::Block(b) | ExprKind::Unsafe(b) => self.emit_block_branch(b, true)?,
+                        _ => Some(self.emit_expr(eb)?),
+                    };
+                    let res = match (t_ty, e_ty) {
+                        (Some(a), Some(b)) if a == b => a,
+                        (Some(a), None) => a,
+                        (None, Some(b)) => b,
+                        (None, None) => WasmTy::I64,
+                        (Some(a), Some(b)) => {
+                            return Err(format!(
+                                "wasm32 if/else branch type mismatch: {:?} vs {:?}",
+                                a, b
+                            ));
+                        }
+                    };
+                    self.code[if_ty_pos] = res.byte();
+                    res
+                } else {
+                    WasmTy::I64
+                };
                 self.nesting -= 1;
                 self.code.push(0x0B); // end
                 if !has_else {
                     self.code.push(0x42);
                     push_sleb64(&mut self.code, 0);
                 }
-                Ok(t_ty)
+                Ok(final_ty)
             }
             ExprKind::Block(b) | ExprKind::Unsafe(b) => self.emit_block(b, true),
             ExprKind::Call { callee, args } => {
@@ -579,6 +671,70 @@ pub pure fn widen_val(x Range[3, 5]) Range[2, 6] {
         assert!(
             out.status.success(),
             "Node V8 execution of general wasm32 failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn general_wasm32_short_circuit_block_scoping_and_float_if_in_v8() {
+        let prog = tenon_syntax::parse(r#"
+pub fn test_short_circuit_and() Int {
+    var x = 0
+    let _ = false && { x = 1; true }
+    x
+}
+
+pub fn test_short_circuit_or() Int {
+    var x = 0
+    let _ = true || { x = 1; false }
+    x
+}
+
+pub fn test_short_circuit_rhs_runs_when_needed() Int {
+    var x = 0
+    let _ = true && { x = 7; true }
+    let _ = false || { x += 3; true }
+    x
+}
+
+pub fn test_block_shadowing() Int {
+    let x = 1
+    var y = 10
+    if true {
+        let x = 2
+        y = x + 20
+    }
+    x * 100 + y
+}
+
+pub fn choose_float(b Bool) Float {
+    if b { 1.5 } else { 2.5 }
+}
+
+pub fn choose_nested_float(k Int) Float {
+    if k < 0 { -1.25 } else if k == 0 { 0.5 } else { 3.75 }
+}
+"#)
+        .unwrap();
+        let rep = tenon_verify::check_program(&prog);
+        assert!(rep.ok, "verify failed: {:?}", rep.diagnostics);
+
+        let bytes = compile_program_to_wasm(&prog).expect("general wasm32 compile");
+        let tmp = std::env::temp_dir().join(format!(
+            "tenon_gen_wasm_fixes_{}.wasm",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, &bytes).unwrap();
+        let js = format!(
+            "const fs=require('fs');const buf=fs.readFileSync({:?});WebAssembly.instantiate(buf).then(({{instance}})=>{{const e=instance.exports;const r=[Number(e.test_short_circuit_and()),Number(e.test_short_circuit_or()),Number(e.test_short_circuit_rhs_runs_when_needed()),Number(e.test_block_shadowing()),e.choose_float(1n),e.choose_float(0n),e.choose_nested_float(-1n),e.choose_nested_float(0n),e.choose_nested_float(5n)];console.log(JSON.stringify(r));if(r[0]!==0||r[1]!==0||r[2]!==10||r[3]!==122||r[4]!==1.5||r[5]!==2.5||r[6]!==-1.25||r[7]!==0.5||r[8]!==3.75)process.exit(1);}});",
+            tmp.to_str().unwrap()
+        );
+        let out = Command::new("node").args(["-e", &js]).output().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            out.status.success(),
+            "Node V8 execution of wasm32 fixes failed: stdout={} stderr={}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );

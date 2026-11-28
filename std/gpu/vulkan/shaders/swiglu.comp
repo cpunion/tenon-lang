@@ -1,0 +1,30 @@
+#version 450
+// Tenon v19 Portable Vulkan 1.1+ Fused SwiGLU (Standard + GPT-OSS Clamped Alpha-SwiGLU)
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer GBuf { float g_data[]; };
+layout(set = 0, binding = 1) readonly buffer UBuf { float u_data[]; };
+layout(set = 0, binding = 2) writeonly buffer OBuf { float o_data[]; };
+
+layout(push_constant) uniform Push {
+    uint N;
+    float alpha;
+    float clamp_lim;
+    uint oai_mode;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N) return;
+    float g = g_data[i];
+    float u = u_data[i];
+    if (pc.oai_mode != 0u) {
+        g = min(g, pc.clamp_lim);
+        u = clamp(u, -pc.clamp_lim, pc.clamp_lim);
+        float sig = 1.0 / (1.0 + exp(-pc.alpha * g));
+        o_data[i] = (g * sig) * (u + 1.0);
+    } else {
+        float sig = 1.0 / (1.0 + exp(-g));
+        o_data[i] = (g * sig) * u;
+    }
+}

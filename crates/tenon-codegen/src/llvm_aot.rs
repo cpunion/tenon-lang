@@ -610,33 +610,48 @@ pub fn compile_with_options(
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("tenon_gpu_app");
+                    // Bundle all companion `@c_src` files AND their local `#include "..."` headers
+                    // into a self-contained sibling `<out>_src/` directory and emit strictly relative paths
+                    // (ZERO host build-machine absolute paths in `_link.bat` / `_link.sh`!).
+                    let out_parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+                    let bundle_dir_name = format!("{}_src", out_name.trim_end_matches(".exe"));
+                    let bundle_dir = out_parent.join(&bundle_dir_name);
+                    let bundled_rel_csrcs = bundle_companion_c_sources(&all_c_sources, &bundle_dir)?;
                     let link_cmd = if is_target_win_bundle {
-                        let mut s = format!(
-                            "@echo off\r\nsetlocal\r\nif \"%CC%\"==\"\" set CC=clang\r\n\"%CC%\" {} \"{}\" \"{}\"",
+                        let exe_name = format!("{}.exe", out_name.trim_end_matches(".exe"));
+                        let mut clang_args = format!(
+                            "{} \"%DIR%{}\" \"%DIR%{}\"",
                             opt_flag, obj_fname, rt_fname
                         );
-                        for csrc in &all_c_sources {
-                            s.push_str(&format!(" \"{}\"", csrc.display()));
+                        let mut msvc_args = format!("\"%DIR%{}\" \"%DIR%{}\"", obj_fname, rt_fname);
+                        for rel in &bundled_rel_csrcs {
+                            let win_rel = rel.replace('/', "\\");
+                            clang_args.push_str(&format!(" \"%DIR%{}\\{}\"", bundle_dir_name, win_rel));
+                            msvc_args.push_str(&format!(" \"%DIR%{}\\{}\"", bundle_dir_name, win_rel));
                         }
-                        s.push_str(" -lws2_32");
+                        clang_args.push_str(" -lws2_32");
+                        msvc_args.push_str(" ws2_32.lib");
                         for lib in &all_link_libs {
-                            s.push_str(&format!(" -l{}", lib));
+                            clang_args.push_str(&format!(" -l{}", lib));
+                            msvc_args.push_str(&format!(" {}.lib", lib));
                         }
-                        s.push_str(&format!(" -o \"{}.exe\"\r\n", out_name.trim_end_matches(".exe")));
-                        s
+                        format!(
+                            "@echo off\r\nsetlocal\r\nset \"DIR=%~dp0\"\r\nif \"%CC%\"==\"\" (\r\n  where clang >nul 2>nul && (set \"CC=clang\") || (set \"CC=cl\")\r\n)\r\nif /I \"%CC%\"==\"cl\" (\r\n  cl /nologo /O2 /MD {} /Fe:\"%DIR%{}\"\r\n) else (\r\n  \"%CC%\" {} -o \"%DIR%{}\"\r\n)\r\n",
+                            msvc_args, exe_name, clang_args, exe_name
+                        )
                     } else {
                         let mut s = format!(
-                            "#!/usr/bin/env sh\nset -eu\nCC=\"${{CC:-clang}}\"\n\"$CC\" {} -s \"{}\" \"{}\"",
+                            "#!/usr/bin/env sh\nset -eu\nDIR=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\nCC=\"${{CC:-clang}}\"\n\"$CC\" {} -s \"$DIR/{}\" \"$DIR/{}\"",
                             opt_flag, obj_fname, rt_fname
                         );
-                        for csrc in &all_c_sources {
-                            s.push_str(&format!(" \"{}\"", csrc.display()));
+                        for rel in &bundled_rel_csrcs {
+                            s.push_str(&format!(" \"$DIR/{}/{}\"", bundle_dir_name, rel));
                         }
                         s.push_str(" -lm -ldl -lpthread -lrt");
                         for lib in &all_link_libs {
                             s.push_str(&format!(" -l{}", lib));
                         }
-                        s.push_str(&format!(" -o \"{}\"\n", out_name));
+                        s.push_str(&format!(" -o \"$DIR/{}\"\n", out_name));
                         s
                     };
                     fs::write(&script_path, &link_cmd).map_err(|e| e.to_string())?;
@@ -8438,6 +8453,104 @@ fn expr_keeps_unique(expr: &Expr, name: &str) -> bool {
         | ExprKind::Await(e) => expr_keeps_unique(e, name),
         _ => false,
     }
+}
+
+/// Bundles companion `@c_src` files and all recursively referenced local `#include "..."` headers
+/// into `bundle_dir`, preserving their relative directory layout from their common ancestor root.
+/// Returns forward-slash relative paths (within `bundle_dir`) for the top-level C sources.
+fn bundle_companion_c_sources(
+    c_sources: &[PathBuf],
+    bundle_dir: &Path,
+) -> Result<Vec<String>, String> {
+    if c_sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut visited: Vec<PathBuf> = Vec::new();
+    let mut queue: Vec<PathBuf> = Vec::new();
+    for src in c_sources {
+        let canon = fs::canonicalize(src).unwrap_or_else(|_| src.clone());
+        if !visited.contains(&canon) {
+            visited.push(canon.clone());
+            queue.push(canon);
+        }
+    }
+    while let Some(file) = queue.pop() {
+        let Ok(txt) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let parent = file.parent().unwrap_or_else(|| Path::new("."));
+        for line in txt.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("#include") {
+                let rest = rest.trim_start();
+                if let Some(after_q) = rest.strip_prefix('"') {
+                    if let Some(end_q) = after_q.find('"') {
+                        let inc_rel = &after_q[..end_q];
+                        let cand = parent.join(inc_rel);
+                        if cand.exists() {
+                            let canon = fs::canonicalize(&cand).unwrap_or(cand);
+                            if !visited.contains(&canon) {
+                                visited.push(canon.clone());
+                                queue.push(canon);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Compute deepest common ancestor directory of all visited source & local header files
+    let mut common_comps: Vec<std::path::Component<'_>> = visited[0]
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .components()
+        .collect();
+    for f in &visited[1..] {
+        let comps: Vec<std::path::Component<'_>> = f
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .components()
+            .collect();
+        let mut keep = 0usize;
+        while keep < common_comps.len() && keep < comps.len() && common_comps[keep] == comps[keep] {
+            keep += 1;
+        }
+        common_comps.truncate(keep);
+    }
+    let common_root: PathBuf = common_comps.iter().collect();
+    fs::create_dir_all(bundle_dir).map_err(|e| e.to_string())?;
+    for f in &visited {
+        let rel = f
+            .strip_prefix(&common_root)
+            .ok()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(f.file_name().unwrap_or_default()));
+        let dst = bundle_dir.join(&rel);
+        if let Some(p) = dst.parent() {
+            fs::create_dir_all(p).map_err(|e| e.to_string())?;
+        }
+        fs::copy(f, &dst).map_err(|e| {
+            format!(
+                "failed to bundle companion source {} -> {}: {}",
+                f.display(),
+                dst.display(),
+                e
+            )
+        })?;
+    }
+    let mut rel_csrcs = Vec::with_capacity(c_sources.len());
+    for src in c_sources {
+        let canon = fs::canonicalize(src).unwrap_or_else(|_| src.clone());
+        let rel = canon
+            .strip_prefix(&common_root)
+            .ok()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(canon.file_name().unwrap_or_default()));
+        rel_csrcs.push(rel.to_string_lossy().replace('\\', "/"));
+    }
+    Ok(rel_csrcs)
 }
 
 fn sanitize(s: &str) -> String {

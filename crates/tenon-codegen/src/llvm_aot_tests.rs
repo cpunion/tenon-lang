@@ -992,4 +992,60 @@ fn llvm_aot_dogfood_matching_engine_and_tenon_docgen_zero_leaks() {
     );
 }
 
+#[test]
+fn cross_gpu_link_bundle_uses_strictly_relative_paths_and_copies_local_headers() {
+    let handle = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .unwrap();
+            let srv_src = repo_root.join("examples/showcase/tenon_llm_server_cuda.tn");
+            let prog = tenon_syntax::load_program_with_imports(&srv_src).expect("load cuda server");
+            let tmp_dir = std::env::temp_dir().join(format!("tenon_bundle_test_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+
+            for (target_name, ext) in [("windows-x86_64-cuda", "bat"), ("linux-x86_64-cuda", "sh")] {
+                let out_path = tmp_dir.join(format!("srv_{}", target_name));
+                let target = crate::targets::resolve_target(target_name).expect("resolve target");
+                let opts = BuildOptions {
+                    opt_level: "O2".into(),
+                    resolved_target: Some(target),
+                    ..Default::default()
+                };
+                compile_with_options(&prog, &out_path, &opts).expect("cross-compile bundle");
+                let script = std::fs::read_to_string(tmp_dir.join(format!("srv_{}_link.{}", target_name, ext)))
+                    .expect("link script exists");
+                assert!(
+                    !script.contains(repo_root.to_str().unwrap()),
+                    "link script {} must NOT contain host absolute path:\n{}",
+                    target_name,
+                    script
+                );
+                assert!(
+                    !script.contains("/Users/") && !script.contains("/home/"),
+                    "link script {} leaked host path:\n{}",
+                    target_name,
+                    script
+                );
+                let src_dir = tmp_dir.join(format!("srv_{}_src", target_name));
+                assert!(
+                    src_dir.join("cuda/moe_stream_cuda_shim.c").exists(),
+                    "bundled CUDA shim missing in {:?}",
+                    src_dir
+                );
+                assert!(
+                    src_dir.join("common/tenon_io_hal.h").exists(),
+                    "bundled local header tenon_io_hal.h missing in {:?}",
+                    src_dir
+                );
+            }
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        })
+        .expect("spawn test thread");
+    handle.join().expect("cross_gpu_link_bundle test panicked");
+}
+
 

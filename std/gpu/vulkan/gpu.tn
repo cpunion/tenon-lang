@@ -1,15 +1,24 @@
-// std/gpu/vulkan/gpu.tn — Zero-Rust Portable Vulkan Compute HAL (`@linear` VRAM Handles)
+// std/gpu/vulkan/gpu.tn — Tenon v19 Zero-SDK Portable Vulkan 1.1–1.3 Compute HAL (`@linear` VRAM Handles)
 //
-// Shares the exact same `@linear` resource discipline as `std/gpu/metal/gpu.tn` for Linux/Windows/MoltenVK.
+// Shares the exact same `@linear` resource discipline as `std/gpu/metal/gpu.tn` for Linux/Windows/MoltenVK,
+// with real GPU SPIR-V pipelines (Q4_0 GEMV, RMSNorm, SwiGLU, Paged FlashAttention-2, Vulkan 1.3 DP4A & CoopMat).
 
 import "std/core/types.tn"
+
+@c_src("vulkan_shim.c")
 
 extern "C" {
     fn tn_vk_init() Int
     fn tn_vk_device_name_cstr() Ptr[UInt8]
+    fn tn_vk_info(field_id Int) Int
     fn tn_vk_buf_create(data_ptr Ptr[UInt8], byte_len Int) Int
     fn tn_vk_buf_read(handle Int, dst_ptr Ptr[UInt8], byte_len Int) Int
     fn tn_vk_buf_free(handle Int) Int
+    fn tn_vk_q4_gemv(w_buf Int, x_buf Int, y_buf Int, m Int, k Int, b Int) Int
+    fn tn_vk_rmsnorm(x_buf Int, w_buf Int, y_buf Int, b Int, h Int, eps Float) Int
+    fn tn_vk_swiglu(g_buf Int, u_buf Int, o_buf Int, n Int, oai_mode Int) Int
+    fn tn_vk_flash_attn_paged(q_buf Int, kc_buf Int, vc_buf Int, bt_buf Int, o_buf Int, b Int, n_qh Int, n_kvh Int, hd Int, kv_base_pos Int, page_sz Int, scale Float, swa_win Int) Int
+    fn tn_vk_self_test() Int
 }
 
 @linear
@@ -24,6 +33,14 @@ pub fn vk_init() Bool {
 
 pub fn vk_device_name() Text {
     unsafe { cstr_to_text(tn_vk_device_name_cstr()) }
+}
+
+pub fn vk_info(field_id Int) Int {
+    unsafe { tn_vk_info(field_id) }
+}
+
+pub fn vk_self_test() Bool {
+    unsafe { tn_vk_self_test() != 0 }
 }
 
 impl VkBuffer {

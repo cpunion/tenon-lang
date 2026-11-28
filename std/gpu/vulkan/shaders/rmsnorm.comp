@@ -1,0 +1,38 @@
+#version 450
+// Tenon v19 Portable Vulkan 1.1+ Batched RMSNorm
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuf { float x_data[]; };
+layout(set = 0, binding = 1) readonly buffer WBuf { float w_data[]; };
+layout(set = 0, binding = 2) writeonly buffer YBuf { float y_data[]; };
+
+layout(push_constant) uniform Push {
+    uint B;
+    uint H;
+    float eps;
+} pc;
+
+shared float s_red[64];
+
+void main() {
+    uint b = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (b >= pc.B) return;
+
+    uint base = b * pc.H;
+    float ss = 0.0;
+    for (uint i = tid; i < pc.H; i += 64u) {
+        float v = x_data[base + i];
+        ss += v * v;
+    }
+    s_red[tid] = ss;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        barrier();
+    }
+    float inv = inversesqrt(s_red[0] / float(pc.H) + pc.eps);
+    for (uint i = tid; i < pc.H; i += 64u) {
+        y_data[base + i] = x_data[base + i] * inv * w_data[i];
+    }
+}

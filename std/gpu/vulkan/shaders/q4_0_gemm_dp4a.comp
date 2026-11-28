@@ -1,0 +1,69 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// Tenon v19 Vulkan 1.3 Hardware DP4A (`VK_KHR_shader_integer_dot_product` / OpSDot) Q4_0 x Q8 GEMM/GEMV
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer WBuf { uint w_words[]; };   // Raw GGUF Q4_0 (18B/block)
+layout(set = 0, binding = 1) readonly buffer XQBuf { int x_q8_pack[]; }; // Packed 4x int8 per int (8 ints per 32-elem block)
+layout(set = 0, binding = 2) readonly buffer XDBuf { float x_d[]; };     // FP32 scale per 32-elem block
+layout(set = 0, binding = 3) writeonly buffer YBuf { float y_data[]; };
+
+layout(push_constant) uniform Push {
+    uint M;
+    uint K;
+    uint B;
+} pc;
+
+shared float s_red[64];
+
+uint read_u8(uint byte_off) {
+    return (w_words[byte_off >> 2u] >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+
+uint read_u16(uint byte_off) {
+    return read_u8(byte_off) | (read_u8(byte_off + 1u) << 8u);
+}
+
+int pack4_i8(int a0, int a1, int a2, int a3) {
+    return (a0 & 0xFF) | ((a1 & 0xFF) << 8) | ((a2 & 0xFF) << 16) | ((a3 & 0xFF) << 24);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.M || tok >= pc.B) return;
+
+    uint nb = pc.K >> 5u;
+    uint row_byte_base = row * nb * 18u;
+    uint x_blk_base = tok * nb;
+    float acc = 0.0;
+
+    for (uint b = tid; b < nb; b += 64u) {
+        uint bp = row_byte_base + b * 18u;
+        float wd = unpackHalf2x16(read_u16(bp)).x;
+        int sum_i = 0;
+        uint xb = (x_blk_base + b) * 8u;
+        for (uint g = 0u; g < 4u; g++) {
+            uint c0 = read_u8(bp + 2u + g * 4u + 0u);
+            uint c1 = read_u8(bp + 2u + g * 4u + 1u);
+            uint c2 = read_u8(bp + 2u + g * 4u + 2u);
+            uint c3 = read_u8(bp + 2u + g * 4u + 3u);
+            int w_lo = pack4_i8(int(c0 & 15u) - 8, int(c1 & 15u) - 8, int(c2 & 15u) - 8, int(c3 & 15u) - 8);
+            int w_hi = pack4_i8(int(c0 >> 4u) - 8, int(c1 >> 4u) - 8, int(c2 >> 4u) - 8, int(c3 >> 4u) - 8);
+            sum_i = dotPacked4x8AccSatEXT(w_lo, x_q8_pack[xb + g], sum_i);
+            sum_i = dotPacked4x8AccSatEXT(w_hi, x_q8_pack[xb + 4u + g], sum_i);
+        }
+        acc += float(sum_i) * wd * x_d[x_blk_base + b];
+    }
+
+    s_red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) {
+        y_data[tok * pc.M + row] = s_red[0];
+    }
+}

@@ -1,0 +1,36 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Tenon v19 Vulkan 1.3 Hardware Cooperative Matrix (`VK_KHR_cooperative_matrix`) 16x16x16 FP16 -> FP32 GEMM
+// Drives Intel Arc XMX, AMD RDNA3/4 WMMA, and NVIDIA Tensor Cores via one unified SPIR-V binary!
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer ABuf { float16_t A[]; }; // [M, K] row-major
+layout(set = 0, binding = 1) readonly buffer BBuf { float16_t B[]; }; // [K, N] row-major
+layout(set = 0, binding = 2) writeonly buffer CBuf { float C[]; };    // [M, N] row-major
+
+layout(push_constant) uniform Push {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+void main() {
+    uint m0 = gl_WorkGroupID.x * 16u;
+    uint n0 = gl_WorkGroupID.y * 16u;
+    if (m0 >= pc.M || n0 >= pc.N) return;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += 16u) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+        coopMatLoad(matA, A, m0 * pc.K + k0, pc.K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, B, k0 * pc.N + n0, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(matA, matB, acc);
+    }
+
+    coopMatStore(acc, C, m0 * pc.N + n0, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+}

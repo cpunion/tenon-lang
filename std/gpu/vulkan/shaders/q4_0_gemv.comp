@@ -1,0 +1,60 @@
+#version 450
+// Tenon v19 Portable Vulkan 1.1+ Raw GGUF Q4_0 (18B/block) x FP32 GEMV
+// Zero extensions required: runs natively on MoltenVK (Apple M-series), Intel Arc, AMD, NVIDIA, Adreno, Mali.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer WBuf { uint w_words[]; };
+layout(set = 0, binding = 1) readonly buffer XBuf { float x_data[]; };
+layout(set = 0, binding = 2) writeonly buffer YBuf { float y_data[]; };
+
+layout(push_constant) uniform Push {
+    uint M;
+    uint K;
+    uint B;
+} pc;
+
+shared float s_red[64];
+
+uint read_u8(uint byte_off) {
+    return (w_words[byte_off >> 2u] >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+
+uint read_u16(uint byte_off) {
+    return read_u8(byte_off) | (read_u8(byte_off + 1u) << 8u);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.M || tok >= pc.B) return;
+
+    uint nb = pc.K >> 5u;
+    uint row_byte_base = row * nb * 18u;
+    uint x_tok_base = tok * pc.K;
+    float acc = 0.0;
+
+    for (uint b = tid; b < nb; b += 64u) {
+        uint bp = row_byte_base + b * 18u;
+        float wd = unpackHalf2x16(read_u16(bp)).x;
+        uint xb = x_tok_base + b * 32u;
+        float sum = 0.0;
+        for (uint i = 0u; i < 16u; i++) {
+            uint c = read_u8(bp + 2u + i);
+            float w_lo = float(int(c & 15u) - 8);
+            float w_hi = float(int(c >> 4u) - 8);
+            sum += w_lo * x_data[xb + i] + w_hi * x_data[xb + i + 16u];
+        }
+        acc += sum * wd;
+    }
+
+    s_red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) {
+        y_data[tok * pc.M + row] = s_red[0];
+    }
+}

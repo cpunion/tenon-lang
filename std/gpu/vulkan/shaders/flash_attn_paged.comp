@@ -1,0 +1,77 @@
+#version 450
+// Tenon v19 Portable Vulkan 1.1+ Paged FlashAttention-2 (Causal + GQA + Sliding Window)
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float q_data[]; };
+layout(set = 0, binding = 1) readonly buffer KBuf { float k_cache[]; };
+layout(set = 0, binding = 2) readonly buffer VBuf { float v_cache[]; };
+layout(set = 0, binding = 3) readonly buffer BTBuf { int block_table[]; };
+layout(set = 0, binding = 4) writeonly buffer OBuf { float o_data[]; };
+
+layout(push_constant) uniform Push {
+    uint B;
+    uint n_qh;
+    uint n_kvh;
+    uint hd;
+    uint kv_base_pos;
+    uint page_sz;
+    float scale;
+    uint swa_win;
+} pc;
+
+shared float s_red[64];
+
+void main() {
+    uint qh = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (qh >= pc.n_qh || tok >= pc.B) return;
+
+    uint kvh = (qh * pc.n_kvh) / pc.n_qh;
+    uint cur_pos = pc.kv_base_pos + tok;
+    uint t_start = (pc.swa_win > 0u && cur_pos + 1u > pc.swa_win) ? (cur_pos + 1u - pc.swa_win) : 0u;
+    uint t_end = cur_pos + 1u;
+
+    uint q_base = (tok * pc.n_qh + qh) * pc.hd;
+    float o_acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    float m_max = -1e30;
+    float l_sum = 0.0;
+
+    for (uint t = t_start; t < t_end; t++) {
+        uint pg = t / pc.page_sz;
+        uint off = t % pc.page_sz;
+        uint phys = uint(block_table[pg]);
+        uint kv_base = ((phys * pc.page_sz + off) * pc.n_kvh + kvh) * pc.hd;
+
+        float qk = 0.0;
+        for (uint d = tid; d < pc.hd; d += 64u) {
+            qk += q_data[q_base + d] * k_cache[kv_base + d];
+        }
+        s_red[tid] = qk;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (tid < s) s_red[tid] += s_red[tid + s];
+            barrier();
+        }
+        float score = s_red[0] * pc.scale;
+        float new_max = max(score, m_max);
+        float exp_old = exp(m_max - new_max);
+        float exp_new = exp(score - new_max);
+        l_sum = l_sum * exp_old + exp_new;
+
+        uint k_slot = 0u;
+        for (uint d = tid; d < pc.hd && k_slot < 4u; d += 64u) {
+            o_acc[k_slot] = o_acc[k_slot] * exp_old + exp_new * v_cache[kv_base + d];
+            k_slot++;
+        }
+        m_max = new_max;
+        barrier();
+    }
+
+    uint k_slot = 0u;
+    float inv_l = (l_sum > 0.0) ? (1.0 / l_sum) : 0.0;
+    for (uint d = tid; d < pc.hd && k_slot < 4u; d += 64u) {
+        o_data[q_base + d] = o_acc[k_slot] * inv_l;
+        k_slot++;
+    }
+}

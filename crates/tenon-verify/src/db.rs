@@ -39,34 +39,47 @@ struct DbInner {
 }
 
 /// Computes a deterministic hash of all item signatures (types, records, enums, function headers,
-/// contracts `requires`/`ensures`, interfaces, attrs) WITHOUT function bodies.
+/// contracts `requires`/`ensures`, interfaces, attrs, reactive views, streams, protocols, etc.)
+/// WITHOUT function bodies.
 /// When only a function body changes, `program_signature_hash` stays identical -> Early Cutoff!
 pub fn program_signature_hash(prog: &Program) -> String {
     let mut sig_buf = String::new();
     for item in &prog.items {
         match item {
+            Item::Import { path, alias, kind, .. } => {
+                sig_buf.push_str(&format!("import:{}:{:?}:{:?}\n", path, alias, kind));
+            }
+            Item::Macro(m) => {
+                sig_buf.push_str(&format!("macro:{:?}\n", m));
+            }
+            Item::ComptimeBlock(b) => {
+                sig_buf.push_str(&format!("comptime:{:?}\n", b));
+            }
+            Item::MacroCall { name, args, .. } => {
+                sig_buf.push_str(&format!("mcall:{}:{:?}\n", name, args));
+            }
             Item::TypeAlias(ta) => {
                 sig_buf.push_str(&format!(
-                    "ta:{}:{}:{:?}:{:?}:{:?}\n",
-                    ta.is_pub, ta.name, ta.type_params, ta.base, ta.predicate
+                    "ta:{}:{}:{:?}:{:?}:{:?}:{:?}\n",
+                    ta.is_pub, ta.name, ta.attrs, ta.type_params, ta.base, ta.predicate
                 ));
             }
             Item::Record(r) => {
                 sig_buf.push_str(&format!(
-                    "rec:{}:{}:{:?}:{:?}:{:?}\n",
-                    r.is_pub, r.name, r.type_params, r.fields, r.where_clauses
+                    "rec:{}:{}:{:?}:{:?}:{:?}:{:?}\n",
+                    r.is_pub, r.name, r.attrs, r.type_params, r.fields, r.where_clauses
                 ));
             }
             Item::Enum(e) => {
                 sig_buf.push_str(&format!(
-                    "enum:{}:{}:{:?}:{:?}\n",
-                    e.is_pub, e.name, e.type_params, e.variants
+                    "enum:{}:{}:{:?}:{:?}:{:?}\n",
+                    e.is_pub, e.name, e.attrs, e.type_params, e.variants
                 ));
             }
             Item::Interface(i) => {
                 sig_buf.push_str(&format!(
-                    "iface:{}:{}:{:?}:{:?}\n",
-                    i.is_pub, i.name, i.type_params, i.methods
+                    "iface:{}:{}:{:?}:{:?}:{:?}\n",
+                    i.is_pub, i.name, i.attrs, i.type_params, i.methods
                 ));
             }
             Item::Fn(f) => {
@@ -84,16 +97,16 @@ pub fn program_signature_hash(prog: &Program) -> String {
                 ));
             }
             Item::ExternFn(ef) => {
-                sig_buf.push_str(&format!("ext:{}:{:?}:{:?}\n", ef.name, ef.params, ef.ret_ty));
+                sig_buf.push_str(&format!("ext:{}:{:?}:{:?}:{:?}\n", ef.name, ef.attrs, ef.params, ef.ret_ty));
             }
             Item::Const(c) => {
-                sig_buf.push_str(&format!("const:{}:{:?}:{:?}\n", c.name, c.ty, c.value));
+                sig_buf.push_str(&format!("const:{}:{:?}:{:?}:{:?}\n", c.name, c.attrs, c.ty, c.value));
             }
             Item::Bitfield(b) => {
-                sig_buf.push_str(&format!("bf:{}:{:?}:{:?}\n", b.name, b.backing_ty, b.fields));
+                sig_buf.push_str(&format!("bf:{}:{:?}:{:?}:{:?}\n", b.name, b.attrs, b.backing_ty, b.fields));
             }
             Item::Union(u) => {
-                sig_buf.push_str(&format!("union:{}:{:?}\n", u.name, u.fields));
+                sig_buf.push_str(&format!("union:{}:{:?}:{:?}\n", u.name, u.attrs, u.fields));
             }
             Item::AttrDecl(a) => {
                 sig_buf.push_str(&format!("attr:{}:{:?}\n", a.name, a.params));
@@ -102,12 +115,29 @@ pub fn program_signature_hash(prog: &Program) -> String {
                 sig_buf.push_str(&format!("impl:{:?}:{:?}\n", imp.interface, imp.target_ty));
                 for m in &imp.methods {
                     sig_buf.push_str(&format!(
-                        "  m:{}:{:?}:{:?}:{:?}\n",
-                        m.name, m.params, m.ret_ty, (&m.requires, &m.ensures)
+                        "  m:{}:{:?}:{:?}:{:?}:{:?}\n",
+                        m.name, m.attrs, m.params, m.ret_ty, (&m.requires, &m.ensures)
                     ));
                 }
             }
-            _ => {}
+            Item::Evolution(ev) => {
+                sig_buf.push_str(&format!("evol:{:?}\n", ev));
+            }
+            Item::LockLattice(ll) => {
+                sig_buf.push_str(&format!("lock_lattice:{:?}\n", ll));
+            }
+            Item::Protocol(pr) => {
+                sig_buf.push_str(&format!("protocol:{:?}\n", pr));
+            }
+            Item::Stream(st) => {
+                sig_buf.push_str(&format!("stream:{:?}\n", st));
+            }
+            Item::View(vw) => {
+                sig_buf.push_str(&format!("view:{:?}\n", vw));
+            }
+            Item::Subscriber(sub) => {
+                sig_buf.push_str(&format!("subscriber:{:?}\n", sub));
+            }
         }
     }
     sha256_hex(sig_buf.as_bytes())
@@ -271,14 +301,15 @@ impl IncrementalDb {
     }
 }
 
-/// Persistent disk verification cache (`.tenon-cache/verify_v1.json`) keyed by full structural
-/// SHA-256 hash (`program_full_hash`). Returns `(CheckReport, cache_hit)`.
+/// Persistent disk verification cache (`.tenon-cache/verify_v2.json`) keyed by full structural
+/// SHA-256 hash (`program_full_hash` covering all items including reactive views, streams, protocols).
+/// Returns `(CheckReport, cache_hit)`.
 pub fn check_program_cached_on_disk(
     prog: &Program,
     cache_dir: &std::path::Path,
 ) -> (CheckReport, bool) {
-    let key = format!("v1_{}", program_full_hash(prog));
-    let cache_file = cache_dir.join("verify_v1.json");
+    let key = format!("v2_{}", program_full_hash(prog));
+    let cache_file = cache_dir.join("verify_v2.json");
     let mut map: BTreeMap<String, CheckReport> = std::fs::read_to_string(&cache_file)
         .ok()
         .and_then(|txt| serde_json::from_str(&txt).ok())
@@ -296,7 +327,7 @@ pub fn check_program_cached_on_disk(
         map.insert(key, report.clone());
         let _ = std::fs::create_dir_all(cache_dir);
         if let Ok(json) = serde_json::to_string(&map) {
-            let tmp = cache_dir.join(format!("verify_v1_{}.tmp", std::process::id()));
+            let tmp = cache_dir.join(format!("verify_v2_{}.tmp", std::process::id()));
             if std::fs::write(&tmp, json).is_ok() {
                 let _ = std::fs::rename(&tmp, &cache_file);
             }
@@ -309,4 +340,53 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     format!("{:x}", h.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reactive_view_bounds_change_invalidates_disk_and_memory_cache() {
+        let ok_src = r#"
+@sync_view("session.msg_list")
+pub reactive view SyncView(session_id Text) {
+    durability = Reconstructible
+    bounds = {
+        max_items = 50 turns
+        max_payload = 16 MiB
+        max_frame = 4 MiB
+        journal_budget = 16 MiB
+        offline_recovery = BoundedReset
+    }
+    output committed_turns(session_id)
+}
+"#;
+        let bad_src = ok_src.replace("BoundedReset", "NeverReset");
+        let ok_prog = parse(ok_src).unwrap();
+        let bad_prog = parse(&bad_src).unwrap();
+        assert_ne!(
+            program_full_hash(&ok_prog),
+            program_full_hash(&bad_prog),
+            "reactive view declaration edits must change program_full_hash"
+        );
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "tenon_verify_cache_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let (r1, hit1) = check_program_cached_on_disk(&ok_prog, &cache_dir);
+        assert!(r1.ok && !hit1, "first BoundedReset check should pass with miss");
+        let (r2, hit2) = check_program_cached_on_disk(&ok_prog, &cache_dir);
+        assert!(r2.ok && hit2, "second BoundedReset check should hit cache");
+        let (r3, hit3) = check_program_cached_on_disk(&bad_prog, &cache_dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        assert!(!hit3, "NeverReset must NEVER hit BoundedReset cache entry");
+        assert!(
+            !r3.ok && r3.diagnostics.iter().any(|d| d.code == "P2014"),
+            "NeverReset with bounded journal_budget must fail with P2014, got: {:?}",
+            r3.diagnostics
+        );
+    }
 }

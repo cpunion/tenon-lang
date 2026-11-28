@@ -6,26 +6,59 @@ use tenon_syntax::*;
 
 pub(crate) const TENON_AOT_SYSTEMS_CORE_C: &str = r#"
 /* ===== Tenon Systems Core C Runtime (Bytes, BytesSlice, CStruct, RawMem, F32) ===== */
+#if defined(_MSC_VER)
+#  include <intrin.h>
+#endif
 
 int64_t tenon_clz(int64_t x) {
     uint64_t u = (uint64_t)x;
-    return u == 0 ? 64 : (int64_t)__builtin_clzll(u);
+    if (u == 0) return 64;
+#if defined(_MSC_VER)
+    unsigned long idx = 0;
+    _BitScanReverse64(&idx, u);
+    return (int64_t)(63u - idx);
+#else
+    return (int64_t)__builtin_clzll(u);
+#endif
 }
 int64_t tenon_ctz(int64_t x) {
     uint64_t u = (uint64_t)x;
-    return u == 0 ? 64 : (int64_t)__builtin_ctzll(u);
+    if (u == 0) return 64;
+#if defined(_MSC_VER)
+    unsigned long idx = 0;
+    _BitScanForward64(&idx, u);
+    return (int64_t)idx;
+#else
+    return (int64_t)__builtin_ctzll(u);
+#endif
 }
 int64_t tenon_popcnt(int64_t x) {
+#if defined(_MSC_VER)
+    return (int64_t)__popcnt64((uint64_t)x);
+#else
     return (int64_t)__builtin_popcountll((uint64_t)x);
+#endif
 }
 int64_t tenon_bswap16(int64_t x) {
+#if defined(_MSC_VER)
+    return (int64_t)_byteswap_ushort((uint16_t)x);
+#else
     return (int64_t)__builtin_bswap16((uint16_t)x);
+#endif
 }
 int64_t tenon_bswap32(int64_t x) {
+#if defined(_MSC_VER)
+    return (int64_t)_byteswap_ulong((uint32_t)x);
+#else
     return (int64_t)__builtin_bswap32((uint32_t)x);
+#endif
 }
 int64_t tenon_bswap64(int64_t x) {
+#if defined(_MSC_VER)
+    return (int64_t)_byteswap_uint64((uint64_t)x);
+#else
     return (int64_t)__builtin_bswap64((uint64_t)x);
+#endif
 }
 int64_t tenon_rotl64(int64_t x, int64_t n) {
     uint64_t u = (uint64_t)x;
@@ -401,10 +434,51 @@ int64_t tenon_cstr_to_text(int64_t ptr) {
 "#;
 
 pub(crate) const TENON_AOT_SYNC_C: &str = r#"
-/* ===== Tenon POSIX Multi-Threading, Atomics, Mutex & MPMC Channel ===== */
-#include <pthread.h>
-#include <time.h>
-#include <unistd.h>
+/* ===== Tenon Cross-OS (POSIX + Win32) Multi-Threading, Atomics, Mutex & MPMC Channel ===== */
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+typedef HANDLE pthread_t;
+typedef CRITICAL_SECTION pthread_mutex_t;
+typedef CONDITION_VARIABLE pthread_cond_t;
+typedef struct { void* (*fn)(void*); void* arg; } TenonWinThrArg;
+static DWORD WINAPI tenon_win_thr_entry(LPVOID p) {
+    TenonWinThrArg* a = (TenonWinThrArg*)p;
+    void* (*fn)(void*) = a->fn; void* arg = a->arg;
+    free(a);
+    (void)fn(arg);
+    return 0;
+}
+static inline int pthread_create(pthread_t* th, const void* attr, void* (*fn)(void*), void* arg) {
+    (void)attr;
+    TenonWinThrArg* a = (TenonWinThrArg*)malloc(sizeof(TenonWinThrArg));
+    if (!a) return -1;
+    a->fn = fn; a->arg = arg;
+    *th = CreateThread(NULL, 0, tenon_win_thr_entry, a, 0, NULL);
+    if (!*th) { free(a); return -1; }
+    return 0;
+}
+static inline int pthread_join(pthread_t th, void** ret) {
+    (void)ret;
+    if (th) { WaitForSingleObject(th, INFINITE); CloseHandle(th); }
+    return 0;
+}
+static inline int pthread_mutex_init(pthread_mutex_t* m, const void* a) { (void)a; InitializeCriticalSection(m); return 0; }
+static inline int pthread_mutex_destroy(pthread_mutex_t* m) { DeleteCriticalSection(m); return 0; }
+static inline int pthread_mutex_lock(pthread_mutex_t* m) { EnterCriticalSection(m); return 0; }
+static inline int pthread_mutex_unlock(pthread_mutex_t* m) { LeaveCriticalSection(m); return 0; }
+static inline int pthread_cond_init(pthread_cond_t* c, const void* a) { (void)a; InitializeConditionVariable(c); return 0; }
+static inline int pthread_cond_destroy(pthread_cond_t* c) { (void)c; return 0; }
+static inline int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) { SleepConditionVariableCS(c, m, INFINITE); return 0; }
+static inline int pthread_cond_signal(pthread_cond_t* c) { WakeConditionVariable(c); return 0; }
+static inline int pthread_cond_broadcast(pthread_cond_t* c) { WakeAllConditionVariable(c); return 0; }
+#else
+#  include <pthread.h>
+#  include <time.h>
+#  include <unistd.h>
+#endif
 
 typedef struct {
     int64_t closure;
@@ -446,10 +520,14 @@ int64_t tenon_thread_join(int64_t handle) {
 
 int64_t tenon_thread_sleep_ms(int64_t ms) {
     if (ms > 0) {
+#if defined(_WIN32)
+        Sleep((DWORD)ms);
+#else
         struct timespec ts;
         ts.tv_sec = ms / 1000;
         ts.tv_nsec = (ms % 1000) * 1000000L;
         nanosleep(&ts, NULL);
+#endif
     }
     return 0;
 }

@@ -1,4 +1,4 @@
-// std/gpu/rocm/rocm_stream.tn — Tenon v18 Zero-SDK AMD ROCm/HIP Compute & IO-Overlapped Inference Binding
+// std/gpu/rocm/rocm_stream.tn — Tenon v19 Zero-SDK AMD ROCm/HIP Full Compute & IO-Overlapped Inference Binding
 @c_src("rocm_stream_shim.c")
 
 extern "C" {
@@ -6,5 +6,18 @@ extern "C" {
     fn tn_rocm_device_name() Int
     fn tn_rocm_arch_name() Int
     fn tn_rocm_info(field_id Int) Int
+    fn tn_rocm_alloc(nbytes Int) Int
+    fn tn_rocm_free(dptr Int) Int
+    fn tn_rocm_htod(dst_dptr Int, src_host Int, nbytes Int) Int
+    fn tn_rocm_dtoh(dst_host Int, src_dptr Int, nbytes Int) Int
+    fn tn_rocm_sync() Int
+    fn tn_rocm_io_read_to_vram(fd Int, file_off Int, dst_dptr Int, nbytes Int) Int
+    fn tn_rocm_rmsnorm(x_dptr Int, w_dptr Int, y_dptr Int, b Int, h Int, eps Float) Int
+    fn tn_rocm_quant_q8_1(x_dptr Int, q8_dptr Int, b Int, k Int) Int
+    fn tn_rocm_gemv_q4_0(w_dptr Int, x_q8_dptr Int, y_dptr Int, m Int, k Int, b Int) Int
+    fn tn_rocm_gemm_q4_0(w_dptr Int, x_q8_dptr Int, y_dptr Int, m Int, n Int, k Int) Int
+    fn tn_rocm_gemm_f16(w_dptr Int, x_dptr Int, y_dptr Int, m Int, n Int, k Int) Int
+    fn tn_rocm_swiglu(gate_dptr Int, up_dptr Int, out_dptr Int, n Int, oai_mode Int) Int
+    fn tn_rocm_flash_attn_paged(q_dptr Int, kc_dptr Int, vc_dptr Int, bt_dptr Int, sinks_dptr Int, out_dptr Int, b Int, n_qh Int, n_kvh Int, hd Int, kv_base_pos Int, page_sz Int, scale Float, softcap Float, swa_win Int) Int
     fn tn_rocm_self_test() Int
 }

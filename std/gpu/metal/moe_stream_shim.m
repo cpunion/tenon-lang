@@ -411,6 +411,7 @@ typedef struct {
     id<MTLBuffer> pbuf_gdn_o;     // [cap * v_dim] F32
     id<MTLBuffer> pbuf_gdn_alpha; // [cap * n_v_heads] F32
     id<MTLBuffer> pbuf_gdn_beta;  // [cap * n_v_heads] F32
+    id<MTLBuffer> pbuf_gdn_wy;    // [ceil(cap/32) * n_v_heads * 2080] F32 (Tenon v19: Chunkwise WY-GDN scratch)
     id<MTLBuffer> pbuf_rlogits;     // [cap * n_experts] F32 (Tenon v8/v9 MoE batched router)
     id<MTLBuffer> pbuf_moe_x;       // [cap * d_model] F32
     id<MTLBuffer> pbuf_moe_h;       // [cap * top_k * d_ff_exp] F32 (Tenon v9 Mega-Kernel hidden)
@@ -457,8 +458,14 @@ static id<MTLComputePipelineState> g_pso_softcap = nil;
 static id<MTLComputePipelineState> g_pso_q_gate_split = nil;
 static id<MTLComputePipelineState> g_pso_attn_gate_sig = nil;
 static id<MTLComputePipelineState> g_pso_gdn_conv1d_silu = nil;
+static id<MTLComputePipelineState> g_pso_gdn_prep_qkgb = nil;
 static id<MTLComputePipelineState> g_pso_gdn_step_batch = nil;
+static id<MTLComputePipelineState> g_pso_gdn_wy_prep = nil;
+static id<MTLComputePipelineState> g_pso_gdn_prefill_chunk = nil;
 static id<MTLComputePipelineState> g_pso_gdn_gated_norm = nil;
+static id<MTLComputePipelineState> g_pso_mtl4_matmul16 = nil;
+static int g_mtl4_tensor_ready = 0;
+static int g_gdn_chunk_disable = 0;
 static id<MTLComputePipelineState> g_pso_gemv_qkv_q4 = nil;
 static id<MTLComputePipelineState> g_pso_gemv_qkv_q4k = nil;
 static id<MTLComputePipelineState> g_pso_gemv_qkv_q8 = nil;
@@ -9612,11 +9619,14 @@ kernel void moe_flash_decode_q8_paged(
     const device float* q [[buffer(0)]], const device uchar* k_cache [[buffer(1)]], const device uchar* v_cache [[buffer(2)]],
     device float* ctx [[buffer(3)]], const device uint* pos_arr [[buffer(4)]], const device uint* slot_arr [[buffer(5)]],
     const device int* block_table [[buffer(6)]], constant MoePagedAttnArgs& p [[buffer(7)]],
+    const device float* learn_sinks [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
 ) {
     uint h = tgid.x, b = tgid.y;
     if (h >= p.n_heads || b >= p.batch_b) return;
+    uint has_ls = (p.attn_sink >> 31);
+    uint attn_sink_n = p.attn_sink & 0x1FFFFFFFu;
     uint kv_len = pos_arr[b] + 1u, slot = slot_arr[b];
     const device int* bt = block_table + (ulong)slot * p.max_blks;
     uint grp = max(p.n_heads / p.n_kv, 1u), kvh = h / grp;
@@ -9632,7 +9642,7 @@ kernel void moe_flash_decode_q8_paged(
     float m_run = -1e30f, l_run = 0.0f;
     float o_acc[8] = {0,0,0,0,0,0,0,0};
     uint win_start = (p.swa_window > 0u && kv_len > p.swa_window) ? (kv_len - p.swa_window) : 0u;
-    uint sink_end = min(p.attn_sink, win_start);
+    uint sink_end = min(attn_sink_n, win_start);
     for (uint pass = 0u; pass < 2u; pass++) {
         uint t_beg = (pass == 0u) ? 0u : win_start;
         uint t_end = (pass == 0u) ? sink_end : kv_len;
@@ -9662,7 +9672,14 @@ kernel void moe_flash_decode_q8_paged(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float gm = max(max(s_m[0], s_m[1]), max(s_m[2], s_m[3])), gl = 0.0f;
     for (uint s = 0; s < 4u; s++) if (s_l[s] > 0.0f) gl += s_l[s] * exp(s_m[s] - gm);
-    float inv = 1.0f / max(gl, 1e-12f);
+    float o_sc = 1.0f;
+    if (has_ls) {
+        float sl = learn_sinks[h];
+        float gms = max(gm, sl);
+        o_sc = exp(gm - gms);
+        gl = gl * o_sc + exp(sl - gms);
+    }
+    float inv = o_sc / max(gl, 1e-12f);
     for (uint d = lid; d < p.out_stride; d += 128u) {
         float ov = 0.0f;
         for (uint s = 0; s < 4u; s++) if (s_l[s] > 0.0f) ov = fma(s_o[s][d], exp(s_m[s] - gm), ov);
@@ -9724,11 +9741,14 @@ kernel void moe_flash_decode_fp8_paged(
     const device float* q [[buffer(0)]], const device uchar* k_cache [[buffer(1)]], const device uchar* v_cache [[buffer(2)]],
     device float* ctx [[buffer(3)]], const device uint* pos_arr [[buffer(4)]], const device uint* slot_arr [[buffer(5)]],
     const device int* block_table [[buffer(6)]], constant MoePagedAttnArgs& p [[buffer(7)]],
+    const device float* learn_sinks [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
 ) {
     uint h = tgid.x, b = tgid.y;
     if (h >= p.n_heads || b >= p.batch_b) return;
+    uint has_ls = (p.attn_sink >> 31);
+    uint attn_sink_n = p.attn_sink & 0x1FFFFFFFu;
     uint kv_len = pos_arr[b] + 1u, slot = slot_arr[b];
     const device int* bt = block_table + (ulong)slot * p.max_blks;
     uint grp = max(p.n_heads / p.n_kv, 1u), kvh = h / grp;
@@ -9742,7 +9762,7 @@ kernel void moe_flash_decode_fp8_paged(
     float m_run = -1e30f, l_run = 0.0f;
     float o_acc[8] = {0,0,0,0,0,0,0,0};
     uint win_start = (p.swa_window > 0u && kv_len > p.swa_window) ? (kv_len - p.swa_window) : 0u;
-    uint sink_end = min(p.attn_sink, win_start);
+    uint sink_end = min(attn_sink_n, win_start);
     for (uint pass = 0u; pass < 2u; pass++) {
         uint t_beg = (pass == 0u) ? 0u : win_start;
         uint t_end = (pass == 0u) ? sink_end : kv_len;
@@ -9772,7 +9792,14 @@ kernel void moe_flash_decode_fp8_paged(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float gm = max(max(s_m[0], s_m[1]), max(s_m[2], s_m[3])), gl = 0.0f;
     for (uint s = 0; s < 4u; s++) if (s_l[s] > 0.0f) gl += s_l[s] * exp(s_m[s] - gm);
-    float inv = 1.0f / max(gl, 1e-12f);
+    float o_sc = 1.0f;
+    if (has_ls) {
+        float sl = learn_sinks[h];
+        float gms = max(gm, sl);
+        o_sc = exp(gm - gms);
+        gl = gl * o_sc + exp(sl - gms);
+    }
+    float inv = o_sc / max(gl, 1e-12f);
     for (uint d = lid; d < p.out_stride; d += 128u) {
         float ov = 0.0f;
         for (uint s = 0; s < 4u; s++) if (s_l[s] > 0.0f) ov = fma(s_o[s][d], exp(s_m[s] - gm), ov);
@@ -10724,9 +10751,9 @@ kernel void moe_flash_prefill_paged_fp16(
     }
 }
 
-// Tenon v13 P1b: Hardware Apple AMX FlashAttention-2 Paged Prefill (dh=64: BQ=32, BK=32, 18 KB SMEM, simdgroup_half8x8!)
+// Tenon v13/v19 P4: Universal FP16 / Q8_0 / FP8_E4M3 Hardware Apple AMX FlashAttention-2 Paged Prefill (dh=64: BQ=32, BK=32, 18 KB SMEM, simdgroup_half8x8!)
 kernel void moe_flash_prefill_amx64(
-    const device float* q [[buffer(0)]], const device half* k_cache [[buffer(1)]], const device half* v_cache [[buffer(2)]],
+    const device float* q [[buffer(0)]], const device uchar* k_cache [[buffer(1)]], const device uchar* v_cache [[buffer(2)]],
     device float* ctx [[buffer(3)]], const device uint* pos_arr [[buffer(4)]], const device uint* slot_arr [[buffer(5)]],
     const device int* block_table [[buffer(6)]], constant MoePagedAttnArgs& p [[buffer(7)]],
     const device float* learn_sinks [[buffer(8)]],
@@ -10736,11 +10763,13 @@ kernel void moe_flash_prefill_amx64(
     uint h = tgid.x, qb0 = tgid.y * 32u;
     if (h >= p.n_heads || qb0 >= p.batch_b) return;
     uint has_ls = (p.attn_sink >> 31);
-    uint attn_sink_n = p.attn_sink & 0x7FFFFFFFu;
+    uint kv_mode = (p.attn_sink >> 29) & 3u; // 0=FP16, 1=Q8_0, 2=FP8_E4M3
+    uint attn_sink_n = p.attn_sink & 0x1FFFFFFFu;
     uint slot = slot_arr[qb0];
     const device int* bt = block_table + (ulong)slot * p.max_blks;
     uint grp = max(p.n_heads / p.n_kv, 1u), kvh = h / grp;
     uint kv_stride = p.n_kv * 64u;
+    ulong qrow_bytes = (ulong)p.n_kv * 68ul; // 2 blocks x 34B per head
     uint max_qb = min(qb0 + 32u, p.batch_b);
     uint max_pos_tg = pos_arr[max_qb - 1u];
     uint min_pos_tg = pos_arr[qb0];
@@ -10786,9 +10815,28 @@ kernel void moe_flash_prefill_amx64(
             uint tk = vi >> 4, c4 = (vi & 15u) << 2;
             if (tk < tk_lim) {
                 uint pt = (tk < 16u) ? (pt0 + tk) : (pt1 + (tk - 16u));
-                ulong off = (ulong)pt * kv_stride + (ulong)kvh * 64ul + c4;
-                *(threadgroup half4*)(&sK[tk][c4]) = *(const device half4*)(k_cache + off);
-                *(threadgroup half4*)(&sV[tk][c4]) = *(const device half4*)(v_cache + off);
+                if (kv_mode == 0u) {
+                    ulong off = (ulong)pt * kv_stride + (ulong)kvh * 64ul + c4;
+                    *(threadgroup half4*)(&sK[tk][c4]) = *(const device half4*)(((const device half*)k_cache) + off);
+                    *(threadgroup half4*)(&sV[tk][c4]) = *(const device half4*)(((const device half*)v_cache) + off);
+                } else {
+                    uint blk = c4 >> 5, ib = c4 & 31u;
+                    ulong h_off = (ulong)pt * qrow_bytes + (ulong)kvh * 68ul + (ulong)blk * 34ul;
+                    const device uchar* kb = k_cache + h_off;
+                    const device uchar* vb = v_cache + h_off;
+                    float kd = float(*(const device half*)kb), vd = float(*(const device half*)vb);
+                    if (kv_mode == 1u) {
+                        const device char* kq = (const device char*)(kb + 2u + ib);
+                        const device char* vq = (const device char*)(vb + 2u + ib);
+                        *(threadgroup half4*)(&sK[tk][c4]) = half4(float4(kq[0], kq[1], kq[2], kq[3]) * kd);
+                        *(threadgroup half4*)(&sV[tk][c4]) = half4(float4(vq[0], vq[1], vq[2], vq[3]) * vd);
+                    } else {
+                        const device uchar* kq = kb + 2u + ib;
+                        const device uchar* vq = vb + 2u + ib;
+                        *(threadgroup half4*)(&sK[tk][c4]) = half4(float4(fp8_e4m3_dec(kq[0]), fp8_e4m3_dec(kq[1]), fp8_e4m3_dec(kq[2]), fp8_e4m3_dec(kq[3])) * kd);
+                        *(threadgroup half4*)(&sV[tk][c4]) = half4(float4(fp8_e4m3_dec(vq[0]), fp8_e4m3_dec(vq[1]), fp8_e4m3_dec(vq[2]), fp8_e4m3_dec(vq[3])) * vd);
+                    }
+                }
             } else {
                 *(threadgroup half4*)(&sK[tk][c4]) = half4(0.0h);
                 *(threadgroup half4*)(&sV[tk][c4]) = half4(0.0h);
@@ -10904,20 +10952,25 @@ kernel void moe_flash_prefill_amx64(
     }
 }
 
-// Tenon v13 P1b: Hardware Apple AMX FlashAttention-2 Paged Prefill (dh=128: BQ=32, BK=16, 21 KB SMEM, 1 PagedKV blk/tile!)
+// Tenon v13/v19 P4: Universal FP16 / Q8_0 / FP8_E4M3 Hardware Apple AMX FlashAttention-2 Paged Prefill (dh=128: BQ=32, BK=16, 21 KB SMEM, 1 PagedKV blk/tile!)
 kernel void moe_flash_prefill_amx128(
-    const device float* q [[buffer(0)]], const device half* k_cache [[buffer(1)]], const device half* v_cache [[buffer(2)]],
+    const device float* q [[buffer(0)]], const device uchar* k_cache [[buffer(1)]], const device uchar* v_cache [[buffer(2)]],
     device float* ctx [[buffer(3)]], const device uint* pos_arr [[buffer(4)]], const device uint* slot_arr [[buffer(5)]],
     const device int* block_table [[buffer(6)]], constant MoePagedAttnArgs& p [[buffer(7)]],
+    const device float* learn_sinks [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
 ) {
     uint h = tgid.x, qb0 = tgid.y * 32u;
     if (h >= p.n_heads || qb0 >= p.batch_b) return;
+    uint has_ls = (p.attn_sink >> 31);
+    uint kv_mode = (p.attn_sink >> 29) & 3u; // 0=FP16, 1=Q8_0, 2=FP8_E4M3
+    uint attn_sink_n = p.attn_sink & 0x1FFFFFFFu;
     uint slot = slot_arr[qb0];
     const device int* bt = block_table + (ulong)slot * p.max_blks;
     uint grp = max(p.n_heads / p.n_kv, 1u), kvh = h / grp;
     uint kv_stride = p.n_kv * 128u;
+    ulong qrow_bytes = (ulong)p.n_kv * 136ul; // 4 blocks x 34B per head
     uint max_qb = min(qb0 + 32u, p.batch_b);
     uint max_pos_tg = pos_arr[max_qb - 1u];
     uint min_pos_tg = pos_arr[qb0];
@@ -10956,16 +11009,36 @@ kernel void moe_flash_prefill_amx128(
         uint t_base = lb << 4;
         if (p.swa_window > 0u) {
             uint ws_tg = (min_pos_tg + 1u > p.swa_window) ? (min_pos_tg + 1u - p.swa_window) : 0u;
-            if (t_base + 16u <= ws_tg && t_base >= p.attn_sink) continue;
+            if (t_base + 16u <= ws_tg && t_base >= attn_sink_n) continue;
         }
         uint tk_lim = min(16u, max_pos_tg - t_base + 1u);
         uint pt_base = uint(bt[lb]) << 4;
         for (uint vi = lid; vi < 512u; vi += 128u) {
             uint tk = vi >> 5, c4 = (vi & 31u) << 2;
             if (tk < tk_lim) {
-                ulong off = (ulong)(pt_base + tk) * kv_stride + (ulong)kvh * 128ul + c4;
-                *(threadgroup half4*)(&sK[tk][c4]) = *(const device half4*)(k_cache + off);
-                *(threadgroup half4*)(&sV[tk][c4]) = *(const device half4*)(v_cache + off);
+                uint pt = pt_base + tk;
+                if (kv_mode == 0u) {
+                    ulong off = (ulong)pt * kv_stride + (ulong)kvh * 128ul + c4;
+                    *(threadgroup half4*)(&sK[tk][c4]) = *(const device half4*)(((const device half*)k_cache) + off);
+                    *(threadgroup half4*)(&sV[tk][c4]) = *(const device half4*)(((const device half*)v_cache) + off);
+                } else {
+                    uint blk = c4 >> 5, ib = c4 & 31u;
+                    ulong h_off = (ulong)pt * qrow_bytes + (ulong)kvh * 136ul + (ulong)blk * 34ul;
+                    const device uchar* kb = k_cache + h_off;
+                    const device uchar* vb = v_cache + h_off;
+                    float kd = float(*(const device half*)kb), vd = float(*(const device half*)vb);
+                    if (kv_mode == 1u) {
+                        const device char* kq = (const device char*)(kb + 2u + ib);
+                        const device char* vq = (const device char*)(vb + 2u + ib);
+                        *(threadgroup half4*)(&sK[tk][c4]) = half4(float4(kq[0], kq[1], kq[2], kq[3]) * kd);
+                        *(threadgroup half4*)(&sV[tk][c4]) = half4(float4(vq[0], vq[1], vq[2], vq[3]) * vd);
+                    } else {
+                        const device uchar* kq = kb + 2u + ib;
+                        const device uchar* vq = vb + 2u + ib;
+                        *(threadgroup half4*)(&sK[tk][c4]) = half4(float4(fp8_e4m3_dec(kq[0]), fp8_e4m3_dec(kq[1]), fp8_e4m3_dec(kq[2]), fp8_e4m3_dec(kq[3])) * kd);
+                        *(threadgroup half4*)(&sV[tk][c4]) = half4(float4(fp8_e4m3_dec(vq[0]), fp8_e4m3_dec(vq[1]), fp8_e4m3_dec(vq[2]), fp8_e4m3_dec(vq[3])) * vd);
+                    }
+                }
             } else {
                 *(threadgroup half4*)(&sK[tk][c4]) = half4(0.0h);
                 *(threadgroup half4*)(&sV[tk][c4]) = half4(0.0h);
@@ -10992,7 +11065,7 @@ kernel void moe_flash_prefill_amx128(
         #pragma unroll
         for (uint k = 0; k < 4u; k++) {
             uint c = c4_l + k, t = t_base + c;
-            bool ok = my_v && (c < tk_lim) && (t <= my_pos) && (p.swa_window == 0u || t >= my_ws || t < p.attn_sink);
+            bool ok = my_v && (c < tk_lim) && (t <= my_pos) && (p.swa_window == 0u || t >= my_ws || t < attn_sink_n);
             sv[k] = ok ? (sS[sg][roff16 + k] * scale_log2) : -1e30f;
             rm = max(rm, sv[k]);
         }
@@ -11040,7 +11113,14 @@ kernel void moe_flash_prefill_amx128(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float inv = 1.0f / max(l_row, 1e-12f);
+    float o_sc = 1.0f;
+    if (has_ls) {
+        float sl = learn_sinks[h] * 1.4426950408889634f;
+        float gms = max(m_row, sl);
+        o_sc = exp2(m_row - gms);
+        l_row = l_row * o_sc + exp2(sl - gms);
+    }
+    float inv = o_sc / max(l_row, 1e-12f);
     uint roff32 = r_l * 32u + c8_l;
     ulong cb = ((ulong)(my_v ? my_b : 0u) * p.n_heads + h) * p.out_stride;
     #pragma unroll
@@ -11716,6 +11796,246 @@ kernel void moe_gdn_step_batch(
     if (cur_slot >= 0 && i_ok) ssm_state[(ulong)cur_slot * state_slot_stride + state_hc_off] = s;
 }
 
+// Tenon v19 P4: Chunkwise Parallel WY-Representation Gated DeltaNet Prefill on Apple Silicon (C=32 tokens/chunk, 16x fewer barriers!)
+struct GdnPrepArgs { uint n_k_heads; uint n_v_heads; uint d_k; uint qkv_dim; uint batch_b; };
+kernel void moe_gdn_prep_qkgb(
+    device float* qkv_conv [[buffer(0)]],
+    device float* alpha_buf [[buffer(1)]],
+    device float* beta_buf [[buffer(2)]],
+    const device float* ssm_a [[buffer(3)]],
+    const device float* dt_bias [[buffer(4)]],
+    constant GdnPrepArgs& p [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint kh = tgid.x, b = tgid.y;
+    if (b >= p.batch_b) return;
+    if (kh < p.n_k_heads) {
+        threadgroup float2 s_nrm[4];
+        bool i_ok = (lid < p.d_k);
+        uint k_dim = p.n_k_heads * p.d_k;
+        ulong qkv_b = (ulong)b * p.qkv_dim;
+        float qi = i_ok ? qkv_conv[qkv_b + (ulong)kh * p.d_k + lid] : 0.0f;
+        float ki = i_ok ? qkv_conv[qkv_b + k_dim + (ulong)kh * p.d_k + lid] : 0.0f;
+        float q2 = simd_sum(qi * qi), k2 = simd_sum(ki * ki);
+        if (lane == 0u) s_nrm[sg] = float2(q2, k2);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float2 n2 = s_nrm[0] + s_nrm[1] + s_nrm[2] + s_nrm[3];
+        if (i_ok) {
+            qkv_conv[qkv_b + (ulong)kh * p.d_k + lid] = qi * rsqrt(n2.x + 1e-6f) * rsqrt(float(p.d_k));
+            qkv_conv[qkv_b + k_dim + (ulong)kh * p.d_k + lid] = ki * rsqrt(n2.y + 1e-6f);
+        }
+    }
+    if (kh == 0u) {
+        for (uint h = lid; h < p.n_v_heads; h += 128u) {
+            ulong idx = (ulong)b * p.n_v_heads + h;
+            float av = alpha_buf[idx] + dt_bias[h];
+            float sp = (av > 20.0f) ? av : log(1.0f + exp(av));
+            alpha_buf[idx] = exp(ssm_a[h] * sp);
+            beta_buf[idx]  = 1.0f / (1.0f + exp(-beta_buf[idx]));
+        }
+    }
+}
+
+kernel void moe_gdn_wy_prep(
+    const device float* qkv_conv [[buffer(0)]],
+    const device float* g_buf [[buffer(1)]],
+    const device float* beta_buf [[buffer(2)]],
+    device float* wy_buf [[buffer(3)]],
+    constant GdnPrepArgs& p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {
+    uint cid = tgid.x, h = tgid.y;
+    uint n_chunks = (p.batch_b + 31u) >> 5;
+    if (cid >= n_chunks || h >= p.n_v_heads) return;
+    uint t0 = cid << 5;
+    uint c_len = min(32u, p.batch_b - t0);
+    uint k_dim = p.n_k_heads * p.d_k;
+    uint kh = (p.n_k_heads > 0u) ? (h % p.n_k_heads) : 0u;
+
+    threadgroup float sK[32][128];
+    threadgroup float sM[32][33];
+    threadgroup float sT[32][33];
+    threadgroup float sL[32];
+    threadgroup float sB[32];
+
+    if (lid == 0u) {
+        float run_l = 0.0f;
+        for (uint i = 0u; i < c_len; i++) {
+            float gv = g_buf[(ulong)(t0 + i) * p.n_v_heads + h];
+            run_l += log(max(gv, 1e-30f));
+            sL[i] = run_l;
+            sB[i] = beta_buf[(ulong)(t0 + i) * p.n_v_heads + h];
+        }
+    }
+    for (uint idx = lid; idx < c_len * p.d_k; idx += 128u) {
+        uint r = idx / p.d_k, c = idx - r * p.d_k;
+        sK[r][c] = qkv_conv[(ulong)(t0 + r) * p.qkv_dim + k_dim + (ulong)kh * p.d_k + c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ulong ch_off = ((ulong)cid * p.n_v_heads + h) * 2080ul;
+    device float* out_T = wy_buf + ch_off;
+    device float* out_P = wy_buf + ch_off + 1024ul;
+    device float* out_L = wy_buf + ch_off + 2048ul;
+    for (uint idx = lid; idx < 1024u; idx += 128u) {
+        uint i = idx >> 5, j = idx & 31u;
+        if (i < c_len && j < i) {
+            float dot_kk = 0.0f;
+            for (uint d = 0u; d < p.d_k; d++) dot_kk = fma(sK[i][d], sK[j][d], dot_kk);
+            sM[i][j] = sB[i] * exp(sL[i] - sL[j]) * dot_kk;
+        } else {
+            sM[i][j] = 0.0f;
+        }
+        if (i < c_len && j <= i) {
+            const device float* qp = qkv_conv + (ulong)(t0 + i) * p.qkv_dim + (ulong)kh * p.d_k;
+            float dot_qk = 0.0f;
+            for (uint d = 0u; d < p.d_k; d++) dot_qk = fma(qp[d], sK[j][d], dot_qk);
+            out_P[idx] = exp(sL[i] - sL[j]) * dot_qk;
+        } else {
+            out_P[idx] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 32u) {
+        uint j = lid;
+        for (uint i = 0u; i < j && i < 32u; i++) sT[i][j] = 0.0f;
+        if (j < c_len) {
+            sT[j][j] = sB[j];
+            for (uint i = j + 1u; i < c_len; i++) {
+                float acc = 0.0f;
+                for (uint r = j; r < i; r++) acc = fma(sM[i][r], sT[r][j], acc);
+                sT[i][j] = -acc;
+            }
+            for (uint i = c_len; i < 32u; i++) sT[i][j] = 0.0f;
+        } else {
+            for (uint i = j; i < 32u; i++) sT[i][j] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = lid; idx < 1024u; idx += 128u) out_T[idx] = sT[idx >> 5][idx & 31u];
+    if (lid < 32u) out_L[lid] = (lid < c_len) ? sL[lid] : 0.0f;
+}
+
+kernel void moe_gdn_prefill_chunk(
+    const device float* qkv_conv [[buffer(0)]],
+    const device float* wy_buf [[buffer(1)]],
+    device float4* ssm_state [[buffer(2)]],
+    device float* o_out [[buffer(3)]],
+    const device uint* slot_arr [[buffer(4)]],
+    constant GdnStepArgs& p [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint col_blk8 = tgid.x, h = tgid.y;
+    uint n_col_blks4 = p.d_v >> 2, n_col_blks8 = p.d_v >> 3;
+    if (col_blk8 >= n_col_blks8 || h >= p.n_v_heads || p.batch_b == 0u) return;
+    uint j0 = col_blk8 << 3, k_dim = p.n_k_heads * p.d_k, v_dim = p.n_v_heads * p.d_v;
+    uint kh = (p.n_k_heads > 0u) ? (h % p.n_k_heads) : 0u;
+    bool i_ok = (lid < p.d_k);
+    uint slot = slot_arr[0];
+    ulong state_slot_stride = (ulong)p.n_v_heads * (ulong)n_col_blks4 * (ulong)p.d_k;
+    ulong sb = (ulong)slot * state_slot_stride;
+    ulong state_hc0 = ((ulong)h * n_col_blks4 + (col_blk8 << 1)) * p.d_k + lid;
+    ulong state_hc1 = state_hc0 + p.d_k;
+    float4 s0 = i_ok ? ssm_state[sb + state_hc0] : float4(0.0f);
+    float4 s1 = i_ok ? ssm_state[sb + state_hc1] : float4(0.0f);
+
+    threadgroup float4 s_ks0[4][32], s_ks1[4][32];
+    threadgroup float4 s_qs0[4][32], s_qs1[4][32];
+    threadgroup float s_Y[32][8], s_U[32][8];
+    threadgroup float s_T[32][33], s_P[32][33];
+    threadgroup float s_L[32], s_dec_end[32];
+
+    uint ti = lid >> 2, cj = lid & 3u;
+    uint n_chunks = (p.batch_b + 31u) >> 5;
+    for (uint cid = 0u; cid < n_chunks; cid++) {
+        uint t0 = cid << 5;
+        uint c_len = min(32u, p.batch_b - t0);
+        ulong ch_off = ((ulong)cid * p.n_v_heads + h) * 2080ul;
+        const device float* T_ptr = wy_buf + ch_off;
+        const device float* P_ptr = wy_buf + ch_off + 1024ul;
+        const device float* L_ptr = wy_buf + ch_off + 2048ul;
+        for (uint idx = lid; idx < 1024u; idx += 128u) {
+            uint rr = idx >> 5, cc = idx & 31u;
+            s_T[rr][cc] = T_ptr[idx];
+            s_P[rr][cc] = P_ptr[idx];
+        }
+        if (lid < c_len) s_L[lid] = L_ptr[lid];
+        for (uint i = 0u; i < c_len; i++) {
+            ulong qkv_i = (ulong)(t0 + i) * p.qkv_dim;
+            float qi = i_ok ? qkv_conv[qkv_i + (ulong)kh * p.d_k + lid] : 0.0f;
+            float ki = i_ok ? qkv_conv[qkv_i + k_dim + (ulong)kh * p.d_k + lid] : 0.0f;
+            float4 ks0 = float4(simd_sum(s0.x * ki), simd_sum(s0.y * ki), simd_sum(s0.z * ki), simd_sum(s0.w * ki));
+            float4 ks1 = float4(simd_sum(s1.x * ki), simd_sum(s1.y * ki), simd_sum(s1.z * ki), simd_sum(s1.w * ki));
+            float4 qs0 = float4(simd_sum(s0.x * qi), simd_sum(s0.y * qi), simd_sum(s0.z * qi), simd_sum(s0.w * qi));
+            float4 qs1 = float4(simd_sum(s1.x * qi), simd_sum(s1.y * qi), simd_sum(s1.z * qi), simd_sum(s1.w * qi));
+            if (lane == 0u) {
+                s_ks0[sg][i] = ks0; s_ks1[sg][i] = ks1;
+                s_qs0[sg][i] = qs0; s_qs1[sg][i] = qs1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float qs_prev0 = 0.0f, qs_prev1 = 0.0f;
+        if (lid < c_len) s_dec_end[lid] = exp(s_L[c_len - 1u] - s_L[lid]);
+        if (ti < c_len) {
+            float dec_i = exp(s_L[ti]);
+            float4 ks0_tot = s_ks0[0][ti] + s_ks0[1][ti] + s_ks0[2][ti] + s_ks0[3][ti];
+            float4 ks1_tot = s_ks1[0][ti] + s_ks1[1][ti] + s_ks1[2][ti] + s_ks1[3][ti];
+            float4 qs0_tot = s_qs0[0][ti] + s_qs0[1][ti] + s_qs0[2][ti] + s_qs0[3][ti];
+            float4 qs1_tot = s_qs1[0][ti] + s_qs1[1][ti] + s_qs1[2][ti] + s_qs1[3][ti];
+            float ks_a = (cj == 0u) ? ks0_tot.x : (cj == 1u) ? ks0_tot.z : (cj == 2u) ? ks1_tot.x : ks1_tot.z;
+            float ks_b = (cj == 0u) ? ks0_tot.y : (cj == 1u) ? ks0_tot.w : (cj == 2u) ? ks1_tot.y : ks1_tot.w;
+            float qs_a = (cj == 0u) ? qs0_tot.x : (cj == 1u) ? qs0_tot.z : (cj == 2u) ? qs1_tot.x : qs1_tot.z;
+            float qs_b = (cj == 0u) ? qs0_tot.y : (cj == 1u) ? qs0_tot.w : (cj == 2u) ? qs1_tot.y : qs1_tot.w;
+            ulong voff = (ulong)(t0 + ti) * p.qkv_dim + 2ul * k_dim + (ulong)h * p.d_v + j0 + (cj << 1);
+            float2 vv = *(const device float2*)(qkv_conv + voff);
+            s_Y[ti][cj * 2u + 0u] = vv.x - dec_i * ks_a;
+            s_Y[ti][cj * 2u + 1u] = vv.y - dec_i * ks_b;
+            qs_prev0 = dec_i * qs_a; qs_prev1 = dec_i * qs_b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ti < c_len) {
+            float u0 = 0.0f, u1 = 0.0f;
+            uint c0 = cj * 2u;
+            for (uint r = 0u; r <= ti; r++) {
+                float tr = s_T[ti][r];
+                u0 = fma(tr, s_Y[r][c0 + 0u], u0);
+                u1 = fma(tr, s_Y[r][c0 + 1u], u1);
+            }
+            s_U[ti][c0 + 0u] = u0; s_U[ti][c0 + 1u] = u1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ti < c_len) {
+            float o0 = qs_prev0, o1 = qs_prev1;
+            uint c0 = cj * 2u;
+            for (uint r = 0u; r <= ti; r++) {
+                float pr = s_P[ti][r];
+                o0 = fma(pr, s_U[r][c0 + 0u], o0);
+                o1 = fma(pr, s_U[r][c0 + 1u], o1);
+            }
+            *(device float2*)(o_out + (ulong)(t0 + ti) * v_dim + (ulong)h * p.d_v + j0 + c0) = float2(o0, o1);
+        }
+        if (i_ok) {
+            float g_end = exp(s_L[c_len - 1u]);
+            s0 *= g_end; s1 *= g_end;
+            for (uint r = 0u; r < c_len; r++) {
+                float kr = qkv_conv[(ulong)(t0 + r) * p.qkv_dim + k_dim + (ulong)kh * p.d_k + lid] * s_dec_end[r];
+                s0 = fma(float4(kr), float4(s_U[r][0], s_U[r][1], s_U[r][2], s_U[r][3]), s0);
+                s1 = fma(float4(kr), float4(s_U[r][4], s_U[r][5], s_U[r][6], s_U[r][7]), s1);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (i_ok) { ssm_state[sb + state_hc0] = s0; ssm_state[sb + state_hc1] = s1; }
+}
+
 struct GdnNormArgs { uint d_v; uint n_groups; float eps; };
 kernel void moe_gdn_gated_rmsnorm(
     const device float* o [[buffer(0)]],
@@ -11966,8 +12286,61 @@ static int moe_init_metal(void) {
     g_pso_q_gate_split      = mk(@"moe_q_gate_split");
     g_pso_attn_gate_sig     = mk(@"moe_attn_gate_sigmoid");
     g_pso_gdn_conv1d_silu   = mk(@"moe_gdn_conv1d_silu");
+    g_pso_gdn_prep_qkgb     = mk(@"moe_gdn_prep_qkgb");
     g_pso_gdn_step_batch    = mk(@"moe_gdn_step_batch");
+    g_pso_gdn_wy_prep       = mk(@"moe_gdn_wy_prep");
+    g_pso_gdn_prefill_chunk = mk(@"moe_gdn_prefill_chunk");
     g_pso_gdn_gated_norm    = mk(@"moe_gdn_gated_rmsnorm");
+    const char* gchk_e = getenv("TENON_GDN_CHUNK");
+    g_gdn_chunk_disable = (gchk_e && atoi(gchk_e) == 0) ? 1 : 0;
+
+    // Tenon v19 P4: Probe Native Metal 4.0 TensorOps (`mpp::tensor_ops::matmul2d` + `cooperative_tensor`) on macOS 26+!
+    {
+        static NSString* kMtl4ProbeSrc = @R"(
+#include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+kernel void moe_mtl4_matmul16_test(
+    device half* A [[buffer(0)]],
+    device half* B [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* C [[buffer(3)]],
+    constant uint& K [[buffer(4)]]
+) {
+    auto tA = tensor<device half, dextents<int, 2>, tensor_inline>(A, dextents<int, 2>((int)K, 16));
+    auto tB = tensor<device half, dextents<int, 2>, tensor_inline>(B, dextents<int, 2>(16, (int)K));
+    auto tC = tensor<device float, dextents<int, 2>, tensor_inline>(C, dextents<int, 2>(16, 16));
+    constexpr auto desc = matmul2d_descriptor(
+        16, 16, dynamic_length_v<int>, false, false, false,
+        matmul2d_descriptor::mode::multiply
+    );
+    matmul2d<desc, execution_simdgroup> op;
+    auto ct_c = op.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
+    op.run(tA, tB, ct_c);
+    for (ushort i = 0; i < ct_c.get_capacity(); i++) {
+        if (ct_c.is_valid_element(i)) {
+            auto ix = ct_c.get_multidimensional_index(i);
+            ct_c[i] += bias[(uint)ix[0]];
+        }
+    }
+    ct_c.store(tC);
+}
+)";
+        NSError* e4 = nil;
+        MTLCompileOptions* o4 = [[MTLCompileOptions alloc] init];
+        o4.languageVersion = (MTLLanguageVersion)0x40000; // MTLLanguageVersion4_0
+        id<MTLLibrary> lib4 = [g_moe_dev newLibraryWithSource:kMtl4ProbeSrc options:o4 error:&e4];
+        if (lib4 != nil) {
+            id<MTLFunction> fn4 = [lib4 newFunctionWithName:@"moe_mtl4_matmul16_test"];
+            if (fn4 != nil) {
+                NSError* pe4 = nil;
+                g_pso_mtl4_matmul16 = [g_moe_dev newComputePipelineStateWithFunction:fn4 error:&pe4];
+                if (g_pso_mtl4_matmul16 != nil) g_mtl4_tensor_ready = 1;
+            }
+        }
+    }
     g_pso_gemv_qkv_q4       = mk(@"moe_gemv_qkv_q4");
     g_pso_gemv_qkv_q4k      = mk(@"moe_gemv_qkv_q4k");
     g_pso_gemv_qkv_q8       = mk(@"moe_gemv_qkv_q8");
@@ -14493,6 +14866,10 @@ int64_t tn_moe_info(int64_t handle, int64_t field_id) {
         case 64: return m->io_eng.backend_id;
         case 65: return m->io_eng.advise_calls;
         case 66: return m->io_eng.total_bytes;
+        case 67: return m->io_eng.reg_buf_count;
+        case 68: return g_mtl4_tensor_ready;
+        case 69: return (g_pso_gdn_wy_prep != nil && g_pso_gdn_prefill_chunk != nil && !g_gdn_chunk_disable) ? 1 : 0;
+        case 70: return (g_pso_flash_prefill_amx64 != nil && g_pso_flash_prefill_amx128 != nil) ? 1 : 0;
         default: return 0;
     }
 }
@@ -14544,6 +14921,9 @@ static void ensure_prefill_bufs(MoeModel* m, int B) {
         m->pbuf_gdn_o     = [g_moe_dev newBufferWithLength:(size_t)cap * v_dim * 4 options:MTLResourceStorageModeShared];
         m->pbuf_gdn_alpha = [g_moe_dev newBufferWithLength:(size_t)cap * n_vh * 4 options:MTLResourceStorageModeShared];
         m->pbuf_gdn_beta  = [g_moe_dev newBufferWithLength:(size_t)cap * n_vh * 4 options:MTLResourceStorageModeShared];
+        size_t n_wy_chunks = ((size_t)cap + 31u) >> 5;
+        if (n_wy_chunks < 1u) n_wy_chunks = 1u;
+        m->pbuf_gdn_wy    = [g_moe_dev newBufferWithLength:n_wy_chunks * n_vh * 2080u * 4u options:MTLResourceStorageModeShared];
     }
     {
         size_t fd_cap = (size_t)(cap < MOE_FD_MAX_B ? cap : MOE_FD_MAX_B);
@@ -15925,18 +16305,51 @@ static void encode_layer_attn_paged_batch(MoeModel* m, id<MTLComputeCommandEncod
         [enc setBytes:&ca length:sizeof(ca) atIndex:5];
         [enc dispatchThreads:MTLSizeMake(qkv_d, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
-        struct { uint32_t n_kh, n_vh, d_k, d_v, qkv_d, batch_b; } sa = { n_kh, n_vh, d_k, d_v, qkv_d, B };
-        [enc setComputePipelineState:g_pso_gdn_step_batch];
-        [enc setBuffer:m->pbuf_gdn_conv offset:0 atIndex:0];
-        [enc setBuffer:m->pbuf_gdn_alpha offset:0 atIndex:1];
-        [enc setBuffer:m->pbuf_gdn_beta offset:0 atIndex:2];
-        [enc setBuffer:ly->gdn_a.buf offset:(NSUInteger)ly->gdn_a.offset atIndex:3];
-        [enc setBuffer:ly->gdn_dt_bias.buf offset:(NSUInteger)ly->gdn_dt_bias.offset atIndex:4];
-        [enc setBuffer:ly->gdn_ssm_state offset:0 atIndex:5];
-        [enc setBuffer:m->pbuf_gdn_o offset:0 atIndex:6];
-        [enc setBuffer:m->buf_cb_slot offset:0 atIndex:7];
-        [enc setBytes:&sa length:sizeof(sa) atIndex:8];
-        [enc dispatchThreadgroups:MTLSizeMake(d_v / 4u, n_vh, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (m->cur_is_prefill && B >= 32u && d_k <= 128u && (d_v & 7u) == 0u &&
+            !g_gdn_chunk_disable && m->pbuf_gdn_wy != nil &&
+            g_pso_gdn_prep_qkgb != nil && g_pso_gdn_wy_prep != nil && g_pso_gdn_prefill_chunk != nil) {
+            struct { uint32_t n_kh, n_vh, d_k, qkv_d, batch_b; } pa = { n_kh, n_vh, d_k, qkv_d, B };
+            [enc setComputePipelineState:g_pso_gdn_prep_qkgb];
+            [enc setBuffer:m->pbuf_gdn_conv offset:0 atIndex:0];
+            [enc setBuffer:m->pbuf_gdn_alpha offset:0 atIndex:1];
+            [enc setBuffer:m->pbuf_gdn_beta offset:0 atIndex:2];
+            [enc setBuffer:ly->gdn_a.buf offset:(NSUInteger)ly->gdn_a.offset atIndex:3];
+            [enc setBuffer:ly->gdn_dt_bias.buf offset:(NSUInteger)ly->gdn_dt_bias.offset atIndex:4];
+            [enc setBytes:&pa length:sizeof(pa) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(n_kh, B, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+            uint32_t n_chunks = (B + 31u) >> 5;
+            [enc setComputePipelineState:g_pso_gdn_wy_prep];
+            [enc setBuffer:m->pbuf_gdn_conv offset:0 atIndex:0];
+            [enc setBuffer:m->pbuf_gdn_alpha offset:0 atIndex:1];
+            [enc setBuffer:m->pbuf_gdn_beta offset:0 atIndex:2];
+            [enc setBuffer:m->pbuf_gdn_wy offset:0 atIndex:3];
+            [enc setBytes:&pa length:sizeof(pa) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(n_chunks, n_vh, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+            struct { uint32_t n_kh, n_vh, d_k, d_v, qkv_d, batch_b; } sa = { n_kh, n_vh, d_k, d_v, qkv_d, B };
+            [enc setComputePipelineState:g_pso_gdn_prefill_chunk];
+            [enc setBuffer:m->pbuf_gdn_conv offset:0 atIndex:0];
+            [enc setBuffer:m->pbuf_gdn_wy offset:0 atIndex:1];
+            [enc setBuffer:ly->gdn_ssm_state offset:0 atIndex:2];
+            [enc setBuffer:m->pbuf_gdn_o offset:0 atIndex:3];
+            [enc setBuffer:m->buf_cb_slot offset:0 atIndex:4];
+            [enc setBytes:&sa length:sizeof(sa) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(d_v / 8u, n_vh, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            struct { uint32_t n_kh, n_vh, d_k, d_v, qkv_d, batch_b; } sa = { n_kh, n_vh, d_k, d_v, qkv_d, B };
+            [enc setComputePipelineState:g_pso_gdn_step_batch];
+            [enc setBuffer:m->pbuf_gdn_conv offset:0 atIndex:0];
+            [enc setBuffer:m->pbuf_gdn_alpha offset:0 atIndex:1];
+            [enc setBuffer:m->pbuf_gdn_beta offset:0 atIndex:2];
+            [enc setBuffer:ly->gdn_a.buf offset:(NSUInteger)ly->gdn_a.offset atIndex:3];
+            [enc setBuffer:ly->gdn_dt_bias.buf offset:(NSUInteger)ly->gdn_dt_bias.offset atIndex:4];
+            [enc setBuffer:ly->gdn_ssm_state offset:0 atIndex:5];
+            [enc setBuffer:m->pbuf_gdn_o offset:0 atIndex:6];
+            [enc setBuffer:m->buf_cb_slot offset:0 atIndex:7];
+            [enc setBytes:&sa length:sizeof(sa) atIndex:8];
+            [enc dispatchThreadgroups:MTLSizeMake(d_v / 4u, n_vh, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
 
         struct { uint32_t d_v, n_groups; float eps; } na = { d_v, B * n_vh, m->rms_eps };
         [enc setComputePipelineState:g_pso_gdn_gated_norm];
@@ -16250,7 +16663,7 @@ static void encode_layer_attn_paged_batch(MoeModel* m, id<MTLComputeCommandEncod
         [enc setBytes:&rargs length:sizeof(rargs) atIndex:9];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)m->n_heads, B, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
-        if (m->cur_use_fd && g_pso_flash_dec_split_paged != nil && g_pso_flash_dec_reduce_paged != nil && m->buf_fd_o != nil) {
+        if (!ly->has_attn_sinks && m->cur_use_fd && g_pso_flash_dec_split_paged != nil && g_pso_flash_dec_reduce_paged != nil && m->buf_fd_o != nil) {
             uint32_t ns = (uint32_t)(m->cur_fd_splits > 0 ? m->cur_fd_splits : 8);
             uint32_t grp = (uint32_t)((m->n_heads / m->n_kv) > 0 ? (m->n_heads / m->n_kv) : 1);
             uint32_t gstep = (grp < 8u ? grp : 8u);
@@ -16273,11 +16686,26 @@ static void encode_layer_attn_paged_batch(MoeModel* m, id<MTLComputeCommandEncod
             [enc setBuffer:m->pbuf_ctx offset:0 atIndex:3]; [enc setBytes:&red length:sizeof(red) atIndex:4];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)m->n_heads, B, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             m->flash_decode_launches++;
+        } else if (m->cur_is_prefill && B >= 32u && (m->kv_quant_q8 == 1 || m->kv_quant_q8 == 2) &&
+                   ((m->d_head == 64 && g_pso_flash_prefill_amx64 != nil) || (m->d_head == 128 && g_pso_flash_prefill_amx128 != nil))) {
+            // Tenon v19 P4: Universal Q8_0 / FP8_E4M3 Hardware Apple AMX FlashAttention-2 Paged Prefill!
+            struct { uint32_t nh, nkv, dh, bb, os; float sc; uint32_t mb, swa, sink; } qamx;
+            memcpy(&qamx, &aargs, sizeof(qamx));
+            qamx.sink = (aargs.sink & 0x9FFFFFFFu) | (((uint32_t)m->kv_quant_q8 & 3u) << 29);
+            [enc setComputePipelineState:(m->d_head == 64 ? g_pso_flash_prefill_amx64 : g_pso_flash_prefill_amx128)];
+            [enc setBuffer:m->pbuf_q offset:0 atIndex:0]; [enc setBuffer:ly->k_cache offset:0 atIndex:1]; [enc setBuffer:ly->v_cache offset:0 atIndex:2];
+            [enc setBuffer:m->pbuf_ctx offset:0 atIndex:3]; [enc setBuffer:m->buf_cb_pos offset:0 atIndex:4]; [enc setBuffer:m->buf_cb_slot offset:0 atIndex:5];
+            [enc setBuffer:m->buf_pa_bt offset:0 atIndex:6]; [enc setBytes:&qamx length:sizeof(qamx) atIndex:7];
+            [enc setBuffer:(ly->has_attn_sinks ? ly->attn_sinks.buf : m->buf_argmax)
+                    offset:(ly->has_attn_sinks ? (NSUInteger)ly->attn_sinks.offset : 0) atIndex:8];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)m->n_heads, (NSUInteger)((B + 31u) / 32u), 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else {
             [enc setComputePipelineState:apso];
             [enc setBuffer:m->pbuf_q offset:0 atIndex:0]; [enc setBuffer:ly->k_cache offset:0 atIndex:1]; [enc setBuffer:ly->v_cache offset:0 atIndex:2];
             [enc setBuffer:m->pbuf_ctx offset:0 atIndex:3]; [enc setBuffer:m->buf_cb_pos offset:0 atIndex:4]; [enc setBuffer:m->buf_cb_slot offset:0 atIndex:5];
             [enc setBuffer:m->buf_pa_bt offset:0 atIndex:6]; [enc setBytes:&aargs length:sizeof(aargs) atIndex:7];
+            [enc setBuffer:(ly->has_attn_sinks ? ly->attn_sinks.buf : m->buf_argmax)
+                    offset:(ly->has_attn_sinks ? (NSUInteger)ly->attn_sinks.offset : 0) atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)m->n_heads, B, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         }
     } else {
@@ -16336,11 +16764,13 @@ static void encode_layer_attn_paged_batch(MoeModel* m, id<MTLComputeCommandEncod
             [enc setBuffer:(ly->has_attn_sinks ? ly->attn_sinks.buf : m->buf_argmax)
                     offset:(ly->has_attn_sinks ? (NSUInteger)ly->attn_sinks.offset : 0) atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)m->n_heads, (NSUInteger)((B + 31u) / 32u), 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        } else if (!ly->has_attn_sinks && m->cur_is_prefill && B >= 32u && m->d_head == 128 && g_pso_flash_prefill_amx128 != nil) {
+        } else if (m->cur_is_prefill && B >= 32u && m->d_head == 128 && g_pso_flash_prefill_amx128 != nil) {
             [enc setComputePipelineState:g_pso_flash_prefill_amx128];
             [enc setBuffer:m->pbuf_q offset:0 atIndex:0]; [enc setBuffer:ly->k_cache offset:0 atIndex:1]; [enc setBuffer:ly->v_cache offset:0 atIndex:2];
             [enc setBuffer:m->pbuf_ctx offset:0 atIndex:3]; [enc setBuffer:m->buf_cb_pos offset:0 atIndex:4]; [enc setBuffer:m->buf_cb_slot offset:0 atIndex:5];
             [enc setBuffer:m->buf_pa_bt offset:0 atIndex:6]; [enc setBytes:&aargs length:sizeof(aargs) atIndex:7];
+            [enc setBuffer:(ly->has_attn_sinks ? ly->attn_sinks.buf : m->buf_argmax)
+                    offset:(ly->has_attn_sinks ? (NSUInteger)ly->attn_sinks.offset : 0) atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)m->n_heads, (NSUInteger)((B + 31u) / 32u), 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else if (!ly->has_attn_sinks && m->cur_is_prefill && B >= 16u && m->d_head <= 256 && (m->d_head & 3) == 0 && g_pso_flash_prefill_paged_fp16 != nil) {
             [enc setComputePipelineState:g_pso_flash_prefill_paged_fp16];
@@ -19640,7 +20070,7 @@ int64_t tn_moe_free(int64_t handle) {
         m->buf_h = nil; m->buf_sh_g = nil; m->buf_sh_u = nil; m->buf_logits = nil; m->buf_argmax = nil;
         m->pbuf_x = nil; m->pbuf_xn = nil; m->pbuf_q = nil; m->pbuf_k = nil; m->pbuf_v = nil;
         m->pbuf_ctx = nil; m->pbuf_g = nil; m->pbuf_u = nil; m->pbuf_mla_q = nil; m->pbuf_mla_kv = nil;
-        m->pbuf_gdn_qkv = nil; m->pbuf_gdn_conv = nil; m->pbuf_gdn_z = nil; m->pbuf_gdn_o = nil; m->pbuf_gdn_alpha = nil; m->pbuf_gdn_beta = nil;
+        m->pbuf_gdn_qkv = nil; m->pbuf_gdn_conv = nil; m->pbuf_gdn_z = nil; m->pbuf_gdn_o = nil; m->pbuf_gdn_alpha = nil; m->pbuf_gdn_beta = nil; m->pbuf_gdn_wy = nil;
         m->prefill_cap = 0;
         for (int s = 0; s < m->n_shards; s++) {
             m->mmap_mtl_bufs[s] = nil;
@@ -19650,4 +20080,132 @@ int64_t tn_moe_free(int64_t handle) {
         m->active = 0;
     }
     return 1;
+}
+
+// Tenon v19 P4: GPU Self-Test verifying Metal Chunkwise WY-GDN (C=32) vs Sequential GDN Recurrence (max_err < 1e-4)
+int64_t tn_moe_gdn_wy_self_test(void) {
+    @autoreleasepool {
+        if (!moe_init_metal() || g_pso_gdn_step_batch == nil || g_pso_gdn_prep_qkgb == nil ||
+            g_pso_gdn_wy_prep == nil || g_pso_gdn_prefill_chunk == nil) return 0;
+        const uint32_t B = 96u, n_kh = 2u, n_vh = 4u, d_k = 128u, d_v = 128u;
+        const uint32_t qkv_d = 2u * n_kh * d_k + n_vh * d_v;
+        const uint32_t v_dim = n_vh * d_v;
+        const uint32_t n_chunks = (B + 31u) >> 5;
+        id<MTLBuffer> b_qkv1 = [g_moe_dev newBufferWithLength:(size_t)B * qkv_d * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_qkv2 = [g_moe_dev newBufferWithLength:(size_t)B * qkv_d * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_alp1 = [g_moe_dev newBufferWithLength:(size_t)B * n_vh * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_alp2 = [g_moe_dev newBufferWithLength:(size_t)B * n_vh * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_bet1 = [g_moe_dev newBufferWithLength:(size_t)B * n_vh * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_bet2 = [g_moe_dev newBufferWithLength:(size_t)B * n_vh * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_a    = [g_moe_dev newBufferWithLength:(size_t)n_vh * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_dt   = [g_moe_dev newBufferWithLength:(size_t)n_vh * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_st1  = [g_moe_dev newBufferWithLength:(size_t)v_dim * d_k * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_st2  = [g_moe_dev newBufferWithLength:(size_t)v_dim * d_k * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_o1   = [g_moe_dev newBufferWithLength:(size_t)B * v_dim * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_o2   = [g_moe_dev newBufferWithLength:(size_t)B * v_dim * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_wy   = [g_moe_dev newBufferWithLength:(size_t)n_chunks * n_vh * 2080u * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_slot = [g_moe_dev newBufferWithLength:(size_t)B * 4u options:MTLResourceStorageModeShared];
+        float* q1 = (float*)[b_qkv1 contents]; float* q2 = (float*)[b_qkv2 contents];
+        for (size_t i = 0; i < (size_t)B * qkv_d; i++) {
+            float v = 0.05f * sinf((float)(i * 13u + 7u));
+            q1[i] = v; q2[i] = v;
+        }
+        float* al1 = (float*)[b_alp1 contents]; float* al2 = (float*)[b_alp2 contents];
+        float* be1 = (float*)[b_bet1 contents]; float* be2 = (float*)[b_bet2 contents];
+        for (size_t i = 0; i < (size_t)B * n_vh; i++) {
+            al1[i] = al2[i] = -0.3f + 0.1f * cosf((float)i);
+            be1[i] = be2[i] = -0.5f + 0.2f * sinf((float)(i * 5u));
+        }
+        float* ap = (float*)[b_a contents]; float* dp = (float*)[b_dt contents];
+        for (uint32_t h = 0; h < n_vh; h++) { ap[h] = -0.4f - 0.1f * (float)h; dp[h] = 0.2f; }
+        memset([b_st1 contents], 0, (size_t)v_dim * d_k * 4u);
+        memset([b_st2 contents], 0, (size_t)v_dim * d_k * 4u);
+        memset([b_slot contents], 0, (size_t)B * 4u);
+
+        id<MTLCommandBuffer> cmd = [g_moe_q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        struct { uint32_t n_kh, n_vh, d_k, d_v, qkv_d, batch_b; } sa = { n_kh, n_vh, d_k, d_v, qkv_d, B };
+        [enc setComputePipelineState:g_pso_gdn_step_batch];
+        [enc setBuffer:b_qkv1 offset:0 atIndex:0]; [enc setBuffer:b_alp1 offset:0 atIndex:1];
+        [enc setBuffer:b_bet1 offset:0 atIndex:2]; [enc setBuffer:b_a offset:0 atIndex:3];
+        [enc setBuffer:b_dt offset:0 atIndex:4];   [enc setBuffer:b_st1 offset:0 atIndex:5];
+        [enc setBuffer:b_o1 offset:0 atIndex:6];   [enc setBuffer:b_slot offset:0 atIndex:7];
+        [enc setBytes:&sa length:sizeof(sa) atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(d_v / 4u, n_vh, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+        struct { uint32_t n_kh, n_vh, d_k, qkv_d, batch_b; } pa = { n_kh, n_vh, d_k, qkv_d, B };
+        [enc setComputePipelineState:g_pso_gdn_prep_qkgb];
+        [enc setBuffer:b_qkv2 offset:0 atIndex:0]; [enc setBuffer:b_alp2 offset:0 atIndex:1];
+        [enc setBuffer:b_bet2 offset:0 atIndex:2]; [enc setBuffer:b_a offset:0 atIndex:3];
+        [enc setBuffer:b_dt offset:0 atIndex:4];   [enc setBytes:&pa length:sizeof(pa) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(n_kh, B, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+        [enc setComputePipelineState:g_pso_gdn_wy_prep];
+        [enc setBuffer:b_qkv2 offset:0 atIndex:0]; [enc setBuffer:b_alp2 offset:0 atIndex:1];
+        [enc setBuffer:b_bet2 offset:0 atIndex:2]; [enc setBuffer:b_wy offset:0 atIndex:3];
+        [enc setBytes:&pa length:sizeof(pa) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(n_chunks, n_vh, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+        [enc setComputePipelineState:g_pso_gdn_prefill_chunk];
+        [enc setBuffer:b_qkv2 offset:0 atIndex:0]; [enc setBuffer:b_wy offset:0 atIndex:1];
+        [enc setBuffer:b_st2 offset:0 atIndex:2];  [enc setBuffer:b_o2 offset:0 atIndex:3];
+        [enc setBuffer:b_slot offset:0 atIndex:4]; [enc setBytes:&sa length:sizeof(sa) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(d_v / 8u, n_vh, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+
+        const float* o1 = (const float*)[b_o1 contents];
+        const float* o2 = (const float*)[b_o2 contents];
+        const float* st1 = (const float*)[b_st1 contents];
+        const float* st2 = (const float*)[b_st2 contents];
+        float max_o = 0.0f, max_s = 0.0f;
+        for (size_t i = 0; i < (size_t)B * v_dim; i++) { float e = fabsf(o1[i] - o2[i]); if (e > max_o) max_o = e; }
+        for (size_t i = 0; i < (size_t)v_dim * d_k; i++) { float e = fabsf(st1[i] - st2[i]); if (e > max_s) max_s = e; }
+        return (max_o < 1e-4f && max_s < 1e-4f) ? 1 : 0;
+    }
+}
+
+// Tenon v19 P4: Native Metal 4.0 MPP `matmul2d` + `cooperative_tensor` Hardware Verification (returns 1=HW MTL4 pass, 2=pre-MTL4 graceful, 0=mismatch)
+int64_t tn_moe_mtl4_self_test(void) {
+    @autoreleasepool {
+        if (!moe_init_metal()) return 0;
+        if (!g_mtl4_tensor_ready || g_pso_mtl4_matmul16 == nil) return 2;
+        const uint32_t M = 16u, N = 16u, K = 64u;
+        id<MTLBuffer> bA = [g_moe_dev newBufferWithLength:(size_t)M * K * 2u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bB = [g_moe_dev newBufferWithLength:(size_t)K * N * 2u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bBias = [g_moe_dev newBufferWithLength:(size_t)N * 4u options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bC = [g_moe_dev newBufferWithLength:(size_t)M * N * 4u options:MTLResourceStorageModeShared];
+        __fp16* pA = (__fp16*)[bA contents];
+        __fp16* pB = (__fp16*)[bB contents];
+        float* pBias = (float*)[bBias contents];
+        for (uint32_t i = 0; i < M * K; i++) pA[i] = (__fp16)(0.25f * (float)((int)(i % 9u) - 4));
+        for (uint32_t i = 0; i < K * N; i++) pB[i] = (__fp16)(0.25f * (float)((int)((i * 3u) % 7u) - 3));
+        for (uint32_t j = 0; j < N; j++) pBias[j] = 0.5f * (float)j;
+        memset([bC contents], 0, (size_t)M * N * 4u);
+
+        id<MTLCommandBuffer> cmd = [g_moe_q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        uint32_t kk = K;
+        [enc setComputePipelineState:g_pso_mtl4_matmul16];
+        [enc setBuffer:bA offset:0 atIndex:0]; [enc setBuffer:bB offset:0 atIndex:1];
+        [enc setBuffer:bBias offset:0 atIndex:2]; [enc setBuffer:bC offset:0 atIndex:3];
+        [enc setBytes:&kk length:4 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+
+        const float* pC = (const float*)[bC contents];
+        float max_err = 0.0f;
+        for (uint32_t r = 0; r < M; r++) {
+            for (uint32_t c = 0; c < N; c++) {
+                float ref = pBias[c];
+                for (uint32_t k = 0; k < K; k++) ref += (float)pA[r * K + k] * (float)pB[k * N + c];
+                float err = fabsf(pC[r * N + c] - ref);
+                if (err > max_err) max_err = err;
+            }
+        }
+        return (max_err < 1e-2f) ? 1 : 0;
+    }
+}
+
+int64_t tn_moe_io_self_test(void) {
+    return (int64_t)tn_io_self_test();
 }
