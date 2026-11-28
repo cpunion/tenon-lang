@@ -30,8 +30,8 @@ import "std/encoding/json.tn"
 import "std/net/reactor.tn"
 import "std/gpu/metal/moe_stream.tn"
 
-const MAX_CB Int = 8
-const MAX_RD Int = 32
+const MAX_CB Int = 16
+const MAX_RD Int = 64
 const HIST_STRIDE Int = 512
 const MAX_LORAS Int = 8
 
@@ -371,7 +371,7 @@ fn format_chat(arch Text, msgs JsonValue, extra_sys Text) Text {
             i += 1
         }
         tb.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n")
-    } else if arch == "qwen3moe" || arch == "qwen2" {
+    } else if arch == "qwen3moe" || arch == "qwen2" || arch == "qwen3" || arch == "qwen35" || arch == "qwen3next" {
         if len(extra_sys) > 0 {
             tb.push_str("<|im_start|>system\n")
             tb.push_str(extra_sys)
@@ -393,6 +393,61 @@ fn format_chat(arch Text, msgs JsonValue, extra_sys Text) Text {
             i += 1
         }
         tb.push_str("<|im_start|>assistant\n")
+    } else if arch == "gemma3" || arch == "gemma2" || arch == "gemma" {
+        var sys_p = if len(extra_sys) > 0 { extra_sys ++ "\n\n" } else { "" }
+        while i < n {
+            match json_at(msgs, i) {
+                Some(m) => {
+                    let role = match json_get_str(m, "role") { Some(r) => r, None => "user" }
+                    let content = match json_get_str(m, "content") { Some(c) => c, None => "" }
+                    if role == "system" {
+                        sys_p = sys_p ++ content ++ "\n\n"
+                    } else {
+                        let gr = if role == "assistant" { "model" } else { "user" }
+                        tb.push_str("<start_of_turn>")
+                        tb.push_str(gr)
+                        tb.push_str("\n")
+                        if gr == "user" && len(sys_p) > 0 {
+                            tb.push_str(sys_p)
+                            sys_p = ""
+                        }
+                        tb.push_str(content)
+                        tb.push_str("<end_of_turn>\n")
+                    }
+                }
+                None => {}
+            }
+            i += 1
+        }
+        tb.push_str("<start_of_turn>model\n")
+    } else if arch == "deepseek2" {
+        if len(extra_sys) > 0 {
+            tb.push_str(extra_sys)
+            tb.push_str("\n\n")
+        }
+        while i < n {
+            match json_at(msgs, i) {
+                Some(m) => {
+                    let role = match json_get_str(m, "role") { Some(r) => r, None => "user" }
+                    let content = match json_get_str(m, "content") { Some(c) => c, None => "" }
+                    if role == "system" {
+                        tb.push_str(content)
+                        tb.push_str("\n\n")
+                    } else if role == "assistant" {
+                        tb.push_str("Assistant: ")
+                        tb.push_str(content)
+                        tb.push_str("\n\n")
+                    } else {
+                        tb.push_str("User: ")
+                        tb.push_str(content)
+                        tb.push_str("\n\n")
+                    }
+                }
+                None => {}
+            }
+            i += 1
+        }
+        tb.push_str("Assistant:")
     } else {
         if len(extra_sys) > 0 {
             tb.push_str("system: ")
@@ -419,7 +474,7 @@ fn format_chat(arch Text, msgs JsonValue, extra_sys Text) Text {
 }
 
 fn is_stop_piece(tok Int, eos Int, piece Text) Bool {
-    tok == eos || piece == "<|eot_id|>" || piece == "<|eom_id|>" || piece == "<|eoft_id|>" || piece == "<|im_end|>" || piece == "</s>"
+    tok == eos || piece == "<|eot_id|>" || piece == "<|eom_id|>" || piece == "<|eoft_id|>" || piece == "<|end_of_text|>" || piece == "<|im_end|>" || piece == "<|endoftext|>" || piece == "<end_of_turn>" || piece == "</s>"
 }
 
 fn f32_bits_to_float(bits Int) Float {
@@ -532,15 +587,18 @@ fn handle_embeddings(cfd Int, handle Int, model_name Text, body Text) {
             let bos = unsafe { tn_moe_info(handle, 11) }
             var tok_buf List[Int] = list_filled(256, 0)
             let nt = unsafe { tn_moe_tokenize(handle, text_cstr_ptr(txt), list_data_ptr(tok_buf), 255) }
-            var ids List[Int] = list_filled(nt + 1, 0)
-            ids[0] = bos
-            var ti = 0
-            while ti < nt {
-                ids[ti + 1] = tok_buf[ti]
-                ti += 1
+            let n_emb = if bos >= 0 { nt + 1 } else if nt > 0 { nt } else { 1 }
+            var ids List[Int] = list_filled(n_emb, 0)
+            if bos >= 0 {
+                ids[0] = bos
+                var ti = 0
+                while ti < nt { ids[ti + 1] = tok_buf[ti]; ti += 1 }
+            } else {
+                var ti = 0
+                while ti < nt { ids[ti] = tok_buf[ti]; ti += 1 }
             }
             var raw_f32 List[Int] = list_filled((dm + 1) / 2, 0)
-            let got = unsafe { tn_moe_embed_text(handle, list_data_ptr(ids), nt + 1, list_data_ptr(raw_f32), dm) }
+            let got = unsafe { tn_moe_embed_text(handle, list_data_ptr(ids), n_emb, list_data_ptr(raw_f32), dm) }
             var emb_arr = json_arr_new()
             var di = 0
             while di < got {
@@ -604,11 +662,16 @@ fn handle_pd_prefill(
             let bos = unsafe { tn_moe_info(handle, 11) }
             var tok_buf List[Int] = list_filled(HIST_STRIDE, 0)
             let nt = unsafe { tn_moe_tokenize(handle, text_cstr_ptr(prompt), list_data_ptr(tok_buf), HIST_STRIDE - 2) }
-            let n_prompt = nt + 1
+            let n_prompt = if bos >= 0 { nt + 1 } else if nt > 0 { nt } else { 1 }
             var ids List[Int] = list_filled(n_prompt, 0)
-            ids[0] = bos
-            var i = 0
-            while i < nt { ids[i + 1] = tok_buf[i]; i += 1 }
+            if bos >= 0 {
+                ids[0] = bos
+                var i = 0
+                while i < nt { ids[i + 1] = tok_buf[i]; i += 1 }
+            } else {
+                var i = 0
+                while i < nt { ids[i] = tok_buf[i]; i += 1 }
+            }
             let pd_slot = 24
             let _ = unsafe { tn_moe_paged_seq_free(handle, pd_slot) }
             let t0 = moe_now_ms()
@@ -1543,6 +1606,7 @@ fn main() Int {
     var b_pos List[Int] = list_filled(MAX_CB, 0)
     var b_slots List[Int] = list_filled(MAX_CB, 0)
     var b_loras List[Int] = list_filled(MAX_CB, 0)
+    var b_is_pf List[Int] = list_filled(MAX_CB, 0)
     var b_out List[Int] = list_filled(MAX_CB, 0)
     var tok_scratch List[Int] = list_filled(HIST_STRIDE, 0)
     var chunk_buf List[Int] = list_filled(HIST_STRIDE, 0)
@@ -1551,6 +1615,7 @@ fn main() Int {
     var clock_tick = 0
     var total_reqs = 0
     var cb_batches_run = 0
+    var mixed_batches_run = 0
     var max_batch_seen = 0
     var cow_forks = 0
     var cow_saved_toks = 0
@@ -1755,6 +1820,7 @@ fn main() Int {
                                 obj = json_obj_set(obj, "cow_forks", JInt(cow_forks))
                                 obj = json_obj_set(obj, "cow_saved_tokens", JInt(cow_saved_toks))
                                 obj = json_obj_set(obj, "cb_batches_run", JInt(cb_batches_run))
+                                obj = json_obj_set(obj, "mixed_batches_run", JInt(mixed_batches_run))
                                 obj = json_obj_set(obj, "max_batch_seen", JInt(max_batch_seen))
                                 obj = json_obj_set(obj, "active_batch_size", JInt(cur_act))
                                 obj = json_obj_set(obj, "total_requests", JInt(total_reqs))
@@ -1785,6 +1851,8 @@ fn main() Int {
                                 mt.push_str(int_to_text(cur_act))
                                 mt.push_str("\n# HELP tenon_cb_batches_total Total CB iterations\n# TYPE tenon_cb_batches_total counter\ntenon_cb_batches_total ")
                                 mt.push_str(int_to_text(cb_batches_run))
+                                mt.push_str("\n# HELP tenon_mixed_prefill_decode_batches_total True mixed-batch prefill+decode steps\n# TYPE tenon_mixed_prefill_decode_batches_total counter\ntenon_mixed_prefill_decode_batches_total ")
+                                mt.push_str(int_to_text(mixed_batches_run))
                                 mt.push_str("\n# HELP tenon_paged_kv_blocks_total Total PagedKV blocks\n# TYPE tenon_paged_kv_blocks_total gauge\ntenon_paged_kv_blocks_total ")
                                 mt.push_str(int_to_text(pa_tot))
                                 mt.push_str("\n# HELP tenon_paged_kv_blocks_free Free PagedKV blocks\n# TYPE tenon_paged_kv_blocks_free gauge\ntenon_paged_kv_blocks_free ")
@@ -2101,13 +2169,21 @@ fn main() Int {
                         match json_get_str(jv, "prompt") { Some(p) => p, None => "Hello" }
                     }
                     let nt = unsafe { tn_moe_tokenize(handle, text_cstr_ptr(prompt), list_data_ptr(tok_scratch), HIST_STRIDE - 2) }
-                    let n_prompt = nt + 1
+                    let n_prompt = if bos >= 0 { nt + 1 } else if nt > 0 { nt } else { 1 }
                     var ids List[Int] = list_filled(n_prompt, 0)
-                    ids[0] = bos
-                    var ti = 0
-                    while ti < nt {
-                        ids[ti + 1] = tok_scratch[ti]
-                        ti += 1
+                    if bos >= 0 {
+                        ids[0] = bos
+                        var ti = 0
+                        while ti < nt {
+                            ids[ti + 1] = tok_scratch[ti]
+                            ti += 1
+                        }
+                    } else {
+                        var ti = 0
+                        while ti < nt {
+                            ids[ti] = tok_scratch[ti]
+                            ti += 1
+                        }
                     }
 
                     // Find longest common prefix across ALL slots for Zero-Copy COW Fork (base model only!)
@@ -2264,52 +2340,36 @@ fn main() Int {
             q_body = n_body
         }
 
-        // Tenon v13 T2.3: Parallel Batched Suffix Ingestion via `tn_moe_step_batch`!
-        // Advances ALL >=2 short-suffix (<=16 tok) same-LoRA prefilling slots together in ONE batched GPU step/token!
-        var batch_pf_go = true
-        while batch_pf_go {
-            var pf_cnt = 0
-            var pf_lora0 = -1
-            var all_short_same = true
-            var psi = 0
-            while psi < MAX_CB {
-                if cb_state[psi] == 1 {
-                    let rem = cb_pf_end[psi] - cb_pf_cur[psi]
-                    if rem <= 0 || rem > 16 {
-                        all_short_same = false
+        // Tenon v14 P5: Long-Prompt Chunked Prefill (>16 remaining tokens) via AMX/FA2 `paged_prefill`;
+        // Short-suffix (<=16 tokens) prefill slots are packed directly with active decode slots into ONE True Mixed-Batch `step_batch` below!
+        var budget = prefill_chunk
+        var pfs = 0
+        while pfs < MAX_CB && budget > 0 {
+            if cb_state[pfs] == 1 {
+                let cur = cb_pf_cur[pfs]
+                let end_p = cb_pf_end[pfs]
+                let rem = end_p - cur
+                if rem > 16 {
+                    let take = if rem < budget { rem } else { budget }
+                    let lid = cb_lora[pfs]
+                    if lid != active_lora_id {
+                        let _ = unsafe { tn_moe_lora_set(handle, lid, 1.0) }
+                        active_lora_id = lid
+                        lora_swaps += 1
                     }
-                    if pf_lora0 < 0 { pf_lora0 = cb_lora[psi] } else if cb_lora[psi] != pf_lora0 { all_short_same = false }
-                    b_toks[pf_cnt] = pf_ids[psi * HIST_STRIDE + cb_pf_cur[psi]]
-                    b_pos[pf_cnt] = cb_pf_cur[psi]
-                    b_slots[pf_cnt] = psi
-                    pf_cnt += 1
-                }
-                psi += 1
-            }
-            if pf_cnt < 2 || !all_short_same {
-                batch_pf_go = false
-            } else {
-                if pf_lora0 != active_lora_id {
-                    let _ = unsafe { tn_moe_lora_set(handle, pf_lora0, 1.0) }
-                    active_lora_id = pf_lora0
-                    lora_swaps += 1
-                }
-                let _ = unsafe {
-                    tn_moe_step_batch(
-                        handle,
-                        list_data_ptr(b_toks),
-                        list_data_ptr(b_pos),
-                        list_data_ptr(b_slots),
-                        pf_cnt,
-                        list_data_ptr(b_out)
-                    )
-                }
-                var bi = 0
-                while bi < pf_cnt {
-                    let pfs = b_slots[bi]
-                    cb_pf_cur[pfs] = cb_pf_cur[pfs] + 1
-                    if cb_pf_cur[pfs] >= cb_pf_end[pfs] {
-                        let first_tok = b_out[bi]
+                    let pbase = pfs * HIST_STRIDE
+                    var ci = 0
+                    while ci < take {
+                        chunk_buf[ci] = pf_ids[pbase + cur + ci]
+                        ci += 1
+                    }
+                    let first_tok = unsafe { tn_moe_paged_prefill(handle, pfs, list_data_ptr(chunk_buf), take, cur) }
+                    cb_pf_cur[pfs] = cur + take
+                    budget -= take
+                    if cb_pf_chunked[pfs] != 0 {
+                        chunked_prefill_chunks += 1
+                    }
+                    if cb_pf_cur[pfs] >= end_p {
                         let pf_ms = moe_now_ms() - cb_tpf0[pfs]
                         cb_pf_ms[pfs] = pf_ms
                         ttft_hist.observe(pf_ms)
@@ -2319,7 +2379,6 @@ fn main() Int {
                         let is_chat = cb_chat[pfs] != 0
                         let want_stream = cb_stream[pfs] != 0
                         let max_toks = cb_max[pfs]
-                        let pbase = pfs * HIST_STRIDE
                         let copy_n = if n_prompt < HIST_STRIDE { n_prompt } else { HIST_STRIDE }
                         var hi = 0
                         while hi < copy_n {
@@ -2363,101 +2422,18 @@ fn main() Int {
                                 cb_text[pfs] = piece0
                             }
                         }
-                    }
-                    bi += 1
-                }
-            }
-        }
-
-        // Chunked Prefill Interleaving: advance up to `prefill_chunk` tokens per tick so active decoders never stall!
-        var budget = prefill_chunk
-        var pfs = 0
-        while pfs < MAX_CB && budget > 0 {
-            if cb_state[pfs] == 1 {
-                let cur = cb_pf_cur[pfs]
-                let end_p = cb_pf_end[pfs]
-                let rem = end_p - cur
-                let take = if rem < budget { rem } else { budget }
-                let lid = cb_lora[pfs]
-                if lid != active_lora_id {
-                    let _ = unsafe { tn_moe_lora_set(handle, lid, 1.0) }
-                    active_lora_id = lid
-                    lora_swaps += 1
-                }
-                let pbase = pfs * HIST_STRIDE
-                var ci = 0
-                while ci < take {
-                    chunk_buf[ci] = pf_ids[pbase + cur + ci]
-                    ci += 1
-                }
-                let first_tok = unsafe { tn_moe_paged_prefill(handle, pfs, list_data_ptr(chunk_buf), take, cur) }
-                cb_pf_cur[pfs] = cur + take
-                budget -= take
-                if cb_pf_chunked[pfs] != 0 {
-                    chunked_prefill_chunks += 1
-                }
-                if cb_pf_cur[pfs] >= end_p {
-                    let pf_ms = moe_now_ms() - cb_tpf0[pfs]
-                    cb_pf_ms[pfs] = pf_ms
-                    ttft_hist.observe(pf_ms)
-                    let n_prompt = cb_ptoks[pfs]
-                    let actual_lcp = cb_cached[pfs]
-                    let cfd = cb_cfd[pfs]
-                    let is_chat = cb_chat[pfs] != 0
-                    let want_stream = cb_stream[pfs] != 0
-                    let max_toks = cb_max[pfs]
-                    let copy_n = if n_prompt < HIST_STRIDE { n_prompt } else { HIST_STRIDE }
-                    var hi = 0
-                    while hi < copy_n {
-                        hist_ids[pbase + hi] = pf_ids[pbase + hi]
-                        hi += 1
-                    }
-                    hist_len[pfs] = copy_n
-                    if want_stream {
-                        let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
-                        let _ = net_write_text(cfd, hdr)
-                    }
-                    let piece0 = unsafe { cstr_to_text(tn_moe_token_cstr(handle, first_tok)) }
-                    if is_stop_piece(first_tok, eos, piece0) || max_toks <= 0 {
-                        send_final_cb_response(cfd, model_name, is_chat, want_stream, "", n_prompt, actual_lcp, 0, pfs, pf_ms, 0.0, "stop")
-                        cb_state[pfs] = 0
-                        cb_cfd[pfs] = -1
                     } else {
-                        var alive = true
-                        if want_stream { alive = write_sse_piece(cfd, model_name, is_chat, piece0) }
-                        if copy_n < HIST_STRIDE {
-                            hist_ids[pbase + copy_n] = first_tok
-                            hist_len[pfs] = copy_n + 1
-                        }
-                        if !alive {
-                            stream_cancelled += 1
-                            let _ = unsafe { tn_moe_paged_seq_free(handle, pfs) }
-                            hist_len[pfs] = 0
-                            let _ = net_close(cfd)
-                            cb_state[pfs] = 0
-                            cb_cfd[pfs] = -1
-                        } else if max_toks <= 1 {
-                            send_final_cb_response(cfd, model_name, is_chat, want_stream, piece0, n_prompt, actual_lcp, 1, pfs, pf_ms, 0.0, "length")
-                            cb_state[pfs] = 0
-                            cb_cfd[pfs] = -1
-                        } else {
-                            cb_state[pfs] = 2
-                            cb_gen[pfs] = 1
-                            cb_pos[pfs] = n_prompt
-                            cb_tok[pfs] = first_tok
-                            cb_tdec[pfs] = moe_now_ms()
-                            cb_text[pfs] = piece0
-                        }
+                        break
                     }
-                } else {
-                    break
                 }
             }
             pfs += 1
         }
 
-        // Tenon v10: ONE Single-Launch Mixed-Batch Heterogeneous Multi-Tenant LoRA BGMV + Metal ICB `step_batch`!
+        // Tenon v14 P5: ONE Single-Launch True Mixed-Batch (Prefill + Decode + Heterogeneous Multi-LoRA BGMV + Metal ICB)!
         var b_sz = 0
+        var n_mix_pf = 0
+        var n_mix_dec = 0
         var first_lid = -1
         var has_hetero = false
         var si = 0
@@ -2468,13 +2444,29 @@ fn main() Int {
                 b_slots[b_sz] = si
                 let lid = cb_lora[si]
                 b_loras[b_sz] = lid
+                b_is_pf[b_sz] = 0
                 if first_lid < 0 { first_lid = lid } else if lid != first_lid { has_hetero = true }
                 b_sz += 1
+                n_mix_dec += 1
+            } else if cb_state[si] == 1 {
+                let rem = cb_pf_end[si] - cb_pf_cur[si]
+                if rem > 0 && rem <= 16 {
+                    b_toks[b_sz] = pf_ids[si * HIST_STRIDE + cb_pf_cur[si]]
+                    b_pos[b_sz] = cb_pf_cur[si]
+                    b_slots[b_sz] = si
+                    let lid = cb_lora[si]
+                    b_loras[b_sz] = lid
+                    b_is_pf[b_sz] = 1
+                    if first_lid < 0 { first_lid = lid } else if lid != first_lid { has_hetero = true }
+                    b_sz += 1
+                    n_mix_pf += 1
+                }
             }
             si += 1
         }
         if b_sz > 0 {
             if b_sz > max_batch_seen { max_batch_seen = b_sz }
+            if n_mix_pf > 0 && n_mix_dec > 0 { mixed_batches_run += 1 }
             if has_hetero {
                 let _ = unsafe { tn_moe_lora_set_batch(handle, list_data_ptr(b_loras), b_sz) }
                 hetero_lora_batches += 1
@@ -2503,49 +2495,108 @@ fn main() Int {
             while bi < b_sz {
                 let s = b_slots[bi]
                 let chosen = b_out[bi]
-                let piece = unsafe { cstr_to_text(tn_moe_token_cstr(handle, chosen)) }
-                let is_chat = cb_chat[s] != 0
-                let want_stream = cb_stream[s] != 0
-                if is_stop_piece(chosen, eos, piece) {
-                    let dec_ms = moe_now_ms() - cb_tdec[s]
-                    if cb_gen[s] > 0 && dec_ms > 0.0 {
-                        let denom = if cb_gen[s] > 1 { cb_gen[s] - 1 } else { 1 }
-                        tpot_hist.observe(dec_ms / int_to_float(denom))
+                if b_is_pf[bi] != 0 {
+                    cb_pf_cur[s] = cb_pf_cur[s] + 1
+                    if cb_pf_cur[s] >= cb_pf_end[s] {
+                        let pf_ms = moe_now_ms() - cb_tpf0[s]
+                        cb_pf_ms[s] = pf_ms
+                        ttft_hist.observe(pf_ms)
+                        let n_prompt = cb_ptoks[s]
+                        let actual_lcp = cb_cached[s]
+                        let cfd = cb_cfd[s]
+                        let is_chat = cb_chat[s] != 0
+                        let want_stream = cb_stream[s] != 0
+                        let max_toks = cb_max[s]
+                        let pbase = s * HIST_STRIDE
+                        let copy_n = if n_prompt < HIST_STRIDE { n_prompt } else { HIST_STRIDE }
+                        var hi = 0
+                        while hi < copy_n {
+                            hist_ids[pbase + hi] = pf_ids[pbase + hi]
+                            hi += 1
+                        }
+                        hist_len[s] = copy_n
+                        if want_stream {
+                            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                            let _ = net_write_text(cfd, hdr)
+                        }
+                        let piece0 = unsafe { cstr_to_text(tn_moe_token_cstr(handle, chosen)) }
+                        if is_stop_piece(chosen, eos, piece0) || max_toks <= 0 {
+                            send_final_cb_response(cfd, model_name, is_chat, want_stream, "", n_prompt, actual_lcp, 0, s, pf_ms, 0.0, "stop")
+                            cb_state[s] = 0
+                            cb_cfd[s] = -1
+                        } else {
+                            var alive = true
+                            if want_stream { alive = write_sse_piece(cfd, model_name, is_chat, piece0) }
+                            if copy_n < HIST_STRIDE {
+                                hist_ids[pbase + copy_n] = chosen
+                                hist_len[s] = copy_n + 1
+                            }
+                            if !alive {
+                                stream_cancelled += 1
+                                let _ = unsafe { tn_moe_paged_seq_free(handle, s) }
+                                hist_len[s] = 0
+                                let _ = net_close(cfd)
+                                cb_state[s] = 0
+                                cb_cfd[s] = -1
+                            } else if max_toks <= 1 {
+                                send_final_cb_response(cfd, model_name, is_chat, want_stream, piece0, n_prompt, actual_lcp, 1, s, pf_ms, 0.0, "length")
+                                cb_state[s] = 0
+                                cb_cfd[s] = -1
+                            } else {
+                                cb_state[s] = 2
+                                cb_gen[s] = 1
+                                cb_pos[s] = n_prompt
+                                cb_tok[s] = chosen
+                                cb_tdec[s] = moe_now_ms()
+                                cb_text[s] = piece0
+                            }
+                        }
                     }
-                    send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, "stop")
-                    cb_state[s] = 0
-                    cb_cfd[s] = -1
-                    cb_text[s] = ""
                 } else {
-                    cb_tok[s] = chosen
-                    cb_pos[s] = cb_pos[s] + 1
-                    cb_gen[s] = cb_gen[s] + 1
-                    cb_text[s] = cb_text[s] ++ piece
-                    let hl = hist_len[s]
-                    if hl < HIST_STRIDE {
-                        hist_ids[s * HIST_STRIDE + hl] = chosen
-                        hist_len[s] = hl + 1
-                    }
-                    var alive = true
-                    if want_stream { alive = write_sse_piece(cb_cfd[s], model_name, is_chat, piece) }
-                    if !alive {
-                        stream_cancelled += 1
-                        let _ = unsafe { tn_moe_paged_seq_free(handle, s) }
-                        hist_len[s] = 0
-                        let _ = net_close(cb_cfd[s])
-                        cb_state[s] = 0
-                        cb_cfd[s] = -1
-                        cb_text[s] = ""
-                    } else if cb_gen[s] >= cb_max[s] || cb_pos[s] + 2 >= 4096 {
+                    let piece = unsafe { cstr_to_text(tn_moe_token_cstr(handle, chosen)) }
+                    let is_chat = cb_chat[s] != 0
+                    let want_stream = cb_stream[s] != 0
+                    if is_stop_piece(chosen, eos, piece) {
                         let dec_ms = moe_now_ms() - cb_tdec[s]
                         if cb_gen[s] > 0 && dec_ms > 0.0 {
                             let denom = if cb_gen[s] > 1 { cb_gen[s] - 1 } else { 1 }
                             tpot_hist.observe(dec_ms / int_to_float(denom))
                         }
-                        send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, "length")
+                        send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, "stop")
                         cb_state[s] = 0
                         cb_cfd[s] = -1
                         cb_text[s] = ""
+                    } else {
+                        cb_tok[s] = chosen
+                        cb_pos[s] = cb_pos[s] + 1
+                        cb_gen[s] = cb_gen[s] + 1
+                        cb_text[s] = cb_text[s] ++ piece
+                        let hl = hist_len[s]
+                        if hl < HIST_STRIDE {
+                            hist_ids[s * HIST_STRIDE + hl] = chosen
+                            hist_len[s] = hl + 1
+                        }
+                        var alive = true
+                        if want_stream { alive = write_sse_piece(cb_cfd[s], model_name, is_chat, piece) }
+                        if !alive {
+                            stream_cancelled += 1
+                            let _ = unsafe { tn_moe_paged_seq_free(handle, s) }
+                            hist_len[s] = 0
+                            let _ = net_close(cb_cfd[s])
+                            cb_state[s] = 0
+                            cb_cfd[s] = -1
+                            cb_text[s] = ""
+                        } else if cb_gen[s] >= cb_max[s] || cb_pos[s] + 2 >= 4096 {
+                            let dec_ms = moe_now_ms() - cb_tdec[s]
+                            if cb_gen[s] > 0 && dec_ms > 0.0 {
+                                let denom = if cb_gen[s] > 1 { cb_gen[s] - 1 } else { 1 }
+                                tpot_hist.observe(dec_ms / int_to_float(denom))
+                            }
+                            send_final_cb_response(cb_cfd[s], model_name, is_chat, want_stream, cb_text[s], cb_ptoks[s], cb_cached[s], cb_gen[s], s, cb_pf_ms[s], dec_ms, "length")
+                            cb_state[s] = 0
+                            cb_cfd[s] = -1
+                            cb_text[s] = ""
+                        }
                     }
                 }
                 bi += 1

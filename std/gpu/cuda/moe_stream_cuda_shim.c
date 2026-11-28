@@ -233,11 +233,18 @@ typedef struct {
     CUfunction k_rope_kv_fp8_paged, k_flash_dec_fp8_paged, k_rope_kv_q4_paged, k_flash_dec_q4_paged;
     CUfunction k_flash_dec_split_paged, k_flash_mla_split_paged, k_flash_dec_reduce_paged;
     CUfunction k_rmsnorm_strided, k_f32_to_f16;
-    CUfunction k_deq_q4_0_f16, k_deq_q4_1_f16, k_deq_q8_0_f16, k_deq_q4k_f16, k_deq_q6k_f16;
+    CUfunction k_deq_q4_0_f16, k_deq_q4_1_f16, k_deq_q5_0_f16, k_deq_q8_0_f16, k_deq_q4k_f16, k_deq_q5k_f16, k_deq_q6k_f16;
     CUfunction k_flash_prefill_paged_fp16, k_flash_prefill_tc_fp16;
-    CUfunction k_quant_q8_1_b, k_gemv_q6k_dp4a, k_gemm_q4_dp4a_sb, k_gemm_q4_1_dp4a_sb, k_gemm_q6k_dp4a_sb;
-    CUfunction k_gemm_q4_mmq, k_gemm_q4_1_mmq, k_gemm_q4_mmq_n64, k_gemm_q4_1_mmq_n64;
+    CUfunction k_quant_q8_1_b, k_gemv_q6k_dp4a, k_gemv_q6k_dp4a_4r, k_gemm_q4_dp4a_sb, k_gemm_q4_1_dp4a_sb, k_gemm_q6k_dp4a_sb;
+    CUfunction k_gemv_q4k_dp4a, k_gemv_q4k_dp4a_4r, k_gemv_q5k_dp4a, k_gemv_q5k_dp4a_4r, k_gemv_q5_0_dp4a, k_gemv_q5_0_dp4a_4r, k_gemv_q8_dp4a, k_gemv_q8_dp4a_4r, k_gemv_q8_dp4a_lm;
+    CUfunction k_gemv_qkv_q4k_dp4a, k_gemv_qkv_q8_dp4a, k_gemv_qkv_q5_0_dp4a;
+    CUfunction k_dense_gu_q4k_dp4a_q8, k_dense_gu_q8_dp4a_q8, k_dense_gu_q5_0_dp4a_q8, k_dense_gu_q5k_dp4a_q8;
+    CUfunction k_gemm_q8_dp4a_sb, k_gemm_q5_0_dp4a_sb, k_gemm_q4k_dp4a_sb, k_gemm_q5k_dp4a_sb;
+    CUfunction k_gemm_q4_mmq, k_gemm_q4_1_mmq, k_gemm_q4_mmq_n64, k_gemm_q4_1_mmq_n64, k_gemm_q8_mmq, k_gemm_q4k_mmq;
     CUfunction k_rmsnorm_q8_1, k_dense_gu_q4_dp4a_q8;
+    CUfunction k_scale_f32, k_geglu_mul, k_rmsnorm_add, k_rmsnorm_add_norm, k_rmsnorm_add_norm_q8_1, k_softcap;
+    CUfunction k_q_gate_split, k_attn_gate_sigmoid, k_gdn_conv1d_silu, k_gdn_step_batch, k_gdn_gated_norm;
+    CUfunction k_vit_pixel_shuffle;
     CUfunction k_argmax;
     CUdeviceptr d_xq8;
     size_t xq8_cap;
@@ -360,11 +367,18 @@ typedef struct {
     CUfunction k_rope_kv_fp8_paged, k_flash_dec_fp8_paged, k_rope_kv_q4_paged, k_flash_dec_q4_paged;
     CUfunction k_flash_dec_split_paged, k_flash_mla_split_paged, k_flash_dec_reduce_paged;
     CUfunction k_rmsnorm_strided, k_f32_to_f16;
-    CUfunction k_deq_q4_0_f16, k_deq_q4_1_f16, k_deq_q8_0_f16, k_deq_q4k_f16, k_deq_q6k_f16;
+    CUfunction k_deq_q4_0_f16, k_deq_q4_1_f16, k_deq_q5_0_f16, k_deq_q8_0_f16, k_deq_q4k_f16, k_deq_q5k_f16, k_deq_q6k_f16;
     CUfunction k_flash_prefill_paged_fp16, k_flash_prefill_tc_fp16;
-    CUfunction k_quant_q8_1_b, k_gemv_q6k_dp4a, k_gemm_q4_dp4a_sb, k_gemm_q4_1_dp4a_sb, k_gemm_q6k_dp4a_sb;
-    CUfunction k_gemm_q4_mmq, k_gemm_q4_1_mmq, k_gemm_q4_mmq_n64, k_gemm_q4_1_mmq_n64;
+    CUfunction k_quant_q8_1_b, k_gemv_q6k_dp4a, k_gemv_q6k_dp4a_4r, k_gemm_q4_dp4a_sb, k_gemm_q4_1_dp4a_sb, k_gemm_q6k_dp4a_sb;
+    CUfunction k_gemv_q4k_dp4a, k_gemv_q4k_dp4a_4r, k_gemv_q5k_dp4a, k_gemv_q5k_dp4a_4r, k_gemv_q5_0_dp4a, k_gemv_q5_0_dp4a_4r, k_gemv_q8_dp4a, k_gemv_q8_dp4a_4r, k_gemv_q8_dp4a_lm;
+    CUfunction k_gemv_qkv_q4k_dp4a, k_gemv_qkv_q8_dp4a, k_gemv_qkv_q5_0_dp4a;
+    CUfunction k_dense_gu_q4k_dp4a_q8, k_dense_gu_q8_dp4a_q8, k_dense_gu_q5_0_dp4a_q8, k_dense_gu_q5k_dp4a_q8;
+    CUfunction k_gemm_q8_dp4a_sb, k_gemm_q5_0_dp4a_sb, k_gemm_q4k_dp4a_sb, k_gemm_q5k_dp4a_sb;
+    CUfunction k_gemm_q4_mmq, k_gemm_q4_1_mmq, k_gemm_q4_mmq_n64, k_gemm_q4_1_mmq_n64, k_gemm_q8_mmq, k_gemm_q4k_mmq;
     CUfunction k_rmsnorm_q8_1, k_dense_gu_q4_dp4a_q8;
+    CUfunction k_scale_f32, k_geglu_mul, k_rmsnorm_add, k_rmsnorm_add_norm, k_rmsnorm_add_norm_q8_1, k_softcap;
+    CUfunction k_q_gate_split, k_attn_gate_sigmoid, k_gdn_conv1d_silu, k_gdn_step_batch, k_gdn_gated_norm;
+    CUfunction k_vit_pixel_shuffle;
     CUfunction k_argmax;
     CUdeviceptr d_xq8;
     size_t xq8_cap;
@@ -887,9 +901,62 @@ static const char* kCuMoeSrc =
 "    if (gid < d_model) out[gid] = dequant_any_elem(emb, ggml_type, tok_id, gid, d_model);\n"
 "}\n"
 "\n"
-"extern \"C\" __global__ void cm_embed_lookup_batch(const uint8_t* emb, const uint32_t* tok_ids, float* out, uint32_t d_model, uint32_t ggml_type, uint32_t batch_b) {\n"
+"extern \"C\" __global__ void cm_embed_lookup_batch(const uint8_t* emb, const uint32_t* tok_ids, float* out, uint32_t d_model, uint32_t ggml_type, uint32_t batch_b, float embed_scale) {\n"
 "    uint32_t d = blockIdx.x * blockDim.x + threadIdx.x, b = blockIdx.y;\n"
-"    if (d < d_model && b < batch_b) out[(uint64_t)b * d_model + d] = dequant_any_elem(emb, ggml_type, tok_ids[b], d, d_model);\n"
+"    if (d < d_model && b < batch_b) out[(uint64_t)b * d_model + d] = dequant_any_elem(emb, ggml_type, tok_ids[b], d, d_model) * embed_scale;\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_scale_f32(float* x, uint32_t n, float sc) {\n"
+"    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) x[i] *= sc;\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_softcap(float* x, uint32_t n, float cap) {\n"
+"    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) x[i] = cap * tanhf(x[i] / cap);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_rmsnorm_add(const float* x, const float* w, float* y, uint32_t dim, uint32_t n_groups, float eps, uint32_t shared_w) {\n"
+"    uint32_t g = blockIdx.x; if (g >= n_groups) return;\n"
+"    __shared__ float s_sq[8];\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint64_t base = (uint64_t)g * dim;\n"
+"    float lsq = 0.0f;\n"
+"    for (uint32_t i = lid; i < dim; i += 256u) { float v = x[base + i]; lsq = fmaf(v, v, lsq); }\n"
+"    lsq = warp_sum(lsq);\n"
+"    if (lane == 0u) s_sq[wid] = lsq;\n"
+"    __syncthreads();\n"
+"    float tot = 0.0f; for (uint32_t s = 0; s < 8u; s++) tot += s_sq[s];\n"
+"    float inv = rsqrtf(tot / (float)dim + eps);\n"
+"    uint64_t wbase = shared_w ? 0ull : base;\n"
+"    for (uint32_t i = lid; i < dim; i += 256u) y[base + i] += x[base + i] * inv * w[wbase + i];\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_rmsnorm_add_norm(const float* x, const float* w1, float* y, const float* w2, float* out2, uint32_t dim, uint32_t n_groups, float eps, uint32_t shared_w) {\n"
+"    uint32_t g = blockIdx.x; if (g >= n_groups) return;\n"
+"    __shared__ float s_sq[8];\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint64_t base = (uint64_t)g * dim;\n"
+"    float lsq1 = 0.0f;\n"
+"    for (uint32_t i = lid; i < dim; i += 256u) { float v = x[base + i]; lsq1 = fmaf(v, v, lsq1); }\n"
+"    lsq1 = warp_sum(lsq1);\n"
+"    if (lane == 0u) s_sq[wid] = lsq1;\n"
+"    __syncthreads();\n"
+"    float tot1 = 0.0f; for (uint32_t s = 0; s < 8u; s++) tot1 += s_sq[s];\n"
+"    float inv1 = rsqrtf(tot1 / (float)dim + eps);\n"
+"    uint64_t wbase = shared_w ? 0ull : base;\n"
+"    float lsq2 = 0.0f;\n"
+"    for (uint32_t i = lid; i < dim; i += 256u) {\n"
+"        float nv = y[base + i] + x[base + i] * inv1 * w1[wbase + i];\n"
+"        y[base + i] = nv;\n"
+"        lsq2 = fmaf(nv, nv, lsq2);\n"
+"    }\n"
+"    lsq2 = warp_sum(lsq2);\n"
+"    if (lane == 0u) s_sq[wid] = lsq2;\n"
+"    __syncthreads();\n"
+"    float tot2 = 0.0f; for (uint32_t s = 0; s < 8u; s++) tot2 += s_sq[s];\n"
+"    float inv2 = rsqrtf(tot2 / (float)dim + eps);\n"
+"    for (uint32_t i = lid; i < dim; i += 256u) out2[base + i] = y[base + i] * inv2 * w2[wbase + i];\n"
 "}\n"
 "\n"
 "extern \"C\" __global__ void cm_rmsnorm(const float* x, const float* w, float* out, uint32_t dim, uint32_t n_groups, float eps, uint32_t shared_w) {\n"
@@ -1046,6 +1113,60 @@ static const char* kCuMoeSrc =
 "    *(uint2*)(dst + ob + 64u) = make_uint2(*(uint32_t*)&hi0, *(uint32_t*)&hi1);\n"
 "}\n"
 "\n"
+"extern \"C\" __global__ void cm_deq_q5_0_f16(const uint8_t* __restrict__ w, half* __restrict__ dst, uint32_t row0, uint32_t n_rows, uint32_t in_dim) {\n"
+"    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    uint32_t blk_idx = tid >> 2, g = tid & 3u;\n"
+"    if (blk_idx >= n_rows * nb) return;\n"
+"    const uint8_t* blk = w + ((uint64_t)row0 * nb + blk_idx) * 22ull;\n"
+"    float d = load_f16_le(blk);\n"
+"    const uint16_t* h16 = (const uint16_t*)(blk + 2u);\n"
+"    uint32_t qh = (uint32_t)__ldg(&h16[0]) | ((uint32_t)__ldg(&h16[1]) << 16);\n"
+"    const uint16_t* p16 = (const uint16_t*)(blk + 6u + g * 4u);\n"
+"    uint32_t q4 = (uint32_t)__ldg(&p16[0]) | ((uint32_t)__ldg(&p16[1]) << 16);\n"
+"    uint32_t b0 = q4 & 0xFFu, b1 = (q4 >> 8) & 0xFFu, b2 = (q4 >> 16) & 0xFFu, b3 = q4 >> 24;\n"
+"    uint32_t j = g * 4u;\n"
+"    half2 lo0 = __floats2half2_rn(((float)((b0 & 0xFu) | (((qh >> (j+0u)) & 1u) << 4)) - 16.0f) * d, ((float)((b1 & 0xFu) | (((qh >> (j+1u)) & 1u) << 4)) - 16.0f) * d);\n"
+"    half2 lo1 = __floats2half2_rn(((float)((b2 & 0xFu) | (((qh >> (j+2u)) & 1u) << 4)) - 16.0f) * d, ((float)((b3 & 0xFu) | (((qh >> (j+3u)) & 1u) << 4)) - 16.0f) * d);\n"
+"    half2 hi0 = __floats2half2_rn(((float)((b0 >> 4)   | (((qh >> (j+16u)) & 1u) << 4)) - 16.0f) * d, ((float)((b1 >> 4)   | (((qh >> (j+17u)) & 1u) << 4)) - 16.0f) * d);\n"
+"    half2 hi1 = __floats2half2_rn(((float)((b2 >> 4)   | (((qh >> (j+18u)) & 1u) << 4)) - 16.0f) * d, ((float)((b3 >> 4)   | (((qh >> (j+19u)) & 1u) << 4)) - 16.0f) * d);\n"
+"    uint64_t ob = (uint64_t)blk_idx * 32ull + j;\n"
+"    *(uint2*)(dst + ob)       = make_uint2(*(uint32_t*)&lo0, *(uint32_t*)&lo1);\n"
+"    *(uint2*)(dst + ob + 16u) = make_uint2(*(uint32_t*)&hi0, *(uint32_t*)&hi1);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_deq_q5k_f16(const uint8_t* __restrict__ w, half* __restrict__ dst, uint32_t row0, uint32_t n_rows, uint32_t in_dim) {\n"
+"    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    uint32_t nb = in_dim >> 8;\n"
+"    uint32_t sb_idx = tid >> 5, l = tid & 31u;\n"
+"    if (sb_idx >= n_rows * nb) return;\n"
+"    const uint8_t* blk = w + ((uint64_t)row0 * nb + sb_idx) * 176ull;\n"
+"    float d = load_f16_le(blk), dmin = load_f16_le(blk + 2u);\n"
+"    const uint8_t* sc = blk + 4u; const uint8_t* qh = blk + 16u; const uint8_t* qs = blk + 48u;\n"
+"    uint32_t j64 = l >> 3, g = l & 7u, k = g * 4u, is = j64 * 2u;\n"
+"    uint8_t sc0, m0, sc1, m1;\n"
+"    if (is < 4u) {\n"
+"        sc0 = sc[is] & 63u; m0 = sc[is + 4u] & 63u;\n"
+"        sc1 = sc[is + 1u] & 63u; m1 = sc[is + 5u] & 63u;\n"
+"    } else {\n"
+"        sc0 = (sc[is + 4u] & 0xFu) | ((sc[is - 4u] >> 6) << 4); m0 = (sc[is + 4u] >> 4) | ((sc[is] >> 6) << 4);\n"
+"        sc1 = (sc[is + 5u] & 0xFu) | ((sc[is - 3u] >> 6) << 4); m1 = (sc[is + 5u] >> 4) | ((sc[is + 1u] >> 6) << 4);\n"
+"    }\n"
+"    float d0 = d * (float)sc0, mn0 = -dmin * (float)m0, d1 = d * (float)sc1, mn1 = -dmin * (float)m1;\n"
+"    uint32_t q4 = __ldg((const uint32_t*)(qs + j64 * 32u + k));\n"
+"    uint32_t h4 = __ldg((const uint32_t*)(qh + k));\n"
+"    uint32_t s0 = j64 * 2u, s1 = s0 + 1u;\n"
+"    uint32_t qlo = (q4 & 0x0F0F0F0Fu) | (((h4 >> s0) & 0x01010101u) << 4);\n"
+"    uint32_t qhi = ((q4 >> 4) & 0x0F0F0F0Fu) | (((h4 >> s1) & 0x01010101u) << 4);\n"
+"    half2 lo0 = __floats2half2_rn(fmaf(d0, (float)(qlo & 0xFFu), mn0), fmaf(d0, (float)((qlo >> 8) & 0xFFu), mn0));\n"
+"    half2 lo1 = __floats2half2_rn(fmaf(d0, (float)((qlo >> 16) & 0xFFu), mn0), fmaf(d0, (float)(qlo >> 24), mn0));\n"
+"    half2 hi0 = __floats2half2_rn(fmaf(d1, (float)(qhi & 0xFFu), mn1), fmaf(d1, (float)((qhi >> 8) & 0xFFu), mn1));\n"
+"    half2 hi1 = __floats2half2_rn(fmaf(d1, (float)((qhi >> 16) & 0xFFu), mn1), fmaf(d1, (float)(qhi >> 24), mn1));\n"
+"    uint64_t ob = (uint64_t)sb_idx * 256ull + (uint64_t)j64 * 64ull + k;\n"
+"    *(uint2*)(dst + ob)       = make_uint2(*(uint32_t*)&lo0, *(uint32_t*)&lo1);\n"
+"    *(uint2*)(dst + ob + 32u) = make_uint2(*(uint32_t*)&hi0, *(uint32_t*)&hi1);\n"
+"}\n"
+"\n"
 "extern \"C\" __global__ void cm_add_bias(float* x, const float* bias, uint32_t n) {\n"
 "    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (gid < n) x[gid] += bias[gid];\n"
@@ -1054,6 +1175,18 @@ static const char* kCuMoeSrc =
 "extern \"C\" __global__ void cm_swiglu_mul(float* g, const float* u, uint32_t n) {\n"
 "    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "    if (gid < n) { float gv = g[gid]; g[gid] = (gv / (1.0f + expf(-gv))) * u[gid]; }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_geglu_mul(float* g, const float* u, uint32_t n) {\n"
+"    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (gid < n) {\n"
+"        float gv = g[gid];\n"
+"        float act;\n"
+"        if (gv > 8.0f) act = gv;\n"
+"        else if (gv < -8.0f) act = 0.0f;\n"
+"        else { float c = fminf(fmaxf(0.7978845608f * (gv + 0.044715f * gv * gv * gv), -10.0f), 10.0f); act = 0.5f * gv * (1.0f + tanhf(c)); }\n"
+"        g[gid] = act * u[gid];\n"
+"    }\n"
 "}\n"
 "\n"
 "extern \"C\" __global__ void cm_gemv_q4(const uint8_t* w, const float* x, float* y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
@@ -1601,6 +1734,76 @@ static const char* kCuMoeSrc =
 "    }\n"
 "}\n"
 "\n"
+"// Tenon v14 P3/P4: Fused Gemma-3 post_attn_norm + residual add + ffn_norm + Q8_1 quantization (1 launch!)\n"
+"extern \"C\" __global__ void cm_rmsnorm_add_norm_q8_1(const float* __restrict__ x, const float* __restrict__ w1,\n"
+"                                                    float* __restrict__ y, const float* __restrict__ w2,\n"
+"                                                    CmQ8_1* __restrict__ out_q8, uint32_t dim, float eps) {\n"
+"    __shared__ float s_sq[8];\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    float lsq1 = 0.0f;\n"
+"    for (uint32_t i = lid; i < dim; i += 256u) { float v = __ldg(&x[i]); lsq1 = fmaf(v, v, lsq1); }\n"
+"    lsq1 = warp_sum(lsq1); if (lane == 0u) s_sq[wid] = lsq1; __syncthreads();\n"
+"    float tot1 = 0.0f; for (uint32_t s = 0; s < 8u; s++) tot1 += s_sq[s];\n"
+"    float inv1 = rsqrtf(tot1 / (float)dim + eps);\n"
+"    float lsq2 = 0.0f;\n"
+"    for (uint32_t i = lid; i < dim; i += 256u) {\n"
+"        float nv = y[i] + __ldg(&x[i]) * inv1 * __ldg(&w1[i]);\n"
+"        y[i] = nv; lsq2 = fmaf(nv, nv, lsq2);\n"
+"    }\n"
+"    lsq2 = warp_sum(lsq2); if (lane == 0u) s_sq[wid] = lsq2; __syncthreads();\n"
+"    float tot2 = 0.0f; for (uint32_t s = 0; s < 8u; s++) tot2 += s_sq[s];\n"
+"    float inv2 = rsqrtf(tot2 / (float)dim + eps);\n"
+"    uint32_t nb = dim >> 5;\n"
+"    for (uint32_t blk = wid; blk < nb; blk += 8u) {\n"
+"        uint32_t idx = (blk << 5) + lane;\n"
+"        float v = y[idx] * inv2 * __ldg(&w2[idx]);\n"
+"        float am = fabsf(v);\n"
+"        #pragma unroll\n"
+"        for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, off));\n"
+"        float d = am / 127.0f; float id = (am > 0.0f) ? (127.0f / am) : 0.0f;\n"
+"        int32_t qi = __float2int_rn(v * id);\n"
+"        float xs = v;\n"
+"        #pragma unroll\n"
+"        for (int off = 16; off > 0; off >>= 1) xs += __shfl_xor_sync(0xFFFFFFFFu, xs, off);\n"
+"        uint32_t b0 = (uint32_t)(qi & 0xFF);\n"
+"        uint32_t b1 = __shfl_down_sync(0xFFFFFFFFu, b0, 1);\n"
+"        uint32_t b2 = __shfl_down_sync(0xFFFFFFFFu, b0, 2);\n"
+"        uint32_t b3 = __shfl_down_sync(0xFFFFFFFFu, b0, 3);\n"
+"        int32_t* qp = (int32_t*)&out_q8[blk].q0;\n"
+"        if ((lane & 3u) == 0u) qp[lane >> 2] = (int32_t)(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));\n"
+"        if (lane == 0u) { out_q8[blk].d = d; out_q8[blk].s = xs; }\n"
+"    }\n"
+"}\n"
+"\n"
+"__device__ __forceinline__ float cm_act_gate(float g, uint32_t act_mode) {\n"
+"    if (act_mode == 1u) {\n"
+"        if (g > 8.0f) return g;\n"
+"        if (g < -8.0f) return 0.0f;\n"
+"        float c = fminf(fmaxf(0.7978845608f * (g + 0.044715f * g * g * g), -10.0f), 10.0f);\n"
+"        return 0.5f * g * (1.0f + tanhf(c));\n"
+"    }\n"
+"    return g / (1.0f + expf(-g));\n"
+"}\n"
+"\n"
+"__device__ __forceinline__ uint32_t cm_q5_hi4(uint32_t qh, uint32_t sh) {\n"
+"    uint32_t m = (qh >> sh) & 0xFu;\n"
+"    return ((m & 1u) << 4) | ((m & 2u) << 11) | ((m & 4u) << 18) | ((m & 8u) << 25);\n"
+"}\n"
+"\n"
+"#if __CUDA_ARCH__ >= 800\n"
+"__device__ __forceinline__ uint32_t cm_smem_u32(const void* p) {\n"
+"    uint32_t addr;\n"
+"    asm(\"{\\n\\t.reg .u64 u64addr;\\n\\tcvta.to.shared.u64 u64addr, %1;\\n\\tcvt.u32.u64 %0, u64addr;\\n}\" : \"=r\"(addr) : \"l\"(p));\n"
+"    return addr;\n"
+"}\n"
+"__device__ __forceinline__ void cm_cp_async16(void* dst, const void* src) {\n"
+"    uint32_t sa = cm_smem_u32(dst);\n"
+"    asm volatile(\"cp.async.ca.shared.global [%0], [%1], 16;\\n\" :: \"r\"(sa), \"l\"(src));\n"
+"}\n"
+"__device__ __forceinline__ void cm_cp_async_commit(void) { asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\"); }\n"
+"__device__ __forceinline__ void cm_cp_async_wait0(void)  { asm volatile(\"cp.async.wait_group 0;\\n\" ::: \"memory\"); }\n"
+"#endif\n"
+"\n"
 "__device__ __forceinline__ int32_t cm_dp4a_4w(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3, int4 q0, int4 q1) {\n"
 "    int32_t s = 0;\n"
 "    s = __dp4a((int32_t)(w0 & 0x0F0F0F0Fu), q0.x, s); s = __dp4a((int32_t)(w1 & 0x0F0F0F0Fu), q0.y, s);\n"
@@ -1620,6 +1823,20 @@ static const char* kCuMoeSrc =
 "    return d * fmaf((float)cm_dp4a_4w(w0, w1, w2, w3, q0, q1), xd, -8.0f * xs);\n"
 "}\n"
 "\n"
+"__device__ __forceinline__ float dot_q4_0_dp4a_2b(const uint8_t* __restrict__ blk2,\n"
+"                                                  int4 q0a, int4 q1a, float xda, float xsa,\n"
+"                                                  int4 q0b, int4 q1b, float xdb, float xsb) {\n"
+"    const uint32_t* p = (const uint32_t*)blk2;\n"
+"    uint32_t p0 = __ldg(&p[0]), p1 = __ldg(&p[1]), p2 = __ldg(&p[2]), p3 = __ldg(&p[3]), p4 = __ldg(&p[4]);\n"
+"    uint32_t p5 = __ldg(&p[5]), p6 = __ldg(&p[6]), p7 = __ldg(&p[7]), p8 = __ldg(&p[8]);\n"
+"    float d0 = __half2float(__ushort_as_half((uint16_t)(p0 & 0xFFFFu)));\n"
+"    float d1 = __half2float(__ushort_as_half((uint16_t)(p4 >> 16)));\n"
+"    uint32_t w0 = __funnelshift_r(p0, p1, 16), w1 = __funnelshift_r(p1, p2, 16);\n"
+"    uint32_t w2 = __funnelshift_r(p2, p3, 16), w3 = __funnelshift_r(p3, p4, 16);\n"
+"    float r0 = d0 * fmaf((float)cm_dp4a_4w(w0, w1, w2, w3, q0a, q1a), xda, -8.0f * xsa);\n"
+"    return fmaf(d1, fmaf((float)cm_dp4a_4w(p5, p6, p7, p8, q0b, q1b), xdb, -8.0f * xsb), r0);\n"
+"}\n"
+"\n"
 "extern \"C\" __global__ void cm_gemv_q4_dp4a(const uint8_t* w, const CmQ8_1* xq8, float* y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
 "    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
 "    uint32_t row0 = (blockIdx.x * 4u + wid) * 4u;\n"
@@ -1630,14 +1847,28 @@ static const char* kCuMoeSrc =
 "    const uint8_t* wp2 = (row0 + 2u < out_dim) ? (wp0 + rb * 2ull) : wp0;\n"
 "    const uint8_t* wp3 = (row0 + 3u < out_dim) ? (wp0 + rb * 3ull) : wp0;\n"
 "    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;\n"
-"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
-"        int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1);\n"
-"        float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
-"        uint64_t boff = (uint64_t)b * 18ull;\n"
-"        a0 += dot_q4_0_dp4a_1b(wp0 + boff, q0, q1, xd, xs);\n"
-"        a1 += dot_q4_0_dp4a_1b(wp1 + boff, q0, q1, xd, xs);\n"
-"        a2 += dot_q4_0_dp4a_1b(wp2 + boff, q0, q1, xd, xs);\n"
-"        a3 += dot_q4_0_dp4a_1b(wp3 + boff, q0, q1, xd, xs);\n"
+"    if ((nb & 1u) == 0u) {\n"
+"        uint32_t nb2 = nb >> 1;\n"
+"        for (uint32_t p = lane; p < nb2; p += 32u) {\n"
+"            uint32_t b0 = p << 1;\n"
+"            int4 q0a = __ldg(&xq8[b0].q0), q1a = __ldg(&xq8[b0].q1); float xda = __ldg(&xq8[b0].d), xsa = __ldg(&xq8[b0].s);\n"
+"            int4 q0b = __ldg(&xq8[b0+1u].q0), q1b = __ldg(&xq8[b0+1u].q1); float xdb = __ldg(&xq8[b0+1u].d), xsb = __ldg(&xq8[b0+1u].s);\n"
+"            uint64_t boff = (uint64_t)p * 36ull;\n"
+"            a0 += dot_q4_0_dp4a_2b(wp0 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"            a1 += dot_q4_0_dp4a_2b(wp1 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"            a2 += dot_q4_0_dp4a_2b(wp2 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"            a3 += dot_q4_0_dp4a_2b(wp3 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"        }\n"
+"    } else {\n"
+"        for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"            int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1);\n"
+"            float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
+"            uint64_t boff = (uint64_t)b * 18ull;\n"
+"            a0 += dot_q4_0_dp4a_1b(wp0 + boff, q0, q1, xd, xs);\n"
+"            a1 += dot_q4_0_dp4a_1b(wp1 + boff, q0, q1, xd, xs);\n"
+"            a2 += dot_q4_0_dp4a_1b(wp2 + boff, q0, q1, xd, xs);\n"
+"            a3 += dot_q4_0_dp4a_1b(wp3 + boff, q0, q1, xd, xs);\n"
+"        }\n"
 "    }\n"
 "    a0 = warp_sum(a0); a1 = warp_sum(a1); a2 = warp_sum(a2); a3 = warp_sum(a3);\n"
 "    if (lane == 0u) {\n"
@@ -1655,10 +1886,20 @@ static const char* kCuMoeSrc =
 "    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 18ull;\n"
 "    const uint8_t* wp = w + (uint64_t)row * rb;\n"
 "    float acc = 0.0f;\n"
-"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
-"        int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1);\n"
-"        float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
-"        acc += dot_q4_0_dp4a_1b(wp + (uint64_t)b * 18ull, q0, q1, xd, xs);\n"
+"    if ((nb & 1u) == 0u) {\n"
+"        uint32_t nb2 = nb >> 1;\n"
+"        for (uint32_t p = lane; p < nb2; p += 32u) {\n"
+"            uint32_t b0 = p << 1;\n"
+"            int4 q0a = __ldg(&xq8[b0].q0), q1a = __ldg(&xq8[b0].q1); float xda = __ldg(&xq8[b0].d), xsa = __ldg(&xq8[b0].s);\n"
+"            int4 q0b = __ldg(&xq8[b0+1u].q0), q1b = __ldg(&xq8[b0+1u].q1); float xdb = __ldg(&xq8[b0+1u].d), xsb = __ldg(&xq8[b0+1u].s);\n"
+"            acc += dot_q4_0_dp4a_2b(wp + (uint64_t)p * 36ull, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"        }\n"
+"    } else {\n"
+"        for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"            int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1);\n"
+"            float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
+"            acc += dot_q4_0_dp4a_1b(wp + (uint64_t)b * 18ull, q0, q1, xd, xs);\n"
+"        }\n"
 "    }\n"
 "    acc = warp_sum(acc);\n"
 "    if (lane == 0u) y[row] = add_res ? (y[row] + acc) : acc;\n"
@@ -1677,12 +1918,24 @@ static const char* kCuMoeSrc =
 "    const uint8_t* wp0 = w + (uint64_t)row0 * rb;\n"
 "    const uint8_t* wp1 = (row0 + 1u < lim) ? (wp0 + rb) : wp0;\n"
 "    float a0 = 0.0f, a1 = 0.0f;\n"
-"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
-"        int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1);\n"
-"        float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
-"        uint64_t boff = (uint64_t)b * 18ull;\n"
-"        a0 += dot_q4_0_dp4a_1b(wp0 + boff, q0, q1, xd, xs);\n"
-"        a1 += dot_q4_0_dp4a_1b(wp1 + boff, q0, q1, xd, xs);\n"
+"    if ((nb & 1u) == 0u) {\n"
+"        uint32_t nb2 = nb >> 1;\n"
+"        for (uint32_t p = lane; p < nb2; p += 32u) {\n"
+"            uint32_t b0 = p << 1;\n"
+"            int4 q0a = __ldg(&xq8[b0].q0), q1a = __ldg(&xq8[b0].q1); float xda = __ldg(&xq8[b0].d), xsa = __ldg(&xq8[b0].s);\n"
+"            int4 q0b = __ldg(&xq8[b0+1u].q0), q1b = __ldg(&xq8[b0+1u].q1); float xdb = __ldg(&xq8[b0+1u].d), xsb = __ldg(&xq8[b0+1u].s);\n"
+"            uint64_t boff = (uint64_t)p * 36ull;\n"
+"            a0 += dot_q4_0_dp4a_2b(wp0 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"            a1 += dot_q4_0_dp4a_2b(wp1 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"        }\n"
+"    } else {\n"
+"        for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"            int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1);\n"
+"            float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
+"            uint64_t boff = (uint64_t)b * 18ull;\n"
+"            a0 += dot_q4_0_dp4a_1b(wp0 + boff, q0, q1, xd, xs);\n"
+"            a1 += dot_q4_0_dp4a_1b(wp1 + boff, q0, q1, xd, xs);\n"
+"        }\n"
 "    }\n"
 "    a0 = warp_sum(a0); a1 = warp_sum(a1);\n"
 "    if (lane == 0u) {\n"
@@ -1714,7 +1967,7 @@ static const char* kCuMoeSrc =
 "    if (lane == 0u) { y[row0] = add_res ? (y[row0] + a0) : a0; if (row1 < out_dim) y[row1] = add_res ? (y[row1] + a1) : a1; }\n"
 "}\n"
 "\n"
-"extern \"C\" __global__ void cm_dense_gate_up_q4_dp4a(const uint8_t* wg, const uint8_t* wu, const CmQ8_1* xq8, float* h_out, uint32_t out_dim, uint32_t in_dim) {\n"
+"extern \"C\" __global__ void cm_dense_gate_up_q4_dp4a(const uint8_t* wg, const uint8_t* wu, const CmQ8_1* xq8, float* h_out, uint32_t out_dim, uint32_t in_dim, uint32_t act_mode) {\n"
 "    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
 "    uint32_t row0 = (blockIdx.x * 4u + wid) * 2u, row1 = row0 + 1u;\n"
 "    if (row0 >= out_dim) return;\n"
@@ -1730,15 +1983,15 @@ static const char* kCuMoeSrc =
 "    }\n"
 "    ag0 = warp_sum(ag0); au0 = warp_sum(au0); ag1 = warp_sum(ag1); au1 = warp_sum(au1);\n"
 "    if (lane == 0u) {\n"
-"        h_out[row0] = (ag0 / (1.0f + expf(-ag0))) * au0;\n"
-"        if (row1 < out_dim) h_out[row1] = (ag1 / (1.0f + expf(-ag1))) * au1;\n"
+"        h_out[row0] = cm_act_gate(ag0, act_mode) * au0;\n"
+"        if (row1 < out_dim) h_out[row1] = cm_act_gate(ag1, act_mode) * au1;\n"
 "    }\n"
 "}\n"
 "\n"
-"// Tenon v13 P2a: Fused Gate+Up+SwiGLU -> Direct Q8_1 Quantization (32 rows/CTA, eliminates d_pg round-trip + quant launch!)\n"
+"// Tenon v13/v14: Fused Gate+Up+SwiGLU/GEGLU -> Direct Q8_1 Quantization (32 rows/CTA, eliminates d_pg round-trip!)\n"
 "extern \"C\" __global__ void cm_dense_gate_up_q4_dp4a_q8(const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,\n"
 "                                                       const CmQ8_1* __restrict__ xq8, CmQ8_1* __restrict__ out_q8,\n"
-"                                                       uint32_t out_dim, uint32_t in_dim) {\n"
+"                                                       uint32_t out_dim, uint32_t in_dim, uint32_t act_mode) {\n"
 "    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
 "    uint32_t blk_out = blockIdx.x;\n"
 "    uint32_t row0 = blk_out * 32u + wid * 4u;\n"
@@ -1754,22 +2007,36 @@ static const char* kCuMoeSrc =
 "    const uint8_t* u3 = (row0 + 3u < out_dim) ? (u0 + rb * 3ull) : u0;\n"
 "    float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;\n"
 "    float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;\n"
-"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
-"        int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1); float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
-"        uint64_t boff = (uint64_t)b * 18ull;\n"
-"        ag0 += dot_q4_0_dp4a_1b(g0 + boff, q0, q1, xd, xs); au0 += dot_q4_0_dp4a_1b(u0 + boff, q0, q1, xd, xs);\n"
-"        ag1 += dot_q4_0_dp4a_1b(g1 + boff, q0, q1, xd, xs); au1 += dot_q4_0_dp4a_1b(u1 + boff, q0, q1, xd, xs);\n"
-"        ag2 += dot_q4_0_dp4a_1b(g2 + boff, q0, q1, xd, xs); au2 += dot_q4_0_dp4a_1b(u2 + boff, q0, q1, xd, xs);\n"
-"        ag3 += dot_q4_0_dp4a_1b(g3 + boff, q0, q1, xd, xs); au3 += dot_q4_0_dp4a_1b(u3 + boff, q0, q1, xd, xs);\n"
+"    if ((nb & 1u) == 0u) {\n"
+"        uint32_t nb2 = nb >> 1;\n"
+"        for (uint32_t p = lane; p < nb2; p += 32u) {\n"
+"            uint32_t b0 = p << 1;\n"
+"            int4 q0a = __ldg(&xq8[b0].q0), q1a = __ldg(&xq8[b0].q1); float xda = __ldg(&xq8[b0].d), xsa = __ldg(&xq8[b0].s);\n"
+"            int4 q0b = __ldg(&xq8[b0+1u].q0), q1b = __ldg(&xq8[b0+1u].q1); float xdb = __ldg(&xq8[b0+1u].d), xsb = __ldg(&xq8[b0+1u].s);\n"
+"            uint64_t boff = (uint64_t)p * 36ull;\n"
+"            ag0 += dot_q4_0_dp4a_2b(g0 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb); au0 += dot_q4_0_dp4a_2b(u0 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"            ag1 += dot_q4_0_dp4a_2b(g1 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb); au1 += dot_q4_0_dp4a_2b(u1 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"            ag2 += dot_q4_0_dp4a_2b(g2 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb); au2 += dot_q4_0_dp4a_2b(u2 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"            ag3 += dot_q4_0_dp4a_2b(g3 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb); au3 += dot_q4_0_dp4a_2b(u3 + boff, q0a, q1a, xda, xsa, q0b, q1b, xdb, xsb);\n"
+"        }\n"
+"    } else {\n"
+"        for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"            int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1); float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
+"            uint64_t boff = (uint64_t)b * 18ull;\n"
+"            ag0 += dot_q4_0_dp4a_1b(g0 + boff, q0, q1, xd, xs); au0 += dot_q4_0_dp4a_1b(u0 + boff, q0, q1, xd, xs);\n"
+"            ag1 += dot_q4_0_dp4a_1b(g1 + boff, q0, q1, xd, xs); au1 += dot_q4_0_dp4a_1b(u1 + boff, q0, q1, xd, xs);\n"
+"            ag2 += dot_q4_0_dp4a_1b(g2 + boff, q0, q1, xd, xs); au2 += dot_q4_0_dp4a_1b(u2 + boff, q0, q1, xd, xs);\n"
+"            ag3 += dot_q4_0_dp4a_1b(g3 + boff, q0, q1, xd, xs); au3 += dot_q4_0_dp4a_1b(u3 + boff, q0, q1, xd, xs);\n"
+"        }\n"
 "    }\n"
 "    ag0 = warp_sum(ag0); au0 = warp_sum(au0); ag1 = warp_sum(ag1); au1 = warp_sum(au1);\n"
 "    ag2 = warp_sum(ag2); au2 = warp_sum(au2); ag3 = warp_sum(ag3); au3 = warp_sum(au3);\n"
 "    __shared__ float sH[32];\n"
 "    if (lane == 0u) {\n"
-"        sH[wid * 4u + 0u] = (row0 + 0u < out_dim) ? ((ag0 / (1.0f + expf(-ag0))) * au0) : 0.0f;\n"
-"        sH[wid * 4u + 1u] = (row0 + 1u < out_dim) ? ((ag1 / (1.0f + expf(-ag1))) * au1) : 0.0f;\n"
-"        sH[wid * 4u + 2u] = (row0 + 2u < out_dim) ? ((ag2 / (1.0f + expf(-ag2))) * au2) : 0.0f;\n"
-"        sH[wid * 4u + 3u] = (row0 + 3u < out_dim) ? ((ag3 / (1.0f + expf(-ag3))) * au3) : 0.0f;\n"
+"        sH[wid * 4u + 0u] = (row0 + 0u < out_dim) ? (cm_act_gate(ag0, act_mode) * au0) : 0.0f;\n"
+"        sH[wid * 4u + 1u] = (row0 + 1u < out_dim) ? (cm_act_gate(ag1, act_mode) * au1) : 0.0f;\n"
+"        sH[wid * 4u + 2u] = (row0 + 2u < out_dim) ? (cm_act_gate(ag2, act_mode) * au2) : 0.0f;\n"
+"        sH[wid * 4u + 3u] = (row0 + 3u < out_dim) ? (cm_act_gate(ag3, act_mode) * au3) : 0.0f;\n"
 "    }\n"
 "    __syncthreads();\n"
 "    if (wid == 0u) {\n"
@@ -1816,28 +2083,52 @@ static const char* kCuMoeSrc =
 "    if (lane == 0u) { y[ob].d = d; y[ob].s = xs; }\n"
 "}\n"
 "\n"
+"__device__ __forceinline__ int32_t cm_q6k_pack_w4(uint32_t lv, uint32_t hv, uint32_t sh, bool hi) {\n"
+"    uint32_t lo = hi ? ((lv >> 4) & 0x0F0F0F0Fu) : (lv & 0x0F0F0F0Fu);\n"
+"    return (int32_t)(lo | (((hv >> sh) & 0x03030303u) << 4));\n"
+"}\n"
+"\n"
 "__device__ __forceinline__ int32_t cm_q6k_load_w4(const uint16_t* __restrict__ ql16, const uint16_t* __restrict__ qh16, uint32_t idx, uint32_t sh, bool hi) {\n"
 "    uint32_t lv = (uint32_t)__ldg(&ql16[idx * 2u]) | ((uint32_t)__ldg(&ql16[idx * 2u + 1u]) << 16);\n"
 "    uint32_t hv = (uint32_t)__ldg(&qh16[idx * 2u]) | ((uint32_t)__ldg(&qh16[idx * 2u + 1u]) << 16);\n"
-"    uint32_t lo = hi ? ((lv >> 4) & 0x0F0F0F0Fu) : (lv & 0x0F0F0F0Fu);\n"
-"    return (int32_t)(lo | (((hv >> sh) & 0x03030303u) << 4));\n"
+"    return cm_q6k_pack_w4(lv, hv, sh, hi);\n"
 "}\n"
 "\n"
 "__device__ __forceinline__ float dot_q6_k_dp4a_1s8(const uint8_t* __restrict__ blk, uint32_t s8, int4 q0, int4 q1, float xd, int32_t sx0, int32_t sx1) {\n"
 "    float d = load_f16_le(blk + 208u);\n"
 "    uint32_t h128 = s8 >> 2, grp = s8 & 3u;\n"
-"    const uint16_t* ql16 = (const uint16_t*)(blk + h128 * 64u + (grp & 1u) * 32u);\n"
-"    const uint16_t* qh16 = (const uint16_t*)(blk + 128u + h128 * 32u);\n"
+"    const uint8_t* qlp = blk + h128 * 64u + (grp & 1u) * 32u;\n"
+"    const uint8_t* qhp = blk + 128u + h128 * 32u;\n"
 "    const int8_t* sc = (const int8_t*)(blk + 192u) + h128 * 8u + grp * 2u;\n"
 "    uint32_t sh = grp * 2u; bool hi = (grp >= 2u);\n"
-"    int32_t dp0 = __dp4a(cm_q6k_load_w4(ql16, qh16, 0u, sh, hi), q0.x, 0);\n"
-"    dp0 = __dp4a(cm_q6k_load_w4(ql16, qh16, 1u, sh, hi), q0.y, dp0);\n"
-"    dp0 = __dp4a(cm_q6k_load_w4(ql16, qh16, 2u, sh, hi), q0.z, dp0);\n"
-"    dp0 = __dp4a(cm_q6k_load_w4(ql16, qh16, 3u, sh, hi), q0.w, dp0);\n"
-"    int32_t dp1 = __dp4a(cm_q6k_load_w4(ql16, qh16, 4u, sh, hi), q1.x, 0);\n"
-"    dp1 = __dp4a(cm_q6k_load_w4(ql16, qh16, 5u, sh, hi), q1.y, dp1);\n"
-"    dp1 = __dp4a(cm_q6k_load_w4(ql16, qh16, 6u, sh, hi), q1.z, dp1);\n"
-"    dp1 = __dp4a(cm_q6k_load_w4(ql16, qh16, 7u, sh, hi), q1.w, dp1);\n"
+"    int32_t dp0, dp1;\n"
+"    if ((((uintptr_t)blk) & 2u) == 0u) {\n"
+"        const uint32_t* ql32 = (const uint32_t*)qlp;\n"
+"        const uint32_t* qh32 = (const uint32_t*)qhp;\n"
+"        dp0 = __dp4a(cm_q6k_pack_w4(__ldg(&ql32[0]), __ldg(&qh32[0]), sh, hi), q0.x, 0);\n"
+"        dp0 = __dp4a(cm_q6k_pack_w4(__ldg(&ql32[1]), __ldg(&qh32[1]), sh, hi), q0.y, dp0);\n"
+"        dp0 = __dp4a(cm_q6k_pack_w4(__ldg(&ql32[2]), __ldg(&qh32[2]), sh, hi), q0.z, dp0);\n"
+"        dp0 = __dp4a(cm_q6k_pack_w4(__ldg(&ql32[3]), __ldg(&qh32[3]), sh, hi), q0.w, dp0);\n"
+"        dp1 = __dp4a(cm_q6k_pack_w4(__ldg(&ql32[4]), __ldg(&qh32[4]), sh, hi), q1.x, 0);\n"
+"        dp1 = __dp4a(cm_q6k_pack_w4(__ldg(&ql32[5]), __ldg(&qh32[5]), sh, hi), q1.y, dp1);\n"
+"        dp1 = __dp4a(cm_q6k_pack_w4(__ldg(&ql32[6]), __ldg(&qh32[6]), sh, hi), q1.z, dp1);\n"
+"        dp1 = __dp4a(cm_q6k_pack_w4(__ldg(&ql32[7]), __ldg(&qh32[7]), sh, hi), q1.w, dp1);\n"
+"    } else {\n"
+"        const uint32_t* ql32 = (const uint32_t*)(qlp - 2u);\n"
+"        const uint32_t* qh32 = (const uint32_t*)(qhp - 2u);\n"
+"        uint32_t l0 = __ldg(&ql32[0]), l1 = __ldg(&ql32[1]), l2 = __ldg(&ql32[2]), l3 = __ldg(&ql32[3]), l4 = __ldg(&ql32[4]);\n"
+"        uint32_t l5 = __ldg(&ql32[5]), l6 = __ldg(&ql32[6]), l7 = __ldg(&ql32[7]), l8 = __ldg(&ql32[8]);\n"
+"        uint32_t h0 = __ldg(&qh32[0]), h1 = __ldg(&qh32[1]), h2 = __ldg(&qh32[2]), h3 = __ldg(&qh32[3]), h4 = __ldg(&qh32[4]);\n"
+"        uint32_t h5 = __ldg(&qh32[5]), h6 = __ldg(&qh32[6]), h7 = __ldg(&qh32[7]), h8 = __ldg(&qh32[8]);\n"
+"        dp0 = __dp4a(cm_q6k_pack_w4(__funnelshift_r(l0, l1, 16), __funnelshift_r(h0, h1, 16), sh, hi), q0.x, 0);\n"
+"        dp0 = __dp4a(cm_q6k_pack_w4(__funnelshift_r(l1, l2, 16), __funnelshift_r(h1, h2, 16), sh, hi), q0.y, dp0);\n"
+"        dp0 = __dp4a(cm_q6k_pack_w4(__funnelshift_r(l2, l3, 16), __funnelshift_r(h2, h3, 16), sh, hi), q0.z, dp0);\n"
+"        dp0 = __dp4a(cm_q6k_pack_w4(__funnelshift_r(l3, l4, 16), __funnelshift_r(h3, h4, 16), sh, hi), q0.w, dp0);\n"
+"        dp1 = __dp4a(cm_q6k_pack_w4(__funnelshift_r(l4, l5, 16), __funnelshift_r(h4, h5, 16), sh, hi), q1.x, 0);\n"
+"        dp1 = __dp4a(cm_q6k_pack_w4(__funnelshift_r(l5, l6, 16), __funnelshift_r(h5, h6, 16), sh, hi), q1.y, dp1);\n"
+"        dp1 = __dp4a(cm_q6k_pack_w4(__funnelshift_r(l6, l7, 16), __funnelshift_r(h6, h7, 16), sh, hi), q1.z, dp1);\n"
+"        dp1 = __dp4a(cm_q6k_pack_w4(__funnelshift_r(l7, l8, 16), __funnelshift_r(h7, h8, 16), sh, hi), q1.w, dp1);\n"
+"    }\n"
 "    float p0 = (float)(dp0 - 32 * sx0) * (float)__ldg(&sc[0]);\n"
 "    float p1 = (float)(dp1 - 32 * sx1) * (float)__ldg(&sc[1]);\n"
 "    return d * xd * (p0 + p1);\n"
@@ -1872,6 +2163,24 @@ static const char* kCuMoeSrc =
 "        if (row0 + 2u < out_dim) y[row0 + 2u] = add_res ? (y[row0 + 2u] + a2) : a2;\n"
 "        if (row0 + 3u < out_dim) y[row0 + 3u] = add_res ? (y[row0 + 3u] + a3) : a3;\n"
 "    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_q6k_dp4a_4r(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4u + wid;\n"
+"    if (row >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 8, s8 = lane & 7u;\n"
+"    const uint8_t* wp = w + (uint64_t)row * (uint64_t)nb * 210ull;\n"
+"    float acc = 0.0f;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        int4 q0 = __ldg(&xq8[xb].q0), q1 = __ldg(&xq8[xb].q1); float xd = __ldg(&xq8[xb].d);\n"
+"        int32_t sx0 = __dp4a(0x01010101, q0.x, __dp4a(0x01010101, q0.y, __dp4a(0x01010101, q0.z, __dp4a(0x01010101, q0.w, 0))));\n"
+"        int32_t sx1 = __dp4a(0x01010101, q1.x, __dp4a(0x01010101, q1.y, __dp4a(0x01010101, q1.z, __dp4a(0x01010101, q1.w, 0))));\n"
+"        acc += dot_q6_k_dp4a_1s8(wp + (uint64_t)b * 210ull, s8, q0, q1, xd, sx0, sx1);\n"
+"    }\n"
+"    acc = warp_sum(acc);\n"
+"    if (lane == 0u) y[row] = add_res ? (y[row] + acc) : acc;\n"
 "}\n"
 "\n"
 "// Tenon v12 Round 3: Shared-Memory xq8 (10 KB SMEM, 256 thr = 8 rows/CTA, 1 row/warp -> 8x less xq8 traffic, 2x occupancy!)\n"
@@ -2047,13 +2356,9 @@ static const char* kCuMoeSrc =
 "            if (x_h == 0u) xd_r = __ldg(&xrow[_bk + x_s].d); \\\n"
 "        } \\\n"
 "        const uint32_t* p0 = (const uint32_t*)(wrow0 + (uint64_t)(PAIR) * 36ull); \\\n"
-"        wa0 = __ldg(&p0[gx]); \\\n"
-"        if (gx == 3u) wb0_3 = __ldg(&p0[4u]); \\\n"
-"        w0_1 = __ldg(&p0[5u + gx]); \\\n"
+"        wa0 = __ldg(&p0[gx]); if (gx == 3u) wb0_3 = __ldg(&p0[4u]); w0_1 = __ldg(&p0[5u + gx]); \\\n"
 "        const uint32_t* p1 = (const uint32_t*)(wrow1 + (uint64_t)(PAIR) * 36ull); \\\n"
-"        wa1 = __ldg(&p1[gx]); \\\n"
-"        if (gx == 3u) wb1_3 = __ldg(&p1[4u]); \\\n"
-"        w1_1 = __ldg(&p1[5u + gx]); \\\n"
+"        wa1 = __ldg(&p1[gx]); if (gx == 3u) wb1_3 = __ldg(&p1[4u]); w1_1 = __ldg(&p1[5u + gx]); \\\n"
 "    } while (0)\n"
 "    PREFETCH_Q4_PAIR(0u);\n"
 "    for (uint32_t pair = 0; pair < nb2; pair++) {\n"
@@ -2619,6 +2924,1008 @@ static const char* kCuMoeSrc =
 "    if (bt > 6u) Q6DSB_ST(6u, a6);\n"
 "    if (bt > 7u) Q6DSB_ST(7u, a7);\n"
 "    #undef Q6DSB_ST\n"
+"}\n"
+"\n"
+"// =========================================================================\n"
+"// Tenon v14 P1: Universal Quant DP4A GEMV, Fused QKV, Fused Gate||Up->Q8_1,\n"
+"// DP4A Small-Batch (B=2..16), & Native INT8 Tensor Core MMQ (Q8_0, Q4_K)!\n"
+"// =========================================================================\n"
+"__device__ __forceinline__ float dot_q8_0_dp4a_1b(const uint8_t* __restrict__ blk, int4 q0, int4 q1, float xd) {\n"
+"    float d = load_f16_le(blk);\n"
+"    const uint16_t* p = (const uint16_t*)(blk + 2u);\n"
+"    int32_t s = 0;\n"
+"    s = __dp4a((int32_t)((uint32_t)__ldg(&p[0])  | ((uint32_t)__ldg(&p[1])  << 16)), q0.x, s);\n"
+"    s = __dp4a((int32_t)((uint32_t)__ldg(&p[2])  | ((uint32_t)__ldg(&p[3])  << 16)), q0.y, s);\n"
+"    s = __dp4a((int32_t)((uint32_t)__ldg(&p[4])  | ((uint32_t)__ldg(&p[5])  << 16)), q0.z, s);\n"
+"    s = __dp4a((int32_t)((uint32_t)__ldg(&p[6])  | ((uint32_t)__ldg(&p[7])  << 16)), q0.w, s);\n"
+"    s = __dp4a((int32_t)((uint32_t)__ldg(&p[8])  | ((uint32_t)__ldg(&p[9])  << 16)), q1.x, s);\n"
+"    s = __dp4a((int32_t)((uint32_t)__ldg(&p[10]) | ((uint32_t)__ldg(&p[11]) << 16)), q1.y, s);\n"
+"    s = __dp4a((int32_t)((uint32_t)__ldg(&p[12]) | ((uint32_t)__ldg(&p[13]) << 16)), q1.z, s);\n"
+"    s = __dp4a((int32_t)((uint32_t)__ldg(&p[14]) | ((uint32_t)__ldg(&p[15]) << 16)), q1.w, s);\n"
+"    return d * xd * (float)s;\n"
+"}\n"
+"\n"
+"__device__ __forceinline__ float dot_q5_0_dp4a_1b(const uint8_t* __restrict__ blk, int4 q0, int4 q1, float xd, float xs) {\n"
+"    float d = load_f16_le(blk);\n"
+"    const uint16_t* h16 = (const uint16_t*)(blk + 2u);\n"
+"    uint32_t qh = (uint32_t)__ldg(&h16[0]) | ((uint32_t)__ldg(&h16[1]) << 16);\n"
+"    const uint16_t* p = (const uint16_t*)(blk + 6u);\n"
+"    uint32_t w0 = (uint32_t)__ldg(&p[0]) | ((uint32_t)__ldg(&p[1]) << 16);\n"
+"    uint32_t w1 = (uint32_t)__ldg(&p[2]) | ((uint32_t)__ldg(&p[3]) << 16);\n"
+"    uint32_t w2 = (uint32_t)__ldg(&p[4]) | ((uint32_t)__ldg(&p[5]) << 16);\n"
+"    uint32_t w3 = (uint32_t)__ldg(&p[6]) | ((uint32_t)__ldg(&p[7]) << 16);\n"
+"    int32_t s = 0;\n"
+"    s = __dp4a((int32_t)((w0 & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 0u)),  q0.x, s);\n"
+"    s = __dp4a((int32_t)((w1 & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 4u)),  q0.y, s);\n"
+"    s = __dp4a((int32_t)((w2 & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 8u)),  q0.z, s);\n"
+"    s = __dp4a((int32_t)((w3 & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 12u)), q0.w, s);\n"
+"    s = __dp4a((int32_t)(((w0 >> 4) & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 16u)), q1.x, s);\n"
+"    s = __dp4a((int32_t)(((w1 >> 4) & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 20u)), q1.y, s);\n"
+"    s = __dp4a((int32_t)(((w2 >> 4) & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 24u)), q1.z, s);\n"
+"    s = __dp4a((int32_t)(((w3 >> 4) & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 28u)), q1.w, s);\n"
+"    return d * fmaf((float)s, xd, -16.0f * xs);\n"
+"}\n"
+"\n"
+"__device__ __forceinline__ float dot_q4_k_dp4a_1s8(const uint8_t* __restrict__ blk, uint32_t s8, int4 q0, int4 q1, float xd, float xs) {\n"
+"    float d = load_f16_le(blk), dmin = load_f16_le(blk + 2u);\n"
+"    const uint8_t* sc = blk + 4u;\n"
+"    uint8_t scv, mv;\n"
+"    if (s8 < 4u) { scv = sc[s8] & 63u; mv = sc[s8 + 4u] & 63u; }\n"
+"    else { scv = (sc[s8 + 4u] & 0xFu) | ((sc[s8 - 4u] >> 6) << 4); mv = (sc[s8 + 4u] >> 4) | ((sc[s8] >> 6) << 4); }\n"
+"    uint32_t j64 = s8 >> 1, sh = (s8 & 1u) << 2;\n"
+"    const uint4* qp = (const uint4*)(blk + 16u + j64 * 32u);\n"
+"    uint4 v0 = __ldg(&qp[0]), v1 = __ldg(&qp[1]);\n"
+"    int32_t dp = 0;\n"
+"    dp = __dp4a((int32_t)((v0.x >> sh) & 0x0F0F0F0Fu), q0.x, dp);\n"
+"    dp = __dp4a((int32_t)((v0.y >> sh) & 0x0F0F0F0Fu), q0.y, dp);\n"
+"    dp = __dp4a((int32_t)((v0.z >> sh) & 0x0F0F0F0Fu), q0.z, dp);\n"
+"    dp = __dp4a((int32_t)((v0.w >> sh) & 0x0F0F0F0Fu), q0.w, dp);\n"
+"    dp = __dp4a((int32_t)((v1.x >> sh) & 0x0F0F0F0Fu), q1.x, dp);\n"
+"    dp = __dp4a((int32_t)((v1.y >> sh) & 0x0F0F0F0Fu), q1.y, dp);\n"
+"    dp = __dp4a((int32_t)((v1.z >> sh) & 0x0F0F0F0Fu), q1.z, dp);\n"
+"    dp = __dp4a((int32_t)((v1.w >> sh) & 0x0F0F0F0Fu), q1.w, dp);\n"
+"    return fmaf(d * (float)scv, (float)dp * xd, -(dmin * (float)mv) * xs);\n"
+"}\n"
+"\n"
+"__device__ __forceinline__ float dot_q5_k_dp4a_1s8(const uint8_t* __restrict__ blk, uint32_t s8, int4 q0, int4 q1, float xd, float xs) {\n"
+"    float d = load_f16_le(blk), dmin = load_f16_le(blk + 2u);\n"
+"    const uint8_t* sc = blk + 4u;\n"
+"    uint8_t scv, mv;\n"
+"    if (s8 < 4u) { scv = sc[s8] & 63u; mv = sc[s8 + 4u] & 63u; }\n"
+"    else { scv = (sc[s8 + 4u] & 0xFu) | ((sc[s8 - 4u] >> 6) << 4); mv = (sc[s8 + 4u] >> 4) | ((sc[s8] >> 6) << 4); }\n"
+"    uint32_t j64 = s8 >> 1, sh = (s8 & 1u) << 2;\n"
+"    const uint4* qhp = (const uint4*)(blk + 16u);\n"
+"    const uint4* qsp = (const uint4*)(blk + 48u + j64 * 32u);\n"
+"    uint4 h0 = __ldg(&qhp[0]), h1 = __ldg(&qhp[1]);\n"
+"    uint4 v0 = __ldg(&qsp[0]), v1 = __ldg(&qsp[1]);\n"
+"    int32_t dp = 0;\n"
+"    dp = __dp4a((int32_t)(((v0.x >> sh) & 0x0F0F0F0Fu) | (((h0.x >> s8) & 0x01010101u) << 4)), q0.x, dp);\n"
+"    dp = __dp4a((int32_t)(((v0.y >> sh) & 0x0F0F0F0Fu) | (((h0.y >> s8) & 0x01010101u) << 4)), q0.y, dp);\n"
+"    dp = __dp4a((int32_t)(((v0.z >> sh) & 0x0F0F0F0Fu) | (((h0.z >> s8) & 0x01010101u) << 4)), q0.z, dp);\n"
+"    dp = __dp4a((int32_t)(((v0.w >> sh) & 0x0F0F0F0Fu) | (((h0.w >> s8) & 0x01010101u) << 4)), q0.w, dp);\n"
+"    dp = __dp4a((int32_t)(((v1.x >> sh) & 0x0F0F0F0Fu) | (((h1.x >> s8) & 0x01010101u) << 4)), q1.x, dp);\n"
+"    dp = __dp4a((int32_t)(((v1.y >> sh) & 0x0F0F0F0Fu) | (((h1.y >> s8) & 0x01010101u) << 4)), q1.y, dp);\n"
+"    dp = __dp4a((int32_t)(((v1.z >> sh) & 0x0F0F0F0Fu) | (((h1.z >> s8) & 0x01010101u) << 4)), q1.z, dp);\n"
+"    dp = __dp4a((int32_t)(((v1.w >> sh) & 0x0F0F0F0Fu) | (((h1.w >> s8) & 0x01010101u) << 4)), q1.w, dp);\n"
+"    return fmaf(d * (float)scv, (float)dp * xd, -(dmin * (float)mv) * xs);\n"
+"}\n"
+"\n"
+"__device__ __forceinline__ float dot_q8_0_dp4a_2b(const uint8_t* __restrict__ blk2,\n"
+"                                                  int4 q0a, int4 q1a, float xda,\n"
+"                                                  int4 q0b, int4 q1b, float xdb) {\n"
+"    const uint32_t* p = (const uint32_t*)blk2;\n"
+"    uint32_t p0 = __ldg(&p[0]), p1 = __ldg(&p[1]), p2 = __ldg(&p[2]), p3 = __ldg(&p[3]);\n"
+"    uint32_t p4 = __ldg(&p[4]), p5 = __ldg(&p[5]), p6 = __ldg(&p[6]), p7 = __ldg(&p[7]), p8 = __ldg(&p[8]);\n"
+"    float d0 = __half2float(__ushort_as_half((uint16_t)(p0 & 0xFFFFu)));\n"
+"    float d1 = __half2float(__ushort_as_half((uint16_t)(p8 >> 16)));\n"
+"    int32_t sa = 0;\n"
+"    sa = __dp4a((int32_t)__funnelshift_r(p0, p1, 16), q0a.x, sa);\n"
+"    sa = __dp4a((int32_t)__funnelshift_r(p1, p2, 16), q0a.y, sa);\n"
+"    sa = __dp4a((int32_t)__funnelshift_r(p2, p3, 16), q0a.z, sa);\n"
+"    sa = __dp4a((int32_t)__funnelshift_r(p3, p4, 16), q0a.w, sa);\n"
+"    sa = __dp4a((int32_t)__funnelshift_r(p4, p5, 16), q1a.x, sa);\n"
+"    sa = __dp4a((int32_t)__funnelshift_r(p5, p6, 16), q1a.y, sa);\n"
+"    sa = __dp4a((int32_t)__funnelshift_r(p6, p7, 16), q1a.z, sa);\n"
+"    sa = __dp4a((int32_t)__funnelshift_r(p7, p8, 16), q1a.w, sa);\n"
+"    int32_t sb = 0;\n"
+"    sb = __dp4a((int32_t)__ldg(&p[9]),  q0b.x, sb); sb = __dp4a((int32_t)__ldg(&p[10]), q0b.y, sb);\n"
+"    sb = __dp4a((int32_t)__ldg(&p[11]), q0b.z, sb); sb = __dp4a((int32_t)__ldg(&p[12]), q0b.w, sb);\n"
+"    sb = __dp4a((int32_t)__ldg(&p[13]), q1b.x, sb); sb = __dp4a((int32_t)__ldg(&p[14]), q1b.y, sb);\n"
+"    sb = __dp4a((int32_t)__ldg(&p[15]), q1b.z, sb); sb = __dp4a((int32_t)__ldg(&p[16]), q1b.w, sb);\n"
+"    return fmaf(d1 * xdb, (float)sb, d0 * xda * (float)sa);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_q8_dp4a(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row0 = (blockIdx.x * 4u + wid) * 4u;\n"
+"    if (row0 >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 34ull;\n"
+"    const uint8_t* wp0 = w + (uint64_t)row0 * rb;\n"
+"    const uint8_t* wp1 = (row0 + 1u < out_dim) ? (wp0 + rb) : wp0;\n"
+"    const uint8_t* wp2 = (row0 + 2u < out_dim) ? (wp0 + rb * 2ull) : wp0;\n"
+"    const uint8_t* wp3 = (row0 + 3u < out_dim) ? (wp0 + rb * 3ull) : wp0;\n"
+"    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;\n"
+"    if ((nb & 1u) == 0u) {\n"
+"        uint32_t nb2 = nb >> 1;\n"
+"        for (uint32_t p = lane; p < nb2; p += 32u) {\n"
+"            uint32_t b0 = p << 1;\n"
+"            int4 q0a = __ldg(&xq8[b0].q0), q1a = __ldg(&xq8[b0].q1); float xda = __ldg(&xq8[b0].d);\n"
+"            int4 q0b = __ldg(&xq8[b0+1u].q0), q1b = __ldg(&xq8[b0+1u].q1); float xdb = __ldg(&xq8[b0+1u].d);\n"
+"            uint64_t boff = (uint64_t)p * 68ull;\n"
+"            a0 += dot_q8_0_dp4a_2b(wp0 + boff, q0a, q1a, xda, q0b, q1b, xdb);\n"
+"            if (row0 + 1u < out_dim) a1 += dot_q8_0_dp4a_2b(wp1 + boff, q0a, q1a, xda, q0b, q1b, xdb);\n"
+"            if (row0 + 2u < out_dim) a2 += dot_q8_0_dp4a_2b(wp2 + boff, q0a, q1a, xda, q0b, q1b, xdb);\n"
+"            if (row0 + 3u < out_dim) a3 += dot_q8_0_dp4a_2b(wp3 + boff, q0a, q1a, xda, q0b, q1b, xdb);\n"
+"        }\n"
+"    } else {\n"
+"        for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"            int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1); float xd = __ldg(&xq8[b].d);\n"
+"            uint64_t boff = (uint64_t)b * 34ull;\n"
+"            a0 += dot_q8_0_dp4a_1b(wp0 + boff, q0, q1, xd);\n"
+"            if (row0 + 1u < out_dim) a1 += dot_q8_0_dp4a_1b(wp1 + boff, q0, q1, xd);\n"
+"            if (row0 + 2u < out_dim) a2 += dot_q8_0_dp4a_1b(wp2 + boff, q0, q1, xd);\n"
+"            if (row0 + 3u < out_dim) a3 += dot_q8_0_dp4a_1b(wp3 + boff, q0, q1, xd);\n"
+"        }\n"
+"    }\n"
+"    a0 = warp_sum(a0); a1 = warp_sum(a1); a2 = warp_sum(a2); a3 = warp_sum(a3);\n"
+"    if (lane == 0u) {\n"
+"        y[row0] = add_res ? (y[row0] + a0) : a0;\n"
+"        if (row0 + 1u < out_dim) y[row0 + 1u] = add_res ? (y[row0 + 1u] + a1) : a1;\n"
+"        if (row0 + 2u < out_dim) y[row0 + 2u] = add_res ? (y[row0 + 2u] + a2) : a2;\n"
+"        if (row0 + 3u < out_dim) y[row0 + 3u] = add_res ? (y[row0 + 3u] + a3) : a3;\n"
+"    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_q8_dp4a_4r(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4u + wid;\n"
+"    if (row >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 34ull;\n"
+"    const uint8_t* wp = w + (uint64_t)row * rb;\n"
+"    float acc = 0.0f;\n"
+"    if ((nb & 1u) == 0u) {\n"
+"        uint32_t nb2 = nb >> 1;\n"
+"        for (uint32_t p = lane; p < nb2; p += 32u) {\n"
+"            uint32_t b0 = p << 1;\n"
+"            int4 q0a = __ldg(&xq8[b0].q0), q1a = __ldg(&xq8[b0].q1); float xda = __ldg(&xq8[b0].d);\n"
+"            int4 q0b = __ldg(&xq8[b0+1u].q0), q1b = __ldg(&xq8[b0+1u].q1); float xdb = __ldg(&xq8[b0+1u].d);\n"
+"            acc += dot_q8_0_dp4a_2b(wp + (uint64_t)p * 68ull, q0a, q1a, xda, q0b, q1b, xdb);\n"
+"        }\n"
+"    } else {\n"
+"        for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"            int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1); float xd = __ldg(&xq8[b].d);\n"
+"            acc += dot_q8_0_dp4a_1b(wp + (uint64_t)b * 34ull, q0, q1, xd);\n"
+"        }\n"
+"    }\n"
+"    acc = warp_sum(acc);\n"
+"    if (lane == 0u) y[row] = add_res ? (y[row] + acc) : acc;\n"
+"}\n"
+"\n"
+"// Tenon v14 R2: Sub-Warp 2-Lane/Row Pair-Aligned Q8_0 LM-Head GEMV (64 rows/CTA, 100% warp eff on nb=36 Gemma-3 & nb=64 Llama-1B!)\n"
+"extern \"C\" __global__ void cm_gemv_q8_dp4a_lm(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 64u + wid * 16u + (lane >> 1);\n"
+"    uint32_t sl = lane & 1u;\n"
+"    uint32_t nb = in_dim >> 5, nb2 = nb >> 1;\n"
+"    float acc = 0.0f;\n"
+"    if (row < out_dim) {\n"
+"        const uint8_t* wp = w + (uint64_t)row * (uint64_t)nb * 34ull;\n"
+"        for (uint32_t p = sl; p < nb2; p += 2u) {\n"
+"            uint32_t b0 = p << 1;\n"
+"            int4 q0a = __ldg(&xq8[b0].q0), q1a = __ldg(&xq8[b0].q1); float xda = __ldg(&xq8[b0].d);\n"
+"            int4 q0b = __ldg(&xq8[b0+1u].q0), q1b = __ldg(&xq8[b0+1u].q1); float xdb = __ldg(&xq8[b0+1u].d);\n"
+"            acc += dot_q8_0_dp4a_2b(wp + (uint64_t)p * 68ull, q0a, q1a, xda, q0b, q1b, xdb);\n"
+"        }\n"
+"    }\n"
+"    acc += __shfl_xor_sync(0xFFFFFFFFu, acc, 1);\n"
+"    if (sl == 0u && row < out_dim) y[row] = add_res ? (y[row] + acc) : acc;\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_q5_0_dp4a(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row0 = (blockIdx.x * 4u + wid) * 4u;\n"
+"    if (row0 >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 22ull;\n"
+"    const uint8_t* wp0 = w + (uint64_t)row0 * rb;\n"
+"    const uint8_t* wp1 = (row0 + 1u < out_dim) ? (wp0 + rb) : wp0;\n"
+"    const uint8_t* wp2 = (row0 + 2u < out_dim) ? (wp0 + rb * 2ull) : wp0;\n"
+"    const uint8_t* wp3 = (row0 + 3u < out_dim) ? (wp0 + rb * 3ull) : wp0;\n"
+"    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;\n"
+"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"        int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1); float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
+"        uint64_t boff = (uint64_t)b * 22ull;\n"
+"        a0 += dot_q5_0_dp4a_1b(wp0 + boff, q0, q1, xd, xs);\n"
+"        if (row0 + 1u < out_dim) a1 += dot_q5_0_dp4a_1b(wp1 + boff, q0, q1, xd, xs);\n"
+"        if (row0 + 2u < out_dim) a2 += dot_q5_0_dp4a_1b(wp2 + boff, q0, q1, xd, xs);\n"
+"        if (row0 + 3u < out_dim) a3 += dot_q5_0_dp4a_1b(wp3 + boff, q0, q1, xd, xs);\n"
+"    }\n"
+"    a0 = warp_sum(a0); a1 = warp_sum(a1); a2 = warp_sum(a2); a3 = warp_sum(a3);\n"
+"    if (lane == 0u) {\n"
+"        y[row0] = add_res ? (y[row0] + a0) : a0;\n"
+"        if (row0 + 1u < out_dim) y[row0 + 1u] = add_res ? (y[row0 + 1u] + a1) : a1;\n"
+"        if (row0 + 2u < out_dim) y[row0 + 2u] = add_res ? (y[row0 + 2u] + a2) : a2;\n"
+"        if (row0 + 3u < out_dim) y[row0 + 3u] = add_res ? (y[row0 + 3u] + a3) : a3;\n"
+"    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_q5_0_dp4a_4r(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4u + wid;\n"
+"    if (row >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 5;\n"
+"    const uint8_t* wp = w + (uint64_t)row * (uint64_t)nb * 22ull;\n"
+"    float acc = 0.0f;\n"
+"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"        int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1); float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
+"        acc += dot_q5_0_dp4a_1b(wp + (uint64_t)b * 22ull, q0, q1, xd, xs);\n"
+"    }\n"
+"    acc = warp_sum(acc);\n"
+"    if (lane == 0u) y[row] = add_res ? (y[row] + acc) : acc;\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_q4k_dp4a(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row0 = (blockIdx.x * 4u + wid) * 4u;\n"
+"    if (row0 >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 8, s8 = lane & 7u; uint64_t rb = (uint64_t)nb * 144ull;\n"
+"    const uint8_t* wp0 = w + (uint64_t)row0 * rb;\n"
+"    const uint8_t* wp1 = (row0 + 1u < out_dim) ? (wp0 + rb) : wp0;\n"
+"    const uint8_t* wp2 = (row0 + 2u < out_dim) ? (wp0 + rb * 2ull) : wp0;\n"
+"    const uint8_t* wp3 = (row0 + 3u < out_dim) ? (wp0 + rb * 3ull) : wp0;\n"
+"    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        int4 q0 = __ldg(&xq8[xb].q0), q1 = __ldg(&xq8[xb].q1); float xd = __ldg(&xq8[xb].d), xs = __ldg(&xq8[xb].s);\n"
+"        uint64_t boff = (uint64_t)b * 144ull;\n"
+"        a0 += dot_q4_k_dp4a_1s8(wp0 + boff, s8, q0, q1, xd, xs);\n"
+"        if (row0 + 1u < out_dim) a1 += dot_q4_k_dp4a_1s8(wp1 + boff, s8, q0, q1, xd, xs);\n"
+"        if (row0 + 2u < out_dim) a2 += dot_q4_k_dp4a_1s8(wp2 + boff, s8, q0, q1, xd, xs);\n"
+"        if (row0 + 3u < out_dim) a3 += dot_q4_k_dp4a_1s8(wp3 + boff, s8, q0, q1, xd, xs);\n"
+"    }\n"
+"    a0 = warp_sum(a0); a1 = warp_sum(a1); a2 = warp_sum(a2); a3 = warp_sum(a3);\n"
+"    if (lane == 0u) {\n"
+"        y[row0] = add_res ? (y[row0] + a0) : a0;\n"
+"        if (row0 + 1u < out_dim) y[row0 + 1u] = add_res ? (y[row0 + 1u] + a1) : a1;\n"
+"        if (row0 + 2u < out_dim) y[row0 + 2u] = add_res ? (y[row0 + 2u] + a2) : a2;\n"
+"        if (row0 + 3u < out_dim) y[row0 + 3u] = add_res ? (y[row0 + 3u] + a3) : a3;\n"
+"    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_q4k_dp4a_4r(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4u + wid;\n"
+"    if (row >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 8, s8 = lane & 7u;\n"
+"    const uint8_t* wp = w + (uint64_t)row * (uint64_t)nb * 144ull;\n"
+"    float acc = 0.0f;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        int4 q0 = __ldg(&xq8[xb].q0), q1 = __ldg(&xq8[xb].q1); float xd = __ldg(&xq8[xb].d), xs = __ldg(&xq8[xb].s);\n"
+"        acc += dot_q4_k_dp4a_1s8(wp + (uint64_t)b * 144ull, s8, q0, q1, xd, xs);\n"
+"    }\n"
+"    acc = warp_sum(acc);\n"
+"    if (lane == 0u) y[row] = add_res ? (y[row] + acc) : acc;\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_q5k_dp4a(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row0 = (blockIdx.x * 4u + wid) * 4u;\n"
+"    if (row0 >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 8, s8 = lane & 7u; uint64_t rb = (uint64_t)nb * 176ull;\n"
+"    const uint8_t* wp0 = w + (uint64_t)row0 * rb;\n"
+"    const uint8_t* wp1 = (row0 + 1u < out_dim) ? (wp0 + rb) : wp0;\n"
+"    const uint8_t* wp2 = (row0 + 2u < out_dim) ? (wp0 + rb * 2ull) : wp0;\n"
+"    const uint8_t* wp3 = (row0 + 3u < out_dim) ? (wp0 + rb * 3ull) : wp0;\n"
+"    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        int4 q0 = __ldg(&xq8[xb].q0), q1 = __ldg(&xq8[xb].q1); float xd = __ldg(&xq8[xb].d), xs = __ldg(&xq8[xb].s);\n"
+"        uint64_t boff = (uint64_t)b * 176ull;\n"
+"        a0 += dot_q5_k_dp4a_1s8(wp0 + boff, s8, q0, q1, xd, xs);\n"
+"        if (row0 + 1u < out_dim) a1 += dot_q5_k_dp4a_1s8(wp1 + boff, s8, q0, q1, xd, xs);\n"
+"        if (row0 + 2u < out_dim) a2 += dot_q5_k_dp4a_1s8(wp2 + boff, s8, q0, q1, xd, xs);\n"
+"        if (row0 + 3u < out_dim) a3 += dot_q5_k_dp4a_1s8(wp3 + boff, s8, q0, q1, xd, xs);\n"
+"    }\n"
+"    a0 = warp_sum(a0); a1 = warp_sum(a1); a2 = warp_sum(a2); a3 = warp_sum(a3);\n"
+"    if (lane == 0u) {\n"
+"        y[row0] = add_res ? (y[row0] + a0) : a0;\n"
+"        if (row0 + 1u < out_dim) y[row0 + 1u] = add_res ? (y[row0 + 1u] + a1) : a1;\n"
+"        if (row0 + 2u < out_dim) y[row0 + 2u] = add_res ? (y[row0 + 2u] + a2) : a2;\n"
+"        if (row0 + 3u < out_dim) y[row0 + 3u] = add_res ? (y[row0 + 3u] + a3) : a3;\n"
+"    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_q5k_dp4a_4r(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y, uint32_t out_dim, uint32_t in_dim, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4u + wid;\n"
+"    if (row >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 8, s8 = lane & 7u;\n"
+"    const uint8_t* wp = w + (uint64_t)row * (uint64_t)nb * 176ull;\n"
+"    float acc = 0.0f;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        int4 q0 = __ldg(&xq8[xb].q0), q1 = __ldg(&xq8[xb].q1); float xd = __ldg(&xq8[xb].d), xs = __ldg(&xq8[xb].s);\n"
+"        acc += dot_q5_k_dp4a_1s8(wp + (uint64_t)b * 176ull, s8, q0, q1, xd, xs);\n"
+"    }\n"
+"    acc = warp_sum(acc);\n"
+"    if (lane == 0u) y[row] = add_res ? (y[row] + acc) : acc;\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_qkv_q4k_dp4a(const uint8_t* wq, const uint8_t* wk, const uint8_t* wv, const CmQ8_1* xq8,\n"
+"                                                float* q_out, float* k_out, float* v_out, uint32_t qdim, uint32_t kvdim, uint32_t in_dim, uint32_t v_is_q6k) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t grow = (blockIdx.x * 4u + wid) * 2u, tot = qdim + kvdim + kvdim;\n"
+"    if (grow >= tot) return;\n"
+"    const uint8_t* w; float* y; uint32_t row0, lim; int use_q6 = 0;\n"
+"    if (grow < qdim) { w = wq; y = q_out; row0 = grow; lim = qdim; }\n"
+"    else if (grow < qdim + kvdim) { w = wk; y = k_out; row0 = grow - qdim; lim = kvdim; }\n"
+"    else { w = wv; y = v_out; row0 = grow - qdim - kvdim; lim = kvdim; use_q6 = (int)v_is_q6k; }\n"
+"    uint32_t nb = in_dim >> 8, s8 = lane & 7u;\n"
+"    uint64_t bsz = use_q6 ? 210ull : 144ull, rb = (uint64_t)nb * bsz;\n"
+"    const uint8_t* wp0 = w + (uint64_t)row0 * rb;\n"
+"    const uint8_t* wp1 = (row0 + 1u < lim) ? (wp0 + rb) : wp0;\n"
+"    float a0 = 0.0f, a1 = 0.0f;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        int4 q0 = __ldg(&xq8[xb].q0), q1 = __ldg(&xq8[xb].q1); float xd = __ldg(&xq8[xb].d), xs = __ldg(&xq8[xb].s);\n"
+"        uint64_t boff = (uint64_t)b * bsz;\n"
+"        if (use_q6) {\n"
+"            int32_t sx0 = __dp4a(0x01010101, q0.x, __dp4a(0x01010101, q0.y, __dp4a(0x01010101, q0.z, __dp4a(0x01010101, q0.w, 0))));\n"
+"            int32_t sx1 = __dp4a(0x01010101, q1.x, __dp4a(0x01010101, q1.y, __dp4a(0x01010101, q1.z, __dp4a(0x01010101, q1.w, 0))));\n"
+"            a0 += dot_q6_k_dp4a_1s8(wp0 + boff, s8, q0, q1, xd, sx0, sx1);\n"
+"            if (row0 + 1u < lim) a1 += dot_q6_k_dp4a_1s8(wp1 + boff, s8, q0, q1, xd, sx0, sx1);\n"
+"        } else {\n"
+"            a0 += dot_q4_k_dp4a_1s8(wp0 + boff, s8, q0, q1, xd, xs);\n"
+"            if (row0 + 1u < lim) a1 += dot_q4_k_dp4a_1s8(wp1 + boff, s8, q0, q1, xd, xs);\n"
+"        }\n"
+"    }\n"
+"    a0 = warp_sum(a0); a1 = warp_sum(a1);\n"
+"    if (lane == 0u) { y[row0] = a0; if (row0 + 1u < lim) y[row0 + 1u] = a1; }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_qkv_q8_dp4a(const uint8_t* wq, const uint8_t* wk, const uint8_t* wv, const CmQ8_1* xq8,\n"
+"                                               float* q_out, float* k_out, float* v_out, uint32_t qdim, uint32_t kvdim, uint32_t in_dim) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t grow = (blockIdx.x * 4u + wid) * 2u, tot = qdim + kvdim + kvdim;\n"
+"    if (grow >= tot) return;\n"
+"    const uint8_t* w; float* y; uint32_t row0, lim;\n"
+"    if (grow < qdim) { w = wq; y = q_out; row0 = grow; lim = qdim; }\n"
+"    else if (grow < qdim + kvdim) { w = wk; y = k_out; row0 = grow - qdim; lim = kvdim; }\n"
+"    else { w = wv; y = v_out; row0 = grow - qdim - kvdim; lim = kvdim; }\n"
+"    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 34ull;\n"
+"    const uint8_t* wp0 = w + (uint64_t)row0 * rb;\n"
+"    const uint8_t* wp1 = (row0 + 1u < lim) ? (wp0 + rb) : wp0;\n"
+"    float a0 = 0.0f, a1 = 0.0f;\n"
+"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"        int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1); float xd = __ldg(&xq8[b].d);\n"
+"        uint64_t boff = (uint64_t)b * 34ull;\n"
+"        a0 += dot_q8_0_dp4a_1b(wp0 + boff, q0, q1, xd);\n"
+"        if (row0 + 1u < lim) a1 += dot_q8_0_dp4a_1b(wp1 + boff, q0, q1, xd);\n"
+"    }\n"
+"    a0 = warp_sum(a0); a1 = warp_sum(a1);\n"
+"    if (lane == 0u) { y[row0] = a0; if (row0 + 1u < lim) y[row0 + 1u] = a1; }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemv_qkv_q5_0_dp4a(const uint8_t* wq, const uint8_t* wk, const uint8_t* wv, const CmQ8_1* xq8,\n"
+"                                                 float* q_out, float* k_out, float* v_out, uint32_t qdim, uint32_t kvdim, uint32_t in_dim, uint32_t v_is_q8) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t grow = blockIdx.x * 4u + wid, tot = qdim + kvdim + kvdim;\n"
+"    if (grow >= tot) return;\n"
+"    const uint8_t* w; float* y; uint32_t row0; int use_q8 = 0;\n"
+"    if (grow < qdim) { w = wq; y = q_out; row0 = grow; }\n"
+"    else if (grow < qdim + kvdim) { w = wk; y = k_out; row0 = grow - qdim; }\n"
+"    else { w = wv; y = v_out; row0 = grow - qdim - kvdim; use_q8 = (int)v_is_q8; }\n"
+"    uint32_t nb = in_dim >> 5; uint64_t bsz = use_q8 ? 34ull : 22ull;\n"
+"    const uint8_t* wp0 = w + (uint64_t)row0 * (uint64_t)nb * bsz;\n"
+"    float a0 = 0.0f;\n"
+"    if (use_q8 && (nb & 1u) == 0u) {\n"
+"        uint32_t nb2 = nb >> 1;\n"
+"        for (uint32_t p = lane; p < nb2; p += 32u) {\n"
+"            uint32_t b0 = p << 1;\n"
+"            int4 q0a = __ldg(&xq8[b0].q0), q1a = __ldg(&xq8[b0].q1); float xda = __ldg(&xq8[b0].d);\n"
+"            int4 q0b = __ldg(&xq8[b0+1u].q0), q1b = __ldg(&xq8[b0+1u].q1); float xdb = __ldg(&xq8[b0+1u].d);\n"
+"            a0 += dot_q8_0_dp4a_2b(wp0 + (uint64_t)p * 68ull, q0a, q1a, xda, q0b, q1b, xdb);\n"
+"        }\n"
+"    } else {\n"
+"        for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"            int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1); float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
+"            uint64_t boff = (uint64_t)b * bsz;\n"
+"            if (use_q8) a0 += dot_q8_0_dp4a_1b(wp0 + boff, q0, q1, xd);\n"
+"            else a0 += dot_q5_0_dp4a_1b(wp0 + boff, q0, q1, xd, xs);\n"
+"        }\n"
+"    }\n"
+"    a0 = warp_sum(a0);\n"
+"    if (lane == 0u) y[row0] = a0;\n"
+"}\n"
+"\n"
+"__device__ __forceinline__ void cm_store_sH_q8(float* sH, float* out_f32, CmQ8_1* out_q8, uint32_t blk_out, uint32_t out_dim, uint32_t wid, uint32_t lane) {\n"
+"    __syncthreads();\n"
+"    if (wid == 0u) {\n"
+"        float v = sH[lane];\n"
+"        uint32_t idx = blk_out * 32u + lane;\n"
+"        if (out_f32 && idx < out_dim) out_f32[idx] = v;\n"
+"        if (out_q8) {\n"
+"            float am = fabsf(v);\n"
+"            #pragma unroll\n"
+"            for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, off));\n"
+"            float d = am / 127.0f; float id = (am > 0.0f) ? (127.0f / am) : 0.0f;\n"
+"            int32_t qi = __float2int_rn(v * id);\n"
+"            float xs = v;\n"
+"            #pragma unroll\n"
+"            for (int off = 16; off > 0; off >>= 1) xs += __shfl_xor_sync(0xFFFFFFFFu, xs, off);\n"
+"            uint32_t b0 = (uint32_t)(qi & 0xFF);\n"
+"            uint32_t b1 = __shfl_down_sync(0xFFFFFFFFu, b0, 1);\n"
+"            uint32_t b2 = __shfl_down_sync(0xFFFFFFFFu, b0, 2);\n"
+"            uint32_t b3 = __shfl_down_sync(0xFFFFFFFFu, b0, 3);\n"
+"            int32_t* qp = (int32_t*)&out_q8[blk_out].q0;\n"
+"            if ((lane & 3u) == 0u) qp[lane >> 2] = (int32_t)(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));\n"
+"            if (lane == 0u) { out_q8[blk_out].d = d; out_q8[blk_out].s = xs; }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_dense_gate_up_q4k_dp4a_q8(const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,\n"
+"                                                        const CmQ8_1* __restrict__ xq8, float* __restrict__ out_f32, CmQ8_1* __restrict__ out_q8,\n"
+"                                                        uint32_t out_dim, uint32_t in_dim, uint32_t act_mode) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u, blk_out = blockIdx.x;\n"
+"    uint32_t row0 = blk_out * 32u + wid * 4u;\n"
+"    if (blk_out * 32u >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 8, s8 = lane & 7u; uint64_t rb = (uint64_t)nb * 144ull;\n"
+"    const uint8_t* g0 = wg + (uint64_t)row0 * rb; const uint8_t* g1 = (row0+1u<out_dim)?(g0+rb):g0;\n"
+"    const uint8_t* g2 = (row0+2u<out_dim)?(g0+rb*2ull):g0; const uint8_t* g3 = (row0+3u<out_dim)?(g0+rb*3ull):g0;\n"
+"    const uint8_t* u0 = wu + (uint64_t)row0 * rb; const uint8_t* u1 = (row0+1u<out_dim)?(u0+rb):u0;\n"
+"    const uint8_t* u2 = (row0+2u<out_dim)?(u0+rb*2ull):u0; const uint8_t* u3 = (row0+3u<out_dim)?(u0+rb*3ull):u0;\n"
+"    float ag0=0,ag1=0,ag2=0,ag3=0,au0=0,au1=0,au2=0,au3=0;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        int4 q0 = __ldg(&xq8[xb].q0), q1 = __ldg(&xq8[xb].q1); float xd = __ldg(&xq8[xb].d), xs = __ldg(&xq8[xb].s);\n"
+"        uint64_t boff = (uint64_t)b * 144ull;\n"
+"        ag0 += dot_q4_k_dp4a_1s8(g0+boff,s8,q0,q1,xd,xs); au0 += dot_q4_k_dp4a_1s8(u0+boff,s8,q0,q1,xd,xs);\n"
+"        ag1 += dot_q4_k_dp4a_1s8(g1+boff,s8,q0,q1,xd,xs); au1 += dot_q4_k_dp4a_1s8(u1+boff,s8,q0,q1,xd,xs);\n"
+"        ag2 += dot_q4_k_dp4a_1s8(g2+boff,s8,q0,q1,xd,xs); au2 += dot_q4_k_dp4a_1s8(u2+boff,s8,q0,q1,xd,xs);\n"
+"        ag3 += dot_q4_k_dp4a_1s8(g3+boff,s8,q0,q1,xd,xs); au3 += dot_q4_k_dp4a_1s8(u3+boff,s8,q0,q1,xd,xs);\n"
+"    }\n"
+"    ag0=warp_sum(ag0); au0=warp_sum(au0); ag1=warp_sum(ag1); au1=warp_sum(au1);\n"
+"    ag2=warp_sum(ag2); au2=warp_sum(au2); ag3=warp_sum(ag3); au3=warp_sum(au3);\n"
+"    __shared__ float sH[32];\n"
+"    if (lane == 0u) {\n"
+"        sH[wid*4u+0u] = (row0+0u<out_dim) ? (cm_act_gate(ag0, act_mode)*au0) : 0.0f;\n"
+"        sH[wid*4u+1u] = (row0+1u<out_dim) ? (cm_act_gate(ag1, act_mode)*au1) : 0.0f;\n"
+"        sH[wid*4u+2u] = (row0+2u<out_dim) ? (cm_act_gate(ag2, act_mode)*au2) : 0.0f;\n"
+"        sH[wid*4u+3u] = (row0+3u<out_dim) ? (cm_act_gate(ag3, act_mode)*au3) : 0.0f;\n"
+"    }\n"
+"    cm_store_sH_q8(sH, out_f32, out_q8, blk_out, out_dim, wid, lane);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_dense_gate_up_q5k_dp4a_q8(const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,\n"
+"                                                        const CmQ8_1* __restrict__ xq8, float* __restrict__ out_f32, CmQ8_1* __restrict__ out_q8,\n"
+"                                                        uint32_t out_dim, uint32_t in_dim, uint32_t act_mode) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u, blk_out = blockIdx.x;\n"
+"    uint32_t row0 = blk_out * 32u + wid * 4u;\n"
+"    if (blk_out * 32u >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 8, s8 = lane & 7u; uint64_t rb = (uint64_t)nb * 176ull;\n"
+"    const uint8_t* g0 = wg + (uint64_t)row0 * rb; const uint8_t* g1 = (row0+1u<out_dim)?(g0+rb):g0;\n"
+"    const uint8_t* g2 = (row0+2u<out_dim)?(g0+rb*2ull):g0; const uint8_t* g3 = (row0+3u<out_dim)?(g0+rb*3ull):g0;\n"
+"    const uint8_t* u0 = wu + (uint64_t)row0 * rb; const uint8_t* u1 = (row0+1u<out_dim)?(u0+rb):u0;\n"
+"    const uint8_t* u2 = (row0+2u<out_dim)?(u0+rb*2ull):u0; const uint8_t* u3 = (row0+3u<out_dim)?(u0+rb*3ull):u0;\n"
+"    float ag0=0,ag1=0,ag2=0,ag3=0,au0=0,au1=0,au2=0,au3=0;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        int4 q0 = __ldg(&xq8[xb].q0), q1 = __ldg(&xq8[xb].q1); float xd = __ldg(&xq8[xb].d), xs = __ldg(&xq8[xb].s);\n"
+"        uint64_t boff = (uint64_t)b * 176ull;\n"
+"        ag0 += dot_q5_k_dp4a_1s8(g0+boff,s8,q0,q1,xd,xs); au0 += dot_q5_k_dp4a_1s8(u0+boff,s8,q0,q1,xd,xs);\n"
+"        ag1 += dot_q5_k_dp4a_1s8(g1+boff,s8,q0,q1,xd,xs); au1 += dot_q5_k_dp4a_1s8(u1+boff,s8,q0,q1,xd,xs);\n"
+"        ag2 += dot_q5_k_dp4a_1s8(g2+boff,s8,q0,q1,xd,xs); au2 += dot_q5_k_dp4a_1s8(u2+boff,s8,q0,q1,xd,xs);\n"
+"        ag3 += dot_q5_k_dp4a_1s8(g3+boff,s8,q0,q1,xd,xs); au3 += dot_q5_k_dp4a_1s8(u3+boff,s8,q0,q1,xd,xs);\n"
+"    }\n"
+"    ag0=warp_sum(ag0); au0=warp_sum(au0); ag1=warp_sum(ag1); au1=warp_sum(au1);\n"
+"    ag2=warp_sum(ag2); au2=warp_sum(au2); ag3=warp_sum(ag3); au3=warp_sum(au3);\n"
+"    __shared__ float sH[32];\n"
+"    if (lane == 0u) {\n"
+"        sH[wid*4u+0u] = (row0+0u<out_dim) ? (cm_act_gate(ag0, act_mode)*au0) : 0.0f;\n"
+"        sH[wid*4u+1u] = (row0+1u<out_dim) ? (cm_act_gate(ag1, act_mode)*au1) : 0.0f;\n"
+"        sH[wid*4u+2u] = (row0+2u<out_dim) ? (cm_act_gate(ag2, act_mode)*au2) : 0.0f;\n"
+"        sH[wid*4u+3u] = (row0+3u<out_dim) ? (cm_act_gate(ag3, act_mode)*au3) : 0.0f;\n"
+"    }\n"
+"    cm_store_sH_q8(sH, out_f32, out_q8, blk_out, out_dim, wid, lane);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_dense_gate_up_q8_dp4a_q8(const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,\n"
+"                                                       const CmQ8_1* __restrict__ xq8, float* __restrict__ out_f32, CmQ8_1* __restrict__ out_q8,\n"
+"                                                       uint32_t out_dim, uint32_t in_dim, uint32_t act_mode) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u, blk_out = blockIdx.x;\n"
+"    uint32_t row0 = blk_out * 32u + wid * 4u;\n"
+"    if (blk_out * 32u >= out_dim) return;\n"
+"    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 34ull;\n"
+"    const uint8_t* g0 = wg + (uint64_t)row0 * rb; const uint8_t* g1 = (row0+1u<out_dim)?(g0+rb):g0;\n"
+"    const uint8_t* g2 = (row0+2u<out_dim)?(g0+rb*2ull):g0; const uint8_t* g3 = (row0+3u<out_dim)?(g0+rb*3ull):g0;\n"
+"    const uint8_t* u0 = wu + (uint64_t)row0 * rb; const uint8_t* u1 = (row0+1u<out_dim)?(u0+rb):u0;\n"
+"    const uint8_t* u2 = (row0+2u<out_dim)?(u0+rb*2ull):u0; const uint8_t* u3 = (row0+3u<out_dim)?(u0+rb*3ull):u0;\n"
+"    float ag0=0,ag1=0,ag2=0,ag3=0,au0=0,au1=0,au2=0,au3=0;\n"
+"    for (uint32_t b = lane; b < nb; b += 32u) {\n"
+"        int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1); float xd = __ldg(&xq8[b].d);\n"
+"        uint64_t boff = (uint64_t)b * 34ull;\n"
+"        ag0 += dot_q8_0_dp4a_1b(g0+boff,q0,q1,xd); au0 += dot_q8_0_dp4a_1b(u0+boff,q0,q1,xd);\n"
+"        ag1 += dot_q8_0_dp4a_1b(g1+boff,q0,q1,xd); au1 += dot_q8_0_dp4a_1b(u1+boff,q0,q1,xd);\n"
+"        ag2 += dot_q8_0_dp4a_1b(g2+boff,q0,q1,xd); au2 += dot_q8_0_dp4a_1b(u2+boff,q0,q1,xd);\n"
+"        ag3 += dot_q8_0_dp4a_1b(g3+boff,q0,q1,xd); au3 += dot_q8_0_dp4a_1b(u3+boff,q0,q1,xd);\n"
+"    }\n"
+"    ag0=warp_sum(ag0); au0=warp_sum(au0); ag1=warp_sum(ag1); au1=warp_sum(au1);\n"
+"    ag2=warp_sum(ag2); au2=warp_sum(au2); ag3=warp_sum(ag3); au3=warp_sum(au3);\n"
+"    __shared__ float sH[32];\n"
+"    if (lane == 0u) {\n"
+"        sH[wid*4u+0u] = (row0+0u<out_dim) ? (cm_act_gate(ag0, act_mode)*au0) : 0.0f;\n"
+"        sH[wid*4u+1u] = (row0+1u<out_dim) ? (cm_act_gate(ag1, act_mode)*au1) : 0.0f;\n"
+"        sH[wid*4u+2u] = (row0+2u<out_dim) ? (cm_act_gate(ag2, act_mode)*au2) : 0.0f;\n"
+"        sH[wid*4u+3u] = (row0+3u<out_dim) ? (cm_act_gate(ag3, act_mode)*au3) : 0.0f;\n"
+"    }\n"
+"    cm_store_sH_q8(sH, out_f32, out_q8, blk_out, out_dim, wid, lane);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_dense_gate_up_q5_0_dp4a_q8(const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,\n"
+"                                                         const CmQ8_1* __restrict__ xq8, float* __restrict__ out_f32, CmQ8_1* __restrict__ out_q8,\n"
+"                                                         uint32_t out_dim, uint32_t in_dim, uint32_t act_mode) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u, blk_out = blockIdx.x;\n"
+"    if (blk_out * 32u >= out_dim) return;\n"
+"    uint32_t sub = lane >> 3, sl = lane & 7u;\n"
+"    uint32_t row_in_cta = wid * 4u + sub;\n"
+"    uint32_t row = blk_out * 32u + row_in_cta;\n"
+"    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 22ull;\n"
+"    float ag = 0.0f, au = 0.0f;\n"
+"    if (row < out_dim) {\n"
+"        const uint8_t* gp = wg + (uint64_t)row * rb;\n"
+"        const uint8_t* up = wu + (uint64_t)row * rb;\n"
+"        for (uint32_t b = sl; b < nb; b += 8u) {\n"
+"            int4 q0 = __ldg(&xq8[b].q0), q1 = __ldg(&xq8[b].q1); float xd = __ldg(&xq8[b].d), xs = __ldg(&xq8[b].s);\n"
+"            uint64_t boff = (uint64_t)b * 22ull;\n"
+"            ag += dot_q5_0_dp4a_1b(gp + boff, q0, q1, xd, xs);\n"
+"            au += dot_q5_0_dp4a_1b(up + boff, q0, q1, xd, xs);\n"
+"        }\n"
+"    }\n"
+"    ag += __shfl_xor_sync(0xFFFFFFFFu, ag, 4); ag += __shfl_xor_sync(0xFFFFFFFFu, ag, 2); ag += __shfl_xor_sync(0xFFFFFFFFu, ag, 1);\n"
+"    au += __shfl_xor_sync(0xFFFFFFFFu, au, 4); au += __shfl_xor_sync(0xFFFFFFFFu, au, 2); au += __shfl_xor_sync(0xFFFFFFFFu, au, 1);\n"
+"    __shared__ float sH[32];\n"
+"    if (sl == 0u) sH[row_in_cta] = (row < out_dim) ? (cm_act_gate(ag, act_mode) * au) : 0.0f;\n"
+"    cm_store_sH_q8(sH, out_f32, out_q8, blk_out, out_dim, wid, lane);\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemm_q8_dp4a_sb(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                              uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"    uint32_t rbase = blockIdx.x * 8u, b0 = blockIdx.y * 8u;\n"
+"    if (rbase >= out_dim || b0 >= batch_b) return;\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u, row = rbase + wid;\n"
+"    uint32_t bt = (batch_b - b0 < 8u) ? (batch_b - b0) : 8u;\n"
+"    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 34ull;\n"
+"    const uint8_t* wp = w + (uint64_t)(row < out_dim ? row : (out_dim - 1u)) * rb;\n"
+"    __shared__ int4 s_q0[8][32]; __shared__ int4 s_q1[8][32]; __shared__ float s_d[8][32];\n"
+"    float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;\n"
+"    for (uint32_t bk = 0; bk < nb; bk += 32u) {\n"
+"        uint32_t bi = bk + lane;\n"
+"        if (wid < bt && bi < nb) {\n"
+"            uint64_t xoff = (uint64_t)(b0 + wid) * nb + bi;\n"
+"            s_q0[wid][lane] = __ldg(&xq8[xoff].q0); s_q1[wid][lane] = __ldg(&xq8[xoff].q1); s_d[wid][lane] = __ldg(&xq8[xoff].d);\n"
+"        }\n"
+"        __syncthreads();\n"
+"        if (row < out_dim && bi < nb) {\n"
+"            const uint8_t* blk = wp + (uint64_t)bi * 34ull;\n"
+"            float d0 = load_f16_le(blk);\n"
+"            const uint16_t* p = (const uint16_t*)(blk + 2u);\n"
+"            int32_t w0 = (int32_t)((uint32_t)__ldg(&p[0])  | ((uint32_t)__ldg(&p[1])  << 16));\n"
+"            int32_t w1 = (int32_t)((uint32_t)__ldg(&p[2])  | ((uint32_t)__ldg(&p[3])  << 16));\n"
+"            int32_t w2 = (int32_t)((uint32_t)__ldg(&p[4])  | ((uint32_t)__ldg(&p[5])  << 16));\n"
+"            int32_t w3 = (int32_t)((uint32_t)__ldg(&p[6])  | ((uint32_t)__ldg(&p[7])  << 16));\n"
+"            int32_t w4 = (int32_t)((uint32_t)__ldg(&p[8])  | ((uint32_t)__ldg(&p[9])  << 16));\n"
+"            int32_t w5 = (int32_t)((uint32_t)__ldg(&p[10]) | ((uint32_t)__ldg(&p[11]) << 16));\n"
+"            int32_t w6 = (int32_t)((uint32_t)__ldg(&p[12]) | ((uint32_t)__ldg(&p[13]) << 16));\n"
+"            int32_t w7 = (int32_t)((uint32_t)__ldg(&p[14]) | ((uint32_t)__ldg(&p[15]) << 16));\n"
+"            #define Q8DSB_STEP(T, ACC) do { \\\n"
+"                int4 q0 = s_q0[(T)][lane], q1 = s_q1[(T)][lane]; \\\n"
+"                int32_t dp = __dp4a(w0, q0.x, __dp4a(w1, q0.y, __dp4a(w2, q0.z, __dp4a(w3, q0.w, 0)))); \\\n"
+"                dp = __dp4a(w4, q1.x, __dp4a(w5, q1.y, __dp4a(w6, q1.z, __dp4a(w7, q1.w, dp)))); \\\n"
+"                (ACC) = fmaf(d0 * s_d[(T)][lane], (float)dp, (ACC)); \\\n"
+"            } while (0)\n"
+"            Q8DSB_STEP(0u, a0); if (bt > 1u) Q8DSB_STEP(1u, a1); if (bt > 2u) Q8DSB_STEP(2u, a2); if (bt > 3u) Q8DSB_STEP(3u, a3);\n"
+"            if (bt > 4u) Q8DSB_STEP(4u, a4); if (bt > 5u) Q8DSB_STEP(5u, a5); if (bt > 6u) Q8DSB_STEP(6u, a6); if (bt > 7u) Q8DSB_STEP(7u, a7);\n"
+"            #undef Q8DSB_STEP\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (row >= out_dim) return;\n"
+"    #define Q8DSB_ST(T, ACC) do { float v = warp_sum((ACC)); if (lane == 0u) { uint64_t idx = (uint64_t)(b0 + (T)) * out_dim + row; y[idx] = add_res ? (y[idx] + v) : v; } } while (0)\n"
+"    Q8DSB_ST(0u, a0); if (bt > 1u) Q8DSB_ST(1u, a1); if (bt > 2u) Q8DSB_ST(2u, a2); if (bt > 3u) Q8DSB_ST(3u, a3);\n"
+"    if (bt > 4u) Q8DSB_ST(4u, a4); if (bt > 5u) Q8DSB_ST(5u, a5); if (bt > 6u) Q8DSB_ST(6u, a6); if (bt > 7u) Q8DSB_ST(7u, a7);\n"
+"    #undef Q8DSB_ST\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemm_q5_0_dp4a_sb(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                                uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"    uint32_t rbase = blockIdx.x * 8u, b0 = blockIdx.y * 8u;\n"
+"    if (rbase >= out_dim || b0 >= batch_b) return;\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u, row = rbase + wid;\n"
+"    uint32_t bt = (batch_b - b0 < 8u) ? (batch_b - b0) : 8u;\n"
+"    uint32_t nb = in_dim >> 5; uint64_t rb = (uint64_t)nb * 22ull;\n"
+"    const uint8_t* wp = w + (uint64_t)(row < out_dim ? row : (out_dim - 1u)) * rb;\n"
+"    __shared__ int4 s_q0[8][32]; __shared__ int4 s_q1[8][32]; __shared__ float2 s_ds[8][32];\n"
+"    float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;\n"
+"    for (uint32_t bk = 0; bk < nb; bk += 32u) {\n"
+"        uint32_t bi = bk + lane;\n"
+"        if (wid < bt && bi < nb) {\n"
+"            uint64_t xoff = (uint64_t)(b0 + wid) * nb + bi;\n"
+"            s_q0[wid][lane] = __ldg(&xq8[xoff].q0); s_q1[wid][lane] = __ldg(&xq8[xoff].q1);\n"
+"            s_ds[wid][lane] = make_float2(__ldg(&xq8[xoff].d), -16.0f * __ldg(&xq8[xoff].s));\n"
+"        }\n"
+"        __syncthreads();\n"
+"        if (row < out_dim && bi < nb) {\n"
+"            const uint8_t* blk = wp + (uint64_t)bi * 22ull;\n"
+"            float d0 = load_f16_le(blk);\n"
+"            const uint16_t* h16 = (const uint16_t*)(blk + 2u);\n"
+"            uint32_t qh = (uint32_t)__ldg(&h16[0]) | ((uint32_t)__ldg(&h16[1]) << 16);\n"
+"            const uint16_t* p = (const uint16_t*)(blk + 6u);\n"
+"            uint32_t w0 = (uint32_t)__ldg(&p[0]) | ((uint32_t)__ldg(&p[1]) << 16);\n"
+"            uint32_t w1 = (uint32_t)__ldg(&p[2]) | ((uint32_t)__ldg(&p[3]) << 16);\n"
+"            uint32_t w2 = (uint32_t)__ldg(&p[4]) | ((uint32_t)__ldg(&p[5]) << 16);\n"
+"            uint32_t w3 = (uint32_t)__ldg(&p[6]) | ((uint32_t)__ldg(&p[7]) << 16);\n"
+"            int32_t l0 = (int32_t)((w0 & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 0u)),  l1 = (int32_t)((w1 & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 4u));\n"
+"            int32_t l2 = (int32_t)((w2 & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 8u)),  l3 = (int32_t)((w3 & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 12u));\n"
+"            int32_t h0 = (int32_t)(((w0 >> 4) & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 16u)), h1 = (int32_t)(((w1 >> 4) & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 20u));\n"
+"            int32_t h2 = (int32_t)(((w2 >> 4) & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 24u)), h3 = (int32_t)(((w3 >> 4) & 0x0F0F0F0Fu) | cm_q5_hi4(qh, 28u));\n"
+"            #define Q50DSB_STEP(T, ACC) do { \\\n"
+"                int4 q0 = s_q0[(T)][lane], q1 = s_q1[(T)][lane]; float2 ds = s_ds[(T)][lane]; \\\n"
+"                int32_t dp = __dp4a(l0, q0.x, __dp4a(l1, q0.y, __dp4a(l2, q0.z, __dp4a(l3, q0.w, 0)))); \\\n"
+"                dp = __dp4a(h0, q1.x, __dp4a(h1, q1.y, __dp4a(h2, q1.z, __dp4a(h3, q1.w, dp)))); \\\n"
+"                (ACC) = fmaf(d0, fmaf((float)dp, ds.x, ds.y), (ACC)); \\\n"
+"            } while (0)\n"
+"            Q50DSB_STEP(0u, a0); if (bt > 1u) Q50DSB_STEP(1u, a1); if (bt > 2u) Q50DSB_STEP(2u, a2); if (bt > 3u) Q50DSB_STEP(3u, a3);\n"
+"            if (bt > 4u) Q50DSB_STEP(4u, a4); if (bt > 5u) Q50DSB_STEP(5u, a5); if (bt > 6u) Q50DSB_STEP(6u, a6); if (bt > 7u) Q50DSB_STEP(7u, a7);\n"
+"            #undef Q50DSB_STEP\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    if (row >= out_dim) return;\n"
+"    #define Q50DSB_ST(T, ACC) do { float v = warp_sum((ACC)); if (lane == 0u) { uint64_t idx = (uint64_t)(b0 + (T)) * out_dim + row; y[idx] = add_res ? (y[idx] + v) : v; } } while (0)\n"
+"    Q50DSB_ST(0u, a0); if (bt > 1u) Q50DSB_ST(1u, a1); if (bt > 2u) Q50DSB_ST(2u, a2); if (bt > 3u) Q50DSB_ST(3u, a3);\n"
+"    if (bt > 4u) Q50DSB_ST(4u, a4); if (bt > 5u) Q50DSB_ST(5u, a5); if (bt > 6u) Q50DSB_ST(6u, a6); if (bt > 7u) Q50DSB_ST(7u, a7);\n"
+"    #undef Q50DSB_ST\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemm_q4k_dp4a_sb(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                               uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4u + wid, b0 = blockIdx.y * 8u;\n"
+"    if (row >= out_dim || b0 >= batch_b) return;\n"
+"    uint32_t bt = (batch_b - b0 < 8u) ? (batch_b - b0) : 8u;\n"
+"    uint32_t nb = in_dim >> 8, nb32 = in_dim >> 5, s8 = lane & 7u, j64 = s8 >> 1, sh = (s8 & 1u) << 2;\n"
+"    const uint8_t* wp = w + (uint64_t)row * (uint64_t)nb * 144ull;\n"
+"    float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        const uint8_t* blk = wp + (uint64_t)b * 144ull;\n"
+"        float d = load_f16_le(blk), dmin = load_f16_le(blk + 2u);\n"
+"        const uint8_t* sc = blk + 4u; uint8_t scv, mv;\n"
+"        if (s8 < 4u) { scv = sc[s8] & 63u; mv = sc[s8 + 4u] & 63u; }\n"
+"        else { scv = (sc[s8 + 4u] & 0xFu) | ((sc[s8 - 4u] >> 6) << 4); mv = (sc[s8 + 4u] >> 4) | ((sc[s8] >> 6) << 4); }\n"
+"        float dl = d * (float)scv, ml = -(dmin * (float)mv);\n"
+"        const uint4* qp = (const uint4*)(blk + 16u + j64 * 32u);\n"
+"        uint4 v0 = __ldg(&qp[0]), v1 = __ldg(&qp[1]);\n"
+"        int32_t w0 = (int32_t)((v0.x >> sh) & 0x0F0F0F0Fu), w1 = (int32_t)((v0.y >> sh) & 0x0F0F0F0Fu);\n"
+"        int32_t w2 = (int32_t)((v0.z >> sh) & 0x0F0F0F0Fu), w3 = (int32_t)((v0.w >> sh) & 0x0F0F0F0Fu);\n"
+"        int32_t w4 = (int32_t)((v1.x >> sh) & 0x0F0F0F0Fu), w5 = (int32_t)((v1.y >> sh) & 0x0F0F0F0Fu);\n"
+"        int32_t w6 = (int32_t)((v1.z >> sh) & 0x0F0F0F0Fu), w7 = (int32_t)((v1.w >> sh) & 0x0F0F0F0Fu);\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        #define Q4KDSB_STEP(T, ACC) do { \\\n"
+"            uint64_t xoff = (uint64_t)(b0 + (T)) * nb32 + xb; \\\n"
+"            int4 q0 = __ldg(&xq8[xoff].q0), q1 = __ldg(&xq8[xoff].q1); float xd = __ldg(&xq8[xoff].d), xs = __ldg(&xq8[xoff].s); \\\n"
+"            int32_t dp = __dp4a(w0, q0.x, __dp4a(w1, q0.y, __dp4a(w2, q0.z, __dp4a(w3, q0.w, 0)))); \\\n"
+"            dp = __dp4a(w4, q1.x, __dp4a(w5, q1.y, __dp4a(w6, q1.z, __dp4a(w7, q1.w, dp)))); \\\n"
+"            (ACC) += fmaf(dl, (float)dp * xd, ml * xs); \\\n"
+"        } while (0)\n"
+"        Q4KDSB_STEP(0u, a0); if (bt > 1u) Q4KDSB_STEP(1u, a1); if (bt > 2u) Q4KDSB_STEP(2u, a2); if (bt > 3u) Q4KDSB_STEP(3u, a3);\n"
+"        if (bt > 4u) Q4KDSB_STEP(4u, a4); if (bt > 5u) Q4KDSB_STEP(5u, a5); if (bt > 6u) Q4KDSB_STEP(6u, a6); if (bt > 7u) Q4KDSB_STEP(7u, a7);\n"
+"        #undef Q4KDSB_STEP\n"
+"    }\n"
+"    #define Q4KDSB_ST(T, ACC) do { float v = warp_sum((ACC)); if (lane == 0u) { uint64_t idx = (uint64_t)(b0 + (T)) * out_dim + row; y[idx] = add_res ? (y[idx] + v) : v; } } while (0)\n"
+"    Q4KDSB_ST(0u, a0); if (bt > 1u) Q4KDSB_ST(1u, a1); if (bt > 2u) Q4KDSB_ST(2u, a2); if (bt > 3u) Q4KDSB_ST(3u, a3);\n"
+"    if (bt > 4u) Q4KDSB_ST(4u, a4); if (bt > 5u) Q4KDSB_ST(5u, a5); if (bt > 6u) Q4KDSB_ST(6u, a6); if (bt > 7u) Q4KDSB_ST(7u, a7);\n"
+"    #undef Q4KDSB_ST\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gemm_q5k_dp4a_sb(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                               uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"    uint32_t wid = threadIdx.x >> 5, lane = threadIdx.x & 31u;\n"
+"    uint32_t row = blockIdx.x * 4u + wid, b0 = blockIdx.y * 8u;\n"
+"    if (row >= out_dim || b0 >= batch_b) return;\n"
+"    uint32_t bt = (batch_b - b0 < 8u) ? (batch_b - b0) : 8u;\n"
+"    uint32_t nb = in_dim >> 8, nb32 = in_dim >> 5, s8 = lane & 7u, j64 = s8 >> 1, sh = (s8 & 1u) << 2;\n"
+"    const uint8_t* wp = w + (uint64_t)row * (uint64_t)nb * 176ull;\n"
+"    float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;\n"
+"    for (uint32_t b = (lane >> 3); b < nb; b += 4u) {\n"
+"        const uint8_t* blk = wp + (uint64_t)b * 176ull;\n"
+"        float d = load_f16_le(blk), dmin = load_f16_le(blk + 2u);\n"
+"        const uint8_t* sc = blk + 4u; uint8_t scv, mv;\n"
+"        if (s8 < 4u) { scv = sc[s8] & 63u; mv = sc[s8 + 4u] & 63u; }\n"
+"        else { scv = (sc[s8 + 4u] & 0xFu) | ((sc[s8 - 4u] >> 6) << 4); mv = (sc[s8 + 4u] >> 4) | ((sc[s8] >> 6) << 4); }\n"
+"        float dl = d * (float)scv, ml = -(dmin * (float)mv);\n"
+"        const uint4* qhp = (const uint4*)(blk + 16u);\n"
+"        const uint4* qsp = (const uint4*)(blk + 48u + j64 * 32u);\n"
+"        uint4 h0 = __ldg(&qhp[0]), h1 = __ldg(&qhp[1]), v0 = __ldg(&qsp[0]), v1 = __ldg(&qsp[1]);\n"
+"        int32_t w0 = (int32_t)(((v0.x >> sh) & 0x0F0F0F0Fu) | (((h0.x >> s8) & 0x01010101u) << 4));\n"
+"        int32_t w1 = (int32_t)(((v0.y >> sh) & 0x0F0F0F0Fu) | (((h0.y >> s8) & 0x01010101u) << 4));\n"
+"        int32_t w2 = (int32_t)(((v0.z >> sh) & 0x0F0F0F0Fu) | (((h0.z >> s8) & 0x01010101u) << 4));\n"
+"        int32_t w3 = (int32_t)(((v0.w >> sh) & 0x0F0F0F0Fu) | (((h0.w >> s8) & 0x01010101u) << 4));\n"
+"        int32_t w4 = (int32_t)(((v1.x >> sh) & 0x0F0F0F0Fu) | (((h1.x >> s8) & 0x01010101u) << 4));\n"
+"        int32_t w5 = (int32_t)(((v1.y >> sh) & 0x0F0F0F0Fu) | (((h1.y >> s8) & 0x01010101u) << 4));\n"
+"        int32_t w6 = (int32_t)(((v1.z >> sh) & 0x0F0F0F0Fu) | (((h1.z >> s8) & 0x01010101u) << 4));\n"
+"        int32_t w7 = (int32_t)(((v1.w >> sh) & 0x0F0F0F0Fu) | (((h1.w >> s8) & 0x01010101u) << 4));\n"
+"        uint32_t xb = (b << 3) + s8;\n"
+"        #define Q5KDSB_STEP(T, ACC) do { \\\n"
+"            uint64_t xoff = (uint64_t)(b0 + (T)) * nb32 + xb; \\\n"
+"            int4 q0 = __ldg(&xq8[xoff].q0), q1 = __ldg(&xq8[xoff].q1); float xd = __ldg(&xq8[xoff].d), xs = __ldg(&xq8[xoff].s); \\\n"
+"            int32_t dp = __dp4a(w0, q0.x, __dp4a(w1, q0.y, __dp4a(w2, q0.z, __dp4a(w3, q0.w, 0)))); \\\n"
+"            dp = __dp4a(w4, q1.x, __dp4a(w5, q1.y, __dp4a(w6, q1.z, __dp4a(w7, q1.w, dp)))); \\\n"
+"            (ACC) += fmaf(dl, (float)dp * xd, ml * xs); \\\n"
+"        } while (0)\n"
+"        Q5KDSB_STEP(0u, a0); if (bt > 1u) Q5KDSB_STEP(1u, a1); if (bt > 2u) Q5KDSB_STEP(2u, a2); if (bt > 3u) Q5KDSB_STEP(3u, a3);\n"
+"        if (bt > 4u) Q5KDSB_STEP(4u, a4); if (bt > 5u) Q5KDSB_STEP(5u, a5); if (bt > 6u) Q5KDSB_STEP(6u, a6); if (bt > 7u) Q5KDSB_STEP(7u, a7);\n"
+"        #undef Q5KDSB_STEP\n"
+"    }\n"
+"    #define Q5KDSB_ST(T, ACC) do { float v = warp_sum((ACC)); if (lane == 0u) { uint64_t idx = (uint64_t)(b0 + (T)) * out_dim + row; y[idx] = add_res ? (y[idx] + v) : v; } } while (0)\n"
+"    Q5KDSB_ST(0u, a0); if (bt > 1u) Q5KDSB_ST(1u, a1); if (bt > 2u) Q5KDSB_ST(2u, a2); if (bt > 3u) Q5KDSB_ST(3u, a3);\n"
+"    if (bt > 4u) Q5KDSB_ST(4u, a4); if (bt > 5u) Q5KDSB_ST(5u, a5); if (bt > 6u) Q5KDSB_ST(6u, a6); if (bt > 7u) Q5KDSB_ST(7u, a7);\n"
+"    #undef Q5KDSB_ST\n"
+"}\n"
+"\n"
+"// Tenon v14 P1+P4: Native 64M x 128N x 64K INT8 Tensor Core MMQ for Q8_0 (cp.async double-buffered sX, ZERO nibble unpack!)\n"
+"extern \"C\" __global__ void cm_gemm_q8_mmq(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                          uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"#if __CUDA_ARCH__ >= 800\n"
+"    uint32_t r0 = blockIdx.x * 128u, b0 = blockIdx.y * 64u;\n"
+"    uint32_t nb = in_dim >> 5, nb2 = nb >> 1;\n"
+"    if (r0 >= out_dim || b0 >= batch_b || nb2 == 0u) return;\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint32_t gid = lane >> 2, tid = lane & 3u;\n"
+"    uint32_t x_s = lid >> 7, x_r = (lid >> 1) & 63u, x_h = lid & 1u;\n"
+"    uint32_t tx = lid >> 2, gx = lid & 3u;\n"
+"    uint32_t gb = b0 + x_r, gr0 = r0 + tx, gr1 = r0 + tx + 64u;\n"
+"    uint64_t rb = (uint64_t)nb * 34ull;\n"
+"    const uint8_t* wrow0 = w + (uint64_t)(gr0 < out_dim ? gr0 : (out_dim - 1u)) * rb;\n"
+"    const uint8_t* wrow1 = w + (uint64_t)(gr1 < out_dim ? gr1 : (out_dim - 1u)) * rb;\n"
+"    const CmQ8_1*  xrow  = xq8 + (uint64_t)(gb < batch_b ? gb : (batch_b - 1u)) * nb;\n"
+"    __shared__ __align__(16) uint8_t sX[2][2][64][48];\n"
+"    __shared__ __align__(16) uint8_t sW[2][128][48];\n"
+"    __shared__ float sWd[2][128];\n"
+"    uint32_t wm = (wid >> 2) * 32u, wn = (wid & 3u) * 32u;\n"
+"    int act0 = (b0 + wm < batch_b) && (r0 + wn < out_dim);\n"
+"    int act1 = (b0 + wm + 16u < batch_b) && (r0 + wn < out_dim);\n"
+"    float c0[4][4] = {{0,0,0,0},{0,0,0,0},{0,0,0,0},{0,0,0,0}};\n"
+"    float c1[4][4] = {{0,0,0,0},{0,0,0,0},{0,0,0,0},{0,0,0,0}};\n"
+"    uint32_t p0a=0, p0b=0, p0e=0, p0c=0, p0d=0, p1a=0, p1b=0, p1e=0, p1c=0, p1d=0;\n"
+"    #define CP_ASYNC_Q8_X(ST, PAIR) do { \\\n"
+"        if (gb < batch_b) { \\\n"
+"            uint32_t _bk = ((PAIR) << 1) + x_s; \\\n"
+"            if (x_h == 0u) { cm_cp_async16(&sX[(ST)][x_s][x_r][0], &xrow[_bk].q0); cm_cp_async16(&sX[(ST)][x_s][x_r][32], &xrow[_bk].d); } \\\n"
+"            else { cm_cp_async16(&sX[(ST)][x_s][x_r][16], &xrow[_bk].q1); } \\\n"
+"        } \\\n"
+"    } while (0)\n"
+"    #define PREFETCH_Q8_W(PAIR) do { \\\n"
+"        const uint32_t* p0 = (const uint32_t*)(wrow0 + (uint64_t)(PAIR) * 68ull); \\\n"
+"        p0a = __ldg(&p0[gx * 2u]); p0b = __ldg(&p0[gx * 2u + 1u]); if (gx == 3u) p0e = __ldg(&p0[8u]); \\\n"
+"        p0c = __ldg(&p0[9u + gx * 2u]); p0d = __ldg(&p0[10u + gx * 2u]); \\\n"
+"        const uint32_t* p1 = (const uint32_t*)(wrow1 + (uint64_t)(PAIR) * 68ull); \\\n"
+"        p1a = __ldg(&p1[gx * 2u]); p1b = __ldg(&p1[gx * 2u + 1u]); if (gx == 3u) p1e = __ldg(&p1[8u]); \\\n"
+"        p1c = __ldg(&p1[9u + gx * 2u]); p1d = __ldg(&p1[10u + gx * 2u]); \\\n"
+"    } while (0)\n"
+"    CP_ASYNC_Q8_X(0u, 0u); cm_cp_async_commit(); PREFETCH_Q8_W(0u);\n"
+"    for (uint32_t pair = 0; pair < nb2; pair++) {\n"
+"        uint32_t cur = pair & 1u, nxt = cur ^ 1u;\n"
+"        uint32_t n0 = __shfl_down_sync(0xFFFFFFFFu, p0a, 1); if (gx == 3u) n0 = p0e;\n"
+"        uint32_t n1 = __shfl_down_sync(0xFFFFFFFFu, p1a, 1); if (gx == 3u) n1 = p1e;\n"
+"        *(uint32_t*)&sW[0][tx][gx * 8u + 0u]       = __funnelshift_r(p0a, p0b, 16);\n"
+"        *(uint32_t*)&sW[0][tx][gx * 8u + 4u]       = __funnelshift_r(p0b, n0,  16);\n"
+"        *(uint32_t*)&sW[1][tx][gx * 8u + 0u]       = p0c;\n"
+"        *(uint32_t*)&sW[1][tx][gx * 8u + 4u]       = p0d;\n"
+"        *(uint32_t*)&sW[0][tx + 64u][gx * 8u + 0u] = __funnelshift_r(p1a, p1b, 16);\n"
+"        *(uint32_t*)&sW[0][tx + 64u][gx * 8u + 4u] = __funnelshift_r(p1b, n1,  16);\n"
+"        *(uint32_t*)&sW[1][tx + 64u][gx * 8u + 0u] = p1c;\n"
+"        *(uint32_t*)&sW[1][tx + 64u][gx * 8u + 4u] = p1d;\n"
+"        if (gx == 0u) { sWd[0][tx] = __half2float(__ushort_as_half((uint16_t)(p0a & 0xFFFFu))); sWd[0][tx + 64u] = __half2float(__ushort_as_half((uint16_t)(p1a & 0xFFFFu))); }\n"
+"        if (gx == 3u) { sWd[1][tx] = __half2float(__ushort_as_half((uint16_t)(p0e >> 16)));     sWd[1][tx + 64u] = __half2float(__ushort_as_half((uint16_t)(p1e >> 16))); }\n"
+"        cm_cp_async_wait0();\n"
+"        __syncthreads();\n"
+"        if (pair + 1u < nb2) { CP_ASYNC_Q8_X(nxt, pair + 1u); cm_cp_async_commit(); PREFETCH_Q8_W(pair + 1u); }\n"
+"        if (act0) {\n"
+"            #pragma unroll\n"
+"            for (uint32_t s = 0; s < 2u; s++) {\n"
+"                uint32_t a00 = *(const uint32_t*)&sX[cur][s][wm + gid][tid * 4u];\n"
+"                uint32_t a01 = *(const uint32_t*)&sX[cur][s][wm + gid + 8u][tid * 4u];\n"
+"                uint32_t a02 = *(const uint32_t*)&sX[cur][s][wm + gid][16u + tid * 4u];\n"
+"                uint32_t a03 = *(const uint32_t*)&sX[cur][s][wm + gid + 8u][16u + tid * 4u];\n"
+"                float xd0 = *(const float*)&sX[cur][s][wm + gid][32], xd1 = *(const float*)&sX[cur][s][wm + gid + 8u][32];\n"
+"                uint32_t a10 = 0u, a11 = 0u, a12 = 0u, a13 = 0u; float xd2 = 0.0f, xd3 = 0.0f;\n"
+"                if (act1) {\n"
+"                    a10 = *(const uint32_t*)&sX[cur][s][wm + 16u + gid][tid * 4u];\n"
+"                    a11 = *(const uint32_t*)&sX[cur][s][wm + 24u + gid][tid * 4u];\n"
+"                    a12 = *(const uint32_t*)&sX[cur][s][wm + 16u + gid][16u + tid * 4u];\n"
+"                    a13 = *(const uint32_t*)&sX[cur][s][wm + 24u + gid][16u + tid * 4u];\n"
+"                    xd2 = *(const float*)&sX[cur][s][wm + 16u + gid][32]; xd3 = *(const float*)&sX[cur][s][wm + 24u + gid][32];\n"
+"                }\n"
+"                #pragma unroll\n"
+"                for (uint32_t ni = 0; ni < 4u; ni++) {\n"
+"                    uint32_t nbase = wn + ni * 8u;\n"
+"                    uint32_t b00 = *(const uint32_t*)&sW[s][nbase + gid][tid * 4u];\n"
+"                    uint32_t b01 = *(const uint32_t*)&sW[s][nbase + gid][16u + tid * 4u];\n"
+"                    float dw0 = sWd[s][nbase + tid * 2u], dw1 = sWd[s][nbase + tid * 2u + 1u];\n"
+"                    int32_t t0, t1, t2, t3;\n"
+"                    asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                                 : \"=r\"(t0), \"=r\"(t1), \"=r\"(t2), \"=r\"(t3)\n"
+"                                 : \"r\"(a00), \"r\"(a01), \"r\"(a02), \"r\"(a03), \"r\"(b00), \"r\"(b01), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"                    c0[ni][0] = fmaf((float)t0 * xd0, dw0, c0[ni][0]); c0[ni][1] = fmaf((float)t1 * xd0, dw1, c0[ni][1]);\n"
+"                    c0[ni][2] = fmaf((float)t2 * xd1, dw0, c0[ni][2]); c0[ni][3] = fmaf((float)t3 * xd1, dw1, c0[ni][3]);\n"
+"                    if (act1) {\n"
+"                        int32_t u0, u1, u2, u3;\n"
+"                        asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                                     : \"=r\"(u0), \"=r\"(u1), \"=r\"(u2), \"=r\"(u3)\n"
+"                                     : \"r\"(a10), \"r\"(a11), \"r\"(a12), \"r\"(a13), \"r\"(b00), \"r\"(b01), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"                        c1[ni][0] = fmaf((float)u0 * xd2, dw0, c1[ni][0]); c1[ni][1] = fmaf((float)u1 * xd2, dw1, c1[ni][1]);\n"
+"                        c1[ni][2] = fmaf((float)u2 * xd3, dw0, c1[ni][2]); c1[ni][3] = fmaf((float)u3 * xd3, dw1, c1[ni][3]);\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    #undef CP_ASYNC_Q8_X\n"
+"    #undef PREFETCH_Q8_W\n"
+"    if (act0) {\n"
+"        uint32_t ob0 = b0 + wm + gid, ob1 = ob0 + 8u, ob2 = ob0 + 16u, ob3 = ob0 + 24u;\n"
+"        #define ST_Q8M(ob, orw, val) if ((ob) < batch_b && (orw) < out_dim) { uint64_t idx = (uint64_t)(ob) * out_dim + (orw); y[idx] = add_res ? (y[idx] + (val)) : (val); }\n"
+"        #pragma unroll\n"
+"        for (uint32_t ni = 0; ni < 4u; ni++) {\n"
+"            uint32_t or0 = r0 + wn + ni * 8u + tid * 2u;\n"
+"            ST_Q8M(ob0, or0, c0[ni][0]); ST_Q8M(ob0, or0 + 1u, c0[ni][1]);\n"
+"            ST_Q8M(ob1, or0, c0[ni][2]); ST_Q8M(ob1, or0 + 1u, c0[ni][3]);\n"
+"            if (act1) { ST_Q8M(ob2, or0, c1[ni][0]); ST_Q8M(ob2, or0 + 1u, c1[ni][1]); ST_Q8M(ob3, or0, c1[ni][2]); ST_Q8M(ob3, or0 + 1u, c1[ni][3]); }\n"
+"        }\n"
+"        #undef ST_Q8M\n"
+"    }\n"
+"#else\n"
+"    (void)w; (void)xq8; (void)y; (void)out_dim; (void)in_dim; (void)batch_b; (void)add_res;\n"
+"#endif\n"
+"}\n"
+"\n"
+"// Tenon v14 P1+P4: Native 64M x 64N x 64K INT8 Tensor Core MMQ for Q4_K (cp.async double-buffered sX, ZERO FP16 dequant DRAM!)\n"
+"extern \"C\" __global__ void cm_gemm_q4k_mmq(const uint8_t* __restrict__ w, const CmQ8_1* __restrict__ xq8, float* __restrict__ y,\n"
+"                                           uint32_t out_dim, uint32_t in_dim, uint32_t batch_b, uint32_t add_res) {\n"
+"#if __CUDA_ARCH__ >= 800\n"
+"    uint32_t r0 = blockIdx.x * 64u, b0 = blockIdx.y * 64u;\n"
+"    uint32_t nb256 = in_dim >> 8, nsteps = nb256 << 2, nb32 = in_dim >> 5;\n"
+"    if (r0 >= out_dim || b0 >= batch_b || nb256 == 0u) return;\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint32_t gid = lane >> 2, tid = lane & 3u;\n"
+"    uint32_t x_r = lid >> 1, x_h = lid & 1u, tx = lid >> 2, gx = lid & 3u;\n"
+"    uint32_t gb = b0 + x_r, gr0 = r0 + tx, gr1 = r0 + tx + 32u;\n"
+"    uint64_t rb = (uint64_t)nb256 * 144ull;\n"
+"    const uint8_t* wrow0 = w + (uint64_t)(gr0 < out_dim ? gr0 : (out_dim - 1u)) * rb;\n"
+"    const uint8_t* wrow1 = w + (uint64_t)(gr1 < out_dim ? gr1 : (out_dim - 1u)) * rb;\n"
+"    const CmQ8_1*  xrow  = xq8 + (uint64_t)(gb < batch_b ? gb : (batch_b - 1u)) * nb32;\n"
+"    __shared__ __align__(16) uint8_t sX[2][2][64][48];\n"
+"    __shared__ __align__(16) uint8_t sW[2][64][48];\n"
+"    __shared__ float sWd[2][64];\n"
+"    __shared__ float sWm[2][64];\n"
+"    uint32_t wm = (wid >> 1) * 32u, wn = (wid & 1u) * 32u;\n"
+"    int act0 = (b0 + wm < batch_b) && (r0 + wn < out_dim);\n"
+"    int act1 = (b0 + wm + 16u < batch_b) && (r0 + wn < out_dim);\n"
+"    float c0[4][4] = {{0,0,0,0},{0,0,0,0},{0,0,0,0},{0,0,0,0}};\n"
+"    float c1[4][4] = {{0,0,0,0},{0,0,0,0},{0,0,0,0},{0,0,0,0}};\n"
+"    #define CP_ASYNC_Q4K_X(ST, STEP) do { \\\n"
+"        if (gb < batch_b) { \\\n"
+"            uint32_t _bk = (STEP) << 1; \\\n"
+"            if (x_h == 0u) { \\\n"
+"                cm_cp_async16(&sX[(ST)][0][x_r][0],  &xrow[_bk + 0u].q0); \\\n"
+"                cm_cp_async16(&sX[(ST)][0][x_r][32], &xrow[_bk + 0u].d); \\\n"
+"                cm_cp_async16(&sX[(ST)][1][x_r][0],  &xrow[_bk + 1u].q0); \\\n"
+"                cm_cp_async16(&sX[(ST)][1][x_r][32], &xrow[_bk + 1u].d); \\\n"
+"            } else { \\\n"
+"                cm_cp_async16(&sX[(ST)][0][x_r][16], &xrow[_bk + 0u].q1); \\\n"
+"                cm_cp_async16(&sX[(ST)][1][x_r][16], &xrow[_bk + 1u].q1); \\\n"
+"            } \\\n"
+"        } \\\n"
+"    } while (0)\n"
+"    CP_ASYNC_Q4K_X(0u, 0u); cm_cp_async_commit();\n"
+"    for (uint32_t step = 0; step < nsteps; step++) {\n"
+"        uint32_t cur = step & 1u, nxt = cur ^ 1u;\n"
+"        uint32_t bk = step >> 2, j64 = step & 3u, is = j64 * 2u;\n"
+"        const uint8_t* b0p = wrow0 + (uint64_t)bk * 144ull;\n"
+"        const uint8_t* b1p = wrow1 + (uint64_t)bk * 144ull;\n"
+"        uint2 wv0 = __ldg((const uint2*)(b0p + 16u + j64 * 32u + gx * 8u));\n"
+"        uint2 wv1 = __ldg((const uint2*)(b1p + 16u + j64 * 32u + gx * 8u));\n"
+"        *(uint32_t*)&sW[0][tx][gx * 8u + 0u]       = wv0.x & 0x0F0F0F0Fu;\n"
+"        *(uint32_t*)&sW[0][tx][gx * 8u + 4u]       = wv0.y & 0x0F0F0F0Fu;\n"
+"        *(uint32_t*)&sW[1][tx][gx * 8u + 0u]       = (wv0.x >> 4) & 0x0F0F0F0Fu;\n"
+"        *(uint32_t*)&sW[1][tx][gx * 8u + 4u]       = (wv0.y >> 4) & 0x0F0F0F0Fu;\n"
+"        *(uint32_t*)&sW[0][tx + 32u][gx * 8u + 0u] = wv1.x & 0x0F0F0F0Fu;\n"
+"        *(uint32_t*)&sW[0][tx + 32u][gx * 8u + 4u] = wv1.y & 0x0F0F0F0Fu;\n"
+"        *(uint32_t*)&sW[1][tx + 32u][gx * 8u + 0u] = (wv1.x >> 4) & 0x0F0F0F0Fu;\n"
+"        *(uint32_t*)&sW[1][tx + 32u][gx * 8u + 4u] = (wv1.y >> 4) & 0x0F0F0F0Fu;\n"
+"        if (gx == 0u) {\n"
+"            #define Q4K_DEC_SC(BP, ROW) do { \\\n"
+"                float _d = load_f16_le((BP)), _dm = load_f16_le((BP) + 2u); const uint8_t* _sc = (BP) + 4u; \\\n"
+"                uint8_t _s0, _m0, _s1, _m1; \\\n"
+"                if (is < 4u) { _s0 = _sc[is] & 63u; _m0 = _sc[is + 4u] & 63u; _s1 = _sc[is + 1u] & 63u; _m1 = _sc[is + 5u] & 63u; } \\\n"
+"                else { _s0 = (_sc[is + 4u] & 0xFu) | ((_sc[is - 4u] >> 6) << 4); _m0 = (_sc[is + 4u] >> 4) | ((_sc[is] >> 6) << 4); \\\n"
+"                       _s1 = (_sc[is + 5u] & 0xFu) | ((_sc[is - 3u] >> 6) << 4); _m1 = (_sc[is + 5u] >> 4) | ((_sc[is + 1u] >> 6) << 4); } \\\n"
+"                sWd[0][(ROW)] = _d * (float)_s0; sWm[0][(ROW)] = -_dm * (float)_m0; \\\n"
+"                sWd[1][(ROW)] = _d * (float)_s1; sWm[1][(ROW)] = -_dm * (float)_m1; \\\n"
+"            } while (0)\n"
+"            Q4K_DEC_SC(b0p, tx);\n"
+"            Q4K_DEC_SC(b1p, tx + 32u);\n"
+"            #undef Q4K_DEC_SC\n"
+"        }\n"
+"        cm_cp_async_wait0();\n"
+"        __syncthreads();\n"
+"        if (step + 1u < nsteps) { CP_ASYNC_Q4K_X(nxt, step + 1u); cm_cp_async_commit(); }\n"
+"        if (act0) {\n"
+"            #pragma unroll\n"
+"            for (uint32_t s = 0; s < 2u; s++) {\n"
+"                uint32_t a00 = *(const uint32_t*)&sX[cur][s][wm + gid][tid * 4u];\n"
+"                uint32_t a01 = *(const uint32_t*)&sX[cur][s][wm + gid + 8u][tid * 4u];\n"
+"                uint32_t a02 = *(const uint32_t*)&sX[cur][s][wm + gid][16u + tid * 4u];\n"
+"                uint32_t a03 = *(const uint32_t*)&sX[cur][s][wm + gid + 8u][16u + tid * 4u];\n"
+"                float xd0 = *(const float*)&sX[cur][s][wm + gid][32],      xs0 = *(const float*)&sX[cur][s][wm + gid][36];\n"
+"                float xd1 = *(const float*)&sX[cur][s][wm + gid + 8u][32], xs1 = *(const float*)&sX[cur][s][wm + gid + 8u][36];\n"
+"                uint32_t a10 = 0u, a11 = 0u, a12 = 0u, a13 = 0u; float xd2 = 0.0f, xs2 = 0.0f, xd3 = 0.0f, xs3 = 0.0f;\n"
+"                if (act1) {\n"
+"                    a10 = *(const uint32_t*)&sX[cur][s][wm + 16u + gid][tid * 4u];\n"
+"                    a11 = *(const uint32_t*)&sX[cur][s][wm + 24u + gid][tid * 4u];\n"
+"                    a12 = *(const uint32_t*)&sX[cur][s][wm + 16u + gid][16u + tid * 4u];\n"
+"                    a13 = *(const uint32_t*)&sX[cur][s][wm + 24u + gid][16u + tid * 4u];\n"
+"                    xd2 = *(const float*)&sX[cur][s][wm + 16u + gid][32]; xs2 = *(const float*)&sX[cur][s][wm + 16u + gid][36];\n"
+"                    xd3 = *(const float*)&sX[cur][s][wm + 24u + gid][32]; xs3 = *(const float*)&sX[cur][s][wm + 24u + gid][36];\n"
+"                }\n"
+"                #pragma unroll\n"
+"                for (uint32_t ni = 0; ni < 4u; ni++) {\n"
+"                    uint32_t nbase = wn + ni * 8u;\n"
+"                    uint32_t b00 = *(const uint32_t*)&sW[s][nbase + gid][tid * 4u];\n"
+"                    uint32_t b01 = *(const uint32_t*)&sW[s][nbase + gid][16u + tid * 4u];\n"
+"                    float dw0 = sWd[s][nbase + tid * 2u], dw1 = sWd[s][nbase + tid * 2u + 1u];\n"
+"                    float mw0 = sWm[s][nbase + tid * 2u], mw1 = sWm[s][nbase + tid * 2u + 1u];\n"
+"                    int32_t t0, t1, t2, t3;\n"
+"                    asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                                 : \"=r\"(t0), \"=r\"(t1), \"=r\"(t2), \"=r\"(t3)\n"
+"                                 : \"r\"(a00), \"r\"(a01), \"r\"(a02), \"r\"(a03), \"r\"(b00), \"r\"(b01), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"                    c0[ni][0] = fmaf((float)t0 * xd0, dw0, fmaf(xs0, mw0, c0[ni][0]));\n"
+"                    c0[ni][1] = fmaf((float)t1 * xd0, dw1, fmaf(xs0, mw1, c0[ni][1]));\n"
+"                    c0[ni][2] = fmaf((float)t2 * xd1, dw0, fmaf(xs1, mw0, c0[ni][2]));\n"
+"                    c0[ni][3] = fmaf((float)t3 * xd1, dw1, fmaf(xs1, mw1, c0[ni][3]));\n"
+"                    if (act1) {\n"
+"                        int32_t u0, u1, u2, u3;\n"
+"                        asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\\n\"\n"
+"                                     : \"=r\"(u0), \"=r\"(u1), \"=r\"(u2), \"=r\"(u3)\n"
+"                                     : \"r\"(a10), \"r\"(a11), \"r\"(a12), \"r\"(a13), \"r\"(b00), \"r\"(b01), \"r\"(0), \"r\"(0), \"r\"(0), \"r\"(0));\n"
+"                        c1[ni][0] = fmaf((float)u0 * xd2, dw0, fmaf(xs2, mw0, c1[ni][0]));\n"
+"                        c1[ni][1] = fmaf((float)u1 * xd2, dw1, fmaf(xs2, mw1, c1[ni][1]));\n"
+"                        c1[ni][2] = fmaf((float)u2 * xd3, dw0, fmaf(xs3, mw0, c1[ni][2]));\n"
+"                        c1[ni][3] = fmaf((float)u3 * xd3, dw1, fmaf(xs3, mw1, c1[ni][3]));\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    #undef CP_ASYNC_Q4K_X\n"
+"    if (act0) {\n"
+"        uint32_t ob0 = b0 + wm + gid, ob1 = ob0 + 8u, ob2 = ob0 + 16u, ob3 = ob0 + 24u;\n"
+"        #define ST_Q4KM(ob, orw, val) if ((ob) < batch_b && (orw) < out_dim) { uint64_t idx = (uint64_t)(ob) * out_dim + (orw); y[idx] = add_res ? (y[idx] + (val)) : (val); }\n"
+"        #pragma unroll\n"
+"        for (uint32_t ni = 0; ni < 4u; ni++) {\n"
+"            uint32_t or0 = r0 + wn + ni * 8u + tid * 2u;\n"
+"            ST_Q4KM(ob0, or0, c0[ni][0]); ST_Q4KM(ob0, or0 + 1u, c0[ni][1]);\n"
+"            ST_Q4KM(ob1, or0, c0[ni][2]); ST_Q4KM(ob1, or0 + 1u, c0[ni][3]);\n"
+"            if (act1) { ST_Q4KM(ob2, or0, c1[ni][0]); ST_Q4KM(ob2, or0 + 1u, c1[ni][1]); ST_Q4KM(ob3, or0, c1[ni][2]); ST_Q4KM(ob3, or0 + 1u, c1[ni][3]); }\n"
+"        }\n"
+"        #undef ST_Q4KM\n"
+"    }\n"
+"#else\n"
+"    (void)w; (void)xq8; (void)y; (void)out_dim; (void)in_dim; (void)batch_b; (void)add_res;\n"
+"#endif\n"
 "}\n"
 "\n"
 "// Q4_K MoE Slot Kernels (Qwen3-MoE / DeepSeek-R1 Q4_K_M!)\n"
@@ -3953,6 +5260,23 @@ static const char* kCuMoeSrc =
 "    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] += x[i];\n"
 "}\n"
 "\n"
+"extern \"C\" __global__ void cm_vit_pixel_shuffle(const float* __restrict__ src, float* __restrict__ dst,\n"
+"                                                uint32_t grid, uint32_t sf, uint32_t d_vis, uint32_t has_cls) {\n"
+"    uint32_t og = grid / sf;\n"
+"    uint32_t out_tok = blockIdx.x;\n"
+"    if (out_tok >= og * og) return;\n"
+"    uint32_t oh = out_tok / og, ow = out_tok - oh * og;\n"
+"    uint32_t sf2 = sf * sf, in_fc = sf2 * d_vis;\n"
+"    const float* base_src = src + (uint64_t)has_cls * d_vis;\n"
+"    float* out_row = dst + (uint64_t)out_tok * in_fc;\n"
+"    for (uint32_t idx = threadIdx.x; idx < in_fc; idx += blockDim.x) {\n"
+"        uint32_t sub = idx / d_vis, d = idx - sub * d_vis;\n"
+"        uint32_t dh_i = sub / sf, dw_i = sub - dh_i * sf;\n"
+"        uint32_t in_tok = (oh * sf + dh_i) * grid + (ow * sf + dw_i);\n"
+"        out_row[idx] = base_src[(uint64_t)in_tok * d_vis + d];\n"
+"    }\n"
+"}\n"
+"\n"
 "extern \"C\" __global__ void cm_vit_full_attn(const float* q, const float* k, const float* v, float* out, uint32_t n_tok, uint32_t n_heads, uint32_t d_head, float scale) {\n"
 "    uint32_t h = blockIdx.x, qi = blockIdx.y; if (h >= n_heads || qi >= n_tok) return;\n"
 "    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u, dm = n_heads * d_head;\n"
@@ -4933,9 +6257,89 @@ static const char* kCuMoeSrc =
 "    int v0 = (b0 < batch_b) ? 1 : 0, v1 = (b1 < batch_b) ? 1 : 0;\n"
 "    uint32_t p0 = v0 ? pos_arr[b0] : 0u, p1 = v1 ? pos_arr[b1] : 0u;\n"
 "    float m0 = -1e30f, l0 = 0.0f, m1 = -1e30f, l1 = 0.0f;\n"
-"    __shared__ half sK[16][132];\n"
-"    __shared__ half sV[16][132];\n"
+"    __shared__ half sK[16][256];\n"
+"    __shared__ half sV[16][256];\n"
 "    uint32_t max_lb = max_pos_tg >> 4, dh4 = d_head >> 2, kv_v4 = 16u * dh4;\n"
+"    if (d_head == 256u) {\n"
+"        uint64_t qb_0 = ((uint64_t)(v0 ? b0 : 0u) * n_heads + h) * 256ull;\n"
+"        uint64_t qb_1 = ((uint64_t)(v1 ? b1 : 0u) * n_heads + h) * 256ull;\n"
+"        float4 q0a = v0 ? __ldg((const float4*)(q + qb_0 + lane * 4u))        : make_float4(0,0,0,0);\n"
+"        float4 q0b = v0 ? __ldg((const float4*)(q + qb_0 + 128u + lane * 4u)) : make_float4(0,0,0,0);\n"
+"        float4 q1a = v1 ? __ldg((const float4*)(q + qb_1 + lane * 4u))        : make_float4(0,0,0,0);\n"
+"        float4 q1b = v1 ? __ldg((const float4*)(q + qb_1 + 128u + lane * 4u)) : make_float4(0,0,0,0);\n"
+"        float4 o0a = make_float4(0,0,0,0), o0b = make_float4(0,0,0,0);\n"
+"        float4 o1a = make_float4(0,0,0,0), o1b = make_float4(0,0,0,0);\n"
+"        for (uint32_t lb = 0; lb <= max_lb; lb++) {\n"
+"            uint32_t t_base = lb << 4;\n"
+"            if (swa_window > 0u) {\n"
+"                uint32_t min_p = pos_arr[qb0];\n"
+"                uint32_t ws = (min_p + 1u > swa_window) ? (min_p + 1u - swa_window) : 0u;\n"
+"                if (t_base + 16u <= ws && t_base >= attn_sink) continue;\n"
+"            }\n"
+"            uint32_t pt_base = (uint32_t)bt[lb] << 4;\n"
+"            for (uint32_t vi = lid; vi < 1024u; vi += 128u) {\n"
+"                uint32_t tk = vi >> 6, c4 = (vi & 63u) << 2;\n"
+"                uint64_t off = (uint64_t)(pt_base + tk) * kv_stride + kvh * 256u + c4;\n"
+"                *(uint2*)(&sK[tk][c4]) = __ldg((const uint2*)(k_cache + off));\n"
+"                *(uint2*)(&sV[tk][c4]) = __ldg((const uint2*)(v_cache + off));\n"
+"            }\n"
+"            __syncthreads();\n"
+"            uint32_t tk_lim = (max_pos_tg - t_base + 1u < 16u) ? (max_pos_tg - t_base + 1u) : 16u;\n"
+"            for (uint32_t tk = 0; tk < tk_lim; tk++) {\n"
+"                uint32_t t = t_base + tk;\n"
+"                float2 k01 = __half22float2(*(const half2*)(&sK[tk][lane * 4u]));\n"
+"                float2 k23 = __half22float2(*(const half2*)(&sK[tk][lane * 4u + 2u]));\n"
+"                float2 k45 = __half22float2(*(const half2*)(&sK[tk][128u + lane * 4u]));\n"
+"                float2 k67 = __half22float2(*(const half2*)(&sK[tk][128u + lane * 4u + 2u]));\n"
+"                float2 v01 = __half22float2(*(const half2*)(&sV[tk][lane * 4u]));\n"
+"                float2 v23 = __half22float2(*(const half2*)(&sV[tk][lane * 4u + 2u]));\n"
+"                float2 v45 = __half22float2(*(const half2*)(&sV[tk][128u + lane * 4u]));\n"
+"                float2 v67 = __half22float2(*(const half2*)(&sV[tk][128u + lane * 4u + 2u]));\n"
+"                if (v0 && t <= p0) {\n"
+"                    int ok0 = 1;\n"
+"                    if (swa_window > 0u) { uint32_t ws = (p0 + 1u > swa_window) ? (p0 + 1u - swa_window) : 0u; ok0 = (t >= ws || t < attn_sink); }\n"
+"                    if (ok0) {\n"
+"                        float dt = fmaf(q0a.x, k01.x, fmaf(q0a.y, k01.y, fmaf(q0a.z, k23.x, q0a.w * k23.y)))\n"
+"                                 + fmaf(q0b.x, k45.x, fmaf(q0b.y, k45.y, fmaf(q0b.z, k67.x, q0b.w * k67.y)));\n"
+"                        float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(dt) * scale, 0);\n"
+"                        float mn = fmaxf(m0, sc), al = __expf(m0 - mn), wt = __expf(sc - mn);\n"
+"                        l0 = fmaf(l0, al, wt); m0 = mn;\n"
+"                        o0a.x = fmaf(o0a.x, al, wt * v01.x); o0a.y = fmaf(o0a.y, al, wt * v01.y);\n"
+"                        o0a.z = fmaf(o0a.z, al, wt * v23.x); o0a.w = fmaf(o0a.w, al, wt * v23.y);\n"
+"                        o0b.x = fmaf(o0b.x, al, wt * v45.x); o0b.y = fmaf(o0b.y, al, wt * v45.y);\n"
+"                        o0b.z = fmaf(o0b.z, al, wt * v67.x); o0b.w = fmaf(o0b.w, al, wt * v67.y);\n"
+"                    }\n"
+"                }\n"
+"                if (v1 && t <= p1) {\n"
+"                    int ok1 = 1;\n"
+"                    if (swa_window > 0u) { uint32_t ws = (p1 + 1u > swa_window) ? (p1 + 1u - swa_window) : 0u; ok1 = (t >= ws || t < attn_sink); }\n"
+"                    if (ok1) {\n"
+"                        float dt = fmaf(q1a.x, k01.x, fmaf(q1a.y, k01.y, fmaf(q1a.z, k23.x, q1a.w * k23.y)))\n"
+"                                 + fmaf(q1b.x, k45.x, fmaf(q1b.y, k45.y, fmaf(q1b.z, k67.x, q1b.w * k67.y)));\n"
+"                        float sc = __shfl_sync(0xFFFFFFFFu, warp_sum(dt) * scale, 0);\n"
+"                        float mn = fmaxf(m1, sc), al = __expf(m1 - mn), wt = __expf(sc - mn);\n"
+"                        l1 = fmaf(l1, al, wt); m1 = mn;\n"
+"                        o1a.x = fmaf(o1a.x, al, wt * v01.x); o1a.y = fmaf(o1a.y, al, wt * v01.y);\n"
+"                        o1a.z = fmaf(o1a.z, al, wt * v23.x); o1a.w = fmaf(o1a.w, al, wt * v23.y);\n"
+"                        o1b.x = fmaf(o1b.x, al, wt * v45.x); o1b.y = fmaf(o1b.y, al, wt * v45.y);\n"
+"                        o1b.z = fmaf(o1b.z, al, wt * v67.x); o1b.w = fmaf(o1b.w, al, wt * v67.y);\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"            __syncthreads();\n"
+"        }\n"
+"        if (v0) {\n"
+"            uint64_t cb = ((uint64_t)b0 * n_heads + h) * 256ull; float inv = 1.0f / fmaxf(l0, 1e-12f);\n"
+"            *(float4*)(ctx + cb + lane * 4u)        = make_float4(o0a.x*inv, o0a.y*inv, o0a.z*inv, o0a.w*inv);\n"
+"            *(float4*)(ctx + cb + 128u + lane * 4u) = make_float4(o0b.x*inv, o0b.y*inv, o0b.z*inv, o0b.w*inv);\n"
+"        }\n"
+"        if (v1) {\n"
+"            uint64_t cb = ((uint64_t)b1 * n_heads + h) * 256ull; float inv = 1.0f / fmaxf(l1, 1e-12f);\n"
+"            *(float4*)(ctx + cb + lane * 4u)        = make_float4(o1a.x*inv, o1a.y*inv, o1a.z*inv, o1a.w*inv);\n"
+"            *(float4*)(ctx + cb + 128u + lane * 4u) = make_float4(o1b.x*inv, o1b.y*inv, o1b.z*inv, o1b.w*inv);\n"
+"        }\n"
+"        return;\n"
+"    }\n"
 "    if (d_head == 64u) {\n"
 "        uint64_t qb_0 = ((uint64_t)(v0 ? b0 : 0u) * n_heads + h) * 64ull;\n"
 "        uint64_t qb_1 = ((uint64_t)(v1 ? b1 : 0u) * n_heads + h) * 64ull;\n"
@@ -6953,6 +8357,153 @@ static const char* kCuMoeSrc =
 "    float acc = 0.0f;\n"
 "    for (uint32_t r = 0; r < rk; r++) acc = fmaf(bo[r], tb[r], acc);\n"
 "    y[(uint64_t)b * out_dim + o] += tbl.scales[sl] * acc;\n"
+"}\n"
+"\n"
+"// =========================================================================\n"
+"// Tenon v14 P3: Qwen3.5 Hybrid Gated DeltaNet (GDN) + Gated Full GQA Kernels\n"
+"// =========================================================================\n"
+"extern \"C\" __global__ void cm_q_gate_split(const float* q_raw, float* q_out, float* gate_out, uint32_t n_heads, uint32_t d_head, uint32_t batch_b) {\n"
+"    uint32_t qdim = n_heads * d_head;\n"
+"    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x, b = blockIdx.y;\n"
+"    if (idx >= qdim || b >= batch_b) return;\n"
+"    uint32_t h = idx / d_head, d = idx - h * d_head;\n"
+"    uint64_t src_base = (uint64_t)b * (qdim * 2u) + (uint64_t)h * (d_head * 2u) + d;\n"
+"    uint64_t dst_idx  = (uint64_t)b * qdim + idx;\n"
+"    q_out[dst_idx]    = q_raw[src_base];\n"
+"    gate_out[dst_idx] = q_raw[src_base + d_head];\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_attn_gate_sigmoid(float* ctx, const float* gate, uint32_t n) {\n"
+"    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (i < n) ctx[i] *= (1.0f / (1.0f + expf(-gate[i])));\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gdn_conv1d_silu(const float* qkv_raw, const float* conv_w, float* conv_state, float* qkv_out,\n"
+"                                              const uint32_t* slot_arr, uint32_t qkv_dim, uint32_t d_conv, uint32_t batch_b) {\n"
+"    uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    if (c >= qkv_dim) return;\n"
+"    uint32_t d_state = d_conv - 1u;\n"
+"    float w0 = conv_w[(uint64_t)c * d_conv + 0u];\n"
+"    float w1 = (d_conv > 1u) ? conv_w[(uint64_t)c * d_conv + 1u] : 0.0f;\n"
+"    float w2 = (d_conv > 2u) ? conv_w[(uint64_t)c * d_conv + 2u] : 0.0f;\n"
+"    float w3 = (d_conv > 3u) ? conv_w[(uint64_t)c * d_conv + 3u] : 0.0f;\n"
+"    int cur_slot = -1;\n"
+"    float st0 = 0.0f, st1 = 0.0f, st2 = 0.0f;\n"
+"    for (uint32_t b = 0u; b < batch_b; b++) {\n"
+"        int sl = (int)slot_arr[b];\n"
+"        if (sl != cur_slot) {\n"
+"            if (cur_slot >= 0) {\n"
+"                uint64_t old_base = (uint64_t)cur_slot * d_state * qkv_dim + c;\n"
+"                if (d_state >= 1u) conv_state[old_base] = st0;\n"
+"                if (d_state >= 2u) conv_state[old_base + qkv_dim] = st1;\n"
+"                if (d_state >= 3u) conv_state[old_base + 2ull * qkv_dim] = st2;\n"
+"            }\n"
+"            cur_slot = sl;\n"
+"            uint64_t new_base = (uint64_t)cur_slot * d_state * qkv_dim + c;\n"
+"            st0 = (d_state >= 1u) ? conv_state[new_base] : 0.0f;\n"
+"            st1 = (d_state >= 2u) ? conv_state[new_base + qkv_dim] : 0.0f;\n"
+"            st2 = (d_state >= 3u) ? conv_state[new_base + 2ull * qkv_dim] : 0.0f;\n"
+"        }\n"
+"        float x = qkv_raw[(uint64_t)b * qkv_dim + c];\n"
+"        float y = (d_conv == 4u) ? fmaf(w0, st0, fmaf(w1, st1, fmaf(w2, st2, w3 * x)))\n"
+"                : (d_conv == 3u) ? fmaf(w0, st0, fmaf(w1, st1, w2 * x))\n"
+"                : (d_conv == 2u) ? fmaf(w0, st0, w1 * x) : (w0 * x);\n"
+"        qkv_out[(uint64_t)b * qkv_dim + c] = y / (1.0f + expf(-y));\n"
+"        st0 = st1; st1 = st2; st2 = x;\n"
+"    }\n"
+"    if (cur_slot >= 0) {\n"
+"        uint64_t base = (uint64_t)cur_slot * d_state * qkv_dim + c;\n"
+"        if (d_state >= 1u) conv_state[base] = st0;\n"
+"        if (d_state >= 2u) conv_state[base + qkv_dim] = st1;\n"
+"        if (d_state >= 3u) conv_state[base + 2ull * qkv_dim] = st2;\n"
+"    }\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gdn_step_batch(const float* __restrict__ qkv_conv, const float* __restrict__ alpha_buf,\n"
+"                                             const float* __restrict__ beta_buf, const float* __restrict__ ssm_a,\n"
+"                                             const float* __restrict__ dt_bias, float4* __restrict__ ssm_state,\n"
+"                                             float* __restrict__ o_out, const uint32_t* __restrict__ slot_arr,\n"
+"                                             uint32_t n_k_heads, uint32_t n_v_heads, uint32_t d_k, uint32_t d_v,\n"
+"                                             uint32_t qkv_dim, uint32_t batch_b) {\n"
+"    uint32_t col_blk = blockIdx.x, h = blockIdx.y;\n"
+"    uint32_t n_col_blks = d_v >> 2;\n"
+"    if (col_blk >= n_col_blks || h >= n_v_heads) return;\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint32_t j0 = col_blk << 2, k_dim = n_k_heads * d_k, v_dim = n_v_heads * d_v;\n"
+"    uint32_t grp = (n_v_heads / n_k_heads) > 0u ? (n_v_heads / n_k_heads) : 1u;\n"
+"    uint32_t kh = h / grp;\n"
+"    float a_val = ssm_a[h], dt_b = dt_bias[h], q_sc = rsqrtf((float)d_k);\n"
+"    int i_ok = (lid < d_k) ? 1 : 0;\n"
+"    __shared__ float2 s_nrm[4];\n"
+"    __shared__ float4 s_red[4];\n"
+"    __shared__ float4 s_out[4];\n"
+"    uint64_t state_slot_stride = (uint64_t)n_v_heads * (uint64_t)n_col_blks * (uint64_t)d_k;\n"
+"    uint64_t state_hc_off = ((uint64_t)h * n_col_blks + col_blk) * d_k + lid;\n"
+"    int cur_slot = -1;\n"
+"    float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+"    for (uint32_t b = 0u; b < batch_b; b++) {\n"
+"        int sl = (int)slot_arr[b];\n"
+"        if (sl != cur_slot) {\n"
+"            if (cur_slot >= 0 && i_ok) ssm_state[(uint64_t)cur_slot * state_slot_stride + state_hc_off] = s;\n"
+"            cur_slot = sl;\n"
+"            s = i_ok ? ssm_state[(uint64_t)cur_slot * state_slot_stride + state_hc_off] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+"        }\n"
+"        uint64_t qkv_b = (uint64_t)b * qkv_dim;\n"
+"        float qi = i_ok ? __ldg(&qkv_conv[qkv_b + (uint64_t)kh * d_k + lid]) : 0.0f;\n"
+"        float ki = i_ok ? __ldg(&qkv_conv[qkv_b + k_dim + (uint64_t)kh * d_k + lid]) : 0.0f;\n"
+"        float q2 = warp_sum(qi * qi), k2 = warp_sum(ki * ki);\n"
+"        if (lane == 0u) s_nrm[wid] = make_float2(q2, k2);\n"
+"        __syncthreads();\n"
+"        float qn2 = s_nrm[0].x + s_nrm[1].x + s_nrm[2].x + s_nrm[3].x;\n"
+"        float kn2 = s_nrm[0].y + s_nrm[1].y + s_nrm[2].y + s_nrm[3].y;\n"
+"        qi *= rsqrtf(qn2 + 1e-6f) * q_sc;\n"
+"        ki *= rsqrtf(kn2 + 1e-6f);\n"
+"        float av = alpha_buf[(uint64_t)b * n_v_heads + h] + dt_b;\n"
+"        float sp = (av > 20.0f) ? av : logf(1.0f + expf(av));\n"
+"        float g  = expf(a_val * sp);\n"
+"        float beta = 1.0f / (1.0f + expf(-beta_buf[(uint64_t)b * n_v_heads + h]));\n"
+"        s.x *= g; s.y *= g; s.z *= g; s.w *= g;\n"
+"        float4 km_s = make_float4(warp_sum(s.x * ki), warp_sum(s.y * ki), warp_sum(s.z * ki), warp_sum(s.w * ki));\n"
+"        if (lane == 0u) s_red[wid] = km_s;\n"
+"        __syncthreads();\n"
+"        float kmx = s_red[0].x + s_red[1].x + s_red[2].x + s_red[3].x;\n"
+"        float kmy = s_red[0].y + s_red[1].y + s_red[2].y + s_red[3].y;\n"
+"        float kmz = s_red[0].z + s_red[1].z + s_red[2].z + s_red[3].z;\n"
+"        float kmw = s_red[0].w + s_red[1].w + s_red[2].w + s_red[3].w;\n"
+"        float4 vv = __ldg((const float4*)(qkv_conv + qkv_b + 2ull * k_dim + (uint64_t)h * d_v + j0));\n"
+"        s.x = fmaf(ki, (vv.x - kmx) * beta, s.x);\n"
+"        s.y = fmaf(ki, (vv.y - kmy) * beta, s.y);\n"
+"        s.z = fmaf(ki, (vv.z - kmz) * beta, s.z);\n"
+"        s.w = fmaf(ki, (vv.w - kmw) * beta, s.w);\n"
+"        float4 ov_s = make_float4(warp_sum(s.x * qi), warp_sum(s.y * qi), warp_sum(s.z * qi), warp_sum(s.w * qi));\n"
+"        if (lane == 0u) s_out[wid] = ov_s;\n"
+"        __syncthreads();\n"
+"        if (lid == 0u) {\n"
+"            *(float4*)(o_out + (uint64_t)b * v_dim + (uint64_t)h * d_v + j0) = make_float4(\n"
+"                s_out[0].x + s_out[1].x + s_out[2].x + s_out[3].x,\n"
+"                s_out[0].y + s_out[1].y + s_out[2].y + s_out[3].y,\n"
+"                s_out[0].z + s_out[1].z + s_out[2].z + s_out[3].z,\n"
+"                s_out[0].w + s_out[1].w + s_out[2].w + s_out[3].w);\n"
+"        }\n"
+"    }\n"
+"    if (cur_slot >= 0 && i_ok) ssm_state[(uint64_t)cur_slot * state_slot_stride + state_hc_off] = s;\n"
+"}\n"
+"\n"
+"extern \"C\" __global__ void cm_gdn_gated_rmsnorm(const float* o, const float* z, const float* w, float* out, uint32_t d_v, uint32_t n_groups, float eps) {\n"
+"    uint32_t g = blockIdx.x; if (g >= n_groups) return;\n"
+"    __shared__ float s_sq[4];\n"
+"    uint32_t lid = threadIdx.x, wid = lid >> 5, lane = lid & 31u;\n"
+"    uint64_t base = (uint64_t)g * d_v;\n"
+"    float lsq = 0.0f;\n"
+"    for (uint32_t i = lid; i < d_v; i += 128u) { float v = o[base + i]; lsq = fmaf(v, v, lsq); }\n"
+"    lsq = warp_sum(lsq);\n"
+"    if (lane == 0u) s_sq[wid] = lsq;\n"
+"    __syncthreads();\n"
+"    float inv = rsqrtf((s_sq[0] + s_sq[1] + s_sq[2] + s_sq[3]) / (float)d_v + eps);\n"
+"    for (uint32_t i = lid; i < d_v; i += 128u) {\n"
+"        float zv = z[base + i];\n"
+"        out[base + i] = (o[base + i] * inv * w[i]) * (zv / (1.0f + expf(-zv)));\n"
+"    }\n"
 "}\n";
 
 static void* cm_sym(void* lib, const char* a, const char* b) {
@@ -7143,22 +8694,59 @@ static int cm_load_dev_kernels(CmDevCtx* dc, const void* bin) {
     LK(k_f32_to_f16, "cm_f32_to_f16");
     LK(k_deq_q4_0_f16, "cm_deq_q4_0_f16");
     LK(k_deq_q4_1_f16, "cm_deq_q4_1_f16");
+    LK(k_deq_q5_0_f16, "cm_deq_q5_0_f16");
     LK(k_deq_q8_0_f16, "cm_deq_q8_0_f16");
     LK(k_deq_q4k_f16, "cm_deq_q4k_f16");
+    LK(k_deq_q5k_f16, "cm_deq_q5k_f16");
     LK(k_deq_q6k_f16, "cm_deq_q6k_f16");
     LK(k_flash_prefill_paged_fp16, "cm_flash_prefill_paged_fp16");
     LK(k_flash_prefill_tc_fp16, "cm_flash_prefill_tc_fp16");
     LK(k_quant_q8_1_b, "cm_quantize_q8_1_b");
     LK(k_gemv_q6k_dp4a, "cm_gemv_q6k_dp4a");
+    LK(k_gemv_q6k_dp4a_4r, "cm_gemv_q6k_dp4a_4r");
+    LK(k_gemv_q4k_dp4a, "cm_gemv_q4k_dp4a");
+    LK(k_gemv_q4k_dp4a_4r, "cm_gemv_q4k_dp4a_4r");
+    LK(k_gemv_q5k_dp4a, "cm_gemv_q5k_dp4a");
+    LK(k_gemv_q5k_dp4a_4r, "cm_gemv_q5k_dp4a_4r");
+    LK(k_gemv_q5_0_dp4a, "cm_gemv_q5_0_dp4a");
+    LK(k_gemv_q5_0_dp4a_4r, "cm_gemv_q5_0_dp4a_4r");
+    LK(k_gemv_q8_dp4a, "cm_gemv_q8_dp4a");
+    LK(k_gemv_q8_dp4a_4r, "cm_gemv_q8_dp4a_4r");
+    LK(k_gemv_q8_dp4a_lm, "cm_gemv_q8_dp4a_lm");
+    LK(k_gemv_qkv_q4k_dp4a, "cm_gemv_qkv_q4k_dp4a");
+    LK(k_gemv_qkv_q8_dp4a, "cm_gemv_qkv_q8_dp4a");
+    LK(k_gemv_qkv_q5_0_dp4a, "cm_gemv_qkv_q5_0_dp4a");
+    LK(k_dense_gu_q4k_dp4a_q8, "cm_dense_gate_up_q4k_dp4a_q8");
+    LK(k_dense_gu_q8_dp4a_q8, "cm_dense_gate_up_q8_dp4a_q8");
+    LK(k_dense_gu_q5_0_dp4a_q8, "cm_dense_gate_up_q5_0_dp4a_q8");
+    LK(k_dense_gu_q5k_dp4a_q8, "cm_dense_gate_up_q5k_dp4a_q8");
     LK(k_gemm_q4_dp4a_sb, "cm_gemm_q4_dp4a_sb");
     LK(k_gemm_q4_1_dp4a_sb, "cm_gemm_q4_1_dp4a_sb");
     LK(k_gemm_q6k_dp4a_sb, "cm_gemm_q6k_dp4a_sb");
+    LK(k_gemm_q8_dp4a_sb, "cm_gemm_q8_dp4a_sb");
+    LK(k_gemm_q5_0_dp4a_sb, "cm_gemm_q5_0_dp4a_sb");
+    LK(k_gemm_q4k_dp4a_sb, "cm_gemm_q4k_dp4a_sb");
+    LK(k_gemm_q5k_dp4a_sb, "cm_gemm_q5k_dp4a_sb");
     LK(k_gemm_q4_mmq, "cm_gemm_q4_mmq");
     LK(k_gemm_q4_1_mmq, "cm_gemm_q4_1_mmq");
     LK(k_gemm_q4_mmq_n64, "cm_gemm_q4_mmq_n64");
     LK(k_gemm_q4_1_mmq_n64, "cm_gemm_q4_1_mmq_n64");
+    LK(k_gemm_q8_mmq, "cm_gemm_q8_mmq");
+    LK(k_gemm_q4k_mmq, "cm_gemm_q4k_mmq");
     LK(k_rmsnorm_q8_1, "cm_rmsnorm_q8_1");
     LK(k_dense_gu_q4_dp4a_q8, "cm_dense_gate_up_q4_dp4a_q8");
+    LK(k_scale_f32, "cm_scale_f32");
+    LK(k_geglu_mul, "cm_geglu_mul");
+    LK(k_rmsnorm_add, "cm_rmsnorm_add");
+    LK(k_rmsnorm_add_norm, "cm_rmsnorm_add_norm");
+    LK(k_rmsnorm_add_norm_q8_1, "cm_rmsnorm_add_norm_q8_1");
+    LK(k_softcap, "cm_softcap");
+    LK(k_q_gate_split, "cm_q_gate_split");
+    LK(k_attn_gate_sigmoid, "cm_attn_gate_sigmoid");
+    LK(k_gdn_conv1d_silu, "cm_gdn_conv1d_silu");
+    LK(k_gdn_step_batch, "cm_gdn_step_batch");
+    LK(k_gdn_gated_norm, "cm_gdn_gated_rmsnorm");
+    LK(k_vit_pixel_shuffle, "cm_vit_pixel_shuffle");
     LK(k_router, "cm_router_topk");
     LK(k_argmax, "cm_argmax_f32");
     #undef LK
@@ -7294,11 +8882,21 @@ int64_t tn_cumoe_init(void) {
     COPY_K(k_rope_kv_fp8_paged); COPY_K(k_flash_dec_fp8_paged); COPY_K(k_rope_kv_q4_paged); COPY_K(k_flash_dec_q4_paged);
     COPY_K(k_flash_dec_split_paged); COPY_K(k_flash_mla_split_paged); COPY_K(k_flash_dec_reduce_paged);
     COPY_K(k_rmsnorm_strided); COPY_K(k_f32_to_f16);
-    COPY_K(k_deq_q4_0_f16); COPY_K(k_deq_q4_1_f16); COPY_K(k_deq_q8_0_f16); COPY_K(k_deq_q4k_f16); COPY_K(k_deq_q6k_f16);
+    COPY_K(k_deq_q4_0_f16); COPY_K(k_deq_q4_1_f16); COPY_K(k_deq_q5_0_f16); COPY_K(k_deq_q8_0_f16); COPY_K(k_deq_q4k_f16); COPY_K(k_deq_q5k_f16); COPY_K(k_deq_q6k_f16);
     COPY_K(k_flash_prefill_paged_fp16); COPY_K(k_flash_prefill_tc_fp16);
-    COPY_K(k_quant_q8_1_b); COPY_K(k_gemv_q6k_dp4a); COPY_K(k_gemm_q4_dp4a_sb); COPY_K(k_gemm_q4_1_dp4a_sb); COPY_K(k_gemm_q6k_dp4a_sb);
+    COPY_K(k_quant_q8_1_b); COPY_K(k_gemv_q6k_dp4a); COPY_K(k_gemv_q6k_dp4a_4r);
+    COPY_K(k_gemv_q4k_dp4a); COPY_K(k_gemv_q4k_dp4a_4r); COPY_K(k_gemv_q5k_dp4a); COPY_K(k_gemv_q5k_dp4a_4r);
+    COPY_K(k_gemv_q5_0_dp4a); COPY_K(k_gemv_q5_0_dp4a_4r); COPY_K(k_gemv_q8_dp4a); COPY_K(k_gemv_q8_dp4a_4r); COPY_K(k_gemv_q8_dp4a_lm);
+    COPY_K(k_gemv_qkv_q4k_dp4a); COPY_K(k_gemv_qkv_q8_dp4a); COPY_K(k_gemv_qkv_q5_0_dp4a);
+    COPY_K(k_dense_gu_q4k_dp4a_q8); COPY_K(k_dense_gu_q8_dp4a_q8); COPY_K(k_dense_gu_q5_0_dp4a_q8); COPY_K(k_dense_gu_q5k_dp4a_q8);
+    COPY_K(k_gemm_q4_dp4a_sb); COPY_K(k_gemm_q4_1_dp4a_sb); COPY_K(k_gemm_q6k_dp4a_sb);
+    COPY_K(k_gemm_q8_dp4a_sb); COPY_K(k_gemm_q5_0_dp4a_sb); COPY_K(k_gemm_q4k_dp4a_sb); COPY_K(k_gemm_q5k_dp4a_sb);
     COPY_K(k_gemm_q4_mmq); COPY_K(k_gemm_q4_1_mmq); COPY_K(k_gemm_q4_mmq_n64); COPY_K(k_gemm_q4_1_mmq_n64);
+    COPY_K(k_gemm_q8_mmq); COPY_K(k_gemm_q4k_mmq);
     COPY_K(k_rmsnorm_q8_1); COPY_K(k_dense_gu_q4_dp4a_q8);
+    COPY_K(k_scale_f32); COPY_K(k_geglu_mul); COPY_K(k_rmsnorm_add); COPY_K(k_rmsnorm_add_norm); COPY_K(k_rmsnorm_add_norm_q8_1); COPY_K(k_softcap);
+    COPY_K(k_q_gate_split); COPY_K(k_attn_gate_sigmoid); COPY_K(k_gdn_conv1d_silu); COPY_K(k_gdn_step_batch); COPY_K(k_gdn_gated_norm);
+    COPY_K(k_vit_pixel_shuffle);
     COPY_K(k_argmax);
     #undef COPY_K
 
@@ -7469,6 +9067,15 @@ typedef struct {
     CmWeightRef bq, bk, bv; int has_qkv_bias;
     CmWeightRef q_norm, k_norm; int has_qk_norm, qk_norm_per_head;
     CmWeightRef ffn_norm;
+    CmWeightRef post_attn_norm; // Gemma-2 / Gemma-3 post-attention RMSNorm
+    CmWeightRef post_ffn_norm;  // Gemma-2 / Gemma-3 post-FFN RMSNorm
+    // Tenon v14 P3: Qwen3.5 Hybrid Gated DeltaNet (GDN) + Gated Full GQA
+    int is_gdn;
+    int is_gated_attn;
+    CmWeightRef gdn_qkv, gdn_gate, gdn_conv1d, gdn_alpha, gdn_beta, gdn_a, gdn_dt_bias, gdn_norm, gdn_out;
+    CUdeviceptr gdn_conv_state; // [CM_PA_MAX_SEQS, d_conv - 1, qkv_dim] F32
+    CUdeviceptr gdn_ssm_state;  // [CM_PA_MAX_SEQS, n_v_heads, d_v/4, d_k, 4] F32
+    size_t gdn_conv_slot_bytes, gdn_ssm_slot_bytes;
     CmWeightRef ffn_gate, ffn_up, ffn_down;
     CmWeightRef router;
     CmWeightRef exp_bias; float* exp_bias_host; int has_exp_bias;
@@ -7551,6 +9158,11 @@ typedef struct {
     int kv_lora_rank, q_lora_rank, v_head_dim;
     int max_ctx, kv_quant_q8, fast_dp4a;
     int sliding_window, attn_sink; // Tenon v10: SWA + Attention Sink
+    // Tenon v14 P3: Gemma-2 / Gemma-3 & Qwen3.5 Hybrid Gated DeltaNet fields
+    int is_gemma3, use_geglu, sliding_window_pattern;
+    float embed_scale, rope_theta_swa, query_pre_attn_scalar, attn_logit_softcap, final_logit_softcap;
+    int is_qwen35, ssm_conv_kernel, ssm_state_size, ssm_group_count, ssm_time_step_rank, ssm_inner_size;
+    CUdeviceptr d_gdn_qkv, d_gdn_conv, d_gdn_z, d_gdn_o, d_gdn_alpha, d_gdn_beta;
     int mla_latent_kv, n_kv_slots, cur_kv_slot, slot_ctx, has_mtp;
     float expert_weights_scale, rope_theta, rms_eps;
     float yarn_mscale_k, yarn_factor;
@@ -7900,12 +9512,22 @@ static int cm_parse_shard(const char* path, int shard_idx, int read_meta, CmMode
             else if (strstr(k, ".attention.kv_lora_rank")) m->kv_lora_rank = (int)gr_int(&gr, vt);
             else if (strstr(k, ".attention.q_lora_rank")) m->q_lora_rank = (int)gr_int(&gr, vt);
             else if (strstr(k, ".attention.value_length")) m->v_head_dim = (int)gr_int(&gr, vt);
+            else if (strstr(k, ".rope.freq_base_swa") && vt == CM_GGUF_F32) m->rope_theta_swa = gr_f32(&gr);
             else if (strstr(k, ".rope.freq_base") && vt == CM_GGUF_F32) m->rope_theta = gr_f32(&gr);
             else if (strstr(k, ".rope.scaling.yarn_log_multiplier") && vt == CM_GGUF_F32) m->yarn_mscale_k = gr_f32(&gr);
             else if (strstr(k, ".rope.scaling.factor") && vt == CM_GGUF_F32) m->yarn_factor = gr_f32(&gr);
             else if (strstr(k, ".rope.scaling.original_context_length")) m->yarn_orig_ctx = (int)gr_int(&gr, vt);
             else if (strstr(k, ".layer_norm_rms_epsilon") && vt == CM_GGUF_F32) m->rms_eps = gr_f32(&gr);
+            else if (strstr(k, ".attention.sliding_window_pattern")) m->sliding_window_pattern = (int)gr_int(&gr, vt);
             else if (strstr(k, ".attention.sliding_window")) m->sliding_window = (int)gr_int(&gr, vt);
+            else if (strstr(k, ".attention.query_pre_attn_scalar") && vt == CM_GGUF_F32) m->query_pre_attn_scalar = gr_f32(&gr);
+            else if (strstr(k, ".attention.logit_softcapping") && vt == CM_GGUF_F32) m->attn_logit_softcap = gr_f32(&gr);
+            else if (strstr(k, ".final_logit_softcapping") && vt == CM_GGUF_F32) m->final_logit_softcap = gr_f32(&gr);
+            else if (strstr(k, ".ssm.conv_kernel")) m->ssm_conv_kernel = (int)gr_int(&gr, vt);
+            else if (strstr(k, ".ssm.state_size")) m->ssm_state_size = (int)gr_int(&gr, vt);
+            else if (strstr(k, ".ssm.group_count")) m->ssm_group_count = (int)gr_int(&gr, vt);
+            else if (strstr(k, ".ssm.time_step_rank")) m->ssm_time_step_rank = (int)gr_int(&gr, vt);
+            else if (strstr(k, ".ssm.inner_size")) m->ssm_inner_size = (int)gr_int(&gr, vt);
             else if (strcmp(k, "tokenizer.ggml.bos_token_id") == 0) m->bos_id = (int)gr_int(&gr, vt);
             else if (strcmp(k, "tokenizer.ggml.eos_token_id") == 0) m->eos_id = (int)gr_int(&gr, vt);
             else if (strcmp(k, "tokenizer.ggml.tokens") == 0 && vt == CM_GGUF_ARR) {
@@ -8000,19 +9622,48 @@ static void launch_gemv_raw_ex(CUstream st, CUdeviceptr w, uint32_t gtype, CUdev
                 fn = g_cu.k_gemv_q4_1_dp4a; rptg = 8;
             } else { fn = g_cu.k_gemv_q4_1; rptg = 8; }
             break;
-        case CM_GGML_Q5_0:   fn = g_cu.k_gemv_q5_0;  rptg = 8; break;
+        case CM_GGML_Q5_0:
+            if (g_cu.fast_dp4a && g_cu.k_gemv_q5_0_dp4a) {
+                if (xq8_override) { xin = xq8_override; }
+                else { launch_quant_q8_1(st, x, in_dim); xin = g_cu.d_xq8; }
+                if (out_dim <= 4096u && g_cu.k_gemv_q5_0_dp4a_4r) { fn = g_cu.k_gemv_q5_0_dp4a_4r; rptg = 4; }
+                else { fn = g_cu.k_gemv_q5_0_dp4a; rptg = 16; }
+            } else { fn = g_cu.k_gemv_q5_0; rptg = 8; }
+            break;
         case CM_GGML_Q5_1:   fn = g_cu.k_gemv_q5_1;  rptg = 8; break;
-        case CM_GGML_Q8_0:   fn = g_cu.k_gemv_q8;    rptg = 8; break;
+        case CM_GGML_Q8_0:
+            if (g_cu.fast_dp4a && g_cu.k_gemv_q8_dp4a) {
+                if (xq8_override) { xin = xq8_override; }
+                else { launch_quant_q8_1(st, x, in_dim); xin = g_cu.d_xq8; }
+                if (out_dim <= 4096u && g_cu.k_gemv_q8_dp4a_4r) { fn = g_cu.k_gemv_q8_dp4a_4r; rptg = 4; }
+                else { fn = g_cu.k_gemv_q8_dp4a; rptg = 16; }
+            } else { fn = g_cu.k_gemv_q8; rptg = 8; }
+            break;
         case CM_GGML_Q2_K:   fn = g_cu.k_gemv_q2k;   rptg = 8; break;
         case CM_GGML_Q3_K:   fn = g_cu.k_gemv_q3k;   rptg = 8; break;
         case CM_GGML_IQ4_XS: fn = g_cu.k_gemv_iq4xs; rptg = 8; break;
-        case CM_GGML_Q4_K:   fn = g_cu.k_gemv_q4k;   rptg = 8; break;
-        case CM_GGML_Q5_K:   fn = g_cu.k_gemv_q5k;   rptg = 8; break;
+        case CM_GGML_Q4_K:
+            if (g_cu.fast_dp4a && (in_dim & 255u) == 0u && g_cu.k_gemv_q4k_dp4a) {
+                if (xq8_override) { xin = xq8_override; }
+                else { launch_quant_q8_1(st, x, in_dim); xin = g_cu.d_xq8; }
+                if (out_dim <= 4096u && g_cu.k_gemv_q4k_dp4a_4r) { fn = g_cu.k_gemv_q4k_dp4a_4r; rptg = 4; }
+                else { fn = g_cu.k_gemv_q4k_dp4a; rptg = 16; }
+            } else { fn = g_cu.k_gemv_q4k; rptg = 8; }
+            break;
+        case CM_GGML_Q5_K:
+            if (g_cu.fast_dp4a && (in_dim & 255u) == 0u && g_cu.k_gemv_q5k_dp4a) {
+                if (xq8_override) { xin = xq8_override; }
+                else { launch_quant_q8_1(st, x, in_dim); xin = g_cu.d_xq8; }
+                if (out_dim <= 4096u && g_cu.k_gemv_q5k_dp4a_4r) { fn = g_cu.k_gemv_q5k_dp4a_4r; rptg = 4; }
+                else { fn = g_cu.k_gemv_q5k_dp4a; rptg = 16; }
+            } else { fn = g_cu.k_gemv_q5k; rptg = 8; }
+            break;
         case CM_GGML_Q6_K:
             if (g_cu.fast_dp4a && (in_dim & 255u) == 0u && g_cu.k_gemv_q6k_dp4a) {
                 if (xq8_override) { xin = xq8_override; }
                 else { launch_quant_q8_1(st, x, in_dim); xin = g_cu.d_xq8; }
-                fn = g_cu.k_gemv_q6k_dp4a; rptg = 16;
+                if (out_dim <= 4096u && g_cu.k_gemv_q6k_dp4a_4r) { fn = g_cu.k_gemv_q6k_dp4a_4r; rptg = 4; }
+                else { fn = g_cu.k_gemv_q6k_dp4a; rptg = 16; }
             } else { fn = g_cu.k_gemv_q6k; rptg = 8; }
             break;
         case CM_GGML_FP8_E4M3: fn = g_cu.k_gemv_fp8;   rptg = 4; break;
@@ -8107,8 +9758,9 @@ static void launch_dense_ffn_raw(CmModel* m, CUstream st,
                        (m->loras[m->active_lora].a[L][4] || m->loras[m->active_lora].a[L][5]));
     if (gt == CM_GGML_Q4_0 && ut == CM_GGML_Q4_0 && !has_gu_lora) {
         if (g_cu.fast_dp4a) {
+            uint32_t act = (uint32_t)m->use_geglu;
             launch_quant_q8_1(st, m->d_xn, dm);
-            void* args[] = { &wg, &wu, &g_cu.d_xq8, &m->d_sh_g, &d_ff, &dm };
+            void* args[] = { &wg, &wu, &g_cu.d_xq8, &m->d_sh_g, &d_ff, &dm, &act };
             g_cu.cuLaunchKernel(g_cu.k_dense_gu_q4_dp4a, (d_ff + 7) / 8, 1, 1, 128, 1, 1, 0, st, args, NULL);
         } else {
             void* args[] = { &wg, &wu, &m->d_xn, &m->d_sh_g, &d_ff, &dm };
@@ -10168,7 +11820,44 @@ static void cm_tp_launch_gemv_dc_ex(CmDevCtx* dc, CUstream st, CUdeviceptr w, ui
             g_cu.cuLaunchKernel(dc->k_quant_q8_1, (nb + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, qa, NULL);
             xin = dc->d_xq8;
         }
-        fn = dc->k_gemv_q6k_dp4a; rptg = 16;
+        if (out_dim <= 4096u && dc->k_gemv_q6k_dp4a_4r) { fn = dc->k_gemv_q6k_dp4a_4r; rptg = 4; }
+        else { fn = dc->k_gemv_q6k_dp4a; rptg = 16; }
+    } else if (gtype == CM_GGML_Q4_K && g_cu.fast_dp4a && (in_dim & 255u) == 0u && dc->k_gemv_q4k_dp4a) {
+        if (xq8_override) { xin = xq8_override; }
+        else {
+            uint32_t nb = in_dim >> 5; void* qa[] = { &x, &dc->d_xq8, &in_dim };
+            g_cu.cuLaunchKernel(dc->k_quant_q8_1, (nb + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, qa, NULL);
+            xin = dc->d_xq8;
+        }
+        if (out_dim <= 4096u && dc->k_gemv_q4k_dp4a_4r) { fn = dc->k_gemv_q4k_dp4a_4r; rptg = 4; }
+        else { fn = dc->k_gemv_q4k_dp4a; rptg = 16; }
+    } else if (gtype == CM_GGML_Q5_K && g_cu.fast_dp4a && (in_dim & 255u) == 0u && dc->k_gemv_q5k_dp4a) {
+        if (xq8_override) { xin = xq8_override; }
+        else {
+            uint32_t nb = in_dim >> 5; void* qa[] = { &x, &dc->d_xq8, &in_dim };
+            g_cu.cuLaunchKernel(dc->k_quant_q8_1, (nb + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, qa, NULL);
+            xin = dc->d_xq8;
+        }
+        if (out_dim <= 4096u && dc->k_gemv_q5k_dp4a_4r) { fn = dc->k_gemv_q5k_dp4a_4r; rptg = 4; }
+        else { fn = dc->k_gemv_q5k_dp4a; rptg = 16; }
+    } else if (gtype == CM_GGML_Q5_0 && g_cu.fast_dp4a && dc->k_gemv_q5_0_dp4a) {
+        if (xq8_override) { xin = xq8_override; }
+        else {
+            uint32_t nb = in_dim >> 5; void* qa[] = { &x, &dc->d_xq8, &in_dim };
+            g_cu.cuLaunchKernel(dc->k_quant_q8_1, (nb + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, qa, NULL);
+            xin = dc->d_xq8;
+        }
+        if (out_dim <= 4096u && dc->k_gemv_q5_0_dp4a_4r) { fn = dc->k_gemv_q5_0_dp4a_4r; rptg = 4; }
+        else { fn = dc->k_gemv_q5_0_dp4a; rptg = 16; }
+    } else if (gtype == CM_GGML_Q8_0 && g_cu.fast_dp4a && dc->k_gemv_q8_dp4a) {
+        if (xq8_override) { xin = xq8_override; }
+        else {
+            uint32_t nb = in_dim >> 5; void* qa[] = { &x, &dc->d_xq8, &in_dim };
+            g_cu.cuLaunchKernel(dc->k_quant_q8_1, (nb + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, qa, NULL);
+            xin = dc->d_xq8;
+        }
+        if (out_dim <= 4096u && dc->k_gemv_q8_dp4a_4r) { fn = dc->k_gemv_q8_dp4a_4r; rptg = 4; }
+        else { fn = dc->k_gemv_q8_dp4a; rptg = 16; }
     } else {
         switch (gtype) {
             case CM_GGML_Q4_0:   fn = dc->k_gemv_q4;    rptg = 8; break;
@@ -10201,11 +11890,12 @@ static void cm_tp_launch_gemv_dc(CmDevCtx* dc, CUstream st, CUdeviceptr w, uint3
 static int cm_launch_cublas_qgemm_dc(CmDevCtx* dc, CUstream st, CUdeviceptr w, uint32_t gtype,
                                      CUdeviceptr x, CUdeviceptr y, uint32_t out_dim, uint32_t in_dim,
                                      uint32_t B, uint32_t add_res) {
-    if (B < 32u || !dc || !dc->cublas || !g_cu.cublasGemmEx || !g_cu.cublasSetStream || g_cu.in_graph_capture) return 0;
-    if (gtype != CM_GGML_Q4_0 && gtype != CM_GGML_Q4_1 && gtype != CM_GGML_Q8_0 &&
-        gtype != CM_GGML_Q4_K && gtype != CM_GGML_Q6_K && gtype != CM_GGML_F16) return 0;
-    if ((gtype == CM_GGML_Q4_K || gtype == CM_GGML_Q6_K) && (in_dim & 255u) != 0u) return 0;
-    if ((gtype == CM_GGML_Q4_0 || gtype == CM_GGML_Q4_1 || gtype == CM_GGML_Q8_0) && (in_dim & 31u) != 0u) return 0;
+    uint32_t min_b = (gtype == CM_GGML_F16) ? 16u : 17u;
+    if (B < min_b || !dc || !dc->cublas || !g_cu.cublasGemmEx || !g_cu.cublasSetStream || g_cu.in_graph_capture) return 0;
+    if (gtype != CM_GGML_Q4_0 && gtype != CM_GGML_Q4_1 && gtype != CM_GGML_Q5_0 && gtype != CM_GGML_Q8_0 &&
+        gtype != CM_GGML_Q4_K && gtype != CM_GGML_Q5_K && gtype != CM_GGML_Q6_K && gtype != CM_GGML_F16) return 0;
+    if ((gtype == CM_GGML_Q4_K || gtype == CM_GGML_Q5_K || gtype == CM_GGML_Q6_K) && (in_dim & 255u) != 0u) return 0;
+    if ((gtype == CM_GGML_Q4_0 || gtype == CM_GGML_Q4_1 || gtype == CM_GGML_Q5_0 || gtype == CM_GGML_Q8_0) && (in_dim & 31u) != 0u) return 0;
 
     size_t px_need = (size_t)B * (size_t)in_dim * 2u;
     if (dc->px_f16_cap < px_need) {
@@ -10256,12 +11946,18 @@ static int cm_launch_cublas_qgemm_dc(CmDevCtx* dc, CUstream st, CUdeviceptr w, u
         } else if (gtype == CM_GGML_Q4_1) {
             uint32_t nthr = nr * (in_dim >> 5) * 4u;
             g_cu.cuLaunchKernel(dc->k_deq_q4_1_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
+        } else if (gtype == CM_GGML_Q5_0) {
+            uint32_t nthr = nr * (in_dim >> 5) * 4u;
+            g_cu.cuLaunchKernel(dc->k_deq_q5_0_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
         } else if (gtype == CM_GGML_Q8_0) {
             uint32_t nthr = nr * (in_dim >> 2);
             g_cu.cuLaunchKernel(dc->k_deq_q8_0_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
         } else if (gtype == CM_GGML_Q4_K) {
             uint32_t nthr = nr * (in_dim >> 8) * 32u;
             g_cu.cuLaunchKernel(dc->k_deq_q4k_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
+        } else if (gtype == CM_GGML_Q5_K) {
+            uint32_t nthr = nr * (in_dim >> 8) * 32u;
+            g_cu.cuLaunchKernel(dc->k_deq_q5k_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
         } else {
             uint32_t nthr = nr * (in_dim >> 8) * 32u;
             g_cu.cuLaunchKernel(dc->k_deq_q6k_f16, (nthr + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, da, NULL);
@@ -10286,30 +11982,42 @@ static void cm_tp_launch_gemm_dc_ex(CmDevCtx* dc, CUstream st, CUdeviceptr w, ui
                                     uint32_t out_dim, uint32_t in_dim, uint32_t B, uint32_t add_res, int xq8_ready) {
     if (B == 1u) { cm_tp_launch_gemv_dc_ex(dc, st, w, gtype, x, y, out_dim, in_dim, add_res, xq8_ready ? dc->d_xq8 : 0); return; }
     size_t xq8_need = (size_t)B * (size_t)(in_dim >> 5) * 48u;
-    if (B >= 16u && g_cu.cc_major >= 8 && g_cu.fast_dp4a && dc->k_quant_q8_1_b && (in_dim & 63u) == 0u && xq8_need <= dc->xq8_cap) {
-        if ((gtype == CM_GGML_Q4_0 && dc->k_gemm_q4_mmq) || (gtype == CM_GGML_Q4_1 && dc->k_gemm_q4_1_mmq)) {
+    if (B > 16u && g_cu.cc_major >= 8 && g_cu.fast_dp4a && dc->k_quant_q8_1_b && (in_dim & 63u) == 0u && xq8_need <= dc->xq8_cap) {
+        if ((gtype == CM_GGML_Q4_0 && dc->k_gemm_q4_mmq) || (gtype == CM_GGML_Q4_1 && dc->k_gemm_q4_1_mmq) ||
+            (gtype == CM_GGML_Q8_0 && out_dim > 32u && dc->k_gemm_q8_mmq) ||
+            (gtype == CM_GGML_Q4_K && (in_dim & 255u) == 0u && dc->k_gemm_q4k_mmq)) {
             if (!xq8_ready) {
                 uint32_t nb = in_dim >> 5;
                 void* qa[] = { &x, &dc->d_xq8, &in_dim, &B };
                 g_cu.cuLaunchKernel(dc->k_quant_q8_1_b, (nb + 3u) / 4u, B, 1, 128, 1, 1, 0, st, qa, NULL);
             }
             void* args[] = { &w, &dc->d_xq8, &y, &out_dim, &in_dim, &B, &add_res };
-            CUfunction fn_mmq = (gtype == CM_GGML_Q4_0) ? dc->k_gemm_q4_mmq : dc->k_gemm_q4_1_mmq;
-            CUfunction fn_mmq_n64 = (gtype == CM_GGML_Q4_0) ? dc->k_gemm_q4_mmq_n64 : dc->k_gemm_q4_1_mmq_n64;
-            uint32_t g128 = ((out_dim + 127u) / 128u) * ((B + 63u) / 64u);
-            if (g128 < 284u && fn_mmq_n64) {
-                g_cu.cuLaunchKernel(fn_mmq_n64, (out_dim + 63u) / 64u, (B + 63u) / 64u, 1, 128, 1, 1, 0, st, args, NULL);
+            if (gtype == CM_GGML_Q8_0) {
+                g_cu.cuLaunchKernel(dc->k_gemm_q8_mmq, (out_dim + 127u) / 128u, (B + 63u) / 64u, 1, 256, 1, 1, 0, st, args, NULL);
+            } else if (gtype == CM_GGML_Q4_K) {
+                g_cu.cuLaunchKernel(dc->k_gemm_q4k_mmq, (out_dim + 63u) / 64u, (B + 63u) / 64u, 1, 128, 1, 1, 0, st, args, NULL);
             } else {
-                g_cu.cuLaunchKernel(fn_mmq, (out_dim + 127u) / 128u, (B + 63u) / 64u, 1, 256, 1, 1, 0, st, args, NULL);
+                CUfunction fn_mmq = (gtype == CM_GGML_Q4_0) ? dc->k_gemm_q4_mmq : dc->k_gemm_q4_1_mmq;
+                CUfunction fn_mmq_n64 = (gtype == CM_GGML_Q4_0) ? dc->k_gemm_q4_mmq_n64 : dc->k_gemm_q4_1_mmq_n64;
+                uint32_t g128 = ((out_dim + 127u) / 128u) * ((B + 63u) / 64u);
+                if (g128 < 284u && fn_mmq_n64) {
+                    g_cu.cuLaunchKernel(fn_mmq_n64, (out_dim + 63u) / 64u, (B + 63u) / 64u, 1, 128, 1, 1, 0, st, args, NULL);
+                } else {
+                    g_cu.cuLaunchKernel(fn_mmq, (out_dim + 127u) / 128u, (B + 63u) / 64u, 1, 256, 1, 1, 0, st, args, NULL);
+                }
             }
             return;
         }
     }
     if (cm_launch_cublas_qgemm_dc(dc, st, w, gtype, x, y, out_dim, in_dim, B, add_res)) return;
     CUfunction fn = dc->k_gemm_q4_b; uint32_t tn = 64u, tb = 32u, bdim = 128u;
-    if (B <= 16u && g_cu.fast_dp4a && dc->k_quant_q8_1_b && xq8_need <= dc->xq8_cap) {
+    if ((B <= 16u || out_dim <= 32u) && g_cu.fast_dp4a && dc->k_quant_q8_1_b && xq8_need <= dc->xq8_cap) {
         if ((gtype == CM_GGML_Q4_0 && dc->k_gemm_q4_dp4a_sb) ||
             (gtype == CM_GGML_Q4_1 && dc->k_gemm_q4_1_dp4a_sb) ||
+            (gtype == CM_GGML_Q8_0 && dc->k_gemm_q8_dp4a_sb) ||
+            (gtype == CM_GGML_Q5_0 && dc->k_gemm_q5_0_dp4a_sb) ||
+            (gtype == CM_GGML_Q4_K && (in_dim & 255u) == 0u && dc->k_gemm_q4k_dp4a_sb) ||
+            (gtype == CM_GGML_Q5_K && (in_dim & 255u) == 0u && dc->k_gemm_q5k_dp4a_sb) ||
             (gtype == CM_GGML_Q6_K && (in_dim & 255u) == 0u && dc->k_gemm_q6k_dp4a_sb)) {
             if (!xq8_ready) {
                 uint32_t nb = in_dim >> 5;
@@ -10320,6 +12028,10 @@ static void cm_tp_launch_gemm_dc_ex(CmDevCtx* dc, CUstream st, CUdeviceptr w, ui
             uint32_t gy = (B + 7u) / 8u;
             if (gtype == CM_GGML_Q4_0)      g_cu.cuLaunchKernel(dc->k_gemm_q4_dp4a_sb,   (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
             else if (gtype == CM_GGML_Q4_1) g_cu.cuLaunchKernel(dc->k_gemm_q4_1_dp4a_sb, (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
+            else if (gtype == CM_GGML_Q8_0) g_cu.cuLaunchKernel(dc->k_gemm_q8_dp4a_sb,   (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
+            else if (gtype == CM_GGML_Q5_0) g_cu.cuLaunchKernel(dc->k_gemm_q5_0_dp4a_sb, (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
+            else if (gtype == CM_GGML_Q4_K) g_cu.cuLaunchKernel(dc->k_gemm_q4k_dp4a_sb,  (out_dim + 3u) / 4u, gy, 1, 128, 1, 1, 0, st, args, NULL);
+            else if (gtype == CM_GGML_Q5_K) g_cu.cuLaunchKernel(dc->k_gemm_q5k_dp4a_sb,  (out_dim + 3u) / 4u, gy, 1, 128, 1, 1, 0, st, args, NULL);
             else                            g_cu.cuLaunchKernel(dc->k_gemm_q6k_dp4a_sb,  (out_dim + 3u) / 4u, gy, 1, 128, 1, 1, 0, st, args, NULL);
             return;
         }
@@ -10619,9 +12331,10 @@ static int64_t cm_tp_forward_batch(CmModel* m, const int64_t* ids, uint32_t B, u
             if (B == 1u) {
                 if (tl->ffn_gate.ggml_type == CM_GGML_Q4_0 && tl->ffn_up.ggml_type == CM_GGML_Q4_0) {
                     if (g_cu.fast_dp4a) {
+                        uint32_t act = (uint32_t)m->use_geglu;
                         uint32_t nb = dm >> 5; void* q8a[] = { &tr->d_xn, &dc->d_xq8, &dm };
                         g_cu.cuLaunchKernel(dc->k_quant_q8_1, (nb + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, q8a, NULL);
-                        void* gua[] = { &tl->ffn_gate.dptr, &tl->ffn_up.dptr, &dc->d_xq8, &tr->d_g, &dff_l, &dm };
+                        void* gua[] = { &tl->ffn_gate.dptr, &tl->ffn_up.dptr, &dc->d_xq8, &tr->d_g, &dff_l, &dm, &act };
                         g_cu.cuLaunchKernel(dc->k_dense_gu_q4_dp4a, (dff_l + 7u) / 8u, 1, 1, 128, 1, 1, 0, st, gua, NULL);
                     } else {
                         void* gua[] = { &tl->ffn_gate.dptr, &tl->ffn_up.dptr, &tr->d_xn, &tr->d_g, &dff_l, &dm };
@@ -10923,6 +12636,7 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
     memset(m, 0, sizeof(CmModel));
     for (int s = 0; s < CM_MAX_SHARDS; s++) m->fds[s] = -1;
     m->rope_theta = 10000.0f; m->rms_eps = 1e-5f; m->bos_id = 1; m->eos_id = 2; m->expert_weights_scale = 1.0f;
+    m->embed_scale = 1.0f;
     m->use_nocache = (int)use_nocache;
     m->enable_overlap = (int)enable_overlap;
 
@@ -10950,7 +12664,16 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
     if (m->rope_dim <= 0) m->rope_dim = m->d_head;
     if (m->d_ff_exp <= 0) m->d_ff_exp = m->d_ff_dense;
     if (m->d_ff_dense <= 0) m->d_ff_dense = m->d_ff_exp;
-    m->rope_neox = (strncmp(m->arch, "qwen", 4) == 0 || strstr(m->arch, "neox") != NULL) ? 1 : 0;
+    m->is_gemma3 = (strcmp(m->arch, "gemma3") == 0 || strcmp(m->arch, "gemma2") == 0 || strcmp(m->arch, "gemma") == 0) ? 1 : 0;
+    m->use_geglu = m->is_gemma3;
+    if (m->is_gemma3) {
+        m->embed_scale = sqrtf((float)m->d_model);
+        if (m->rope_theta_swa <= 0.0f) m->rope_theta_swa = 10000.0f;
+        if (m->sliding_window_pattern <= 0 && strcmp(m->arch, "gemma3") == 0) m->sliding_window_pattern = 6;
+    }
+    m->is_qwen35 = (strncmp(m->arch, "qwen35", 6) == 0 || strncmp(m->arch, "qwen3next", 9) == 0) ? 1 : 0;
+    if (m->is_qwen35 && m->bos_id == 1) m->bos_id = -1;
+    m->rope_neox = (strncmp(m->arch, "qwen", 4) == 0 || strstr(m->arch, "neox") != NULL || m->is_gemma3) ? 1 : 0;
     m->dense_model = (m->n_experts <= 0) ? 1 : 0;
     {
         const char* fdp = getenv("TENON_CUDA_FAST_DP4A");
@@ -11232,13 +12955,27 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
             CmLayer* ly = &m->layers[L];
             int stream_dense_w = (m->dense_model && !ly->is_pinned_dense);
             if (strcmp(sub, "attn_norm.weight") == 0) cm_load_pinned_vram(m, &ly->attn_norm, ti);
-            else if (strcmp(sub, "ffn_norm.weight") == 0 || strcmp(sub, "post_attention_norm.weight") == 0) cm_load_pinned_vram(m, &ly->ffn_norm, ti);
+            else if (strcmp(sub, "ffn_norm.weight") == 0) cm_load_pinned_vram(m, &ly->ffn_norm, ti);
+            else if (strcmp(sub, "post_attention_norm.weight") == 0) cm_load_pinned_vram(m, &ly->post_attn_norm, ti);
+            else if (strcmp(sub, "post_ffw_norm.weight") == 0) cm_load_pinned_vram(m, &ly->post_ffn_norm, ti);
+            else if (strcmp(sub, "attn_qkv.weight") == 0) { cm_load_pinned_vram(m, &ly->gdn_qkv, ti); ly->is_gdn = 1; m->is_qwen35 = 1; }
+            else if (strcmp(sub, "attn_gate.weight") == 0) { cm_load_pinned_vram(m, &ly->gdn_gate, ti); ly->is_gdn = 1; m->is_qwen35 = 1; }
+            else if (strcmp(sub, "ssm_conv1d.weight") == 0) { cm_load_pinned_vram(m, &ly->gdn_conv1d, ti); ly->is_gdn = 1; m->is_qwen35 = 1; }
+            else if (strcmp(sub, "ssm_alpha.weight") == 0) { cm_load_pinned_vram(m, &ly->gdn_alpha, ti); ly->is_gdn = 1; m->is_qwen35 = 1; }
+            else if (strcmp(sub, "ssm_beta.weight") == 0) { cm_load_pinned_vram(m, &ly->gdn_beta, ti); ly->is_gdn = 1; m->is_qwen35 = 1; }
+            else if (strcmp(sub, "ssm_a") == 0) { cm_load_pinned_vram(m, &ly->gdn_a, ti); ly->is_gdn = 1; m->is_qwen35 = 1; }
+            else if (strcmp(sub, "ssm_dt.bias") == 0) { cm_load_pinned_vram(m, &ly->gdn_dt_bias, ti); ly->is_gdn = 1; m->is_qwen35 = 1; }
+            else if (strcmp(sub, "ssm_norm.weight") == 0) { cm_load_pinned_vram(m, &ly->gdn_norm, ti); ly->is_gdn = 1; m->is_qwen35 = 1; }
+            else if (strcmp(sub, "ssm_out.weight") == 0) { cm_load_pinned_vram(m, &ly->gdn_out, ti); ly->is_gdn = 1; m->is_qwen35 = 1; }
             else if (strcmp(sub, "attn_q.bias") == 0) { cm_load_pinned_vram(m, &ly->bq, ti); ly->has_qkv_bias = 1; }
             else if (strcmp(sub, "attn_k.bias") == 0) { cm_load_pinned_vram(m, &ly->bk, ti); ly->has_qkv_bias = 1; }
             else if (strcmp(sub, "attn_v.bias") == 0) { cm_load_pinned_vram(m, &ly->bv, ti); ly->has_qkv_bias = 1; }
             else if (strcmp(sub, "attn_q_norm.weight") == 0) { cm_load_pinned_vram(m, &ly->q_norm, ti); ly->has_qk_norm = 1; ly->qk_norm_per_head = ((int)ti->ne[0] == m->d_head) ? 1 : 0; }
             else if (strcmp(sub, "attn_k_norm.weight") == 0) cm_load_pinned_vram(m, &ly->k_norm, ti);
-            else if (strcmp(sub, "attn_q.weight") == 0) { if (stream_dense_w && !m->dense_pin_all_attn) { cm_record_meta(&ly->wq, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; } else cm_load_pinned_vram(m, &ly->wq, ti); }
+            else if (strcmp(sub, "attn_q.weight") == 0) {
+                if ((int)ti->ne[1] == 2 * m->n_heads * m->d_head) { ly->is_gated_attn = 1; m->is_qwen35 = 1; }
+                if (stream_dense_w && !m->dense_pin_all_attn) { cm_record_meta(&ly->wq, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; } else cm_load_pinned_vram(m, &ly->wq, ti);
+            }
             else if (strcmp(sub, "attn_k.weight") == 0) { if (stream_dense_w && !m->dense_pin_all_attn) { cm_record_meta(&ly->wk, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; } else cm_load_pinned_vram(m, &ly->wk, ti); }
             else if (strcmp(sub, "attn_v.weight") == 0) { if (stream_dense_w && !m->dense_pin_all_attn) { cm_record_meta(&ly->wv, ti); m->total_streamable_bytes += (int64_t)ti->byte_size; } else cm_load_pinned_vram(m, &ly->wv, ti); }
             else if (strcmp(sub, "attn_q_a.weight") == 0) { cm_load_pinned_vram(m, &ly->wq_a, ti); ly->is_mla = 1; }
@@ -11269,6 +13006,13 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
         }
     }
     free(tlist);
+    for (int L = 0; L < m->n_layers; L++) {
+        CmLayer* ly = &m->layers[L];
+        if (!ly->ffn_norm.dptr && ly->post_attn_norm.dptr) {
+            ly->ffn_norm = ly->post_attn_norm;
+            memset(&ly->post_attn_norm, 0, sizeof(CmWeightRef));
+        }
+    }
     if (!m->lm_head.dptr && m->tok_embd.dptr) m->lm_head = m->tok_embd;
     if (m->yarn_factor > 1.0f && !m->has_rope_freqs && m->rope_dim > 0) {
         int half_r = m->rope_dim >> 1;
@@ -11416,6 +13160,29 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
                     void* uargs[] = { &ly->wkv_b.dptr, &ly->mla_wuk_f16, &ly->mla_wuv_f16, &gtb, &nh_u, &nope_d, &v_d, &kv_r };
                     g_cu.cuLaunchKernel(g_cu.k_mla_unpack_wkv_b, (kv_r + 31u) / 32u, max_j, nh_u, 32, 1, 1, 0, m->compute_stream, uargs, NULL);
                 }
+            } else if (ly->is_gdn && ly->gdn_qkv.dptr && ly->gdn_out.dptr) {
+                int d_conv = m->ssm_conv_kernel > 1 ? m->ssm_conv_kernel : 4;
+                int d_k = m->ssm_state_size > 0 ? m->ssm_state_size : 128;
+                int n_v_h = m->ssm_time_step_rank > 0 ? m->ssm_time_step_rank : (int)ly->gdn_a.ne0;
+                int inner = m->ssm_inner_size > 0 ? m->ssm_inner_size : (int)ly->gdn_out.ne0;
+                int d_v = (n_v_h > 0 && inner > 0) ? (inner / n_v_h) : d_k;
+                int qkv_dim = (int)ly->gdn_qkv.ne1;
+                ly->gdn_conv_slot_bytes = (size_t)(d_conv - 1) * (size_t)qkv_dim * 4u;
+                ly->gdn_ssm_slot_bytes  = (size_t)n_v_h * (size_t)d_v * (size_t)d_k * 4u;
+                size_t conv_tot = (size_t)CM_PA_MAX_SEQS * ly->gdn_conv_slot_bytes;
+                size_t ssm_tot  = (size_t)CM_PA_MAX_SEQS * ly->gdn_ssm_slot_bytes;
+                if (conv_tot > 0) {
+                    g_cu.cuMemAlloc(&ly->gdn_conv_state, conv_tot);
+                    g_cu.cuMemsetD8(ly->gdn_conv_state, 0, conv_tot);
+                    m->core_vram_bytes += (int64_t)conv_tot;
+                }
+                if (ssm_tot > 0) {
+                    g_cu.cuMemAlloc(&ly->gdn_ssm_state, ssm_tot);
+                    g_cu.cuMemsetD8(ly->gdn_ssm_state, 0, ssm_tot);
+                    m->core_vram_bytes += (int64_t)ssm_tot;
+                }
+                ly->k_cache_base = 0; ly->v_cache_base = 0;
+                ly->k_cache = 0; ly->v_cache = 0; ly->kv_slot_bytes = 0;
             } else {
                 g_cu.cuMemAlloc(&ly->k_cache_base, kv_bytes_std);
                 g_cu.cuMemAlloc(&ly->v_cache_base, kv_bytes_std);
@@ -11671,9 +13438,18 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
     return (int64_t)slot;
 }
 
+int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr, int64_t slot_ids_ptr, int64_t n_active, int64_t out_toks_ptr);
+int64_t tn_cumoe_paged_prefill(int64_t handle, int64_t slot_id, int64_t tok_ids_ptr, int64_t n_toks, int64_t start_pos);
+
 int64_t tn_cumoe_step(int64_t handle, int64_t tok_id, int64_t pos) {
     if (handle <= 0 || handle >= CM_MAX_MODELS || !g_cm[handle].active) return 0;
     CmModel* m = &g_cm[handle];
+    if (m->is_gemma3 || m->is_qwen35) {
+        int64_t tid_a = tok_id, pos_a = pos, slt_a = m->cur_kv_slot, out_a = 0;
+        tn_cumoe_step_batch(handle, (int64_t)(uintptr_t)&tid_a, (int64_t)(uintptr_t)&pos_a,
+                            (int64_t)(uintptr_t)&slt_a, 1, (int64_t)(uintptr_t)&out_a);
+        return out_a;
+    }
     double t0 = cm_now_ms(), io_acc = 0.0;
 
     // PATH 0: TRUE 2D HYBRID (TP x EP) OR MULTI-GPU TENSOR PARALLELISM (TP=2..8)!
@@ -12506,6 +14282,30 @@ static void cm_ensure_prefill_bufs(CmModel* m, int B) {
         g_cu.cuMemAlloc(&m->d_fd_m, n_sp * 4u);
         g_cu.cuMemAlloc(&m->d_fd_l, n_sp * 4u);
     }
+    if (m->is_qwen35) {
+        size_t max_qkv = qd * 2u, max_v = qd, max_nv = 64u;
+        for (int L = 0; L < m->n_layers; L++) {
+            CmLayer* ly = &m->layers[L];
+            if (ly->is_gdn) {
+                if (ly->gdn_qkv.ne1 > max_qkv) max_qkv = (size_t)ly->gdn_qkv.ne1;
+                if (ly->gdn_gate.ne1 > max_v)  max_v   = (size_t)ly->gdn_gate.ne1;
+                if (ly->gdn_out.ne0 > max_v)   max_v   = (size_t)ly->gdn_out.ne0;
+                if (ly->gdn_alpha.ne1 > max_nv) max_nv = (size_t)ly->gdn_alpha.ne1;
+            }
+        }
+        if (m->d_gdn_qkv)   g_cu.cuMemFree(m->d_gdn_qkv);
+        if (m->d_gdn_conv)  g_cu.cuMemFree(m->d_gdn_conv);
+        if (m->d_gdn_z)     g_cu.cuMemFree(m->d_gdn_z);
+        if (m->d_gdn_o)     g_cu.cuMemFree(m->d_gdn_o);
+        if (m->d_gdn_alpha) g_cu.cuMemFree(m->d_gdn_alpha);
+        if (m->d_gdn_beta)  g_cu.cuMemFree(m->d_gdn_beta);
+        g_cu.cuMemAlloc(&m->d_gdn_qkv,   (size_t)cap * max_qkv * 4u);
+        g_cu.cuMemAlloc(&m->d_gdn_conv,  (size_t)cap * max_qkv * 4u);
+        g_cu.cuMemAlloc(&m->d_gdn_z,     (size_t)cap * max_v   * 4u);
+        g_cu.cuMemAlloc(&m->d_gdn_o,     (size_t)cap * max_v   * 4u);
+        g_cu.cuMemAlloc(&m->d_gdn_alpha, (size_t)cap * max_nv  * 4u);
+        g_cu.cuMemAlloc(&m->d_gdn_beta,  (size_t)cap * max_nv  * 4u);
+    }
     m->prefill_cap = cap;
 }
 
@@ -12516,29 +14316,41 @@ static void launch_gemm_batch_raw_ex(CUstream st, CUdeviceptr w, uint32_t gtype,
         return;
     }
     size_t xq8_need = (size_t)B * (size_t)(in_dim >> 5) * 48u;
-    if (B >= 16u && g_cu.cc_major >= 8 && g_cu.fast_dp4a && g_cu.k_quant_q8_1_b && (in_dim & 63u) == 0u && xq8_need <= g_cu.gpus[0].xq8_cap) {
-        if ((gtype == CM_GGML_Q4_0 && g_cu.k_gemm_q4_mmq) || (gtype == CM_GGML_Q4_1 && g_cu.k_gemm_q4_1_mmq)) {
+    if (B > 16u && g_cu.cc_major >= 8 && g_cu.fast_dp4a && g_cu.k_quant_q8_1_b && (in_dim & 63u) == 0u && xq8_need <= g_cu.gpus[0].xq8_cap) {
+        if ((gtype == CM_GGML_Q4_0 && g_cu.k_gemm_q4_mmq) || (gtype == CM_GGML_Q4_1 && g_cu.k_gemm_q4_1_mmq) ||
+            (gtype == CM_GGML_Q8_0 && out_dim > 32u && g_cu.k_gemm_q8_mmq) ||
+            (gtype == CM_GGML_Q4_K && (in_dim & 255u) == 0u && g_cu.k_gemm_q4k_mmq)) {
             if (!xq8_ready) {
                 uint32_t nb = in_dim >> 5;
                 void* qa[] = { &x, &g_cu.d_xq8, &in_dim, &B };
                 g_cu.cuLaunchKernel(g_cu.k_quant_q8_1_b, (nb + 3u) / 4u, B, 1, 128, 1, 1, 0, st, qa, NULL);
             }
             void* args[] = { &w, &g_cu.d_xq8, &y, &out_dim, &in_dim, &B, &add_res };
-            CUfunction fn_mmq = (gtype == CM_GGML_Q4_0) ? g_cu.k_gemm_q4_mmq : g_cu.k_gemm_q4_1_mmq;
-            CUfunction fn_mmq_n64 = (gtype == CM_GGML_Q4_0) ? g_cu.k_gemm_q4_mmq_n64 : g_cu.k_gemm_q4_1_mmq_n64;
-            uint32_t g128 = ((out_dim + 127u) / 128u) * ((B + 63u) / 64u);
-            if (g128 < 284u && fn_mmq_n64) {
-                g_cu.cuLaunchKernel(fn_mmq_n64, (out_dim + 63u) / 64u, (B + 63u) / 64u, 1, 128, 1, 1, 0, st, args, NULL);
+            if (gtype == CM_GGML_Q8_0) {
+                g_cu.cuLaunchKernel(g_cu.k_gemm_q8_mmq, (out_dim + 127u) / 128u, (B + 63u) / 64u, 1, 256, 1, 1, 0, st, args, NULL);
+            } else if (gtype == CM_GGML_Q4_K) {
+                g_cu.cuLaunchKernel(g_cu.k_gemm_q4k_mmq, (out_dim + 63u) / 64u, (B + 63u) / 64u, 1, 128, 1, 1, 0, st, args, NULL);
             } else {
-                g_cu.cuLaunchKernel(fn_mmq, (out_dim + 127u) / 128u, (B + 63u) / 64u, 1, 256, 1, 1, 0, st, args, NULL);
+                CUfunction fn_mmq = (gtype == CM_GGML_Q4_0) ? g_cu.k_gemm_q4_mmq : g_cu.k_gemm_q4_1_mmq;
+                CUfunction fn_mmq_n64 = (gtype == CM_GGML_Q4_0) ? g_cu.k_gemm_q4_mmq_n64 : g_cu.k_gemm_q4_1_mmq_n64;
+                uint32_t g128 = ((out_dim + 127u) / 128u) * ((B + 63u) / 64u);
+                if (g128 < 284u && fn_mmq_n64) {
+                    g_cu.cuLaunchKernel(fn_mmq_n64, (out_dim + 63u) / 64u, (B + 63u) / 64u, 1, 128, 1, 1, 0, st, args, NULL);
+                } else {
+                    g_cu.cuLaunchKernel(fn_mmq, (out_dim + 127u) / 128u, (B + 63u) / 64u, 1, 256, 1, 1, 0, st, args, NULL);
+                }
             }
             return;
         }
     }
     if (cm_launch_cublas_qgemm_dc(&g_cu.gpus[0], st, w, gtype, x, y, out_dim, in_dim, B, add_res)) return;
-    if (B <= 16u && g_cu.fast_dp4a && g_cu.k_quant_q8_1_b && xq8_need <= g_cu.gpus[0].xq8_cap) {
+    if ((B <= 16u || out_dim <= 32u) && g_cu.fast_dp4a && g_cu.k_quant_q8_1_b && xq8_need <= g_cu.gpus[0].xq8_cap) {
         if ((gtype == CM_GGML_Q4_0 && g_cu.k_gemm_q4_dp4a_sb) ||
             (gtype == CM_GGML_Q4_1 && g_cu.k_gemm_q4_1_dp4a_sb) ||
+            (gtype == CM_GGML_Q8_0 && g_cu.k_gemm_q8_dp4a_sb) ||
+            (gtype == CM_GGML_Q5_0 && g_cu.k_gemm_q5_0_dp4a_sb) ||
+            (gtype == CM_GGML_Q4_K && (in_dim & 255u) == 0u && g_cu.k_gemm_q4k_dp4a_sb) ||
+            (gtype == CM_GGML_Q5_K && (in_dim & 255u) == 0u && g_cu.k_gemm_q5k_dp4a_sb) ||
             (gtype == CM_GGML_Q6_K && (in_dim & 255u) == 0u && g_cu.k_gemm_q6k_dp4a_sb)) {
             if (!xq8_ready) {
                 uint32_t nb = in_dim >> 5;
@@ -12549,6 +14361,10 @@ static void launch_gemm_batch_raw_ex(CUstream st, CUdeviceptr w, uint32_t gtype,
             uint32_t gy = (B + 7u) / 8u;
             if (gtype == CM_GGML_Q4_0)      g_cu.cuLaunchKernel(g_cu.k_gemm_q4_dp4a_sb,   (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
             else if (gtype == CM_GGML_Q4_1) g_cu.cuLaunchKernel(g_cu.k_gemm_q4_1_dp4a_sb, (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
+            else if (gtype == CM_GGML_Q8_0) g_cu.cuLaunchKernel(g_cu.k_gemm_q8_dp4a_sb,   (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
+            else if (gtype == CM_GGML_Q5_0) g_cu.cuLaunchKernel(g_cu.k_gemm_q5_0_dp4a_sb, (out_dim + 7u) / 8u, gy, 1, 256, 1, 1, 0, st, args, NULL);
+            else if (gtype == CM_GGML_Q4_K) g_cu.cuLaunchKernel(g_cu.k_gemm_q4k_dp4a_sb,  (out_dim + 3u) / 4u, gy, 1, 128, 1, 1, 0, st, args, NULL);
+            else if (gtype == CM_GGML_Q5_K) g_cu.cuLaunchKernel(g_cu.k_gemm_q5k_dp4a_sb,  (out_dim + 3u) / 4u, gy, 1, 128, 1, 1, 0, st, args, NULL);
             else                            g_cu.cuLaunchKernel(g_cu.k_gemm_q6k_dp4a_sb,  (out_dim + 3u) / 4u, gy, 1, 128, 1, 1, 0, st, args, NULL);
             return;
         }
@@ -12716,39 +14532,80 @@ static void launch_dense_ffn_batch(CmModel* m, CUstream st,
     int has_lora = (m->active_lora > 0 || m->use_batch_lora) && L >= 0;
     int ffn_q8_ready = m->xq8_ffn_ready;
     m->xq8_ffn_ready = 0;
-    if (B == 1u && gt == CM_GGML_Q4_0 && ut == CM_GGML_Q4_0 && !has_lora) {
-        // Tenon v13 P2a: Fused Gate+Up+SwiGLU -> Direct Q8_1 (non-aliasing +64KB offset) -> DP4A Down!
-        if (g_cu.fast_dp4a) {
-            if (!ffn_q8_ready) launch_quant_q8_1(st, m->d_pxn, dm);
-            int can_fuse_q8 = ((d_ff & 31u) == 0u && g_cu.k_dense_gu_q4_dp4a_q8 &&
-                               (dt == CM_GGML_Q4_0 || dt == CM_GGML_Q4_1 || (dt == CM_GGML_Q6_K && (d_ff & 255u) == 0u)) &&
-                               (size_t)(dm >> 5) * 48u <= 65536u &&
-                               65536u + (size_t)(d_ff >> 5) * 48u <= g_cu.gpus[0].xq8_cap);
-            if (can_fuse_q8) {
-                CUdeviceptr d_xq8_h = g_cu.d_xq8 + 65536ull;
-                void* args[] = { &wg, &wu, &g_cu.d_xq8, &d_xq8_h, &d_ff, &dm };
+    uint32_t act = m->use_geglu ? 1u : 0u;
+    int has_post_ffn = (L >= 0 && L < m->n_layers && m->layers[L].post_ffn_norm.dptr != 0);
+    CUdeviceptr down_dst = has_post_ffn ? m->d_pxn : m->d_px;
+    uint32_t down_add = has_post_ffn ? 0u : 1u;
+    int down_done = 0;
+
+    if (B == 1u && gt == ut && !has_lora && g_cu.fast_dp4a &&
+        (gt == CM_GGML_Q4_0 || gt == CM_GGML_Q8_0 || gt == CM_GGML_Q5_0 ||
+         ((gt == CM_GGML_Q4_K || gt == CM_GGML_Q5_K) && (dm & 255u) == 0u))) {
+        // Tenon v13/v14: Universal Fused Gate+Up+(SwiGLU|GEGLU) -> Direct Q8_1 -> DP4A Down!
+        if (!ffn_q8_ready) launch_quant_q8_1(st, m->d_pxn, dm);
+        int dt_ok = (dt == CM_GGML_Q4_0 || dt == CM_GGML_Q4_1 || dt == CM_GGML_Q8_0 || dt == CM_GGML_Q5_0 ||
+                     ((dt == CM_GGML_Q4_K || dt == CM_GGML_Q5_K || dt == CM_GGML_Q6_K) && (d_ff & 255u) == 0u));
+        int can_fuse_q8 = ((d_ff & 31u) == 0u && dt_ok &&
+                           (size_t)(dm >> 5) * 48u <= 65536u &&
+                           65536u + (size_t)(d_ff >> 5) * 48u <= g_cu.gpus[0].xq8_cap);
+        CUdeviceptr d_xq8_h = g_cu.d_xq8 + 65536ull;
+        if (gt == CM_GGML_Q4_0) {
+            if (can_fuse_q8 && g_cu.k_dense_gu_q4_dp4a_q8) {
+                void* args[] = { &wg, &wu, &g_cu.d_xq8, &d_xq8_h, &d_ff, &dm, &act };
                 g_cu.cuLaunchKernel(g_cu.k_dense_gu_q4_dp4a_q8, d_ff >> 5, 1, 1, 256, 1, 1, 0, st, args, NULL);
-                launch_gemv_raw_ex(st, wd, dt, m->d_pg, m->d_px, dm, d_ff, 1, d_xq8_h);
-                return;
+                launch_gemv_raw_ex(st, wd, dt, m->d_pg, down_dst, dm, d_ff, down_add, d_xq8_h);
+                down_done = 1;
+            } else {
+                void* args[] = { &wg, &wu, &g_cu.d_xq8, &m->d_pg, &d_ff, &dm, &act };
+                g_cu.cuLaunchKernel(g_cu.k_dense_gu_q4_dp4a, (d_ff + 7u) / 8u, 1, 1, 128, 1, 1, 0, st, args, NULL);
             }
-            void* args[] = { &wg, &wu, &g_cu.d_xq8, &m->d_pg, &d_ff, &dm };
-            g_cu.cuLaunchKernel(g_cu.k_dense_gu_q4_dp4a, (d_ff + 7u) / 8u, 1, 1, 128, 1, 1, 0, st, args, NULL);
         } else {
-            void* args[] = { &wg, &wu, &m->d_pxn, &m->d_pg, &d_ff, &dm };
-            g_cu.cuLaunchKernel(g_cu.k_dense_gu_q4, (d_ff + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, args, NULL);
+            CUfunction fn_gu = (gt == CM_GGML_Q4_K) ? g_cu.k_dense_gu_q4k_dp4a_q8
+                             : (gt == CM_GGML_Q5_K) ? g_cu.k_dense_gu_q5k_dp4a_q8
+                             : (gt == CM_GGML_Q8_0) ? g_cu.k_dense_gu_q8_dp4a_q8
+                                                    : g_cu.k_dense_gu_q5_0_dp4a_q8;
+            if (fn_gu) {
+                CUdeviceptr out_f32 = can_fuse_q8 ? 0 : m->d_pg;
+                CUdeviceptr out_q8  = can_fuse_q8 ? d_xq8_h : 0;
+                void* args[] = { &wg, &wu, &g_cu.d_xq8, &out_f32, &out_q8, &d_ff, &dm, &act };
+                g_cu.cuLaunchKernel(fn_gu, (d_ff + 31u) / 32u, 1, 1, 256, 1, 1, 0, st, args, NULL);
+                if (can_fuse_q8) {
+                    launch_gemv_raw_ex(st, wd, dt, m->d_pg, down_dst, dm, d_ff, down_add, d_xq8_h);
+                    down_done = 1;
+                }
+            } else {
+                launch_gemv_raw_ex(st, wg, gt, m->d_pxn, m->d_pg, d_ff, dm, 0, g_cu.d_xq8);
+                launch_gemv_raw_ex(st, wu, ut, m->d_pxn, m->d_pu, d_ff, dm, 0, g_cu.d_xq8);
+                uint32_t tot = d_ff;
+                void* sargs[] = { &m->d_pg, &m->d_pu, &tot };
+                g_cu.cuLaunchKernel(m->use_geglu ? g_cu.k_geglu_mul : g_cu.k_swiglu_mul, (tot + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, sargs, NULL);
+            }
         }
+    } else if (B == 1u && gt == CM_GGML_Q4_0 && ut == CM_GGML_Q4_0 && !has_lora && !m->use_geglu) {
+        void* args[] = { &wg, &wu, &m->d_pxn, &m->d_pg, &d_ff, &dm };
+        g_cu.cuLaunchKernel(g_cu.k_dense_gu_q4, (d_ff + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, args, NULL);
     } else {
-        int share_q8 = (B > 1u && g_cu.fast_dp4a && gt == ut && (gt == CM_GGML_Q4_0 || gt == CM_GGML_Q4_1) && (dm & 63u) == 0u);
+        int share_q8 = (B > 1u && g_cu.fast_dp4a && gt == ut && (dm & 63u) == 0u &&
+                        (gt == CM_GGML_Q4_0 || gt == CM_GGML_Q4_1 || gt == CM_GGML_Q8_0 || gt == CM_GGML_Q5_0 ||
+                         ((gt == CM_GGML_Q4_K || gt == CM_GGML_Q5_K) && (dm & 255u) == 0u)));
         launch_gemm_batch_raw_ex(st, wg, gt, m->d_pxn, m->d_pg, d_ff, dm, B, 0, 0);
         if (has_lora) launch_lora_delta(m, st, L, 4, m->d_pxn, m->d_pg, d_ff, dm, B);
         launch_gemm_batch_raw_ex(st, wu, ut, m->d_pxn, m->d_pu, d_ff, dm, B, 0, share_q8);
         if (has_lora) launch_lora_delta(m, st, L, 5, m->d_pxn, m->d_pu, d_ff, dm, B);
         uint32_t tot = B * d_ff;
         void* sargs[] = { &m->d_pg, &m->d_pu, &tot };
-        g_cu.cuLaunchKernel(g_cu.k_swiglu_mul, (tot + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, sargs, NULL);
+        g_cu.cuLaunchKernel(m->use_geglu ? g_cu.k_geglu_mul : g_cu.k_swiglu_mul, (tot + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, sargs, NULL);
     }
-    launch_gemm_batch_raw(st, wd, dt, m->d_pg, m->d_px, dm, d_ff, B, 1);
-    if (has_lora) launch_lora_delta(m, st, L, 6, m->d_pg, m->d_px, dm, d_ff, B);
+    if (!down_done) {
+        launch_gemm_batch_raw(st, wd, dt, m->d_pg, down_dst, dm, d_ff, B, down_add);
+        if (has_lora) launch_lora_delta(m, st, L, 6, m->d_pg, down_dst, dm, d_ff, B);
+    }
+    if (has_post_ffn) {
+        CUdeviceptr pnw = m->layers[L].post_ffn_norm.dptr;
+        uint32_t shw = 1u;
+        void* rna[] = { &m->d_pxn, &pnw, &m->d_px, &dm, &B, &m->rms_eps, &shw };
+        g_cu.cuLaunchKernel(g_cu.k_rmsnorm_add, B, 1, 1, 256, 1, 1, 0, st, rna, NULL);
+    }
 }
 
 static int64_t cm_prefill_or_verify(CmModel* m, int64_t handle, const int64_t* ids, int64_t n_toks, int64_t start_pos, int64_t* out_argmax_all) {
@@ -12956,6 +14813,9 @@ static int64_t cm_prefill_or_verify(CmModel* m, int64_t handle, const int64_t* i
 
 int64_t tn_cumoe_prefill(int64_t handle, int64_t tok_ids_ptr, int64_t n_toks, int64_t start_pos) {
     if (handle <= 0 || handle >= CM_MAX_MODELS || !g_cm[handle].active || !tok_ids_ptr || n_toks <= 0) return 0;
+    if (g_cm[handle].is_gemma3 || g_cm[handle].is_qwen35) {
+        return tn_cumoe_paged_prefill(handle, g_cm[handle].cur_kv_slot, tok_ids_ptr, n_toks, start_pos);
+    }
     return cm_prefill_or_verify(&g_cm[handle], handle, (const int64_t*)(uintptr_t)tok_ids_ptr, n_toks, start_pos, NULL);
 }
 
@@ -13316,12 +15176,85 @@ int64_t tn_cumoe_tokenize(int64_t handle, int64_t text_cstr, int64_t out_ids_ptr
     return n_out;
 }
 
+static inline int cm_can_dp4a_vec(uint32_t gt, uint32_t in_dim) {
+    if ((in_dim & 31u) != 0u) return 0;
+    if (gt == CM_GGML_Q4_0 || gt == CM_GGML_Q4_1 || gt == CM_GGML_Q8_0 || gt == CM_GGML_Q5_0) return 1;
+    if ((gt == CM_GGML_Q4_K || gt == CM_GGML_Q5_K || gt == CM_GGML_Q6_K) && (in_dim & 255u) == 0u) return 1;
+    return 0;
+}
+
+static inline float cm_layer_rope_theta(const CmModel* m, int L) {
+    if (m->is_gemma3 && m->sliding_window_pattern > 1) {
+        int is_global = (((L + 1) % m->sliding_window_pattern) == 0);
+        if (!is_global && m->rope_theta_swa > 0.0f) return m->rope_theta_swa;
+    }
+    return m->rope_theta;
+}
+
+static inline uint32_t cm_layer_swa_window(const CmModel* m, int L) {
+    if (m->is_gemma3 && m->sliding_window_pattern > 1) {
+        int is_global = (((L + 1) % m->sliding_window_pattern) == 0);
+        return is_global ? 0u : (m->sliding_window > 0 ? (uint32_t)m->sliding_window : 0u);
+    }
+    return m->sliding_window > 0 ? (uint32_t)m->sliding_window : 0u;
+}
+
+static inline float cm_layer_attn_scale(const CmModel* m) {
+    if (m->query_pre_attn_scalar > 0.0f) return 1.0f / sqrtf(m->query_pre_attn_scalar);
+    return 1.0f / sqrtf((float)m->d_head);
+}
+
+static inline void cm_launch_softcap(CUstream st, CUdeviceptr x, uint32_t n, float cap) {
+    if (cap <= 0.0f || !g_cu.k_softcap) return;
+    void* sa[] = { &x, &n, &cap };
+    g_cu.cuLaunchKernel(g_cu.k_softcap, (n + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, sa, NULL);
+}
+
+static void cm_gdn_zero_slot(CmModel* m, int slot) {
+    if (!m->is_qwen35 || slot < 0 || slot >= CM_PA_MAX_SEQS) return;
+    for (int L = 0; L < m->n_layers; L++) {
+        CmLayer* ly = &m->layers[L];
+        if (!ly->is_gdn) continue;
+        if (ly->gdn_conv_state && ly->gdn_conv_slot_bytes > 0) {
+            CUdeviceptr p = ly->gdn_conv_state + (uint64_t)slot * (uint64_t)ly->gdn_conv_slot_bytes;
+            if (g_cu.cuMemsetD8Async) g_cu.cuMemsetD8Async(p, 0, ly->gdn_conv_slot_bytes, m->compute_stream);
+            else g_cu.cuMemsetD8(p, 0, ly->gdn_conv_slot_bytes);
+        }
+        if (ly->gdn_ssm_state && ly->gdn_ssm_slot_bytes > 0) {
+            CUdeviceptr p = ly->gdn_ssm_state + (uint64_t)slot * (uint64_t)ly->gdn_ssm_slot_bytes;
+            if (g_cu.cuMemsetD8Async) g_cu.cuMemsetD8Async(p, 0, ly->gdn_ssm_slot_bytes, m->compute_stream);
+            else g_cu.cuMemsetD8(p, 0, ly->gdn_ssm_slot_bytes);
+        }
+    }
+}
+
+static void cm_gdn_copy_slot(CmModel* m, int src_slot, int dst_slot) {
+    if (!m->is_qwen35 || src_slot < 0 || src_slot >= CM_PA_MAX_SEQS || dst_slot < 0 || dst_slot >= CM_PA_MAX_SEQS || src_slot == dst_slot) return;
+    for (int L = 0; L < m->n_layers; L++) {
+        CmLayer* ly = &m->layers[L];
+        if (!ly->is_gdn) continue;
+        if (ly->gdn_conv_state && ly->gdn_conv_slot_bytes > 0) {
+            g_cu.cuMemcpyDtoDAsync(ly->gdn_conv_state + (uint64_t)dst_slot * (uint64_t)ly->gdn_conv_slot_bytes,
+                                   ly->gdn_conv_state + (uint64_t)src_slot * (uint64_t)ly->gdn_conv_slot_bytes,
+                                   ly->gdn_conv_slot_bytes, m->compute_stream);
+        }
+        if (ly->gdn_ssm_state && ly->gdn_ssm_slot_bytes > 0) {
+            g_cu.cuMemcpyDtoDAsync(ly->gdn_ssm_state + (uint64_t)dst_slot * (uint64_t)ly->gdn_ssm_slot_bytes,
+                                   ly->gdn_ssm_state + (uint64_t)src_slot * (uint64_t)ly->gdn_ssm_slot_bytes,
+                                   ly->gdn_ssm_slot_bytes, m->compute_stream);
+        }
+    }
+}
+
 int64_t tn_cumoe_reset(int64_t handle) {
     if (handle <= 0 || handle >= CM_MAX_MODELS || !g_cm[handle].active) return 0;
     CmModel* m = &g_cm[handle];
     m->cache_hits = 0; m->cache_misses = 0; m->prefetch_hits = 0;
     m->io_bytes_read = 0; m->pcie_h2d_bytes = 0;
     m->decode_phase = 1;
+    if (m->is_qwen35) {
+        for (int s = 0; s < CM_PA_MAX_SEQS; s++) cm_gdn_zero_slot(m, s);
+    }
     return 1;
 }
 
@@ -13514,6 +15447,7 @@ int64_t tn_cumoe_paged_seq_free(int64_t handle, int64_t slot_id) {
         }
     }
     m->pa_seq_len[slot_id] = 0;
+    cm_gdn_zero_slot(m, (int)slot_id);
     cm_pa_sync_bt(m);
     return (int64_t)freed;
 }
@@ -13536,6 +15470,7 @@ int64_t tn_cumoe_paged_seq_fork(int64_t handle, int64_t src_slot, int64_t dst_sl
     }
     m->pa_seq_len[dst_slot] = (int)prefix_len;
     m->pa_cow_forks++;
+    cm_gdn_copy_slot(m, (int)src_slot, (int)dst_slot);
     cm_pa_sync_bt(m);
     return (int64_t)shared;
 }
@@ -13546,12 +15481,67 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
     CmLayer* ly = &m->layers[L];
     uint32_t dm = (uint32_t)m->d_model, qdim = (uint32_t)(m->n_heads * m->d_head), kvdim = (uint32_t)(m->n_kv * m->d_head);
     uint32_t wo_in = (ly->wo.ne0 > 0) ? (uint32_t)ly->wo.ne0 : qdim;
-    uint32_t swa = m->sliding_window > 0 ? (uint32_t)m->sliding_window : 0u;
+    uint32_t swa = cm_layer_swa_window(m, L);
     uint32_t sink = m->attn_sink > 0 ? (uint32_t)m->attn_sink : 0u;
     int has_qkv_lora = (m->active_lora > 0 || m->use_batch_lora);
-    int fuse_attn_q8 = (B == 1u && g_cu.fast_dp4a && !has_qkv_lora && !(ly->is_mla && m->mla_latent_kv && ly->mla_wuk_f16 && ly->mla_wuv_f16) &&
-                        ly->wq.ggml_type == CM_GGML_Q4_0 && ly->wk.ggml_type == CM_GGML_Q4_0 && ly->wv.ggml_type == CM_GGML_Q4_0 &&
-                        (dm & 31u) == 0u && g_cu.k_rmsnorm_q8_1 != NULL);
+
+    // Tenon v14 P3: Native Qwen3.5 Hybrid Gated DeltaNet (GDN) Linear-Time Recurrence Layer!
+    if (ly->is_gdn && ly->gdn_qkv.dptr && ly->gdn_out.dptr) {
+        uint32_t qkv_dim = (uint32_t)ly->gdn_qkv.ne1;
+        uint32_t v_dim   = (uint32_t)ly->gdn_out.ne0;
+        uint32_t n_v_h   = (uint32_t)(m->ssm_time_step_rank > 0 ? m->ssm_time_step_rank : (int)ly->gdn_a.ne0);
+        uint32_t d_k     = (uint32_t)(m->ssm_state_size > 0 ? m->ssm_state_size : 128);
+        uint32_t n_k_h   = (uint32_t)(m->ssm_group_count > 0 ? m->ssm_group_count : (int)n_v_h);
+        uint32_t d_v     = v_dim / (n_v_h > 0u ? n_v_h : 1u);
+        uint32_t d_conv  = (uint32_t)(m->ssm_conv_kernel > 1 ? m->ssm_conv_kernel : 4);
+        int fuse_gdn_q8  = (B == 1u && g_cu.fast_dp4a && (dm & 31u) == 0u && g_cu.k_rmsnorm_q8_1 != NULL &&
+                            cm_can_dp4a_vec(ly->gdn_qkv.ggml_type, dm));
+        if (fuse_gdn_q8) {
+            CUdeviceptr wp = ly->attn_norm.dptr;
+            void* rqa[] = { &m->d_px, &wp, &m->d_pxn, &g_cu.d_xq8, &dm, &m->rms_eps };
+            g_cu.cuLaunchKernel(g_cu.k_rmsnorm_q8_1, 1, 1, 1, 256, 1, 1, 0, st, rqa, NULL);
+        } else {
+            launch_rmsnorm(st, m->d_px, &ly->attn_norm, m->d_pxn, dm, B, m->rms_eps, 1);
+        }
+        int share_gdn_q8 = (B > 1u && g_cu.fast_dp4a && (dm & 63u) == 0u &&
+                            (ly->gdn_qkv.ggml_type == CM_GGML_Q4_0 || ly->gdn_qkv.ggml_type == CM_GGML_Q4_1 ||
+                             ly->gdn_qkv.ggml_type == CM_GGML_Q8_0 || ly->gdn_qkv.ggml_type == CM_GGML_Q5_0 ||
+                             ((ly->gdn_qkv.ggml_type == CM_GGML_Q4_K || ly->gdn_qkv.ggml_type == CM_GGML_Q5_K) && (dm & 255u) == 0u)));
+        launch_gemm_batch_raw_ex(st, ly->gdn_qkv.dptr, ly->gdn_qkv.ggml_type, m->d_pxn, m->d_gdn_qkv, qkv_dim, dm, B, 0, fuse_gdn_q8);
+        int q8_gate = fuse_gdn_q8 ? cm_can_dp4a_vec(ly->gdn_gate.ggml_type, dm) : (share_gdn_q8 && ly->gdn_gate.ggml_type == ly->gdn_qkv.ggml_type);
+        launch_gemm_batch_raw_ex(st, ly->gdn_gate.dptr, ly->gdn_gate.ggml_type, m->d_pxn, m->d_gdn_z, v_dim, dm, B, 0, q8_gate);
+        int q8_ab = fuse_gdn_q8 ? cm_can_dp4a_vec(ly->gdn_alpha.ggml_type, dm) : 0;
+        launch_gemm_batch_raw_ex(st, ly->gdn_alpha.dptr, ly->gdn_alpha.ggml_type, m->d_pxn, m->d_gdn_alpha, n_v_h, dm, B, 0, q8_ab);
+        int q8_bt = fuse_gdn_q8 ? cm_can_dp4a_vec(ly->gdn_beta.ggml_type, dm) : 0;
+        launch_gemm_batch_raw_ex(st, ly->gdn_beta.dptr, ly->gdn_beta.ggml_type, m->d_pxn, m->d_gdn_beta, n_v_h, dm, B, 0, q8_bt);
+        void* ca[] = { &m->d_gdn_qkv, &ly->gdn_conv1d.dptr, &ly->gdn_conv_state, &m->d_gdn_conv, &m->d_cb_slot, &qkv_dim, &d_conv, &B };
+        g_cu.cuLaunchKernel(g_cu.k_gdn_conv1d_silu, (qkv_dim + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, ca, NULL);
+        void* sa[] = { &m->d_gdn_conv, &m->d_gdn_alpha, &m->d_gdn_beta, &ly->gdn_a.dptr, &ly->gdn_dt_bias.dptr,
+                       &ly->gdn_ssm_state, &m->d_gdn_o, &m->d_cb_slot, &n_k_h, &n_v_h, &d_k, &d_v, &qkv_dim, &B };
+        g_cu.cuLaunchKernel(g_cu.k_gdn_step_batch, d_v >> 2, n_v_h, 1, 128, 1, 1, 0, st, sa, NULL);
+        uint32_t n_grp = B * n_v_h;
+        void* na[] = { &m->d_gdn_o, &m->d_gdn_z, &ly->gdn_norm.dptr, &m->d_gdn_o, &d_v, &n_grp, &m->rms_eps };
+        g_cu.cuLaunchKernel(g_cu.k_gdn_gated_norm, n_grp, 1, 1, 128, 1, 1, 0, st, na, NULL);
+        launch_gemm_batch_raw(st, ly->gdn_out.dptr, ly->gdn_out.ggml_type, m->d_gdn_o, m->d_px, dm, v_dim, B, 1);
+        int fuse_ffn_q8 = (B == 1u && g_cu.fast_dp4a && m->resident_mode && ly->is_dense && !has_qkv_lora &&
+                           ly->ffn_gate.ggml_type == ly->ffn_up.ggml_type && cm_can_dp4a_vec(ly->ffn_gate.ggml_type, dm) &&
+                           ly->ffn_gate.ggml_type != CM_GGML_Q4_1 && ly->ffn_gate.ggml_type != CM_GGML_Q6_K &&
+                           g_cu.k_rmsnorm_q8_1 != NULL);
+        if (fuse_ffn_q8) {
+            CUdeviceptr wp = ly->ffn_norm.dptr, null_f32 = 0;
+            void* rqa[] = { &m->d_px, &wp, &null_f32, &g_cu.d_xq8, &dm, &m->rms_eps };
+            g_cu.cuLaunchKernel(g_cu.k_rmsnorm_q8_1, 1, 1, 1, 256, 1, 1, 0, st, rqa, NULL);
+            m->xq8_ffn_ready = 1;
+        } else {
+            launch_rmsnorm(st, m->d_px, &ly->ffn_norm, m->d_pxn, dm, B, m->rms_eps, 1);
+        }
+        return;
+    }
+
+    int is_mla_active = (ly->is_mla && m->mla_latent_kv && ly->mla_wuk_f16 && ly->mla_wuv_f16);
+    int fuse_attn_q8 = (B == 1u && g_cu.fast_dp4a && !has_qkv_lora && !is_mla_active &&
+                        cm_can_dp4a_vec(ly->wq.ggml_type, dm) && cm_can_dp4a_vec(ly->wk.ggml_type, dm) && cm_can_dp4a_vec(ly->wv.ggml_type, dm) &&
+                        g_cu.k_rmsnorm_q8_1 != NULL);
     if (fuse_attn_q8) {
         CUdeviceptr wp = ly->attn_norm.dptr, null_f32 = 0;
         void* rqa[] = { &m->d_px, &wp, &null_f32, &g_cu.d_xq8, &dm, &m->rms_eps };
@@ -13561,12 +15551,12 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
     }
 
     // Tenon v8: Native Batched PagedAttention Compressed Latent MLA (DeepSeek-V2/V3/R1)!
-    if (ly->is_mla && m->mla_latent_kv && ly->mla_wuk_f16 && ly->mla_wuv_f16) {
+    if (is_mla_active) {
         uint32_t nh = (uint32_t)m->n_heads, dh = (uint32_t)m->d_head, rd = (uint32_t)m->rope_dim;
         uint32_t vd = (uint32_t)m->v_head_dim, kv_r = (uint32_t)(m->kv_lora_rank > 0 ? m->kv_lora_rank : 512);
         uint32_t nope_d = dh - rd, ldim = kv_r + rd, rn = (uint32_t)m->rope_neox, hf = (uint32_t)m->has_rope_freqs;
         uint32_t mb = (uint32_t)CM_PA_MAX_LOGICAL_BLKS, out_st = wo_in / nh;
-        float theta = m->rope_theta, mla_sc = 1.0f / sqrtf((float)dh);
+        float theta = cm_layer_rope_theta(m, L), mla_sc = cm_layer_attn_scale(m);
         if (m->yarn_mscale_k > 0.0f && m->yarn_factor > 1.0f) { float ms = 1.0f + m->yarn_mscale_k * logf(m->yarn_factor); mla_sc *= ms * ms; }
         CUdeviceptr rf = hf ? m->rope_freqs.dptr : m->d_argmax;
         if (ly->wq_a.dptr && ly->wq_b.dptr && m->q_lora_rank > 0) {
@@ -13619,9 +15609,18 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
     CUdeviceptr pq = ring_base ? (ring_base + m->dense_off_wq) : ly->wq.dptr;
     CUdeviceptr pk = ring_base ? (ring_base + m->dense_off_wk) : ly->wk.dptr;
     CUdeviceptr pv = ring_base ? (ring_base + m->dense_off_wv) : ly->wv.dptr;
-    if (B == 1u && !has_qkv_lora &&
-        ly->wq.ggml_type == CM_GGML_Q4_0 && ly->wk.ggml_type == CM_GGML_Q4_0 && ly->wv.ggml_type == CM_GGML_Q4_0) {
-        // Tenon v13: Single-launch fused Q||K||V for B=1 Paged Decode (DP4A fused directly from cm_rmsnorm_q8_1!)
+    uint32_t qgt = ly->wq.ggml_type, kgt = ly->wk.ggml_type, vgt = ly->wv.ggml_type;
+    if (ly->is_gated_attn) {
+        int share_qkv_q8 = (B > 1u && g_cu.fast_dp4a && (dm & 63u) == 0u &&
+                            (qgt == CM_GGML_Q4_0 || qgt == CM_GGML_Q4_1 || qgt == CM_GGML_Q8_0 || qgt == CM_GGML_Q5_0 ||
+                             ((qgt == CM_GGML_Q4_K || qgt == CM_GGML_Q5_K) && (dm & 255u) == 0u)));
+        launch_gemm_batch_raw_ex(st, pq, qgt, m->d_pxn, m->d_gdn_qkv, qdim * 2u, dm, B, 0, fuse_attn_q8);
+        uint32_t nh_g = (uint32_t)m->n_heads, dh_g = (uint32_t)m->d_head;
+        void* sga[] = { &m->d_gdn_qkv, &m->d_pq, &m->d_gdn_z, &nh_g, &dh_g, &B };
+        g_cu.cuLaunchKernel(g_cu.k_q_gate_split, (qdim + 255u) / 256u, B, 1, 256, 1, 1, 0, st, sga, NULL);
+        launch_gemm_batch_raw_ex(st, pk, kgt, m->d_pxn, m->d_pk, kvdim, dm, B, 0, fuse_attn_q8 ? 1 : (share_qkv_q8 && kgt == qgt));
+        launch_gemm_batch_raw_ex(st, pv, vgt, m->d_pxn, m->d_pv, kvdim, dm, B, 0, fuse_attn_q8 ? 1 : (share_qkv_q8 && vgt == qgt));
+    } else if (B == 1u && !has_qkv_lora && qgt == CM_GGML_Q4_0 && kgt == CM_GGML_Q4_0 && vgt == CM_GGML_Q4_0) {
         uint32_t tot = qdim + kvdim + kvdim;
         if (g_cu.fast_dp4a) {
             if (!fuse_attn_q8) launch_quant_q8_1(st, m->d_pxn, dm);
@@ -13631,13 +15630,31 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
             void* qargs[] = { &pq, &pk, &pv, &m->d_pxn, &m->d_pq, &m->d_pk, &m->d_pv, &qdim, &kvdim, &dm };
             g_cu.cuLaunchKernel(g_cu.k_gemv_qkv_q4, (tot + 7u) / 8u, 1, 1, 128, 1, 1, 0, st, qargs, NULL);
         }
+    } else if (B == 1u && !has_qkv_lora && g_cu.fast_dp4a && (dm & 255u) == 0u && g_cu.k_gemv_qkv_q4k_dp4a &&
+               qgt == CM_GGML_Q4_K && kgt == CM_GGML_Q4_K && (vgt == CM_GGML_Q4_K || vgt == CM_GGML_Q6_K)) {
+        uint32_t tot = qdim + kvdim + kvdim, v_q6 = (vgt == CM_GGML_Q6_K) ? 1u : 0u;
+        if (!fuse_attn_q8) launch_quant_q8_1(st, m->d_pxn, dm);
+        void* qargs[] = { &pq, &pk, &pv, &g_cu.d_xq8, &m->d_pq, &m->d_pk, &m->d_pv, &qdim, &kvdim, &dm, &v_q6 };
+        g_cu.cuLaunchKernel(g_cu.k_gemv_qkv_q4k_dp4a, (tot + 7u) / 8u, 1, 1, 128, 1, 1, 0, st, qargs, NULL);
+    } else if (B == 1u && !has_qkv_lora && g_cu.fast_dp4a && (dm & 31u) == 0u && g_cu.k_gemv_qkv_q8_dp4a &&
+               qgt == CM_GGML_Q8_0 && kgt == CM_GGML_Q8_0 && vgt == CM_GGML_Q8_0) {
+        uint32_t tot = qdim + kvdim + kvdim;
+        if (!fuse_attn_q8) launch_quant_q8_1(st, m->d_pxn, dm);
+        void* qargs[] = { &pq, &pk, &pv, &g_cu.d_xq8, &m->d_pq, &m->d_pk, &m->d_pv, &qdim, &kvdim, &dm };
+        g_cu.cuLaunchKernel(g_cu.k_gemv_qkv_q8_dp4a, (tot + 7u) / 8u, 1, 1, 128, 1, 1, 0, st, qargs, NULL);
+    } else if (B == 1u && !has_qkv_lora && g_cu.fast_dp4a && (dm & 31u) == 0u && g_cu.k_gemv_qkv_q5_0_dp4a &&
+               qgt == CM_GGML_Q5_0 && kgt == CM_GGML_Q5_0 && (vgt == CM_GGML_Q5_0 || vgt == CM_GGML_Q8_0)) {
+        uint32_t tot = qdim + kvdim + kvdim, v_q8 = (vgt == CM_GGML_Q8_0) ? 1u : 0u;
+        if (!fuse_attn_q8) launch_quant_q8_1(st, m->d_pxn, dm);
+        void* qargs[] = { &pq, &pk, &pv, &g_cu.d_xq8, &m->d_pq, &m->d_pk, &m->d_pv, &qdim, &kvdim, &dm, &v_q8 };
+        g_cu.cuLaunchKernel(g_cu.k_gemv_qkv_q5_0_dp4a, (tot + 3u) / 4u, 1, 1, 128, 1, 1, 0, st, qargs, NULL);
     } else {
         int share_qkv_q8 = (B > 1u && g_cu.fast_dp4a && (dm & 63u) == 0u &&
-                            (ly->wq.ggml_type == CM_GGML_Q4_0 || ly->wq.ggml_type == CM_GGML_Q4_1) &&
-                            ly->wk.ggml_type == ly->wq.ggml_type && ly->wv.ggml_type == ly->wq.ggml_type);
-        launch_gemm_batch_raw_ex(st, pq, ly->wq.ggml_type, m->d_pxn, m->d_pq, qdim, dm, B, 0, 0);
-        launch_gemm_batch_raw_ex(st, pk, ly->wk.ggml_type, m->d_pxn, m->d_pk, kvdim, dm, B, 0, share_qkv_q8);
-        launch_gemm_batch_raw_ex(st, pv, ly->wv.ggml_type, m->d_pxn, m->d_pv, kvdim, dm, B, 0, share_qkv_q8);
+                            (qgt == CM_GGML_Q4_0 || qgt == CM_GGML_Q4_1 || qgt == CM_GGML_Q8_0 || qgt == CM_GGML_Q5_0 ||
+                             ((qgt == CM_GGML_Q4_K || qgt == CM_GGML_Q5_K) && (dm & 255u) == 0u)));
+        launch_gemm_batch_raw_ex(st, pq, qgt, m->d_pxn, m->d_pq, qdim, dm, B, 0, fuse_attn_q8);
+        launch_gemm_batch_raw_ex(st, pk, kgt, m->d_pxn, m->d_pk, kvdim, dm, B, 0, fuse_attn_q8 ? 1 : (share_qkv_q8 && kgt == qgt));
+        launch_gemm_batch_raw_ex(st, pv, vgt, m->d_pxn, m->d_pv, kvdim, dm, B, 0, fuse_attn_q8 ? 1 : (share_qkv_q8 && vgt == qgt));
     }
     if (m->active_lora > 0 || m->use_batch_lora) {
         launch_lora_delta(m, st, L, 0, m->d_pxn, m->d_pq, qdim, dm, B);
@@ -13660,7 +15677,7 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
     }
     uint32_t nh = (uint32_t)m->n_heads, nkv = (uint32_t)m->n_kv, dh = (uint32_t)m->d_head, rd = (uint32_t)m->rope_dim;
     uint32_t rn = (uint32_t)m->rope_neox, hf = (uint32_t)m->has_rope_freqs, mb = (uint32_t)CM_PA_MAX_LOGICAL_BLKS;
-    float theta = m->rope_theta, sc = 1.0f / sqrtf((float)dh);
+    float theta = cm_layer_rope_theta(m, L), sc = cm_layer_attn_scale(m);
     CUdeviceptr rf = hf ? m->rope_freqs.dptr : m->d_argmax;
     if (m->kv_quant_q8 == 1) {
         void* ra[] = { &m->d_pq, &m->d_pk, &m->d_pv, &ly->k_cache_base, &ly->v_cache_base, &rf,
@@ -13695,7 +15712,7 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
         void* aa[] = { &m->d_pq, &ly->k_cache_base, &ly->v_cache_base, &m->d_pctx,
                        &m->d_cb_pos, &m->d_cb_slot, &m->d_pa_bt, &nh, &nkv, &dh, &B, &sc, &mb, &swa, &sink };
         g_cu.cuLaunchKernel(g_cu.k_flash_prefill_tc_fp16, nh, (B + 63u) / 64u, 1, 128, 1, 1, 0, st, aa, NULL);
-    } else if (m->cur_is_prefill && B >= 16u && m->kv_quant_q8 == 0 && dh <= 128u && (dh & 3u) == 0u && g_cu.k_flash_prefill_paged_fp16) {
+    } else if (m->cur_is_prefill && B >= 16u && m->kv_quant_q8 == 0 && dh <= 256u && (dh & 3u) == 0u && g_cu.k_flash_prefill_paged_fp16) {
         void* aa[] = { &m->d_pq, &ly->k_cache_base, &ly->v_cache_base, &m->d_pctx,
                        &m->d_cb_pos, &m->d_cb_slot, &m->d_pa_bt, &nh, &nkv, &dh, &B, &sc, &mb, &swa, &sink };
         g_cu.cuLaunchKernel(g_cu.k_flash_prefill_paged_fp16, nh, (B + 7u) / 8u, 1, 128, 1, 1, 0, st, aa, NULL);
@@ -13707,13 +15724,33 @@ static void launch_layer_attn_paged_batch(CmModel* m, CUstream st, int L, uint32
                        &m->d_cb_pos, &m->d_cb_slot, &m->d_pa_bt, &nh, &nkv, &dh, &B, &sc, &mb, &swa, &sink };
         g_cu.cuLaunchKernel(afn, nh, B, 1, 128, 1, 1, 0, st, aa, NULL);
     }
+    if (ly->is_gated_attn) {
+        uint32_t tot_g = B * qdim;
+        void* ga[] = { &m->d_pctx, &m->d_gdn_z, &tot_g };
+        g_cu.cuLaunchKernel(g_cu.k_attn_gate_sigmoid, (tot_g + 255u) / 256u, 1, 1, 256, 1, 1, 0, st, ga, NULL);
+    }
     CUdeviceptr po = ring_base ? (ring_base + m->dense_off_wo) : ly->wo.dptr;
-    launch_gemm_batch_raw(st, po, ly->wo.ggml_type, m->d_pctx, m->d_px, dm, wo_in, B, 1);
-    if (m->active_lora > 0 || m->use_batch_lora) launch_lora_delta(m, st, L, 3, m->d_pctx, m->d_px, dm, wo_in, B);
+    int has_post_attn = (ly->post_attn_norm.dptr != 0);
+    CUdeviceptr wo_dst = has_post_attn ? m->d_pxn : m->d_px;
+    uint32_t wo_add = has_post_attn ? 0u : 1u;
+    launch_gemm_batch_raw(st, po, ly->wo.ggml_type, m->d_pctx, wo_dst, dm, wo_in, B, wo_add);
+    if (m->active_lora > 0 || m->use_batch_lora) launch_lora_delta(m, st, L, 3, m->d_pctx, wo_dst, dm, wo_in, B);
     int fuse_ffn_q8 = (B == 1u && g_cu.fast_dp4a && m->resident_mode && ly->is_dense && !has_qkv_lora &&
-                       ly->ffn_gate.ggml_type == CM_GGML_Q4_0 && ly->ffn_up.ggml_type == CM_GGML_Q4_0 &&
-                       (dm & 31u) == 0u && g_cu.k_rmsnorm_q8_1 != NULL);
-    if (fuse_ffn_q8) {
+                       ly->ffn_gate.ggml_type == ly->ffn_up.ggml_type && cm_can_dp4a_vec(ly->ffn_gate.ggml_type, dm) &&
+                       ly->ffn_gate.ggml_type != CM_GGML_Q4_1 && ly->ffn_gate.ggml_type != CM_GGML_Q6_K &&
+                       g_cu.k_rmsnorm_q8_1 != NULL);
+    if (has_post_attn) {
+        CUdeviceptr w1 = ly->post_attn_norm.dptr, w2 = ly->ffn_norm.dptr;
+        if (fuse_ffn_q8 && g_cu.k_rmsnorm_add_norm_q8_1) {
+            void* rqa[] = { &m->d_pxn, &w1, &m->d_px, &w2, &g_cu.d_xq8, &dm, &m->rms_eps };
+            g_cu.cuLaunchKernel(g_cu.k_rmsnorm_add_norm_q8_1, 1, 1, 1, 256, 1, 1, 0, st, rqa, NULL);
+            m->xq8_ffn_ready = 1;
+        } else {
+            uint32_t shw = 1u;
+            void* rna[] = { &m->d_pxn, &w1, &m->d_px, &w2, &m->d_pxn, &dm, &B, &m->rms_eps, &shw };
+            g_cu.cuLaunchKernel(g_cu.k_rmsnorm_add_norm, B, 1, 1, 256, 1, 1, 0, st, rna, NULL);
+        }
+    } else if (fuse_ffn_q8) {
         CUdeviceptr wp = ly->ffn_norm.dptr, null_f32 = 0;
         void* rqa[] = { &m->d_px, &wp, &null_f32, &g_cu.d_xq8, &dm, &m->rms_eps };
         g_cu.cuLaunchKernel(g_cu.k_rmsnorm_q8_1, 1, 1, 1, 256, 1, 1, 0, st, rqa, NULL);
@@ -13796,7 +15833,8 @@ static void cm_tp_paged_forward_body(CmModel* m, uint32_t B, int need_batch_argm
     g_cu.cuCtxSetCurrent(dc0->ctx);
     uint32_t gt_emb = m->tok_embd.ggml_type;
     CUdeviceptr ep = m->tok_embd.dptr;
-    void* eb_args[] = { &ep, &m->tp[0].d_cb_tok, &m->tp[0].d_x, &dm, &gt_emb, &B };
+    float esc = (m->embed_scale > 0.0f) ? m->embed_scale : 1.0f;
+    void* eb_args[] = { &ep, &m->tp[0].d_cb_tok, &m->tp[0].d_x, &dm, &gt_emb, &B, &esc };
     g_cu.cuLaunchKernel(dc0->k_embed_batch, (dm + 255u) / 256u, B, 1, 256, 1, 1, 0, m->tp[0].stream, eb_args, NULL);
     cm_tp_bcast_x(m, B * dm);
 
@@ -13962,18 +16000,18 @@ static void cm_tp_paged_forward_body(CmModel* m, uint32_t B, int need_batch_argm
                     CUdeviceptr null_f32 = 0;
                     void* rqa[] = { &tr->d_x, &fnw, &null_f32, &dc->d_xq8, &dm, &m->rms_eps };
                     g_cu.cuLaunchKernel(dc->k_rmsnorm_q8_1, 1, 1, 1, 256, 1, 1, 0, st, rqa, NULL);
-                    uint32_t dt = tl->ffn_down.ggml_type;
+                    uint32_t dt = tl->ffn_down.ggml_type, act = m->use_geglu ? 1u : 0u;
                     int can_fuse_q8 = ((dff_l & 31u) == 0u && dc->k_dense_gu_q4_dp4a_q8 &&
-                                       (dt == CM_GGML_Q4_0 || dt == CM_GGML_Q4_1 || (dt == CM_GGML_Q6_K && (dff_l & 255u) == 0u)) &&
+                                       cm_can_dp4a_vec(dt, dff_l) &&
                                        (size_t)(dm >> 5) * 48u <= 65536u &&
                                        65536u + (size_t)(dff_l >> 5) * 48u <= dc->xq8_cap);
                     if (can_fuse_q8) {
                         CUdeviceptr d_xq8_h = dc->d_xq8 + 65536ull;
-                        void* gua[] = { &tl->ffn_gate.dptr, &tl->ffn_up.dptr, &dc->d_xq8, &d_xq8_h, &dff_l, &dm };
+                        void* gua[] = { &tl->ffn_gate.dptr, &tl->ffn_up.dptr, &dc->d_xq8, &d_xq8_h, &dff_l, &dm, &act };
                         g_cu.cuLaunchKernel(dc->k_dense_gu_q4_dp4a_q8, dff_l >> 5, 1, 1, 256, 1, 1, 0, st, gua, NULL);
                         cm_tp_launch_gemv_dc_ex(dc, st, tl->ffn_down.dptr, dt, tr->d_g, tr->d_tp_part, dm, dff_l, 0, d_xq8_h);
                     } else {
-                        void* gua[] = { &tl->ffn_gate.dptr, &tl->ffn_up.dptr, &dc->d_xq8, &tr->d_g, &dff_l, &dm };
+                        void* gua[] = { &tl->ffn_gate.dptr, &tl->ffn_up.dptr, &dc->d_xq8, &tr->d_g, &dff_l, &dm, &act };
                         g_cu.cuLaunchKernel(dc->k_dense_gu_q4_dp4a, (dff_l + 7u) / 8u, 1, 1, 128, 1, 1, 0, st, gua, NULL);
                         cm_tp_launch_gemv_dc(dc, st, tl->ffn_down.dptr, dt, tr->d_g, tr->d_tp_part, dm, dff_l, 0);
                     }
@@ -14111,9 +16149,7 @@ static void cm_tp_paged_forward_body(CmModel* m, uint32_t B, int need_batch_argm
     CUstream st0 = m->tp[0].stream;
     uint32_t v = (uint32_t)m->vocab_size;
     if (need_batch_argmax) {
-        if (B == 1u && g_cu.fast_dp4a && (dm & 31u) == 0u && g_cu.k_rmsnorm_q8_1 &&
-            (m->lm_head.ggml_type == CM_GGML_Q4_0 || m->lm_head.ggml_type == CM_GGML_Q4_1 ||
-             (m->lm_head.ggml_type == CM_GGML_Q6_K && (dm & 255u) == 0u))) {
+        if (B == 1u && g_cu.fast_dp4a && g_cu.k_rmsnorm_q8_1 && cm_can_dp4a_vec(m->lm_head.ggml_type, dm)) {
             CUdeviceptr wp = m->out_norm.dptr, null_f32 = 0;
             void* rqa[] = { &m->tp[0].d_x, &wp, &null_f32, &g_cu.d_xq8, &dm, &m->rms_eps };
             g_cu.cuLaunchKernel(g_cu.k_rmsnorm_q8_1, 1, 1, 1, 256, 1, 1, 0, st0, rqa, NULL);
@@ -14122,6 +16158,7 @@ static void cm_tp_paged_forward_body(CmModel* m, uint32_t B, int need_batch_argm
             launch_rmsnorm(st0, m->tp[0].d_x, &m->out_norm, m->tp[0].d_xn, dm, B, m->rms_eps, 1);
             launch_gemm_batch_raw(st0, m->lm_head.dptr, m->lm_head.ggml_type, m->tp[0].d_xn, m->d_batch_logits, v, dm, B, 0);
         }
+        cm_launch_softcap(st0, m->d_batch_logits, B * v, m->final_logit_softcap);
         void* aa[] = { &m->d_batch_logits, &m->d_argmax_batch, &v, &B };
         g_cu.cuLaunchKernel(g_cu.k_argmax_b, B, 1, 1, 256, 1, 1, 0, st0, aa, NULL);
         g_cu.cuMemcpyDtoHAsync(m->h_argmax_batch, m->d_argmax_batch, (size_t)B * 4u, st0);
@@ -14514,12 +16551,11 @@ int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr
         if (g_cu.cuStreamBeginCapture(m->compute_stream, 2) == CUDA_SUCCESS) {
             g_cu.in_graph_capture = 1;
             CUdeviceptr ep = m->tok_embd.dptr;
-            void* eargs[] = { &ep, &m->d_cb_tok, &m->d_px, &dm, &gt, &B };
+            float esc = (m->embed_scale > 0.0f) ? m->embed_scale : 1.0f;
+            void* eargs[] = { &ep, &m->d_cb_tok, &m->d_px, &dm, &gt, &B, &esc };
             g_cu.cuLaunchKernel(g_cu.k_embed_batch, (dm + 255u) / 256u, B, 1, 256, 1, 1, 0, m->compute_stream, eargs, NULL);
             cm_run_dense_paged_layers_batch(m, B);
-            if (B == 1u && g_cu.fast_dp4a && (dm & 31u) == 0u && g_cu.k_rmsnorm_q8_1 &&
-                (m->lm_head.ggml_type == CM_GGML_Q4_0 || m->lm_head.ggml_type == CM_GGML_Q4_1 ||
-                 (m->lm_head.ggml_type == CM_GGML_Q6_K && (dm & 255u) == 0u))) {
+            if (B == 1u && g_cu.fast_dp4a && g_cu.k_rmsnorm_q8_1 && cm_can_dp4a_vec(m->lm_head.ggml_type, dm)) {
                 CUdeviceptr wp = m->out_norm.dptr, null_f32 = 0;
                 void* rqa[] = { &m->d_px, &wp, &null_f32, &g_cu.d_xq8, &dm, &m->rms_eps };
                 g_cu.cuLaunchKernel(g_cu.k_rmsnorm_q8_1, 1, 1, 1, 256, 1, 1, 0, m->compute_stream, rqa, NULL);
@@ -14528,6 +16564,7 @@ int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr
                 launch_rmsnorm(m->compute_stream, m->d_px, &m->out_norm, m->d_pxn, dm, B, m->rms_eps, 1);
                 launch_gemm_batch_raw(m->compute_stream, m->lm_head.dptr, m->lm_head.ggml_type, m->d_pxn, m->d_batch_logits, v, dm, B, 0);
             }
+            cm_launch_softcap(m->compute_stream, m->d_batch_logits, B * v, m->final_logit_softcap);
             void* aa[] = { &m->d_batch_logits, &m->d_argmax_batch, &v, &B };
             g_cu.cuLaunchKernel(g_cu.k_argmax_b, B, 1, 1, 256, 1, 1, 0, m->compute_stream, aa, NULL);
             g_cu.cuMemcpyDtoHAsync(m->h_argmax_batch, m->d_argmax_batch, (size_t)B * 4u, m->compute_stream);
@@ -14572,9 +16609,10 @@ int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr
         m->cb_graph_enabled = 0;
     }
 
+    float esc = (m->embed_scale > 0.0f) ? m->embed_scale : 1.0f;
     if (m->resident_mode && m->tok_embd.dptr && g_cu.k_embed_batch) {
         CUdeviceptr ep = m->tok_embd.dptr;
-        void* eargs[] = { &ep, &m->d_cb_tok, &m->d_px, &dm, &gt, &B };
+        void* eargs[] = { &ep, &m->d_cb_tok, &m->d_px, &dm, &gt, &B, &esc };
         g_cu.cuLaunchKernel(g_cu.k_embed_batch, (dm + 255u) / 256u, B, 1, 256, 1, 1, 0, m->compute_stream, eargs, NULL);
     } else {
         for (uint32_t bi = 0; bi < B; bi++) {
@@ -14593,13 +16631,16 @@ int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr
                 g_cu.cuStreamSynchronize(m->compute_stream);
             }
         }
+        if (esc != 1.0f && g_cu.k_scale_f32) {
+            uint32_t tot_e = B * dm;
+            void* sa[] = { &m->d_px, &tot_e, &esc };
+            g_cu.cuLaunchKernel(g_cu.k_scale_f32, (tot_e + 255u) / 256u, 1, 1, 256, 1, 1, 0, m->compute_stream, sa, NULL);
+        }
     }
     cm_run_dense_paged_layers_batch(m, B);
 
     // Batched Final Norm + Batched LM Head + Single-Launch Parallel Argmax directly on GPU!
-    if (B == 1u && g_cu.fast_dp4a && (dm & 31u) == 0u && g_cu.k_rmsnorm_q8_1 &&
-        (m->lm_head.ggml_type == CM_GGML_Q4_0 || m->lm_head.ggml_type == CM_GGML_Q4_1 ||
-         (m->lm_head.ggml_type == CM_GGML_Q6_K && (dm & 255u) == 0u))) {
+    if (B == 1u && g_cu.fast_dp4a && g_cu.k_rmsnorm_q8_1 && cm_can_dp4a_vec(m->lm_head.ggml_type, dm)) {
         CUdeviceptr wp = m->out_norm.dptr, null_f32 = 0;
         void* rqa[] = { &m->d_px, &wp, &null_f32, &g_cu.d_xq8, &dm, &m->rms_eps };
         g_cu.cuLaunchKernel(g_cu.k_rmsnorm_q8_1, 1, 1, 1, 256, 1, 1, 0, m->compute_stream, rqa, NULL);
@@ -14608,6 +16649,7 @@ int64_t tn_cumoe_step_batch(int64_t handle, int64_t tok_ids_ptr, int64_t pos_ptr
         launch_rmsnorm(m->compute_stream, m->d_px, &m->out_norm, m->d_pxn, dm, B, m->rms_eps, 1);
         launch_gemm_batch_raw(m->compute_stream, m->lm_head.dptr, m->lm_head.ggml_type, m->d_pxn, m->d_batch_logits, v, dm, B, 0);
     }
+    cm_launch_softcap(m->compute_stream, m->d_batch_logits, B * v, m->final_logit_softcap);
     void* aa[] = { &m->d_batch_logits, &m->d_argmax_batch, &v, &B };
     g_cu.cuLaunchKernel(g_cu.k_argmax_b, B, 1, 1, 256, 1, 1, 0, m->compute_stream, aa, NULL);
     g_cu.cuMemcpyDtoHAsync(m->h_argmax_batch, m->d_argmax_batch, (size_t)B * 4u, m->compute_stream);
@@ -14691,12 +16733,14 @@ int64_t tn_cumoe_paged_prefill(int64_t handle, int64_t slot_id, int64_t tok_ids_
             p_arr[b] = (uint32_t)p; s_arr[b] = (uint32_t)s;
         }
         cm_pa_sync_bt(m);
+        if (!m->d_cb_tok) g_cu.cuMemAlloc(&m->d_cb_tok, (size_t)CM_PREFILL_MAX_B * 4u);
         g_cu.cuMemcpyHtoDAsync(m->d_cb_pos,  p_arr, (size_t)B * 4u, m->compute_stream);
         g_cu.cuMemcpyHtoDAsync(m->d_cb_slot, s_arr, (size_t)B * 4u, m->compute_stream);
+        float esc = (m->embed_scale > 0.0f) ? m->embed_scale : 1.0f;
         if (m->resident_mode && m->tok_embd.dptr && g_cu.k_embed_batch && m->d_cb_tok) {
             g_cu.cuMemcpyHtoDAsync(m->d_cb_tok, t_arr, (size_t)B * 4u, m->compute_stream);
             CUdeviceptr ep = m->tok_embd.dptr;
-            void* eargs[] = { &ep, &m->d_cb_tok, &m->d_px, &dm, &gt, &B };
+            void* eargs[] = { &ep, &m->d_cb_tok, &m->d_px, &dm, &gt, &B, &esc };
             g_cu.cuLaunchKernel(g_cu.k_embed_batch, (dm + 255u) / 256u, B, 1, 256, 1, 1, 0, m->compute_stream, eargs, NULL);
         } else {
             for (uint32_t bi = 0; bi < B; bi++) {
@@ -14715,6 +16759,11 @@ int64_t tn_cumoe_paged_prefill(int64_t handle, int64_t slot_id, int64_t tok_ids_
                     g_cu.cuStreamSynchronize(m->compute_stream);
                 }
             }
+            if (esc != 1.0f && g_cu.k_scale_f32) {
+                uint32_t tot_e = B * dm;
+                void* sa[] = { &m->d_px, &tot_e, &esc };
+                g_cu.cuLaunchKernel(g_cu.k_scale_f32, (tot_e + 255u) / 256u, 1, 1, 256, 1, 1, 0, m->compute_stream, sa, NULL);
+            }
         }
         cm_run_dense_paged_layers_batch(m, B);
         if (off + B == n_toks) {
@@ -14723,6 +16772,7 @@ int64_t tn_cumoe_paged_prefill(int64_t handle, int64_t slot_id, int64_t tok_ids_
             if (m->d_last_hidden) g_cu.cuMemcpyDtoDAsync(m->d_last_hidden, lx, (size_t)dm * 4u, m->compute_stream);
             launch_rmsnorm(m->compute_stream, lx, &m->out_norm, m->d_xn, dm, 1, m->rms_eps, 0);
             launch_gemv(m->compute_stream, &m->lm_head, m->d_xn, m->d_logits, v, dm, 0);
+            cm_launch_softcap(m->compute_stream, m->d_logits, v, m->final_logit_softcap);
             void* aa[] = { &m->d_logits, &m->d_argmax, &v };
             g_cu.cuLaunchKernel(g_cu.k_argmax, 1, 1, 1, 256, 1, 1, 0, m->compute_stream, aa, NULL);
             g_cu.cuMemcpyDtoHAsync(m->h_argmax, m->d_argmax, 4, m->compute_stream);
@@ -14759,15 +16809,18 @@ int64_t tn_cumoe_paged_step_embd(int64_t handle, int64_t slot_id, int64_t embd_f
     int s = (int)slot_id; if (s < 0 || s >= CM_PA_MAX_SEQS) s = 0;
     const float* vecs = (const float*)(uintptr_t)embd_f32_ptr;
     uint32_t dm = (uint32_t)m->d_model;
-    int chunk_sz = 64;
+    int chunk_sz = 256;
+    if (chunk_sz > CM_PREFILL_MAX_B) chunk_sz = CM_PREFILL_MAX_B;
     cm_ensure_prefill_bufs(m, chunk_sz);
+    m->cur_use_fd = 0;
+    m->cur_is_prefill = 1;
     int64_t off = 0, last_tok = 0;
     while (off < n_vecs) {
         uint32_t B = (uint32_t)((n_vecs - off > chunk_sz) ? chunk_sz : (n_vecs - off));
         uint32_t p_arr[CM_PREFILL_MAX_B], s_arr[CM_PREFILL_MAX_B];
         for (uint32_t b = 0; b < B; b++) {
             int p = (int)(start_pos + off + b);
-            if (!cm_pa_ensure_slot_pos(m, s, p)) return 0;
+            if (!cm_pa_ensure_slot_pos(m, s, p)) { m->cur_is_prefill = 0; return 0; }
             p_arr[b] = (uint32_t)p; s_arr[b] = (uint32_t)s;
         }
         cm_pa_sync_bt(m);
@@ -14781,6 +16834,7 @@ int64_t tn_cumoe_paged_step_embd(int64_t handle, int64_t slot_id, int64_t embd_f
             if (m->d_last_hidden) g_cu.cuMemcpyDtoDAsync(m->d_last_hidden, lx, (size_t)dm * 4u, m->compute_stream);
             launch_rmsnorm(m->compute_stream, lx, &m->out_norm, m->d_xn, dm, 1, m->rms_eps, 0);
             launch_gemv(m->compute_stream, &m->lm_head, m->d_xn, m->d_logits, v, dm, 0);
+            cm_launch_softcap(m->compute_stream, m->d_logits, v, m->final_logit_softcap);
             void* aa[] = { &m->d_logits, &m->d_argmax, &v };
             g_cu.cuLaunchKernel(g_cu.k_argmax, 1, 1, 1, 256, 1, 1, 0, m->compute_stream, aa, NULL);
             g_cu.cuMemcpyDtoHAsync(m->h_argmax, m->d_argmax, 4, m->compute_stream);
@@ -14791,6 +16845,7 @@ int64_t tn_cumoe_paged_step_embd(int64_t handle, int64_t slot_id, int64_t embd_f
         }
         off += B;
     }
+    m->cur_is_prefill = 0;
     m->last_total_ms = cm_now_ms() - t0;
     return last_tok;
 }
@@ -15867,7 +17922,8 @@ typedef struct {
     CmWeightRef patch_w, patch_b, class_embd, pos_embd, pre_ln_w, pre_ln_b, post_ln_w, post_ln_b;
     CmWeightRef mm_fc_w, mm_fc_b, mm_0_w, mm_0_b, mm_2_w, mm_2_b;
     CmMmprojLayer layers[CM_MMPROJ_MAX_LAYERS];
-    CUdeviceptr d_in, d_x, d_xn, d_q, d_k, d_v, d_ctx, d_ff_buf, d_ps, d_out, d_zero;
+    CUdeviceptr d_in, d_x, d_xn, d_q, d_k, d_v, d_ctx, d_ff_buf, d_ps, d_out, d_zero, d_patch_f16;
+    float* h_pin;
 } CmMmprojModel;
 
 static CmMmprojModel g_cm_mmproj[CM_MMPROJ_MAX_MODELS];
@@ -16030,6 +18086,15 @@ int64_t tn_cumoe_mmproj_load(int64_t path_cstr) {
     g_cu.cuMemAlloc(&mm->d_out,    (size_t)n_out * (size_t)pdim * 4u);
     g_cu.cuMemAlloc(&mm->d_zero,   64u);
     g_cu.cuMemsetD8(mm->d_zero, 0, 64u);
+    if (mm->patch_w.dptr && mm->patch_w.ggml_type == CM_GGML_F32 && g_cu.k_f32_to_f16) {
+        uint32_t pn = (uint32_t)(mm->patch_w.byte_size >> 2);
+        if (g_cu.cuMemAlloc(&mm->d_patch_f16, (size_t)pn * 2u) == CUDA_SUCCESS) {
+            void* fa[] = { &mm->patch_w.dptr, &mm->d_patch_f16, &pn };
+            g_cu.cuLaunchKernel(g_cu.k_f32_to_f16, ((pn + 1u) / 2u + 255u) / 256u, 1, 1, 256, 1, 1, 0, mm->stream, fa, NULL);
+            g_cu.cuStreamSynchronize(mm->stream);
+        }
+    }
+    g_cu.cuMemHostAlloc((void**)&mm->h_pin, (size_t)(grid * grid) * (size_t)patch_dim * sizeof(float), CU_MEMHOSTALLOC_PORTABLE);
     mm->active = 1;
     return (int64_t)slot;
 }
@@ -16071,14 +18136,13 @@ int64_t tn_cumoe_mmproj_encode_rgb(int64_t mm_h, int64_t rgb_u8_ptr, int64_t wid
     if (max_vecs < n_out) return 0;
 
     const uint8_t* src = (const uint8_t*)(uintptr_t)rgb_u8_ptr;
-    float* img = (float*)malloc((size_t)3 * (size_t)sz * (size_t)sz * sizeof(float));
-    for (int y = 0; y < sz; y++) {
-        float fy = ((float)y + 0.5f) * (float)height / (float)sz - 0.5f;
-        int y0 = (int)floorf(fy); float dy = fy - (float)y0; int y1 = y0 + 1;
-        if (y0 < 0) y0 = 0;
-        if (y0 >= height) y0 = (int)height - 1;
-        if (y1 < 0) y1 = 0;
-        if (y1 >= height) y1 = (int)height - 1;
+    float* pin = mm->h_pin;
+    int pin_owned = 0;
+    if (!pin) { pin = (float*)malloc((size_t)n_patches * (size_t)pdim * sizeof(float)); pin_owned = 1; }
+    int x0_lut[2048], x1_lut[2048];
+    float dx_lut[2048];
+    int use_lut = (sz <= 2048);
+    if (use_lut) {
         for (int x = 0; x < sz; x++) {
             float fx = ((float)x + 0.5f) * (float)width / (float)sz - 0.5f;
             int x0 = (int)floorf(fx); float dx = fx - (float)x0; int x1 = x0 + 1;
@@ -16086,35 +18150,65 @@ int64_t tn_cumoe_mmproj_encode_rgb(int64_t mm_h, int64_t rgb_u8_ptr, int64_t wid
             if (x0 >= width) x0 = (int)width - 1;
             if (x1 < 0) x1 = 0;
             if (x1 >= width) x1 = (int)width - 1;
-            for (int c = 0; c < 3; c++) {
-                float p00 = (float)src[((size_t)y0 * (size_t)width + (size_t)x0) * 3u + c];
-                float p01 = (float)src[((size_t)y0 * (size_t)width + (size_t)x1) * 3u + c];
-                float p10 = (float)src[((size_t)y1 * (size_t)width + (size_t)x0) * 3u + c];
-                float p11 = (float)src[((size_t)y1 * (size_t)width + (size_t)x1) * 3u + c];
-                float v = ((p00 * (1.0f - dx) + p01 * dx) * (1.0f - dy) + (p10 * (1.0f - dx) + p11 * dx) * dy) / 255.0f;
-                img[((size_t)c * (size_t)sz + (size_t)y) * (size_t)sz + (size_t)x] = (v - mm->mean[c]) / mm->std[c];
-            }
+            x0_lut[x] = x0; x1_lut[x] = x1; dx_lut[x] = dx;
         }
     }
-    float* pin = (float*)malloc((size_t)n_patches * (size_t)pdim * sizeof(float));
+    float inv_s0 = 1.0f / (255.0f * mm->std[0]), off0 = -mm->mean[0] / mm->std[0];
+    float inv_s1 = 1.0f / (255.0f * mm->std[1]), off1 = -mm->mean[1] / mm->std[1];
+    float inv_s2 = 1.0f / (255.0f * mm->std[2]), off2 = -mm->mean[2] / mm->std[2];
+    int ps2 = ps * ps;
     for (int py = 0; py < grid; py++) {
-        for (int px = 0; px < grid; px++) {
-            float* dst = pin + (size_t)(py * grid + px) * (size_t)pdim;
-            for (int c = 0; c < 3; c++) {
-                for (int ky = 0; ky < ps; ky++) {
-                    const float* row = img + ((size_t)c * (size_t)sz + (size_t)(py * ps + ky)) * (size_t)sz + (size_t)(px * ps);
-                    memcpy(dst + ((size_t)c * (size_t)ps + (size_t)ky) * (size_t)ps, row, (size_t)ps * sizeof(float));
+        for (int ky = 0; ky < ps; ky++) {
+            int y = py * ps + ky;
+            float fy = ((float)y + 0.5f) * (float)height / (float)sz - 0.5f;
+            int y0 = (int)floorf(fy); float dy = fy - (float)y0; int y1 = y0 + 1;
+            if (y0 < 0) y0 = 0;
+            if (y0 >= height) y0 = (int)height - 1;
+            if (y1 < 0) y1 = 0;
+            if (y1 >= height) y1 = (int)height - 1;
+            float wy0 = 1.0f - dy, wy1 = dy;
+            const uint8_t* r0 = src + (size_t)y0 * (size_t)width * 3u;
+            const uint8_t* r1 = src + (size_t)y1 * (size_t)width * 3u;
+            for (int px = 0; px < grid; px++) {
+                float* pbase = pin + (size_t)(py * grid + px) * (size_t)pdim + (size_t)ky * (size_t)ps;
+                float* d0 = pbase;
+                float* d1 = pbase + ps2;
+                float* d2 = pbase + 2 * ps2;
+                for (int kx = 0; kx < ps; kx++) {
+                    int x = px * ps + kx;
+                    int x0, x1; float dx;
+                    if (use_lut) { x0 = x0_lut[x]; x1 = x1_lut[x]; dx = dx_lut[x]; }
+                    else {
+                        float fx = ((float)x + 0.5f) * (float)width / (float)sz - 0.5f;
+                        x0 = (int)floorf(fx); dx = fx - (float)x0; x1 = x0 + 1;
+                        if (x0 < 0) x0 = 0;
+                        if (x0 >= width) x0 = (int)width - 1;
+                        if (x1 < 0) x1 = 0;
+                        if (x1 >= width) x1 = (int)width - 1;
+                    }
+                    float wx0 = 1.0f - dx, wx1 = dx;
+                    const uint8_t* a0 = r0 + (size_t)x0 * 3u;
+                    const uint8_t* a1 = r0 + (size_t)x1 * 3u;
+                    const uint8_t* b0 = r1 + (size_t)x0 * 3u;
+                    const uint8_t* b1 = r1 + (size_t)x1 * 3u;
+                    float v0 = (a0[0] * wx0 + a1[0] * wx1) * wy0 + (b0[0] * wx0 + b1[0] * wx1) * wy1;
+                    float v1 = (a0[1] * wx0 + a1[1] * wx1) * wy0 + (b0[1] * wx0 + b1[1] * wx1) * wy1;
+                    float v2 = (a0[2] * wx0 + a1[2] * wx1) * wy0 + (b0[2] * wx0 + b1[2] * wx1) * wy1;
+                    d0[kx] = v0 * inv_s0 + off0;
+                    d1[kx] = v1 * inv_s1 + off1;
+                    d2[kx] = v2 * inv_s2 + off2;
                 }
             }
         }
     }
-    free(img);
 
     g_cu.cuCtxSetCurrent(g_cu.ctx);
     CUstream st = mm->stream;
     g_cu.cuMemcpyHtoDAsync(mm->d_in, pin, (size_t)n_patches * (size_t)pdim * sizeof(float), st);
     CUdeviceptr patch_out = mm->has_cls ? mm->d_xn : mm->d_x;
-    launch_gemm_batch_raw(st, mm->patch_w.dptr, mm->patch_w.ggml_type, mm->d_in, patch_out, (uint32_t)mm->d_vis, (uint32_t)pdim, (uint32_t)n_patches, 0);
+    CUdeviceptr pw_ptr = mm->d_patch_f16 ? mm->d_patch_f16 : mm->patch_w.dptr;
+    uint32_t pw_gt = mm->d_patch_f16 ? CM_GGML_F16 : mm->patch_w.ggml_type;
+    launch_gemm_batch_raw(st, pw_ptr, pw_gt, mm->d_in, patch_out, (uint32_t)mm->d_vis, (uint32_t)pdim, (uint32_t)n_patches, 0);
     if (mm->patch_b.dptr) launch_add_bias_batch(st, patch_out, &mm->patch_b, (uint32_t)mm->d_vis, (uint32_t)n_patches);
     if (mm->has_cls && mm->class_embd.dptr) {
         g_cu.cuMemcpyDtoDAsync(mm->d_x, mm->class_embd.dptr, (size_t)mm->d_vis * 4u, st);
@@ -16155,52 +18249,24 @@ int64_t tn_cumoe_mmproj_encode_rgb(int64_t mm_h, int64_t rgb_u8_ptr, int64_t wid
         launch_add_bias_batch(st, mm->d_x, &ly->fc2_b, dv, nt);
     }
     if (mm->post_ln_w.dptr) launch_vit_ln(st, mm->d_x, &mm->post_ln_w, &mm->post_ln_b, mm->d_x, dv, nt, mm->eps, mm->d_zero);
-    g_cu.cuStreamSynchronize(st);
-    free(pin);
 
+    // Tenon v14 P2: 100% Single-Stream GPU Pixel-Shuffle + Projector (ZERO mid-pipeline sync/DtoH/HtoD!)
     int out_dim = (mm->proj_dim > 0) ? mm->proj_dim : mm->d_vis;
-    float* hx = (float*)malloc((size_t)n_tok * (size_t)mm->d_vis * sizeof(float));
-    g_cu.cuMemcpyDtoH(hx, mm->d_x, (size_t)n_tok * (size_t)mm->d_vis * sizeof(float));
-    const float* vx = hx + (mm->has_cls ? mm->d_vis : 0);
-
+    uint32_t grid_u = (uint32_t)grid, hcls_u = (uint32_t)(mm->has_cls ? 1u : 0u);
     if (mm->is_idefics3 && mm->mm_fc_w.dptr) {
-        int sf = mm->scale_factor, og = grid / sf, in_fc = sf * sf * mm->d_vis;
-        float* psb = (float*)malloc((size_t)n_out * (size_t)in_fc * sizeof(float));
-        for (int oh = 0; oh < og; oh++) {
-            for (int ow = 0; ow < og; ow++) {
-                float* dst = psb + (size_t)(oh * og + ow) * (size_t)in_fc;
-                for (int dh_i = 0; dh_i < sf; dh_i++) {
-                    for (int dw_i = 0; dw_i < sf; dw_i++) {
-                        const float* sp = vx + (size_t)((oh * sf + dh_i) * grid + (ow * sf + dw_i)) * (size_t)mm->d_vis;
-                        memcpy(dst + (size_t)(dh_i * sf + dw_i) * (size_t)mm->d_vis, sp, (size_t)mm->d_vis * sizeof(float));
-                    }
-                }
-            }
-        }
-        g_cu.cuMemcpyHtoDAsync(mm->d_ps, psb, (size_t)n_out * (size_t)in_fc * sizeof(float), st);
-        launch_gemm_batch_raw(st, mm->mm_fc_w.dptr, mm->mm_fc_w.ggml_type, mm->d_ps, mm->d_out, (uint32_t)out_dim, (uint32_t)in_fc, (uint32_t)n_out, 0);
+        uint32_t sf_u = (uint32_t)mm->scale_factor;
+        uint32_t in_fc = sf_u * sf_u * dv;
+        void* psa[] = { &mm->d_x, &mm->d_ps, &grid_u, &sf_u, &dv, &hcls_u };
+        g_cu.cuLaunchKernel(g_cu.k_vit_pixel_shuffle, (uint32_t)n_out, 1, 1, 256, 1, 1, 0, st, psa, NULL);
+        launch_gemm_batch_raw(st, mm->mm_fc_w.dptr, mm->mm_fc_w.ggml_type, mm->d_ps, mm->d_out, (uint32_t)out_dim, in_fc, (uint32_t)n_out, 0);
         if (mm->mm_fc_b.dptr) launch_add_bias_batch(st, mm->d_out, &mm->mm_fc_b, (uint32_t)out_dim, (uint32_t)n_out);
         g_cu.cuMemcpyDtoHAsync((void*)(uintptr_t)out_embd_ptr, mm->d_out, (size_t)n_out * (size_t)out_dim * sizeof(float), st);
-        g_cu.cuStreamSynchronize(st);
-        free(psb);
     } else if (mm->is_qwen2vl && mm->spatial_merge_size > 1 && mm->mm_0_w.dptr && mm->mm_2_w.dptr) {
-        // Real Qwen2.5-VL 2x2 Spatial Token Merger -> 2-layer GELU MLP Projector!
-        int ms = mm->spatial_merge_size, og = grid / ms, in_m = ms * ms * mm->d_vis;
-        float* psb = (float*)malloc((size_t)n_out * (size_t)in_m * sizeof(float));
-        for (int oh = 0; oh < og; oh++) {
-            for (int ow = 0; ow < og; ow++) {
-                float* dst = psb + (size_t)(oh * og + ow) * (size_t)in_m;
-                for (int dh_i = 0; dh_i < ms; dh_i++) {
-                    for (int dw_i = 0; dw_i < ms; dw_i++) {
-                        const float* sp = vx + (size_t)((oh * ms + dh_i) * grid + (ow * ms + dw_i)) * (size_t)mm->d_vis;
-                        memcpy(dst + (size_t)(dh_i * ms + dw_i) * (size_t)mm->d_vis, sp, (size_t)mm->d_vis * sizeof(float));
-                    }
-                }
-            }
-        }
+        uint32_t ms_u = (uint32_t)mm->spatial_merge_size, in_m = ms_u * ms_u * dv;
         uint32_t mid = (uint32_t)mm->mm_0_w.ne1, one = 1u;
-        g_cu.cuMemcpyHtoDAsync(mm->d_ps, psb, (size_t)n_out * (size_t)in_m * sizeof(float), st);
-        launch_gemm_batch_raw(st, mm->mm_0_w.dptr, mm->mm_0_w.ggml_type, mm->d_ps, mm->d_ff_buf, mid, (uint32_t)in_m, (uint32_t)n_out, 0);
+        void* psa[] = { &mm->d_x, &mm->d_ps, &grid_u, &ms_u, &dv, &hcls_u };
+        g_cu.cuLaunchKernel(g_cu.k_vit_pixel_shuffle, (uint32_t)n_out, 1, 1, 256, 1, 1, 0, st, psa, NULL);
+        launch_gemm_batch_raw(st, mm->mm_0_w.dptr, mm->mm_0_w.ggml_type, mm->d_ps, mm->d_ff_buf, mid, in_m, (uint32_t)n_out, 0);
         if (mm->mm_0_b.dptr) launch_add_bias_batch(st, mm->d_ff_buf, &mm->mm_0_b, mid, (uint32_t)n_out);
         uint32_t gn = (uint32_t)n_out * mid;
         void* ga[] = { &mm->d_ff_buf, &gn, &one };
@@ -16208,12 +18274,10 @@ int64_t tn_cumoe_mmproj_encode_rgb(int64_t mm_h, int64_t rgb_u8_ptr, int64_t wid
         launch_gemm_batch_raw(st, mm->mm_2_w.dptr, mm->mm_2_w.ggml_type, mm->d_ff_buf, mm->d_out, (uint32_t)out_dim, mid, (uint32_t)n_out, 0);
         if (mm->mm_2_b.dptr) launch_add_bias_batch(st, mm->d_out, &mm->mm_2_b, (uint32_t)out_dim, (uint32_t)n_out);
         g_cu.cuMemcpyDtoHAsync((void*)(uintptr_t)out_embd_ptr, mm->d_out, (size_t)n_out * (size_t)out_dim * sizeof(float), st);
-        g_cu.cuStreamSynchronize(st);
-        free(psb);
     } else if (mm->mm_0_w.dptr && mm->mm_2_w.dptr) {
         uint32_t mid = (uint32_t)mm->mm_0_w.ne1, one = 1u;
-        g_cu.cuMemcpyHtoDAsync(mm->d_ps, vx, (size_t)n_out * (size_t)mm->d_vis * sizeof(float), st);
-        launch_gemm_batch_raw(st, mm->mm_0_w.dptr, mm->mm_0_w.ggml_type, mm->d_ps, mm->d_ff_buf, mid, dv, (uint32_t)n_out, 0);
+        CUdeviceptr vx_gpu = mm->d_x + (uint64_t)(mm->has_cls ? mm->d_vis : 0) * 4ull;
+        launch_gemm_batch_raw(st, mm->mm_0_w.dptr, mm->mm_0_w.ggml_type, vx_gpu, mm->d_ff_buf, mid, dv, (uint32_t)n_out, 0);
         if (mm->mm_0_b.dptr) launch_add_bias_batch(st, mm->d_ff_buf, &mm->mm_0_b, mid, (uint32_t)n_out);
         uint32_t gn = (uint32_t)n_out * mid;
         void* ga[] = { &mm->d_ff_buf, &gn, &one };
@@ -16221,11 +18285,12 @@ int64_t tn_cumoe_mmproj_encode_rgb(int64_t mm_h, int64_t rgb_u8_ptr, int64_t wid
         launch_gemm_batch_raw(st, mm->mm_2_w.dptr, mm->mm_2_w.ggml_type, mm->d_ff_buf, mm->d_out, (uint32_t)out_dim, mid, (uint32_t)n_out, 0);
         if (mm->mm_2_b.dptr) launch_add_bias_batch(st, mm->d_out, &mm->mm_2_b, (uint32_t)out_dim, (uint32_t)n_out);
         g_cu.cuMemcpyDtoHAsync((void*)(uintptr_t)out_embd_ptr, mm->d_out, (size_t)n_out * (size_t)out_dim * sizeof(float), st);
-        g_cu.cuStreamSynchronize(st);
     } else {
-        memcpy((void*)(uintptr_t)out_embd_ptr, vx, (size_t)n_out * (size_t)mm->d_vis * sizeof(float));
+        CUdeviceptr vx_gpu = mm->d_x + (uint64_t)(mm->has_cls ? mm->d_vis : 0) * 4ull;
+        g_cu.cuMemcpyDtoHAsync((void*)(uintptr_t)out_embd_ptr, vx_gpu, (size_t)n_out * (size_t)mm->d_vis * sizeof(float), st);
     }
-    free(hx);
+    g_cu.cuStreamSynchronize(st);
+    if (pin_owned) free(pin);
     return (int64_t)n_out;
 }
 
@@ -16234,7 +18299,8 @@ int64_t tn_cumoe_mmproj_free(int64_t mm_h) {
     CmMmprojModel* mm = &g_cm_mmproj[mm_h];
     g_cu.cuCtxSetCurrent(g_cu.ctx);
     if (mm->stream) { g_cu.cuStreamSynchronize(mm->stream); g_cu.cuStreamDestroy(mm->stream); mm->stream = NULL; }
-    CUdeviceptr* ptrs[] = { &mm->d_weights, &mm->d_in, &mm->d_x, &mm->d_xn, &mm->d_q, &mm->d_k, &mm->d_v, &mm->d_ctx, &mm->d_ff_buf, &mm->d_ps, &mm->d_out, &mm->d_zero };
+    if (mm->h_pin) { g_cu.cuMemFreeHost(mm->h_pin); mm->h_pin = NULL; }
+    CUdeviceptr* ptrs[] = { &mm->d_weights, &mm->d_in, &mm->d_x, &mm->d_xn, &mm->d_q, &mm->d_k, &mm->d_v, &mm->d_ctx, &mm->d_ff_buf, &mm->d_ps, &mm->d_out, &mm->d_zero, &mm->d_patch_f16 };
     for (size_t i = 0; i < sizeof(ptrs)/sizeof(ptrs[0]); i++) if (*ptrs[i]) { g_cu.cuMemFree(*ptrs[i]); *ptrs[i] = 0; }
     memset(mm, 0, sizeof(CmMmprojModel));
     return 1;
@@ -17029,10 +19095,17 @@ int64_t tn_cumoe_free(int64_t handle) {
         cm_free_dptr(&ly->wk_b.dptr); cm_free_dptr(&ly->wv_b.dptr);
         cm_free_dptr(&ly->bq.dptr); cm_free_dptr(&ly->bk.dptr); cm_free_dptr(&ly->bv.dptr);
         cm_free_dptr(&ly->q_norm.dptr); cm_free_dptr(&ly->k_norm.dptr); cm_free_dptr(&ly->ffn_norm.dptr);
+        cm_free_dptr(&ly->post_attn_norm.dptr); cm_free_dptr(&ly->post_ffn_norm.dptr);
+        cm_free_dptr(&ly->gdn_qkv.dptr); cm_free_dptr(&ly->gdn_gate.dptr); cm_free_dptr(&ly->gdn_conv1d.dptr);
+        cm_free_dptr(&ly->gdn_alpha.dptr); cm_free_dptr(&ly->gdn_beta.dptr); cm_free_dptr(&ly->gdn_a.dptr);
+        cm_free_dptr(&ly->gdn_dt_bias.dptr); cm_free_dptr(&ly->gdn_norm.dptr); cm_free_dptr(&ly->gdn_out.dptr);
+        cm_free_dptr(&ly->gdn_conv_state); cm_free_dptr(&ly->gdn_ssm_state);
         cm_free_dptr(&ly->ffn_gate.dptr); cm_free_dptr(&ly->ffn_up.dptr); cm_free_dptr(&ly->ffn_down.dptr);
         cm_free_dptr(&ly->router.dptr); cm_free_dptr(&ly->exp_bias.dptr);
         cm_free_dptr(&ly->sh_gate.dptr); cm_free_dptr(&ly->sh_up.dptr); cm_free_dptr(&ly->sh_down.dptr);
     }
+    cm_free_dptr(&m->d_gdn_qkv); cm_free_dptr(&m->d_gdn_conv); cm_free_dptr(&m->d_gdn_z);
+    cm_free_dptr(&m->d_gdn_o); cm_free_dptr(&m->d_gdn_alpha); cm_free_dptr(&m->d_gdn_beta);
     for (int s = 0; s < 4; s++) {
         cm_free_dptr(&m->dense_ring_dptr[s]);
         if (m->dense_ring_host[s]) { g_cu.cuMemFreeHost(m->dense_ring_host[s]); m->dense_ring_host[s] = NULL; }

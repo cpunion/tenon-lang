@@ -2839,6 +2839,26 @@ fn format_chat_template(arch: &str, messages: &[(String, String)]) -> String {
             }
         }
         out.push_str("<|assistant|>\n");
+    } else if a.starts_with("gemma") {
+        let mut sys_prefix = String::new();
+        for (role, content) in messages {
+            if role == "system" {
+                sys_prefix.push_str(content);
+                sys_prefix.push_str("\n\n");
+            } else {
+                let gr = if role == "assistant" { "model" } else { "user" };
+                out.push_str("<start_of_turn>");
+                out.push_str(gr);
+                out.push('\n');
+                if gr == "user" && !sys_prefix.is_empty() {
+                    out.push_str(&sys_prefix);
+                    sys_prefix.clear();
+                }
+                out.push_str(content);
+                out.push_str("<end_of_turn>\n");
+            }
+        }
+        out.push_str("<start_of_turn>model\n");
     } else if a.starts_with("qwen") {
         for (role, content) in messages {
             out.push_str("<|im_start|>");
@@ -2889,6 +2909,7 @@ fn is_stop_token(tok_id: i64, eos_id: i64, piece: &str) -> bool {
             | "<|im_end|>"
             | "<|endoftext|>"
             | "<|user|>"
+            | "<end_of_turn>"
             | "<end_of_utterance>"
             | "</s>"
     )
