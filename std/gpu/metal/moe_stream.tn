@@ -63,6 +63,9 @@ extern "C" {
     fn tn_moe_paged_kv_info(handle Int, field_id Int) Int
     fn tn_moe_paged_seq_free(handle Int, slot_id Int) Int
     fn tn_moe_paged_seq_fork(handle Int, src_slot Int, dst_slot Int, prefix_len Int) Int
+    fn tn_moe_prefix_cache_register(handle Int, slot_id Int, tok_ids_ptr Ptr[UInt8], n_toks Int) Int
+    fn tn_moe_prefix_cache_attach(handle Int, dst_slot Int, tok_ids_ptr Ptr[UInt8], n_toks Int) Int
+    fn tn_moe_dsa_self_test(seq_len Int, top_k Int, idx_heads Int, idx_dim Int) Int
     fn tn_moe_paged_prefill(handle Int, slot_id Int, tok_ids_ptr Ptr[UInt8], n_toks Int, start_pos Int) Int
     fn tn_moe_step_batch(handle Int, tok_ids_ptr Ptr[UInt8], pos_ptr Ptr[UInt8], slot_ids_ptr Ptr[UInt8], n_active Int, out_toks_ptr Ptr[UInt8]) Int
     fn tn_moe_copy_logits_batch(handle Int, batch_idx Int, dst_f32_ptr Ptr[UInt8]) Int

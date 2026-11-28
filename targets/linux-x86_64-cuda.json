@@ -1,0 +1,21 @@
+{
+  "inherits": ["linux-x86_64"],
+  "llvm-target": "x86_64-unknown-linux-gnu",
+  "cpu": "x86-64-v3",
+  "os": "linux",
+  "arch": "x86_64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "elf",
+  "cflags": [
+    "-DTENON_TARGET_CUDA=1"
+  ],
+  "build-tags": [
+    "linux",
+    "x86_64",
+    "unix",
+    "elf",
+    "cuda"
+  ],
+  "description": "Linux x86_64 Zero-Rust Standalone NVIDIA CUDA Server/Inference ELF (glibc + dlopen libcuda)"
+}

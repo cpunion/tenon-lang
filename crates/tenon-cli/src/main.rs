@@ -1615,6 +1615,7 @@ fn cmd_targets(_args: &[String]) -> ExitCode {
     }
     println!("\nUsage examples:");
     println!("  tenon build app.tn --target linux-x86_64 --lib obj -o app_linux_x64.o");
+    println!("  tenon build examples/showcase/tenon_llm_server_cuda.tn --target linux-x86_64-cuda -o tenon_llm_server_cuda");
     println!("  tenon build fw.tn  --target esp32c3 --lib static -o libfw_esp32c3.a");
     println!("  tenon build fw.tn  --target rp2040 --lib static -o libfw_rp2040.a");
     println!("  tenon build mod.tn --target targets/custom_board.json --lib obj -o mod.o");

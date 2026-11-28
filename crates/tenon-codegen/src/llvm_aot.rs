@@ -560,6 +560,63 @@ pub fn compile_with_options(
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e == "o" || e == "obj");
+            let is_target_linux_cuda = opts
+                .resolved_target
+                .as_ref()
+                .is_some_and(|t| t.os == "linux" && t.build_tags.iter().any(|b| b == "cuda"));
+            let cross_linux_bundle = opts.output_kind == OutputKind::Executable
+                && !emit_obj_only
+                && is_target_linux_cuda
+                && !is_host_target
+                && opts.sysroot.is_none();
+            if cross_linux_bundle {
+                // Cross-compiling a standalone Zero-Rust Linux CUDA ELF from macOS/Windows without a Linux sysroot:
+                // emit target-compiled x86_64 ELF object `<out>.o`, minimal C runtime `<out>_rt.c`, and 1-command `<out>_link.sh`!
+                let out_str = output_path.to_string_lossy().to_string();
+                let obj_path = PathBuf::from(format!("{}.o", out_str));
+                let rt_out_path = PathBuf::from(format!("{}_rt.c", out_str));
+                let sh_path = PathBuf::from(format!("{}_link.sh", out_str));
+                let mut c1 = Command::new("clang");
+                c1.arg(opt_flag).arg("-c").arg("-Wno-override-module");
+                for ta in &target_clang_args {
+                    c1.arg(ta);
+                }
+                if opts.debug_info {
+                    c1.arg("-g");
+                }
+                c1.args([tmp_ll.to_str().unwrap(), "-o", obj_path.to_str().unwrap()]);
+                let o1 = c1.output().map_err(|e| format!("clang failed: {}", e))?;
+                if !o1.status.success() {
+                    Err(format!(
+                        "LLVM clang -c (linux-x86_64-cuda object) failed:\n{}",
+                        String::from_utf8_lossy(&o1.stderr)
+                    ))
+                } else {
+                    fs::write(&rt_out_path, &rt_c).map_err(|e| e.to_string())?;
+                    let mut link_cmd = format!(
+                        "#!/usr/bin/env sh\nset -eu\nCC=\"${{CC:-clang}}\"\n\"$CC\" {} -s \"{}\" \"{}\"",
+                        opt_flag,
+                        obj_path.file_name().and_then(|s| s.to_str()).unwrap_or("app.o"),
+                        rt_out_path.file_name().and_then(|s| s.to_str()).unwrap_or("app_rt.c")
+                    );
+                    for csrc in &all_c_sources {
+                        link_cmd.push_str(&format!(" \"{}\"", csrc.display()));
+                    }
+                    link_cmd.push_str(" -lm -ldl -lpthread");
+                    for lib in &all_link_libs {
+                        link_cmd.push_str(&format!(" -l{}", lib));
+                    }
+                    let out_name = output_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("tenon_cuda_app");
+                    link_cmd.push_str(&format!(" -o \"{}\"\n", out_name));
+                    fs::write(&sh_path, &link_cmd).map_err(|e| e.to_string())?;
+                    // Copy the compiled target object to `output_path` as well if caller checks `output_path` metadata
+                    fs::copy(&obj_path, output_path).map_err(|e| e.to_string())?;
+                    Ok(())
+                }
+            } else {
             let mut cmd = Command::new("clang");
             cmd.arg(opt_flag);
             for ta in &target_clang_args {
@@ -594,6 +651,9 @@ pub fn compile_with_options(
                 if has_objc_sources {
                     cmd.arg("-fobjc-arc");
                 }
+                if is_target_linux_cuda && opts.output_kind == OutputKind::Executable && !opts.debug_info {
+                    cmd.arg("-s");
+                }
                 cmd.args([
                     "-Wno-override-module",
                     tmp_ll.to_str().unwrap(),
@@ -607,10 +667,10 @@ pub fn compile_with_options(
                 }
                 if uses_http {
                     cmd.args(["-lcurl", "-lpthread"]);
-                } else if uses_sync && !is_freestanding {
+                } else if (uses_sync || is_target_linux_cuda) && !is_freestanding {
                     cmd.arg("-lpthread");
                 }
-                if cfg!(target_os = "linux") && is_host_target && !is_freestanding {
+                if ((cfg!(target_os = "linux") && is_host_target) || is_target_linux_cuda) && !is_freestanding {
                     cmd.args(["-lm", "-ldl"]);
                 }
                 for lib in &all_link_libs {
@@ -637,6 +697,7 @@ pub fn compile_with_options(
                 ))
             } else {
                 Ok(())
+            }
             }
         }
     };

@@ -116,6 +116,7 @@ const BUILTIN_TARGETS: &[(&str, &'static str, &str)] = &[
     ("macos-arm64", "desktop", include_str!("../../../targets/macos-arm64.json")),
     ("macos-x86_64", "desktop", include_str!("../../../targets/macos-x86_64.json")),
     ("linux-x86_64", "desktop", include_str!("../../../targets/linux-x86_64.json")),
+    ("linux-x86_64-cuda", "gpu-server", include_str!("../../../targets/linux-x86_64-cuda.json")),
     ("linux-arm64", "desktop", include_str!("../../../targets/linux-arm64.json")),
     ("linux-riscv64", "desktop", include_str!("../../../targets/linux-riscv64.json")),
     ("windows-x86_64", "desktop", include_str!("../../../targets/windows-x86_64.json")),
@@ -566,6 +567,12 @@ mod tests {
         let lnx = resolve_target("linux-x86_64").expect("resolve linux-x86_64");
         assert_eq!(lnx.llvm_target, "x86_64-unknown-linux-gnu");
         assert!(!lnx.freestanding);
+
+        let lnx_cu = resolve_target("linux-x86_64-cuda").expect("resolve linux-x86_64-cuda");
+        assert_eq!(lnx_cu.llvm_target, "x86_64-unknown-linux-gnu");
+        assert!(!lnx_cu.freestanding);
+        assert!(lnx_cu.build_tags.contains(&"cuda".to_string()));
+        assert!(lnx_cu.cflags.iter().any(|f| f.contains("TENON_TARGET_CUDA")));
 
         let raw = resolve_target("aarch64-unknown-linux-musl").expect("resolve raw triple");
         assert_eq!(raw.os, "linux");

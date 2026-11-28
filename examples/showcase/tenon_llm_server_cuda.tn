@@ -296,6 +296,28 @@ impl LatencyHist {
         }
     }
 
+    pub fn quantile_ms(self, q Float) Float {
+        if self.count <= 0 { return 0.0 }
+        let target = q * int_to_float(self.count)
+        let n = len(self.bounds)
+        var prev_cnt = 0.0
+        var prev_b = 0.0
+        var i = 0
+        while i < n {
+            let cur_cnt = int_to_float(self.buckets[i])
+            let cur_b = int_to_float(self.bounds[i])
+            if cur_cnt >= target {
+                let span = cur_cnt - prev_cnt
+                if span <= 0.0 { return cur_b }
+                return prev_b + ((target - prev_cnt) / span) * (cur_b - prev_b)
+            }
+            prev_cnt = cur_cnt
+            prev_b = cur_b
+            i += 1
+        }
+        prev_b
+    }
+
     pub fn format_prom(self, metric Text, help Text) Text {
         var tb = TextBuilder.new()
         tb.push_str("# HELP " ++ metric ++ " " ++ help ++ "\n# TYPE " ++ metric ++ " histogram\n")
@@ -308,6 +330,10 @@ impl LatencyHist {
         tb.push_str(metric ++ "_bucket{le=\"+Inf\"} " ++ int_to_text(self.count) ++ "\n")
         tb.push_str(metric ++ "_sum " ++ float_to_text(int_to_float(self.sum_us) / 1000.0) ++ "\n")
         tb.push_str(metric ++ "_count " ++ int_to_text(self.count) ++ "\n")
+        tb.push_str("# HELP " ++ metric ++ "_quantile Estimated latency quantiles (p50/p95/p99) in ms\n# TYPE " ++ metric ++ "_quantile gauge\n")
+        tb.push_str(metric ++ "_quantile{quantile=\"0.5\"} " ++ float_to_text(self.quantile_ms(0.5)) ++ "\n")
+        tb.push_str(metric ++ "_quantile{quantile=\"0.95\"} " ++ float_to_text(self.quantile_ms(0.95)) ++ "\n")
+        tb.push_str(metric ++ "_quantile{quantile=\"0.99\"} " ++ float_to_text(self.quantile_ms(0.99)) ++ "\n")
         tb.finish()
     }
 }
@@ -1504,7 +1530,7 @@ fn main() Int {
         "/tmp/models/v6/Llama-3.2-1B-Instruct-Q4_0.gguf"
     }
     let chunk_env = sys_env("TENON_PREFILL_CHUNK")
-    let prefill_chunk = parse_pos_int(chunk_env, 64)
+    let prefill_chunk = parse_pos_int(chunk_env, 256)
     let max_queue = parse_pos_int(sys_env("TENON_MAX_QUEUE"), 64)
     let model_name = "tenon-native-gguf"
 
@@ -1761,6 +1787,13 @@ fn main() Int {
                                 let pa_tot = unsafe { tn_cumoe_paged_kv_info(handle, 1) }
                                 let pa_free = unsafe { tn_cumoe_paged_kv_info(handle, 2) }
                                 let pa_forks = unsafe { tn_cumoe_paged_kv_info(handle, 4) }
+                                let pc_blks = unsafe { tn_cumoe_paged_kv_info(handle, 7) }
+                                let pc_hits = unsafe { tn_cumoe_paged_kv_info(handle, 8) }
+                                let pc_miss = unsafe { tn_cumoe_paged_kv_info(handle, 9) }
+                                let pc_saved = unsafe { tn_cumoe_paged_kv_info(handle, 10) }
+                                let pc_evict = unsafe { tn_cumoe_paged_kv_info(handle, 11) }
+                                let pc_tot = pc_hits + pc_miss
+                                let pc_ratio = if pc_tot > 0 { int_to_float(pc_hits) / int_to_float(pc_tot) } else { 0.0 }
                                 let vram = unsafe { tn_cumoe_info(handle, 8) }
                                 let g_rep = unsafe { tn_cumoe_info(handle, 46) }
                                 let g_cap = unsafe { tn_cumoe_info(handle, 47) }
@@ -1817,6 +1850,12 @@ fn main() Int {
                                 obj = json_obj_set(obj, "paged_kv_blocks", JInt(pa_tot))
                                 obj = json_obj_set(obj, "paged_kv_free_blocks", JInt(pa_free))
                                 obj = json_obj_set(obj, "paged_cow_forks", JInt(pa_forks))
+                                obj = json_obj_set(obj, "prefix_cache_cached_blocks", JInt(pc_blks))
+                                obj = json_obj_set(obj, "prefix_cache_hits", JInt(pc_hits))
+                                obj = json_obj_set(obj, "prefix_cache_misses", JInt(pc_miss))
+                                obj = json_obj_set(obj, "prefix_cache_saved_tokens", JInt(pc_saved))
+                                obj = json_obj_set(obj, "prefix_cache_evictions", JInt(pc_evict))
+                                obj = json_obj_set(obj, "prefix_cache_hit_ratio", JFloat(pc_ratio))
                                 obj = json_obj_set(obj, "cow_forks", JInt(cow_forks))
                                 obj = json_obj_set(obj, "cow_saved_tokens", JInt(cow_saved_toks))
                                 obj = json_obj_set(obj, "cb_batches_run", JInt(cb_batches_run))
@@ -1831,6 +1870,13 @@ fn main() Int {
                                 let pa_tot = unsafe { tn_cumoe_paged_kv_info(handle, 1) }
                                 let pa_free = unsafe { tn_cumoe_paged_kv_info(handle, 2) }
                                 let pa_forks = unsafe { tn_cumoe_paged_kv_info(handle, 4) }
+                                let pc_blks = unsafe { tn_cumoe_paged_kv_info(handle, 7) }
+                                let pc_hits = unsafe { tn_cumoe_paged_kv_info(handle, 8) }
+                                let pc_miss = unsafe { tn_cumoe_paged_kv_info(handle, 9) }
+                                let pc_saved = unsafe { tn_cumoe_paged_kv_info(handle, 10) }
+                                let pc_evict = unsafe { tn_cumoe_paged_kv_info(handle, 11) }
+                                let pc_tot = pc_hits + pc_miss
+                                let pc_ratio = if pc_tot > 0 { int_to_float(pc_hits) / int_to_float(pc_tot) } else { 0.0 }
                                 let g_rep = unsafe { tn_cumoe_info(handle, 46) }
                                 let g_cap = unsafe { tn_cumoe_info(handle, 47) }
                                 let tc_tiles = unsafe { tn_cumoe_info(handle, 45) }
@@ -1860,6 +1906,18 @@ fn main() Int {
                                 mt.push_str(int_to_text(pa_free))
                                 mt.push_str("\n# HELP tenon_paged_cow_forks_total COW prefix forks\n# TYPE tenon_paged_cow_forks_total counter\ntenon_paged_cow_forks_total ")
                                 mt.push_str(int_to_text(pa_forks))
+                                mt.push_str("\n# HELP tenon_prefix_cache_cached_blocks Radix APC cached PagedKV blocks\n# TYPE tenon_prefix_cache_cached_blocks gauge\ntenon_prefix_cache_cached_blocks ")
+                                mt.push_str(int_to_text(pc_blks))
+                                mt.push_str("\n# HELP tenon_prefix_cache_hits_total Automatic Prefix Cache hits\n# TYPE tenon_prefix_cache_hits_total counter\ntenon_prefix_cache_hits_total ")
+                                mt.push_str(int_to_text(pc_hits))
+                                mt.push_str("\n# HELP tenon_prefix_cache_misses_total Automatic Prefix Cache misses\n# TYPE tenon_prefix_cache_misses_total counter\ntenon_prefix_cache_misses_total ")
+                                mt.push_str(int_to_text(pc_miss))
+                                mt.push_str("\n# HELP tenon_prefix_cache_hit_ratio Automatic Prefix Cache hit ratio\n# TYPE tenon_prefix_cache_hit_ratio gauge\ntenon_prefix_cache_hit_ratio ")
+                                mt.push_str(float_to_text(pc_ratio))
+                                mt.push_str("\n# HELP tenon_prefix_cache_saved_tokens_total Prompt tokens skipped by Radix APC\n# TYPE tenon_prefix_cache_saved_tokens_total counter\ntenon_prefix_cache_saved_tokens_total ")
+                                mt.push_str(int_to_text(pc_saved))
+                                mt.push_str("\n# HELP tenon_prefix_cache_evictions_total LRU evicted Radix APC blocks\n# TYPE tenon_prefix_cache_evictions_total counter\ntenon_prefix_cache_evictions_total ")
+                                mt.push_str(int_to_text(pc_evict))
                                 mt.push_str("\n# HELP tenon_chunked_prefill_chunks_total Chunked prefill ticks\n# TYPE tenon_chunked_prefill_chunks_total counter\ntenon_chunked_prefill_chunks_total ")
                                 mt.push_str(int_to_text(chunked_prefill_chunks))
                                 mt.push_str("\n# HELP tenon_lora_swaps_total Runtime LoRA swaps\n# TYPE tenon_lora_swaps_total counter\ntenon_lora_swaps_total ")
@@ -2236,7 +2294,22 @@ fn main() Int {
                     cb_lru[dst] = clock_tick
 
                     var actual_lcp = 0
-                    if best_lcp > 0 && best_src >= 0 && best_src != dst {
+                    let apc_max = if lid_sel == 0 && n_prompt > 16 { ((n_prompt - 1) / 16) * 16 } else { 0 }
+                    if apc_max > 0 && (apc_max > best_lcp || best_src == dst) {
+                        // Tenon v17 P3: Engine-Level Content-Hashed Radix Prefix Cache (survives slot eviction!)
+                        let apc_lcp = unsafe { tn_cumoe_prefix_cache_attach(handle, dst, list_data_ptr(ids), n_prompt) }
+                        if apc_lcp > 0 && (apc_lcp >= best_lcp || best_src == dst) {
+                            cow_saved_toks += apc_lcp
+                            actual_lcp = apc_lcp
+                        } else if best_lcp > 0 && best_src >= 0 && best_src != dst {
+                            let _ = unsafe { tn_cumoe_paged_seq_fork(handle, best_src, dst, best_lcp) }
+                            cow_forks += 1
+                            cow_saved_toks += best_lcp
+                            actual_lcp = best_lcp
+                        } else {
+                            let _ = unsafe { tn_cumoe_paged_seq_free(handle, dst) }
+                        }
+                    } else if best_lcp > 0 && best_src >= 0 && best_src != dst {
                         let _ = unsafe { tn_cumoe_paged_seq_fork(handle, best_src, dst, best_lcp) }
                         cow_forks += 1
                         cow_saved_toks += best_lcp
@@ -2350,7 +2423,7 @@ fn main() Int {
                 let cur = cb_pf_cur[pfs]
                 let end_p = cb_pf_end[pfs]
                 let rem = end_p - cur
-                if rem > 16 {
+                if rem > 16 || (rem > 1 && n_dec == 0) {
                     let take = if rem < budget { rem } else { budget }
                     let lid = cb_lora[pfs]
                     if lid != active_lora_id {
@@ -2384,9 +2457,13 @@ fn main() Int {
                         var hi = 0
                         while hi < copy_n {
                             hist_ids[pbase + hi] = pf_ids[pbase + hi]
+                            tok_scratch[hi] = pf_ids[pbase + hi]
                             hi += 1
                         }
                         hist_len[pfs] = copy_n
+                        if lid == 0 && copy_n >= 16 {
+                            let _ = unsafe { tn_cumoe_prefix_cache_register(handle, pfs, list_data_ptr(tok_scratch), copy_n) }
+                        }
                         if want_stream {
                             let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
                             let _ = net_write_text(cfd, hdr)
@@ -2513,9 +2590,13 @@ fn main() Int {
                         var hi = 0
                         while hi < copy_n {
                             hist_ids[pbase + hi] = pf_ids[pbase + hi]
+                            tok_scratch[hi] = pf_ids[pbase + hi]
                             hi += 1
                         }
                         hist_len[s] = copy_n
+                        if cb_lora[s] == 0 && copy_n >= 16 {
+                            let _ = unsafe { tn_cumoe_prefix_cache_register(handle, s, list_data_ptr(tok_scratch), copy_n) }
+                        }
                         if want_stream {
                             let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
                             let _ = net_write_text(cfd, hdr)
