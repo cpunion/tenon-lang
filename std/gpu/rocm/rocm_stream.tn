@@ -1,0 +1,10 @@
+// std/gpu/rocm/rocm_stream.tn — Tenon v18 Zero-SDK AMD ROCm/HIP Compute & IO-Overlapped Inference Binding
+@c_src("rocm_stream_shim.c")
+
+extern "C" {
+    fn tn_rocm_init() Int
+    fn tn_rocm_device_name() Int
+    fn tn_rocm_arch_name() Int
+    fn tn_rocm_info(field_id Int) Int
+    fn tn_rocm_self_test() Int
+}

@@ -1305,7 +1305,25 @@ int64_t tenon_sched_tasks_completed(void) {
 "#;
 
 pub(crate) const TENON_AOT_NET_C: &str = r#"
-/* ===== Tenon POSIX Non-Blocking TCP Sockets, kqueue/epoll Reactor & Clock ===== */
+/* ===== Tenon Cross-OS Non-Blocking TCP Sockets, kqueue/epoll/WSAPoll Reactor & Clock ===== */
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#endif
+static int tenon_wsa_ready = 0;
+static void tenon_wsa_ensure(void) {
+    if (!tenon_wsa_ready) {
+        WSADATA wd;
+        if (WSAStartup(MAKEWORD(2, 2), &wd) == 0) tenon_wsa_ready = 1;
+    }
+}
+#else
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1319,17 +1337,28 @@ pub(crate) const TENON_AOT_NET_C: &str = r#"
 #elif defined(__linux__)
 #include <sys/epoll.h>
 #endif
+#endif
 
 #ifdef TENON_LLI_MODE
 static _Atomic int tenon_last_eagain = 0;
+#elif defined(_MSC_VER)
+static __declspec(thread) int tenon_last_eagain = 0;
 #else
 static _Thread_local int tenon_last_eagain = 0;
 #endif
 
 int64_t tenon_time_now_ns(void) {
+#if defined(_WIN32)
+    static LARGE_INTEGER freq = {0};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER cnt;
+    QueryPerformanceCounter(&cnt);
+    return (int64_t)((double)cnt.QuadPart * 1e9 / (double)(freq.QuadPart > 0 ? freq.QuadPart : 1));
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+#endif
 }
 
 int64_t tenon_time_now_ms(void) {
@@ -1367,8 +1396,22 @@ static int tenon_parse_ipv4_port(int64_t addr_text, struct sockaddr_in* sa) {
 }
 
 int64_t tenon_net_tcp_listen(int64_t addr_text) {
+#if defined(_WIN32)
+    tenon_wsa_ensure();
+#endif
     struct sockaddr_in sa;
     if (!tenon_parse_ipv4_port(addr_text, &sa)) return -1;
+#if defined(_WIN32)
+    SOCKET fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) return -1;
+    BOOL one = TRUE;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
+    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR || listen(fd, 1024) == SOCKET_ERROR) {
+        closesocket(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+#else
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int one = 1;
@@ -1381,19 +1424,34 @@ int64_t tenon_net_tcp_listen(int64_t addr_text) {
         return -1;
     }
     return (int64_t)fd;
+#endif
 }
 
 int64_t tenon_net_tcp_local_port(int64_t fd) {
     if (fd < 0) return -1;
     struct sockaddr_in sa;
     socklen_t sl = sizeof(sa);
+#if defined(_WIN32)
+    if (getsockname((SOCKET)fd, (struct sockaddr*)&sa, &sl) == SOCKET_ERROR) return -1;
+#else
     if (getsockname((int)fd, (struct sockaddr*)&sa, &sl) < 0) return -1;
+#endif
     return (int64_t)ntohs(sa.sin_port);
 }
 
 int64_t tenon_net_tcp_accept(int64_t fd) {
     tenon_last_eagain = 0;
     if (fd < 0) return -1;
+#if defined(_WIN32)
+    SOCKET cfd = accept((SOCKET)fd, NULL, NULL);
+    if (cfd == INVALID_SOCKET) {
+        if (WSAGetLastError() == WSAEWOULDBLOCK) tenon_last_eagain = 1;
+        return -1;
+    }
+    BOOL one = TRUE;
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+    return (int64_t)cfd;
+#else
     int cfd = accept((int)fd, NULL, NULL);
     if (cfd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) tenon_last_eagain = 1;
@@ -1402,11 +1460,26 @@ int64_t tenon_net_tcp_accept(int64_t fd) {
     int one = 1;
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     return (int64_t)cfd;
+#endif
 }
 
 int64_t tenon_net_tcp_connect(int64_t addr_text) {
+#if defined(_WIN32)
+    tenon_wsa_ensure();
+#endif
     struct sockaddr_in sa;
     if (!tenon_parse_ipv4_port(addr_text, &sa)) return -1;
+#if defined(_WIN32)
+    SOCKET fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) return -1;
+    if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) {
+        closesocket(fd);
+        return -1;
+    }
+    BOOL one = TRUE;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+    return (int64_t)fd;
+#else
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
@@ -1416,21 +1489,32 @@ int64_t tenon_net_tcp_connect(int64_t addr_text) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     return (int64_t)fd;
+#endif
 }
 
 int64_t tenon_net_set_nonblocking(int64_t fd, int64_t nb) {
     if (fd < 0) return 0;
+#if defined(_WIN32)
+    u_long mode = nb ? 1ul : 0ul;
+    return ioctlsocket((SOCKET)fd, FIONBIO, &mode) == 0 ? 1 : 0;
+#else
     int flags = fcntl((int)fd, F_GETFL, 0);
     if (flags < 0) return 0;
     if (nb) flags |= O_NONBLOCK;
     else flags &= ~O_NONBLOCK;
     return fcntl((int)fd, F_SETFL, flags) == 0 ? 1 : 0;
+#endif
 }
 
 int64_t tenon_net_set_nodelay(int64_t fd, int64_t nd) {
     if (fd < 0) return 0;
+#if defined(_WIN32)
+    BOOL val = nd ? TRUE : FALSE;
+    return setsockopt((SOCKET)fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&val, sizeof(val)) == 0 ? 1 : 0;
+#else
     int val = nd ? 1 : 0;
     return setsockopt((int)fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)) == 0 ? 1 : 0;
+#endif
 }
 
 int64_t tenon_net_read(int64_t fd, int64_t max_bytes) {
@@ -1439,12 +1523,21 @@ int64_t tenon_net_read(int64_t fd, int64_t max_bytes) {
     size_t cap = (size_t)(max_bytes > 1048576 ? 1048576 : max_bytes);
     uint8_t stack_buf[4096];
     uint8_t* tmp = cap <= sizeof(stack_buf) ? stack_buf : (uint8_t*)malloc(cap);
+#if defined(_WIN32)
+    int n = recv((SOCKET)fd, (char*)tmp, (int)cap, 0);
+    if (n <= 0) {
+        if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) tenon_last_eagain = 1;
+        if (tmp != stack_buf) free(tmp);
+        return tenon_bytes_new(0);
+    }
+#else
     ssize_t n = recv((int)fd, tmp, cap, 0);
     if (n <= 0) {
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) tenon_last_eagain = 1;
         if (tmp != stack_buf) free(tmp);
         return tenon_bytes_new(0);
     }
+#endif
     int64_t words = ((int64_t)n + 7) / 8;
     if (words < 1) words = 1;
     TenonObj* obj = tenon_rc_alloc_raw(10, (int64_t)n, words);
@@ -1459,12 +1552,21 @@ int64_t tenon_net_read_text(int64_t fd, int64_t max_bytes) {
     size_t cap = (size_t)(max_bytes > 1048576 ? 1048576 : max_bytes);
     uint8_t stack_buf[8192];
     uint8_t* tmp = cap <= sizeof(stack_buf) ? stack_buf : (uint8_t*)malloc(cap);
+#if defined(_WIN32)
+    int n = recv((SOCKET)fd, (char*)tmp, (int)cap, 0);
+    if (n <= 0) {
+        if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) tenon_last_eagain = 1;
+        if (tmp != stack_buf) free(tmp);
+        return tenon_text_new(0, 0);
+    }
+#else
     ssize_t n = recv((int)fd, tmp, cap, 0);
     if (n <= 0) {
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) tenon_last_eagain = 1;
         if (tmp != stack_buf) free(tmp);
         return tenon_text_new(0, 0);
     }
+#endif
     int64_t words = ((int64_t)n + 1 + 7) / 8;
     if (words < 1) words = 1;
     TenonObj* obj = tenon_rc_alloc_raw(4, (int64_t)n, words);
@@ -1481,6 +1583,16 @@ int64_t tenon_net_write(int64_t fd, int64_t bytes_obj) {
     const uint8_t* p = (const uint8_t*)hdr->fields;
     size_t rem = (size_t)hdr->len;
     size_t total = 0;
+#if defined(_WIN32)
+    while (rem > 0) {
+        int chunk = rem > 0x7FFFFFFFu ? 0x7FFFFFFF : (int)rem;
+        int n = send((SOCKET)fd, (const char*)(p + total), chunk, 0);
+        if (n < 0) return total > 0 ? (int64_t)total : -1;
+        if (n == 0) break;
+        total += (size_t)n;
+        rem -= (size_t)n;
+    }
+#else
 #ifdef SO_NOSIGPIPE
     { int nosig = 1; setsockopt((int)fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig)); }
 #endif
@@ -1498,6 +1610,7 @@ int64_t tenon_net_write(int64_t fd, int64_t bytes_obj) {
         total += (size_t)n;
         rem -= (size_t)n;
     }
+#endif
     return (int64_t)total;
 }
 
@@ -1506,16 +1619,33 @@ int64_t tenon_net_write_text(int64_t fd, int64_t text_obj) {
 }
 
 int64_t tenon_net_close(int64_t fd) {
+#if defined(_WIN32)
+    if (fd >= 0) closesocket((SOCKET)fd);
+#else
     if (fd >= 0) close((int)fd);
+#endif
     return 0;
 }
 
-/* ===== OS Event Reactor (kqueue / epoll) ===== */
+/* ===== Cross-OS Event Reactor (macOS kqueue / Linux epoll / Windows WSAPoll) ===== */
+#if defined(_WIN32)
+#define TN_WIN_REACTOR_MAX 1024
+typedef struct {
+    WSAPOLLFD pfds[TN_WIN_REACTOR_MAX];
+    int64_t   tokens[TN_WIN_REACTOR_MAX];
+    int       count;
+} TnWinReactor;
+#endif
+
 int64_t tenon_reactor_new(void) {
 #ifdef __APPLE__
     return (int64_t)kqueue();
 #elif defined(__linux__)
     return (int64_t)epoll_create1(EPOLL_CLOEXEC);
+#elif defined(_WIN32)
+    tenon_wsa_ensure();
+    TnWinReactor* wr = (TnWinReactor*)calloc(1, sizeof(TnWinReactor));
+    return (int64_t)(uintptr_t)wr;
 #else
     return -1;
 #endif
@@ -1541,6 +1671,19 @@ int64_t tenon_reactor_add(int64_t rfd, int64_t fd, int64_t mask, int64_t token) 
     ev.events = ((mask & 1) ? EPOLLIN : 0) | ((mask & 2) ? EPOLLOUT : 0);
     ev.data.u64 = (uint64_t)token;
     return epoll_ctl((int)rfd, EPOLL_CTL_ADD, (int)fd, &ev) == 0 ? 1 : 0;
+#elif defined(_WIN32)
+    TnWinReactor* wr = (TnWinReactor*)(uintptr_t)rfd;
+    if (!wr || wr->count >= TN_WIN_REACTOR_MAX) return 0;
+    SHORT ev = ((mask & 1) ? POLLRDNORM : 0) | ((mask & 2) ? POLLWRNORM : 0);
+    for (int i = 0; i < wr->count; i++) {
+        if (wr->pfds[i].fd == (SOCKET)fd) { wr->pfds[i].events = ev; wr->tokens[i] = token; return 1; }
+    }
+    wr->pfds[wr->count].fd = (SOCKET)fd;
+    wr->pfds[wr->count].events = ev;
+    wr->pfds[wr->count].revents = 0;
+    wr->tokens[wr->count] = token;
+    wr->count++;
+    return 1;
 #else
     (void)mask; (void)token;
     return 0;
@@ -1557,6 +1700,17 @@ int64_t tenon_reactor_del(int64_t rfd, int64_t fd) {
     return 1;
 #elif defined(__linux__)
     epoll_ctl((int)rfd, EPOLL_CTL_DEL, (int)fd, NULL);
+    return 1;
+#elif defined(_WIN32)
+    TnWinReactor* wr = (TnWinReactor*)(uintptr_t)rfd;
+    if (!wr) return 0;
+    for (int i = 0; i < wr->count; i++) {
+        if (wr->pfds[i].fd == (SOCKET)fd) {
+            wr->count--;
+            if (i < wr->count) { wr->pfds[i] = wr->pfds[wr->count]; wr->tokens[i] = wr->tokens[wr->count]; }
+            break;
+        }
+    }
     return 1;
 #else
     return 0;
@@ -1599,6 +1753,28 @@ int64_t tenon_reactor_wait(int64_t rfd, int64_t timeout_ms, int64_t max_events) 
         list->fields[i] = ((int64_t)evs[i].data.u64 << 8) | rev;
     }
     return (int64_t)(uintptr_t)list;
+#elif defined(_WIN32)
+    TnWinReactor* wr = (TnWinReactor*)(uintptr_t)rfd;
+    if (!wr || wr->count <= 0) {
+        if (timeout_ms > 0) Sleep((DWORD)timeout_ms);
+        return (int64_t)(uintptr_t)tenon_rc_alloc_raw(5, 0, 1);
+    }
+    int r = WSAPoll(wr->pfds, (ULONG)wr->count, (INT)timeout_ms);
+    if (r <= 0) return (int64_t)(uintptr_t)tenon_rc_alloc_raw(5, 0, 1);
+    int64_t out_buf[1024];
+    int n = 0;
+    for (int i = 0; i < wr->count && n < cap; i++) {
+        SHORT re = wr->pfds[i].revents;
+        if (re == 0) continue;
+        int64_t rev = 0;
+        if (re & (POLLRDNORM | POLLIN)) rev |= 1;
+        if (re & (POLLWRNORM | POLLOUT)) rev |= 2;
+        if (re & (POLLHUP | POLLERR | POLLNVAL)) rev |= 4;
+        out_buf[n++] = (wr->tokens[i] << 8) | rev;
+    }
+    TenonObj* list = tenon_rc_alloc_raw(5, (int64_t)n, (int64_t)(n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) list->fields[i] = out_buf[i];
+    return (int64_t)(uintptr_t)list;
 #else
     (void)rfd; (void)timeout_ms; (void)cap;
     return (int64_t)(uintptr_t)tenon_rc_alloc_raw(5, 0, 1);
@@ -1606,7 +1782,11 @@ int64_t tenon_reactor_wait(int64_t rfd, int64_t timeout_ms, int64_t max_events) 
 }
 
 int64_t tenon_reactor_close(int64_t rfd) {
+#if defined(_WIN32)
+    if (rfd > 0) free((TnWinReactor*)(uintptr_t)rfd);
+#else
     if (rfd >= 0) close((int)rfd);
+#endif
     return 0;
 }
 "#;

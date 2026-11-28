@@ -560,22 +560,33 @@ pub fn compile_with_options(
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e == "o" || e == "obj");
-            let is_target_linux_cuda = opts
+            let is_target_gpu_bundle = opts.resolved_target.as_ref().is_some_and(|t| {
+                (t.os == "linux" || t.os == "windows")
+                    && t.build_tags
+                        .iter()
+                        .any(|b| b == "cuda" || b == "rocm" || b == "vulkan")
+            });
+            let is_target_win_bundle = opts
                 .resolved_target
                 .as_ref()
-                .is_some_and(|t| t.os == "linux" && t.build_tags.iter().any(|b| b == "cuda"));
-            let cross_linux_bundle = opts.output_kind == OutputKind::Executable
+                .is_some_and(|t| t.os == "windows");
+            let cross_gpu_bundle = opts.output_kind == OutputKind::Executable
                 && !emit_obj_only
-                && is_target_linux_cuda
+                && is_target_gpu_bundle
                 && !is_host_target
                 && opts.sysroot.is_none();
-            if cross_linux_bundle {
-                // Cross-compiling a standalone Zero-Rust Linux CUDA ELF from macOS/Windows without a Linux sysroot:
-                // emit target-compiled x86_64 ELF object `<out>.o`, minimal C runtime `<out>_rt.c`, and 1-command `<out>_link.sh`!
+            if cross_gpu_bundle {
+                // Cross-compiling a standalone Zero-Rust Linux/Windows GPU (CUDA/ROCm/Vulkan) binary without a target sysroot:
+                // emit target-compiled object (`<out>.o`/`.obj`), cross-OS C runtime `<out>_rt.c`, and 1-command link script!
                 let out_str = output_path.to_string_lossy().to_string();
-                let obj_path = PathBuf::from(format!("{}.o", out_str));
+                let obj_ext = if is_target_win_bundle { "obj" } else { "o" };
+                let obj_path = PathBuf::from(format!("{}.{}", out_str, obj_ext));
                 let rt_out_path = PathBuf::from(format!("{}_rt.c", out_str));
-                let sh_path = PathBuf::from(format!("{}_link.sh", out_str));
+                let script_path = PathBuf::from(format!(
+                    "{}_link.{}",
+                    out_str,
+                    if is_target_win_bundle { "bat" } else { "sh" }
+                ));
                 let mut c1 = Command::new("clang");
                 c1.arg(opt_flag).arg("-c").arg("-Wno-override-module");
                 for ta in &target_clang_args {
@@ -588,31 +599,47 @@ pub fn compile_with_options(
                 let o1 = c1.output().map_err(|e| format!("clang failed: {}", e))?;
                 if !o1.status.success() {
                     Err(format!(
-                        "LLVM clang -c (linux-x86_64-cuda object) failed:\n{}",
+                        "LLVM clang -c (cross GPU object) failed:\n{}",
                         String::from_utf8_lossy(&o1.stderr)
                     ))
                 } else {
                     fs::write(&rt_out_path, &rt_c).map_err(|e| e.to_string())?;
-                    let mut link_cmd = format!(
-                        "#!/usr/bin/env sh\nset -eu\nCC=\"${{CC:-clang}}\"\n\"$CC\" {} -s \"{}\" \"{}\"",
-                        opt_flag,
-                        obj_path.file_name().and_then(|s| s.to_str()).unwrap_or("app.o"),
-                        rt_out_path.file_name().and_then(|s| s.to_str()).unwrap_or("app_rt.c")
-                    );
-                    for csrc in &all_c_sources {
-                        link_cmd.push_str(&format!(" \"{}\"", csrc.display()));
-                    }
-                    link_cmd.push_str(" -lm -ldl -lpthread");
-                    for lib in &all_link_libs {
-                        link_cmd.push_str(&format!(" -l{}", lib));
-                    }
+                    let obj_fname = obj_path.file_name().and_then(|s| s.to_str()).unwrap_or("app.o");
+                    let rt_fname = rt_out_path.file_name().and_then(|s| s.to_str()).unwrap_or("app_rt.c");
                     let out_name = output_path
                         .file_name()
                         .and_then(|s| s.to_str())
-                        .unwrap_or("tenon_cuda_app");
-                    link_cmd.push_str(&format!(" -o \"{}\"\n", out_name));
-                    fs::write(&sh_path, &link_cmd).map_err(|e| e.to_string())?;
-                    // Copy the compiled target object to `output_path` as well if caller checks `output_path` metadata
+                        .unwrap_or("tenon_gpu_app");
+                    let link_cmd = if is_target_win_bundle {
+                        let mut s = format!(
+                            "@echo off\r\nsetlocal\r\nif \"%CC%\"==\"\" set CC=clang\r\n\"%CC%\" {} \"{}\" \"{}\"",
+                            opt_flag, obj_fname, rt_fname
+                        );
+                        for csrc in &all_c_sources {
+                            s.push_str(&format!(" \"{}\"", csrc.display()));
+                        }
+                        s.push_str(" -lws2_32");
+                        for lib in &all_link_libs {
+                            s.push_str(&format!(" -l{}", lib));
+                        }
+                        s.push_str(&format!(" -o \"{}.exe\"\r\n", out_name.trim_end_matches(".exe")));
+                        s
+                    } else {
+                        let mut s = format!(
+                            "#!/usr/bin/env sh\nset -eu\nCC=\"${{CC:-clang}}\"\n\"$CC\" {} -s \"{}\" \"{}\"",
+                            opt_flag, obj_fname, rt_fname
+                        );
+                        for csrc in &all_c_sources {
+                            s.push_str(&format!(" \"{}\"", csrc.display()));
+                        }
+                        s.push_str(" -lm -ldl -lpthread -lrt");
+                        for lib in &all_link_libs {
+                            s.push_str(&format!(" -l{}", lib));
+                        }
+                        s.push_str(&format!(" -o \"{}\"\n", out_name));
+                        s
+                    };
+                    fs::write(&script_path, &link_cmd).map_err(|e| e.to_string())?;
                     fs::copy(&obj_path, output_path).map_err(|e| e.to_string())?;
                     Ok(())
                 }
@@ -651,7 +678,7 @@ pub fn compile_with_options(
                 if has_objc_sources {
                     cmd.arg("-fobjc-arc");
                 }
-                if is_target_linux_cuda && opts.output_kind == OutputKind::Executable && !opts.debug_info {
+                if is_target_gpu_bundle && !is_target_win_bundle && opts.output_kind == OutputKind::Executable && !opts.debug_info {
                     cmd.arg("-s");
                 }
                 cmd.args([
@@ -665,13 +692,17 @@ pub fn compile_with_options(
                 for dir in &opts.link_dirs {
                     cmd.arg(format!("-L{}", dir));
                 }
-                if uses_http {
-                    cmd.args(["-lcurl", "-lpthread"]);
-                } else if (uses_sync || is_target_linux_cuda) && !is_freestanding {
-                    cmd.arg("-lpthread");
-                }
-                if ((cfg!(target_os = "linux") && is_host_target) || is_target_linux_cuda) && !is_freestanding {
-                    cmd.args(["-lm", "-ldl"]);
+                if is_target_win_bundle {
+                    cmd.arg("-lws2_32");
+                } else {
+                    if uses_http {
+                        cmd.args(["-lcurl", "-lpthread"]);
+                    } else if (uses_sync || is_target_gpu_bundle) && !is_freestanding {
+                        cmd.arg("-lpthread");
+                    }
+                    if ((cfg!(target_os = "linux") && is_host_target) || is_target_gpu_bundle) && !is_freestanding {
+                        cmd.args(["-lm", "-ldl"]);
+                    }
                 }
                 for lib in &all_link_libs {
                     cmd.arg(format!("-l{}", lib));

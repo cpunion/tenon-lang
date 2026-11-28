@@ -11,6 +11,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include "../common/tenon_io_hal.h"
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <mach/mach.h>
@@ -303,6 +304,7 @@ typedef struct {
     int fd_splits_forced;
     int cur_use_fd;
     int cur_fd_splits;
+    TnIoEngine io_eng; // Tenon v18: Multi-Platform Async Storage-to-GPU IO HAL (`F_RDADVISE` + `F_NOCACHE` Unified Mem)
     int cur_is_prefill;
     int batch_logits_dirty_row;
     id residency_set;
@@ -7863,10 +7865,10 @@ kernel void moe_grouped_gu_swiglu_mega_amx(
 
     if (lid == 0u && tgid.x == 0u) atomic_fetch_add_explicit(&meta[3], 1u, memory_order_relaxed);
     if (p.gtype == 12u && p.gtype2 == 12u && (p.in_dim & 255u) == 0u) {
-        // Fast Q4_K 64K C^T = W * X^T (transpose=FALSE, 1 load unpacks BOTH lo4 & hi4 -> 2x fewer barriers & header reads!)
-        threadgroup half sX[64][32];
-        threadgroup half sWG[32][64];
-        threadgroup half sWU[32][64];
+        // Fast Q4_K 64K C^T = W * X^T (transpose=FALSE, +8 padded 0-bank-conflict SMEM, 16 KiB = 2 TGs/core, 1 load unpacks BOTH lo4 & hi4!)
+        threadgroup half sX[64][40];
+        threadgroup half sWG[32][72];
+        threadgroup half sWU[32][72];
         threadgroup float sOG[4][64];
         threadgroup float sOU[4][64];
         uint tr = lid >> 2, g = lid & 3u, c8 = g * 8u, gr = r0 + tr;
@@ -7933,12 +7935,12 @@ kernel void moe_grouped_gu_swiglu_mega_amx(
                     #pragma unroll
                     for (uint kk = 0; kk < 64u; kk += 8u) {
                         simdgroup_half8x8 x0, x1, mg0, mg1, mu0, mu1;
-                        simdgroup_load(x0,  &sX[kk][sg_m + 0u],  32, ulong2(0, 0), false);
-                        simdgroup_load(x1,  &sX[kk][sg_m + 8u],  32, ulong2(0, 0), false);
-                        simdgroup_load(mg0, &sWG[sg_n + 0u][kk], 64, ulong2(0, 0), false);
-                        simdgroup_load(mg1, &sWG[sg_n + 8u][kk], 64, ulong2(0, 0), false);
-                        simdgroup_load(mu0, &sWU[sg_n + 0u][kk], 64, ulong2(0, 0), false);
-                        simdgroup_load(mu1, &sWU[sg_n + 8u][kk], 64, ulong2(0, 0), false);
+                        simdgroup_load(x0,  &sX[kk][sg_m + 0u],  40, ulong2(0, 0), false);
+                        simdgroup_load(x1,  &sX[kk][sg_m + 8u],  40, ulong2(0, 0), false);
+                        simdgroup_load(mg0, &sWG[sg_n + 0u][kk], 72, ulong2(0, 0), false);
+                        simdgroup_load(mg1, &sWG[sg_n + 8u][kk], 72, ulong2(0, 0), false);
+                        simdgroup_load(mu0, &sWU[sg_n + 0u][kk], 72, ulong2(0, 0), false);
+                        simdgroup_load(mu1, &sWU[sg_n + 8u][kk], 72, ulong2(0, 0), false);
                         simdgroup_multiply_accumulate(g00, mg0, x0, g00); simdgroup_multiply_accumulate(g01, mg1, x0, g01);
                         simdgroup_multiply_accumulate(g10, mg0, x1, g10); simdgroup_multiply_accumulate(g11, mg1, x1, g11);
                         simdgroup_multiply_accumulate(u00, mu0, x0, u00); simdgroup_multiply_accumulate(u01, mu1, x0, u01);
@@ -8495,9 +8497,110 @@ kernel void moe_grouped_down_mega_amx(
     }
 
     if (lid == 0u && tgid.x == 0u) atomic_fetch_add_explicit(&meta[3], 1u, memory_order_relaxed);
-    // Tenon v16 P2: Zero-Transpose C^T = W * X^T Grouped MoE Down-Proj AMX (transpose=FALSE, direct simdgroup_store!)
-    threadgroup half sX[32][32];
-    threadgroup half sW[64][32];
+    // Tenon v18 P3: Fast Q4_K 64K 1-Load-Both-Nibbles + Bank-Conflict-Free (+8 padded) C^T = W * X^T Down-Proj AMX (15 KiB = 2 TGs/core!)
+    if (p.gtype == 12u && (p.in_dim & 255u) == 0u) {
+        threadgroup half sX[64][40];
+        threadgroup half sW[64][72];
+        threadgroup float sO[4][64];
+        uint tr = lid >> 2, g = lid & 3u, c8 = g * 8u;
+        uint gr0 = r0 + tr, gr1 = r0 + tr + 32u, nb256 = p.in_dim >> 8;
+        ulong rb256 = (ulong)nb256 * 144ul;
+        const device uchar* wr0 = dw + (ulong)(gr0 < p.out_dim ? gr0 : (p.out_dim - 1u)) * rb256;
+        const device uchar* wr1 = dw + (ulong)(gr1 < p.out_dim ? gr1 : (p.out_dim - 1u)) * rb256;
+        uint sg_n = (sg & 1u) * 32u, sg_m = (sg >> 1) * 16u;
+        for (uint m0 = 0; m0 < cnt; m0 += 32u) {
+            uint bt = min(32u, cnt - m0);
+            bool do_m0 = (sg_m < bt), do_m1 = (sg_m + 8u < bt);
+            simdgroup_float8x8 a00(0.0f), a01(0.0f), a02(0.0f), a03(0.0f);
+            simdgroup_float8x8 a10(0.0f), a11(0.0f), a12(0.0f), a13(0.0f);
+            for (uint sb = 0; sb < nb256; sb++) {
+                const device uchar* b0 = wr0 + (ulong)sb * 144ul;
+                const device uchar* b1 = wr1 + (ulong)sb * 144ul;
+                half2 dm0 = (gr0 < p.out_dim) ? *(const device half2*)b0 : half2(0.0h);
+                half2 dm1 = (gr1 < p.out_dim) ? *(const device half2*)b1 : half2(0.0h);
+                #pragma unroll
+                for (uint qtr = 0; qtr < 4u; qtr++) {
+                    uint kbase = (sb << 8) + (qtr << 6);
+                    if (tr < bt) {
+                        const device float4* xp = (const device float4*)(h_grp + (ulong)(off + m0 + tr) * p.in_dim + kbase + c8);
+                        half4 v0 = half4(xp[0]), v1 = half4(xp[1]), v2 = half4(xp[8]), v3 = half4(xp[9]);
+                        sX[c8 + 0u][tr] = v0.x; sX[c8 + 1u][tr] = v0.y; sX[c8 + 2u][tr] = v0.z; sX[c8 + 3u][tr] = v0.w;
+                        sX[c8 + 4u][tr] = v1.x; sX[c8 + 5u][tr] = v1.y; sX[c8 + 6u][tr] = v1.z; sX[c8 + 7u][tr] = v1.w;
+                        sX[32u + c8 + 0u][tr] = v2.x; sX[32u + c8 + 1u][tr] = v2.y; sX[32u + c8 + 2u][tr] = v2.z; sX[32u + c8 + 3u][tr] = v2.w;
+                        sX[32u + c8 + 4u][tr] = v3.x; sX[32u + c8 + 5u][tr] = v3.y; sX[32u + c8 + 6u][tr] = v3.z; sX[32u + c8 + 7u][tr] = v3.w;
+                    } else {
+                        #pragma unroll
+                        for (uint ii = 0; ii < 8u; ii++) { sX[c8 + ii][tr] = 0.0h; sX[32u + c8 + ii][tr] = 0.0h; }
+                    }
+                    #define DEW_DN4K(COND, BLK, DM, ROWI) do { \
+                        if (COND) { \
+                            uchar s0, m0c, s1, m1c; unpack_q4k_sc_pair((BLK) + 4u, qtr, s0, m0c, s1, m1c); \
+                            half hs0 = half(float((DM).x) * float(s0)), hm0 = half(-float((DM).y) * float(m0c)); \
+                            half hs1 = half(float((DM).x) * float(s1) * 0.0625f), hm1 = half(-float((DM).y) * float(m1c)); \
+                            ushort4 qq = *(const device packed_ushort4*)((BLK) + 16u + qtr * 32u + c8); \
+                            uchar4 c0 = as_type<uchar4>(qq.xy), c1 = as_type<uchar4>(qq.zw); \
+                            *(threadgroup half4*)(&sW[(ROWI)][c8])       = fma(half4(hs0), half4(c0 & uchar4(0x0Fu)), half4(hm0)); \
+                            *(threadgroup half4*)(&sW[(ROWI)][c8 + 4u])  = fma(half4(hs0), half4(c1 & uchar4(0x0Fu)), half4(hm0)); \
+                            *(threadgroup half4*)(&sW[(ROWI)][32u + c8]) = fma(half4(hs1), half4(c0 & uchar4(0xF0u)), half4(hm1)); \
+                            *(threadgroup half4*)(&sW[(ROWI)][36u + c8]) = fma(half4(hs1), half4(c1 & uchar4(0xF0u)), half4(hm1)); \
+                        } else { \
+                            *(threadgroup half4*)(&sW[(ROWI)][c8]) = half4(0.0h); *(threadgroup half4*)(&sW[(ROWI)][c8 + 4u]) = half4(0.0h); \
+                            *(threadgroup half4*)(&sW[(ROWI)][32u + c8]) = half4(0.0h); *(threadgroup half4*)(&sW[(ROWI)][36u + c8]) = half4(0.0h); \
+                        } \
+                    } while (0)
+                    DEW_DN4K(gr0 < p.out_dim, b0, dm0, tr);
+                    DEW_DN4K(gr1 < p.out_dim, b1, dm1, tr + 32u);
+                    #undef DEW_DN4K
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    #pragma unroll
+                    for (uint kk = 0; kk < 64u; kk += 8u) {
+                        simdgroup_half8x8 x0, x1, w0, w1, w2, w3;
+                        simdgroup_load(x0, &sX[kk][sg_m + 0u],  40, ulong2(0, 0), false);
+                        simdgroup_load(x1, &sX[kk][sg_m + 8u],  40, ulong2(0, 0), false);
+                        simdgroup_load(w0, &sW[sg_n +  0u][kk], 72, ulong2(0, 0), false);
+                        simdgroup_load(w1, &sW[sg_n +  8u][kk], 72, ulong2(0, 0), false);
+                        simdgroup_load(w2, &sW[sg_n + 16u][kk], 72, ulong2(0, 0), false);
+                        simdgroup_load(w3, &sW[sg_n + 24u][kk], 72, ulong2(0, 0), false);
+                        simdgroup_multiply_accumulate(a00, w0, x0, a00); simdgroup_multiply_accumulate(a01, w1, x0, a01);
+                        simdgroup_multiply_accumulate(a02, w2, x0, a02); simdgroup_multiply_accumulate(a03, w3, x0, a03);
+                        simdgroup_multiply_accumulate(a10, w0, x1, a10); simdgroup_multiply_accumulate(a11, w1, x1, a11);
+                        simdgroup_multiply_accumulate(a12, w2, x1, a12); simdgroup_multiply_accumulate(a13, w3, x1, a13);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
+            if (do_m0) {
+                if ((sg_m + 16u <= bt) && (r0 + sg_n + 32u <= p.out_dim)) {
+                    device float* yb = y_grp + (ulong)(off + m0 + sg_m) * p.out_dim + (r0 + sg_n);
+                    simdgroup_store(a00, yb + 0u * p.out_dim +  0u, p.out_dim, ulong2(0, 0), true);
+                    simdgroup_store(a01, yb + 0u * p.out_dim +  8u, p.out_dim, ulong2(0, 0), true);
+                    simdgroup_store(a02, yb + 0u * p.out_dim + 16u, p.out_dim, ulong2(0, 0), true);
+                    simdgroup_store(a03, yb + 0u * p.out_dim + 24u, p.out_dim, ulong2(0, 0), true);
+                    simdgroup_store(a10, yb + 8u * p.out_dim +  0u, p.out_dim, ulong2(0, 0), true);
+                    simdgroup_store(a11, yb + 8u * p.out_dim +  8u, p.out_dim, ulong2(0, 0), true);
+                    simdgroup_store(a12, yb + 8u * p.out_dim + 16u, p.out_dim, ulong2(0, 0), true);
+                    simdgroup_store(a13, yb + 8u * p.out_dim + 24u, p.out_dim, ulong2(0, 0), true);
+                } else {
+                    #define ST_DN4K(ACC, M_OFF, N_OFF) do { \
+                        simdgroup_store((ACC), &sO[sg][0], 8, ulong2(0, 0), true); \
+                        simdgroup_barrier(mem_flags::mem_threadgroup); \
+                        for (uint idx = lane; idx < 64u; idx += 32u) { \
+                            uint om = sg_m + (M_OFF) + (idx >> 3), orow = r0 + sg_n + (N_OFF) + (idx & 7u); \
+                            if (om < bt && orow < p.out_dim) y_grp[(ulong)(off + m0 + om) * p.out_dim + orow] = sO[sg][idx]; \
+                        } \
+                        simdgroup_barrier(mem_flags::mem_threadgroup); \
+                    } while (0)
+                    ST_DN4K(a00, 0u,  0u); ST_DN4K(a01, 0u,  8u); ST_DN4K(a02, 0u, 16u); ST_DN4K(a03, 0u, 24u);
+                    if (do_m1) { ST_DN4K(a10, 8u,  0u); ST_DN4K(a11, 8u,  8u); ST_DN4K(a12, 8u, 16u); ST_DN4K(a13, 8u, 24u); }
+                    #undef ST_DN4K
+                }
+            }
+        }
+        return;
+    }
+    // Tenon v16/v18: Zero-Transpose C^T = W * X^T Bank-Conflict-Free (+8 padded) Grouped MoE Down-Proj AMX
+    threadgroup half sX[32][40];
+    threadgroup half sW[64][40];
     threadgroup float sO[4][64];
     uint tr = lid >> 2, g = lid & 3u, c0 = g * 8u;
     uint gr0 = r0 + tr, gr1 = r0 + tr + 32u, nb = p.in_dim >> 5;
@@ -8533,12 +8636,12 @@ kernel void moe_grouped_down_mega_amx(
             #pragma unroll
             for (uint kk = 0; kk < 32u; kk += 8u) {
                 simdgroup_half8x8 x0, x1, w0, w1, w2, w3;
-                simdgroup_load(x0, &sX[kk][sg_m + 0u],  32, ulong2(0, 0), false);
-                simdgroup_load(x1, &sX[kk][sg_m + 8u],  32, ulong2(0, 0), false);
-                simdgroup_load(w0, &sW[sg_n +  0u][kk], 32, ulong2(0, 0), false);
-                simdgroup_load(w1, &sW[sg_n +  8u][kk], 32, ulong2(0, 0), false);
-                simdgroup_load(w2, &sW[sg_n + 16u][kk], 32, ulong2(0, 0), false);
-                simdgroup_load(w3, &sW[sg_n + 24u][kk], 32, ulong2(0, 0), false);
+                simdgroup_load(x0, &sX[kk][sg_m + 0u],  40, ulong2(0, 0), false);
+                simdgroup_load(x1, &sX[kk][sg_m + 8u],  40, ulong2(0, 0), false);
+                simdgroup_load(w0, &sW[sg_n +  0u][kk], 40, ulong2(0, 0), false);
+                simdgroup_load(w1, &sW[sg_n +  8u][kk], 40, ulong2(0, 0), false);
+                simdgroup_load(w2, &sW[sg_n + 16u][kk], 40, ulong2(0, 0), false);
+                simdgroup_load(w3, &sW[sg_n + 24u][kk], 40, ulong2(0, 0), false);
                 simdgroup_multiply_accumulate(a00, w0, x0, a00); simdgroup_multiply_accumulate(a01, w1, x0, a01);
                 simdgroup_multiply_accumulate(a02, w2, x0, a02); simdgroup_multiply_accumulate(a03, w3, x0, a03);
                 simdgroup_multiply_accumulate(a10, w0, x1, a10); simdgroup_multiply_accumulate(a11, w1, x1, a11);
@@ -12476,7 +12579,17 @@ int64_t tn_moe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int64
         } else if (kvq_env && (strcmp(kvq_env, "fp16") == 0 || strcmp(kvq_env, "f16") == 0 || strcmp(kvq_env, "0") == 0)) {
             m->kv_quant_q8 = 0;
         } else {
-            m->kv_quant_q8 = (m->max_ctx > 2048) ? 1 : 0;
+            m->kv_quant_q8 = (m->max_ctx > 2048 && !m->is_gpt_oss) ? 1 : 0;
+        }
+        tn_io_init(&m->io_eng, m->use_nocache);
+        // Tenon v18 P3: VRAM-aware PagedKV block pool sizing (`TENON_KV_BLOCKS` override or generous >=256 blks on Apple Unified Mem!)
+        const char* kvb_env = getenv("TENON_KV_BLOCKS");
+        if (kvb_env && atoi(kvb_env) > 0) {
+            int req_ctx = atoi(kvb_env) * PA_BLOCK_SIZE;
+            if (req_ctx > m->max_ctx && req_ctx <= MOE_MAX_SEQ) m->max_ctx = req_ctx;
+        } else if (!ctx_env && m->max_ctx < 4096 && m->n_layers <= 48 && !m->is_qwen35) {
+            // Double default Radix APC block pool (128 -> 256 blks) while keeping FP16 KV (kv_quant_q8 already chosen above!)
+            m->max_ctx = 4096;
         }
         const char* swa_env = getenv("TENON_SLIDING_WINDOW");
         if (swa_env && atoi(swa_env) >= 0) m->sliding_window = atoi(swa_env);
@@ -13982,6 +14095,19 @@ int64_t tn_moe_step(int64_t handle, int64_t tok_id, int64_t pos) {
                 int n_layers_cap = m->n_layers;
                 dispatch_group_async(m->dense_io_grp, m->ring_prod_q, ^{
                     for (int pL = first_stream; pL < n_layers_cap; pL++) {
+                        // Tenon v18 P5: Issue non-blocking macOS `F_RDADVISE` NVMe lookahead for layer `pL + 1` BEFORE reading `pL`!
+                        if (pL + 1 < n_layers_cap && !m->use_nocache) {
+                            MoeLayer* nly = &m->layers[pL + 1];
+                            if (nly->ffn_gate.byte_size > 0) {
+                                tn_io_advise_willneed(&m->io_eng, m->fds[nly->ffn_gate.shard_idx], nly->ffn_gate.file_off, (size_t)nly->ffn_gate.byte_size);
+                            }
+                            if (nly->ffn_up.byte_size > 0) {
+                                tn_io_advise_willneed(&m->io_eng, m->fds[nly->ffn_up.shard_idx], nly->ffn_up.file_off, (size_t)nly->ffn_up.byte_size);
+                            }
+                            if (nly->ffn_down.byte_size > 0) {
+                                tn_io_advise_willneed(&m->io_eng, m->fds[nly->ffn_down.shard_idx], nly->ffn_down.file_off, (size_t)nly->ffn_down.byte_size);
+                            }
+                        }
                         dispatch_semaphore_wait(sem_empty, DISPATCH_TIME_FOREVER);
                         load_dense_layer_into_ping(m, pL, (pL - first_stream) % n_ring, 1);
                         dispatch_semaphore_signal(sem_full);
@@ -14364,6 +14490,9 @@ int64_t tn_moe_info(int64_t handle, int64_t field_id) {
         case 45: return (m->buf_moe_meta != nil) ? (int64_t)((const uint32_t*)[m->buf_moe_meta contents])[3] : 0;
         case 46: return m->has_dsa;
         case 47: return m->dsa_top_k;
+        case 64: return m->io_eng.backend_id;
+        case 65: return m->io_eng.advise_calls;
+        case 66: return m->io_eng.total_bytes;
         default: return 0;
     }
 }

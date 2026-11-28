@@ -1,0 +1,21 @@
+{
+  "inherits": ["linux-x86_64"],
+  "llvm-target": "x86_64-unknown-linux-gnu",
+  "cpu": "x86-64-v3",
+  "os": "linux",
+  "arch": "x86_64",
+  "pointer-bits": 64,
+  "freestanding": false,
+  "binary-format": "elf",
+  "cflags": [
+    "-DTENON_TARGET_ROCM=1"
+  ],
+  "build-tags": [
+    "linux",
+    "x86_64",
+    "unix",
+    "elf",
+    "rocm"
+  ],
+  "description": "Linux x86_64 Zero-Rust AMD ROCm/HIP Server/Inference ELF (CDNA3 MFMA / RDNA3-4 WMMA + io_uring + dlopen libamdhip64)"
+}

@@ -117,9 +117,14 @@ const BUILTIN_TARGETS: &[(&str, &'static str, &str)] = &[
     ("macos-x86_64", "desktop", include_str!("../../../targets/macos-x86_64.json")),
     ("linux-x86_64", "desktop", include_str!("../../../targets/linux-x86_64.json")),
     ("linux-x86_64-cuda", "gpu-server", include_str!("../../../targets/linux-x86_64-cuda.json")),
+    ("linux-x86_64-rocm", "gpu-server", include_str!("../../../targets/linux-x86_64-rocm.json")),
+    ("linux-x86_64-vulkan", "gpu-server", include_str!("../../../targets/linux-x86_64-vulkan.json")),
     ("linux-arm64", "desktop", include_str!("../../../targets/linux-arm64.json")),
     ("linux-riscv64", "desktop", include_str!("../../../targets/linux-riscv64.json")),
     ("windows-x86_64", "desktop", include_str!("../../../targets/windows-x86_64.json")),
+    ("windows-x86_64-cuda", "gpu-server", include_str!("../../../targets/windows-x86_64-cuda.json")),
+    ("windows-x86_64-rocm", "gpu-server", include_str!("../../../targets/windows-x86_64-rocm.json")),
+    ("windows-x86_64-vulkan", "gpu-server", include_str!("../../../targets/windows-x86_64-vulkan.json")),
     ("windows-arm64", "desktop", include_str!("../../../targets/windows-arm64.json")),
     // Mobile
     ("ios-arm64", "mobile", include_str!("../../../targets/ios-arm64.json")),
@@ -573,6 +578,18 @@ mod tests {
         assert!(!lnx_cu.freestanding);
         assert!(lnx_cu.build_tags.contains(&"cuda".to_string()));
         assert!(lnx_cu.cflags.iter().any(|f| f.contains("TENON_TARGET_CUDA")));
+
+        for &(tname, os_exp, tag_exp) in &[
+            ("windows-x86_64-cuda", "windows", "cuda"),
+            ("linux-x86_64-rocm", "linux", "rocm"),
+            ("windows-x86_64-rocm", "windows", "rocm"),
+            ("linux-x86_64-vulkan", "linux", "vulkan"),
+            ("windows-x86_64-vulkan", "windows", "vulkan"),
+        ] {
+            let t = resolve_target(tname).unwrap_or_else(|e| panic!("resolve {}: {}", tname, e));
+            assert_eq!(t.os, os_exp);
+            assert!(t.build_tags.contains(&tag_exp.to_string()));
+        }
 
         let raw = resolve_target("aarch64-unknown-linux-musl").expect("resolve raw triple");
         assert_eq!(raw.os, "linux");
