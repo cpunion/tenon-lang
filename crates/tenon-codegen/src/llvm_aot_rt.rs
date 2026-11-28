@@ -5,7 +5,93 @@ pub(crate) const TENON_AOT_RUNTIME_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
 #ifdef TENON_THREAD_SAFE
-#  if !defined(_WIN32)
+#  if defined(_WIN32)
+#    ifndef TENON_WIN_PTHREAD_COMPAT
+#      define TENON_WIN_PTHREAD_COMPAT 1
+#      ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#      endif
+#      include <windows.h>
+typedef HANDLE pthread_t;
+typedef SRWLOCK pthread_mutex_t;
+#      define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
+typedef CONDITION_VARIABLE pthread_cond_t;
+typedef INIT_ONCE pthread_once_t;
+#      define PTHREAD_ONCE_INIT INIT_ONCE_STATIC_INIT
+typedef struct { DWORD idx; } pthread_key_t;
+typedef struct { void* (*fn)(void*); void* arg; } TenonWinThrArg;
+static DWORD WINAPI tenon_win_thr_entry(LPVOID p) {
+    TenonWinThrArg* a = (TenonWinThrArg*)p;
+    void* (*fn)(void*) = a->fn; void* arg = a->arg;
+    free(a);
+    (void)fn(arg);
+    return 0;
+}
+static inline int pthread_create(pthread_t* th, const void* attr, void* (*fn)(void*), void* arg) {
+    (void)attr;
+    TenonWinThrArg* a = (TenonWinThrArg*)malloc(sizeof(TenonWinThrArg));
+    if (!a) return -1;
+    a->fn = fn; a->arg = arg;
+    *th = CreateThread(NULL, 0, tenon_win_thr_entry, a, 0, NULL);
+    if (!*th) { free(a); return -1; }
+    return 0;
+}
+static inline int pthread_join(pthread_t th, void** ret) {
+    (void)ret;
+    if (th) { WaitForSingleObject(th, INFINITE); CloseHandle(th); }
+    return 0;
+}
+static inline int pthread_detach(pthread_t th) {
+    if (th) CloseHandle(th);
+    return 0;
+}
+static inline int pthread_mutex_init(pthread_mutex_t* m, const void* a) { (void)a; InitializeSRWLock(m); return 0; }
+static inline int pthread_mutex_destroy(pthread_mutex_t* m) { (void)m; return 0; }
+static inline int pthread_mutex_lock(pthread_mutex_t* m) { AcquireSRWLockExclusive(m); return 0; }
+static inline int pthread_mutex_unlock(pthread_mutex_t* m) { ReleaseSRWLockExclusive(m); return 0; }
+static inline int pthread_cond_init(pthread_cond_t* c, const void* a) { (void)a; InitializeConditionVariable(c); return 0; }
+static inline int pthread_cond_destroy(pthread_cond_t* c) { (void)c; return 0; }
+static inline int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) { SleepConditionVariableSRW(c, m, INFINITE, 0); return 0; }
+static inline int pthread_cond_signal(pthread_cond_t* c) { WakeConditionVariable(c); return 0; }
+static inline int pthread_cond_broadcast(pthread_cond_t* c) { WakeAllConditionVariable(c); return 0; }
+static BOOL CALLBACK tenon_win_once_trampoline(PINIT_ONCE o, PVOID param, PVOID* ctx) {
+    (void)o; (void)ctx;
+    void (*fn)(void) = (void (*)(void))param;
+    if (fn) fn();
+    return TRUE;
+}
+static inline int pthread_once(pthread_once_t* once, void (*fn)(void)) {
+    return InitOnceExecuteOnce(once, tenon_win_once_trampoline, (PVOID)(uintptr_t)fn, NULL) ? 0 : -1;
+}
+static inline int pthread_key_create(pthread_key_t* k, void (*dtor)(void*)) {
+#      if defined(_WIN64)
+    DWORD id = FlsAlloc((PFLS_CALLBACK_FUNCTION)(uintptr_t)dtor);
+    if (id == FLS_OUT_OF_INDEXES) return -1;
+#      else
+    (void)dtor;
+    DWORD id = TlsAlloc();
+    if (id == TLS_OUT_OF_INDEXES) return -1;
+#      endif
+    k->idx = id;
+    return 0;
+}
+static inline void* pthread_getspecific(pthread_key_t k) {
+#      if defined(_WIN64)
+    return FlsGetValue(k.idx);
+#      else
+    return TlsGetValue(k.idx);
+#      endif
+}
+static inline int pthread_setspecific(pthread_key_t k, const void* val) {
+#      if defined(_WIN64)
+    return FlsSetValue(k.idx, (PVOID)(uintptr_t)val) ? 0 : -1;
+#      else
+    return TlsSetValue(k.idx, (LPVOID)(uintptr_t)val) ? 0 : -1;
+#      endif
+}
+static inline int sched_yield(void) { SwitchToThread(); return 0; }
+#    endif
+#  else
 #    include <pthread.h>
 #  endif
 #endif

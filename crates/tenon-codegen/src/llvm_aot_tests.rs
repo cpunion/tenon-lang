@@ -507,6 +507,7 @@ return r == 47 ? 0 : 1;
             "-O2",
             c_main.to_str().unwrap(),
             lib_path.to_str().unwrap(),
+            "-lm",
             "-o",
             c_bin.to_str().unwrap(),
         ])
@@ -1010,12 +1011,20 @@ fn cross_gpu_link_bundle_uses_strictly_relative_paths_and_copies_local_headers()
             for (target_name, ext) in [("windows-x86_64-cuda", "bat"), ("linux-x86_64-cuda", "sh")] {
                 let out_path = tmp_dir.join(format!("srv_{}", target_name));
                 let target = crate::targets::resolve_target(target_name).expect("resolve target");
+                let is_native_host = target.is_host();
                 let opts = BuildOptions {
                     opt_level: "O2".into(),
                     resolved_target: Some(target),
                     ..Default::default()
                 };
-                compile_with_options(&prog, &out_path, &opts).expect("cross-compile bundle");
+                compile_with_options(&prog, &out_path, &opts).expect("compile target");
+                if is_native_host {
+                    // On a native host matching this target (e.g., x86_64 Linux runner building linux-x86_64-cuda),
+                    // LLVM AOT directly links the native executable rather than emitting a cross-compile bundle.
+                    let meta = std::fs::metadata(&out_path).expect("native executable exists");
+                    assert!(meta.len() > 0, "native executable for {} should be non-empty", target_name);
+                    continue;
+                }
                 let script = std::fs::read_to_string(tmp_dir.join(format!("srv_{}_link.{}", target_name, ext)))
                     .expect("link script exists");
                 assert!(
@@ -1084,6 +1093,48 @@ fn cross_gpu_link_bundle_uses_strictly_relative_paths_and_copies_local_headers()
                             chk.status.success() && linked_out.exists(),
                             "zig cc -target {} full link failed:\n{}",
                             zig_target,
+                            String::from_utf8_lossy(&chk.stderr)
+                        );
+                    }
+                }
+            }
+
+            // Also verify a threaded (`TENON_THREAD_SAFE` + `TENON_USE_SYNC` + M:N scheduler) Windows program
+            // (`mn_preempt_sched_demo.tn`) compiles and full-links cleanly under `zig cc -target x86_64-windows-gnu`!
+            let sched_src = repo_root.join("examples/dogfood/mn_preempt_sched_demo.tn");
+            let sched_prog = tenon_syntax::load_program_with_imports(&sched_src).expect("load sched demo");
+            let sched_target = crate::targets::resolve_target("windows-x86_64-cuda").expect("resolve win target");
+            if !sched_target.is_host() {
+                let sched_out = tmp_dir.join("sched_win");
+                let sched_opts = BuildOptions {
+                    opt_level: "O2".into(),
+                    resolved_target: Some(sched_target),
+                    ..Default::default()
+                };
+                compile_with_options(&sched_prog, &sched_out, &sched_opts).expect("cross-compile sched_win");
+                if let Ok(zig_ver) = Command::new("zig").arg("version").output() {
+                    if zig_ver.status.success() {
+                        let linked_sched = tmp_dir.join("sched_win.exe");
+                        let helper_c = tmp_dir.join("sched_win_src/bench_ffi_helper.c");
+                        assert!(helper_c.exists(), "bundled bench_ffi_helper.c missing");
+                        let chk = Command::new("zig")
+                            .args([
+                                "cc",
+                                "-target",
+                                "x86_64-windows-gnu",
+                                "-O2",
+                                tmp_dir.join("sched_win.obj").to_str().unwrap(),
+                                tmp_dir.join("sched_win_rt.c").to_str().unwrap(),
+                                helper_c.to_str().unwrap(),
+                                "-lws2_32",
+                                "-o",
+                                linked_sched.to_str().unwrap(),
+                            ])
+                            .output()
+                            .expect("run zig cc on threaded windows runtime");
+                        assert!(
+                            chk.status.success() && linked_sched.exists(),
+                            "zig cc -target x86_64-windows-gnu failed on threaded sched_win_rt.c:\n{}",
                             String::from_utf8_lossy(&chk.stderr)
                         );
                     }

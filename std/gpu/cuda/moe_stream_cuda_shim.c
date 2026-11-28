@@ -13166,6 +13166,7 @@ typedef struct {
     uint8_t* mmap_ptrs[CM_MAX_SHARDS];
 #if defined(_WIN32)
     HANDLE mmap_handles[CM_MAX_SHARDS];
+    HANDLE io_hfiles[CM_MAX_SHARDS]; // FILE_FLAG_OVERLAPPED handles for true async Windows 11 IOCP!
 #endif
     uint64_t total_disk_bytes;
     int use_nocache;
@@ -13495,7 +13496,9 @@ static void cm_read_slice(CmModel* m, int shard, void* dst, size_t n, uint64_t o
         memset(&req, 0, sizeof(req));
         req.fd = m->fds[shard]; req.dst = dst; req.len = n; req.off = off;
 #if defined(_WIN32)
-        req.hfile = (HANDLE)_get_osfhandle(m->fds[shard]);
+        req.hfile = (m->io_hfiles[shard] && m->io_hfiles[shard] != INVALID_HANDLE_VALUE)
+                  ? m->io_hfiles[shard]
+                  : (HANDLE)_get_osfhandle(m->fds[shard]);
 #endif
         if (tn_io_read_batch(&m->io_eng, &req, 1) < n) {
             cm_pread_exact(m->fds[shard], dst, n, off);
@@ -14155,9 +14158,15 @@ static void cm_stage_expert(CmModel* m, int L, int eid, uint8_t* dst) {
         reqs[2].fd = m->fds[ly->down_exps.shard_idx]; reqs[2].dst = dst + ly->gate_exp_bytes + ly->up_exp_bytes; reqs[2].len = (size_t)ly->down_exp_bytes;
         reqs[2].off = ly->down_exps.file_off + (uint64_t)eid * ly->down_exp_bytes;
 #if defined(_WIN32)
-        reqs[0].hfile = (HANDLE)_get_osfhandle(reqs[0].fd);
-        reqs[1].hfile = (HANDLE)_get_osfhandle(reqs[1].fd);
-        reqs[2].hfile = (HANDLE)_get_osfhandle(reqs[2].fd);
+        {
+            int s0 = ly->gate_exps.shard_idx, s1 = ly->up_exps.shard_idx, s2 = ly->down_exps.shard_idx;
+            reqs[0].hfile = (m->io_hfiles[s0] && m->io_hfiles[s0] != INVALID_HANDLE_VALUE)
+                          ? m->io_hfiles[s0] : (HANDLE)_get_osfhandle(reqs[0].fd);
+            reqs[1].hfile = (m->io_hfiles[s1] && m->io_hfiles[s1] != INVALID_HANDLE_VALUE)
+                          ? m->io_hfiles[s1] : (HANDLE)_get_osfhandle(reqs[1].fd);
+            reqs[2].hfile = (m->io_hfiles[s2] && m->io_hfiles[s2] != INVALID_HANDLE_VALUE)
+                          ? m->io_hfiles[s2] : (HANDLE)_get_osfhandle(reqs[2].fd);
+        }
 #endif
         size_t want = reqs[0].len + reqs[1].len + reqs[2].len;
         if (tn_io_read_batch(&m->io_eng, reqs, 3) == want) {
@@ -17023,7 +17032,12 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
     if (slot < 0) return 0;
     CmModel* m = &g_cm[slot];
     memset(m, 0, sizeof(CmModel));
-    for (int s = 0; s < CM_MAX_SHARDS; s++) m->fds[s] = -1;
+    for (int s = 0; s < CM_MAX_SHARDS; s++) {
+        m->fds[s] = -1;
+#if defined(_WIN32)
+        m->io_hfiles[s] = INVALID_HANDLE_VALUE;
+#endif
+    }
     m->rope_theta = 10000.0f; m->rms_eps = 1e-5f; m->bos_id = 1; m->eos_id = 2; m->expert_weights_scale = 1.0f;
     m->embed_scale = 1.0f;
     m->use_nocache = (int)use_nocache;
@@ -17218,6 +17232,10 @@ int64_t tn_cumoe_load_gguf(int64_t path_cstr, int64_t cache_slots_per_layer, int
         m->total_disk_bytes += (uint64_t)st.st_size;
         m->fds[s] = cm_open_ro(shard_paths[s]);
         if (m->fds[s] < 0) { free(tlist); return 0; }
+#if defined(_WIN32)
+        // Dedicated FILE_FLAG_OVERLAPPED handle so production shard reads enter Windows 11 IOCP!
+        m->io_hfiles[s] = tn_io_win_open_overlapped(shard_paths[s], 0);
+#endif
         if (!m->use_nocache) {
 #if defined(_WIN32)
             HANDLE hf = (HANDLE)_get_osfhandle(m->fds[s]);
@@ -25069,6 +25087,10 @@ int64_t tn_cumoe_free(int64_t handle) {
 #if defined(_WIN32)
         if (m->mmap_ptrs[s]) { UnmapViewOfFile(m->mmap_ptrs[s]); m->mmap_ptrs[s] = NULL; }
         if (m->mmap_handles[s]) { CloseHandle(m->mmap_handles[s]); m->mmap_handles[s] = NULL; }
+        if (m->io_hfiles[s] && m->io_hfiles[s] != INVALID_HANDLE_VALUE) {
+            CloseHandle(m->io_hfiles[s]);
+            m->io_hfiles[s] = INVALID_HANDLE_VALUE;
+        }
 #else
         if (m->mmap_ptrs[s]) { munmap(m->mmap_ptrs[s], m->shard_sizes[s]); m->mmap_ptrs[s] = NULL; }
 #endif

@@ -697,32 +697,35 @@ static inline size_t tn_io_read_batch(TnIoEngine* io, const TnIoReq* reqs, int n
 #if defined(_WIN32)
     int lim = n_reqs < TN_IO_MAX_BATCH ? n_reqs : TN_IO_MAX_BATCH;
     HANDLE handles[TN_IO_MAX_BATCH];
-    for (int i = 0; i < lim; i++) handles[i] = tn_io_win_req_handle(&reqs[i]);
-
-    int all_iocp = (io && io->iocp != NULL && io->iocp_cs_ready) ? 1 : 0;
-    if (all_iocp) {
-        for (int i = 0; i < lim; i++) {
-            if (reqs[i].len == 0 || !reqs[i].dst) continue;
-            if (!tn_io_win_ensure_iocp_file(io, handles[i])) { all_iocp = 0; break; }
+    int use_iocp[TN_IO_MAX_BATCH];
+    int n_iocp_reqs = 0;
+    int n_ev_reqs = 0;
+    int can_iocp = (io && io->iocp != NULL && io->iocp_cs_ready) ? 1 : 0;
+    for (int i = 0; i < lim; i++) {
+        handles[i] = tn_io_win_req_handle(&reqs[i]);
+        use_iocp[i] = 0;
+        if (reqs[i].len == 0 || !reqs[i].dst || handles[i] == INVALID_HANDLE_VALUE) continue;
+        if (can_iocp && tn_io_win_ensure_iocp_file(io, handles[i])) {
+            use_iocp[i] = 1;
+            n_iocp_reqs++;
+        } else {
+            n_ev_reqs++;
         }
     }
-    if (all_iocp) {
-        // Multi-thread-safe IOCP demux:
-        //   1. All worker threads submit ReadFile concurrently with per-op `TnWinIoOp` (wrapping OVERLAPPED).
-        //   2. `rem` starts at 1 (submitter guard) so ops[] on this stack stays alive until EVERY accepted
-        //      ReadFile has posted its completion AND been matched via `entries[k].lpOverlapped`.
-        //   3. Leader-Follower reaping under `io->iocp_cs` / `io->iocp_cv` guarantees zero completion theft,
-        //      zero stack use-after-return, zero deadlocks, and zero per-batch kernel event allocations.
-        TnWinIoOp ops[TN_IO_MAX_BATCH];
-        volatile LONG rem = 1;
-        volatile LONG64 batch_bytes = 0;
+
+    // Path A (IOCP-associated handles): ALWAYS submit `TnWinIoOp` matched via `entries[k].lpOverlapped`.
+    // Submitter guard `rem = 1` keeps `ops[]` alive on this stack until every accepted ReadFile is reaped.
+    TnWinIoOp ops[TN_IO_MAX_BATCH];
+    volatile LONG rem = 1;
+    volatile LONG64 iocp_bytes = 0;
+    if (n_iocp_reqs > 0) {
         for (int i = 0; i < lim; i++) {
-            if (reqs[i].len == 0 || !reqs[i].dst || handles[i] == INVALID_HANDLE_VALUE) continue;
+            if (!use_iocp[i]) continue;
             memset(&ops[i], 0, sizeof(TnWinIoOp));
             ops[i].ov.Offset     = (DWORD)(reqs[i].off & 0xFFFFFFFFull);
             ops[i].ov.OffsetHigh = (DWORD)(reqs[i].off >> 32);
             ops[i].rem           = &rem;
-            ops[i].batch_bytes   = &batch_bytes;
+            ops[i].batch_bytes   = &iocp_bytes;
             InterlockedIncrement(&rem);
             DWORD got = 0;
             BOOL ok = ReadFile(handles[i], reqs[i].dst, (DWORD)reqs[i].len, &got, &ops[i].ov);
@@ -730,9 +733,40 @@ static inline size_t tn_io_read_batch(TnIoEngine* io, const TnIoReq* reqs, int n
                 InterlockedDecrement(&rem);
             }
         }
-        // Drop submitter guard reference (rem hits 0 iff all ops already completed or none were submitted)
-        InterlockedDecrement(&rem);
+    }
+    InterlockedDecrement(&rem);
 
+    // Path B (Non-IOCP handles): submit OVERLAPPED event reads with bit 0 of `hEvent` SET (`| 1u`),
+    // which per Microsoft Win32 docs strictly suppresses IOCP completion posting even if a handle was
+    // externally associated with an IOCP — guaranteeing ZERO non-`TnWinIoOp` pointers ever enter `io->iocp`.
+    OVERLAPPED ev_ovs[TN_IO_MAX_BATCH];
+    HANDLE raw_evs[TN_IO_MAX_BATCH];
+    int ev_inflight = 0;
+    if (n_ev_reqs > 0) {
+        memset(ev_ovs, 0, sizeof(ev_ovs));
+        memset(raw_evs, 0, sizeof(raw_evs));
+        for (int i = 0; i < lim; i++) {
+            if (use_iocp[i] || reqs[i].len == 0 || !reqs[i].dst || handles[i] == INVALID_HANDLE_VALUE) continue;
+            HANDLE ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+            if (!ev) continue;
+            ev_ovs[i].Offset     = (DWORD)(reqs[i].off & 0xFFFFFFFFull);
+            ev_ovs[i].OffsetHigh = (DWORD)(reqs[i].off >> 32);
+            ev_ovs[i].hEvent     = (HANDLE)((uintptr_t)ev | (uintptr_t)1u);
+            DWORD got = 0;
+            if (ReadFile(handles[i], reqs[i].dst, (DWORD)reqs[i].len, &got, &ev_ovs[i])) {
+                total += (size_t)got;
+                CloseHandle(ev);
+            } else if (GetLastError() == ERROR_IO_PENDING) {
+                raw_evs[i] = ev;
+                ev_inflight++;
+            } else {
+                CloseHandle(ev);
+            }
+        }
+    }
+
+    // Reap all Path A IOCP completions for this batch (Leader-Follower, lpOverlapped-demuxed)
+    if (n_iocp_reqs > 0) {
         OVERLAPPED_ENTRY entries[TN_IO_MAX_BATCH];
         EnterCriticalSection(&io->iocp_cs);
         while (InterlockedCompareExchange(&rem, 0, 0) > 0) {
@@ -749,7 +783,6 @@ static inline size_t tn_io_read_batch(TnIoEngine* io, const TnIoReq* reqs, int n
                         if (op->batch_bytes) {
                             InterlockedExchangeAdd64(op->batch_bytes, (LONG64)entries[k].dwNumberOfBytesTransferred);
                         }
-                        // Decrementing `op->rem` MUST be the very last touch of `op` (owning stack may unwind after 0)
                         if (op->rem) InterlockedDecrement(op->rem);
                     }
                 }
@@ -761,40 +794,19 @@ static inline size_t tn_io_read_batch(TnIoEngine* io, const TnIoReq* reqs, int n
             }
         }
         LeaveCriticalSection(&io->iocp_cs);
-        total = (size_t)InterlockedCompareExchange64(&batch_bytes, 0, 0);
-        if (io) {
-            TN_IO_ATOMIC_ADD64(&io->iocp_batches, 1);
-            TN_IO_ATOMIC_ADD64(&io->total_bytes, (int64_t)total);
-        }
-        return total;
+        total += (size_t)InterlockedCompareExchange64(&iocp_bytes, 0, 0);
+        TN_IO_ATOMIC_ADD64(&io->iocp_batches, 1);
     }
-    // Fallback OVERLAPPED event path if handle wasn't opened with FILE_FLAG_OVERLAPPED / IOCP association failed
-    OVERLAPPED ovs[TN_IO_MAX_BATCH];
-    memset(ovs, 0, sizeof(ovs));
-    int inflight = 0;
-    for (int i = 0; i < lim; i++) {
-        if (reqs[i].len == 0 || !reqs[i].dst || handles[i] == INVALID_HANDLE_VALUE) continue;
-        ovs[i].Offset     = (DWORD)(reqs[i].off & 0xFFFFFFFFull);
-        ovs[i].OffsetHigh = (DWORD)(reqs[i].off >> 32);
-        ovs[i].hEvent     = CreateEventA(NULL, TRUE, FALSE, NULL);
-        DWORD got = 0;
-        if (ReadFile(handles[i], reqs[i].dst, (DWORD)reqs[i].len, &got, &ovs[i])) {
-            total += (size_t)got;
-            CloseHandle(ovs[i].hEvent);
-            ovs[i].hEvent = NULL;
-        } else if (GetLastError() == ERROR_IO_PENDING) {
-            inflight++;
-        } else {
-            CloseHandle(ovs[i].hEvent);
-            ovs[i].hEvent = NULL;
-        }
-    }
-    for (int i = 0; i < lim && inflight > 0; i++) {
-        if (ovs[i].hEvent) {
+
+    // Reap any pending Path B event reads (wait on raw unmasked HANDLE, then GetOverlappedResult + CloseHandle)
+    for (int i = 0; i < lim && ev_inflight > 0; i++) {
+        if (raw_evs[i]) {
+            WaitForSingleObject(raw_evs[i], INFINITE);
             DWORD got = 0;
-            if (GetOverlappedResult(handles[i], &ovs[i], &got, TRUE)) total += (size_t)got;
-            CloseHandle(ovs[i].hEvent);
-            inflight--;
+            if (GetOverlappedResult(handles[i], &ev_ovs[i], &got, FALSE)) total += (size_t)got;
+            CloseHandle(raw_evs[i]);
+            raw_evs[i] = NULL;
+            ev_inflight--;
         }
     }
     if (io) TN_IO_ATOMIC_ADD64(&io->total_bytes, (int64_t)total);
@@ -924,7 +936,7 @@ static inline int tn_io_self_test(void) {
                 }
                 size_t got = tn_io_read_batch(&io, reqs, 4);
                 CloseHandle(hr);
-                if (got == N && memcmp(ref, dst, N) == 0) ok = 1;
+                if (got == N && memcmp(ref, dst, N) == 0 && io.iocp_batches > 0) ok = 1;
             }
             DeleteFileA(fname);
         }

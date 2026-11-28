@@ -436,13 +436,19 @@ int64_t tenon_cstr_to_text(int64_t ptr) {
 pub(crate) const TENON_AOT_SYNC_C: &str = r#"
 /* ===== Tenon Cross-OS (POSIX + Win32) Multi-Threading, Atomics, Mutex & MPMC Channel ===== */
 #if defined(_WIN32)
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
+#  ifndef TENON_WIN_PTHREAD_COMPAT
+#    define TENON_WIN_PTHREAD_COMPAT 1
+#    ifndef WIN32_LEAN_AND_MEAN
+#      define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
 typedef HANDLE pthread_t;
-typedef CRITICAL_SECTION pthread_mutex_t;
+typedef SRWLOCK pthread_mutex_t;
+#    define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
 typedef CONDITION_VARIABLE pthread_cond_t;
+typedef INIT_ONCE pthread_once_t;
+#    define PTHREAD_ONCE_INIT INIT_ONCE_STATIC_INIT
+typedef struct { DWORD idx; } pthread_key_t;
 typedef struct { void* (*fn)(void*); void* arg; } TenonWinThrArg;
 static DWORD WINAPI tenon_win_thr_entry(LPVOID p) {
     TenonWinThrArg* a = (TenonWinThrArg*)p;
@@ -465,15 +471,44 @@ static inline int pthread_join(pthread_t th, void** ret) {
     if (th) { WaitForSingleObject(th, INFINITE); CloseHandle(th); }
     return 0;
 }
-static inline int pthread_mutex_init(pthread_mutex_t* m, const void* a) { (void)a; InitializeCriticalSection(m); return 0; }
-static inline int pthread_mutex_destroy(pthread_mutex_t* m) { DeleteCriticalSection(m); return 0; }
-static inline int pthread_mutex_lock(pthread_mutex_t* m) { EnterCriticalSection(m); return 0; }
-static inline int pthread_mutex_unlock(pthread_mutex_t* m) { LeaveCriticalSection(m); return 0; }
+static inline int pthread_detach(pthread_t th) { if (th) CloseHandle(th); return 0; }
+static inline int pthread_mutex_init(pthread_mutex_t* m, const void* a) { (void)a; InitializeSRWLock(m); return 0; }
+static inline int pthread_mutex_destroy(pthread_mutex_t* m) { (void)m; return 0; }
+static inline int pthread_mutex_lock(pthread_mutex_t* m) { AcquireSRWLockExclusive(m); return 0; }
+static inline int pthread_mutex_unlock(pthread_mutex_t* m) { ReleaseSRWLockExclusive(m); return 0; }
 static inline int pthread_cond_init(pthread_cond_t* c, const void* a) { (void)a; InitializeConditionVariable(c); return 0; }
 static inline int pthread_cond_destroy(pthread_cond_t* c) { (void)c; return 0; }
-static inline int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) { SleepConditionVariableCS(c, m, INFINITE); return 0; }
+static inline int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) { SleepConditionVariableSRW(c, m, INFINITE, 0); return 0; }
 static inline int pthread_cond_signal(pthread_cond_t* c) { WakeConditionVariable(c); return 0; }
 static inline int pthread_cond_broadcast(pthread_cond_t* c) { WakeAllConditionVariable(c); return 0; }
+static inline int pthread_key_create(pthread_key_t* k, void (*dtor)(void*)) {
+#    if defined(_WIN64)
+    DWORD id = FlsAlloc((PFLS_CALLBACK_FUNCTION)(uintptr_t)dtor);
+    if (id == FLS_OUT_OF_INDEXES) return -1;
+#    else
+    (void)dtor;
+    DWORD id = TlsAlloc();
+    if (id == TLS_OUT_OF_INDEXES) return -1;
+#    endif
+    k->idx = id;
+    return 0;
+}
+static inline void* pthread_getspecific(pthread_key_t k) {
+#    if defined(_WIN64)
+    return FlsGetValue(k.idx);
+#    else
+    return TlsGetValue(k.idx);
+#    endif
+}
+static inline int pthread_setspecific(pthread_key_t k, const void* val) {
+#    if defined(_WIN64)
+    return FlsSetValue(k.idx, (PVOID)(uintptr_t)val) ? 0 : -1;
+#    else
+    return TlsSetValue(k.idx, (LPVOID)(uintptr_t)val) ? 0 : -1;
+#    endif
+}
+static inline int sched_yield(void) { SwitchToThread(); return 0; }
+#  endif
 #else
 #  include <pthread.h>
 #  include <time.h>
@@ -533,8 +568,14 @@ int64_t tenon_thread_sleep_ms(int64_t ms) {
 }
 
 int64_t tenon_thread_hw_concurrency(void) {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors > 0 ? (int64_t)si.dwNumberOfProcessors : 1;
+#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int64_t)n : 1;
+#endif
 }
 
 static inline int tenon_decode_ord(int64_t o) {
@@ -778,9 +819,11 @@ int64_t tenon_chan_close(int64_t ch_ptr) {
 }
 
 /* ===== Tenon Lock-Free P-Core SPMC Batch-Stealing M:N Preemptive Scheduler (Zero cgo Overhead!) ===== */
-#include <sched.h>
+#if !defined(_WIN32)
+#  include <sched.h>
+#endif
 #ifdef __APPLE__
-#include <sys/sysctl.h>
+#  include <sys/sysctl.h>
 #endif
 
 #define TN_MAX_WORKERS  16
@@ -1049,11 +1092,17 @@ static void tn_sched_run_task(TenonTask* t, int wid) {
 /* Go-style background sysmon preemption watchdog (500us quantum) */
 static void* tn_sysmon_loop(void* arg) {
     (void)arg;
+#if !defined(_WIN32)
     struct timespec ts;
     ts.tv_sec = 0;
     ts.tv_nsec = 500000L; /* 0.5 ms quantum */
+#endif
     for (;;) {
+#if defined(_WIN32)
+        Sleep(1);
+#else
         nanosleep(&ts, NULL);
+#endif
         int need_preempt = 0;
         for (int i = 0; i < g_num_workers; i++) {
             if (__atomic_load_n(&g_workers[i].busy, __ATOMIC_ACQUIRE)) {
@@ -1073,10 +1122,16 @@ static void* tn_sysmon_loop(void* arg) {
 }
 
 static inline uint64_t tn_fast_ticks(void) {
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(_WIN32)
     uint64_t v;
     __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
     return v;
+#elif defined(_WIN32)
+    static LARGE_INTEGER freq = {0};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER cnt;
+    QueryPerformanceCounter(&cnt);
+    return (uint64_t)((double)cnt.QuadPart * 1e9 / (double)(freq.QuadPart > 0 ? freq.QuadPart : 1));
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1200,7 +1255,13 @@ static void tn_sched_init_slow(void) {
 #endif
         pthread_key_create(&g_sched_tls_key, NULL);
         g_sched_tls_ready = 1;
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        long n = (long)(si.dwNumberOfProcessors > 0 ? si.dwNumberOfProcessors : 2);
+#else
         long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
 #ifdef __APPLE__
         /* Pin worker count strictly to Apple Silicon P-cores (hw.perflevel0.physicalcpu)
          * so NO worker is ever demoted onto slow E-cores (zero stragglers & zero oversubscription)! */
