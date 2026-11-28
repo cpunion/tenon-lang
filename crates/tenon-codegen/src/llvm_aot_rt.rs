@@ -5,7 +5,13 @@ pub(crate) const TENON_AOT_RUNTIME_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
 #ifdef TENON_THREAD_SAFE
-#include <pthread.h>
+#  if !defined(_WIN32)
+#    include <pthread.h>
+#  endif
+#endif
+#if defined(_WIN32) && !defined(_MSC_VER)
+/* MSVC-targeted .obj references _fltused from msvcrt; provide it for MinGW/zig cc toolchains. */
+int _fltused = 1;
 #endif
 
 typedef struct {
@@ -1114,8 +1120,18 @@ int main(void) {
 
 pub(crate) const TENON_AOT_OS_C: &str = r#"
 #include <errno.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#  include <direct.h>
+#  define tenon_os_getcwd(buf, sz) _getcwd((buf), (int)(sz))
+#  define tenon_os_popen(cmd, m)   _popen((cmd), (m))
+#  define tenon_os_pclose(fp)      _pclose(fp)
+#else
+#  include <sys/wait.h>
+#  include <unistd.h>
+#  define tenon_os_getcwd(buf, sz) getcwd((buf), (sz))
+#  define tenon_os_popen(cmd, m)   popen((cmd), (m))
+#  define tenon_os_pclose(fp)      pclose(fp)
+#endif
 
 static int g_stdin_eof = 0;
 static int g_file_ok = 1;
@@ -1181,7 +1197,7 @@ int64_t tenon_sys_env(int64_t key) {
 
 int64_t tenon_sys_cwd(void) {
     char buf[4096];
-    if (!getcwd(buf, sizeof(buf))) return tenon_text_new((int64_t)(uintptr_t)".", 1);
+    if (!tenon_os_getcwd(buf, sizeof(buf))) return tenon_text_new((int64_t)(uintptr_t)".", 1);
     return tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)strlen(buf));
 }
 
@@ -1241,7 +1257,7 @@ int64_t tenon_sys_exec(int64_t cmd) {
     char* wrapped = (char*)malloc(clen + 16);
     snprintf(wrapped, clen + 16, "%s 2>&1", c);
     free(c);
-    FILE* fp = popen(wrapped, "r");
+    FILE* fp = tenon_os_popen(wrapped, "r");
     free(wrapped);
     if (!fp) {
         g_exec_exit_code = -1;
@@ -1257,9 +1273,13 @@ int64_t tenon_sys_exec(int64_t cmd) {
             buf = (char*)realloc(buf, cap);
         }
     }
-    int st = pclose(fp);
+    int st = tenon_os_pclose(fp);
+#if defined(_WIN32)
+    g_exec_exit_code = (st >= 0) ? (int64_t)st : -1;
+#else
     if (WIFEXITED(st)) g_exec_exit_code = WEXITSTATUS(st);
     else g_exec_exit_code = -1;
+#endif
     int64_t res = tenon_text_new((int64_t)(uintptr_t)buf, (int64_t)len);
     free(buf);
     return res;

@@ -25,6 +25,7 @@
 #include "../common/tenon_io_hal.h"
 
 #if defined(_WIN32)
+#  include <io.h>
 #  define TN_ROCM_DLOPEN(name)       ((void*)LoadLibraryA(name))
 #  define TN_ROCM_DLSYM(lib, sym)    ((void*)GetProcAddress((HMODULE)(lib), (sym)))
 #else
@@ -1204,6 +1205,13 @@ int64_t tn_rocm_io_read_to_vram(int64_t fd, int64_t file_off, int64_t dst_dptr, 
         TnIoReq req;
         memset(&req, 0, sizeof(req));
         req.fd  = (int)fd;
+#if defined(_WIN32)
+        {
+            intptr_t osfh = _get_osfhandle((int)fd);
+            if (osfh == -1) break;
+            req.hfile = (HANDLE)osfh;
+        }
+#endif
         req.dst = stage;
         req.len = chunk;
         req.off = off;

@@ -42,11 +42,61 @@ struct DbInner {
 /// contracts `requires`/`ensures`, interfaces, attrs, reactive views, streams, protocols, etc.)
 /// WITHOUT function bodies.
 /// When only a function body changes, `program_signature_hash` stays identical -> Early Cutoff!
+fn hash_fn_signature(f: &tenon_syntax::FnDecl, out: &mut String) {
+    // Exhaustive destructuring ensures any future AST field on FnDecl triggers a compile error if unhashed.
+    let tenon_syntax::FnDecl {
+        attrs,
+        is_pub,
+        is_pure,
+        is_async,
+        is_test,
+        is_unsafe,
+        is_comptime,
+        is_ghost,
+        name,
+        type_params,
+        type_param_bounds,
+        params,
+        ret_ty,
+        requires,
+        ensures,
+        body: _,
+        span: _,
+    } = f;
+    out.push_str(&format!(
+        "fn:{}:{}:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}\n",
+        is_pub,
+        is_pure,
+        is_async,
+        is_test,
+        is_unsafe,
+        is_comptime,
+        is_ghost,
+        name,
+        attrs,
+        type_params,
+        type_param_bounds,
+        params,
+        ret_ty,
+        requires,
+        ensures,
+    ));
+}
+
 pub fn program_signature_hash(prog: &Program) -> String {
     let mut sig_buf = String::new();
+    sig_buf.push_str(&format!(
+        "prog_meta:{:?}:{:?}:{:?}\n",
+        prog.build_config, prog.file_packages, prog.test_file_ids
+    ));
     for item in &prog.items {
         match item {
-            Item::Import { path, alias, kind, .. } => {
+            Item::Import {
+                path,
+                alias,
+                kind,
+                span: _,
+            } => {
                 sig_buf.push_str(&format!("import:{}:{:?}:{:?}\n", path, alias, kind));
             }
             Item::Macro(m) => {
@@ -55,69 +105,184 @@ pub fn program_signature_hash(prog: &Program) -> String {
             Item::ComptimeBlock(b) => {
                 sig_buf.push_str(&format!("comptime:{:?}\n", b));
             }
-            Item::MacroCall { name, args, .. } => {
+            Item::MacroCall {
+                name,
+                args,
+                span: _,
+            } => {
                 sig_buf.push_str(&format!("mcall:{}:{:?}\n", name, args));
             }
-            Item::TypeAlias(ta) => {
+            Item::TypeAlias(tenon_syntax::TypeAliasDecl {
+                attrs,
+                is_pub,
+                is_distinct,
+                name,
+                type_params,
+                type_param_defaults,
+                variadic_param,
+                base,
+                predicate,
+                span: _,
+            }) => {
                 sig_buf.push_str(&format!(
-                    "ta:{}:{}:{:?}:{:?}:{:?}:{:?}\n",
-                    ta.is_pub, ta.name, ta.attrs, ta.type_params, ta.base, ta.predicate
+                    "ta:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}\n",
+                    is_pub,
+                    is_distinct,
+                    name,
+                    attrs,
+                    type_params,
+                    type_param_defaults,
+                    variadic_param,
+                    base,
+                    predicate
                 ));
             }
-            Item::Record(r) => {
+            Item::Record(tenon_syntax::RecordDecl {
+                attrs,
+                is_pub,
+                name,
+                type_params,
+                type_param_bounds,
+                type_param_defaults,
+                fields,
+                where_clauses,
+                invariants,
+                methods,
+                span: _,
+            }) => {
                 sig_buf.push_str(&format!(
-                    "rec:{}:{}:{:?}:{:?}:{:?}:{:?}\n",
-                    r.is_pub, r.name, r.attrs, r.type_params, r.fields, r.where_clauses
+                    "rec:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}\n",
+                    is_pub,
+                    name,
+                    attrs,
+                    type_params,
+                    type_param_bounds,
+                    type_param_defaults,
+                    fields,
+                    where_clauses,
+                    invariants
+                ));
+                for m in methods {
+                    sig_buf.push_str("  rec_m:");
+                    hash_fn_signature(m, &mut sig_buf);
+                }
+            }
+            Item::Enum(tenon_syntax::EnumDecl {
+                attrs,
+                is_pub,
+                name,
+                type_params,
+                type_param_bounds,
+                type_param_defaults,
+                variants,
+                span: _,
+            }) => {
+                sig_buf.push_str(&format!(
+                    "enum:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}\n",
+                    is_pub, name, attrs, type_params, type_param_bounds, type_param_defaults, variants
                 ));
             }
-            Item::Enum(e) => {
+            Item::Interface(tenon_syntax::InterfaceDecl {
+                attrs,
+                is_pub,
+                name,
+                type_params,
+                type_param_bounds,
+                assoc_types,
+                methods,
+                span: _,
+            }) => {
                 sig_buf.push_str(&format!(
-                    "enum:{}:{}:{:?}:{:?}:{:?}\n",
-                    e.is_pub, e.name, e.attrs, e.type_params, e.variants
-                ));
-            }
-            Item::Interface(i) => {
-                sig_buf.push_str(&format!(
-                    "iface:{}:{}:{:?}:{:?}:{:?}\n",
-                    i.is_pub, i.name, i.attrs, i.type_params, i.methods
+                    "iface:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}\n",
+                    is_pub, name, attrs, type_params, type_param_bounds, assoc_types, methods
                 ));
             }
             Item::Fn(f) => {
+                hash_fn_signature(f, &mut sig_buf);
+            }
+            Item::ExternFn(tenon_syntax::ExternFnDecl {
+                attrs,
+                is_pub,
+                abi,
+                name,
+                params,
+                ret_ty,
+                is_variadic,
+                link_lib,
+                span: _,
+            }) => {
                 sig_buf.push_str(&format!(
-                    "fn:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}\n",
-                    f.is_pub,
-                    f.is_pure,
-                    f.is_async,
-                    f.is_ghost,
-                    f.name,
-                    f.type_params,
-                    f.params,
-                    f.ret_ty,
-                    (&f.requires, &f.ensures, &f.attrs)
+                    "ext:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}\n",
+                    is_pub, abi, name, is_variadic, link_lib, attrs, params, ret_ty
                 ));
             }
-            Item::ExternFn(ef) => {
-                sig_buf.push_str(&format!("ext:{}:{:?}:{:?}:{:?}\n", ef.name, ef.attrs, ef.params, ef.ret_ty));
+            Item::Const(tenon_syntax::ConstDecl {
+                attrs,
+                is_pub,
+                name,
+                ty,
+                value,
+                span: _,
+            }) => {
+                sig_buf.push_str(&format!(
+                    "const:{}:{}:{:?}:{:?}:{:?}\n",
+                    is_pub, name, attrs, ty, value
+                ));
             }
-            Item::Const(c) => {
-                sig_buf.push_str(&format!("const:{}:{:?}:{:?}:{:?}\n", c.name, c.attrs, c.ty, c.value));
+            Item::Bitfield(tenon_syntax::BitfieldDecl {
+                attrs,
+                is_pub,
+                name,
+                backing_ty,
+                fields,
+                span: _,
+            }) => {
+                sig_buf.push_str(&format!(
+                    "bf:{}:{}:{:?}:{:?}:{:?}\n",
+                    is_pub, name, attrs, backing_ty, fields
+                ));
             }
-            Item::Bitfield(b) => {
-                sig_buf.push_str(&format!("bf:{}:{:?}:{:?}:{:?}\n", b.name, b.attrs, b.backing_ty, b.fields));
+            Item::Union(tenon_syntax::UnionDecl {
+                attrs,
+                is_pub,
+                name,
+                fields,
+                span: _,
+            }) => {
+                sig_buf.push_str(&format!(
+                    "union:{}:{}:{:?}:{:?}\n",
+                    is_pub, name, attrs, fields
+                ));
             }
-            Item::Union(u) => {
-                sig_buf.push_str(&format!("union:{}:{:?}:{:?}\n", u.name, u.attrs, u.fields));
+            Item::AttrDecl(tenon_syntax::AttrDecl {
+                attrs,
+                is_pub,
+                name,
+                params,
+                span: _,
+            }) => {
+                sig_buf.push_str(&format!(
+                    "attr:{}:{}:{:?}:{:?}\n",
+                    is_pub, name, attrs, params
+                ));
             }
-            Item::AttrDecl(a) => {
-                sig_buf.push_str(&format!("attr:{}:{:?}\n", a.name, a.params));
-            }
-            Item::Impl(imp) => {
-                sig_buf.push_str(&format!("impl:{:?}:{:?}\n", imp.interface, imp.target_ty));
-                for m in &imp.methods {
-                    sig_buf.push_str(&format!(
-                        "  m:{}:{:?}:{:?}:{:?}:{:?}\n",
-                        m.name, m.attrs, m.params, m.ret_ty, (&m.requires, &m.ensures)
-                    ));
+            Item::Impl(tenon_syntax::ImplDecl {
+                attrs,
+                type_params,
+                type_param_bounds,
+                interface,
+                target_ty,
+                assoc_bindings,
+                methods,
+                span: _,
+            }) => {
+                sig_buf.push_str(&format!(
+                    "impl:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}\n",
+                    attrs, type_params, type_param_bounds, interface, target_ty, assoc_bindings
+                ));
+                for m in methods {
+                    sig_buf.push_str("  impl_m:");
+                    hash_fn_signature(m, &mut sig_buf);
                 }
             }
             Item::Evolution(ev) => {
@@ -153,14 +318,22 @@ pub fn program_fn_body_hashes(prog: &Program) -> BTreeMap<String, String> {
         } else if let Item::Impl(imp) = item {
             for m in &imp.methods {
                 let s = format!("{:?}", m.body);
-                out.insert(format!("{}::{}", imp.target_ty.display_name(), m.name), sha256_hex(s.as_bytes()));
+                out.insert(
+                    format!("{}::{}", imp.target_ty.display_name(), m.name),
+                    sha256_hex(s.as_bytes()),
+                );
+            }
+        } else if let Item::Record(r) = item {
+            for m in &r.methods {
+                let s = format!("{:?}", m.body);
+                out.insert(format!("{}::{}", r.name, m.name), sha256_hex(s.as_bytes()));
             }
         }
     }
     out
 }
 
-/// Computes a full structural hash of a parsed `Program` (signatures + all bodies).
+/// Computes a full structural hash of a parsed `Program` (exhaustive AST + metadata).
 pub fn program_full_hash(prog: &Program) -> String {
     let sig = program_signature_hash(prog);
     let bodies = program_fn_body_hashes(prog);
@@ -171,6 +344,14 @@ pub fn program_full_hash(prog: &Program) -> String {
         acc.push('=');
         acc.push_str(&v);
     }
+    // Also fold the complete Debug representation of the AST & build metadata so NO field
+    // (including spans, variadic flags, ABI, invariants, or future fields) can ever alias.
+    let full_ast = format!(
+        "{:?}|{:?}|{:?}|{:?}",
+        prog.items, prog.build_config, prog.file_packages, prog.test_file_ids
+    );
+    acc.push('|');
+    acc.push_str(&sha256_hex(full_ast.as_bytes()));
     sha256_hex(acc.as_bytes())
 }
 
@@ -301,15 +482,15 @@ impl IncrementalDb {
     }
 }
 
-/// Persistent disk verification cache (`.tenon-cache/verify_v2.json`) keyed by full structural
-/// SHA-256 hash (`program_full_hash` covering all items including reactive views, streams, protocols).
+/// Persistent disk verification cache (`.tenon-cache/verify_v3.json`) keyed by full structural
+/// SHA-256 hash (`program_full_hash` covering all items, fields, variadic flags, views, metadata).
 /// Returns `(CheckReport, cache_hit)`.
 pub fn check_program_cached_on_disk(
     prog: &Program,
     cache_dir: &std::path::Path,
 ) -> (CheckReport, bool) {
-    let key = format!("v2_{}", program_full_hash(prog));
-    let cache_file = cache_dir.join("verify_v2.json");
+    let key = format!("v3_{}", program_full_hash(prog));
+    let cache_file = cache_dir.join("verify_v3.json");
     let mut map: BTreeMap<String, CheckReport> = std::fs::read_to_string(&cache_file)
         .ok()
         .and_then(|txt| serde_json::from_str(&txt).ok())
@@ -327,7 +508,7 @@ pub fn check_program_cached_on_disk(
         map.insert(key, report.clone());
         let _ = std::fs::create_dir_all(cache_dir);
         if let Ok(json) = serde_json::to_string(&map) {
-            let tmp = cache_dir.join(format!("verify_v2_{}.tmp", std::process::id()));
+            let tmp = cache_dir.join(format!("verify_v3_{}.tmp", std::process::id()));
             if std::fs::write(&tmp, json).is_ok() {
                 let _ = std::fs::rename(&tmp, &cache_file);
             }
@@ -387,6 +568,47 @@ pub reactive view SyncView(session_id Text) {
             !r3.ok && r3.diagnostics.iter().any(|d| d.code == "P2014"),
             "NeverReset with bounded journal_budget must fail with P2014, got: {:?}",
             r3.diagnostics
+        );
+    }
+
+    #[test]
+    fn extern_fn_is_variadic_change_invalidates_disk_and_memory_cache() {
+        let var_src = r#"
+extern "C" {
+    fn mysum(a Int, ...) Int
+}
+pub fn main() Int {
+    unsafe { mysum(1, 2) }
+}
+"#;
+        let nonvar_src = var_src.replace(", ...", "     ");
+        let var_prog = parse(var_src).unwrap();
+        let nonvar_prog = parse(&nonvar_src).unwrap();
+        assert_ne!(
+            program_signature_hash(&var_prog),
+            program_signature_hash(&nonvar_prog),
+            "ExternFn.is_variadic change must invalidate program_signature_hash"
+        );
+        assert_ne!(
+            program_full_hash(&var_prog),
+            program_full_hash(&nonvar_prog),
+            "ExternFn.is_variadic change must invalidate program_full_hash"
+        );
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "tenon_verify_variadic_cache_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let (r1, hit1) = check_program_cached_on_disk(&var_prog, &cache_dir);
+        assert!(r1.ok && !hit1, "variadic extern call should pass with miss");
+        let (r2, hit2) = check_program_cached_on_disk(&nonvar_prog, &cache_dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        assert!(!hit2, "removing `, ...` must NEVER hit variadic cache entry");
+        assert!(
+            !r2.ok && r2.diagnostics.iter().any(|d| d.code == "E0202"),
+            "non-variadic call with extra arg must fail with E0202, got: {:?}",
+            r2.diagnostics
         );
     }
 }

@@ -813,14 +813,14 @@ int64_t tn_vk_flash_attn_paged(
     int64_t q_buf, int64_t kc_buf, int64_t vc_buf, int64_t bt_buf, int64_t o_buf,
     int64_t B, int64_t n_qh, int64_t n_kvh, int64_t hd, int64_t kv_base_pos, int64_t page_sz,
     double scale, int64_t swa_win) {
-    if (!g_vk.compute_ready || B <= 0 || n_qh <= 0 || hd <= 0) return 0;
+    if (!g_vk.compute_ready || B <= 0 || n_qh <= 0 || n_kvh <= 0 || hd <= 0 || page_sz <= 0) return 0;
     struct {
         uint32_t B, n_qh, n_kvh, hd, kv_base_pos, page_sz;
         float scale;
         uint32_t swa_win;
     } pc = {
         (uint32_t)B, (uint32_t)n_qh, (uint32_t)n_kvh, (uint32_t)hd,
-        (uint32_t)kv_base_pos, (uint32_t)(page_sz > 0 ? page_sz : 4),
+        (uint32_t)kv_base_pos, (uint32_t)page_sz,
         (float)scale, (uint32_t)(swa_win > 0 ? swa_win : 0)
     };
     int64_t bufs[5] = { q_buf, kc_buf, vc_buf, bt_buf, o_buf };
@@ -983,6 +983,28 @@ int64_t tn_vk_self_test(void) {
     }
     tn_vk_buf_free(bq); tn_vk_buf_free(bk); tn_vk_buf_free(bv); tn_vk_buf_free(bt); tn_vk_buf_free(bo);
     if (!ok) return 0;
+
+    // 3b. Paged FlashAttention-2 Large Head-Dim (hd=512 > 256) verification: ensures dims 256..511 are never dropped!
+    {
+        const uint32_t LHD = 512u;
+        float lq[512], lk[512], lv[512], lo[512];
+        int32_t lbt[1] = { 0 };
+        for (uint32_t d = 0; d < LHD; d++) { lq[d] = 0.05f; lk[d] = 0.05f; lv[d] = 1.0f; lo[d] = 0.0f; }
+        int64_t blq = tn_vk_buf_create((int64_t)(uintptr_t)lq, (int64_t)sizeof(lq));
+        int64_t blk = tn_vk_buf_create((int64_t)(uintptr_t)lk, (int64_t)sizeof(lk));
+        int64_t blv = tn_vk_buf_create((int64_t)(uintptr_t)lv, (int64_t)sizeof(lv));
+        int64_t blt = tn_vk_buf_create((int64_t)(uintptr_t)lbt, (int64_t)sizeof(lbt));
+        int64_t blo = tn_vk_buf_create(0, (int64_t)sizeof(lo));
+        ok = tn_vk_flash_attn_paged(blq, blk, blv, blt, blo, 1, 1, 1, LHD, 0, 1, 1.0 / sqrt((double)LHD), 0) ? 1 : 0;
+        if (ok) {
+            tn_vk_buf_read(blo, (int64_t)(uintptr_t)lo, (int64_t)sizeof(lo));
+            for (uint32_t d = 0; d < LHD; d++) {
+                if (fabsf(lo[d] - 1.0f) > 1e-4f) { ok = 0; break; }
+            }
+        }
+        tn_vk_buf_free(blq); tn_vk_buf_free(blk); tn_vk_buf_free(blv); tn_vk_buf_free(blt); tn_vk_buf_free(blo);
+        if (!ok) return 0;
+    }
 
     // 4. Vulkan 1.3 Hardware DP4A (`VK_KHR_shader_integer_dot_product` / OpSDot) Q4_0 x Q8 GEMM verification
     if (g_vk.pipe_q4_dp4a.pipe != 0) {

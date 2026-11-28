@@ -215,11 +215,16 @@ impl<'a> WasmFnEmitter<'a> {
                 self.emit_stmt(s)?;
             }
             if let Some(t) = &blk.tail {
-                let ty = self.emit_expr(t)?;
-                if !want_val {
-                    self.code.push(0x1A); // drop
+                let maybe_ty = self.emit_expr_opt(t)?;
+                match maybe_ty {
+                    Some(ty) => {
+                        if !want_val {
+                            self.code.push(0x1A); // drop
+                        }
+                        Ok(Some(ty))
+                    }
+                    None => Ok(None), // tail expression itself diverged (`unreachable` / `return` in all branches)
                 }
-                Ok(Some(ty))
             } else {
                 let diverges = matches!(
                     blk.stmts.last(),
@@ -239,6 +244,77 @@ impl<'a> WasmFnEmitter<'a> {
         })();
         self.locals = saved_locals;
         res
+    }
+
+    fn emit_expr_opt(&mut self, expr: &Expr) -> Result<Option<WasmTy>, String> {
+        match &expr.kind {
+            ExprKind::If {
+                cond,
+                then_block,
+                else_branch,
+            } => {
+                let _ = self.emit_expr(cond)?;
+                self.code.extend_from_slice(&[0x42, 0x00, 0x52]); // i64.const 0; i64.ne -> i32
+                let has_else = else_branch.is_some();
+                let if_ty_pos = self.code.len() + 1;
+                if has_else {
+                    self.code.extend_from_slice(&[0x04, WasmTy::I64.byte()]); // placeholder, patched after branches!
+                } else {
+                    self.code.extend_from_slice(&[0x04, 0x40]); // if (void)
+                }
+                self.nesting += 1;
+                let t_ty = self.emit_block_branch(then_block, has_else)?;
+                let mut both_diverge = false;
+                let final_ty = if let Some(eb) = else_branch {
+                    self.code.push(0x05); // else
+                    let e_ty = match &eb.kind {
+                        ExprKind::Block(b) | ExprKind::Unsafe(b) => self.emit_block_branch(b, true)?,
+                        _ => self.emit_expr_opt(eb)?,
+                    };
+                    match (t_ty, e_ty) {
+                        (Some(a), Some(b)) if a == b => {
+                            self.code[if_ty_pos] = a.byte();
+                            Some(a)
+                        }
+                        (Some(a), None) => {
+                            self.code[if_ty_pos] = a.byte();
+                            Some(a)
+                        }
+                        (None, Some(b)) => {
+                            self.code[if_ty_pos] = b.byte();
+                            Some(b)
+                        }
+                        (None, None) => {
+                            // Both branches terminate control flow (`return`/`break`/`continue`):
+                            // emit `if (void) ... else ... end; unreachable` so the post-if stack is
+                            // polymorphic and valid in ANY expected context (f64, i64, or void)!
+                            self.code[if_ty_pos] = 0x40;
+                            both_diverge = true;
+                            None
+                        }
+                        (Some(a), Some(b)) => {
+                            return Err(format!(
+                                "wasm32 if/else branch type mismatch: {:?} vs {:?}",
+                                a, b
+                            ));
+                        }
+                    }
+                } else {
+                    Some(WasmTy::I64)
+                };
+                self.nesting -= 1;
+                self.code.push(0x0B); // end
+                if both_diverge {
+                    self.code.push(0x00); // unreachable -> polymorphic Wasm stack
+                } else if !has_else {
+                    self.code.push(0x42);
+                    push_sleb64(&mut self.code, 0);
+                }
+                Ok(final_ty)
+            }
+            ExprKind::Block(b) | ExprKind::Unsafe(b) => self.emit_block_branch(b, true),
+            _ => Ok(Some(self.emit_expr(expr)?)),
+        }
     }
 
     fn emit_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
@@ -483,54 +559,9 @@ impl<'a> WasmFnEmitter<'a> {
                 }
                 Ok(dst)
             }
-            ExprKind::If {
-                cond,
-                then_block,
-                else_branch,
-            } => {
-                let _ = self.emit_expr(cond)?;
-                self.code.extend_from_slice(&[0x42, 0x00, 0x52]); // i64.const 0; i64.ne -> i32
-                let has_else = else_branch.is_some();
-                let if_ty_pos = self.code.len() + 1;
-                if has_else {
-                    self.code.extend_from_slice(&[0x04, WasmTy::I64.byte()]); // placeholder, patched after branches!
-                } else {
-                    self.code.extend_from_slice(&[0x04, 0x40]); // if (void)
-                }
-                self.nesting += 1;
-                let t_ty = self.emit_block_branch(then_block, has_else)?;
-                let final_ty = if let Some(eb) = else_branch {
-                    self.code.push(0x05); // else
-                    let e_ty = match &eb.kind {
-                        ExprKind::Block(b) | ExprKind::Unsafe(b) => self.emit_block_branch(b, true)?,
-                        _ => Some(self.emit_expr(eb)?),
-                    };
-                    let res = match (t_ty, e_ty) {
-                        (Some(a), Some(b)) if a == b => a,
-                        (Some(a), None) => a,
-                        (None, Some(b)) => b,
-                        (None, None) => WasmTy::I64,
-                        (Some(a), Some(b)) => {
-                            return Err(format!(
-                                "wasm32 if/else branch type mismatch: {:?} vs {:?}",
-                                a, b
-                            ));
-                        }
-                    };
-                    self.code[if_ty_pos] = res.byte();
-                    res
-                } else {
-                    WasmTy::I64
-                };
-                self.nesting -= 1;
-                self.code.push(0x0B); // end
-                if !has_else {
-                    self.code.push(0x42);
-                    push_sleb64(&mut self.code, 0);
-                }
-                Ok(final_ty)
+            ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::Unsafe(_) => {
+                Ok(self.emit_expr_opt(expr)?.unwrap_or(WasmTy::I64))
             }
-            ExprKind::Block(b) | ExprKind::Unsafe(b) => self.emit_block(b, true),
             ExprKind::Call { callee, args } => {
                 let ExprKind::Ident(fname) = &callee.kind else {
                     return Err("indirect calls not yet supported in general wasm32 MVP".into());
@@ -576,7 +607,7 @@ fn compile_wasm_fn(
         loop_depths: Vec::new(),
     };
     let want_ret = f.ret_ty.is_some();
-    let _ = emitter.emit_block(&f.body, want_ret)?;
+    let _ = emitter.emit_block_branch(&f.body, want_ret)?;
     emitter.code.push(0x0B); // end function
 
     let mut body = Vec::new();
@@ -715,6 +746,14 @@ pub fn choose_float(b Bool) Float {
 pub fn choose_nested_float(k Int) Float {
     if k < 0 { -1.25 } else if k == 0 { 0.5 } else { 3.75 }
 }
+
+pub fn choose_both_return_float(b Bool) Float {
+    if b { return 1.5 } else { return 2.5 }
+}
+
+pub fn choose_nested_return_float(k Int) Float {
+    if k < 0 { return -4.5 } else if k == 0 { return 0.25 } else { return 9.75 }
+}
 "#)
         .unwrap();
         let rep = tenon_verify::check_program(&prog);
@@ -727,7 +766,7 @@ pub fn choose_nested_float(k Int) Float {
         ));
         std::fs::write(&tmp, &bytes).unwrap();
         let js = format!(
-            "const fs=require('fs');const buf=fs.readFileSync({:?});WebAssembly.instantiate(buf).then(({{instance}})=>{{const e=instance.exports;const r=[Number(e.test_short_circuit_and()),Number(e.test_short_circuit_or()),Number(e.test_short_circuit_rhs_runs_when_needed()),Number(e.test_block_shadowing()),e.choose_float(1n),e.choose_float(0n),e.choose_nested_float(-1n),e.choose_nested_float(0n),e.choose_nested_float(5n)];console.log(JSON.stringify(r));if(r[0]!==0||r[1]!==0||r[2]!==10||r[3]!==122||r[4]!==1.5||r[5]!==2.5||r[6]!==-1.25||r[7]!==0.5||r[8]!==3.75)process.exit(1);}});",
+            "const fs=require('fs');const buf=fs.readFileSync({:?});WebAssembly.instantiate(buf).then(({{instance}})=>{{const e=instance.exports;const r=[Number(e.test_short_circuit_and()),Number(e.test_short_circuit_or()),Number(e.test_short_circuit_rhs_runs_when_needed()),Number(e.test_block_shadowing()),e.choose_float(1n),e.choose_float(0n),e.choose_nested_float(-1n),e.choose_nested_float(0n),e.choose_nested_float(5n),e.choose_both_return_float(1n),e.choose_both_return_float(0n),e.choose_nested_return_float(-1n),e.choose_nested_return_float(0n),e.choose_nested_return_float(7n)];console.log(JSON.stringify(r));if(r[0]!==0||r[1]!==0||r[2]!==10||r[3]!==122||r[4]!==1.5||r[5]!==2.5||r[6]!==-1.25||r[7]!==0.5||r[8]!==3.75||r[9]!==1.5||r[10]!==2.5||r[11]!==-4.5||r[12]!==0.25||r[13]!==9.75)process.exit(1);}});",
             tmp.to_str().unwrap()
         );
         let out = Command::new("node").args(["-e", &js]).output().unwrap();

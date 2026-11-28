@@ -1041,6 +1041,53 @@ fn cross_gpu_link_bundle_uses_strictly_relative_paths_and_copies_local_headers()
                     "bundled local header tenon_io_hal.h missing in {:?}",
                     src_dir
                 );
+                // Verify the generated runtime C file (`*_rt.c`), bundled CUDA shim, and target `.obj`/`.o`
+                // full-link into a real Windows PE32+ `.exe` / Linux ELF binary when `zig` is installed.
+                if let Ok(zig_ver) = Command::new("zig").arg("version").output() {
+                    if zig_ver.status.success() {
+                        let is_win = target_name.starts_with("windows");
+                        let zig_target = if is_win {
+                            "x86_64-windows-gnu"
+                        } else {
+                            "x86_64-linux-gnu"
+                        };
+                        let obj_path = tmp_dir.join(format!(
+                            "srv_{}.{}",
+                            target_name,
+                            if is_win { "obj" } else { "o" }
+                        ));
+                        let rt_c_path = tmp_dir.join(format!("srv_{}_rt.c", target_name));
+                        let shim_c_path = src_dir.join("cuda/moe_stream_cuda_shim.c");
+                        let linked_out = tmp_dir.join(format!(
+                            "srv_{}_linked{}",
+                            target_name,
+                            if is_win { ".exe" } else { "" }
+                        ));
+                        let mut cmd = Command::new("zig");
+                        cmd.args([
+                            "cc",
+                            "-target",
+                            zig_target,
+                            "-O2",
+                            obj_path.to_str().unwrap(),
+                            rt_c_path.to_str().unwrap(),
+                            shim_c_path.to_str().unwrap(),
+                        ]);
+                        if is_win {
+                            cmd.arg("-lws2_32");
+                        } else {
+                            cmd.args(["-lm", "-ldl", "-lpthread", "-lrt"]);
+                        }
+                        cmd.args(["-o", linked_out.to_str().unwrap()]);
+                        let chk = cmd.output().expect("run zig cc link");
+                        assert!(
+                            chk.status.success() && linked_out.exists(),
+                            "zig cc -target {} full link failed:\n{}",
+                            zig_target,
+                            String::from_utf8_lossy(&chk.stderr)
+                        );
+                    }
+                }
             }
             let _ = std::fs::remove_dir_all(&tmp_dir);
         })

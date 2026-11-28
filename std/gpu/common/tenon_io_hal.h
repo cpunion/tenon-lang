@@ -25,6 +25,7 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+#  include <io.h>
 #  define TN_IO_ATOMIC_ADD64(p, v) InterlockedExchangeAdd64((volatile LONG64*)(p), (LONG64)(v))
 #elif defined(__APPLE__)
 #  include <unistd.h>
@@ -159,10 +160,13 @@ typedef struct {
     pfn_cuFileRead              cuFileRead;
 #endif
 #if defined(_WIN32)
-    HANDLE   iocp;
-    volatile long iocp_lock;
-    HANDLE   iocp_files[TN_IO_MAX_IOCP_FILES];
-    int      iocp_file_count;
+    HANDLE             iocp;
+    CRITICAL_SECTION   iocp_cs;
+    CONDITION_VARIABLE iocp_cv;
+    int                iocp_cs_ready;
+    int                iocp_leader_active;
+    HANDLE             iocp_files[TN_IO_MAX_IOCP_FILES];
+    int                iocp_file_count;
 #endif
 } TnIoEngine;
 
@@ -207,6 +211,10 @@ static inline int tn_io_init(TnIoEngine* io, int use_nocache) {
     io->backend_id = TN_IO_BACKEND_MACOS_RDADVISE;
     return 1;
 #elif defined(_WIN32)
+    InitializeCriticalSection(&io->iocp_cs);
+    InitializeConditionVariable(&io->iocp_cv);
+    io->iocp_cs_ready = 1;
+    io->iocp_leader_active = 0;
     io->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     io->backend_id = TN_IO_BACKEND_WIN_IOCP;
     return 1;
@@ -301,7 +309,8 @@ static inline int tn_io_init(TnIoEngine* io, int use_nocache) {
 static inline int tn_io_register_buffers(TnIoEngine* io, void* const* ptrs, const size_t* lens, int count) {
     if (!io || !ptrs || !lens || count <= 0) return 0;
     if (count > TN_IO_MAX_REG_BUFS) count = TN_IO_MAX_REG_BUFS;
-#if defined(__linux__) && defined(TENON_HAVE_IO_URING_HDR) && defined(__NR_io_uring_register) && defined(IORING_REGISTER_BUFFERS)
+    // Note: IORING_REGISTER_BUFFERS / IORING_UNREGISTER_BUFFERS are C enums (not #define macros) in <linux/io_uring.h> since Linux 5.1.
+#if defined(__linux__) && defined(TENON_HAVE_IO_URING_HDR) && defined(__NR_io_uring_register)
     if (io->uring_ready) {
         while (__sync_lock_test_and_set(&io->uring_lock, 1)) {}
         if (io->reg_buf_count > 0) {
@@ -341,7 +350,8 @@ static inline int tn_io_register_buffers(TnIoEngine* io, void* const* ptrs, cons
 static inline int tn_io_register_files(TnIoEngine* io, const int* fds, int count) {
     if (!io || !fds || count <= 0) return 0;
     if (count > TN_IO_MAX_REG_FILES) count = TN_IO_MAX_REG_FILES;
-#if defined(__linux__) && defined(TENON_HAVE_IO_URING_HDR) && defined(__NR_io_uring_register) && defined(IORING_REGISTER_FILES)
+    // Note: IORING_REGISTER_FILES / IORING_UNREGISTER_FILES are C enums (not #define macros) in <linux/io_uring.h> since Linux 5.1.
+#if defined(__linux__) && defined(TENON_HAVE_IO_URING_HDR) && defined(__NR_io_uring_register)
     if (io->uring_ready) {
         while (__sync_lock_test_and_set(&io->uring_lock, 1)) {}
         if (io->reg_file_count > 0) {
@@ -411,10 +421,8 @@ static inline void tn_io_destroy(TnIoEngine* io) {
     if (!io) return;
 #if defined(__linux__) && defined(TENON_HAVE_IO_URING_HDR)
     if (io->uring_ready) {
-#  if defined(__NR_io_uring_register) && defined(IORING_UNREGISTER_BUFFERS)
+#  if defined(__NR_io_uring_register)
         if (io->reg_buf_count > 0) (void)syscall(__NR_io_uring_register, io->uring_fd, IORING_UNREGISTER_BUFFERS, NULL, 0u);
-#  endif
-#  if defined(__NR_io_uring_register) && defined(IORING_UNREGISTER_FILES)
         if (io->reg_file_count > 0) (void)syscall(__NR_io_uring_register, io->uring_fd, IORING_UNREGISTER_FILES, NULL, 0u);
 #  endif
         if (io->sq_ring) munmap(io->sq_ring, io->sq_ring_sz);
@@ -451,6 +459,8 @@ static inline void tn_io_destroy(TnIoEngine* io) {
 #endif
 #if defined(_WIN32)
     if (io->iocp) { CloseHandle(io->iocp); io->iocp = NULL; }
+    if (io->iocp_cs_ready) { DeleteCriticalSection(&io->iocp_cs); io->iocp_cs_ready = 0; }
+    io->iocp_leader_active = 0;
     io->iocp_file_count = 0;
 #endif
 }
@@ -526,17 +536,32 @@ static inline int tn_io_find_reg_file(const TnIoEngine* io, int fd) {
 #endif
 
 #if defined(_WIN32)
+typedef struct {
+    OVERLAPPED       ov;          // MUST be first field so (TnWinIoOp*)entry.lpOverlapped is exact!
+    volatile LONG*   rem;         // Owning batch's remaining-inflight refcount
+    volatile LONG64* batch_bytes; // Owning batch's transferred bytes accumulator
+} TnWinIoOp;
+
 static inline HANDLE tn_io_win_open_overlapped(const char* path, int use_nocache) {
     if (!path) return INVALID_HANDLE_VALUE;
     DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN;
     if (use_nocache) flags |= FILE_FLAG_NO_BUFFERING;
     return CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, flags, NULL);
 }
+static inline HANDLE tn_io_win_req_handle(const TnIoReq* r) {
+    if (!r) return INVALID_HANDLE_VALUE;
+    if (r->hfile && r->hfile != INVALID_HANDLE_VALUE) return r->hfile;
+    if (r->fd >= 0) {
+        intptr_t osfh = _get_osfhandle(r->fd);
+        if (osfh != -1) return (HANDLE)osfh;
+    }
+    return INVALID_HANDLE_VALUE;
+}
 static inline int tn_io_win_ensure_iocp_file(TnIoEngine* io, HANDLE hfile) {
-    if (!io || !io->iocp || hfile == INVALID_HANDLE_VALUE || !hfile) return 0;
-    while (InterlockedCompareExchange(&io->iocp_lock, 1, 0) != 0) {}
+    if (!io || !io->iocp || !io->iocp_cs_ready || hfile == INVALID_HANDLE_VALUE || !hfile) return 0;
+    EnterCriticalSection(&io->iocp_cs);
     for (int i = 0; i < io->iocp_file_count; i++) {
-        if (io->iocp_files[i] == hfile) { InterlockedExchange(&io->iocp_lock, 0); return 1; }
+        if (io->iocp_files[i] == hfile) { LeaveCriticalSection(&io->iocp_cs); return 1; }
     }
     int ok = 0;
     if (io->iocp_file_count < TN_IO_MAX_IOCP_FILES) {
@@ -545,7 +570,7 @@ static inline int tn_io_win_ensure_iocp_file(TnIoEngine* io, HANDLE hfile) {
             ok = 1;
         }
     }
-    InterlockedExchange(&io->iocp_lock, 0);
+    LeaveCriticalSection(&io->iocp_cs);
     return ok;
 }
 #endif
@@ -573,14 +598,12 @@ static inline size_t tn_io_read_batch(TnIoEngine* io, const TnIoReq* reqs, int n
             memset(sqe, 0, sizeof(*sqe));
             int bidx = (io->reg_buf_count > 0) ? tn_io_find_reg_buf(io, reqs[i].dst, reqs[i].len) : -1;
             int fidx = (io->reg_file_count > 0) ? tn_io_find_reg_file(io, reqs[i].fd) : -1;
-#  ifdef IORING_OP_READ_FIXED
+            // Note: IORING_OP_READ_FIXED is a C enum in <linux/io_uring.h> (not a #define macro).
             if (bidx >= 0) {
                 sqe->opcode    = IORING_OP_READ_FIXED;
                 sqe->buf_index = (uint16_t)bidx;
                 fixed_hits++;
-            } else
-#  endif
-            {
+            } else {
                 sqe->opcode    = IORING_OP_READ;
             }
 #  ifdef IOSQE_FIXED_FILE
@@ -673,36 +696,72 @@ static inline size_t tn_io_read_batch(TnIoEngine* io, const TnIoReq* reqs, int n
 
 #if defined(_WIN32)
     int lim = n_reqs < TN_IO_MAX_BATCH ? n_reqs : TN_IO_MAX_BATCH;
-    int all_iocp = (io && io->iocp != NULL) ? 1 : 0;
+    HANDLE handles[TN_IO_MAX_BATCH];
+    for (int i = 0; i < lim; i++) handles[i] = tn_io_win_req_handle(&reqs[i]);
+
+    int all_iocp = (io && io->iocp != NULL && io->iocp_cs_ready) ? 1 : 0;
     if (all_iocp) {
         for (int i = 0; i < lim; i++) {
-            if (!tn_io_win_ensure_iocp_file(io, reqs[i].hfile)) { all_iocp = 0; break; }
+            if (reqs[i].len == 0 || !reqs[i].dst) continue;
+            if (!tn_io_win_ensure_iocp_file(io, handles[i])) { all_iocp = 0; break; }
         }
     }
-    OVERLAPPED ovs[TN_IO_MAX_BATCH];
     if (all_iocp) {
-        int inflight = 0;
+        // Multi-thread-safe IOCP demux:
+        //   1. All worker threads submit ReadFile concurrently with per-op `TnWinIoOp` (wrapping OVERLAPPED).
+        //   2. `rem` starts at 1 (submitter guard) so ops[] on this stack stays alive until EVERY accepted
+        //      ReadFile has posted its completion AND been matched via `entries[k].lpOverlapped`.
+        //   3. Leader-Follower reaping under `io->iocp_cs` / `io->iocp_cv` guarantees zero completion theft,
+        //      zero stack use-after-return, zero deadlocks, and zero per-batch kernel event allocations.
+        TnWinIoOp ops[TN_IO_MAX_BATCH];
+        volatile LONG rem = 1;
+        volatile LONG64 batch_bytes = 0;
         for (int i = 0; i < lim; i++) {
-            memset(&ovs[i], 0, sizeof(OVERLAPPED));
-            ovs[i].Offset     = (DWORD)(reqs[i].off & 0xFFFFFFFFull);
-            ovs[i].OffsetHigh = (DWORD)(reqs[i].off >> 32);
+            if (reqs[i].len == 0 || !reqs[i].dst || handles[i] == INVALID_HANDLE_VALUE) continue;
+            memset(&ops[i], 0, sizeof(TnWinIoOp));
+            ops[i].ov.Offset     = (DWORD)(reqs[i].off & 0xFFFFFFFFull);
+            ops[i].ov.OffsetHigh = (DWORD)(reqs[i].off >> 32);
+            ops[i].rem           = &rem;
+            ops[i].batch_bytes   = &batch_bytes;
+            InterlockedIncrement(&rem);
             DWORD got = 0;
-            BOOL ok = ReadFile(reqs[i].hfile, reqs[i].dst, (DWORD)reqs[i].len, &got, &ovs[i]);
-            if (ok || GetLastError() == ERROR_IO_PENDING) {
-                // Note: with IOCP attached (without FILE_SKIP_COMPLETION_PORT_ON_SUCCESS), every accepted ReadFile posts a completion packet.
-                inflight++;
+            BOOL ok = ReadFile(handles[i], reqs[i].dst, (DWORD)reqs[i].len, &got, &ops[i].ov);
+            if (!ok && GetLastError() != ERROR_IO_PENDING) {
+                InterlockedDecrement(&rem);
             }
         }
+        // Drop submitter guard reference (rem hits 0 iff all ops already completed or none were submitted)
+        InterlockedDecrement(&rem);
+
         OVERLAPPED_ENTRY entries[TN_IO_MAX_BATCH];
-        int reaped = 0;
-        while (reaped < inflight) {
-            ULONG got_n = 0;
-            if (!GetQueuedCompletionStatusEx(io->iocp, entries, (ULONG)(inflight - reaped), &got_n, INFINITE, FALSE)) break;
-            for (ULONG k = 0; k < got_n; k++) {
-                total += (size_t)entries[k].dwNumberOfBytesTransferred;
-                reaped++;
+        EnterCriticalSection(&io->iocp_cs);
+        while (InterlockedCompareExchange(&rem, 0, 0) > 0) {
+            if (!io->iocp_leader_active) {
+                io->iocp_leader_active = 1;
+                LeaveCriticalSection(&io->iocp_cs);
+                ULONG got_n = 0;
+                BOOL ok_g = GetQueuedCompletionStatusEx(io->iocp, entries, TN_IO_MAX_BATCH, &got_n, INFINITE, FALSE);
+                EnterCriticalSection(&io->iocp_cs);
+                if (ok_g) {
+                    for (ULONG k = 0; k < got_n; k++) {
+                        TnWinIoOp* op = (TnWinIoOp*)entries[k].lpOverlapped;
+                        if (!op) continue;
+                        if (op->batch_bytes) {
+                            InterlockedExchangeAdd64(op->batch_bytes, (LONG64)entries[k].dwNumberOfBytesTransferred);
+                        }
+                        // Decrementing `op->rem` MUST be the very last touch of `op` (owning stack may unwind after 0)
+                        if (op->rem) InterlockedDecrement(op->rem);
+                    }
+                }
+                io->iocp_leader_active = 0;
+                WakeAllConditionVariable(&io->iocp_cv);
+                if (!ok_g) break;
+            } else {
+                SleepConditionVariableCS(&io->iocp_cv, &io->iocp_cs, INFINITE);
             }
         }
+        LeaveCriticalSection(&io->iocp_cs);
+        total = (size_t)InterlockedCompareExchange64(&batch_bytes, 0, 0);
         if (io) {
             TN_IO_ATOMIC_ADD64(&io->iocp_batches, 1);
             TN_IO_ATOMIC_ADD64(&io->total_bytes, (int64_t)total);
@@ -710,14 +769,16 @@ static inline size_t tn_io_read_batch(TnIoEngine* io, const TnIoReq* reqs, int n
         return total;
     }
     // Fallback OVERLAPPED event path if handle wasn't opened with FILE_FLAG_OVERLAPPED / IOCP association failed
+    OVERLAPPED ovs[TN_IO_MAX_BATCH];
+    memset(ovs, 0, sizeof(ovs));
     int inflight = 0;
     for (int i = 0; i < lim; i++) {
-        memset(&ovs[i], 0, sizeof(OVERLAPPED));
+        if (reqs[i].len == 0 || !reqs[i].dst || handles[i] == INVALID_HANDLE_VALUE) continue;
         ovs[i].Offset     = (DWORD)(reqs[i].off & 0xFFFFFFFFull);
         ovs[i].OffsetHigh = (DWORD)(reqs[i].off >> 32);
         ovs[i].hEvent     = CreateEventA(NULL, TRUE, FALSE, NULL);
         DWORD got = 0;
-        if (ReadFile(reqs[i].hfile, reqs[i].dst, (DWORD)reqs[i].len, &got, &ovs[i])) {
+        if (ReadFile(handles[i], reqs[i].dst, (DWORD)reqs[i].len, &got, &ovs[i])) {
             total += (size_t)got;
             CloseHandle(ovs[i].hEvent);
             ovs[i].hEvent = NULL;
@@ -731,7 +792,7 @@ static inline size_t tn_io_read_batch(TnIoEngine* io, const TnIoReq* reqs, int n
     for (int i = 0; i < lim && inflight > 0; i++) {
         if (ovs[i].hEvent) {
             DWORD got = 0;
-            if (GetOverlappedResult(reqs[i].hfile, &ovs[i], &got, TRUE)) total += (size_t)got;
+            if (GetOverlappedResult(handles[i], &ovs[i], &got, TRUE)) total += (size_t)got;
             CloseHandle(ovs[i].hEvent);
             inflight--;
         }
